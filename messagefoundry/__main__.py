@@ -10873,6 +10873,8 @@ def _backup(args: argparse.Namespace) -> int:
     }
     if result.staging_leftover is not None:  # BACKLOG #1174: a good archive, plaintext left behind
         payload["staging_leftover"] = result.staging_leftover
+    if result.config_unreadable_files:  # vault BACKLOG #3765: the digest covers the rest
+        payload["config_unreadable_files"] = list(result.config_unreadable_files)
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -10883,6 +10885,15 @@ def _backup(args: argparse.Namespace) -> int:
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
+        if result.config_unreadable_files:
+            from messagefoundry.config.fingerprint import describe_left_out
+            from messagefoundry.controlchars import scrub_log_argument
+
+            left_out = describe_left_out(result.config_unreadable_files)
+            print(
+                f"WARNING: the config fingerprint left out {scrub_log_argument(left_out)}",
+                file=sys.stderr,
+            )
     return 0
 
 

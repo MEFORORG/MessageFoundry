@@ -31,6 +31,44 @@ def test_config_page_badge_clean() -> None:
     assert "DRIFTED" not in html
 
 
+def test_config_page_badge_names_what_it_did_not_compare() -> None:
+    html = config_page(
+        ConfigProvenance(
+            loaded=True,
+            fingerprint="a" * 64,
+            drift=False,
+            left_out_files=2,
+            reload_refused=None,
+        )
+    )
+    assert ">clean<" in html
+    assert "Config files or folders not compared, as unreadable: 2" in html
+    assert "DRIFTED" not in html
+
+
+def test_config_page_badge_says_a_lock_alone_can_read_as_drifted() -> None:
+    html = config_page(
+        ConfigProvenance(
+            loaded=True,
+            fingerprint="a" * 64,
+            drift=True,
+            left_out_files=1,
+            reload_refused=None,
+        )
+    )
+    assert ">DRIFTED<" in html
+    assert "a lock can show as DRIFTED, and does not rule out a real change" in html
+
+
+def test_config_page_badge_does_not_read_clean_on_no_reading() -> None:
+    html = config_page(
+        ConfigProvenance(loaded=True, fingerprint="a" * 64, drift=None, reload_refused=None)
+    )
+    assert ">NOT COMPARED<" in html
+    assert ">clean<" not in html and "DRIFTED" not in html
+    assert "matches the config on disk" not in html
+
+
 def test_config_page_badge_drifted() -> None:
     html = config_page(
         ConfigProvenance(

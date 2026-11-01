@@ -77,14 +77,14 @@ _DETAIL_NODE_MAX = 56
 _DETAIL_NODE_TAIL = 24
 
 
-def _short_node(node: str) -> str:
-    """``node`` whole when it fits :data:`_DETAIL_NODE_MAX`, else its head and its ``pid:tag`` tail
-    around ``...``, so both the host and the process it names stay readable. Not
+def _short_node(node: str, limit: int) -> str:
+    """``node`` whole when it fits ``limit``, else its head and its ``pid:tag`` tail around
+    ``...``, so both the host and the process it names stay readable. Not
     ``intake_bound.process_alert_subject``'s shortening: that one must give a stable alert key, so
     it ends in a checksum; this one is prose for a reader."""
-    if len(node) <= _DETAIL_NODE_MAX:
+    if len(node) <= limit:
         return node
-    head = _DETAIL_NODE_MAX - _DETAIL_NODE_TAIL - len("...")
+    head = limit - _DETAIL_NODE_TAIL - len("...")
     return f"{node[:head]}...{node[-_DETAIL_NODE_TAIL:]}"
 
 
@@ -95,22 +95,27 @@ def config_changed_detail(
     baseline_action: str,
     baseline_node: str | None,
     baseline_at: str,
+    comparison: str,
 ) -> str:
     """The one-line description of a ``config_changed`` alert both sinks show (vault BACKLOG #2597).
 
     It must hold for a config that changed on purpose and for one node that diverged from the rest,
-    so it states the two digests and where the older one came from and judges neither. Digests are
-    cut to 12 hex characters here; the event carries them whole. No path and no git commit.
+    so it states the two digests and where the older one came from and judges neither. It says
+    ``found``, not ``started on``: ``fingerprint`` can be the directory's after an edit this
+    process did not run. Digests are cut to 12 hex characters here; the event carries them whole.
+    No path and no git commit.
 
     The alert instance's reason column keeps only about the first 200 characters, and its cut drops
-    a token that straddles the limit whole. So the baseline's time and node lead, and a node id
-    longer than :data:`_DETAIL_NODE_MAX` is shortened here, which keeps the whole line inside the
-    cut for a baseline action name of up to 36 characters; the event carries the node whole (vault
-    BACKLOG #2944). The store's redaction replaces the ISO time in that column as date-shaped text,
+    a token that straddles the limit whole. So a marker (any ``comparison`` but ``compared``) leads,
+    then the baseline's time and node, and a node id longer than :data:`_DETAIL_NODE_MAX`, less
+    what the marker takes, is shortened here. That keeps the whole line inside the cut for a
+    baseline action name of up to 36 characters; the event carries the node whole (vault BACKLOG
+    #2944, #3765). The store's redaction replaces the ISO time in that column as date-shaped text,
     so there it reads ``[redacted]``; the event's ``baseline_at`` carries it whole."""
-    node = _short_node(baseline_node) if baseline_node else "unknown"
+    lead = "" if comparison == "compared" else f"{comparison}: "
+    node = _short_node(baseline_node, _DETAIL_NODE_MAX - len(lead)) if baseline_node else "unknown"
     return (
-        f"baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): started on "
+        f"{lead}baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): found "
         f"config {fingerprint[:12]}, baseline config {previous_fingerprint[:12]}"
     )
 
@@ -845,11 +850,13 @@ class AlertSink(Protocol):
         ``control_action`` fires on it (BACKLOG #1898). Raised once per start at most, never on a
         fresh store, a baseline without a digest, or one taken under another fingerprint scheme.
 
-        ``comparison`` is the start's outcome: ``compared``, or a marker that the start's digest
-        left out a file it could not read (``partial_start_digest``), the baseline's did
-        (``partial_baseline``), or the directory changed while the start loaded it
-        (``changed_during_load``). A marker adds to the page; it never suppresses one (vault
-        BACKLOG #2944, #3765)."""
+        ``comparison`` is the start's outcome: ``compared``, or a marker that a digest the start
+        took left out a file it could not read (``partial_start_digest``), the baseline's did
+        (``partial_baseline``), the directory changed after the start's load read it
+        (``changed_during_load``), or the start has no digest of the bytes it loaded and judged
+        only the directory (``no_start_digest``). ``fingerprint`` is the digest that differs: the
+        directory's when it does, else that of the bytes the load read. A marker adds to the page;
+        it never suppresses one (vault BACKLOG #2944, #3765)."""
         ...
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
@@ -1376,8 +1383,10 @@ class LoggingAlertSink:
         comparison: str = "compared",
     ) -> None:
         log.warning(
-            "ALERT config_changed: %r %s (this node %s, engine shard %s; baseline actor %s; "
-            "fingerprint %s, previous %s; comparison %s)",
+            # The detail may shorten the baseline node to fit a reason column. A log line has no
+            # such cut, so it carries that node whole, as the event does (vault BACKLOG #3765).
+            "ALERT config_changed: %r %s (this node %s, engine shard %s; baseline node %s, "
+            "actor %s; fingerprint %s, previous %s; comparison %s)",
             name,
             config_changed_detail(
                 fingerprint=fingerprint,
@@ -1385,9 +1394,11 @@ class LoggingAlertSink:
                 baseline_action=baseline_action,
                 baseline_node=baseline_node,
                 baseline_at=baseline_at,
+                comparison=comparison,
             ),
             node,
             shard,
+            baseline_node,
             baseline_actor,
             fingerprint,
             previous_fingerprint,

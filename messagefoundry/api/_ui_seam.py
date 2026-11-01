@@ -770,12 +770,17 @@ from typing import Any
 #: which the handshake does not catch: an older console omits ``request``, and a newer console
 #: passes it to an engine that lacks it.
 #:
+#: Vault BACKLOG #3765: ``ConfigProvenance`` gained ``left_out_files``, which the console's config
+#: page reads by attribute, so it forces a bump. ``drift`` may now be ``None``, which an older
+#: console would render as clean, and the digest records field names only, so that alone would not
+#: have moved it.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b634db50214474e2"
+ENGINE_UI_SEAM: str = "0341bb4cd2670000"
 
 
 @dataclass(frozen=True, slots=True)

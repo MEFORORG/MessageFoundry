@@ -61,6 +61,7 @@ from typing import Any
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -211,9 +212,12 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 #: than this out of an archive. The store member is STREAMED to disk under its own cap; the manifest
 #: is the one member parsed into memory (``json.loads`` holds the decoded object on top of the raw
 #: bytes), so an unbounded read here is the only place a forged archive could balloon the verifying
-#: process's memory. 1 MiB is many times the largest manifest this writer produces — a fixed field
+#: process's memory. 1 MiB is many times the usual manifest this writer produces — a fixed field
 #: set plus one row count per table in the snapshot's own schema (BACKLOG #1722; every table, not a
-#: hand-picked sample — see :func:`_count_tables`).
+#: hand-picked sample — see :func:`_count_tables`). It is not a bound on what the writer can
+#: produce: ``config_unreadable_files`` holds one relative path per file or folder the config
+#: digest left out, uncapped (vault BACKLOG #3765). A list long enough to pass this cap writes an
+#: archive this read refuses, so a verify reports FAIL and a restore refuses it.
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -286,6 +290,9 @@ class BackupResult:
     config_bundled: bool = False
     config_dir: str | None = None
     config_bundle_error: str | None = None
+    #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
+    #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
+    config_unreadable_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,16 +303,20 @@ class _ConfigBundle:
     bundled: bool
     fingerprint: str | None
     error: str | None
+    #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
+    #: of the whole bundle (vault BACKLOG #3765).
+    left_out: tuple[str, ...] = ()
 
     def manifest_fields(self) -> dict[str, object]:
         """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
-        directory path, a digest and an exception class name."""
+        directory path, a digest, an exception class name and relative config file names."""
         return {
             "config_fingerprint": self.fingerprint,
             "config_bundled": self.bundled,
             # Named on a fault too, so the record says which directory failed.
             "config_dir": str(self.path) if self.path is not None else None,
             "config_bundle_error": self.error,
+            "config_unreadable_files": list(self.left_out),
         }
 
 
@@ -753,6 +764,7 @@ class BackupRunner:
             config_bundled=bundle.bundled,
             config_dir=str(bundle.path) if bundle.path is not None else None,
             config_bundle_error=bundle.error,
+            config_unreadable_files=bundle.left_out,
         )
 
     async def _verify_and_publish(
@@ -1197,6 +1209,7 @@ class BackupRunner:
             "config_bundled": result.config_bundled,
             "config_dir": result.config_dir,
             "config_bundle_error": result.config_bundle_error,
+            "config_unreadable_files": list(result.config_unreadable_files),
             "snapshot_sha256": result.snapshot_sha256,
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
@@ -1268,12 +1281,19 @@ class BackupRunner:
         goes on, because the store snapshot is worth keeping; a config-only pass fails, in
         :meth:`_do_backup`. The digest itself catches what
         :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
-        a load tolerates cannot fail a backup. Each warning names the directory and an error class
-        or a scrubbed reason, never config content. With ``include_config`` off nothing is bundled,
-        so a fault is not one the operator needs to hear about, and none is recorded."""
+        a load tolerates cannot fail a backup, though the archive walk can: ``tar.add`` opens each
+        file itself, so a file still locked there fails the run. What the digest left out as
+        unreadable is recorded beside it, so the record does not read as the digest of the whole
+        bundle (vault BACKLOG #3765), and logged at WARNING when the bundle is being archived. On a
+        bundled pass that list reaches a record only for what the walk passes over, at least a
+        folder it cannot list, and for a lock gone by the walk. Each warning names the directory
+        and an error class, a scrubbed reason or a relative file name, never config content. With
+        ``include_config`` off nothing is bundled, so a listing fault is not one the operator needs
+        to hear about, and none is recorded; the digest is still taken, so its left-out list is."""
         if config_dir is None:
             return _ConfigBundle(path=None, bundled=False, fingerprint=None, error=None)
-        from messagefoundry.config.fingerprint import config_fingerprint
+        from messagefoundry.config.fingerprint import describe_left_out, snapshot_fingerprint
+        from messagefoundry.config.snapshot import read_config_snapshot
 
         include = self._settings.include_config
         try:
@@ -1292,17 +1312,27 @@ class BackupRunner:
             )
             return _ConfigBundle(path=config_dir, bundled=False, fingerprint=None, error=error)
         fingerprint: str | None = None
+        left_out: tuple[str, ...] = ()
         try:
-            fingerprint = config_fingerprint(config_dir)
+            snapshot = read_config_snapshot(config_dir, strict=False)
+            fingerprint = snapshot_fingerprint(snapshot)
+            left_out = snapshot.unreadable
         except (OSError, ValueError) as exc:
             log.warning(
                 "DR backup: config fingerprint failed for %s: %s", config_dir, safe_exc(exc)
+            )
+        if left_out and include:
+            log.warning(
+                "DR backup: the config fingerprint of %s left out what it could not read: %s",
+                config_dir,
+                scrub_log_argument(describe_left_out(left_out)),
             )
         return _ConfigBundle(
             path=config_dir,
             bundled=include,
             fingerprint=fingerprint,
             error=None,
+            left_out=left_out,
         )
 
     def _is_server_db(self) -> bool:

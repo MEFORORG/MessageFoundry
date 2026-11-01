@@ -327,7 +327,14 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import ConfigDirMissing, digest_coverage, fingerprint_matches
+from messagefoundry.config.fingerprint import (
+    ConfigDirMissing,
+    DigestCoverage,
+    describe_left_out,
+    digest_coverage,
+    left_out_of,
+    same_digest,
+)
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -2849,15 +2856,17 @@ type _StartOutcome = Literal[
 ]
 
 #: The outcomes that leave this start unchecked; see :data:`_BASELINE_UNCHECKED`. Only starts that
-#: made no comparison: one that compared, whatever marker it carries, paged on a change and is the
-#: next start's baseline, as every compared start is (vault BACKLOG #2944, #3765).
+#: made no comparison, or have no digest of the bytes they loaded to be a baseline: one that
+#: compared those bytes, whatever marker it carries, paged on a change and is the next start's
+#: baseline, as every compared start is (vault BACKLOG #2944, #3765).
 _UNCHECKED_OUTCOMES: frozenset[str] = frozenset({"read_failed", "no_start_digest"})
 
 
 @dataclass(frozen=True, slots=True)
 class _StartConfigComparison:
     """This start's config digest set against the newest one the store recorded (vault BACKLOG
-    #2597). Built only when both digests exist under one fingerprint scheme."""
+    #2597). Built only when both digests exist under one fingerprint scheme. ``fingerprint`` is the
+    digest the start judged, the one a page names: :func:`_compare_start_config` says which."""
 
     fingerprint: str
     previous_fingerprint: str
@@ -2873,8 +2882,9 @@ class _StartConfigComparison:
 
     @property
     def changed(self) -> bool:
-        return self.left_out != self.previous_left_out or not fingerprint_matches(
-            self.fingerprint, self.previous_fingerprint
+        return not same_digest(
+            DigestCoverage(self.fingerprint, self.left_out),
+            DigestCoverage(self.previous_fingerprint, self.previous_left_out),
         )
 
 
@@ -2914,11 +2924,31 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
     return task.result()
 
 
+def _moved_after_load(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest shows bytes moved after the load read them: both were taken,
+    over the same files, and differ. Not two digests that left out different files, which is a
+    lock and shows no change (vault BACKLOG #3765, LF8)."""
+    return (
+        loaded is not None
+        and disk is not None
+        and loaded.left_out == disk.left_out
+        and not same_digest(loaded, disk)
+    )
+
+
+def _may_have_moved(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest fails to show the load's bytes still there. Wider than
+    :func:`_moved_after_load`: a digest that was not taken, or that left out other files, shows
+    nothing either way."""
+    return loaded is None or disk is None or not same_digest(loaded, disk)
+
+
 # The markers below are information only (vault BACKLOG #3765, items 15 to 17, the Lander's
-# send-back of engine PR 2370): wherever main paged on a digest change, this pages too. A partial
-# digest, a partial baseline or a directory that moved during the load names the page's outcome; it
-# never turns a page into a WARNING or adopts an unjudged baseline. The cost is accepted: a file an
-# antivirus lock holds at one start and not at the next pages on the same bytes, as it did on main.
+# send-back of engine PR 2370): a start pages whenever the directory after its load differs from the
+# baseline, and whenever the bytes it loaded do. A partial digest, a partial
+# baseline or a directory that moved during the load names the page's outcome; it never turns a page
+# into a WARNING or adopts an unjudged baseline. The cost is accepted: a file an antivirus lock holds
+# at one start and not at the next pages on the same bytes, as it did on main.
 #
 # Two follow-ons are declined (vault BACKLOG #2944, items 7 and 8). Paging back past
 # _CONFIG_BASELINE_WINDOW by id: a run of more than that many unusable rows takes that many
@@ -2931,7 +2961,7 @@ async def _compare_start_config(
     engine: Engine,
     snapshot: Mapping[str, object] | None,
     *,
-    before_load: Mapping[str, object] | None,
+    on_disk: Mapping[str, object] | None,
 ) -> tuple[_StartOutcome, _StartConfigComparison | None]:
     """Compare the start's config ``snapshot`` with the store's baseline (vault BACKLOG #2597), and
     return the outcome the start's ``config_loaded`` row records as ``comparison``, with the
@@ -2946,54 +2976,66 @@ async def _compare_start_config(
     The caller passes the digest :meth:`Engine.capture_start_provenance` took: off its snapshot,
     or, when it has none, off :attr:`Engine.loaded_config_fingerprint` read before
     ``engine.start()`` (vault BACKLOG #3076). Never a read taken once a reload can run, so a reload
-    that lands before the row is written cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
-    since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
+    that lands before the row is written cannot change what this start is said to have loaded. Only
+    the ``fingerprint`` and what it left out are compared, since ``git_head``, ``dir`` and ``node``
+    differ between nodes running the same bytes.
 
     Any digest change pages, as it did before vault BACKLOG #2944 added the markers below; they
     name the outcome and never skip the comparison (vault BACKLOG #3765).
 
-    ``before_load`` is the digest the caller took of the directory it loads, just before the load
-    (vault BACKLOG #2944). The start's own digest is taken after the load, so an edit between the
-    two reads could be recorded as loaded. When the two digests differ, or the first could not be
-    taken, the outcome is ``changed_during_load``, and the comparison still runs on the start's own
-    digest, as main's did. The caller stops the process vouching for that digest only when both
-    digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
-    that failed, or two that left out different files, is marked here and still vouched for. Two
-    reads miss at least an edit that lands and is reverted between them.
+    ``snapshot`` is the digest of the bytes the load ran, and ``on_disk`` the digest of the
+    directory just after the load, the start's one digest read (vault BACKLOG #2944, #3765). The
+    start judges both: ``on_disk`` first, then ``snapshot``. A comparison carries the first that
+    differs from the baseline, so a page fires when either differs, and names the directory
+    wherever the directory differs. A start that loaded edited bytes and saw them reverted before
+    ``on_disk`` pages too, on the bytes it ran. A digest that could not be taken is not judged. A
+    ``snapshot`` with no digest is ``no_start_digest`` whatever ``on_disk`` says, with a comparison
+    when one can be made, so it still pages, and its row is no baseline either way.
+
+    The outcome is ``changed_during_load`` when the two digests cover the same files and differ, so
+    bytes moved after the load read them. The row still names ``snapshot``, the bytes this process
+    runs, so the next start, on the moved bytes, pages again. Two reads miss at least an edit that
+    lands and is reverted after the load read that file.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
-    start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it
-    left out; a whole start that meets a partial baseline is ``partial_baseline``. Either pages
+    start where either digest is partial is ``partial_start_digest``, logged at WARNING with what
+    it left out; a whole start that meets a partial baseline is ``partial_baseline``. Either pages
     when the digests differ, and two digests that left out different files count as different
-    (:attr:`_StartConfigComparison.changed`).
+    (:func:`~messagefoundry.config.fingerprint.same_digest`).
 
-    ``read_failed`` and ``no_start_digest`` carry no comparison and leave the start unchecked
-    (:data:`_UNCHECKED_OUTCOMES`), so a later start compares against the last checked row instead.
+    ``read_failed`` and ``no_start_digest`` leave the start unchecked (:data:`_UNCHECKED_OUTCOMES`),
+    so a later start compares against the last checked row instead.
     A fresh store, a baseline with no digest or a new scheme each starts a new baseline with no
     comparison, since passing over those rows would leave every later start in the same place.
     Every other outcome carries a comparison. It never raises, except on cancellation: the read is
     bounded by :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, and any failure, in the read or in a row
     it returns, is logged at WARNING and costs only the comparison."""
-    start = digest_coverage(snapshot)
-    if snapshot is None or start is None:
+    loaded = digest_coverage(snapshot)
+    disk = digest_coverage(on_disk)
+    digests = [digest for digest in (disk, loaded) if digest is not None]
+    if not digests:
         _log.info("config change check skipped: this start has no config fingerprint")
         return "no_start_digest", None
-    current, left_out = start
+    left_out = left_out_of(*digests)
     if left_out:
         _log.warning(
             "config change check: this start's config fingerprint left out what it could not "
             "read: %s",
-            scrub_log_argument(", ".join(left_out)),
+            scrub_log_argument(describe_left_out(left_out)),
         )
-    before = digest_coverage(before_load)
-    moved = before is None or before[1] != left_out or not fingerprint_matches(before[0], current)
+    moved = _moved_after_load(loaded, disk)
     if moved:
         _log.warning(
-            "config change check: the config directory changed while this start loaded it, or "
-            "could not be read just before the load, so its digest may name bytes this process "
-            "never loaded; it is compared all the same"
+            "config change check: the config directory changed after this start's load read it, "
+            "so the bytes on disk are not the bytes this process runs; both are compared"
         )
-    scheme = snapshot.get("scheme")
+    scheme = ((snapshot if loaded is not None else on_disk) or {}).get("scheme")
+
+    def unjudged(outcome: _StartOutcome) -> _StartOutcome:
+        """``outcome``, for a start that made no comparison: one with no digest of the bytes it
+        loaded stays unchecked whatever stopped the comparison."""
+        return "no_start_digest" if loaded is None else outcome
+
     try:
         rows = await _bounded(
             engine.store.recent_audit_of(_CONFIG_BASELINE_ACTIONS, limit=_CONFIG_BASELINE_WINDOW),
@@ -3021,15 +3063,14 @@ async def _compare_start_config(
                 )
             else:
                 _log.info("config change check: no earlier config row; this start is the baseline")
-            return "no_baseline", None
+            return unjudged("no_baseline"), None
         baseline = digest_coverage(detail)
         if baseline is None:
             _log.info(
                 "config change check skipped: the store's newest usable %s row has no fingerprint",
                 row.get("action"),
             )
-            return "degraded_baseline", None
-        previous, baseline_left_out = baseline
+            return unjudged("degraded_baseline"), None
         if scheme is None or detail.get("scheme") != scheme:
             _log.info(
                 "config change check skipped: the store's newest usable %s row used fingerprint "
@@ -3038,27 +3079,28 @@ async def _compare_start_config(
                 detail.get("scheme"),
                 scheme,
             )
-            return "scheme_mismatch", None
-        outcome: _StartOutcome = (
+            return unjudged("scheme_mismatch"), None
+        outcome: _StartOutcome = unjudged(
             "changed_during_load"
             if moved
             else "partial_start_digest"
             if left_out
             else "partial_baseline"
-            if baseline_left_out
+            if baseline.left_out
             else "compared"
         )
+        judged = next((d for d in digests if not same_digest(d, baseline)), digests[0])
         node = detail.get("node")
         actor = row.get("actor")
         return outcome, _StartConfigComparison(
-            fingerprint=current,
-            previous_fingerprint=previous,
+            fingerprint=judged.fold,
+            previous_fingerprint=baseline.fold,
             baseline_action=str(row.get("action")),
             baseline_actor=actor if isinstance(actor, str) else None,
             baseline_at=_iso_utc(row.get("ts")),
             baseline_node=node if isinstance(node, str) else None,
-            left_out=left_out,
-            previous_left_out=baseline_left_out,
+            left_out=judged.left_out,
+            previous_left_out=baseline.left_out,
         )
     except Exception as exc:  # noqa: BLE001 - alert-only (step 5): no failure here may stop a start
         _log.warning(
@@ -3066,23 +3108,6 @@ async def _compare_start_config(
             safe_exc(exc),
         )
         return "read_failed", None
-
-
-def _moved_during_load(
-    before_load: Mapping[str, object] | None, after_load: Mapping[str, object] | None
-) -> bool:
-    """Whether two digests over the same files, one just before the start's load and one just
-    after it, differ: bytes did change in between (vault BACKLOG #2944). Not every
-    ``changed_during_load``: a digest that failed, or two that left out different files (a passing
-    antivirus lock), say nothing changed."""
-    before = digest_coverage(before_load)
-    after = digest_coverage(after_load)
-    return (
-        before is not None
-        and after is not None
-        and before[1] == after[1]
-        and not fingerprint_matches(before[0], after[0])
-    )
 
 
 def _raise_config_changed(
@@ -3129,8 +3154,9 @@ async def _record_start_audit(
     could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is.
 
     ``outcome`` and ``comparison`` are :func:`_compare_start_config`'s result. The row records
-    the outcome as ``comparison``, and ``previous_fingerprint`` and ``changed``, both ``None`` when
-    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`.
+    the outcome as ``comparison``, and ``previous_fingerprint``, ``judged_fingerprint`` and
+    ``changed``, each ``None`` when no comparison was made. The caller raises the alert, through
+    :func:`_raise_config_changed`.
 
     ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
     #2838). The row names that, so the digest it records is the one the comparison used. When the
@@ -3202,6 +3228,14 @@ async def _record_start_audit(
             **({"superseded": True} if superseded else {}),
             **({_BASELINE_UNCHECKED: True} if untrusted or outcome in _UNCHECKED_OUTCOMES else {}),
             "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
+            # The digest a page names, which is the directory's where that differs: the row's own
+            # ``fingerprint`` is the bytes this process runs (vault BACKLOG #3765).
+            "judged_fingerprint": comparison.fingerprint if comparison else None,
+            **(
+                {"judged_unreadable_files": list(comparison.left_out)}
+                if comparison and comparison.left_out
+                else {}
+            ),
             "changed": comparison.changed if comparison else None,
         },
     )
@@ -9303,34 +9337,45 @@ def create_app(
         fingerprint + best-effort git commit captured at load, and whether the on-disk config has since
         DRIFTED. No PHI/secrets — a one-way hash + a commit sha; gated by ``monitoring:read`` like
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
-        compares it to the loaded baseline; it degrades to clean when the baseline is missing or the
-        config dir is unreadable, so a read never raises.
+        compares it to the loaded baseline. It is ``None`` when a graph is running and either digest
+        could not be taken, so a read that compared nothing does not read as clean, and ``False``
+        when no graph is running (vault BACKLOG #3765).
 
         ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
         console's Reload form follows the engine (BACKLOG #3189)."""
         reload_refused = _reload_refusal(_user)
         loaded = engine.loaded_config_fingerprint
-        fp = loaded.get("fingerprint") if loaded else None
-        if not isinstance(fp, str) or not fp:
-            # No graph loaded yet, or fingerprint unavailable.
-            return ConfigProvenance(loaded=False, reload_refused=reload_refused)
-        drift = False
+        running = digest_coverage(loaded)
+        if loaded is None or running is None:
+            # No graph loaded yet, or fingerprint unavailable. A running graph with no baseline
+            # compared nothing, which must not read as clean (vault BACKLOG #3765).
+            return ConfigProvenance(
+                loaded=False,
+                drift=None if engine.registry_runner is not None else False,
+                reload_refused=reload_refused,
+            )
+        drift: bool | None = None
+        on_disk = None
         target = engine.running_config_dir
         if target is not None:
-            # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
-            # reports clean rather than a false DRIFT alarm.
+            # The one best-effort rule every load uses (vault BACKLOG #2597). A digest that could
+            # not be taken reports no reading, which is not clean (vault BACKLOG #3765). What a
+            # digest left out is a reading, and a difference in it is drift.
             current, _reason = await engine.fingerprint_bundle(target)
             if current is not None:
-                # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift.
-                drift = not fingerprint_matches(current.get("fingerprint"), fp)
-        git_head = loaded.get("git_head") if loaded else None
-        files = loaded.get("files") if loaded else None
+                # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift,
+                # and so does a change in what a digest left out (vault BACKLOG #3765).
+                on_disk = digest_coverage(current)
+                drift = on_disk is None or not same_digest(on_disk, running)
+        git_head = loaded.get("git_head")
+        files = loaded.get("files")
         return ConfigProvenance(
             loaded=True,
-            fingerprint=fp,
+            fingerprint=running.fold,
             git_head=git_head if isinstance(git_head, str) else None,
             files=files if isinstance(files, int) else None,
             drift=drift,
+            left_out_files=len(left_out_of(running, on_disk)),
             reload_refused=reload_refused,
         )
 
@@ -11893,20 +11938,6 @@ def create_managed_app(
                 # Before the load reads the directory, so a sibling's reload that lands after it is
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
-                # The digest of the directory the load reads, just before it, set against the
-                # one taken just after it below, so an edit between the load and that digest is
-                # marked changed_during_load and not vouched for (vault BACKLOG #2944).
-                # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
-                # which reads as a changed directory.
-                before_load: Mapping[str, object] | None = None
-                try:
-                    before_load, _reason = await engine.fingerprint_bundle(Path(config_dir))
-                except Exception as exc:  # noqa: BLE001 - see the comment above
-                    _log.warning(
-                        "the start could not digest its config before the load (%s); its config "
-                        "is still compared, and a change still pages",
-                        safe_exc(exc),
-                    )
                 loaded = load_config(config_dir)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
@@ -11923,10 +11954,24 @@ def create_managed_app(
                 # The runner holds the graph now. The lifespan frame lives as long as the process,
                 # so this name would pin the start's graph past every reload (vault BACKLOG #3076).
                 del loaded
-                # Right after the load, so the digest covers the bytes it read, and the provenance
-                # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
-                # unreadable bundle: it leaves the baseline empty and the start goes on.
+                # The digest of the bytes the load read, so the provenance route has a baseline
+                # from the start on (vault BACKLOG #2597). Never raises on an unreadable bundle: it
+                # leaves the baseline empty and the start goes on.
                 start_fingerprint_failure = await engine.capture_start_provenance()
+                # The start's one digest read: the directory as it is now, set against those bytes
+                # below, so an edit after the load read a file still pages at this start (vault
+                # BACKLOG #3765, items 18 and 21).
+                # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
+                # and the bytes the load read are compared alone.
+                on_disk: Mapping[str, object] | None = None
+                try:
+                    on_disk, _reason = await engine.fingerprint_bundle(Path(config_dir))
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    _log.warning(
+                        "the start could not digest its config directory after the load (%s); "
+                        "the bytes it loaded are still compared, and a change still pages",
+                        safe_exc(exc),
+                    )
                 # One snapshot of what this load put live, taken before engine.start() can spawn a
                 # convergence reload. The comparison below and the config_loaded row both use it,
                 # so neither can name a graph this start did not load (vault BACKLOG #2838).
@@ -11949,29 +11994,30 @@ def create_managed_app(
                 # written. So the next start pages again for the same change, unless a flag toggle
                 # or reload row lands in between and becomes the baseline. A repeat page on a
                 # degraded start is the safe side of that trade.
-                # The digest compared is the one the during-load test judges too, so a start with
-                # no snapshot still stops vouching for a directory that moved under its load.
                 compared = (
                     start_loaded.fingerprint
                     if start_loaded is not None
                     else engine.loaded_config_fingerprint
                 )
                 start_outcome, start_config = await _compare_start_config(
-                    engine, compared, before_load=before_load
+                    engine, compared, on_disk=on_disk
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 # The outcome alone decides it, by design (vault BACKLOG #3076 item 6): a start
                 # row that names no snapshot, or that a reload superseded, is no baseline itself,
                 # but its comparison still ran, and a flag row vouches for no more than that.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
-                if _moved_during_load(before_load, compared):
-                    # The digest may name bytes this process never loaded, so the provenance route
-                    # and a DR activation must not vouch for it (vault BACKLOG #2944). Its flag
-                    # rows then carry no digest, so they are marked unchecked too: a later start
-                    # passes over them to this start's row rather than reading one as a degraded
-                    # baseline and comparing nothing (vault BACKLOG #3765).
-                    engine.loaded_config_fingerprint = None
-                    engine.config_baseline_unchecked = True
+                if compared and _may_have_moved(
+                    digest_coverage(compared), digest_coverage(on_disk)
+                ):
+                    # The VCS head is read after the load, so unless the directory is shown not to
+                    # have moved it may be the commit it moved to, which the digest of the bytes
+                    # that ran must not be bound to (vault BACKLOG #3765). Advisory, so it is
+                    # dropped.
+                    unbound = {k: v for k, v in compared.items() if k != "git_head"}
+                    engine.loaded_config_fingerprint = unbound
+                    if start_loaded is not None:
+                        start_loaded = replace(start_loaded, fingerprint=unbound)
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises. Vault BACKLOG #3145
                 # item 1 (a gate-refused restart pages on every attempt) is declined: that is this

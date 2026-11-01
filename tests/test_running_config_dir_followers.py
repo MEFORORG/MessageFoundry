@@ -41,6 +41,7 @@ from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy
 from messagefoundry.pipeline.sharding import DEFAULT_SHARD, filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage, Store
+from tests.test_config_fingerprint import _unlistable, _unreadable
 from tests.test_dr_running_config_dir import _write_graph
 
 RAW = "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|DIR00001|P|2.5\rPID|1||MRN1\r"
@@ -101,6 +102,83 @@ async def _last_audit(store: Store) -> dict[str, object]:
 
 def _bundle_fields(record: dict[str, object]) -> tuple[object, object, object]:
     return record["config_bundled"], record["config_dir"], record["config_bundle_error"]
+
+
+async def test_a_backup_records_what_its_config_fingerprint_left_out(
+    backup_engine: tuple[Engine, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3765, item 23: an archive's ``config_fingerprint`` read as the digest of the
+    whole bundle when a file it covers could not be read. The mock fails ``read_bytes`` alone, so
+    it stands for a lock held over the digest's read and gone by the archive walk. A lock that
+    outlasts the walk fails the run:
+    :func:`test_a_lock_the_archive_walk_meets_fails_a_bundled_backup`."""
+    engine, live, _staging = backup_engine
+    runner = engine._backup_runner
+    assert runner is not None
+    (live / "environments").mkdir()
+    (live / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
+    whole = await runner.run_once(now=1.0)
+    assert whole is not None and whole.config_unreadable_files == (), "control: nothing left out"
+    assert (await _last_audit(engine.store))["config_unreadable_files"] == []
+
+    _unreadable(monkeypatch, "dev.toml")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        partial = await runner.run_once(now=2.0 + 86_400)
+    assert partial is not None
+    assert partial.config_fingerprint == fp.config_fingerprint(live)
+    assert partial.config_fingerprint != whole.config_fingerprint
+    assert partial.config_unreadable_files == ("environments/dev.toml",)
+    left_out = ["environments/dev.toml"]
+    assert (await _last_audit(engine.store))["config_unreadable_files"] == left_out
+    with _archive_tar(partial.archive_path) as tar:
+        assert _manifest(tar)["config_unreadable_files"] == left_out
+    assert any("left out what it could not read" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_lock_the_archive_walk_meets_fails_a_bundled_backup(
+    backup_engine: tuple[Engine, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tar.add`` opens each file itself, so a file still locked at the walk fails the run, and
+    ``config_unreadable_files`` is never written for it."""
+    engine, live, _staging = backup_engine
+    runner = engine._backup_runner
+    assert runner is not None
+    (live / "environments").mkdir()
+    (live / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
+    _unreadable(monkeypatch, "dev.toml")
+    real_open = tarfile.bltn_open  # type: ignore[attr-defined]
+
+    def _open(name: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(name).name == "dev.toml":
+            raise PermissionError(13, "Permission denied", str(name))
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile, "bltn_open", _open)
+    with pytest.raises(BackupError) as failed:
+        await runner.run_once(now=1.0)
+    assert failed.value.kind == "write"
+    assert "config_unreadable_files" not in await _last_audit(engine.store)
+
+
+async def test_a_folder_the_archive_walk_cannot_list_is_named_and_the_run_succeeds(
+    backup_engine: tuple[Engine, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rglob`` swallows a listing error, so the walk passes over the folder and the run succeeds
+    with less config than the directory holds. The list is what says so."""
+    engine, live, _staging = backup_engine
+    runner = engine._backup_runner
+    assert runner is not None
+    (live / "environments").mkdir()
+    (live / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
+    _unlistable(monkeypatch, live / "environments")
+    result = await runner.run_once(now=1.0)
+    assert result is not None
+    assert result.config_unreadable_files == ("environments",)
+    with _archive_tar(result.archive_path) as tar:
+        assert "config/environments/dev.toml" not in tar.getnames()
+        assert _manifest(tar)["config_unreadable_files"] == ["environments"]
 
 
 async def test_a_backup_after_a_reload_from_another_root_carries_that_root(
@@ -253,7 +331,7 @@ async def test_a_fingerprint_fault_costs_only_the_fingerprint(
         # What the fold raises on a file name that is not UTF-8 (vault BACKLOG #2839).
         raise UnicodeEncodeError("utf-8", "x\udc80", 1, 2, "surrogates not allowed")
 
-    monkeypatch.setattr(fp, "config_fingerprint", failing)
+    monkeypatch.setattr(fp, "snapshot_fingerprint", failing)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
         run = await _backup_of(tmp_path, cfg)
     assert run.fingerprint is None
@@ -290,7 +368,7 @@ async def test_an_unexpected_fingerprint_fault_fails_the_pass_and_the_loop_survi
     def broken(directory: object) -> str:
         raise RuntimeError("not a read fault")
 
-    monkeypatch.setattr(fp, "config_fingerprint", broken)
+    monkeypatch.setattr(fp, "snapshot_fingerprint", broken)
     runner = BackupRunner(
         store,
         BackupSettings(

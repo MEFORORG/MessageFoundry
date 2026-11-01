@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import itertools
 import json
 import logging
+import shutil
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -40,6 +43,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
+from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
@@ -49,7 +53,7 @@ from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
-from tests.test_config_fingerprint import _unreadable
+from tests.test_config_fingerprint import _unlistable, _unreadable
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
 
 _ACTIONS = ("config_loaded", "config_reload", "connection_flag_set")
@@ -263,8 +267,8 @@ async def test_a_baseline_under_another_scheme_raises_no_alert(
 ) -> None:
     real = fp_mod.config_fingerprint_detail
 
-    def _other_scheme(path: Path) -> dict[str, object]:
-        detail = real(path)
+    def _other_scheme(path: Path, **kwargs: Any) -> dict[str, object]:
+        detail = real(path, **kwargs)
         if scheme is None:
             del detail["scheme"]  # a row written before the tag existed
         else:
@@ -363,7 +367,7 @@ async def test_a_start_that_took_no_digest_is_passed_over_too(
     await _start(tmp_path, cfg)
     _edit(cfg)
 
-    def _unreadable(_path: Path) -> dict[str, object]:
+    def _unreadable(_path: Path, **_kwargs: Any) -> dict[str, object]:
         raise OSError("unreadable bundle")
 
     with monkeypatch.context() as m:
@@ -1114,8 +1118,8 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
     assert event["type"] == "config_changed" and event["connection"] == "config:aaaaaaaaaaaa"
     assert event["comparison"] == "partial_start_digest"
     assert event["detail"] == (
-        "baseline 2026-10-04T00:00:00+00:00 on node host:2:y (config_reload): started on config "
-        "aaaaaaaaaaaa, baseline config bbbbbbbbbbbb"
+        "partial_start_digest: baseline 2026-10-04T00:00:00+00:00 on node host:2:y (config_reload): "
+        "found config aaaaaaaaaaaa, baseline config bbbbbbbbbbbb"
     )
     assert (event["fingerprint"], event["previous_fingerprint"]) == ("a" * 64, "b" * 64)
     assert set(event) <= {
@@ -1346,14 +1350,14 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
     """Item 5: an edit between the load and the start's digest was recorded as loaded. Here the
-    start loads edited bytes and the edit is reverted before the digest, so without the check the
-    row named the baseline's bytes and no start ever reported the change this one ran. main did
-    not page at this start either; the marker and the withheld provenance are what it adds, and
-    the next start on the edited bytes pages (vault BACKLOG #3765)."""
+    start loads edited bytes and the edit is reverted before the digest of the directory. The row
+    names the bytes that ran, and the start pages on them, which main did not (vault BACKLOG
+    #3765)."""
     before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)
     original = (cfg / "cfg.py").read_bytes()
     _edit(cfg)
+    ran = config_fingerprint(cfg)
 
     def _load_then_revert(*args: Any, **kwargs: Any) -> Any:
         registry = load_config(*args, **kwargs)
@@ -1369,14 +1373,15 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
             unchecked_after = engine.config_baseline_unchecked
             rows = await _start_rows(engine)
     assert config_fingerprint(cfg) == before, "control: the digest after the load matches"
-    assert alerts == []
-    assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is False
-    assert "baseline_unchecked" not in rows[-1]
-    assert provenance_after is None, "the digest may name bytes the process never loaded"
-    assert unchecked_after is True, "its flag rows carry no digest, so they are no baseline"
-    _edit(cfg)
+    assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts] == [(ran, before)]
+    assert alerts[0]["comparison"] == "changed_during_load"
+    assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
+    assert rows[-1]["fingerprint"] == ran and "baseline_unchecked" not in rows[-1]
+    assert provenance_after is not None and provenance_after["fingerprint"] == ran
+    assert unchecked_after is False, "the start compared, and its digest is the bytes it ran"
+    # The directory went back, so the next start differs from what this one ran, and says so.
     rows = await _start(tmp_path, cfg)
-    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+    assert [a["fingerprint"] for a in alerts] == [ran, before]
     assert rows[-1]["comparison"] == "compared"
 
 
@@ -1384,13 +1389,14 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
 _LONG_NODE = f"{'h' * 253}:4194304:abcdef12"
 
 
-def _long_node_detail() -> str:
+def _long_node_detail(comparison: str = "compared") -> str:
     return config_changed_detail(
         fingerprint="a" * 64,
         previous_fingerprint="b" * 64,
         baseline_action="connection_flag_set",
         baseline_node=_LONG_NODE,
         baseline_at="2026-10-04T00:00:00+00:00",
+        comparison=comparison,
     )
 
 
@@ -1404,6 +1410,47 @@ def test_the_detail_leads_with_the_baseline_time_and_node_and_fits_the_reason_co
     assert detail.endswith("baseline config bbbbbbbbbbbb")
 
 
+#: Every outcome a page can carry but ``compared``: _StartOutcome, less those with no comparison.
+_MARKERS = ("partial_start_digest", "partial_baseline", "changed_during_load", "no_start_digest")
+
+
+@pytest.mark.parametrize("marker", _MARKERS)
+def test_the_detail_leads_with_a_marker_and_still_fits_the_reason_column(marker: str) -> None:
+    """LF9: the reason text did not carry the outcome, so an alert list read a partial digest and a
+    moved directory as a plain change. The marker leads, and the rest still fits the column."""
+    detail = _long_node_detail(marker)
+    assert len(detail) <= 200
+    assert detail.startswith(f"{marker}: baseline 2026-10-04T00:00:00+00:00 on node hhh")
+    assert ":4194304:abcdef12 (connection_flag_set)" in detail
+    assert detail.endswith("baseline config bbbbbbbbbbbb")
+
+
+def test_a_compared_detail_carries_no_marker() -> None:
+    assert _long_node_detail().startswith("baseline ")
+    assert "compared" not in _long_node_detail()
+
+
+def test_the_logging_sink_carries_the_baseline_node_whole(caplog: pytest.LogCaptureFixture) -> None:
+    """Item 20: the detail shortens a long node to fit a reason column, and the log line, which has
+    no such cut, inherited that and lost the node the event carries whole."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alerts"):
+        LoggingAlertSink().config_changed(
+            "config:aaaaaaaaaaaa",
+            fingerprint="a" * 64,
+            previous_fingerprint="b" * 64,
+            node="this-node",
+            shard=None,
+            baseline_action="connection_flag_set",
+            baseline_actor="alice",
+            baseline_at="2026-10-04T00:00:00+00:00",
+            baseline_node=_LONG_NODE,
+            comparison="changed_during_load",
+        )
+    line = caplog.records[-1].getMessage()
+    assert _LONG_NODE in line
+    assert line.startswith("ALERT config_changed: 'config:aaaaaaaaaaaa' changed_during_load: ")
+
+
 async def check_config_changed_reason_survives_a_long_node(store: Any) -> None:
     """Store the ``config_changed`` detail at the longest node id and read it back uncut. Shared
     with the SQL Server and PostgreSQL store suites (vault BACKLOG #2944, item 6).
@@ -1411,21 +1458,23 @@ async def check_config_changed_reason_survives_a_long_node(store: Any) -> None:
     The store's redaction replaces the ISO date as date-shaped text, on every backend and at every
     node length, so the stored reason is the redacted line. The event carries ``baseline_at``
     whole. What this pins is the cut: nothing past the node is lost."""
-    detail = _long_node_detail()
-    expected = detail.replace("2026-10-04T00:00:00+00:00", "[redacted]")
-    await store.upsert_alert_instance(
-        event_type="config_changed",
-        connection="config:aaaaaaaaaaaa",
-        severity="warning",
-        reason=detail,
-        now=100.0,
-    )
-    (row,) = [
-        a
-        for a in await store.list_active_alert_instances(allowed_channels=None)
-        if a.event_type == "config_changed"
-    ]
-    assert row.reason == expected
+    # The longest marker: it takes the most from the node, and must not push the end past the cut.
+    for name, comparison in (("a", "compared"), ("b", "partial_start_digest")):
+        detail = _long_node_detail(comparison)
+        expected = detail.replace("2026-10-04T00:00:00+00:00", "[redacted]")
+        await store.upsert_alert_instance(
+            event_type="config_changed",
+            connection=f"config:{name * 12}",
+            severity="warning",
+            reason=detail,
+            now=100.0,
+        )
+        (row,) = [
+            a
+            for a in await store.list_active_alert_instances(allowed_channels=None)
+            if a.event_type == "config_changed" and a.connection == f"config:{name * 12}"
+        ]
+        assert row.reason == expected
 
 
 async def test_the_config_changed_reason_survives_a_long_node_sqlite(tmp_path: Path) -> None:
@@ -1479,24 +1528,33 @@ async def test_a_convergence_row_with_a_partial_digest_is_a_baseline(
     assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == row["fingerprint"]
 
 
-async def test_a_failed_digest_before_the_load_never_blocks_the_start(
+async def test_a_failed_digest_of_the_directory_never_blocks_the_start(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
+    """The digest of the directory after the load is audit only, and a failure of it is no change:
+    the bytes the load read are compared alone, so an edit before the load still pages."""
     await _start(tmp_path, cfg)
     real = Engine.fingerprint_bundle
     calls: list[Path] = []
 
-    async def _first_raises(self: Engine, path: Path, *snapshot: Any) -> Any:
-        calls.append(path)
-        if len(calls) == 1:
+    async def _directory_read_raises(
+        self: Engine, path: Path, snapshot: Any = None, /
+    ) -> tuple[dict[str, object] | None, str | None]:
+        if snapshot is None:
+            calls.append(path)
             raise RuntimeError("synthetic")
-        return await real(self, path, *snapshot)
+        return await real(self, path, snapshot)
 
     with monkeypatch.context() as m:
-        m.setattr(Engine, "fingerprint_bundle", _first_raises)
+        m.setattr(Engine, "fingerprint_bundle", _directory_read_raises)
         rows = await _start(tmp_path, cfg)  # asserts the graph is serving
-    assert rows[-1]["comparison"] == "changed_during_load"
-    assert alerts == []
+        assert calls, "control: the read was reached"
+        assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is False
+        assert alerts == []
+        _edit(cfg)
+        rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is True
+    assert len(alerts) == 1
 
 
 # --- vault BACKLOG #3765, items 15, 16, 17 and 19: never page less than main did ----------------
@@ -1567,13 +1625,14 @@ async def test_an_edit_that_lands_during_the_start_load_pages(
     assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
 
 
-async def test_a_start_with_no_snapshot_stops_vouching_for_a_directory_that_moved(
+async def test_a_start_with_no_snapshot_still_marks_a_directory_that_moved(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
-    """The merge of this PR's no-snapshot fallback (vault BACKLOG #3076) with main's during-load
-    test (vault BACKLOG #2944): the test judges the digest the start compared. RED when it is
-    handed the missing snapshot, which reads as nothing moved, so the process went on vouching
-    for a digest that may name bytes it never loaded."""
+    """The merge of the no-snapshot fallback (vault BACKLOG #3076) with the during-load test (vault
+    BACKLOG #2944): the test judges the digest the start compared, the one its load took. RED when
+    it is handed the missing snapshot, which reads as nothing moved. The process vouches for the
+    bytes it runs, and the route reports the difference as drift (vault BACKLOG #3765)."""
+    before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)
 
     def _no_snapshot(cls: type[Any], engine: Engine) -> Any:
@@ -1593,8 +1652,8 @@ async def test_a_start_with_no_snapshot_stops_vouching_for_a_directory_that_move
             provenance_after = engine.loaded_config_fingerprint
             unchecked_after = engine.config_baseline_unchecked
     assert [a["comparison"] for a in alerts] == ["changed_during_load"], "control: it paged"
-    assert provenance_after is None, "the digest may name bytes the process never loaded"
-    assert unchecked_after is True
+    assert provenance_after is not None and provenance_after["fingerprint"] == before
+    assert unchecked_after is False
 
 
 async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(
@@ -1633,3 +1692,276 @@ async def test_the_convergence_row_writes_the_fingerprint_it_judged(
     row = json.loads(rows[0]["detail"])
     assert row["fingerprint"] == "e" * 64
     assert row["baseline_unchecked"] is True, "the engine has moved on: it is no baseline"
+
+
+# --- vault BACKLOG #3765, items 18 and 21, LF8 and LF11: one digest read, of the bytes that ran ---
+
+
+async def test_a_start_reads_the_directory_for_a_digest_once(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 21, LF11: a start read the directory for a digest twice, around its load. The digest of
+    what it runs comes from the load's own read, so only the one of the disk now takes a read."""
+    reads: list[Any] = []
+
+    def _counted(directory: Any, *, strict: bool) -> Any:
+        reads.append(directory)
+        return read_config_snapshot(directory, strict=strict)
+
+    with monkeypatch.context() as m:
+        m.setattr(fp_mod, "read_config_snapshot", _counted)
+        await _start(tmp_path, cfg)
+    assert len(reads) == 1, reads
+
+
+async def test_an_edit_after_the_load_pages_and_is_not_recorded_as_loaded(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Vault BACKLOG #2944 item 5: the row named bytes the process never ran, and the next start,
+    on those bytes, saw no change. This start pages as main did, and the row names what ran, so the
+    next start pages too. That second page is more than main raised, never less."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(app_module, "load_config", _load_then_edit)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            loaded = engine.loaded_config_fingerprint
+            rows = await _start_rows(engine)
+    after = config_fingerprint(cfg)
+    assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts] == [(after, before)]
+    assert rows[-1]["fingerprint"] == before, "the row names the bytes that ran"
+    assert rows[-1]["judged_fingerprint"] == after, "and the digest the page named"
+    assert loaded is not None and loaded["fingerprint"] == before
+    rows = await _start(tmp_path, cfg)
+    assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts][1:] == [(after, before)]
+    assert rows[-1]["comparison"] == "compared"
+
+
+async def test_a_file_locked_after_the_load_leaves_a_whole_fingerprint(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 18: a read after the load could leave a file out of the digest of a graph that loaded
+    it, so every reader of the loaded digest held a partial one. It still pages, as main did on
+    the partial digest, and LF8: nothing changed, so the marker says partial, not changed."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    locked = {"on": False}
+
+    def _load_then_lock(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        locked["on"] = True
+        return registry
+
+    with monkeypatch.context() as m:
+        _unreadable(m, "cfg.py", when=locked)
+        m.setattr(app_module, "load_config", _load_then_lock)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            loaded = engine.loaded_config_fingerprint
+            rows = await _start_rows(engine)
+    assert loaded is not None and loaded["fingerprint"] == before
+    assert UNREADABLE_FILES_KEY not in loaded and UNREADABLE_FILES_KEY not in rows[-1]
+    assert [a["comparison"] for a in alerts] == ["partial_start_digest"]
+    assert rows[-1]["comparison"] == "partial_start_digest" and rows[-1]["changed"] is True
+    assert rows[-1]["judged_unreadable_files"] == ["cfg.py"], "the row says why it changed"
+
+
+async def test_a_moved_start_binds_no_later_commit_to_the_bytes_it_ran(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pull after the load read its files is the likeliest way to move a directory. The head is
+    read after the load, so it would name the new commit beside the digest of the old bytes."""
+    await _start(tmp_path, cfg)
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(fp_mod, "_git_head", lambda _start: "c" * 40)
+        rows = await _start(tmp_path, cfg)
+        assert rows[-1]["git_head"] == "c" * 40, "control: an unmoved start keeps its head"
+        m.setattr(app_module, "load_config", _load_then_edit)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            loaded = engine.loaded_config_fingerprint
+            rows = await _start_rows(engine)
+    assert rows[-1]["comparison"] == "changed_during_load"
+    assert "git_head" not in rows[-1]
+    assert loaded is not None and "git_head" not in loaded and loaded["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    ("reading", "comparison"),
+    [("not_taken", "compared"), ("other_files", "partial_start_digest")],
+)
+async def test_a_head_needs_a_directory_digest_that_shows_nothing_moved(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reading: str,
+    comparison: str,
+) -> None:
+    """The head stays only beside a directory digest of the same files and bytes. A digest that
+    was not taken, or that left out other files, cannot show that the directory did not move."""
+    _covered_file(cfg, "dev.toml")
+    await _start(tmp_path, cfg)
+    real = Engine.fingerprint_bundle
+    locked = {"on": False}
+
+    async def _no_directory_digest(
+        self: Engine, path: Path, snapshot: Any = None, /
+    ) -> tuple[dict[str, object] | None, str | None]:
+        if snapshot is None:
+            return None, "synthetic"
+        return await real(self, path, snapshot)
+
+    def _load_then_lock_and_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        locked["on"] = True
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(fp_mod, "_git_head", lambda _start: "c" * 40)
+        if reading == "not_taken":
+            m.setattr(Engine, "fingerprint_bundle", _no_directory_digest)
+        else:
+            _unreadable(m, "dev.toml", when=locked)
+            m.setattr(app_module, "load_config", _load_then_lock_and_edit)
+        rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == comparison
+    assert "git_head" not in rows[-1]
+
+
+@pytest.mark.parametrize("fault", ["gone", "unlistable"])
+async def test_a_directory_lost_after_the_load_pages_on_the_same_bytes(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    fault: str,
+) -> None:
+    """Such a directory still gives a digest, of an empty bundle or with ``.`` left out, so it is
+    judged and differs. Only a digest that fails outright costs the second comparison alone."""
+    await _start(tmp_path, cfg)
+    lost = {"on": False}
+
+    def _load_then_lose(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        if fault == "gone":
+            shutil.rmtree(cfg)
+        else:
+            lost["on"] = True
+        return registry
+
+    with monkeypatch.context() as m:
+        _unlistable(m, cfg, when=lost)
+        m.setattr(app_module, "load_config", _load_then_lose)
+        await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+
+
+class _OneRowStore:
+    """The store a comparison reads: one baseline row."""
+
+    def __init__(self, detail: dict[str, object] | None) -> None:
+        self._detail = detail
+
+    async def recent_audit_of(self, _actions: Any, *, limit: int) -> list[dict[str, Any]]:
+        if self._detail is None:
+            return []
+        return [
+            {
+                "action": "config_loaded",
+                "actor": "system",
+                "ts": 1.0,
+                "detail": json.dumps(self._detail),
+            }
+        ]
+
+
+def _digest(fold: str, *left_out: str) -> dict[str, object]:
+    return {
+        "fingerprint": fold * 64,
+        "scheme": FINGERPRINT_SCHEME,
+        **({UNREADABLE_FILES_KEY: list(left_out)} if left_out else {}),
+    }
+
+
+#: Enough digests to reach every relation two of them can have: equal, a different fold, a
+#: different left-out list with the same fold, and both.
+_DIGESTS = (
+    _digest("a"),
+    _digest("b"),
+    _digest("a", "environments/x.toml"),
+    _digest("b", "environments/y.toml"),
+)
+
+
+@pytest.mark.parametrize(
+    ("baseline", "disk", "loaded"),
+    list(itertools.product(_DIGESTS, (None, *_DIGESTS), (None, *_DIGESTS))),
+)
+async def test_no_digest_pair_pages_less_than_the_directory_alone(
+    baseline: dict[str, object],
+    disk: dict[str, object] | None,
+    loaded: dict[str, object] | None,
+) -> None:
+    """The Lander's rule on vault BACKLOG #3765: no path pages less than main. main compared one
+    digest, the directory after the load, so wherever that differs from the baseline this start
+    must page with main's own fingerprint, whatever the digest of the load's bytes says. RED if
+    the comparison judges only the bytes the load read."""
+    engine = cast(Engine, SimpleNamespace(store=_OneRowStore(baseline)))
+    outcome, comparison = await app_module._compare_start_config(engine, loaded, on_disk=disk)
+    if disk is None and loaded is None:
+        assert (outcome, comparison) == ("no_start_digest", None)
+        return
+    assert comparison is not None
+    if disk is not None and disk != baseline:
+        assert comparison.changed, "main paged here"
+        assert comparison.fingerprint == disk["fingerprint"], "the page main raised"
+    else:
+        assert comparison.changed is (loaded is not None and loaded != baseline)
+    assert (outcome == "no_start_digest") is (loaded is None)
+    # The marker says a change only when one was seen: the two digests cover the same files.
+    if outcome == "changed_during_load":
+        assert disk is not None and loaded is not None
+        assert disk.get(UNREADABLE_FILES_KEY) == loaded.get(UNREADABLE_FILES_KEY)
+        assert disk["fingerprint"] != loaded["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    ("baseline", "expected"),
+    [
+        (None, "no_baseline"),
+        ({"node": "n"}, "degraded_baseline"),
+        ({"fingerprint": "a" * 64, "scheme": "mefor-cfg-fp:v0"}, "scheme_mismatch"),
+    ],
+    ids=["no-baseline", "degraded", "other-scheme"],
+)
+async def test_a_start_with_no_digest_of_its_bytes_stays_unchecked_with_no_comparison(
+    baseline: dict[str, object] | None, expected: str
+) -> None:
+    """Whatever stopped the comparison, a start with no digest of its bytes writes a digest-less
+    row, and an unmarked one would read as a degraded baseline at the next start."""
+    engine = cast(Engine, SimpleNamespace(store=_OneRowStore(baseline)))
+    outcome, comparison = await app_module._compare_start_config(engine, None, on_disk=_digest("a"))
+    assert (outcome, comparison) == ("no_start_digest", None)
+    assert outcome in app_module._UNCHECKED_OUTCOMES
+    # Positive control: with the digest it is the outcome the name says.
+    outcome, comparison = await app_module._compare_start_config(
+        engine, _digest("a"), on_disk=_digest("a")
+    )
+    assert (outcome, comparison) == (expected, None)

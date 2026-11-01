@@ -1639,6 +1639,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     baseline_action=baseline_action,
                     baseline_node=baseline_node,
                     baseline_at=baseline_at,
+                    comparison=comparison,
                 ),
                 "fingerprint": fingerprint,
                 "previous_fingerprint": previous_fingerprint,

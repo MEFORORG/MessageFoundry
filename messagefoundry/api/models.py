@@ -692,7 +692,18 @@ class ConfigProvenance(BaseModel):
     fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v3)
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
-    drift: bool = False  # the on-disk config now differs from what was loaded
+    #: The on-disk config now differs from what was loaded, or the two digests left out different
+    #: files. ``None`` when a graph is running and either digest could not be taken, so nothing was
+    #: compared: that is not clean, and ``loaded`` is false when it is the loaded digest (vault
+    #: BACKLOG #3765). ``False`` when no graph is running.
+    drift: bool | None = False
+    #: How many files and folders the loaded digest or the on-disk digest left out as unreadable
+    #: (vault BACKLOG #3765). Where both left out the same ones, ``drift`` says nothing about them.
+    #: Where they differ, ``drift`` is true even on unchanged bytes, so a lock alone reads as drift.
+    #: A count, not their names: this route answers a channel-scoped caller, and a config module is
+    #: named for its connection. The ``config_loaded`` audit row names what the loaded digest left
+    #: out.
+    left_out_files: int = 0
     #: The refusal ``POST /config/reload`` gives THIS caller whatever it proves, or ``None`` when no
     #: such refusal applies (BACKLOG #3189). Today that is :data:`RELOAD_REFUSED_CHANNEL_SCOPED`
     #: for a channel-scoped caller. It is computed by the engine's own rule, so a page can stop
