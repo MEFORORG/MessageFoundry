@@ -2972,6 +2972,9 @@ _INTERVENING = {
         '<List Disabled="1"><Line Data="ItemClear %ADT/PID-20"/></List>',
         "List: List",
     ),
+    "block-label": ('<Block Data="Section"/>', "# Corepoint Block: Section"),
+    # A label carrying a statement holds only its marker, which is no statement position.
+    "block-statement-label": ('<Block Data="MsgLog %ADT"/>', "# Corepoint Block: MsgLog %ADT"),
     "one-of-each": (
         '<Line/><Line Comment="checked by hand"/><Line Data="MsgLog %ADT"/>'
         '<Line Disabled="1" Data="ElseIf (y)"/>',
@@ -3062,6 +3065,56 @@ def test_a_disabled_construct_keeps_the_branch_written_after_it() -> None:
     assert "Else" in _count_steps(_handler_steps(owned), in_loop=False)[1]
     continued = first + '<Line Disabled="1" Data="ElseIf (b)"/>' + arm
     assert _ORPHAN not in _handler_body(_handler_source(continued))
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        pytest.param('<If Disabled="1" Data="Else"><List/></If>', id="disabled-if-tag-else-data"),
+        # A Call whose @Data is a statement is a label demoted from a call, and keeps its shape.
+        pytest.param('<Call Data="ItemCopy %ADT/PID-3 to %ADT/PID-4"/>', id="demoted-call"),
+    ],
+)
+def test_a_step_that_keeps_its_construct_kind_still_orphans_the_branch(between: str) -> None:
+    """A disabled ``<If>`` is read as the ``If`` it would have rendered, not as the verb its
+    ``@Data`` leads with, and a demoted call is read as the call it was. Each stands between an
+    ``If`` and an ``Else``, so the ``Else`` stays an orphan and fails closed. Code review of this
+    change, round 2."""
+    handler = _handler_body(
+        _handler_source('<Line Data="If (a)"><List/></Line>' + between + _sibling_arm("Else"))
+    )
+    assert f"    if False:  # TODO: Corepoint Else {_ORPHAN}" in handler
+    assert not _send_lines(handler, 1)
+
+
+def test_an_orphans_own_branches_stay_dead() -> None:
+    """A marker in an orphan's own list splits off a branch the orphan cannot continue. It
+    renders inside the orphan's dead placeholder, never at the handler's own level. Code review
+    of this change, round 2."""
+    second = '<Line Data="MsgSend %ADT [OB_TWO]"/>'
+    body = f'<Line Data="Else"><List>{_SEND_INPUT}<Line Data="Catch"/>{second}</List></Line>'
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert '        sends.append(Send("OB_TWO", msg))' in handler
+    assert not _send_lines(handler, 1)
+    assert "Catch" in _count_steps(_handler_steps(body), in_loop=False)[1]
+    ast.parse(src)
+
+
+def test_a_branch_with_branches_of_its_own_is_never_adopted_across_a_step() -> None:
+    """No chain renders a branch's own branches, so adopting one across a step that runs
+    nothing would drop them uncounted. It stays an orphan, whose branches render dead and count.
+    The control is the same branch with no step between, which main already adopts. Code review
+    of this change, round 2."""
+    arm = (
+        f'<Line Data="Else"><List>{_SEND_INPUT}<Line Data="ElseIf (q)"/>'
+        '<Line Data="MsgSend %ADT [OB_TWO]"/></List></Line>'
+    )
+    body = '<Line Data="If (a)"><List/></Line><Line Data="MsgLog %ADT"/>' + arm
+    handler = _handler_body(_handler_source(body))
+    assert '        sends.append(Send("OB_TWO", msg))' in handler
+    assert not _send_lines(handler, 1)
+    assert {"Else", "ElseIf"} <= set(_count_steps(_handler_steps(body), in_loop=False)[1])
 
 
 def test_the_filed_repro_keeps_its_send_conditional(tmp_path: Path) -> None:

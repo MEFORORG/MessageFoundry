@@ -283,7 +283,8 @@ _OPENS = {"if", "try", "case", "choosefrom"}
 def _chained(step: Step) -> bool:
     if not isinstance(step, Control):
         return False
-    name = step.source_verb.lower() if step.kind == "disabled" else step.kind
+    # A disabled statement carries the kind it would have had in ``args`` (amended below).
+    name = (step.args or ("",))[0] if step.kind == "disabled" else step.kind
     return name in _OPENS or any(_chained(s) for s in (*step.body, *step.branches))
 
 
@@ -311,9 +312,11 @@ def _off(step: Step) -> bool:
 def _construct_at(steps: list[Step], marker: Control) -> int:
     at = len(steps) - 1
     # A marker holding nothing but label markers takes the steps after it in its own
-    # construct's list, so it looks back past nothing: the label amendment has already lifted
-    # its markers off the end.
-    if [s for s in marker.body if type(s) is UnmappedAction or not isinstance(s, UnmappedAction)]:
+    # construct's list, and a branch with branches of its own would lose them in a chain. Either
+    # looks back past nothing: the label amendment has already lifted its markers off the end.
+    if not marker.branches and [
+        s for s in marker.body if type(s) is UnmappedAction or not isinstance(s, UnmappedAction)
+    ]:
         while at >= 0 and _off(steps[at]):
             at -= 1
     return at
@@ -325,8 +328,22 @@ _ORPHAN_INLINE = (
     "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
 )
 _SCAN_SKIP_PAIR = (_LIVE_SKIP, "        if _is_disabled(elem):\n")
+_DISABLED_RETURN_STEP = '        return [Control("disabled", source, label, body=tuple(body))]\n'
+_STRAY_TAIL = "    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))\n"
 _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     _SCAN_SKIP_PAIR,
+    # A disabled statement keeps the kind it would have had, for the look-back below.
+    (
+        _DISABLED_RETURN_STEP,
+        '        return [Control("disabled", source, label, args=(kind or "",), '
+        "body=tuple(body))]\n",
+    ),
+    # An orphan's own branches render inside its dead placeholder.
+    (
+        _STRAY_TAIL,
+        "    deeper = 1 if ctrl.kind in _BRANCH_PARENT else 0\n"
+        "    out.extend(_stray_branches(ctrl, indent + deeper, in_loop=in_loop))\n",
+    ),
     # BACKLOG #2685: a branch with no construct renders its body under a dead placeholder.
     (
         _ORPHAN_INLINE,

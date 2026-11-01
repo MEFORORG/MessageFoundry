@@ -786,13 +786,18 @@ amendment. The differential guard now loads this amendment first, and bounds §2
 tree it loads onto. A separate test bounds this amendment. Its scan half changes a list only where
 the list holds a disabled wrapper, because a switched-off overwrite of the input no longer makes a
 later send of the input a refusal. Against the tree with that scan half alone, the rest adds no
-code line, moves none shallower, and adds no closing send, on the battery and the raw draw.
+code line, moves none shallower, and adds no closing send, on the battery and the raw draw. That
+bound reads whether a line runs by its depth alone, so a line that moves between a `try:` body and
+an `except` body at one depth is outside what it can see.
 
 At least these limits remain, each a lost scope that still renders live: a stray branch
 `_split_branches` gives a construct that cannot continue it, an element whose tag is not
-modelled, and the steps after a bare marker standing at the handler's own level. A branch marker
-inside a disabled wrapper no longer opens its branch in the construct around the wrapper, as a
-disabled marker line never did.
+modelled, the steps after a bare marker standing at the handler's own level, and the steps after
+a bare marker adopted by a nested construct written directly before it. One case is not quieter
+than main. A bare branch marker inside a disabled wrapper no longer opens its branch in the
+construct around the wrapper, as a disabled marker line never did. So the steps after the wrapper
+stay in that construct's own body: in a `try:` body, or in a `ChooseFrom` ahead of its first arm,
+where they run, though main kept them in the dead branch.
 
 ## 3. Acceptance criteria
 

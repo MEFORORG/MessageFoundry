@@ -259,6 +259,9 @@ class Control:
     # off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is. Only the test
     # that decides the shape of the tree reads it (:func:`_structural_kind`).
     demoted_from: str = ""
+    # On a ``"disabled"`` step, the kind the element would have rendered as live, or ``""`` (a list
+    # wrapper, a transform statement). Only :func:`_holds_a_chain` reads it (BACKLOG #2685).
+    disabled_kind: str = ""
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -1598,10 +1601,14 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
     that position, a :class:`LabelMarker` among them, and passes them as ``between``. A marker
     never changes which branch is adopted: the answer is the one this list gives with every
     marker taken out of it. Any other such step is skipped only for a branch that carries its
-    own body. A bare marker (:func:`_opens_a_branch`) is adopted across label markers alone, as
-    it was before: in a construct's own list, the steps after it are its branch, and adopting
-    it onto a nested construct would leave them in the enclosing body, where they run
-    (BACKLOG #2685)."""
+    own body, and holds no branch of its own. Across one, the rest is adopted as it was before,
+    across label markers alone (BACKLOG #2685):
+
+    * A bare marker (:func:`_opens_a_branch`): in a construct's own list the steps after it are
+      its branch, and adopting it onto a nested construct would leave them in the enclosing
+      body, where they run.
+    * A branch holding branches of its own, from a bare marker in its own list: no chain renders
+      a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead."""
     if len(produced) != 1 or not steps:
         return False
     branch, previous = produced[0], steps[-1]
@@ -1612,7 +1619,9 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
         and previous.kind == _BRANCH_PARENT[branch.kind]
     ):
         return False
-    if _opens_a_branch(branch) and not all(isinstance(s, LabelMarker) for s in between):
+    if (_opens_a_branch(branch) or branch.branches) and not all(
+        isinstance(s, LabelMarker) for s in between
+    ):
         return False
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
@@ -1654,13 +1663,10 @@ _CHAIN_KINDS = frozenset(_BRANCH_PARENT.values())
 
 def _holds_a_chain(step: Step) -> bool:
     """Whether ``step``, or any step under it, is a construct a sibling branch may continue. A
-    disabled step names the kind it would have had only through its source verb or tag."""
+    disabled step is read as the kind it would have rendered as live."""
     if not isinstance(step, Control):
         return False
-    kind = step.kind
-    if kind == "disabled":
-        name = step.source_verb.lower()
-        kind = _KIND_BY_VERB.get(name) or _CONTAINER_KIND_BY_TAG.get(name) or ""
+    kind = step.disabled_kind if step.kind == "disabled" else step.kind
     return kind in _CHAIN_KINDS or any(map(_holds_a_chain, (*step.body, *step.branches)))
 
 
@@ -1714,7 +1720,7 @@ def _parse_statement(
     body = _container_steps(elem, subject, held, in_control or kind in _NESTING_KINDS, depth)
 
     if _is_disabled(elem):
-        return [_disabled_step(elem, source, body)]
+        return [_disabled_step(elem, source, body, kind or "")]
 
     # A statement written anywhere but on a ``<Line>`` is marked and counted, and never emitted as
     # a write or a delivery: whether Corepoint runs it there is not known. A send in a Block's
@@ -1807,13 +1813,15 @@ def _parse_statement(
     return [*marker, Control(kind, source, detail, body=inner, branches=branches)]
 
 
-def _disabled_step(elem: Element, source: str, body: list[Step]) -> Control:
+def _disabled_step(elem: Element, source: str, body: list[Step], kind: str = "") -> Control:
     """The one node a ``@Disabled`` element becomes, a statement and a list wrapper alike.
 
     Preserved in full as commented-out pseudo-source: the subtree is parsed, so it is visible and
-    counted, but it is never emitted as live code."""
+    counted, but it is never emitted as live code. ``kind`` is what it would have rendered as."""
     label = strip_markup(_attr(elem, "Data")) or strip_markup(_attr(elem, "Comment"))
-    return Control("disabled", source, label or _local(elem.tag), body=tuple(body))
+    return Control(
+        "disabled", source, label or _local(elem.tag), body=tuple(body), disabled_kind=kind
+    )
 
 
 def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
@@ -2639,7 +2647,10 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     The tail runs for EVERY kind, so a construct added later cannot silently drop an adopted branch by
     forgetting to ask for it — see :func:`_stray_branches` (BACKLOG #1854)."""
     out = _generate_construct(ctrl, indent, in_loop=in_loop)
-    out.extend(_stray_branches(ctrl, indent, in_loop=in_loop))
+    # An orphan's own branches go inside its dead placeholder, which ends the lines above: at its
+    # own level they would run for every message (BACKLOG #2685).
+    tail = indent + 1 if ctrl.kind in _BRANCH_PARENT else indent
+    out.extend(_stray_branches(ctrl, tail, in_loop=in_loop))
     return out
 
 
