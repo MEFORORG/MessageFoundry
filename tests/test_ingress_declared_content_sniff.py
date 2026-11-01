@@ -38,6 +38,7 @@ from messagefoundry.parsing.binary import is_marked
 from messagefoundry.parsing.sniff import text_sniff_head
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.receipt import RefusalKind
 
 #: The four network-listener sources BACKLOG #1109 names. MLLP/TCP/DATABASE reach the pipeline through
 #: ``_handle_inbound``; HTTP has its own receipt-returning twin, ``_handle_inbound_http`` (exercised
@@ -122,15 +123,18 @@ async def test_mismatch_dead_letters_on_every_network_source(
 async def test_http_listener_mismatch_dead_letters_and_returns_no_receipt(
     store: MessageStore,
 ) -> None:
-    # The HTTP listener's own handler (ADR 0023): the same guard, but the receipt is None (the source
-    # answers it with a 422, ADR 0154 amendment 2026-09-26) rather than a wire ACK.
+    # The HTTP listener's own handler (ADR 0023): the same guard, but the receipt is a permanent
+    # refusal naming the ERROR row (the source answers it with a 422, ADR 0154 amendments 2026-09-26
+    # and 2026-10-30) rather than a wire ACK.
     reg = _registry(ContentType.JSON, source=ConnectorType.HTTP)
     runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     result = await runner._handle_inbound_http(reg.inbound["IB_TEST"], b"<not>json</not>")
 
-    assert result is None
+    assert result.refusal is RefusalKind.PERMANENT
     assert _is_mismatch(await _one_row(store))
+    named = await store.get_message(result.message_id)
+    assert named is not None and named["status"] == MessageStatus.ERROR.value
 
 
 # --- per-content-type coverage --------------------------------------------------------------------

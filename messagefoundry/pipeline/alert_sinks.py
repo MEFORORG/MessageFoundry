@@ -1170,8 +1170,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
-        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
+    def connection_error(
+        self,
+        name: str,
+        *,
+        kind: str,
+        detail: str | None = None,
+        error_class: str | None = None,
+    ) -> None:
+        # #46: an outbound lane went down. error_class is not sent: the event is unchanged. The shared _emit throttle keys on (type, connection), so a
         # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
         self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
 

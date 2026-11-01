@@ -46,6 +46,7 @@ from messagefoundry.transports.base import IntakeGate, SourceConnector, wait_for
 from messagefoundry.transports.database import DatabaseSource
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.http_listener import HttpSource
+from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from messagefoundry.transports.tcp import TcpSource
 from messagefoundry.transports.x12 import X12Source
 
@@ -517,11 +518,11 @@ async def test_a_paused_http_listener_withholds_the_read_and_then_serves_every_p
     src.intake_gate = gate
     seen: list[bytes] = []
 
-    async def handler(raw: bytes) -> str | None:
+    async def handler(raw: bytes) -> IngressReceipt:
         seen.append(raw)
-        return f"msg-{len(seen)}"
+        return IngressReceipt.accepted(f"msg-{len(seen)}")
 
-    await src.start(handler)
+    await src.start(receipt_handler(handler))
     try:
         posts = [asyncio.create_task(_post(src.sockport, f"BODY-{i}".encode())) for i in range(3)]
         await asyncio.sleep(_PAUSED_WINDOW)

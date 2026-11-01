@@ -452,7 +452,6 @@ _INT_CAPS = [
 #: range check, so a negative is not refused here; that is a separate question for each setting.
 _COUNT_ONLY = [
     pytest.param(_SCP, "max_associations", "_max_associations", id="scp-max_associations"),
-    pytest.param(_SCP, "max_pdu_size", "_max_pdu_size", id="scp-max_pdu_size"),
     pytest.param(_SCU, "max_pdu_size", "_max_pdu_size", id="scu-max_pdu_size"),
     pytest.param(_database_out, "pool_max", "_pool_max", id="database-out-pool_max"),
     pytest.param(
@@ -471,7 +470,15 @@ _COUNT_ONLY = [
 _NOT_A_COUNT = [True, False, 1.9, 2048.5, 0.5, Decimal("1.9"), Fraction(19, 10), math.inf, math.nan]
 
 
-@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS + _COUNT_ONLY)
+#: Integer settings read by ``count_setting`` with a range of their own on top, each pinned where it
+#: is built: the SCP's ``max_pdu_size`` takes 4096 to 1 MiB (``tests/test_dicom_scp_receipt_bounds.py``,
+#: vault BACKLOG #2712). The spelling rule is the same, so it is held to it here with values in range.
+_COUNT_RANGED = [
+    pytest.param(_SCP, "max_pdu_size", "_max_pdu_size", id="scp-max_pdu_size"),
+]
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS + _COUNT_ONLY + _COUNT_RANGED)
 @pytest.mark.parametrize("bad", _NOT_A_COUNT)
 def test_an_integer_setting_refuses_a_bool_or_a_fraction(
     build: Build, key: str, attr: str, bad: object
@@ -507,6 +514,17 @@ def test_an_integer_setting_accepts_a_whole_number_and_padded_text(
     assert getattr(build({key: Decimal("4096")}), attr) == 4096
     assert getattr(build({key: " 7 "}), attr) == 7
     assert getattr(build({key: "+5"}), attr) == 5
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _COUNT_RANGED)
+def test_a_ranged_integer_setting_accepts_a_whole_number_and_padded_text(
+    build: Build, key: str, attr: str
+) -> None:
+    """The control above, with values inside the setting's own range."""
+    assert getattr(build({key: 16384.0}), attr) == 16384
+    assert getattr(build({key: Decimal("8192")}), attr) == 8192
+    assert getattr(build({key: " 4096 "}), attr) == 4096
+    assert getattr(build({key: "+65536"}), attr) == 65536
 
 
 async def test_the_reference_sync_pool_size_is_a_count(monkeypatch: pytest.MonkeyPatch) -> None:

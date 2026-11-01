@@ -29,6 +29,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import ConnectionEventWrite
 
@@ -191,6 +192,89 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
         "10.0.0.2",
         "10.0.0.4",
     ]
+
+
+_UNDECLARED = "not_a_connection_event_kind"
+
+
+async def test_undeclared_kinds_are_refused_at_enqueue_and_the_burst_keeps_every_declared_row(
+    store: MessageStore, runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1624: the runner refuses a kind outside ``CONNECTION_EVENT_KINDS`` before it is
+    queued. In the store, a run of three such rows used to trip the salvage's store-is-refusing
+    cutoff and lose the declared rows behind them; refused at enqueue, they never reach a burst."""
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0))
+        for i in (1, 2, 3):
+            _enqueue(runner, _event(i, kind=_UNDECLARED))
+        _enqueue(runner, _event(4))
+        _enqueue(runner, _event(5))
+    assert runner._conn_events_dropped == 3
+    assert runner._conn_event_q is not None and runner._conn_event_q.qsize() == 3
+
+    before = store.committed_txns
+    _start_drainer(runner)
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        await _join(runner)
+    assert store.committed_txns - before == 1, "the burst stays one commit, with no salvage"
+    kept = await store.list_connection_events(allowed_channels=None)
+    assert sorted(e.peer_host or "" for e in kept) == ["10.0.0.0", "10.0.0.4", "10.0.0.5"]
+
+    refusals = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
+    # One warning per (connection, kind), naming both. Events 1 and 3 share IB_T1; event 2 is IB_T0.
+    assert len(refusals) == 2, refusals
+    assert all(_UNDECLARED in m for m in refusals)
+    assert {"'IB_T0'", "'IB_T1'"} == {m.split()[1] for m in refusals}
+    assert not [r for r in caplog.records if "burst write failed" in r.getMessage()]
+
+
+def _refusal_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "undeclared connection_event" in r.getMessage()
+    ]
+
+
+def test_the_refusal_warning_shows_the_kind_redacted_then_bounded(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    long_kind = "undeclared_long_" + "x" * 500
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0, kind=long_kind))
+    [line] = _refusal_lines(caplog)
+    shown = safe_text(long_kind, limit=wiring_runner._UNDECLARED_KIND_SHOWN)
+    assert repr(shown) in line, "the line carries safe_text of the WHOLE kind, bounded"
+    # Not the cut-then-redact form: a raw head of the kind must not appear.
+    assert long_kind[: wiring_runner._UNDECLARED_KIND_SHOWN] not in line
+
+
+def test_no_fragment_of_a_name_in_the_kind_reaches_the_log(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Synthetic. Cutting at 64 characters before redacting would leave "Jane" in the line.
+    kind = "k" * 58 + " Jane Doe"
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0, kind=kind))
+    [line] = _refusal_lines(caplog)
+    assert "Jane" not in line and "Doe" not in line, line
+
+
+def test_the_refusal_warning_is_throttled_per_pair_and_capped_across_pairs(
+    runner: RegistryRunner, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two distinct kinds on one connection each log; a repeat inside the window does not, but the
+    # next line written reports the running total, repeats included.
+    cap = runner._undeclared_kind_log.max_per_window
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        _enqueue(runner, _event(0, kind="undeclared_a"))
+        _enqueue(runner, _event(0, kind="undeclared_a"))
+        _enqueue(runner, _event(0, kind="undeclared_b"))
+        for i in range(cap + 5):
+            _enqueue(runner, _event(0, kind=f"undeclared_more_{i}"))
+    lines = [r.getMessage() for r in caplog.records if "undeclared" in r.getMessage()]
+    assert len(lines) == cap, "every pair past the cross-pair cap is counted and not logged"
+    assert "undeclared_a" in lines[0] and "(1 such event(s)" in lines[0]
+    assert "undeclared_b" in lines[1] and "(3 such event(s)" in lines[1]
+    assert runner._conn_events_dropped == cap + 8
 
 
 async def test_a_salvage_gives_up_once_the_store_itself_is_refusing(

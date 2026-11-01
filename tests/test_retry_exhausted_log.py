@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -46,6 +46,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from tests._refusal_log_capture import TOKEN, assert_no_token, until
+from tests._store_audit import no_operator_audit
 
 OUT = "file_out"
 LOGGER = "messagefoundry.pipeline.wiring_runner"
@@ -91,19 +92,6 @@ class _Fails:
 
     async def aclose(self) -> None:
         return None
-
-
-# Not this item's line: the DeliveryError arm's edge-triggered connection_lost alert logs
-# safe_exc(exc), which leaves _TRANSPORT_TEXT's token in place. That predates #3108 and is not filed
-# yet; the #3108 exit report hands it to the Manager. Skipped by its WHOLE message, so any other
-# record, that alert with any other text included, is still scanned.
-_PRE_EXISTING_ALERT = (
-    f"ALERT connection_error: outbound 'file_out' connection_lost: DeliveryError: {_TRANSPORT_TEXT}"
-)
-
-
-def _assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    assert_no_token(records, skip_message=_PRE_EXISTING_ALERT)
 
 
 def _exhausted_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -167,7 +155,7 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     assert repr(OUT) in text and str(msg["id"]) in text
     assert "DeliveryError" in text and "code '?'" in text
     assert "dead-lettered at the retry cap, after 2 attempt(s)" in text
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 def _stepped_runner(
@@ -212,7 +200,7 @@ async def test_the_line_fires_on_the_attempt_that_dead_letters_and_not_one_soone
     assert "dead-lettered at the retry cap, after 3 attempt(s)" in text
     expected = "(NegativeAckError, code 'AE')" if transient_nak else "(DeliveryError, code '?')"
     assert expected in text
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 async def test_retry_forever_never_writes_the_line(
@@ -250,7 +238,7 @@ async def test_a_batch_that_runs_out_its_attempts_logs_one_line(
     text = line.getMessage()
     assert repr(OUT) in text and "a batch of 3" in text and head_ids[-1] in text
     assert "DeliveryError" in text and "dead-lettered at the retry cap, after 2 attempt(s)" in text
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 def test_an_exhausted_line_does_not_share_a_window_with_a_permanent_refusal(
@@ -344,7 +332,7 @@ async def test_the_line_needs_no_status_read_after_the_write(
     await runner._process_delivery_item(OUT, await _claim(store))
     (line,) = _exhausted_lines(caplog)
     assert "unconfirmed" not in line.getMessage()
-    _assert_no_token(caplog.records)
+    assert_no_token(caplog.records)
 
 
 async def test_a_batch_whose_first_member_vanished_still_logs(
@@ -411,7 +399,7 @@ async def test_a_replay_right_after_the_dead_letter_does_not_hide_the_line(
 
     async def then_replay(*args: Any, **kwargs: Any) -> Any:
         outcome = await real(*args, **kwargs)
-        assert await store.replay_dead(audit=None) == 1
+        assert await store.replay_dead(audit=no_operator_audit) == 1
         return outcome
 
     monkeypatch.setattr(store, "mark_failed", then_replay)
@@ -504,7 +492,7 @@ async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
     # and replaying each named message re-queues its row.
     assert await store.count_dead(allowed_channels=None) == dead_before + len(mids)
     for m in mids:
-        assert await store.replay(m) == 1
+        assert await store.replay(m, audit=no_operator_audit) == 1
     assert [r["status"] for m in mids for r in await store.outbox_for(m)] == [
         OutboxStatus.PENDING.value
     ] * len(mids)
@@ -587,7 +575,7 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     # Both claims hold in every shape, the two-handler one included: the view does not list the
     # row, and replaying the message re-queues it (with any sibling still PENDING).
     assert await store.count_dead(allowed_channels=None) == 0
-    assert await store.replay(mid) == handlers
+    assert await store.replay(mid, audit=no_operator_audit) == handlers
     assert await _status(store, item.id) == OutboxStatus.PENDING.value
 
 

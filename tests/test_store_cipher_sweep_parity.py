@@ -43,14 +43,14 @@ cell on all three backends, and the AST one drops 12 comment-prose captures (1 o
 raw-text scan of the same pattern had been treating as table names. Nothing goes the other way.
 
 BACKLOG #1169, #1723, ASVS 11.3.3. Reads engine source; needs no database, driver or key, so it runs
-on the plain leg. The RUNTIME proof that a keyless-to-keyed open really seals these cells is a
-different test on a different leg: ``test_migration_encrypts_existing_state_value`` in
-``tests/test_store_encryption.py`` on the plain leg for SQLite,
+on the plain leg. The RUNTIME proof that a keyless-to-keyed open really seals these cells is one
+contract on three legs, ``tests/_keyed_reopen_contract.py``, scoped by :func:`_written_cells` here:
+``tests/test_store_keyed_reopen_cells.py`` on the plain leg for SQLite, and
 ``test_legacy_plaintext_migrated_on_keyed_reopen`` in ``tests/test_postgres_store.py`` on the
-``postgres-store`` leg, and ``test_legacy_plaintext_error_detail_migrated_on_open`` plus
-``test_state_plaintext_migrated_on_keyed_reopen`` in ``tests/test_sqlserver_store.py`` on the
-``sqlserver-store`` leg. Those legs open KEYLESS by default, so each of those tests opens its own
-keyed handle; everything they do not name is covered only by the static parity check here.
+``postgres-store`` leg and in ``tests/test_sqlserver_store.py`` on the ``sqlserver-store`` leg. Those
+legs open KEYLESS by default, so the contract opens its own keyed handle. It drives
+``_encrypt_existing_rows`` alone: a cell's ``reencrypt_to_active`` pass has runtime coverage only where
+a rotation test names that cell, and otherwise only the static parity check here.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
 _BACKENDS = ("store.py", "postgres.py", "sqlserver.py")
 
 #: The two passes. Both are reached only on a KEYED handle, and the routine CI legs open keyless, so
-#: only the named migration tests in the module docstring ever execute either body.
+#: only a test that opens its own keyed handle, as the module docstring says, executes either body.
 _SWEEPS = ("_encrypt_existing_rows", "reencrypt_to_active")
 
 #: Every statement shape a backend uses to put a row into a table; the capture is that table.
@@ -310,7 +310,7 @@ def test_every_written_cipher_cell_is_swept(backend: str, sweep: str) -> None:
         f"{backend}: {sweep} never names these cipher-covered cells, so a value written to them "
         "is left behind by that transition (plaintext at rest, or stranded under a retired key). "
         "The server legs open keyless by default, so nothing there executes the sweep body except "
-        f"the named migration tests in the module docstring.\n  unswept: {unswept}"
+        f"a test that opens its own keyed handle.\n  unswept: {unswept}"
     )
 
 

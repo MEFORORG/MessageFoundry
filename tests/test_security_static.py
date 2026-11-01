@@ -691,6 +691,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/auth/trust_anchors.py": (
         r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
     ),
+    # BACKLOG #2814 -- _RemoteError.without_names. Unresolvable BY CONSTRUCTION: the alternatives are
+    # the file names this upload rendered, known only at runtime. Every alternative is re.escape'd
+    # literal text, so the pattern holds no quantifier from input: a plain alternation of literals.
+    "messagefoundry/transports/remotefile.py": ("'|'.join(map(re.escape, bases))",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
