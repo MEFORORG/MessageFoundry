@@ -272,7 +272,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 | Operation | Route | Permission | Extra gate |
 |---|---|---|---|
 | Start / stop / restart a connection, singly or over a selection | `/ui/connections/{name}/start`, `/stop`, `/restart`, `/ui/connections/bulk-control` | `connections:control` | — |
-| Toggle a connection's flag annotation — the one console write that persists to `connections.toml` | `/ui/connections/{name}/flag` | `config:deploy` | — |
+| Toggle a connection's flag annotation, which the store holds | `/ui/connections/{name}/flag` | `config:deploy` | — |
 | Reload the graph from the engine's own startup config dir (executes your config Python) | `/ui/config/reload` | `config:deploy` | step-up bound to the action `config_reload` (vault BACKLOG #2625), unless `[auth].require_action_step_up = false`; dual control **only if you add `config_reload` to `[approvals].operations`** — see the note above |
 | Replay one message | `/ui/messages/{message_id}/replay` | `messages:replay` | step-up |
 | Replay dead deliveries — for one channel, for one (channel, destination), or all of them | `/ui/dead-letters/{channel_id}/replay`, `/ui/dead-letters/{channel_id}/{destination_name}/replay`, `/ui/dead-letters/replay-all` | `messages:replay` | step-up + dual control |

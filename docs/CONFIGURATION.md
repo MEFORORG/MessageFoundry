@@ -1828,7 +1828,7 @@ in the alert list, or pin `[cluster].node_id`.
 
 **`config_changed` says a start loaded different config bytes than the store's baseline** (vault
 BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
-newest usable `config_loaded`, `config_reload` or `connection_flag_set` audit row. That row may come
+newest usable `config_loaded` or `config_reload` audit row. That row may come
 from any node or engine shard, because they all share one config directory. A start that sees a
 change raises `config_changed` once. Its `config_loaded` row records the outcome as `comparison`
 (at least `compared`, `no_start_digest`, `no_baseline`, `degraded_baseline`,
@@ -1839,15 +1839,9 @@ started together, can each raise it; the alert list folds them into one instance
 
 - A change applied with `POST /config/reload` and then restarted does not alert. A change that only
   a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
-- A connection flag toggle does not alert either. Its row vouches for the directory it wrote only
-  when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
-- A toggle whose row fails, is not recorded within 10 seconds, or is cancelled by a shutdown is
-  refused, and the engine tries to put `connections.toml` back as it was (vault BACKLOG #2945).
-  The API answers a failed or late row 503. The next start reports a config change whenever the disk and the newest
-  row still disagree, which happens in at least these cases: another edit changed the file in the
-  meantime, and it is left as that edit wrote it and logged; the engine could not read, lock or
-  write the file to put it back; the process stopped before the row; or the store committed the
-  row after all, after the 10 seconds or before it reported its failure.
+- A connection flag toggle does not alert either. The store holds the flag, so a toggle changes
+  no file the fingerprint covers, and its `connection_flag_set` row is no baseline. A change on disk
+  that nobody loaded still alerts at the next start, whatever toggles landed in between.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - Any fingerprint change raises the alert. The markers below add detail to the page, as its
@@ -1864,13 +1858,12 @@ started together, can each raise it; the alert list folds them into one instance
   differ, or the first cannot be taken, the comparison is `changed_during_load`, and the start is
   still compared, on the fingerprint taken after the load. When both cover the same files and still
   differ, `GET /config/provenance` also has no loaded fingerprint to vouch for until the next
-  reload, and the flag toggle rows that process writes are marked `baseline_unchecked`. The two
-  reads miss at least an edit that lands and is reverted between them.
+  reload. The two reads miss at least an edit that lands and is reverted between them.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,
-  marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
-  later start passes over those rows, and over any row whose detail is not a JSON object (at
+  marks its own row `baseline_unchecked`. A
+  later start passes over that row, and over any row whose detail is not a JSON object (at
   WARNING), and compares against the newest usable row before them. So the change the unchecked
   start could not see is reported by the next start that can read. A config reload's row is
   usually not marked: applying the directory by reload vouches for it. When it is marked, and
@@ -1887,15 +1880,15 @@ started together, can each raise it; the alert list folds them into one instance
   `loosenings` are `null`, and it has no `shard` key and no `fingerprint` key at all. A start that
   could not tell whether a reload swapped its graph names its own graph, degraded with the
   `start_swap_check` step. A later start passes over both rows. So after a snapshot fault, the
-  next start raises `config_changed` again for the same change, unless a flag toggle or reload row
-  lands in between and becomes the baseline.
+  next start raises `config_changed` again for the same change, unless a reload row lands in
+  between and becomes the baseline.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
   whether the reload lands before or after the start's row. A convergence row that could not take
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it. One that took a
   partial fingerprint is a baseline like any other. The row names the fingerprint that reload
-  took, and is marked `superseded` when a later reload or flag toggle moved the engine on first.
+  took, and is marked `superseded` when a later reload moved the engine on first.
 - On a cluster, a reload row carries `config_version`, the shared version the reload applied
   (vault BACKLOG #3109). An operator reload's row carries the version it bumped the cluster to. A
   convergence row carries the version the node converged on. An operator reload whose bump failed

@@ -19,10 +19,11 @@
   `SCHEMA_VERSION` schema in
   [`config/connection_schema.py`](../../messagefoundry/config/connection_schema.py) plus the
   `connectionEditor` / `connectionForm` / `connectionQuickInput` modules under `ide/src/`.
-  The 2026-07-19 amendment below is built too: `flagged` on both connection models and in the read and
-  write key sets, `Engine.set_connection_flag`
+  The 2026-07-19 amendment below was built and has been reversed: the 2026-10-31 amendment moved
+  the flag to the store, so `connections.toml` carries no `flagged` key.
+  `Engine.set_connection_flag`
   ([`pipeline/engine.py`](../../messagefoundry/pipeline/engine.py)) behind
-  `POST /connections/{name}/flag` ([`api/app.py`](../../messagefoundry/api/app.py)), and
+  `POST /connections/{name}/flag` ([`api/app.py`](../../messagefoundry/api/app.py)) stays, with
   `tests/test_connection_flag.py`. *Phase 4* is confirmed only in part: the decomposition
   convention is documented ([docs/CONNECTIONS.md](../CONNECTIONS.md) section "Decomposing by role")
   with the `IB_DEMO_ORU_*` sample, but the re-port of the deferred multi-destination fan-out feeds
@@ -190,9 +191,75 @@ touch this feature adds.
 
 ---
 
+## Amendment (2026-10-31) — The object flag moves to the store, and the engine stops writing config (BACKLOG #2623)
+
+- **Status:** **Accepted (2026-10-31), on a review result the owner may overturn.** Reverses the
+  2026-07-19 amendment below, whose text stays as the record of what was built and why.
+
+**What was wrong with the flag in `connections.toml`.** A toggle's validate step called `load_config`
+on the live directory, so one toggle ran every config module in the engine's process. That is a
+trigger for code execution from a route with no second approver, for a field that decides nothing.
+The write also needed the service account to hold write access to the directory it executes code
+from, which `install-service.ps1` does not grant, and a cluster node had to refuse the toggle because
+it could reach only its own copy.
+
+**Decision.**
+
+1. **`flagged`, and only `flagged`, moves to a new `connection_flag` table on all three store
+   backends.** `auto_start` and `deployed` share the old tables, and both act: the runner skips and
+   starts listeners on them. They stay in `connections.toml`, inside the ADR 0041 fingerprint.
+2. **No seal.** The flag decides nothing, so nothing a seal would protect rests on it. What a database
+   writer with no key can do is move a marker on the console, which is attention, not access.
+   `tests/test_connection_flag_readers.py` fails when a new reader appears. That test is what brings
+   the seal question back if the flag ever comes to act.
+3. **A row is the flag.** A flagged connection has a row, keyed by name and direction, and an
+   unflagged one has none. No stored value exists to be malformed. Nothing in a start or a reload
+   reads the table, and the flag is off the `Registry`, so no stored row can refuse either. The
+   dashboard read fails soft: a row the driver cannot decode costs the markers, at WARNING, and never
+   the page.
+4. **The store is the only source.** The `flagged` TOML key and the `flagged=` declaration argument
+   are removed, and the loader refuses both. Ignoring the key would leave a hand edit that reads as
+   flagging a connection and flags nothing. There are no deployments, so there is nothing to migrate
+   and no compatibility to keep.
+5. **Any connection in the running graph takes the flag**, code-first included. That is the branch
+   the 2026-07-19 scope fork deferred. A name the running graph does not have is refused **409**. A
+   cluster node toggles like any other: the store is the one thing the nodes share.
+6. **A toggle still writes `connection_flag_set`**, with its actor and client, in the same transaction
+   as the flag. If the row fails the flag does not change, and the route answers **503**. The row
+   carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
+   Left on that list, a row with no digest would read as a degraded baseline and the next start would
+   compare nothing.
+7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering
+   a gate is a decision of its own, not a side effect of this move.
+8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept
+   a config write and its baseline row together went with it. `tests/test_config_write_census.py` now
+   fails on any engine write of a config file.
+
+**Accepted residual.** A database writer can flip the flag. That changes no fingerprint and writes no
+audit row. A stored value that disagrees with the newest `connection_flag_set` row is the only trace,
+and nothing compares them. An unusable row never refuses anything.
+
+**Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
+for an approver, because the IDE promote pre-flight would stall on a second person.
+[SECURITY.md](../SECURITY.md) records it, until a dry run can run in a throwaway worker.
+
+- **AC-1** — WHEN `POST /connections/{name}/flag` names a connection in the running graph, THE SYSTEM
+  SHALL write the flag and its `connection_flag_set` row in one transaction, and run no config module.
+  → `tests/test_connection_flag.py::test_a_toggle_runs_no_config_module`
+- **AC-2** — WHEN a toggle lands, THE SYSTEM SHALL leave every file in the config directory unchanged.
+  → `tests/test_connection_flag.py::test_a_toggle_changes_nothing_in_the_config_directory`
+- **AC-3** — WHEN the store holds a row no toggle could write, THE SYSTEM SHALL start and reload as
+  though it were absent.
+  → `tests/test_connection_flag.py::test_a_stored_row_refuses_neither_a_start_nor_a_reload`
+- **AC-4** — WHEN a module other than the listed display code reads the flag, THE build SHALL fail.
+  → `tests/test_connection_flag_readers.py`
+
+---
+
 ## Amendment (2026-07-19) — Console-settable object flag + the FIRST console→connections.toml write seam (BACKLOG #131)
 
-- **Status:** **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
+- **Status:** **Reversed by the 2026-10-31 amendment above.** Kept as the record of what was built.
+  **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
   a Flagged Objects filter" (lane `dg-s8a`, Wave 6). Additive to the accepted read/CLI-write design.
 
 **What it adds.**
