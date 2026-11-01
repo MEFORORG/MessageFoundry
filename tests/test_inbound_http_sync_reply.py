@@ -110,8 +110,10 @@ def test_the_status_choices_are_closed() -> None:
 def test_reply_content_type_must_be_passthrough_or_a_mime_type() -> None:
     with pytest.raises(WiringError, match="not empty"):
         Http(port=8080, reply_from="OB_PARTNER", reply_content_type="")
-    with pytest.raises(WiringError, match="which is neither"):
+    # The refusal says what a value must look like and quotes none: 'application/json' is its example.
+    with pytest.raises(WiringError, match=r"or a MIME type \(value withheld") as refused:
         Http(port=8080, reply_from="OB_PARTNER", reply_content_type="json")
+    assert "'json'" not in str(refused.value)
     # A real MIME type and the passthrough sentinel both pass.
     Http(port=8080, reply_from="OB_PARTNER", reply_content_type="application/soap+xml")
     Http(port=8080, reply_from="OB_PARTNER", reply_content_type="passthrough")
