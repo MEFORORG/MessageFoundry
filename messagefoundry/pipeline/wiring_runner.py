@@ -138,7 +138,7 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import PEEK_READ_FAULTS
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7MessageTooLarge
 from messagefoundry.parsing.sniff import (
     attachment_mime_agrees,
     b64_head,
@@ -151,6 +151,7 @@ from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
     IngressGuardError,
+    IngressTooLarge,
     carry_binary_ingress,
     check_binary_size,
     check_declared_type,
@@ -183,7 +184,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_max_rows,
     reference_statement,
 )
-from messagefoundry.pipeline.refused_body import RefusedBodyAllowance
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, with_refusal_note
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -252,6 +253,7 @@ from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
 __all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
@@ -901,7 +903,16 @@ class _StreamBudgetExceeded(Exception):
     """A very-large-document detach was refused because it would push the aggregate in-flight streaming
     budget ([inbound].stream_inflight_budget_bytes) over its ceiling (#149, ADR 0105 Phase 1a) — the
     backpressure DoS guard that replaces the frame cap. Caught in the ingress path and turned into an
-    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
+    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message.
+
+    ``alone`` is True when the body by itself is over the whole budget, so the refusal can never
+    clear however the concurrent detaches finish: a receipt source answers it as over-size rather
+    than inviting a re-send (BACKLOG #2105)."""
+
+    def __init__(self, message: str, *, alone: bool = False) -> None:
+        # The default keeps cls(*args), which pickle and copy rebuild an exception with, working.
+        super().__init__(message)
+        self.alone = alone
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -4884,9 +4895,9 @@ class RegistryRunner:
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
         # A source that answers the sender with its own protocol status declares wants_receipt, and gets
-        # the receipt handler: the committed message_id, or None when the body was refused and recorded
-        # ERROR. The HTTP listener (ADR 0023) owns what it answers for each (HttpSource._serve_one);
-        # the DICOM C-STORE SCP maps None to a
+        # the receipt handler: an IngressReceipt carrying the committed message_id, or the refusal's
+        # kind and the ERROR row's id (BACKLOG #2105). The HTTP listener (ADR 0023) owns what it answers
+        # for each (HttpSource._serve_one); the DICOM C-STORE SCP maps a refusal to a
         # DIMSE failure (BACKLOG #1910). Every other source gets the standard handler, whose str return is
         # a wire reply/ACK and whose None means both "committed" and "refused". The transport declares the
         # contract rather than the runner keying on a connector type (CLAUDE.md sec. 4).
@@ -7825,23 +7836,30 @@ class RegistryRunner:
     def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
         # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
         # receipt can carry it (AC-2) — distinct from the MLLP/TCP handler, whose str return is a wire
-        # REPLY to frame. So HTTP gets its own handler returning the committed message_id (or None when
-        # the body was NOT committed: a recorded ERROR from a decode/size guard). The receipt semantics
-        # (which the source maps to 202/4xx) are HTTP's own response logic, exactly as the HL7 ACK is
-        # MLLP's — the ingress commit + count-and-log + disposition machine are the SAME as _handle_inbound.
-        # Every source declaring wants_receipt binds this handler, the DICOM SCP included (BACKLOG #1910),
-        # so None here must keep meaning "not committed": the SCP answers a DIMSE failure on it.
-        async def on_request(raw: bytes) -> str | None:
+        # REPLY to frame. So HTTP gets its own handler returning an IngressReceipt: the committed
+        # message_id, or the refusal's kind and the ERROR row's id when the body was NOT committed. The
+        # receipt semantics (which the source maps to 202/4xx/503) are HTTP's own response logic, exactly
+        # as the HL7 ACK is MLLP's — the ingress commit + count-and-log + disposition machine are the SAME
+        # as _handle_inbound. Every source declaring wants_receipt binds this handler, the DICOM SCP
+        # included (BACKLOG #1910), so a refusal here must keep meaning "not committed": the SCP answers a
+        # DIMSE failure on it.
+        async def on_request(raw: bytes) -> IngressReceipt:
             return await self._handle_inbound_http(ic, raw)
 
-        return on_request
+        return receipt_handler(on_request)
 
     async def _declared_content_mismatch(
-        self, ic: InboundConnection, raw: bytes, *, text: str | None = None
-    ) -> bool:
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        *,
+        text: str | None = None,
+        kind: RefusalKind | None = None,
+    ) -> str | None:
         """Whether a NON-HL7 ingress body contradicts its inbound's declared ``content_type`` (ASVS
-        5.2.2, BACKLOG #1109). ``True`` means the body was dead-lettered here and the caller must stop;
-        ``False`` means it matched (or the type carries no reliable signature) and ingress continues.
+        5.2.2, BACKLOG #1109). A message id means the body was dead-lettered here, as that ``ERROR``
+        row, and the caller must stop; ``None`` means it matched (or the type carries no reliable
+        signature) and ingress continues.
 
         The rule is :func:`~messagefoundry.pipeline.ingress_guards.check_declared_type`, which the
         operator resend calls too. The file sources have run the same magic-byte sniff since the
@@ -7864,50 +7882,52 @@ class RegistryRunner:
             check_declared_type(ic, raw if text is None else text_sniff_head(text))
         except IngressGuardError as exc:
             # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
-            await self._record_refused(
+            return await self._record_refused(
                 ic,
                 raw,
                 text,
                 error=exc.reason,
                 message_type=ic.content_type.value,
+                kind=kind,
             )
-            return True
-        return False
+        return None
 
-    async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> str | None:
-        """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
-        first-slice receipt, ADR 0023 D3). Returns ``None`` when the body was NOT committed — one of
-        the guards below refused it and recorded an ``ERROR`` (count-and-log: still persisted, never
-        accepted-and-dropped). What the source answers for each is the source's own logic
+    async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> IngressReceipt:
+        """Commit a POSTed HTTP body to the ingress stage and return its receipt: the engine
+        ``message_id`` (the first-slice receipt, ADR 0023 D3), or a refusal when the body was NOT
+        committed — one of the guards below refused it and recorded an ``ERROR`` (count-and-log: still
+        persisted, never accepted-and-dropped). A refusal carries that ``ERROR`` row's id and its
+        :class:`~messagefoundry.transports.receipt.RefusalKind`, which is what lets the source tell a
+        sender to re-send later from one that must not (BACKLOG #2105, the ADR 0154 amendment of
+        2026-10-30). What the source answers for each is the source's own logic
         (``HttpSource._serve_one`` for HTTP). A pre-ingress oversize/malformed/allowlist refusal is the
         source's own synchronous ``4xx`` BEFORE this runs.
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
-        :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
+        :meth:`_handle_inbound`; it differs only in returning a receipt instead of a wire ACK and in not
         building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt).
 
         It is the receipt handler for EVERY source that declares ``wants_receipt``, not only HTTP. The
-        DICOM C-STORE SCP answers a DIMSE failure on ``None`` (BACKLOG #1910), so no path here may return
-        ``None`` after ``enqueue_ingress`` has committed, or an accepted object reads as refused."""
+        DICOM C-STORE SCP answers a DIMSE failure on a refusal (BACKLOG #1910), so no path here may
+        return a refusal after ``enqueue_ingress`` has committed, or an accepted object reads as
+        refused. Every refusal below is built from the id ``_record_refused`` returned, and every
+        acceptance from the id ``enqueue_ingress`` returned, so neither can stand for the other."""
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
             # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. The shared
-            # guard bounds the RAW bytes (SEC-017), as _handle_inbound does. ERROR + None on overrun.
+            # guard bounds the RAW bytes (SEC-017), as _handle_inbound does. ERROR + refusal on overrun.
             try:
                 check_binary_size(raw)
             except IngressGuardError as exc:
-                await self._record_refused(
-                    ic,
-                    raw,
-                    None,
-                    error=exc.reason,
-                    message_type=ic.content_type.value,
+                return await self._refuse_guarded(
+                    ic, raw, None, exc, message_type=ic.content_type.value
                 )
-                return None
-            if await self._declared_content_mismatch(ic, raw):
-                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+            mismatch = await self._declared_content_mismatch(ic, raw, kind=RefusalKind.PERMANENT)
+            if mismatch is not None:
+                # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+                return IngressReceipt.refused(RefusalKind.PERMANENT, mismatch)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=carry_binary_ingress(raw, ic),
@@ -7917,51 +7937,37 @@ class RegistryRunner:
                 summary=None,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
-            return mid
+            return IngressReceipt.accepted(mid)
 
         # The same decode and post-decode guards as _handle_inbound, from ingress_guards (#1689).
         encoding = listener_encoding(ic)
         try:
             text = decode_body(raw, ic, encoding=encoding)
         except IngressGuardError as exc:
-            await self._record_refused(
-                ic,
-                raw,
-                None,
-                error=exc.reason,
-                message_type=None if hl7v2 else ic.content_type.value,
+            return await self._refuse_guarded(
+                ic, raw, None, exc, message_type=None if hl7v2 else ic.content_type.value
             )
-            return None
 
         try:
             check_decoded(text, ic)
-        except IngressBodyRejected as exc:
+        except IngressGuardError as exc:
             # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
             # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte inside the
-            # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4).
-            await self._record_refused(
-                ic,
-                raw,
-                text,
-                error=exc.reason,
-                message_type=None if hl7v2 else ic.content_type.value,
+            # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4). So does
+            # the engine ceiling on a NON-HL7 body (SEC-017), a ``size``-phase refusal answered as
+            # over-size; check_decoded never raises that for HL7.
+            return await self._refuse_guarded(
+                ic, raw, text, exc, message_type=None if hl7v2 else ic.content_type.value
             )
-            return None
-        except IngressGuardError as exc:
-            # The engine ceiling on a NON-HL7 body (SEC-017); check_decoded never raises it for HL7.
-            await self._record_refused(
-                ic,
-                raw,
-                text,
-                error=exc.reason,
-                message_type=ic.content_type.value,
-            )
-            return None
 
         if not hl7v2:
-            if await self._declared_content_mismatch(ic, raw, text=text):
-                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+            mismatch = await self._declared_content_mismatch(
+                ic, raw, text=text, kind=RefusalKind.PERMANENT
+            )
+            if mismatch is not None:
+                # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+                return IngressReceipt.refused(RefusalKind.PERMANENT, mismatch)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=text,
@@ -7971,7 +7977,7 @@ class RegistryRunner:
                 summary=None,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
-            return mid
+            return IngressReceipt.accepted(mid)
 
         # HL7-over-HTTP: parse (+ optional strict validate) before committing, recording ERROR on a
         # malformed message exactly as MLLP does — but the synchronous response is the source's 202/4xx,
@@ -7983,17 +7989,21 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
-            await self._record_refused(
+            # Over the peek's max_bytes is over-size, as the engine ceiling is on any other body; every
+            # other parse refusal is about the body's content.
+            return await self._refuse(
                 ic,
                 raw,
                 text,
+                RefusalKind.OVERSIZE
+                if isinstance(exc, HL7MessageTooLarge)
+                else RefusalKind.PERMANENT,
                 error=(
                     f"parse error: {safe_exc(exc)}"
                     if isinstance(exc, HL7PeekError)
                     else _peek_read_fault(ic, exc)
                 ),
             )
-            return None
         if ic.validation.strict and streaming_over:
             # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
             # MSH structure Peek.parse validated) — see _handle_inbound for the rationale.
@@ -8019,26 +8029,47 @@ class RegistryRunner:
                 # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
                 # it instead of pinning intake. The message string is PHI-safe/value-free (only the
                 # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
+                #
+                # PERMANENT, not temporary (BACKLOG #2105): a body that times out for its own content
+                # times out on every re-send, and each attempt orphans another hl7apy thread this path
+                # cannot kill, so inviting a retry would multiply the very load this timeout bounds. A
+                # timeout caused by load instead cannot be told apart from it here. ADR 0154's
+                # 2026-10-30 amendment records the cost and when it may be reclassified.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
-                return None
+                return await self._refuse(
+                    ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
+                )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
-                await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                return None
+                # validate() keeps its own size cap, the engine default, even where the inbound's
+                # max_message_bytes admitted the body to the peek. It says itself when that cap
+                # refused the body, measured on the text it normalized, so nothing here re-derives it.
+                kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
+                return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns None, which the source answers as a refusal — never
-        # accepted-and-dropped.
+        # failure records ERROR + returns a refusal — never accepted-and-dropped.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
-                await self._record_refused(
-                    ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
+                # Only the in-flight budget is the engine's own and clears as concurrent detaches
+                # finish, so only it invites a re-send, and only when the body would fit the budget
+                # once they have: one larger than the whole budget is over-size. An unsupported
+                # backend and a malformed handle refuse the same body every time.
+                if isinstance(exc, _StreamBudgetExceeded):
+                    kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+                else:
+                    kind = RefusalKind.PERMANENT
+                return await self._refuse(
+                    ic,
+                    raw,
+                    text,
+                    kind,
+                    error=f"streaming detach failed: {safe_exc(exc)}",
+                    peek=peek,
                 )
-                return None
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=skeleton,
@@ -8049,7 +8080,42 @@ class RegistryRunner:
             attachment_refs=attachment_refs or None,
         )
         self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
-        return mid
+        return IngressReceipt.accepted(mid)
+
+    async def _refuse(
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        text: str | None,
+        kind: RefusalKind,
+        *,
+        error: str,
+        message_type: str | None = None,
+        peek: Peek | None = None,
+    ) -> IngressReceipt:
+        """Record a refused body as ``ERROR`` and return that row as a receipt refusal of ``kind``.
+
+        The receipt is built from the id ``_record_refused`` returned, so it always names the row."""
+        mid = await self._record_refused(
+            ic, raw, text, error=error, message_type=message_type, peek=peek, kind=kind
+        )
+        return IngressReceipt.refused(kind, mid)
+
+    async def _refuse_guarded(
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        text: str | None,
+        exc: IngressGuardError,
+        *,
+        message_type: str | None,
+    ) -> IngressReceipt:
+        """Record an ingress-guard refusal as ``ERROR`` and return it as a receipt refusal.
+
+        The engine ceiling (:class:`IngressTooLarge`) is answered as over-size on every path (BACKLOG
+        #2105); every other guard is about the body and is permanent."""
+        kind = RefusalKind.OVERSIZE if isinstance(exc, IngressTooLarge) else RefusalKind.PERMANENT
+        return await self._refuse(ic, raw, text, kind, error=exc.reason, message_type=message_type)
 
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
@@ -8082,9 +8148,12 @@ class RegistryRunner:
         size = len(text)
         budget = self._stream_inflight_budget
         if budget and self._stream_inflight_bytes + size > budget:
+            alone = size > budget
             raise _StreamBudgetExceeded(
                 f"streaming in-flight budget exceeded ({self._stream_inflight_bytes} + {size} > "
-                f"{budget} bytes); refusing the detach (backpressure)"
+                f"{budget} bytes); refusing the detach "
+                + ("(the body alone is over the budget)" if alone else "(backpressure)"),
+                alone=alone,
             )
         # Reserve the budget for the whole detach window (buffer + per-chunk seal); release in finally the
         # instant the attachment(s) are durable and the skeleton is small — the peak this bounds is passed.
@@ -8150,7 +8219,7 @@ class RegistryRunner:
                     message_type=ic.content_type.value,
                 )
                 return None
-            if await self._declared_content_mismatch(ic, raw):
+            if await self._declared_content_mismatch(ic, raw) is not None:
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
             # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
@@ -8254,7 +8323,7 @@ class RegistryRunner:
             return None
 
         if not hl7v2:
-            if await self._declared_content_mismatch(ic, raw, text=text):
+            if await self._declared_content_mismatch(ic, raw, text=text) is not None:
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
             # HL7 ACK. The decoded body is committed verbatim and the router/transform workers route it
@@ -8449,6 +8518,7 @@ class RegistryRunner:
         error: str,
         message_type: str | None = None,
         peek: Peek | None = None,
+        kind: RefusalKind | None = None,
     ) -> str:
         """Record a body refused before ingress as ``ERROR``. Every refusal phase lands here, so every
         one is counted and logged (CLAUDE.md section 2). ``wire`` is the body as received and
@@ -8456,7 +8526,14 @@ class RegistryRunner:
         after the parse passes ``peek`` so the row carries the header fields an operator searches by.
         The per-inbound refused-body allowance decides whether the whole body or its head is stored;
         its length always is, and a digest keyed from the store's audit key whenever the store holds
-        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it."""
+        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it.
+
+        ``kind``, which a receipt source's refusal passes, leads the stored error as
+        ``[refusal kind: <kind>]``, so an operator can tell a temporary refusal from a final one
+        before resending the row (BACKLOG #2105). It is added after the allowance's bound, so it goes
+        ahead of the allowance note too: the text opens with it whether or not the allowance is spent.
+        Both notes go first because the store's redaction cuts from a quoted segment id to the end of
+        the text."""
         bounded = self._refused_body.bound(
             ic.name,
             wire,
@@ -8470,7 +8547,11 @@ class RegistryRunner:
             channel_id=ic.name,
             raw=bounded.raw,
             status=MessageStatus.ERROR,
-            error=bounded.error,
+            error=(
+                bounded.error
+                if kind is None
+                else with_refusal_note(f"[refusal kind: {kind.value}] ", bounded.error)
+            ),
             control_id=peek.control_id if peek is not None else None,
             message_type=peek.message_type if peek is not None else message_type,
             source_type=ic.spec.type.value,

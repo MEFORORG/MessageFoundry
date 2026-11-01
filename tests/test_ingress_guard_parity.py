@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import re
 import textwrap
 import tokenize
 from collections.abc import AsyncIterator
@@ -393,7 +394,14 @@ async def test_the_listener_and_the_dry_run_refuse_with_the_same_reason(
 
     assert preview.disposition is MessageStatus.ERROR, preview.error
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
-    assert rows[0]["error"] == preview.error
+    stored = rows[0]["error"]
+    if listener == "_handle_inbound_http":
+        # The receipt path leads its stored reason with the refusal's kind (BACKLOG #2105). The
+        # reason after that tag must still agree with the dry run word for word.
+        tag = re.match(r"\[refusal kind: (permanent|oversize)\] ", stored)
+        assert tag is not None, stored
+        stored = stored[tag.end() :]
+    assert stored == preview.error
 
 
 def _spy(monkeypatch: pytest.MonkeyPatch, module: Any, names: tuple[str, ...]) -> list[str]:

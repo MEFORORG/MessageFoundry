@@ -35,6 +35,7 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._store_audit import no_operator_audit
 
 PW = "a-strong-test-passphrase"
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -171,7 +172,9 @@ async def test_a_pair_whose_bodies_retention_erased_is_not_a_target(store: Any) 
 
     assert await store.count_dead(allowed_channels=None) == 2
     assert await store.list_replay_targets(allowed_channels=None) == [("IB_NEW", "OB_A")]
-    assert await store.replay_dead(channel_id="IB_OLD", now=1_000_001.0) == 0
+    assert (
+        await store.replay_dead(channel_id="IB_OLD", now=1_000_001.0, audit=no_operator_audit) == 0
+    )
 
 
 # --- the JSON API: GET /dead-letters carries replay_targets and replayable_in_scope --------------

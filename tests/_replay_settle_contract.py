@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStatus, Stage
+from tests._store_audit import no_operator_audit
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
@@ -58,7 +59,7 @@ async def assert_replayed_routed_row_settles(
     await store.dead_letter_now(routed.id, "transform error", now=140.0)
     assert await _status(store, mid) == MessageStatus.ERROR.value
 
-    assert await store.replay(mid, now=150.0) == 1
+    assert await store.replay(mid, now=150.0, audit=no_operator_audit) == 1
     assert await _status(store, mid) == MessageStatus.ROUTED.value
     routed = await store.claim_next_fifo("IB", now=160.0, stage=Stage.ROUTED.value)
     assert routed is not None
@@ -84,7 +85,7 @@ async def assert_replayed_ingress_row_is_received(store: Any) -> None:
     await store.dead_letter_now(ingress.id, "router error", now=120.0)
     assert await _status(store, mid) == MessageStatus.ERROR.value
 
-    assert await store.replay(mid, now=130.0) == 1
+    assert await store.replay(mid, now=130.0, audit=no_operator_audit) == 1
     assert await _status(store, mid) == MessageStatus.RECEIVED.value
     again = await store.claim_next_fifo("IB", now=140.0, stage=Stage.INGRESS.value)
     assert again is not None and again.message_id == mid
