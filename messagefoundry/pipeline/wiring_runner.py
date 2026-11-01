@@ -46,9 +46,10 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
+    anchor_store_refusal,
+    connection_anchor_failure,
     inbound_lane_reads_ca,
     lane_ca_setting,
-    refused_connection_anchor,
 )
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
@@ -3413,8 +3414,10 @@ class RegistryRunner:
         """Check the dialling CA a connection test is about to read (vault BACKLOG #2371). The route
         awaits it before :meth:`build_test_connector`, which is synchronous, so a test never dials
         with a CA the lane check would refuse. Raises :class:`WiringError` from the refusal, as
-        that method wraps a build failure, so the route's anchor arm reports it. The same name
-        order: an inbound wins over an outbound."""
+        that method wraps a build failure, so the route's anchor arm reports it. A store that
+        stopped the check is neither a refusal nor a failed build, so it is raised through
+        :func:`anchor_store_refusal`, for the route's store arm (vault BACKLOG #3746). The same
+        name order: an inbound wins over an outbound."""
         if self._lane_anchor_check is None:
             return
         ic = self.registry.inbound.get(name)
@@ -3431,6 +3434,8 @@ class RegistryRunner:
                 await self._check_lane_anchor("outbound", name, dest.settings, fails_lane=False)
         except WiringError:
             raise
+        except AnchorStoreUnavailable as exc:
+            raise anchor_store_refusal(exc) from exc
         except Exception as exc:
             raise WiringError(f"connector build failed: {exc}") from exc
 
@@ -4213,11 +4218,11 @@ class RegistryRunner:
                     if isinstance(exc, AnchorSettingRefused)
                     else lane_ca_setting(settings)
                 )
-                error = refused_connection_anchor(exc, setting=_lane_setting(direction, name, key))
+                error = connection_anchor_failure(exc, setting=_lane_setting(direction, name, key))
                 raise error from error.__cause__
             passed.append((direction, name))
         if store_fault is not None:
-            error = refused_connection_anchor(store_fault)
+            error = connection_anchor_failure(store_fault)
             raise error from error.__cause__
         return passed
 

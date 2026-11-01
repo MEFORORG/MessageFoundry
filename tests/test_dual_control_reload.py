@@ -60,7 +60,7 @@ from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
-from tests.test_trust_anchors import _block
+from tests.test_trust_anchors import _block, _FaultyAuditStore, _judged_clean
 
 PW = "a-strong-test-passphrase"
 
@@ -716,6 +716,58 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         ]
         events = [json.loads(r["detail"])["event"] for r in rows if r["action"] == ta.AUDIT_ACTION]
         assert "pin_mismatch" in events
+    finally:
+        await engine.stop()
+
+
+async def test_a_released_reload_a_store_fault_stops_answers_422_and_says_not_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3746 item 5, end to end: a store that stops the settings preflight of a
+    released reload answers 422, the approve route's answer for a refused release, not the 503
+    ``_audit_refused_reload`` returns for an inline one. The row keeps ``store_unavailable``, and
+    ``approval_digest_check`` ``not_reached`` is written only for a
+    ``ConfigRefusedBeforeApprovalCheck``. The approval is marked failed and nothing swaps. Red
+    under: the executor answering the status ``_audit_refused_reload`` returned, or the engine not
+    keeping the store fault as the marker's cause."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    anchor = tmp_path / "ad-ca.pem"
+    anchor.write_bytes(_block(b"good"))
+    _judged_clean(monkeypatch)
+    spec = ta.AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(anchor), None)
+    # Only the preflight's store fails, so the route's own rows land.
+    faulty: Any = _FaultyAuditStore(None)
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    store = await MessageStore.open(tmp_path / "dc.db")
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        config_dir=cfg,
+        settings_preflight=ta.make_settings_anchor_preflight([spec], faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine)
+        _approval_id, refused = await _hold_then_release(
+            engine, service, {}, between=lambda: setattr(faulty, "fail", "list_audit")
+        )
+        assert refused.status_code == 422, refused.text
+        assert "could not reach its store" in refused.json()["detail"]
+        assert engine.registry_runner is None
+        rows = await store.list_audit(limit=100)
+        assert "approval.failed" in [r["action"] for r in rows]
+        failed = [json.loads(r["detail"]) for r in rows if r["action"] == "config_reload_failed"]
+        assert failed == [
+            {
+                "requested": None,
+                "dry_run": False,
+                "approved_fingerprint": config_fingerprint(cfg),
+                "approval_digest_check": "not_reached",
+                "reason": "store_unavailable",
+            }
+        ]
     finally:
         await engine.stop()
 

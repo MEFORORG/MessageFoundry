@@ -2467,6 +2467,18 @@ Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error.
 
+**The same store fault would not read as a refused anchor on the connection routes either (vault
+BACKLOG #3746).** A start or restart of an inbound whose CA check the store stopped would answer
+**503**, not the **409** a refused CA answers. A restart would have stopped the listener before
+the check ran, so its 503 would say the connection is left stopped. The lane would read `failed`,
+with a line saying the CA could not be checked. A connection test would report `success: false`
+with one fixed line, and that line is what the route writes to `audit_log.detail`. An audit read
+whose page ends in a row with a `ts` that is not a finite number would count as the same fault,
+because the look-back for the anchor's last fingerprint could not page past it. That look-back
+would otherwise read as a first observation. The `connection_control` row a refused start or
+restart writes is fail-soft: a store that also refuses that row would leave the 409 or 503
+standing, and the row's loss would be logged at ERROR.
+
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
 connection counts and the digest it took before the swap. The row is written after the swap, so a

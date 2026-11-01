@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 import messagefoundry.auth.trust_anchors as ta
+from messagefoundry.api import create_app
 from messagefoundry.api.app import _ANCHOR_REFUSED_DETAIL, _run_connection_test
 from messagefoundry.auth.trust_anchors import (
     AnchorSettingRefused,
@@ -48,8 +51,14 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from tests.test_dr_outlive_deadline import _admin_client, _coordinator, _rows, _seed
 from tests.test_dr_passive_followups import _PASSIVE_UNCHECKED, _runner
-from tests.test_outbound_ca_anchors import _ca, _CountingSink, _sha
-from tests.test_trust_anchors import _block, _path_ok
+from tests.test_outbound_ca_anchors import (
+    _ca,
+    _CountingSink,
+    _outbound_registry,
+    _real_ca,
+    _sha,
+)
+from tests.test_trust_anchors import _block, _FaultyAuditStore, _path_ok
 
 _IB = "IB_FTPS"
 _PIN_MISMATCH = "does not match its configured SHA-256 pin"
@@ -214,7 +223,7 @@ async def test_a_dr_activation_its_preflight_refuses_names_no_path(
     named = Path(_CA_DIR) / "partner-ca.pem"
 
     async def refuse(_registry: object) -> None:
-        error = ta.refused_connection_anchor(
+        error = ta.connection_anchor_failure(
             TrustAnchorError(f"the trust anchor '{named.as_posix()}' {_PIN_MISMATCH}")
         )
         raise error from error.__cause__
@@ -252,10 +261,10 @@ def test_the_chain_walk_follows_explicit_causes_only_and_ends_on_a_cycle() -> No
     abort and the API's routes share (vault BACKLOG #3498)."""
     refusal = TrustAnchorError("refused")
     assert trust_anchor_cause(refusal) is refusal
-    wrapped = ta.refused_connection_anchor(refusal)
+    wrapped = ta.connection_anchor_failure(refusal)
     assert wrapped.__cause__ is refusal and trust_anchor_cause(wrapped) is refusal
     # A blank pin is a ValueError, which the reload check wraps in a TrustAnchorError first.
-    blank = ta.refused_connection_anchor(ValueError("a blank pin"), setting="a lane")
+    blank = ta.connection_anchor_failure(ValueError("a blank pin"), setting="a lane")
     assert (found := trust_anchor_cause(blank)) is not None and found.setting == "a lane"
     assert trust_anchor_cause(WiringError("a listener could not bind")) is None
     looped, other = RuntimeError("a"), RuntimeError("b")
@@ -375,10 +384,6 @@ async def test_a_reload_with_a_typo_in_a_literal_pin_is_an_invalid_config(
     ``invalid_config`` as before the chain walk; only the shape a trust-anchor check raises is
     ``trust_anchor`` (vault BACKLOG #3498). The control is a CA the registry preflight refuses,
     in the same route. Red under: the anchor arm walking the whole cause chain."""
-    import httpx
-
-    from messagefoundry.api import create_app
-
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = tmp_path / "anchor.pem"
@@ -578,6 +583,176 @@ async def test_a_lane_ca_line_is_kept_whole(
         assert reason.endswith(ending) and len(reason) > 200, reason
     finally:
         await runner.stop()
+
+
+#: The fixed answers for a check the store stopped, spelled here so a test fails if one goes.
+_STORE_START = "the engine could not reach its store to check a trust anchor; see the engine log"
+_STORE_RESTART = "so this restart left the connection stopped"
+
+
+async def _control(engine: Engine, action: str) -> httpx.Response:
+    """POST ``action`` for the poller. A 500 arrives as a response, not a raise."""
+    app = create_app(engine, allow_no_auth=True)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        return await client.post(f"/connections/{_IB}/{action}")
+
+
+@pytest.fixture
+async def store_stopped_engine(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> AsyncIterator[Engine]:
+    """An engine over a working store whose poller's CA check meets a store refusing its audit
+    read, the shape the real check raises. The lane reads ``failed`` from the first start."""
+    faulty: Any = _FaultyAuditStore("list_audit")
+    engine = Engine(
+        store,
+        lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_poller_graph(_ca(tmp_path), None))
+    await engine.start()
+    yield engine
+    await engine.stop()
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"), [("start", _STORE_START), ("restart", _STORE_RESTART)]
+)
+async def test_the_control_route_answers_a_stopped_check_as_a_store_fault(
+    store_stopped_engine: Engine, store: MessageStore, action: str, expected: str
+) -> None:
+    """Vault BACKLOG #3746 item 1: a store that stops the CA check answers 503 with a store line,
+    not the 409 "trust anchor refused" of a CA that was checked. A restart's stop half already ran,
+    so its line says the connection is left stopped. The lane's status keeps its "could not be
+    checked" line, and the refused row is still written. The refused CA keeps its 409 in
+    ``test_the_control_route_audits_a_refused_poller_start``. Red under: the route's
+    ``AnchorStoreUnavailable`` test removed from its ``TrustAnchorError`` arm, or the restart's
+    line dropped."""
+    r = await _control(store_stopped_engine, action)
+    assert r.status_code == 503, r.text
+    assert expected in r.json()["detail"]
+    assert "refused" not in r.json()["detail"]
+    rr = store_stopped_engine.registry_runner
+    assert rr is not None and not rr.inbound_running(_IB)
+    assert "could not be checked" in (rr.inbound_failed(_IB) or "")
+    assert await _rows(store, "connection_control") == [
+        {"connection": _IB, "action": action, "role": "source", "running": False}
+    ]
+
+
+async def test_a_stopped_check_on_a_restart_leaves_a_running_poller_down(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """What the restart's line says, on a lane that was serving. The stop half runs before the
+    check, so a store fault there takes the poller down, and the answer has to say so. Red under:
+    ``restart_inbound`` checking first, which makes the line false, so it would have to change."""
+    faulty: Any = _FaultyAuditStore(None)
+    engine = Engine(
+        store,
+        lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_poller_graph(_real_ca(tmp_path), None))
+    await engine.start()
+    try:
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running(_IB)
+        faulty.fail = "list_audit"
+        r = await _control(engine, "restart")
+        assert r.status_code == 503, r.text
+        assert _STORE_RESTART in r.json()["detail"]
+        assert not rr.inbound_running(_IB)
+    finally:
+        await engine.stop()
+
+
+def _store_fault_line() -> TrustAnchorError:
+    """What a start raises for a check the store stopped: the lane's fixed line, from the fault."""
+    line = TrustAnchorError("inbound connection: its tls_ca_file could not be checked")
+    line.__cause__ = AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+    return line
+
+
+@pytest.mark.parametrize(
+    ("raised", "status", "detail"),
+    [
+        pytest.param(_store_fault_line(), 503, _STORE_START, id="store"),
+        pytest.param(TrustAnchorError("x"), 409, _ANCHOR_REFUSED_DETAIL, id="anchor"),
+        pytest.param(WiringError("x"), 409, f"{_IB!r}: start refused", id="start-gate"),
+    ],
+)
+async def test_a_refused_start_keeps_its_answer_when_its_audit_row_fails(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raised: Exception,
+    status: int,
+    detail: str,
+) -> None:
+    """Vault BACKLOG #3746 item 1: a store that stopped the check is likely to refuse the refused
+    start's own row, and the answer stands either way, on each arm that shares the write. The lost
+    row is logged at ERROR. Red under: the shared block calling ``_record_control_audit``
+    unguarded, which answers 500."""
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+    engine.add_registry(_poller_graph(Path("unused.pem"), None, auto_start=False))
+    await engine.start()
+    rr = engine.registry_runner
+    assert rr is not None
+    real = store.record_audit
+
+    async def refuse_start(_name: str, *, operator: bool) -> None:
+        raise raised
+
+    async def refuse_control(action: str, **kwargs: Any) -> None:
+        if action == "connection_control":
+            raise sqlite3.OperationalError("database is locked")
+        await real(action, **kwargs)
+
+    monkeypatch.setattr(rr, "start_inbound", refuse_start)
+    monkeypatch.setattr(store, "record_audit", refuse_control)
+    try:
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            r = await _control(engine, "start")
+        assert r.status_code == status, r.text
+        assert detail in r.json()["detail"]
+        lost = [rec for rec in caplog.records if "connection_control row" in rec.getMessage()]
+        assert [rec.levelno for rec in lost] == [logging.ERROR]
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.parametrize("direction", ["inbound", "outbound"])
+async def test_a_connection_test_reports_a_stopped_check_as_a_store_fault(
+    store: MessageStore, tmp_path: Path, judged: None, direction: str
+) -> None:
+    """Vault BACKLOG #3746 item 2: the store's fault used to come back as "connector build failed:
+    the store refused ...", which the route wrote to ``audit_log.detail``. It is the fixed store
+    line now, naming no connection, label or backend type, and the runner raises it as the store
+    refusal, not as a failed build. Red under: ``check_test_anchor``'s store arm removed, or the
+    route's."""
+    ca = _ca(tmp_path)
+    reg, name = _poller_graph(ca, None), _IB
+    if direction == "outbound":
+        reg, name = _outbound_registry(ca, _sha(ca)), "OUT"
+    faulty: Any = _FaultyAuditStore("list_audit")
+    check = ta.make_lane_anchor_check(faulty, enforcing=True)
+    runner = _runner(store, reg, lane_anchor_check=check)
+    result = await _run_connection_test(runner, name, direction)
+    assert (result.supported, result.success) == (True, False)
+    assert result.detail == _STORE_START
+    with pytest.raises(WiringError, match="a trust anchor could not be checked") as err:
+        await runner.check_test_anchor(name)
+    assert isinstance(err.value.__cause__, AnchorStoreUnavailable)
+
+
+async def test_a_connection_test_still_reports_a_failed_build_as_one(store: MessageStore) -> None:
+    """The control for the test above: a lane check's other faults keep the build failure's text,
+    so the store arm did not swallow them. Red under: the store arm catching ``Exception``."""
+    reg = _poller_graph(Path("unused.pem"), None)
+    runner = _runner(store, reg, lane_anchor_check=_raising(RuntimeError("a lane check bug")))
+    result = await _run_connection_test(runner, _IB, "inbound")
+    assert result.detail == "connector build failed: a lane check bug"
 
 
 async def test_a_kept_failure_whose_settings_stop_resolving_says_so_in_the_log(
