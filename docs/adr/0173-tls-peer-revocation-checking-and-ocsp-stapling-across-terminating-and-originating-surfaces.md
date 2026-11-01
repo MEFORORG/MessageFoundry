@@ -765,8 +765,16 @@ time-check flag as well as its CRL flag, so a hop whose CRL is a real check no l
 line. A guard handed a context that skips time validity keeps it, because that context's CRL is no
 real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the line too: at least
 MLLP and the DICOM SCU (since §13) and the REST, SOAP, FHIR and FTPS hops (§4.3 above) hand the
-guard no context there, so such a hop crosses on its attestation alone. The over-statement stands there only in part, since a certificate the CRL lists is still
-refused at the handshake. This correction changed no disposition. Where the line no longer fires, the
+guard no context there, so such a hop crosses on its attestation alone. **The guard's own
+disposition does not apply that reading:** it still admits a context that skips time validity on
+that context's CRL, with no attestation, so the rule rests on each caller passing no context. The
+choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
+`SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
+`_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.
+`FhirLookupExecutor` (`fhir.py`) and `DicomWebDestination` (`dicomweb.py`) pass their opener
+unconditionally; neither builds an expiry-relaxed opener today. On a `tls_allow_expired` hop the
+line's over-statement stands only in part, since a certificate the CRL lists is still refused at the handshake. This correction
+changed no disposition. Where the line no longer fires, the
 attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
 `security_loosenings()` names an `[alerts]` pair.
 

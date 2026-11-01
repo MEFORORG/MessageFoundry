@@ -2779,10 +2779,11 @@ class RevocationHopGuard:
         # real check crossed on that check, so this line would be a false record there and it is
         # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
         # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Its
-        # disposition is ALLOW on that CRL flag, which this line does not move. The callers named
-        # here do not hand the guard such a CRL: rest.py and remotefile.py do not let it relax a
-        # refusal, and MLLP and the DICOM SCU pass no context (skips_validity_period, ADR 0173
-        # §13), so those hops cross on the attestation and keep the line for that reason.
+        # disposition is ALLOW on that CRL flag, which this line does not move. Nothing here refuses
+        # such a CRL: each caller makes the choice at its own call site, passing no context on a
+        # tls_allow_expired hop. At least the REST, SOAP and FHIR destinations, FTPS
+        # (_guard_ftps_revocation), MLLP and the DICOM SCU do (ADR 0173 §4.3 and §13), so those
+        # hops cross on the attestation and keep the line for that reason.
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (
