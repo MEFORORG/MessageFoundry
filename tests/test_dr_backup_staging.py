@@ -541,7 +541,12 @@ async def test_a_run_cancelled_during_the_build_is_cleaned_up_by_its_worker(
 
         # The worker still holds the directory, and a sweep proves it live rather than abandoned.
         (live,) = _staging_dirs(data_dir)
-        assert await asyncio.to_thread(dr_backup._sweep_abandoned_staging, data_dir.absolute()) == 0
+        assert (
+            await asyncio.to_thread(
+                dr_backup._sweep_abandoned_staging, data_dir.absolute(), owned_like=tmp_path
+            )
+            == 0
+        )
         assert live.is_dir()
 
         release.set()
@@ -588,7 +593,7 @@ def test_the_sweep_removes_only_what_a_lock_proves_abandoned(tmp_path) -> None:
     unrelated = root / "not-ours"
     unrelated.mkdir()
     try:
-        swept = dr_backup._sweep_abandoned_staging(root)
+        swept = dr_backup._sweep_abandoned_staging(root, owned_like=tmp_path)
         assert swept == 2
         assert not dead_backup.exists() and not dead_verify.exists()
         assert (live.path / "store.db").read_bytes() == b"synthetic plaintext"
@@ -617,7 +622,9 @@ async def test_a_live_runs_staging_survives_a_concurrent_sweep(tmp_path, monkeyp
         observed["dead_gone_before"] = not dead.exists()
         second_dead = _abandoned(data_dir.absolute(), "mefor-verify-")
         await real(dest_path, method=method)
-        swept = await asyncio.to_thread(dr_backup._sweep_abandoned_staging, data_dir.absolute())
+        swept = await asyncio.to_thread(
+            dr_backup._sweep_abandoned_staging, data_dir.absolute(), owned_like=tmp_path
+        )
         observed["swept"] = swept
         observed["second_dead_gone"] = not second_dead.exists()
         observed["own_snapshot_survived"] = Path(dest_path).is_file()
@@ -685,7 +692,7 @@ def test_a_teardown_that_half_fails_leaves_proof_for_the_next_sweep(tmp_path, mo
     assert (work.path / ".lock").exists() and (work.path / ".lock-held").exists()
 
     monkeypatch.setattr(dr_backup, "_remove_tree", real_remove)
-    assert dr_backup._sweep_abandoned_staging(root) == 1
+    assert dr_backup._sweep_abandoned_staging(root, owned_like=tmp_path) == 1
     assert not work.path.exists()
 
 

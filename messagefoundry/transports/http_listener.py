@@ -46,10 +46,14 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.credential import client_cert_principal, constant_time_match_any
+from messagefoundry.credential import (
+    VERIFIED_ISSUER_KEY,
+    client_cert_principal_under_issuer,
+    constant_time_match_any,
+)
 from messagefoundry.redaction import safe_exc
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import ListenerAdmission
@@ -76,6 +80,9 @@ from messagefoundry.transports.mllp import (
     _set_tcp_nodelay,
     _upgrades_tls_itself,
 )
+
+if TYPE_CHECKING:
+    from messagefoundry.pki import IssuerIndex
 
 __all__ = [
     "DEFAULT_MAX_BODY_BYTES",
@@ -658,6 +665,59 @@ def reply_seconds(s: Mapping[str, Any], key: str) -> float:
     return positive_seconds(value, knob=key, transport="HTTP source")
 
 
+def _subjects_by_issuer(subjects: Any) -> dict[str, dict[str, str]]:
+    """``intake_client_subjects`` as the matcher reads it: issuer DN -> each name mapped to itself.
+
+    The ``Http`` factory has already validated the shape (vault BACKLOG #2287). This refuses a value
+    that is not a table at all, such as the retired flat list, so a ``Source`` built some other way
+    fails at construction rather than denying every peer with nothing in the log."""
+    if not subjects:
+        return {}
+    if not isinstance(subjects, Mapping) or any(
+        not isinstance(names, list | tuple) for names in subjects.values()
+    ):
+        raise ValueError(
+            "HTTP source intake_client_subjects must be a table keyed by the issuing CA's DN, each "
+            "naming a list of subjects, not a flat list (vault BACKLOG #2287)"
+        )
+    return {str(issuer): {str(n): str(n) for n in names} for issuer, names in subjects.items()}
+
+
+def _client_issuer_index(
+    name: str, cadata: str | None, subjects: Mapping[str, object]
+) -> IssuerIndex | None:
+    """Index the client CAs this listener loaded, and warn about an issuer key that cannot match.
+
+    ``cadata`` is the text the SSL context loaded, or ``None`` when it loaded none. A key
+    naming no loaded CA, or naming two loaded CAs with one subject and different keys, would deny
+    every certificate under it with nothing in the log, so each one is warned about here, as the API
+    does for ``[api].tls_client_cert_identities``."""
+    if cadata is None:
+        return None
+    # Lazy: pki pulls in cryptography, which a listener without mtls_subject never needs.
+    from messagefoundry.pki import IssuerIndex
+
+    index = IssuerIndex(cadata)
+    if index.unreadable:
+        logger.warning(
+            "HTTP source %s: %d certificate(s) in tls_ca_file could not be parsed for "
+            "intake_client_subjects; no client certificate is admitted under them",
+            name,
+            index.unreadable,
+        )
+    for issuer in index.unmatched_keys(subjects):
+        # pki's own reason names the API's file, so this line states both causes in this
+        # listener's terms rather than quote it.
+        logger.warning(
+            "HTTP source %s: intake_client_subjects issuer %r names no CA certificate loaded from "
+            "tls_ca_file, or names several with one subject and different keys; no client "
+            "certificate is admitted under it",
+            name,
+            issuer,
+        )
+    return index
+
+
 class HttpSource(SourceConnector):
     """Listen for inbound HTTP/1.1 requests, commit each POSTed body to the ingress stage via the
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
@@ -676,6 +736,8 @@ class HttpSource(SourceConnector):
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
+        #: How this source names itself in a log line.
+        self._log_name: str = config.name or f"{self.host}:{self.port}"
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled where allowed; a negative or NaN → refused at build
         # (BACKLOG #1872).
@@ -722,8 +784,15 @@ class HttpSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
+        # The client trust store's exact text, handed back by the builder so the issuer index below
+        # reads the bytes the context loaded and never re-reads tls_ca_file (vault BACKLOG #2287).
+        loaded_client_ca: list[str] = []
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(
-            s, server=True, name=config.name or "", listener_family="HTTP listener"
+            s,
+            server=True,
+            name=config.name or "",
+            listener_family="HTTP listener",
+            on_client_ca=loaded_client_ca.append,
         )
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
         # #3302), counted as the MLLP listener counts them: `_start_tls` where this listener runs
@@ -754,12 +823,12 @@ class HttpSource(SourceConnector):
         self._credential_header_folded: str | None = (
             self._credential_header.replace("_", "-") if self._credential_header else None
         )
-        subjects = s.get("intake_client_subjects")
-        #: Matched through ``client_cert_principal``, so the allow-list is a map to itself: it gives us
-        #: that helper's deny-by-default and its qualified CN/SAN namespacing for free, rather than a
-        #: second subject-matching implementation that could disagree with the API's.
-        self._intake_subjects: dict[str, str] = (
-            {str(x): str(x) for x in subjects} if subjects else {}
+        #: Issuer DN -> qualified subject names, each name mapped to itself (vault BACKLOG #2287).
+        #: Matched through ``client_cert_principal_under_issuer``, the API's own matcher, so a subject
+        #: counts only under the loaded CA that signed the leaf, with that helper's deny-by-default and
+        #: qualified CN/SAN namespacing, rather than a second matcher that could disagree with it.
+        self._intake_subjects: dict[str, dict[str, str]] = _subjects_by_issuer(
+            s.get("intake_client_subjects")
         )
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
         # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
@@ -792,6 +861,19 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        #: Which loaded client CA signed a peer's leaf. Only ``mtls_subject`` reads it, so no other
+        #: mode pays for parsing the trust store. ``None`` there means no client CA was loaded, and
+        #: then no certificate names an issuer, so every one is denied. Built after every check
+        #: in this constructor that can refuse it, because it may warn (BACKLOG #2749's rule).
+        self._issuer_index: IssuerIndex | None = (
+            _client_issuer_index(
+                self._log_name,
+                loaded_client_ca[0] if loaded_client_ca else None,
+                self._intake_subjects,
+            )
+            if self.intake_auth == "mtls_subject"
+            else None
+        )
         if self.max_body_bytes is None:
             # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
             # #2749, as FileSource does for its caps). Logged after every check in this constructor,
@@ -799,7 +881,7 @@ class HttpSource(SourceConnector):
             logger.warning(
                 "HTTP source %s: max_body_bytes is off, so a request body of any declared size is "
                 "read whole; set a positive value to bound it",
-                config.name or f"{self.host}:{self.port}",
+                self._log_name,
             )
 
     async def start(
@@ -1040,6 +1122,10 @@ class HttpSource(SourceConnector):
         is left is the subject binding the CA does not give us: ``tls_ca_file`` alone means "any
         certificate this CA ever signed".
 
+        The subject is looked up only under the loaded CA whose key signed the leaf (vault BACKLOG
+        #2287). With several CAs in ``tls_ca_file``, any of them can issue a listed subject, and
+        without the issuer every one of those certificates was admitted as that partner.
+
         Worth noting as an architectural asymmetry: ADR 0083's blocker on the admin API was that stock
         uvicorn does not surface the peer certificate to the ASGI scope. ``HttpSource`` owns its own
         socket, so mTLS-as-identity is strictly *easier* here than there.
@@ -1058,9 +1144,10 @@ class HttpSource(SourceConnector):
                 peer,
                 HttpRequestError(401, "intake authentication required", kind="intake_auth_failed"),
             )
-        if client_cert_principal(peercert, self._intake_subjects) is None:
-            # A chain this CA signed, carrying a subject nobody allow-listed — an AUTHORIZATION
-            # failure, and deliberately distinct from the 401 above (deny-by-default).
+        verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
+        if client_cert_principal_under_issuer(verified, self._intake_subjects) is None:
+            # A chain a trusted CA signed, carrying a subject nobody allow-listed under THAT CA — an
+            # AUTHORIZATION failure, and deliberately distinct from the 401 above (deny-by-default).
             return self._charged(
                 peer,
                 HttpRequestError(
@@ -1071,6 +1158,30 @@ class HttpSource(SourceConnector):
             )
         self._note_intake_success(peer)
         return None
+
+    def _verified_issuer(self, ssl_object: Any) -> str:
+        """The subject of the loaded CA that directly signed the peer's leaf, or ``""``.
+
+        Read from the leaf's DER and the index alone. Never from ``getpeercert()["issuer"]``, which
+        the issuing CA writes and OpenSSL matches to a CA loosely, folding case and whitespace; and
+        never from ``get_verified_chain()``, which is empty on a resumed session. ``""`` matches no
+        issuer, so anything that cannot be established is denied."""
+        index = self._issuer_index
+        if index is None:
+            return ""
+        try:
+            leaf_der = ssl_object.getpeercert(binary_form=True)
+            return index.issuer_of(leaf_der) if leaf_der else ""
+        except Exception:
+            # Deliberately broad, as the API shim's twin is: anything that stops the issuer being
+            # established must DENY (a charged, audited 403), never escape into the generic
+            # per-connection handler, which neither charges the attempt nor audits it.
+            logger.warning(
+                "HTTP source %s: could not establish a client certificate's issuer; denying",
+                self._log_name,
+                exc_info=True,
+            )
+            return ""
 
     def _presented_credential(self, head: HttpRequest) -> str | None:
         """The credential this request presents, or ``None``. Header names are already lower-cased."""

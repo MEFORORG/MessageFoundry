@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import time
 from pathlib import Path
 
@@ -410,12 +411,13 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
 
 
 async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
-    store: MessageStore,
+    store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Vault BACKLOG #2809: the permanent re-attach refusal is the one member's, as a frame refusal
     # is, so its healthy sibling still goes out in the envelope.
     from messagefoundry.parsing.split import split_batch
 
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
     a = _big_b64(600)
     ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
     sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
@@ -439,6 +441,10 @@ async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
     stats = await store.stats()
     assert stats.get(OutboxStatus.DEAD.value, 0) == 1
     assert stats.get(OutboxStatus.DONE.value, 0) == 1
+    # The member's line names the re-attach as its reason, never a frame check that did not run.
+    (line,) = [r.getMessage() for r in caplog.records if "dead-lettered alone" in r.getMessage()]
+    assert "its document cannot be re-attached" in line and "code 'reattach'" in line
+    assert "frame" not in line
 
 
 def _engine_value_error(*_args: object, **_kwargs: object) -> str:

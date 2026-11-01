@@ -95,7 +95,16 @@ def test_a_string_is_not_an_array_even_though_python_calls_it_a_sequence(tmp_pat
     paper and wrong in practice: ``proxy_no_proxy = "host"`` iterates as four characters. The
     factories spell the string alternative out when they mean it -- ``Email``'s
     ``recipients: list[str] | str | EnvRef`` -- so a bare sequence annotation means an array."""
+    # This read Http's intake_client_subjects until that setting became a table of lists keyed by
+    # the issuing CA (vault BACKLOG #2287); proxy_no_proxy is a bare Sequence[str] still.
     with pytest.raises(WiringError, match="must be an array, got a string"):
+        load_config(_config(tmp_path, _rest('          proxy_no_proxy = "partner.example"')))
+
+
+def test_the_retired_flat_subject_list_is_refused_at_load(tmp_path: Path) -> None:
+    """vault BACKLOG #2287: ``intake_client_subjects`` is a table keyed by the issuing CA's DN, and
+    the flat array it used to be is refused at load, not read."""
+    with pytest.raises(WiringError, match="'intake_client_subjects' must be a table, got an array"):
         load_config(
             _config(
                 tmp_path,
@@ -106,7 +115,7 @@ def test_a_string_is_not_an_array_even_though_python_calls_it_a_sequence(tmp_pat
                 router = "r"
                   [inbound.settings]
                   port = 8443
-                  intake_client_subjects = "CN:partner.example"
+                  intake_client_subjects = ["CN:partner.example"]
                 """,
             )
         )

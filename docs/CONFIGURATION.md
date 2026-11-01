@@ -1192,7 +1192,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `messages_days` | | | **→ moved to `[security].delete_message_bodies_after_days`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
-| `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** rows at **every stage**. A dead `ingress` or `routed` row carries the whole raw body, so the purge reaches it as well as a dead outbound row (BACKLOG #1188). This is their own window, because a dead row stays replayable until purged. Unset or `0`, this global window meets the startup posture gate described above this table; `0` = keep only where that gate allows it. An outbound's own `dead_letter_days` overrides it for that outbound's dead rows only (see *Per-connection overrides* below). An override of `0` meets its own gate, described there. A dead row at any other stage always takes this global window. *Corrected 2026-09-28 (BACKLOG #1186):* this row used to scope the purge to outbound rows, which BACKLOG #1188 made false. |
+| `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** rows at **every stage**. A dead `ingress` or `routed` row carries the whole raw body, so the purge reaches it as well as a dead outbound row (BACKLOG #1188). This is their own window, because a dead row stays replayable until purged. A dead re-ingress token (a captured reply owed to a loopback, ADR 0013) is the exception: it is blanked with its reply on the body window, so it is not replayable after that (BACKLOG #1560). Unset or `0`, this global window meets the startup posture gate described above this table; `0` = keep only where that gate allows it. An outbound's own `dead_letter_days` overrides it for that outbound's dead rows only (see *Per-connection overrides* below). An override of `0` meets its own gate, described there. A dead row at any other stage always takes this global window. *Corrected 2026-09-28 (BACKLOG #1186):* this row used to scope the purge to outbound rows, which BACKLOG #1188 made false. |
 | `processed_archive_days` | int | `0` | past N days, **delete** the archived copies a File inbound left in its `.processed` directory (`processed_subdir`, written when `after_read = "move"`, the default). Each is a clear-text copy of an inbound payload, so this is the fourth window the startup posture gate described above this table auto-bounds, at the body window (owner ruling A2 of 2026-10-08, BACKLOG #1188). Keyed on **archive** time: the File source sets each copy's mtime as it archives it, so a partner's preserved old mtime cannot age a fresh copy out early; on POSIX the sweep keys on the later of mtime and ctime. The archive move sets ctime, but so does any later change to the copy's metadata (a `chmod`, `chown` or ACL change), and that restarts the copy's window. On Windows a copy whose stamp failed keeps the drop's own mtime and can age out early; the failure is logged as a warning. Regular files one level deep only, never through a link or junction; file content is never read and no file name is logged. Only a File inbound whose listener is bound, and whose `after_read` is `"move"`, is swept, so a stopped or undeployed inbound's archive waits until it runs again. An archive directory that is, or contains, the watch or `.error` directory of any inbound in the configuration (on every engine shard under `serve --shard`) or the target directory of any File outbound, bound or not, or one of the engine's own directories (at least the directories holding the store, key and TLS files the settings name, the config directory, and any `*_dir` setting or the backup `destination`, an archive inside one of those last two counting too), is skipped with a warning on every pass. The sweep deletes nothing in at least these further cases: for every connection, when one connection's directory settings cannot be resolved (a missing `env()` value); and for one connection, when a directory it must not reach exists, or may, but its identity cannot be read under that connection's identity (an unreachable share, a refused `stat`). Each is logged as a warning on every pass. Every regular file in the directory counts as an archive, so give `processed_subdir` a directory of its own. `.error` is never swept. `0` = keep only where the gate allows it |
 | `allow_unbounded_phi` | | | **→ moved to `[security].allow_keeping_phi_indefinitely`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
 | `state_max_age_days` | int | `0` | past N days, **delete** transform-state entries (ADR 0005) last written before the cutoff — keeps the in-memory state cache + table bounded. A simple global age purge (by `set_at`); per-namespace policy is a follow-up. `0` = keep |
@@ -1592,7 +1592,10 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > operating system's own proxy settings, `[egress].proxy_url` and a per-connection `proxy` alike, and
 > no `NO_PROXY` entry is needed. A proxy setting that a loopback destination makes inert is logged at
 > INFO when the connection is built, and the static-credential report lists no proxy credential for
-> a connection whose every target is loopback. An off-box hop still uses the proxy.
+> a connection whose every target is loopback. An off-box hop still uses the proxy. Which spellings
+> of a host count as loopback is stated on
+> [`is_loopback_hop_host`](../messagefoundry/config/tls_policy.py). The proxy rule reads it through
+> `bounded_read.is_never_proxied_host`, which reads an empty host as off-box.
 >
 > **This is a rule of the engine's own `urllib` openers**: at least the HTTP family and its token
 > endpoints, the alert webhook, the OIDC legs and the AI broker. A client built on another HTTP
@@ -2757,14 +2760,20 @@ only the **leader** polls a poll source. Under active-passive HA the whole graph
 belt-and-suspenders, and the queue's `FOR UPDATE SKIP LOCKED` + row leases serve intra-node concurrency
 and failover recovery rather than concurrent multi-node draining). The brief overlap during a leadership
 transition (the old leader's last in-flight poll vs. the new leader's first) is bounded by the same
-at-least-once guarantees that cover a crash mid-poll — the file-rename / row-claim atomicity and the
-downstream queue's idempotent handoff make a re-read a tolerated duplicate, never data loss. The
+at-least-once guarantees that cover a crash mid-poll — the file rename, the database source's
+mark-after-hand-off, and the downstream queue's idempotent handoff make a re-read a tolerated
+duplicate, never data loss. For a `database` source at least two shapes break that: a
+`poll_statement` that writes, which the read-only test on it does not always catch, and a
+high-water-mark `mark_statement`, whose mark on a later row advances the cursor past a row whose
+handler failed; see the [Database source](CONNECTIONS.md#database-source--databasepoll) section. The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.
 For a
-`database` source the row-claim atomicity is the operator's `poll_statement`/`mark_statement` (claim
-with a status flag or `UPDATE ... RETURNING`); the engine owns the atomic rename only for file sources.
+`database` source the row claim is the operator's `mark_statement`, run per row after the handler
+returns, so a row read twice in the transition window is a duplicate. `poll_statement` must not
+write; [`CONNECTIONS.md`](CONNECTIONS.md#database-source--databasepoll) says why and what is refused
+(BACKLOG #2178). The engine owns the atomic rename only for file sources.
 
 If the leader stops cleanly it expires its lease so a follower acquires leadership at once; if it
 crashes or is partitioned, the lease ages out and a follower acquires after at most

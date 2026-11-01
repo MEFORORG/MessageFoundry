@@ -33,6 +33,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import FHIR, WiringError
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
@@ -948,10 +949,11 @@ async def test_a_reply_the_keep_first_read_cannot_take_is_dead_lettered(
     # trigger is a raised RecursionError, since the real depth is a property of the runner.
     import messagefoundry.transports.fhir as fhir_module
 
-    def _too_deep(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        raise RecursionError("simulated deep nesting")
+    class _TooDeep(fhir_module._KeepFirstKey):
+        def __call__(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr(fhir_module, "_keep_first_key", _too_deep)
+    monkeypatch.setattr(fhir_module, "_KeepFirstKey", _TooDeep)
     dest = _dest(interaction="update")
     reply = _reply_with('{"status": "404 Not Found"}', meta='{"tag": 1, "tag": 1}')
     dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
@@ -996,6 +998,443 @@ async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
     dest = _dest(interaction="update")
     dest._opener = _FakeOpener(body=b"")  # type: ignore[assignment]
     assert await dest.send(UPDATE_1965) is None
+
+
+# --- vault BACKLOG #3796: every occurrence of a repeated key is compared as a canonical JSON node,
+# so a nested occurrence that reads two ways, and 1 against true, 1 against 1.0 or 0.0 against
+# -0.0, fail closed as reply-repeats-a-key (ADR 0095 Amendment B.1). Synthetic replies only.
+
+
+def _entry_with(entry: str) -> bytes:
+    """A transaction-response whose one entry is written by hand, so it can repeat ``response``."""
+    return (
+        '{"resourceType": "Bundle", "type": "transaction-response", "entry": [' + entry + "]}"
+    ).encode()
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The middle response reads 200 keeping the first key and 404 keeping the last. Both
+        # readings of the whole reply take an outer 200, so before vault BACKLOG #3796 it was delivered.
+        _entry_with(
+            '{"response": {"status": "200 OK"}, '
+            '"response": {"status": "200 OK", "status": "404 Not Found"}, '
+            '"response": {"status": "200 OK"}}'
+        ),
+        # The same with two occurrences: the first reads two ways itself.
+        _entry_with(
+            '{"response": {"status": "200 OK", "status": "404 Not Found"}, '
+            '"response": {"status": "200 OK"}}'
+        ),
+        # A repeat that reads two ways three objects below the occurrence.
+        _reply_with(
+            '{"status": "200 OK"}',
+            meta='{"a": {"b": {"c": 1}}, "a": {"b": {"c": 1, "c": 2}}, "a": {"b": {"c": 1}}}',
+        ),
+        # 1 against true, as at every level: Python reads 1 == True.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": true, "tag": 1}'),
+        _entry_with(
+            '{"response": {"status": "200 OK", "x": 1}, '
+            '"response": {"status": "200 OK", "x": true}, '
+            '"response": {"status": "200 OK", "x": 1}}'
+        ),
+        _reply_with(
+            '{"status": "200 OK"}', meta='{"a": [{"b": 1}], "a": [{"b": true}], "a": [{"b": 1}]}'
+        ),
+        # The same in a value the delivery takes, where the two readings are compared.
+        _reply_with('{"status": "200 OK", "etag": 1, "etag": true}'),
+        # int against float, and 0.0 against -0.0, which Python also reads as equal.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": 1.0, "tag": 1}'),
+        _reply_with('{"status": "200 OK", "etag": 1, "etag": 1.0}'),
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 0.0, "tag": -0.0, "tag": 0.0}'),
+        _reply_with('{"status": "200 OK", "location": 0.0, "location": -0.0}'),
+    ],
+    ids=[
+        "middle-response-404-under-keep-last",
+        "first-response-reads-two-ways",
+        "two-ways-three-levels-below",
+        "one-against-true-in-meta",
+        "one-against-true-in-a-middle-response",
+        "one-against-true-in-a-list",
+        "one-against-true-in-etag",
+        "int-against-float-in-meta",
+        "int-against-float-in-etag",
+        "zero-against-negative-zero-in-meta",
+        "zero-against-negative-zero-in-location",
+    ],
+)
+async def test_a_repeated_key_that_differs_as_a_json_node_is_dead_lettered(
+    reply: bytes, capture: bool
+) -> None:
+    # Each of these was delivered before vault BACKLOG #3796, so each fails on the unfixed code.
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Control: every occurrence is one node, so the reply reads one way (ADR 0095 B.1).
+        _entry_with(
+            '{"response": {"status": "200 OK"}, "response": {"status": "200 OK"}, '
+            '"response": {"status": "200 OK"}}'
+        ),
+        # Key order inside an object is not part of what it is.
+        _reply_with(
+            '{"status": "200 OK"}',
+            meta='{"a": {"x": 1, "y": true}, "a": {"y": true, "x": 1}, "a": {"x": 1, "y": true}}',
+        ),
+        # A two-way repeat that is not itself an occurrence of a repeated key: judged as B.1 says.
+        _entry_with('{"response": {"status": "200 OK", "status": "201 Created"}}'),
+        # Every NaN token is one value here, unlike Python's float comparison (ADR 0095 B.1).
+        _reply_with('{"status": "200 OK"}', meta='{"tag": NaN, "tag": NaN, "tag": NaN}'),
+        _reply_with('{"status": "200 OK"}', meta='{"n": NaN, "tag": 1, "tag": 1}'),
+    ],
+    ids=[
+        "one-node-three-times",
+        "key-order",
+        "two-ways-not-repeated",
+        "nan-repeated",
+        "nan-beside",
+    ],
+)
+async def test_a_repeated_key_that_is_one_json_node_is_delivered(
+    reply: bytes, capture: bool
+) -> None:
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize(
+    "meta",
+    ['{"tag": NaN, "tag": 1, "tag": NaN}', '{"tag": NaN, "tag": Infinity, "tag": NaN}'],
+    ids=["nan-against-a-number", "nan-against-infinity"],
+)
+async def test_a_nan_against_another_value_is_dead_lettered(meta: str) -> None:
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK"}', meta=meta))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+def _deep_and_wide(depth: int, width: int, leaf: str) -> bytes:
+    """A reply whose ``meta`` repeats a key three times, each occurrence a chain ``depth`` objects
+    deep, the middle one ending in ``leaf``, beside a list of ``width`` objects that each repeat a
+    key. Comparing two occurrences by recursion would pass Python's recursion limit here, and one
+    that compares both readings at every level, as a compare reverted in engine PR 2356 did, takes 2**depth."""
+
+    def chain(end: str) -> str:
+        return '{"a": ' * depth + end + "}" * depth
+
+    wide = ", ".join('{"k": [[1, {"u": 2}]], "k": [[1, {"u": 2}]]}' for _ in range(width))
+    meta = (
+        '{"c": '
+        + chain("1")
+        + ', "c": '
+        + chain(leaf)
+        + ', "c": '
+        + chain("1")
+        + ', "w": ['
+        + wide
+        + "]}"
+    )
+    return _reply_with('{"status": "200 OK"}', meta=meta)
+
+
+async def test_a_deep_wide_reply_is_judged_in_linear_work_without_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messagefoundry.transports.fhir as fhir_module
+
+    calls = 0
+    intern = fhir_module._NodeIds._intern
+
+    def _counting(self: Any, key: object) -> int:
+        nonlocal calls
+        calls += 1
+        return intern(self, key)
+
+    monkeypatch.setattr(fhir_module._NodeIds, "_intern", _counting)
+    # 3000 levels is three times Python's default recursion limit and well inside the depth json
+    # itself parses.
+    reply = _deep_and_wide(3000, 5000, "1")
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+    # Each JSON value is interned a bounded number of times, so the work is linear in the body: no
+    # pairwise or per-reading compare. Every value takes at least one byte.
+    assert 0 < calls <= len(reply)
+
+
+async def test_one_against_true_at_the_bottom_of_a_deep_occurrence_is_dead_lettered() -> None:
+    import messagefoundry.transports.fhir as fhir_module
+
+    reply = _deep_and_wide(3000, 10, "true")
+    # The occurrence compare is what refuses it, not a depth refusal of the keep-first parse.
+    _, hint = json_loads_or_refusal(reply.decode(), object_pairs_hook=fhir_module._KeepFirstKey())
+    assert hint == "_ThirdReading"
+    _, control = json_loads_or_refusal(
+        _deep_and_wide(3000, 10, "1").decode(), object_pairs_hook=fhir_module._KeepFirstKey()
+    )
+    assert control is None
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+def test_ints_whose_own_hashes_collide_are_interned_by_keys_that_do_not() -> None:
+    # Python's int hash is n mod (2**61 - 1), so these 64 ints share one hash. Interned by the int
+    # itself, each lookup would scan every earlier one, and a reply full of them would take
+    # quadratic time; the operation count above cannot see that.
+    import messagefoundry.transports.fhir as fhir_module
+
+    colliding = [5 + k * (2**61 - 1) for k in range(64)]
+    assert len({hash(n) for n in colliding}) == 1
+    ids = fhir_module._NodeIds()
+    for n in colliding:
+        ids.node(n)
+    assert len({hash(key) for key in ids._table}) == len(colliding)
+    # Control: the type and the value are still the id, so 1 and true stay apart.
+    assert ids.node(1) != ids.node(True) and ids.node(1) == ids.node(1)
+
+
+_KEY_HASHES = """
+import json, sys
+from messagefoundry.transports.fhir import _KeepFirstKey
+hook = _KeepFirstKey()
+# Only occurrences of a repeated key are interned, so every kind sits inside one.
+x = '{"a": [1, [2.5, "x"]], "c": 1, "d": [true], "e": ["", {}, [], null]}'
+json.loads('{"b": ' + x + ', "b": ' + x + '}', object_pairs_hook=hook)
+fixed = lambda v: type(v) in (bool, type(None)) or v in ("", b"")
+print(json.dumps([[getattr(k[0], "__name__", "?"), hash(k[1]), fixed(k[1])] for k in hook.ids._table]))
+"""
+
+
+def test_every_interning_key_but_six_fixed_ones_hashes_by_the_process_seed() -> None:
+    # A reply's lists and objects get ids from the ids below them, which are small ints the reply
+    # orders. A key whose hash is a fixed function of them (a tuple of ints, as at b7b82b02) could
+    # be built offline to collide, and each lookup would then scan every earlier key: quadratic.
+    # A test cannot plant such a collision cheaply (it is a 64-bit search), so this pins the
+    # precondition: each key's hash moves with PYTHONHASHSEED, which an attacker does not know.
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+
+    def hashes(seed: str) -> list[list[Any]]:
+        # This checkout, whatever directory pytest runs from or the venv installed.
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": str(root)}
+        out = subprocess.run(
+            [sys.executable, "-c", _KEY_HASHES],
+            cwd=root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        ).stdout
+        return list(json.loads(out))
+
+    one, two = hashes("1"), hashes("2")
+    kinds = [kind for kind, _, _ in one]
+    assert kinds == [kind for kind, _, _ in two]
+    assert {"list", "dict", "int", "float", "str", "bool", "NoneType"} <= set(kinds)  # all reached
+    fixed = 0
+    for (kind, first, is_fixed), (_, second, _) in zip(one, two, strict=True):
+        if is_fixed:
+            # true, false, null and the empty string, object and list: six keys at most.
+            fixed += 1
+            assert first == second, kind
+        else:
+            assert first != second, kind
+    assert fixed == 5  # true, null, "", {} and []: the six less false, which this reply lacks
+
+
+def _with_many_values(count: int, item: str = "0") -> bytes:
+    """A reply that repeats a key twice, each occurrence a list of ``count`` copies of ``item``."""
+    many = "[" + ", ".join([item] * count) + "]"
+    return _reply_with('{"status": "200 OK"}', meta='{"t": ' + many + ', "t": ' + many + "}")
+
+
+async def test_a_reply_past_the_node_budget_is_dead_lettered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Control for the delivery below: repeated occurrences too large to judge fail closed, as a
+    # backstop on the interning work (ADR 0095 B.1).
+    import messagefoundry.transports.fhir as fhir_module
+
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET // 2))  # type: ignore[assignment]
+    with caplog.at_level("WARNING"), pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+    # The budget ran out inside the keep-first parse, and the refusal says so in the log.
+    assert any("too large to judge (_TooManyNodes)" in r.getMessage() for r in caplog.records)
+    # Containers trip the backstop while they are collected, before any of them is interned.
+    caplog.clear()
+    dest._opener = _FakeOpener(body=_with_many_values(fhir_module._NODE_BUDGET, "[]"))  # type: ignore[assignment]
+    with caplog.at_level("WARNING"), pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == "reply-repeats-a-key"
+    assert any("too large to judge (_TooManyNodes)" in r.getMessage() for r in caplog.records)
+    # Control: the same shape, well inside the budget, is delivered.
+    dest._opener = _FakeOpener(body=_with_many_values(1000))  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+
+
+def test_the_refusal_does_not_hold_the_parsed_trees_on_its_traceback() -> None:
+    # The dead-letter path holds the error while it writes to the store, so its traceback must not
+    # keep the two parsed trees, the id tables or the hook alive.
+    import messagefoundry.transports.fhir as fhir_module
+
+    reply = _reply_with('{"status": "200 OK", "status": "404 Not Found"}').decode()
+    with pytest.raises(NegativeAckError) as ei:
+        fhir_module._agreed_reading(reply)
+    tb = ei.value.__traceback__
+    while tb is not None:
+        for value in tb.tb_frame.f_locals.values():
+            assert not isinstance(value, (dict, fhir_module._KeepFirstKey, fhir_module._NodeIds))
+        tb = tb.tb_next
+
+
+async def test_a_large_agreeing_reply_with_a_small_repeat_is_judged_without_its_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A review of this branch at eb8ba6a7 measured it: an updated Patient with 60,000 extensions
+    # beside one harmless repeat in meta, about 2.3 MB, which main delivers. Interning the whole
+    # reply dead-lettered it on the budget. Only the repeated occurrences and the compared values
+    # are interned, so it is delivered again, in a handful of steps.
+    import messagefoundry.transports.fhir as fhir_module
+
+    calls = 0
+    intern = fhir_module._NodeIds._intern
+
+    def _counting(self: Any, key: object) -> int:
+        nonlocal calls
+        calls += 1
+        return intern(self, key)
+
+    monkeypatch.setattr(fhir_module._NodeIds, "_intern", _counting)
+    extensions = ", ".join(
+        f'{{"url": "http://example.org/fhir/ext-{n}", "valueString": "synthetic value {n}"}}'
+        for n in range(60_000)
+    )
+    resource = '{"resourceType": "Patient", "id": "p1", "extension": [' + extensions + "]}"
+    reply = (
+        '{"resourceType": "Bundle", "type": "transaction-response", "meta": {"tag": 1, "tag": 1}, '
+        '"entry": [{"resource": ' + resource + ', "response": {"status": "200 OK"}}]}'
+    ).encode()
+    assert len(reply) > 2_000_000
+    for capture in (True, False):
+        dest = _dest(interaction="update", capture_response=capture)
+        dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+        calls = 0
+        resp = await dest.send(UPDATE_1965)
+        if capture:
+            assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+        else:
+            assert resp is None
+        assert 0 < calls < 50  # the two tag occurrences and the compared values, nothing else
+
+
+async def test_the_node_budget_also_bounds_the_compare_of_the_two_readings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The plain reading's compared values are interned after the keep-first parse and after the
+    # keep-first reading's, so the budget must hold there too: set it just past both, so that it
+    # runs out inside the walk of the plain reading's etag.
+    import messagefoundry.transports.fhir as fhir_module
+
+    reply = _reply_with('{"status": "200 OK", "etag": [[0, 1, 2, 3]], "etag": [[0, 1, 2, 3]]}')
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None  # control: the readings agree
+    hook = fhir_module._KeepFirstKey()
+    first, hint = json_loads_or_refusal(reply.decode(), object_pairs_hook=hook)
+    assert hint is None
+    fhir_module._reply_reading(first, hook.ids)
+    before_plain = hook.ids._interned
+    last = json.loads(reply)
+    fhir_module._reply_reading(last, hook.ids)
+    assert hook.ids._interned - before_plain > 6  # the plain etag walk takes more than 3 steps
+    monkeypatch.setattr(fhir_module, "_NODE_BUDGET", before_plain + 3)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == "reply-repeats-a-key" and ei.value.__context__ is None
+
+
+async def test_running_out_of_memory_judging_a_reply_is_dead_lettered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A MemoryError is not a DeliveryError: escaping send() it would read as an internal error.
+    import messagefoundry.transports.fhir as fhir_module
+
+    class _NoMemory(fhir_module._KeepFirstKey):
+        def __call__(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            raise MemoryError
+
+    monkeypatch.setattr(fhir_module, "_KeepFirstKey", _NoMemory)
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK", "status": "200 OK"}'))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+    assert ei.value.__context__ is None
+
+
+def test_running_out_of_memory_in_the_plain_read_escapes_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The plain read judges nothing, so a MemoryError there is not refused as this reply's: it
+    # escapes as it did before vault BACKLOG #3796, and only the keep-first parse and the compare
+    # fail closed (the test above).
+    import messagefoundry.transports.fhir as fhir_module
+
+    def _plain_read_runs_out(raw: str | bytes, **kwargs: Any) -> tuple[Any, str | None]:
+        if kwargs.get("object_pairs_hook") is None:
+            raise MemoryError
+        return json_loads_or_refusal(raw, **kwargs)
+
+    monkeypatch.setattr(fhir_module, "json_loads_or_refusal", _plain_read_runs_out)
+    with pytest.raises(MemoryError):
+        fhir_module._agreed_reading(
+            _reply_with('{"status": "200 OK", "status": "200 OK"}').decode()
+        )
+
+
+@pytest.mark.parametrize(
+    ("reply", "hint"),
+    [
+        # Through a list: the flag climbs from the object inside it to the occurrence.
+        (
+            _reply_with('{"status": "200 OK"}', meta='{"k": [{"s": 1, "s": 2}], "k": [{"s": 1}]}'),
+            "_ThirdReading",
+        ),
+        (_reply_with('{"status": "200 OK"}', meta='{"k": [{"s": 1}], "k": [{"s": 1}]}'), None),
+    ],
+    ids=["two-ways-inside-a-list", "control"],
+)
+def test_an_occurrence_reads_two_ways_through_a_list(reply: bytes, hint: str | None) -> None:
+    import messagefoundry.transports.fhir as fhir_module
+
+    _, got = json_loads_or_refusal(reply.decode(), object_pairs_hook=fhir_module._KeepFirstKey())
+    assert got == hint
 
 
 async def test_dynamic_if_match_on_plain_update_moves_into_the_entry() -> None:

@@ -32,6 +32,7 @@ from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
+    "FRAMING_CODE",
     "MULTIPLE_MESSAGES_CODE",
     "FrameError",
     "FrameByteFault",
@@ -54,6 +55,10 @@ logger = logging.getLogger(__name__)
 #: The :class:`NegativeAckError` code of an MLLP or TCP delivery refused for holding more than one
 #: ``MSH`` segment (ADR 0209).
 MULTIPLE_MESSAGES_CODE = "multiple-messages"
+
+#: The :class:`NegativeAckError` code of a payload holding its codec's own start or end byte
+#: (ADR 0205 rule 1).
+FRAMING_CODE = "framing"
 
 #: The listeners whose reply-charset fallback has been logged. One line per connection, not per
 #: reply: an unusable name fails every message alike, and each one already has its ERROR row.
@@ -94,7 +99,7 @@ def check_frame_bytes(codec: FrameCodec, payload: str, encoding: str, *, transpo
     # harness; what is engine-only is the permanent delivery failure it becomes here.
     fault = codec.find_frame_byte(body)
     if fault is not None:
-        raise NegativeAckError(fault.describe(transport), code="framing", permanent=True)
+        raise NegativeAckError(fault.describe(transport), code=FRAMING_CODE, permanent=True)
     return body
 
 
