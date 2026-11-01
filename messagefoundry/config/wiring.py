@@ -9680,9 +9680,9 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
     # Longest first, so a repr goes before the str inside it.
     for quotation in sorted(quoted, key=len, reverse=True):
         text = text.replace(quotation, f"[{quoted[quotation]} text withheld]")
-    return (
-        text if isinstance(exc, WiringError) else f"error loading config module {path.name}: {text}"
-    )
+    if issubclass(type(exc), WiringError):
+        return text
+    return f"error loading config module {path.name}: {text}"
 
 
 def _refusal_for(
@@ -9709,7 +9709,9 @@ def _refusal_for(
         if _keeps_engine_wording(exc):
             text = _rewritten_refusal(path, exc)
             if text is None:
-                if isinstance(exc, WiringError):
+                # The real type: ``__class__`` can answer WiringError, and a bare ``raise`` of that
+                # would leave ``validate_config``, which catches only the real one.
+                if issubclass(type(exc), WiringError):
                     return None
                 return WiringError(f"error loading config module {path.name}: {exc}"), exc
             imported = exc.__cause__

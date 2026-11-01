@@ -931,6 +931,16 @@ def test_an_engine_raised_class_keeps_its_wording_when_only_its_name_faults(
     assert str(_load_error(tmp_path)) == "error loading config module feed.py: "
 
 
+def test_a_class_answering_as_a_wiring_error_is_not_one(tmp_path: Path, engine_probe: str) -> None:
+    bad_class = (
+        "from messagefoundry.config.wiring import WiringError\n\n"
+        "class Bad(Exception):\n    __class__ = WiringError\n"
+    )
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    assert type(_load_error(tmp_path)) is WiringError
+
+
 def test_a_helper_left_to_its_guard_is_logged_by_its_real_type_name(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1131,11 +1141,12 @@ def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:
 
 
 def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> None:
-    # Python sets a signal's KeyboardInterrupt's __context__ to whatever was being handled.
+    # Python sets a signal's KeyboardInterrupt's __context__ to whatever was being handled. Sent in a
+    # loop because the handler can run inside a weakref callback, which swallows the interrupt.
     body = (
         "import signal\n\n"
         f"try:\n    raise ValueError({NEEDLE!r})\n"
-        "except ValueError:\n    signal.raise_signal(signal.SIGINT)\n"
+        "except ValueError:\n    while True:\n        signal.raise_signal(signal.SIGINT)\n"
     )
     _write(tmp_path, "feed.py", body)
     # A pytest-xdist worker can run with SIGINT ignored.

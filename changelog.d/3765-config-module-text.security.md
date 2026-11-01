@@ -18,5 +18,6 @@
   refused like the rest. An interrupt that lands while the loader reads a failed module's exception
   is absorbed, and that module is refused. An exception's text counts as engine wording only when
   its frame is in the package's own files, so a module that sets `__name__` to look like the engine
-  is withheld, and so is vendored code. A module that catches a refusal and rewrites its `args`, or
-  that builds a class whose name holds a value, is not caught.
+  is withheld, and so is vendored code. At least these are not caught: a module that catches a
+  refusal and rewrites its `args`, one that builds a class whose name holds a value, and one that
+  compiles code under an engine file name to forge a frame.

@@ -9,11 +9,12 @@ can still print from the other two. A leaf that imports only the standard librar
 ``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``, and
 ``__main__`` without loading anything else.
 
-The rule reads the innermost frame's compiled file name, then its module name. A module can rebind
-``__name__``, so the name alone is a claim, and a config module and its helpers run as
-``mefor_config_*`` from a file outside this package. The file name is fixed when code is compiled,
-so a module that compiles text under an engine path, and sets the name to match, still passes. This
-tells accident from engine wording: it does not stop code that sets out to forge a frame."""
+The rule reads the innermost frame's compiled file name and its module name, and needs both. A
+module can rebind ``__name__``, so the name alone is a claim. A config directory can sit inside the
+package, and its modules and helpers run as ``mefor_config_*``, so the file alone is not enough. The
+file name is fixed when code is compiled, so a module that compiles text under an engine path, and
+sets the name to match, still passes. This tells accident from engine wording: it does not stop code
+that sets out to forge a frame."""
 
 from __future__ import annotations
 
@@ -68,8 +69,6 @@ def _engine_frame(exc: BaseException) -> TracebackType | None:
     file = tb.tb_frame.f_code.co_filename
     if not file.startswith(_ENGINE_DIR) or file.startswith(_VENDORED_DIR):
         return None
-    # The file alone is not enough: a config directory can sit inside the package, and its modules
-    # run under their own names.
     module = tb.tb_frame.f_globals.get("__name__", "")
     return tb if isinstance(module, str) and module.split(".")[0] == "messagefoundry" else None
 
