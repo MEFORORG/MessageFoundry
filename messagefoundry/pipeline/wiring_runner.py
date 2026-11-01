@@ -8917,7 +8917,7 @@ class RegistryRunner:
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only the two failures the MESSAGE causes: the payload does not parse as HL7, or its
+            # Only these two failures, which the MESSAGE causes: the payload does not parse as HL7, or its
             # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809). The same payload fails
             # the same way on every attempt, so a retry could never succeed: refuse it permanently,
             # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
@@ -9042,12 +9042,14 @@ class RegistryRunner:
                 # check_frame runs the same delimiter rewrite send() does, so on this single-row
                 # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
-                # member with rewrite=False and never rewrites the envelope. A hydration failure is
-                # not a refusal, so it stays what shadow made it before, a completed delivery, unless
-                # the payload itself caused it: that one is a permanent refusal and dead-letters, as
-                # live (vault #2809). Only on a framing connector: a shadow outbound that does not
-                # frame never hydrates, so it completes a row live would dead-letter. A store read fault is not a hydration failure: it re-pends, as
-                # live (vault #2756).
+                # member with rewrite=False and never rewrites the envelope. A retryable hydration
+                # failure (a DeliveryError) is not a refusal, so it stays what shadow made it before,
+                # a completed delivery. Two kinds do not: one the payload itself caused is a
+                # permanent refusal and dead-letters, as live, and a stored document holding a CR or
+                # LF is a plain ValueError that takes the internal-error policy, as live (vault
+                # #2809). Only on a framing connector: a shadow outbound that does not frame never
+                # hydrates, so it completes a row live would dead-letter. A store read fault is not a
+                # hydration failure: it re-pends, as live (vault #2756).
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))

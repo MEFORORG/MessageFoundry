@@ -256,17 +256,20 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   pre-send `encoding_characters` / `hl7_raw_separators` failures — so the row takes the normal
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
-- **What the payload causes, and what it cannot (vault BACKLOG #2809, added 2026-11-01).** Two
-  re-attach failures are the payload's own: it does not parse as HL7, or its `MSH-1` and `MSH-2` do not
-  name its separators. Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into
-  a permanent `NegativeAckError` (code `reattach`), so that row alone dead-letters, under either
-  `internal_error` policy; on a batched outbound that member alone is dead-lettered and the rest of the
-  batch goes out. A stored document that holds a CR or LF is **not** the payload's: the ingress detach
-  refuses an escaped `OBX-5.5` (`EscapedDocumentError`) and a raw LF ends the segment, so only store
-  corruption or an engine bug could leave one. The re-attach raises it as a plain `ValueError`, so the
-  outbound's [`internal_error`](../CONFIGURATION.md#delivery) policy judges it: `continue`
-  dead-letters the row, and `stop` stops the connection with a `connection_stopped` alert. A parser
-  fault takes the same internal-error path.
+- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** Two are
+  refused permanently: the payload does not parse as HL7, or its `MSH-1` and `MSH-2` do not name its
+  separators. Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
+  permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
+  `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
+  batch goes out, provided every other member hydrates; a whole-batch failure in the same pass takes
+  that member with the batch. A stored document that holds a CR or LF is **not** the payload's: the
+  ingress detach refuses an escaped `OBX-5.5` (`EscapedDocumentError`) and a raw LF ends the segment,
+  so no payload can leave one, and one there points at the store or the engine. The re-attach raises
+  it as a plain `ValueError`, so the outbound's [`internal_error`](../CONFIGURATION.md#delivery)
+  policy judges it, as it judges a parser fault: `continue` dead-letters, and `stop` stops the
+  connection with a `connection_stopped` alert. On a batched outbound that policy applies to the
+  whole batch, so under `continue` every member of the batch still present is dead-lettered with it.
+  A missing attachment or a malformed handle stays the retryable `DeliveryError` above.
 - **Delivery is a pure READ — never a decref.** A message fans out to multiple outbounds and is
   replayable, so each send **reads** the immutable, content-addressed attachment per-send and leaves the
   refcount untouched; the refcount is released **only** at retention/purge (below). This makes retry

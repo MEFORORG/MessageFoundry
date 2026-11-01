@@ -128,11 +128,12 @@ class UnreattachableDocumentError(ValueError):
     """The payload itself stops a re-attach (vault BACKLOG #2809). Two shapes only: the parser
     refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault`` set), or its
     MSH-1 and MSH-2 do not name its separators. The same payload fails the same way on every
-    attempt, so the delivery path refuses it permanently. Every other ``ValueError`` in the
-    re-attach may be an engine fault and stays the outbound's internal-error policy to judge: a
-    parser fault, and a stored document that holds a CR or LF. The ingress detach refuses an
-    escape and a raw LF ends the segment, so no payload can leave a stored CR or LF; one there means
-    store corruption or an engine bug. The text names the step, never a byte of the payload."""
+    attempt, so the delivery path refuses it permanently. A :class:`DocRefError` (a missing
+    attachment or a malformed handle) is the delivery path's retryable failure. Every other
+    ``ValueError`` in the re-attach may be an engine fault and stays the outbound's internal-error
+    policy to judge, at least a parser fault and a stored document that holds a CR or LF. The
+    ingress detach refuses an escape and a raw LF ends the segment, so no payload can leave a stored
+    CR or LF. The text names the step, never a byte of the payload."""
 
 
 def _b64encode_unbroken(data: bytes) -> str:
