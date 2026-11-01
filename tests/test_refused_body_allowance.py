@@ -212,6 +212,10 @@ async def test_the_http_receipt_path_is_bounded_too(store: MessageStore) -> None
     rows = await _rows(store)
     assert len(rows) == 20
     assert all(r["raw"] == body.decode()[:512] for r in rows)
+    # BACKLOG #2105: with the allowance spent, the kind tag still opens the stored reason, ahead of
+    # the allowance note, so an operator reading the row sees the kind first.
+    for r in rows:
+        assert r["error"].startswith("[refusal kind: permanent] [refused-body allowance spent"), r
 
 
 # --- every refusal phase ---------------------------------------------------------------------------

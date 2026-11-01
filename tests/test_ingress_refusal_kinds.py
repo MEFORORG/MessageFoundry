@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from harness.drivers.http import message_id_of
 from messagefoundry.config.models import (
     ConnectorType,
     ContentType,
@@ -120,6 +121,8 @@ def _assert_names_the_row(resp: _Response, row: dict[str, Any]) -> None:
     # temporary one, which the sender will re-send, from a final one before resending it.
     kind = {503: "temporary", 413: "oversize", 422: "permanent"}[resp.status]
     assert row["error"].startswith(f"[refusal kind: {kind}] "), row["error"]
+    # The harness reads only an accepted answer's message_id, so this real refusal reads as none.
+    assert message_id_of(resp.body) is None
 
 
 # --- temporary: 503 + Retry-After -----------------------------------------------------------------

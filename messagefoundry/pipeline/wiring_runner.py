@@ -8406,10 +8406,10 @@ class RegistryRunner:
 
         ``kind``, which a receipt source's refusal passes, leads the stored error as
         ``[refusal kind: <kind>]``, so an operator can tell a temporary refusal from a final one
-        before resending the row (BACKLOG #2105). It goes first, as the allowance note does, because
-        the store's redaction cuts from a quoted segment id to the end of the text."""
-        if kind is not None:
-            error = with_refusal_note(f"[refusal kind: {kind.value}] ", error)
+        before resending the row (BACKLOG #2105). It is added after the allowance's bound, so it goes
+        ahead of the allowance note too: the text opens with it whether or not the allowance is spent.
+        Both notes go first because the store's redaction cuts from a quoted segment id to the end of
+        the text."""
         bounded = self._refused_body.bound(
             ic.name,
             wire,
@@ -8423,7 +8423,11 @@ class RegistryRunner:
             channel_id=ic.name,
             raw=bounded.raw,
             status=MessageStatus.ERROR,
-            error=bounded.error,
+            error=(
+                bounded.error
+                if kind is None
+                else with_refusal_note(f"[refusal kind: {kind.value}] ", bounded.error)
+            ),
             control_id=peek.control_id if peek is not None else None,
             message_type=peek.message_type if peek is not None else message_type,
             source_type=ic.spec.type.value,
