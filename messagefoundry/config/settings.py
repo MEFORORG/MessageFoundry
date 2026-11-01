@@ -6968,8 +6968,8 @@ def _looks_like_url(value: str) -> bool:
     """Whether ``value``, stripped and lower-cased, starts with ``<scheme>://``, where the scheme is
     a letter and then at least one more letter, digit, ``+``, ``.`` or ``-``. These settings take a
     LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as a
-    bogus local path (vault BACKLOG #2600). A value of any other shape is not detected, and can
-    load as a path.
+    bogus local path (vault BACKLOG #2600). A value with any other shape once stripped is not
+    detected, and can load as a path.
 
     It hands back no text, because a refusal quotes no part of the value: see
     :func:`settings_error_detail`."""
