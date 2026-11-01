@@ -9,15 +9,21 @@
 
 **Two invariants hold no matter what you set here** ([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5, the *No-loosen rule*):
 
-1. **A PHI weakening under strict enforcement is still refused — with two explicitly-acknowledged
+1. **A PHI weakening under strict enforcement is still refused — with explicitly-acknowledged
    exceptions.** No `[security]` value — and no `--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS` escape —
    can start a **PHI instance at `enforcement = enforce`** (the default) with a **cleartext off-box bind, no
-   auth, open egress, or unbounded PHI retention**. Those four still fail closed (`serve` exits 2),
-   unconditionally. At the default this is **byte-identical to the former production-PHI refusal** — [ADR
+   auth, or open egress**. Those three still fail closed (`serve` exits 2), unconditionally.
+   At the default this is **byte-identical to the former production-PHI refusal** — [ADR
    0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 2) re-keyed the
    refuse/warn dial off the *derived* `production` tier and onto the *explicit* `enforcement` level;
    `enforcement = warn` reproduces the historical non-production warn-and-start (a loud loosening —
-   see the `enforcement = warn` deviation below). **Two of these controls may be lifted while staying at
+   see the `enforcement = warn` deviation below). **Unbounded PHI retention** on a classified window
+   ([PHI.md](PHI.md) section 2 lists what no window reaches) fails closed the same way until a dedicated
+   retention switch lifts it at `enforce`:
+   [`allow_keeping_phi_indefinitely = true`](#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--true--unbounded-phi-retention)
+   for the auto-bounded windows, and each
+   [`allow_keeping_<tier>_indefinitely`](#allow_keeping_tier_indefinitely--true--one-retention-tier-with-no-window)
+   for its one tier. **At least two other controls may be lifted while staying at
    `enforce`, but only behind a dedicated acknowledgment switch that does nothing else** (the No-loosen
    carve-out, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5 as amended, [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)):
    `allow_single_factor_admin_when_exposed` (single-factor sign-in at exposure) and
@@ -524,7 +530,8 @@ false premise.
   and that window unset, they name `delete_message_bodies_after_days` too, though nobody wrote `0`.
   `messagefoundry security show` runs no gate and reads the file as written, so it does not.
   `security_loosenings()` does not read the other auto-bounded windows: at least `dead_letter_days`,
-  `reference_snapshot_days` and `processed_archive_days` can stay at `0` with no entry in any of these records.
+  `reference_snapshot_days` and `processed_archive_days` can stay at `0` with no entry in any
+  `security_loosenings()` reading.
 - **Still refused:** a **PHI** instance whose PHI-body window is set **explicitly to `0`** refuses under
   **strict enforcement** (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true`
   (which downgrades the refusal to a loud audited warning). This bullet used to say the 30-day auto-bound of
@@ -570,9 +577,10 @@ false premise.
   MessageFoundry normally **refuses to start**. Every account with no second factor enrolled,
   Administrators included, would then sign in over the network with a single factor. The one
   exception is an OIDC sign-in that carries an amr/acr claim checked while
-  `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud, audited warning** (the same
-  warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
-  single-factor while staying at `enforce`.
+  `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud warning with a startup
+  AUDIT line** (the warn-and-start `enforcement = warn` takes, scoped to this one control, plus that line,
+  which this gate does not write under `enforcement = warn`), so the instance boots single-factor while
+  staying at `enforce`.
 - **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means
   `[api].tls_terminated_upstream` or a set `[api].trusted_proxies` — the bind-and-proxy posture,
   **independent of the browser console**. The

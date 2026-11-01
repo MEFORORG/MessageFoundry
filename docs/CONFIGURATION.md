@@ -3112,14 +3112,16 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 — byte-identical to the former production-PHI refusal
 ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)).
 
-> **Two acknowledged exceptions — `enforcement = enforce` is not the whole answer.** The No-loosen rule
+> **Acknowledged exceptions — `enforcement = enforce` is not the whole answer.** The No-loosen rule
 > ships with exactly two dedicated second-acknowledgment switches ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md);
 > [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) invariant 1), each of which drops **one** strict-enforcement
 > refusal to a loud, audited warning that starts:
 > `allow_unencrypted_phi_under_strict_enforcement` (keyless PHI at rest) and
 > `allow_single_factor_admin_when_exposed` (single-factor sign-in on an exposed instance) — both rows below.
+> The retention switches (`allow_keeping_phi_indefinitely`, each `allow_keeping_<tier>_indefinitely`)
+> start under `enforce` too, outside those two — rows below.
 > Separately, `enforcement = warn` downgrades **every** PHI serve-gate refusal at once. So confirming
-> `enforcement = enforce` is necessary but **not sufficient**: read those three values before recording
+> `enforcement = enforce` is necessary but **not sufficient**: read at least those values before recording
 > a posture. Each is reported by `security_loosenings()` on `GET /security/posture`, so none is silent.
 
 | key | type | default | meaning |

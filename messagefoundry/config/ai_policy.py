@@ -80,8 +80,10 @@ class SecurityEnforcement(str, Enum):  # noqa: UP042
       first is honoured only at ``[security].enforcement = warn``. Byte-identical to the historical
       ``production=True`` dial position, so a stock prod instance is unchanged and a declared-PHI
       staging/dev instance now fails closed the same way.
-    * ``warn`` — the gates **WARN + audit + continue** and the escapes are **honored**. Byte-identical
-      to the historical ``production=False`` dial position (the non-production posture).
+    * ``warn`` — the gates this dial governs **WARN + continue** and the escapes are **honored**. An
+      ``AUDIT:`` line here is per gate: at least the global body-window and single-factor gates
+      write none.
+      Byte-identical to the historical ``production=False`` dial position (the non-production posture).
 
     The *tier* fact (``[security].production_instance`` / ``[ai].production``) is retained where it
     reflects a true property (the DEBUG-logging refusal, the AI data-scope ceiling); this enum owns
