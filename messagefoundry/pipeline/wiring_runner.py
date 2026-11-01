@@ -48,6 +48,7 @@ from messagefoundry.auth.trust_anchors import (
     TrustAnchorError,
     anchor_store_refusal,
     connection_anchor_failure,
+    explicit_cause,
     inbound_lane_reads_ca,
     lane_ca_setting,
 )
@@ -3615,7 +3616,7 @@ class RegistryRunner:
                 name, owner=self._destination_owner(name), shard=self.registry.shard_id
             )
 
-    async def start_outbound(self, name: str) -> None:
+    async def start_outbound(self, name: str) -> bool:
         """RESUME delivery on one outbound connection (no-op if not paused). The OPPOSITE primitive to
         the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
         so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073).
@@ -3641,13 +3642,16 @@ class RegistryRunner:
         that marker unlogged. :meth:`_reconcile_outbounds` now asks the same gate before it does.
 
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before that gate, so a
-        refused start neither probes the log nor pages."""
+        refused start neither probes the log nor pages.
+
+        Returns True when the store stopped the lane's CA check and the lane was not resumed
+        (:meth:`_start_outbound_unsafe`, vault BACKLOG #3746), for the control route to answer."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
             if not self._outbound_start_permitted(name):
-                return
-            await self._start_outbound_unsafe(name)
+                return False
+            return await self._start_outbound_unsafe(name)
 
     async def stop_outbound(self, name: str) -> None:
         """PAUSE delivery on one outbound connection while RETAINING its queued rows PENDING (the
@@ -3665,7 +3669,7 @@ class RegistryRunner:
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
 
-    async def restart_outbound(self, name: str) -> None:
+    async def restart_outbound(self, name: str) -> bool:
         """Stop + start delivery for one outbound in a single lock span (atomic w.r.t. a concurrent
         reload). The connector is kept WARM throughout (``_destinations[name]`` is never torn down) — a
         restart deliberately keeps MLLP sockets / DB pools / SMART tokens warm, exactly like a reload.
@@ -3688,7 +3692,10 @@ class RegistryRunner:
         ``_gate_parked`` marker is put back: a calendar park the stop half drops is not.
 
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before either half, so
-        neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067)."""
+        neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067).
+
+        Returns what :meth:`start_outbound` returns. Its stop half has run by then, so a True
+        leaves the lane paused."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
@@ -3696,7 +3703,8 @@ class RegistryRunner:
             try:
                 self._stop_outbound_unsafe(name)
                 if self._outbound_start_permitted(name):
-                    await self._start_outbound_unsafe(name)
+                    return await self._start_outbound_unsafe(name)
+                return False
             finally:
                 if engine_parked and name in self._outbound_paused:
                     self._gate_parked.add(name)
@@ -4228,7 +4236,7 @@ class RegistryRunner:
 
     async def _ensure_destination_built(
         self, name: str, *, warn_query_credentials: bool = True
-    ) -> None:
+    ) -> bool:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
         an operator start (#115). The ``auto_start=False`` boot gate leaves a CONNECTOR-LESS lane, so a
         resume alone could never deliver a single byte: the advertised ``POST /connections/{name}/start``
@@ -4253,12 +4261,16 @@ class RegistryRunner:
         EXCEPT for a lane that has left the DR park unbuilt (vault BACKLOG #3263): that one stays
         parked with its rows held (:meth:`_start_outbound_unsafe`). A reload that builds such a
         lane leaves it parked the same way (:meth:`_reconcile_outbounds`), and passes
-        ``warn_query_credentials=False`` because its build check already warned (vault BACKLOG #2910)."""
+        ``warn_query_credentials=False`` because its build check already warned (vault BACKLOG #2910).
+
+        Returns True when the store stopped the CA check (vault BACKLOG #3746), which says nothing
+        against the CA, so a start does not resume the lane: see :meth:`_start_outbound_unsafe`.
+        The test reads the fixed line's cause, since that line stays a ``TrustAnchorError``."""
         if name in self._destinations or ("outbound", name) in self._filtered:
-            return
+            return False
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
-            return
+            return False
         connector: DestinationConnector | None = None
         try:
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
@@ -4290,12 +4302,14 @@ class RegistryRunner:
             # first failed for another reason keeps that older reason in its status; the CA
             # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
             # item 3, declined: recording it again is what the alert-storm test pins against).
+            # A store fault's line is a TrustAnchorError too, so it is held to the same rule.
             if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
                 self._record_failed(name, exc, kind="outbound")
-            return
+            return explicit_cause(exc, AnchorStoreUnavailable) is not None
         self._destinations[name] = connector
         self._failed.pop(("outbound", name), None)
         self._dr_unbuilt.pop(name, None)
+        return False
 
     async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
         """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
@@ -4308,12 +4322,19 @@ class RegistryRunner:
         except Exception:
             log.exception("closing the rejected connector for outbound %r raised", name)
 
-    async def _start_outbound_unsafe(self, name: str) -> None:
+    async def _start_outbound_unsafe(self, name: str) -> bool:
         """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
         its connector first if the lane has none (a start-disabled or failed lane is connector-less —
         see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a pause never
         tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent for a
         name that isn't paused.
+
+        Returns True when the store stopped the lane's CA check, and does NOT resume the lane (vault
+        BACKLOG #3746). Nothing is known against the CA, and a resumed lane with no connector
+        charges each row it claims an attempt, which dead-letters it under a finite
+        ``max_attempts``. A returned value, not a raise: a scheduler tick and a reload reach this
+        too, with nobody to answer. The next start checks the CA again. A lane that was not paused,
+        such as one that failed at boot, stays as it was.
 
         REFUSES a DR-parked lane with :class:`DrParkedError`, which its public doors raise first;
         this one is the backstop for an internal caller that forgot to ask.
@@ -4332,7 +4353,7 @@ class RegistryRunner:
             # passive start's record goes, so a fault still there is recorded in this build's own
             # words (vault BACKLOG #3263).
             self._failed.pop(("outbound", name), None)
-        await self._ensure_destination_built(name)
+        check_stopped = await self._ensure_destination_built(name)
         if name in self._dr_unbuilt and name not in self._destinations:
             # The build failed on a lane held since it left the DR park (vault BACKLOG #3263).
             # Resuming it would charge each held row an attempt with no connector. The park
@@ -4343,7 +4364,9 @@ class RegistryRunner:
                 self._gate_parked.add(name)
             else:
                 self._park_outbound_lane(name)
-            return
+            return check_stopped
+        if check_stopped:
+            return True
         self._outbound_paused.discard(name)
         self._schedule_parked.discard(name)
         # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
@@ -4365,6 +4388,7 @@ class RegistryRunner:
             worker = self._workers.get(name)
             if worker is None or worker.done():
                 self._spawn_worker(name)
+        return False
 
     # --- per-connection active-window scheduler (#147, ADR 0095) --------------
 

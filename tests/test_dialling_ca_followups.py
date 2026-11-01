@@ -17,6 +17,7 @@ Each test names the single mutation it goes red under.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -36,7 +37,7 @@ from messagefoundry.auth.trust_anchors import (
     TrustAnchorError,
     trust_anchor_cause,
 )
-from messagefoundry.config.models import Priority
+from messagefoundry.config.models import Priority, RetryPolicy
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.config.wiring import (
     Ftp,
@@ -590,12 +591,12 @@ _STORE_START = "the engine could not reach its store to check a trust anchor; se
 _STORE_RESTART = "so this restart left the connection stopped"
 
 
-async def _control(engine: Engine, action: str) -> httpx.Response:
-    """POST ``action`` for the poller. A 500 arrives as a response, not a raise."""
+async def _control(engine: Engine, action: str, name: str = _IB) -> httpx.Response:
+    """POST ``action`` for ``name``. A 500 arrives as a response, not a raise."""
     app = create_app(engine, allow_no_auth=True)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-        return await client.post(f"/connections/{_IB}/{action}")
+        return await client.post(f"/connections/{name}/{action}")
 
 
 @pytest.fixture
@@ -671,6 +672,113 @@ async def test_a_stopped_check_on_a_restart_leaves_a_running_poller_down(
         assert not rr.inbound_running(_IB)
     finally:
         await engine.stop()
+
+
+#: One outbound row, so a lane resumed with no connector shows at its first claim.
+_ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|PF1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+
+
+@pytest.mark.parametrize("row_lands", [True, False], ids=["row-written", "row-lost"])
+@pytest.mark.parametrize(
+    ("action", "expected"), [("start", _STORE_START), ("restart", _STORE_RESTART)]
+)
+async def test_an_outbound_start_the_store_stopped_answers_503_and_holds_its_rows(
+    store: MessageStore,
+    tmp_path: Path,
+    judged: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    action: str,
+    expected: str,
+    row_lands: bool,
+) -> None:
+    """Vault BACKLOG #3746 item 1, the outbound half. An operator start of a connector-less lane
+    whose CA check the store stopped answered 200 running:true and resumed the lane, so a queued
+    row was claimed with no connector, charged an attempt and, at ``max_attempts`` 1, dead-lettered
+    with nothing known against the CA. It answers 503 now, the lane stays paused with the row
+    pending, and the row names the fault. A store that also refuses the audit row leaves the 503
+    standing. The next start after the store is back resumes it. Red under: the start resuming
+    the lane, the route's ``held`` arm removed, or that arm's audit write left bare."""
+    ca = _ca(tmp_path)
+    reg = _outbound_registry(ca, _sha(ca), auto_start=False, retry=RetryPolicy(max_attempts=1))
+    faulty: Any = _FaultyAuditStore(None)
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(reg)
+    await engine.start()
+    real = store.record_audit
+
+    async def refuse_control(audit_action: str, **kwargs: Any) -> None:
+        if audit_action == "connection_control":
+            raise sqlite3.OperationalError("database is locked")
+        await real(audit_action, **kwargs)
+
+    try:
+        rr = engine.registry_runner
+        assert rr is not None
+        row_id = await store.enqueue_message(
+            channel_id="IB_X", raw=_ADT, deliveries=[("OUT", _ADT)]
+        )
+        faulty.fail = "list_audit"
+        if not row_lands:
+            monkeypatch.setattr(store, "record_audit", refuse_control)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            r = await _control(engine, action, "OUT")
+        assert r.status_code == 503, r.text
+        assert expected in r.json()["detail"]
+        await asyncio.sleep(0.3)
+        rows = await store.outbox_for(row_id)
+        assert [(row["status"], row["attempts"]) for row in rows] == [("pending", 0)]
+        assert not rr.outbound_running("OUT")
+        assert "could not be checked" in (rr.outbound_failed("OUT") or "")
+        lost = [rec for rec in caplog.records if "connection_control row" in rec.getMessage()]
+        assert [rec.levelno for rec in lost] == ([] if row_lands else [logging.ERROR])
+        monkeypatch.undo()
+        if row_lands:
+            assert await _rows(store, "connection_control") == [
+                {
+                    "connection": "OUT",
+                    "action": action,
+                    "role": "destination",
+                    "running": False,
+                    "reason": "store_unavailable",
+                }
+            ]
+        faulty.fail = None
+        ok = await _control(engine, "start", "OUT")
+        assert ok.status_code == 200, ok.text
+        assert rr.outbound_running("OUT") and "OUT" in rr._destinations
+    finally:
+        await engine.stop()
+
+
+async def test_an_engine_door_holds_a_lane_the_store_stopped_without_raising(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A window open and an alert rule reach the same start with nobody to answer. It says the
+    lane is held rather than raising, so a scheduler tick logs no traceback and a reload that
+    resumes a calendar-parked lane after its swap cannot fail on it. Red under: the start raising
+    the fault."""
+    ca = _ca(tmp_path)
+    faulty: Any = _FaultyAuditStore("list_audit")
+    check = ta.make_lane_anchor_check(faulty, enforcing=True)
+    runner = _runner(
+        store, _outbound_registry(ca, _sha(ca), auto_start=False), lane_anchor_check=check
+    )
+    await runner.start()
+    try:
+        assert await runner.start_outbound("OUT") is True
+        assert await runner.restart_outbound("OUT") is True
+        assert not runner.outbound_running("OUT")
+        faulty.fail = None
+        assert await runner.start_outbound("OUT") is False
+        assert runner.outbound_running("OUT")
+    finally:
+        await runner.stop()
 
 
 def _store_fault_line() -> TrustAnchorError:
@@ -799,10 +907,70 @@ async def test_the_connection_test_route_keeps_its_line_when_its_row_fails(
         assert (r.json()["success"], r.json()["detail"]) == (False, line)
         rows = await _rows(store, "connection_test")
         assert [row["detail"] for row in rows] == ([line] if row_lands else [])
+        # Vault BACKLOG #3746 item 2: only the store's fault carries the reason.
+        reason = ["store_unavailable"] if pin is None else [None]
+        assert [row.get("reason") for row in rows] == (reason if row_lands else [])
         lost = [rec for rec in caplog.records if "connection_test row" in rec.getMessage()]
         assert [rec.levelno for rec in lost] == ([] if row_lands else [logging.ERROR])
     finally:
         await engine.stop()
+
+
+async def _test_with_its_row_refused(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, reg: Registry, check: Any, name: str
+) -> httpx.Response:
+    """POST the connection test of ``name`` with every ``connection_test`` row refused."""
+    engine = Engine(
+        store,
+        lane_anchor_check=check,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(reg)
+    await engine.start()
+    real = store.record_audit
+
+    async def refuse_test_row(action: str, **kwargs: Any) -> None:
+        if action == "connection_test":
+            raise sqlite3.OperationalError("database is locked")
+        await real(action, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", refuse_test_row)
+    try:
+        return await _control(engine, "test", name)
+    finally:
+        await engine.stop()
+
+
+async def test_a_test_stopped_at_its_ca_check_for_any_reason_keeps_its_line(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which write the route takes comes from what ``_run_connection_test`` reports, not from the
+    line's text, so a stop neither fixed line names is covered too: here a refused setting, whose
+    line is the wrapped build text. Nothing was dialled. Red under: the route keying the write on
+    the two fixed lines, which answers 500."""
+    reg = _poller_graph(Path("unused.pem"), None, auto_start=False)
+    check = _raising(AnchorSettingRefused("tls_ca_pin is set but empty"))
+    r = await _test_with_its_row_refused(store, monkeypatch, reg, check, _IB)
+    assert r.status_code == 200, r.text
+    assert "tls_ca_pin is set but empty" in r.json()["detail"]
+
+
+async def test_a_test_that_dialled_keeps_its_row_required(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: a probe that ran keeps the bare write, so a lost row on a
+    real dial still fails loudly. Red under: the route's write soft for every result."""
+    from messagefoundry.transports.rest import RestDestination
+
+    async def reachable(_self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(RestDestination, "test_connection", reachable)
+    ca = _ca(tmp_path)
+    r = await _test_with_its_row_refused(
+        store, monkeypatch, _outbound_registry(ca, _sha(ca), auto_start=False), None, "OUT"
+    )
+    assert r.status_code == 500, r.text
 
 
 async def test_a_connection_test_still_reports_a_failed_build_as_one(store: MessageStore) -> None:

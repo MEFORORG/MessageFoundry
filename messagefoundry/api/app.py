@@ -64,6 +64,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
+from pydantic import PrivateAttr
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -3734,10 +3735,12 @@ async def _record_refused_control_audit(
     name: str,
     action: str,
     *,
+    role: str,
     store_fault: bool,
     client: str | None,
 ) -> None:
-    """:func:`_record_control_audit` for an inbound whose start or restart was refused.
+    """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
+    outbound's the store stopped. ``role`` is the resolved role.
 
     Written fail-soft, as :func:`_audit_refused_reload`'s row is. The refusal's answer stands
     whether or not the row lands, and a store that stopped the trust-anchor check is likely to
@@ -3752,7 +3755,7 @@ async def _record_refused_control_audit(
                 identity,
                 name,
                 action,
-                role="source",
+                role=role,
                 running=False,
                 client=client,
                 reason=reason,
@@ -3764,10 +3767,11 @@ async def _record_refused_control_audit(
             ),
         ),
         log=_log,
-        message="a refused %s of inbound connection %s by %s at %s, reason %s: its "
+        message="a refused %s of %s connection %s by %s at %s, reason %s: its "
         "connection_control row failed",
         args=lambda: (
             action,
+            role,
             scrub_log_argument(name),
             scrub_log_argument(actor),
             scrub_log_argument(client or "-"),
@@ -3854,13 +3858,23 @@ _ANCHOR_STORE_RESTART_DETAIL = (
     "connection stopped; start it once the store is back, and see the engine log"
 )
 
-#: The two lines of a connection test the CA check stopped before it dialled anything.
-_ANCHOR_CHECK_STOPPED_DETAILS: Final = frozenset({_ANCHOR_REFUSED_DETAIL, _ANCHOR_STORE_DETAIL})
+
+def _anchor_store_detail(action: str) -> str:
+    """The fixed answer for a start or restart whose trust-anchor check the store stopped."""
+    return _ANCHOR_STORE_RESTART_DETAIL if action == "restart" else _ANCHOR_STORE_DETAIL
 
 
-async def _run_connection_test(
-    rr: RegistryRunner, name: str, direction: str
-) -> ConnectionTestResult:
+class _ConnectionTestRun(ConnectionTestResult):
+    """A :class:`ConnectionTestResult`, plus what the route's audit row needs and the reply does
+    not carry (vault BACKLOG #3746). ``_check_stopped`` is True when the test ended at its CA
+    check, whatever stopped it, so nothing was dialled. ``_reason`` is the row's ``reason``, set
+    only for a check the store stopped. Private attributes, so neither reaches the response."""
+
+    _check_stopped: bool = PrivateAttr(default=False)
+    _reason: str | None = PrivateAttr(default=None)
+
+
+async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) -> _ConnectionTestRun:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
     Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
     raising — only an unexpected bug would 500. Closes the test connector afterward.
@@ -3872,9 +3886,15 @@ async def _run_connection_test(
     that a connector's exceptions never interpolate a credential *value* — this is depth, not the seal."""
 
     def _result(
-        *, supported: bool, success: bool, ms: float, detail: str | None
-    ) -> ConnectionTestResult:
-        return ConnectionTestResult(
+        *,
+        supported: bool,
+        success: bool,
+        ms: float,
+        detail: str | None,
+        check_stopped: bool = False,
+        reason: str | None = None,
+    ) -> _ConnectionTestRun:
+        run = _ConnectionTestRun(
             name=name,
             direction=direction,
             supported=supported,
@@ -3882,6 +3902,8 @@ async def _run_connection_test(
             duration_ms=round(ms, 1),
             detail=detail,
         )
+        run._check_stopped, run._reason = check_stopped, reason
+        return run
 
     # A not-deployed connection (#233, ADR 0111) has no live endpoint to reach, and its env() must
     # NEVER be resolved — so short-circuit BEFORE build_test_connector, which would resolve env()
@@ -3898,9 +3920,11 @@ async def _run_connection_test(
             detail="connection is not deployed (deployed=false) — nothing to test",
         )
 
+    checked = False
     try:
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
+        checked = True
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
@@ -3914,14 +3938,24 @@ async def _run_connection_test(
                 "connection test of %s stopped: the store refused its trust-anchor audit",
                 scrub_log_argument(name),
             )
-            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_STORE_DETAIL)
+            return _result(
+                supported=True,
+                success=False,
+                ms=0.0,
+                detail=_ANCHOR_STORE_DETAIL,
+                check_stopped=True,
+                reason="store_unavailable",
+            )
+        failure = safe_text(str(exc))
         if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).
             _log.warning("connection test refused %r (trust anchor): %s", name, exc)
-            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
-        return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
+            failure = _ANCHOR_REFUSED_DETAIL
+        return _result(
+            supported=True, success=False, ms=0.0, detail=failure, check_stopped=not checked
+        )
     start = time.monotonic()
     supported, success, detail = True, False, None
     try:
@@ -5411,12 +5445,10 @@ def create_app(
                 # Vault BACKLOG #3746: the lane's fixed line is a TrustAnchorError for a store fault
                 # too, raised from it. Nothing is known against the CA, so that is a 503.
                 store_fault = explicit_cause(exc, AnchorStoreUnavailable) is not None
-                if not store_fault:
-                    refused = HTTPException(409, _ANCHOR_REFUSED_DETAIL)
-                elif action == "restart":
-                    refused = HTTPException(503, _ANCHOR_STORE_RESTART_DETAIL)
+                if store_fault:
+                    refused = HTTPException(503, _anchor_store_detail(action))
                 else:
-                    refused = HTTPException(503, _ANCHOR_STORE_DETAIL)
+                    refused = HTTPException(409, _ANCHOR_REFUSED_DETAIL)
             except (WiringError, InsecureHopRefused) as exc:
                 # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
                 # gate an auto_start = false listener first meets here. It escaped as a 500 with no
@@ -5439,6 +5471,7 @@ def create_app(
                     identity,
                     name,
                     action,
+                    role="source",
                     store_fault=store_fault,
                     client=client,
                 )
@@ -5449,13 +5482,15 @@ def create_app(
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
+            # Vault BACKLOG #3746: the store stopped the lane's CA check, and it was not resumed.
+            held = False
             try:
                 if action == "start":
-                    await rr.start_outbound(name)
+                    held = await rr.start_outbound(name)
                 elif action == "stop":
                     await rr.stop_outbound(name)
                 else:
-                    await rr.restart_outbound(name)
+                    held = await rr.restart_outbound(name)
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5469,6 +5504,17 @@ def create_app(
                 # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
                 # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
+            if held:
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    role="destination",
+                    store_fault=True,
+                    client=client,
+                )
+                raise HTTPException(503, _anchor_store_detail(action))
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client
@@ -5659,6 +5705,7 @@ def create_app(
                 "success": result.success,
                 "detail": result.detail,
             }
+            | ({"reason": result._reason} if result._reason is not None else {})
         )
 
         def write_row() -> Coroutine[Any, Any, None]:
@@ -5667,12 +5714,12 @@ def create_app(
                 "connection_test", actor=actor, channel_id=channel_id, detail=row, client=client
             )
 
-        if result.detail not in _ANCHOR_CHECK_STOPPED_DETAILS:
+        if not result._check_stopped:
             await write_row()
             return result
-        # Vault BACKLOG #3746: a test the CA check stopped dialled nothing, and a store that
+        # Vault BACKLOG #3746: a test that ended at its CA check dialled nothing, and a store that
         # refused the check's rows is likely to refuse this one too. A raise would replace the
-        # fixed line with a 500, so () defects.
+        # answer with a 500, so () defects.
         await write_audit_soft(
             lambda: _write_through_cancel(
                 write_row(), lambda: _lost_row("connection_test", actor, row)
