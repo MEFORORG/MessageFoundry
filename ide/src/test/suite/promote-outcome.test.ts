@@ -105,10 +105,11 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     assert.strictEqual(
       msg.text,
       "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-        "4 handlers, running. Restart the engine to apply a changed trust anchor. This reload " +
-        "checked the new file but does not load it, so the engine still trusts the old CA for: " +
-        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file. This covers only the engine that " +
-        "answered: another engine shard or cluster node reports its own anchors in its own log.",
+        "4 handlers, running. Restart the engine to apply a changed trust anchor: this reload " +
+        "checked the new file but does not load it. The names that follow are not a complete " +
+        "set: another engine shard or cluster node reports only in its own log, and a CA a hop " +
+        "loads by path is never named here. The engine still trusts the old CA for: " +
+        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file.",
     );
   });
 
@@ -130,6 +131,17 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     ["a list holding an empty name", [""]],
     ["a list holding a link", ["[Finish](command:workbench.action.reloadWindow)"]],
     ["a good name beside a bad one", ["[auth].ad_tls_ca_cert_file", "[x](command:y)"]],
+    // The anchors and the length bound: each of these holds a well-formed name, or nearly one.
+    ["a good name with a link after it", ["[auth].x [y](command:z)"]],
+    ["a link with a good name after it", ["[y](command:z) [auth].x"]],
+    ["a good name with a trailing newline", ["[auth].x\n"]],
+    ["a name in the wrong case", ["[AUTH].X"]],
+    ["a key past the length bound", [`[auth].${"x".repeat(65)}`]],
+    // Falsy values that are not null: `||` in place of `??` would read these as clean.
+    ["an empty string", ""],
+    ["zero", 0],
+    ["false", false],
+    ["an object", {}],
   ] as const) {
     test(`a restart_required of ${name} keeps the counts, warns, and prints none of it`, async () => {
       const msg = await promoteReplying(restart);

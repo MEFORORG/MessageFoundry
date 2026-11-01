@@ -10,7 +10,9 @@ import { isRecord } from "./engineTrustModel";
 /**
  * The fields of messagefoundry/api/models.py:ReloadResult (the /config/reload response) that the
  * promote reads. The engine also sends `degraded` and `failures`; reporting those is BACKLOG #2259.
- * `restart_required` is null where the engine did not check, as on a dry run, so null is no finding.
+ * `restart_required` holds setting names, or null where the engine did not check, as on a dry run,
+ * so null is no finding. It is `unknown` here because `isReloadResult` does not check it, so a reader
+ * has to go through `reloadShortfall`.
  */
 export interface ReloadResult {
   inbound: number;
@@ -19,7 +21,7 @@ export interface ReloadResult {
   handlers: number;
   running: boolean;
   dry_run: boolean;
-  restart_required?: string[] | null;
+  restart_required?: unknown;
 }
 
 /**
@@ -101,7 +103,7 @@ const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
  * did happen, and it must not read as a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
-  const names: unknown = r.restart_required ?? [];
+  const names = r.restart_required ?? [];
   if (
     !Array.isArray(names) ||
     !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
@@ -115,10 +117,10 @@ function reloadShortfall(r: ReloadResult): string[] {
     return [];
   }
   return [
-    "Restart the engine to apply a changed trust anchor. This reload checked the new file but " +
-      `does not load it, so the engine still trusts the old CA for: ${names.join(", ")}. This ` +
-      "covers only the engine that answered: another engine shard or cluster node reports its " +
-      "own anchors in its own log.",
+    "Restart the engine to apply a changed trust anchor: this reload checked the new file but " +
+      "does not load it. The names that follow are not a complete set: another engine shard or " +
+      "cluster node reports only in its own log, and a CA a hop loads by path is never named " +
+      `here. The engine still trusts the old CA for: ${names.join(", ")}.`,
   ];
 }
 
