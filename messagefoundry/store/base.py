@@ -3111,9 +3111,9 @@ class AuthStore(Protocol):
         """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
         return how many it revoked (BACKLOG #2614).
 
-        Raises the session epoch of the accounts its read of the account list returns, then ends
-        the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for what it
-        may miss. A kept session whose seal does not verify raises
+        Raises the session epoch of at most the accounts its read of the account list returns,
+        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
+        what it may miss. A kept session whose seal does not verify raises
         :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
         ...
 

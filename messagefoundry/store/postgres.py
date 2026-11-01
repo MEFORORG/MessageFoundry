@@ -10636,9 +10636,9 @@ class PostgresStore:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
-        Raises the session epoch of the accounts its read of the account list returns, then ends
-        the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for what it
-        may miss."""
+        Raises the session epoch of at most the accounts its read of the account list returns,
+        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
+        what it may miss."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
