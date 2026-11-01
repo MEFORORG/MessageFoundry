@@ -105,8 +105,7 @@ from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.exception_origin import (
     exception_chain,
-    raised_again_outside_the_engine,
-    raised_by_the_engine,
+    raised_only_by_the_engine,
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
@@ -9476,15 +9475,11 @@ def _module_failure(
     return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
 
 
-def _on_the_main_thread() -> bool:
-    return threading.current_thread() is threading.main_thread()
-
-
 def _is_a_signal(exc: BaseException) -> bool:
     """Whether ``exc`` can be what Ctrl-C raised. A subclass is not what a signal raises, and Python
     delivers a signal only to the main thread, so on any other, such as a reload's worker, an
     interrupt is code, and one leaving there would stop the event loop."""
-    return type(exc) is KeyboardInterrupt and _on_the_main_thread()
+    return type(exc) is KeyboardInterrupt and threading.current_thread() is threading.main_thread()
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -9684,11 +9679,7 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
         return True
     # The exact class: only the runtime's own has fixed text, and a subclass can write its own. By
     # identity, because ``in`` would run a metaclass's ``__eq__``.
-    return (
-        any(type(exc) is limit for limit in _RUNTIME_LIMITS)
-        and raised_by_the_engine(exc)
-        and not raised_again_outside_the_engine(exc)
-    )
+    return any(type(exc) is limit for limit in _RUNTIME_LIMITS) and raised_only_by_the_engine(exc)
 
 
 def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
@@ -9748,9 +9739,9 @@ def _refusal_for(
     value; tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no
     refusal that sits behind another. What it was raised from that the engine did not word can hold
     a value: the whole text of such an exception is taken out of the refusal, and the chain goes. A
-    slice of that text, or a copy made before the raise, stays. Only an exact ``WiringError`` stands
-    as raised: a subclass can write what prints through more methods than one, and ``check``
-    formats a refusal with an f-string, so any other is rebuilt plain.
+    slice of that text, or a copy made before the raise, stays. Only an exact ``WiringError`` whose
+    arguments are text stands as raised: a subclass can write what prints through more methods than
+    one, and ``check`` formats a refusal with an f-string, so any other is rebuilt plain.
 
     An import failure keeps a textless stand-in of its type as the cause, because the engine-shard
     preflight (_config_preflight) reads the cause's type for its helper advice.
