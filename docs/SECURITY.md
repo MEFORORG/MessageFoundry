@@ -146,8 +146,8 @@ with its gate, in [Route → permission map](#route--permission-map-engine-api) 
 implicit.
 
 Both app factories are **fail-closed**. With no `AuthService` attached, `create_app(engine)`
-and `create_managed_app(...)` deny every protected route unless the caller explicitly opts out
-with `allow_no_auth=True`, the escape hatch for embedders and tests. Neither factory reaches
+and `create_managed_app(...)` deny every protected route. Only `allow_no_auth=True`, the escape
+hatch for embedders and tests, opens the bearer-token gates. Neither factory reaches
 that mode by omission, both refuse the opt-in beside an auth service or auth settings, and `serve`
 never passes it. `serve` always requires sign-in, on every bind, loopback included (vault BACKLOG
 #2719), and no setting turns an attached service off (vault BACKLOG #2825). It used to allow a loopback
@@ -4118,7 +4118,8 @@ dict. Each model now gets a serializer over its own gated properties only
 ([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
 closed. The published schema of every other gated model is unchanged.
 
-**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves every route to
+**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves every route
+behind a bearer-token gate to
 the built-in system identity, which holds every role and therefore every permission, so the
 per-property gate withholds nothing there. `serve` never builds that app (vault BACKLOG #2719).
 
@@ -6968,9 +6969,9 @@ these sit outside the list:
 - the dialling settings CAs named above. Their hops load the file by path and record no fingerprint
   to compare with, so a changed one is never listed, and it can still need a restart or a rebuild
   of the connections that use it;
-- another engine shard. A reload is per process with no fleet coordination (ADR 0073), so an engine
-  shard reports at least when a reload or a DR activation on it reaches this check, and only a
-  reload's response carries the list;
+- another engine shard. A reload is per process with no fleet coordination (ADR 0073). An engine
+  shard logs and audits a changed anchor at least when a reload or a DR activation on it runs the
+  settings check. Only a reload's response carries the list;
 - another cluster node, converging on the reload. It has no response to carry a list, and the
   `auth.trust_anchor` row names no node, so it says so only in its own log, and only once its
   convergence reload reaches this check.

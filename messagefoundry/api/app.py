@@ -15,10 +15,10 @@ be driven two ways:
 Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and no setting
 turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
 bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
-protected route is refused unless the caller passes ``allow_no_auth=True``, in which case the
-bearer-token gates admit a caller as the full-access system identity (SYS-1). Both factories refuse
-that opt-in beside an auth service or auth settings. Only embedders and tests pass it; ``serve``
-never does.
+protected route is refused. Only ``allow_no_auth=True`` opens the bearer-token gates, which then
+admit a tokenless caller as the full-access system identity (SYS-1). Both factories refuse that
+opt-in beside an auth service or auth settings. Only embedders and tests pass it; ``serve`` never
+does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -11568,10 +11568,10 @@ def create_managed_app(
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
-    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes, and
-    the build logs one WARNING naming which of the two it got. Beside ``auth_settings`` that opt-in
-    raises ``ValueError``.
+    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused.
+    Only ``allow_no_auth=True``, the same opt-in :func:`create_app` takes, opens the bearer-token
+    gates. The build logs one WARNING naming which of the two it got. Beside ``auth_settings`` that
+    opt-in raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -12549,20 +12549,21 @@ def create_managed_app(
         # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app is in one
         # of two modes. The denied line cannot sit in create_app, which every managed app calls
         # with auth=None before the lifespan attaches a service, and the open line stays beside it.
-        # auth_settings stays an argument because app.state.auth is None at build on every managed
-        # app. The mode comes from app.state, the flag the gates read, not from this argument.
+        # The outer test stays on auth_settings because no managed app has a service at build, so
+        # app.state cannot answer it. The mode comes from app.state through open_mode, as the gates
+        # read it, and not from the allow_no_auth argument.
         if open_mode(app.state):
             _log.warning(
                 "create_managed_app: built with allow_no_auth=True and no auth_settings, so no "
-                "service attaches and the API's bearer-token gates admit any caller as the "
-                "full-access system identity, with no sign-in"
+                "service attaches and the API's bearer-token gates admit a tokenless caller as "
+                "the full-access system identity, with no sign-in"
             )
         else:
             _log.warning(
                 "create_managed_app: built with no auth_settings and without allow_no_auth, so %s: "
                 "no service attaches and the API's bearer-token gates refuse every caller. "
-                "auth_settings attaches sign-in; allow_no_auth=True instead admits any caller as "
-                "the full-access system identity",
+                "auth_settings attaches sign-in; allow_no_auth=True instead admits a tokenless "
+                "caller as the full-access system identity",
                 AUTH_NOT_CONFIGURED,
             )
     return app

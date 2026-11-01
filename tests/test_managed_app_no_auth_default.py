@@ -90,9 +90,7 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
     )
     # The refusal is the handshake's HTTP answer, sent before accept (refuse_websocket), so the test
     # client raises the denial itself; a bare WebSocketDisconnect would also pass a socket that
-    # accepted and then dropped (vault BACKLOG #2731 item 6). The test client always offers the denial
-    # extension, so the 1008 close arm is test_without_the_extension_every_refusal_is_still_a_bare_close
-    # in tests/test_ws_handshake_header_floor.py, on the same route.
+    # accepted and then dropped (vault BACKLOG #2731 item 6).
     with (
         TestClient(refused) as tc,
         pytest.raises(WebSocketDenialResponse) as denied,
@@ -116,16 +114,16 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
 _FACTORY_LOGGER = create_managed_app.__module__
 
 
-def _assert_build_lines(caplog: pytest.LogCaptureFixture, *wordings: str) -> None:
+def _assert_build_line(caplog: pytest.LogCaptureFixture, wording: str | None) -> None:
     """Every WARNING the factory's logger wrote, so a second line worded differently counts too:
-    exactly one line per wording, each holding it."""
+    one line holding ``wording``, or none for ``None``."""
     lines = [
         r.getMessage()
         for r in caplog.records
         if r.name == _FACTORY_LOGGER and r.levelno >= logging.WARNING
     ]
-    assert len(lines) == len(wordings), lines
-    assert all(wording in line for line, wording in zip(lines, wordings, strict=True)), lines
+    assert len(lines) == (0 if wording is None else 1), lines
+    assert wording is None or wording in lines[0]
 
 
 #: Each build line's own words: neither line holds the other's.
@@ -136,22 +134,22 @@ _OPEN_LINE = "with no sign-in"
 @pytest.mark.parametrize(
     ("auth_settings", "allow_no_auth", "expected"),
     [
-        pytest.param(None, False, (_DENIED_LINE,), id="nothing-passed"),
-        pytest.param(None, True, (_OPEN_LINE,), id="opted-in"),
+        pytest.param(None, False, _DENIED_LINE, id="nothing-passed"),
+        pytest.param(None, True, _OPEN_LINE, id="opted-in"),
         pytest.param(
             AuthSettings(require_mfa=False, notify_security_events=False),
             False,
-            (),
+            None,
             id="auth-settings",
         ),
     ],
 )
-def test_a_build_with_no_auth_settings_names_its_mode_once(
+def test_a_build_names_its_no_auth_mode_once(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     auth_settings: AuthSettings | None,
     allow_no_auth: bool,
-    expected: tuple[str, ...],
+    expected: str | None,
 ) -> None:
     """Vault BACKLOG #2731 item 1 and #3746 item 17: a build with no settings logs one WARNING
     naming the mode it got, the deny-all default or the open mode. Enabled settings are the control:
@@ -164,7 +162,7 @@ def test_a_build_with_no_auth_settings_names_its_mode_once(
         allow_no_auth=allow_no_auth,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    _assert_build_lines(caplog, *expected)
+    _assert_build_line(caplog, expected)
 
 
 @pytest.mark.parametrize(
@@ -203,7 +201,7 @@ def test_the_build_line_reads_the_state_the_gates_read(
         allow_no_auth=not state,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    _assert_build_lines(caplog, wording)
+    _assert_build_line(caplog, wording)
 
 
 async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signed_in_one(
