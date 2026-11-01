@@ -1611,9 +1611,8 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
   `[security].enforcement = warn` does not lift the refusal: the HTTP family's no-loosen floor
   turns that WARN back into a refusal.
 - **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses. A connection
-  cannot hold it and `cleartext_accepted` together, whether it is built by `outbound()`,
-  `FhirLookup()`, `connections.toml` or directly as a `Destination` or `FhirLookupExecutor`, so an
-  attested connection has no route to a `proxy_user` login on a proxy off this machine. Decision
+  cannot hold it and `cleartext_accepted` together ([the pair rule](#attesting-a-hop-secure-tls_hop_attested)),
+  so an attested connection has no route to a `proxy_user` login on a proxy off this machine. Decision
   d20261031T213402506-5d928c, taken under the owner's delegation of 2026-10-31, keeps it so: the
   owner's 2026-10-05 ruling declined an unconditional refusal, and B462-R2 keeps `proxy_url` plus
   `proxy_user`, so `cleartext_accepted` stays the declared route even at a site whose proxy leg
@@ -3435,7 +3434,9 @@ tls_hop_attested_reason = "TLS terminates at the stunnel sidecar"
 `DatabaseLookup()` and `DatabaseRef()`. It is a top-level key, **not** a transport setting. Under
 `[settings]`, or written into a factory's settings dict from Python, it is refused at load. A flag with
 no reason, a blank reason, or a reason with no flag also fail at load. So does an `env()` value, and so
-does declaring it together with `cleartext_accepted`, which is the opposite claim.
+does declaring it together with `cleartext_accepted`, which is the opposite claim. The pair is
+refused at construction as well, at least for a `Destination` or a `FhirLookupExecutor` built
+directly rather than through a factory.
 
 **Do not attest a hop that is not secure.** A peer that simply cannot do TLS is
 [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted), which WARNs at every

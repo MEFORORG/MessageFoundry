@@ -271,31 +271,58 @@ def test_tls_hop_attested_does_not_admit_a_proxy_credential(
     assert not [r for r in caplog.records if "ATTESTED secure" in r.getMessage()]
 
 
-def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None:
-    """``outbound()`` and ``_dest_config`` refuse the pair, and so does the model itself, so a
-    ``Destination`` built directly cannot reach the connector with both. With both set, the
-    acceptance would admit the proxy login while the attestation silenced the hop's WARN and audit
-    record (decision d20261031T213402506-5d928c keeps ``cleartext_accepted`` as the route and gives
+@pytest.mark.parametrize("target", [_HTTP_TARGET, _HTTPS_TARGET], ids=["http", "https"])
+def test_a_directly_built_destination_refuses_attested_beside_accepted(target: str) -> None:
+    """``outbound()`` refuses the pair, and so does the model itself, which is the one check a
+    directly built ``Destination`` or ``OutboundConnection`` meets. Before, both built and the
+    acceptance admitted the proxy login. On an ``http`` target the body hop's disposition reads the
+    attestation first, so that hop crossed with no acceptance record (decision
+    d20261031T213402506-5d928c keeps ``cleartext_accepted`` as the proxy route and gives
     ``tls_hop_attested`` none)."""
     with pytest.raises(ValueError, match="opposite claims"):
-        _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
+        _rest(target, accepted=True, attested=True, **_PROXY_LOGIN)
+
+
+_ACCEPTED: dict[str, Any] = {
+    "cleartext_accepted": True,
+    "cleartext_reason": "legacy partner listener has no TLS",
+}
+
+
+def _lookup(**declarations: object) -> FhirLookupExecutor:
+    """One ``FhirLookupExecutor`` built directly, with the proxy login, under an enforcing posture."""
+    settings = {
+        "url": _HTTPS_TARGET,
+        **_PROXY_LOGIN,
+        "tls_revocation_attested": True,
+        "tls_revocation_attested_reason": "revocation-checking PKI at the partner edge",
+        **declarations,
+    }
+    with active_hop_posture(HopPosture(enforcing=True)):
+        return FhirLookupExecutor({"lk": settings}, egress=permitting(settings))
 
 
 def test_a_directly_built_fhir_lookup_refuses_attested_beside_accepted() -> None:
     """``FhirLookup()`` and the runner's settings builder refuse the pair, and so does the executor,
-    so one built directly from a settings mapping cannot admit a proxy login under both."""
-    settings = {
-        "url": _HTTPS_TARGET,
-        **_PROXY_LOGIN,
-        "tls_hop_attested": True,
-        "tls_hop_attested_reason": "IPsec tunnel to the partner",
-        "cleartext_accepted": True,
-        "cleartext_reason": "legacy partner listener has no TLS",
-        "tls_revocation_attested": True,
-        "tls_revocation_attested_reason": "revocation-checking PKI at the partner edge",
-    }
+    so one built directly from a settings mapping cannot hold it."""
+    attested = {"tls_hop_attested": True, "tls_hop_attested_reason": "IPsec tunnel to the partner"}
     with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*opposite claims"):
-        FhirLookupExecutor({"lk": settings}, egress=permitting(settings))
+        _lookup(**attested, **_ACCEPTED)
+
+
+@pytest.mark.parametrize("reason", [None, "   "], ids=["missing", "blank"])
+def test_a_directly_built_fhir_lookup_refuses_an_acceptance_with_no_reason(
+    reason: str | None,
+) -> None:
+    """``FhirLookupSpec`` refuses it, and the executor now does too, so a proxy login is not
+    admitted on an acceptance whose record would carry no reason."""
+    with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*cleartext_reason"):
+        _lookup(cleartext_accepted=True, cleartext_reason=reason)
+
+
+def test_control_a_directly_built_fhir_lookup_with_the_acceptance_alone_builds() -> None:
+    """The same settings without the attestation: the declared route builds and sends the login."""
+    assert _lookup(**_ACCEPTED)._headers["lk"]["Proxy-Authorization"] == _HEADER
 
 
 def test_control_tls_hop_attested_still_carries_the_body_hop_past_a_credential_free_proxy() -> None:

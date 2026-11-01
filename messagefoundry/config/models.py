@@ -357,12 +357,12 @@ def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
 def check_attested_and_accepted(attested: bool, accepted: bool) -> None:
     """Refuse a declaration that claims its hop is both secure and not secure.
 
-    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
-    record never fire, and the hop crosses silently while declaring an accepted risk. On the proxy
-    leg the acceptance still admits a proxy login, so a pair would carry that credential across with
-    the attestation's silence. The factories refuse the pair through ``config.wiring``; this is the
-    one rule they share with :class:`Destination` and the ``FhirLookup`` read executor, so neither
-    can be built directly into the state the factories refuse."""
+    The body hop's disposition checks the attestation first, so on a cleartext body hop with both set
+    the acceptance's WARN and audit record never fire, and the hop crosses silently while declaring
+    an accepted risk. (The proxy leg reads the acceptance alone, so there the pair adds nothing; it
+    is refused as an incoherent declaration all the same.) The factories refuse the pair through
+    ``config.wiring``; this is the one rule they share with :class:`Destination` and the
+    ``FhirLookup`` read executor, so neither can be built directly with the pair."""
     if attested and accepted:
         raise ValueError(
             "tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
@@ -808,6 +808,10 @@ class WindowsCredential(BaseModel):
 class Destination(BaseModel):
     """An outbound connector endpoint. Each outbound connection queues independently
     so a slow/failed one never blocks the others."""
+
+    # A refusal from the validators below must not echo the resolved settings, which hold secrets
+    # such as ``proxy_password``, into a ValidationError's input.
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     name: str
     type: ConnectorType

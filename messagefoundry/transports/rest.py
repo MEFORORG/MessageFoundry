@@ -2284,7 +2284,8 @@ def proxy_auth_handler_from_settings(
         message=(
             f"sends a {credential} over cleartext http to {proxy_host!r}; unlike the "
             "destination's own credentials, this leg can be declared with cleartext_accepted and "
-            "a cleartext_reason; tls_hop_attested does not admit it"
+            "a cleartext_reason; tls_hop_attested does not admit it, and a connection that "
+            "declares it drops it first, since the two cannot be declared together"
         ),
         attested=False,
         cleartext_accepted=cleartext_accepted,

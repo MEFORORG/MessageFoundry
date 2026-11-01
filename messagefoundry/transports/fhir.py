@@ -64,6 +64,7 @@ from typing import Any, Literal, NamedTuple, overload
 from messagefoundry.config.models import (
     ConnectorType,
     Destination,
+    _check_cleartext_acceptance,
     bool_setting,
     check_attested_and_accepted,
     hop_attestation_from_settings,
@@ -1920,9 +1921,10 @@ class FhirLookupExecutor:
             try:
                 attested = hop_attestation_from_settings(s)
                 lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
-                # The pair FhirLookup() and the runner's settings builder refuse, refused here too,
-                # so a directly built executor cannot admit a proxy login under both (decision
-                # d20261031T213402506-5d928c gives tls_hop_attested no proxy route).
+                # FhirLookup() and the runner's settings builder refuse an acceptance with no reason
+                # and the attested-plus-accepted pair; a directly built executor meets the same
+                # rules here, so it cannot hold a state the factories refuse.
+                _check_cleartext_acceptance(lk_accepted, lk_reason)
                 check_attested_and_accepted(attested, lk_accepted)
             except ValueError as exc:
                 raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
