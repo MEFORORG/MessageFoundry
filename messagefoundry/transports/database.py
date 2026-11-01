@@ -13,13 +13,17 @@ weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised
 job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
 any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
-list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), none of which names a host, so a keyword cannot give
-the driver a host other than the ``server`` that ``[egress].allowed_db`` checks (vault BACKLOG #2577). On the generic
-path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
+list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`): the list is hand-chosen, no keyword is on it in order to
+name a host, and a file keyword's value is screened separately by spelling.
+``[egress].allowed_db`` reads the host from the ``server`` setting (vault BACKLOG #2577). The list covers
+keywords only, and relies on at least a driver named on the escape list reading the ``}}`` escape in a
+braced password (:func:`_odbc_password`), and the driver reading ``SERVER`` as its target
+(docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). On the generic path TLS is the operator's responsibility (configured through
+the driver's own keyword) — MessageFoundry
 cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
-Construction logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
+Construction logs the delegation as a fail-safe (a WARNING when no TLS mode is set, or one says no TLS — see
 :func:`_warn_generic_tls_unenforced`) and **gates it**: a generic hop whose ``odbc_params`` say TLS is not
-required goes through the shared cleartext-hop authority like every other cleartext transport, so an
+required, or set no mode, goes through the shared cleartext-hop authority like every other cleartext transport, so an
 enforcing instance refuses it off-loopback rather than crossing in the clear (BACKLOG #1178 — see
 :func:`generic_cleartext_hop_guard`). The live aioodbc round-trip is exercised by the CI SQL Server service-container job
 (``tests/test_database_connector_integration.py``); the connector logic is also unit-tested with a
@@ -86,6 +90,7 @@ from messagefoundry.config.tls_policy import (
     current_hop_posture,
     hop_name_prefix,
 )
+from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
@@ -116,6 +121,7 @@ from messagefoundry.transports.db_endpoint import (
     odbc_keyword_name,
     odbc_param,
 )
+from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = [
@@ -272,7 +278,7 @@ def _build_dsn(
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
 # metacharacters (`; { } =`) and newlines is the STORE-5 guard for the operator-supplied generic keys
-# (the VALUES are additionally brace-quoted), so message-influenced data can't smuggle extra keywords.
+# (the VALUES are checked by _odbc_literal), so message-influenced data can't smuggle extra keywords.
 _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 
 # The ONLY keywords ``odbc_params`` may set on the generic dialect (vault BACKLOG #2577), in the form
@@ -282,8 +288,9 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # that check means something only while a keyword cannot hand the driver another host. Every ODBC
 # driver has its own keywords for a host, an address, a data source name, a socket or a whole option
 # string, and a new driver release can add another. A list of refused names would always trail the
-# drivers. This list instead names keywords the engine knows to carry no host, and
-# :func:`_build_odbc_dsn` refuses everything else when the connection is built.
+# drivers. Here the list is hand-chosen, no keyword is on it in order to name a host,
+# and a file keyword's value is screened separately by spelling. :func:`_build_odbc_dsn` refuses
+# everything else when the connection is built.
 #
 # WHAT EARNS A PLACE. A keyword whose value is a port, a TLS mode, a local file the driver verifies or
 # authenticates with, or a session setting. Nothing that names a host, a service, a data source or a
@@ -292,8 +299,10 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # a second copy here would leave the driver to choose between the two. A keyword whose only use is
 # to stop certificate verification is absent too.
 #
-# WHAT THE LIST DOES NOT SETTLE. It is a rule about keywords. Which driver ``odbc_driver`` names, and
-# what that driver does with the keywords it is sent, are outside it.
+# WHAT THE LIST DOES NOT SETTLE. It is a rule about keywords, and relies on at least a driver named
+# on the escape list reading the ``}}`` escape in a braced password, and the driver reading
+# ``SERVER`` as its target (docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). Which driver ``odbc_driver`` names,
+# and what that driver does with the keywords it is sent, are outside it.
 #
 # ``port`` is here because the generic dialect has no other way to send one. It moves the port and
 # never the host.
@@ -335,10 +344,22 @@ _ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 # screens. A path keyword added to the list above belongs here too; a test holds this a subset.
 _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
-# A best-effort hint that the operator configured driver-level TLS via an odbc_params keyword (anything
-# ssl/tls/encrypt-ish — psqlODBC `SSLmode`, MySQL `SSLMODE`, some drivers' `Encrypt`). Used ONLY to tune
-# the severity of the generic-path construction-time TLS reminder (WARNING vs DEBUG) — never to gate or
-# alter the connection. It cannot prove the value *verifies* the cert, only that TLS was addressed.
+# The ONLY keywords the engine counts as setting a generic hop's TLS mode, in the form
+# :func:`odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
+# as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
+# docs/CONNECTIONS.md records what the drivers read so far do with one.
+#
+# `encrypt` IS UNPROVEN. It is here for a driver that reads it. docs/CONNECTIONS.md records that
+# neither psqlODBC's keyword parser nor MySQL Connector/ODBC's parameter page has it. On a driver
+# that ignores it, `Encrypt=yes` would clear this gate and leave the driver at its own default, so
+# treat that spelling as the operator's claim, not a tested control.
+_ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
+
+# Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
+# about the hop, so presence is never ownership: this picks which keywords' values are read against
+# :data:`_ODBC_NO_TLS_VALUES`, and tells "no TLS keyword" from "no TLS mode" in the reason an operator
+# reads. Since BACKLOG #1178 a no-TLS value found this way also gates the hop, so this is not
+# report-only. It can never clear a hop.
 _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 
 # The VALUES of a TLS-ish keyword that mean TLS is NOT REQUIRED on the hop, so the connection may cross
@@ -351,6 +372,12 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   psqlODBC `sslmode`  : disable (never) / allow (plaintext first) / prefer (opportunistic, silent fallback)
 #   MySQL    `SSLMODE`  : DISABLED / PREFERRED (same two shapes)
 #   assorted `Encrypt`  : no / 0 / false / off
+#   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
+#
+# Since BACKLOG #2705 the build also holds `sslmode` to libpq's six lower-case spellings on every
+# driver but MySQL Connector/ODBC (_refuse_unread_sslmode), so for a built hop this list's open end
+# matters for `encrypt`, and for `sslmode` on MySQL's driver. The posture readers classify specs
+# that were never built, so they still apply the list alone.
 #
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
 # `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
@@ -366,6 +393,7 @@ _ODBC_NO_TLS_VALUES: tuple[str, ...] = (
     "prefer",
     "preferred",
     "no",
+    "optional",
     "off",
     "false",
     "0",
@@ -390,10 +418,34 @@ _ODBC_SECRET_KEY_RE = re.compile(
 )
 
 
-def _is_tls_mode_keyword(name: str) -> bool:
-    """True for an ``odbc_params`` keyword that may set the hop's TLS mode: it matches the TLS hint
-    and is not a secret-bearing keyword."""
+def _is_tls_keyword(name: str) -> bool:
+    """True for an ``odbc_params`` keyword about TLS: it matches the TLS hint and is not a
+    secret-bearing keyword. Being one sets no mode; :func:`_sets_tls_mode` asks that."""
     return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
+
+
+def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
+    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value with no
+    blank at either end. Anything else sets nothing: the engine has no evidence of how a driver reads
+    it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good
+    one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+
+    A padded value does not count because a driver that does not trim would read something other
+    than the word judged here: psqlODBC switches on the first character, so ``" require"`` would
+    select its default. Since BACKLOG #2705 :func:`_build_odbc_dsn` refuses a blank, padded or
+    boolean value outright, on any posture, so this matters for the posture readers, which classify
+    specs that were never built. :func:`_odbc_keyword` refuses a padded keyword for the same reason.
+
+    Every key is read, not the first spelling of each, so the answer for a table that names a mode
+    keyword twice in different case does not depend on key order. The build refuses such a table;
+    the posture readers classify specs that were never built."""
+    return any(
+        odbc_keyword_name(str(key)) in _ODBC_TLS_MODE_KEYWORDS
+        and isinstance(value, str)
+        and value.strip()
+        and value == value.strip()
+        for key, value in params.items()
+    )
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -401,10 +453,10 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     ``["KEY=value", ...]`` (#333). Empty when the operator set no such value. The value is rendered
     as the lower-case constant from :data:`_ODBC_NO_TLS_VALUES` it matched, never as supplied, and a
     keyword :data:`_ODBC_SECRET_KEY_RE` names is skipped. What a report can carry is therefore a
-    keyword name and one of those nine words; a secret keyword that regex does not name could still
+    keyword name and one of those words; a secret keyword that regex does not name could still
     be reported as ``KEY=<word>`` when its value is one of them.
 
-    The SINGLE classifier for the generic-ODBC cleartext-risk question, shared by this module's
+    One half of :func:`generic_odbc_tls_unenforced`, the verdict shared by this module's
     construction-time reminder (:func:`_warn_generic_tls_unenforced`) and by the posture readers that
     report the hop to an operator (``config.wiring.unverified_generic_db_hops`` ->
     ``security_loosenings`` / ``GET /security/posture`` / ``messagefoundry check``). One definition, so a
@@ -414,7 +466,7 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     found: list[str] = []
     for key, value in params.items():
         name = str(key)
-        if not _is_tls_mode_keyword(name):
+        if not _is_tls_keyword(name):
             continue
         label = _no_tls_label(value)
         if label is not None:
@@ -423,13 +475,19 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
 
 
 def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
-    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when the operator addressed TLS.
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
+    finds a usable mode value and no TLS keyword holds a no-TLS word. A blank, padded or non-string
+    mode value is not usable, so it does not clear the hop.
 
-    Two ways to be at risk, and they read differently to an operator, so they are reported differently:
-    no TLS keyword at all, or a TLS keyword pinned to a no-TLS value (the latter names the offenders).
-    Shares :func:`generic_odbc_no_tls_params` with the construction reminder — see that docstring for
-    why a value deny-list, and for the encrypted-but-unverified residual this deliberately does not
-    classify.
+    Three ways to be at risk, and they read differently to an operator, so they are reported
+    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a TLS keyword with
+    no mode beside it, such as a lone ``sslcert`` or a blank ``sslmode`` (BACKLOG #2483), or no TLS
+    keyword at all. Only :data:`_ODBC_TLS_MODE_KEYWORDS` can clear a hop. Shares
+    :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
+    :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
+    this deliberately does not classify. An unrecognized mode value stays delegated here for the same
+    reason, though since BACKLOG #2705 the build refuses an ``sslmode`` spelling
+    :func:`_refuse_unread_sslmode` rejects before this verdict is used.
 
     Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
     non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so
@@ -439,8 +497,10 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if any(_is_tls_mode_keyword(str(k)) for k in params):
+    if _sets_tls_mode(params):
         return None
+    if any(_is_tls_keyword(str(k)) for k in params):
+        return "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
     return "no TLS keyword is set in odbc_params"
 
 
@@ -510,24 +570,127 @@ def _odbc_unsafe_text(text: str, refused: str) -> bool:
     return not text.isascii() or has_control_char(text) or any(ch in refused for ch in text)
 
 
-def _odbc_literal(value: object, *, what: str, connection: str | None, refused: str = ";{}") -> str:
-    """``value`` brace-quoted for the generic connection string, or a ValueError when it is not
-    printable ASCII or holds a ``refused`` character (vault BACKLOG #2577).
-
-    The braces are the ODBC quoting rule and ``}}`` is its escape. Not every driver is known to read
-    that escape, and one that does not would see the value end at the first ``}`` and read what
-    follows as the next keyword. So for every value the engine can restrict at no cost, the
-    delimiters are refused instead of escaped. A password is the exception (``refused=""``): it must
-    be able to hold any printable ASCII character, so it keeps the ODBC escape and relies on the
-    driver reading it. The refusal names the setting and never the value."""
-    text = str(value)
+def _refuse_unsafe_text(text: str, *, what: str, connection: str | None, refused: str) -> None:
+    """A ValueError when ``text`` is not printable ASCII or holds a ``refused`` character
+    (vault BACKLOG #2577). The refusal names the setting and never the value."""
     if _odbc_unsafe_text(text, refused):
-        listed = ", ".join(f"'{ch}'" for ch in refused)
+        # repr, so a quote character prints readably: ';' stays ';', and ' prints as "'".
+        listed = ", ".join(repr(ch) for ch in refused)
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE {what} must hold only printable ASCII characters"
             + (f", and none of {listed}" if refused else "")
         )
-    return odbc_brace(text)
+
+
+def _refuse_none(value: object, *, what: str, connection: str | None) -> None:
+    """A ValueError when ``value`` is ``None`` (BACKLOG #2705). An unbraced setting is sent as its
+    ``str()``, so a ``None`` would reach the driver as the four letters ``None`` rather than as no
+    value. An unset ``database``, ``username`` or ``password`` is left out of the string instead,
+    and an ``odbc_params`` keyword with no value should be left out of the table."""
+    if value is None:
+        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {what} must not be None")
+
+
+# The characters a value sent WITHOUT braces must not hold (BACKLOG #2705): the three that end a
+# value or open a braced one, ``=``, and both quote characters. The quotes sat inside braces on
+# main, and how a driver reads one in a plain value has not been measured.
+_ODBC_UNBRACED_REFUSED = ";{}=\"'"
+
+
+def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
+    """``value`` as the generic connection string sends it, WITHOUT braces, or a ValueError (BACKLOG
+    #2705). Used for ``database``, ``username`` and every ``odbc_params`` value.
+
+    Braced values were measured to be misread (psqlODBC ran ``SSLmode={verify-full}`` with no TLS).
+    A plain value cannot be quoted, so at least these are refused instead: the characters in
+    :data:`_ODBC_UNBRACED_REFUSED`, a value that is not printable ASCII, ``None``, and an empty,
+    blank or padded value. docs/CONNECTIONS.md, *Values on the generic dialect*, holds the rules,
+    the reasons and the measurements; this docstring does not restate them.
+
+    The refusal names the setting and never the value. A password follows its own rule
+    (:func:`_odbc_password`), and the driver name stays braced."""
+    _refuse_none(value, what=what, connection=connection)
+    text = str(value)
+    _refuse_unsafe_text(text, what=what, connection=connection, refused=_ODBC_UNBRACED_REFUSED)
+    if not text or text != text.strip():
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE {what} must not be empty, blank, "
+            "or start or end with a space"
+        )
+    return text
+
+
+# MySQL Connector/ODBC's registered names, in lower case. The escape list below holds them, and
+# they alone keep MySQL's own ``SSLMODE`` spellings (:func:`_refuse_unread_sslmode`).
+_MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
+_MYSQL_ODBC_DRIVERS = re.compile(_MYSQL_ODBC_DRIVER_NAME)
+
+# The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
+# with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
+# names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
+# Server``, not probed then but relied on for the same escape by the SQL Server preset and the
+# store. psqlODBC's names include the bare ``PostgreSQL``, the section name RHEL registers it
+# under. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
+# has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
+# merely mentions a database, a library path, or another registered name that only folds to one of
+# these is unmeasured and does not match.
+_ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
+    r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
+    rf"|{_MYSQL_ODBC_DRIVER_NAME}"
+    r"|odbc driver [0-9]+ for sql server"
+)
+
+# The ``sslmode`` values the generic dialect sends for any driver but MySQL Connector/ODBC: libpq's
+# six modes, exactly, in lower case (BACKLOG #2705). psqlODBC's source reads an ``SSLmode`` value by
+# its first byte, and only a lower case one names a mode, so ``Require``, ``VERIFY-FULL``,
+# ``REQUIRED``, ``on`` or ``1`` would mean disable to it, while :func:`generic_odbc_tls_unenforced`
+# counts each as TLS addressed. Only these spellings mean the same thing to both.
+_LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+
+
+def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
+    """A ValueError when an ``sslmode`` value is not one of :data:`_LIBPQ_SSL_MODES`, exactly
+    (BACKLOG #2705). The keyword is matched in any case, as the build matches every keyword.
+
+    The rule depends on the driver family, read from the ``odbc_driver`` name: MySQL Connector/ODBC
+    sends the same keyword with its own upper case values (``REQUIRED``, ``VERIFY_IDENTITY``), so a
+    name :data:`_MYSQL_ODBC_DRIVERS` matches whole is left to MySQL's spellings, as before. Every
+    other driver, psqlODBC under any name included, takes the libpq spellings only. The refusal
+    lists the accepted values and never the value given."""
+    if _MYSQL_ODBC_DRIVERS.fullmatch(driver.lower()) or text in _LIBPQ_SSL_MODES:
+        return
+    raise ValueError(
+        f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslmode' must be one of "
+        f"{', '.join(_LIBPQ_SSL_MODES)}, in lower case (see Generic ODBC in docs/CONNECTIONS.md)"
+    )
+
+
+def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
+    """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
+
+    For a driver :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names, it is ALWAYS braced, with the ``}}``
+    escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
+    ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
+    literally, so only the braced form sends the password as written.
+
+    For any other driver it is sent plain, and only when it holds none of ``;``, ``{``, ``}`` or a
+    quote character and has no leading or trailing space: a driver that reads no braces (the Access
+    driver) takes it only that way, and one that does not read the escape would end a braced value
+    at the first ``}`` and read the rest as further keywords. Any other password is refused for
+    such a driver. A driver missing from the list is unmeasured, not known to be unsafe.
+
+    A password must be printable ASCII whatever the driver. A refusal names the setting and never
+    describes the value beyond saying the driver cannot carry it."""
+    text = str(password)
+    _refuse_unsafe_text(text, what="password", connection=connection, refused="")
+    if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
+        return odbc_brace(text)
+    if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
+        return text
+    raise ValueError(
+        f"{hop_name_prefix(connection)}DATABASE password cannot be carried by this odbc_driver; "
+        "change the password (see Generic ODBC in docs/CONNECTIONS.md)"
+    )
 
 
 def _is_remote_spelling(value: object) -> bool:
@@ -834,30 +997,38 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     top-level ``username``/``password`` settings (``env()``-resolved + secret-redacted) under the
     ``odbc_user_key``/``odbc_password_key`` keyword names (default ``UID``/``PWD``).
 
-    **No keyword can give the driver a host other than ``server``** (vault BACKLOG #2577). An
-    ``odbc_params`` keyword must be on :data:`_ODBC_PARAM_ALLOWLIST`, and the two credential keywords on
-    their own short lists, or the build is refused with the keyword and the connection named. A keyword
-    given twice is refused, so the driver never chooses between two copies. A driver that takes its
-    target under another keyword cannot be configured on this path. The egress check itself is the
-    caller's (``pipeline.wiring_runner``); this builder keeps the host that check read the host sent.
+    **The keyword lists cover keywords only, and rely on at least a driver named on the escape list
+    reading the ``}}`` escape in a braced password, and the driver reading ``SERVER`` as its target**
+    (vault BACKLOG #2577, BACKLOG #2705; docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). An ``odbc_params`` keyword
+    must be on :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
+    the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
+    twice is refused. A driver may take its target under a keyword other than ``SERVER``, and the
+    engine does not detect that. The egress check runs outside this builder, at least in
+    ``build_source`` and ``build_destination`` (``transports.base``). This builder sends ``server``
+    as written.
 
-    Every value is brace-quoted (STORE-5 injection guard) and must be printable ASCII
-    (:func:`_odbc_literal`). ``odbc_driver``, ``database``, ``username`` and every ``odbc_params``
-    value also refuse ``;``, ``{`` and ``}`` rather than escaping them. ``password`` keeps the ODBC
-    ``}}`` escape, so it may hold any printable ASCII character.
+    Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
+    every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
+    they refuse at least ``;``, ``{``, ``}``, ``=``, a quote, an empty or blank value and a leading
+    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
+    ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
+    :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
+    refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
+    on the escape list, and otherwise sent plain when it can be and refused when it cannot
+    (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
     weakened-TLS refusal (:func:`_build_dsn`) does not apply here — configure verifying TLS via the
     driver's own keyword in ``odbc_params`` (e.g. psqlODBC ``SSLmode=verify-full``, MySQL
     ``SSLMODE=VERIFY_IDENTITY``). Because that delegation is otherwise invisible, construction logs it
-    (:func:`_warn_generic_tls_unenforced`): a **WARNING** when no TLS keyword is present, DEBUG when one
-    is.
+    (:func:`_warn_generic_tls_unenforced`): a **WARNING** when ``odbc_params`` set no TLS mode or pin
+    one to a no-TLS value, DEBUG otherwise.
 
     Delegating TLS is not the same as declining to gate the hop. A connection whose ``odbc_params`` say
-    TLS is **not required** is refused off-loopback on an enforcing instance by
+    TLS is **not required**, or set no mode at all, is refused off-loopback on an enforcing instance by
     :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors call beside this builder.
-    What stays delegated is the case this path genuinely cannot judge: a driver keyword IS set, and the
+    What stays delegated is the case this path genuinely cannot judge: a mode keyword IS set, and the
     engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
@@ -865,16 +1036,17 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         raise ValueError(f"{where}DATABASE generic dialect requires an 'odbc_driver' setting")
     # SERVER is emitted UNBRACED (validated, not brace-quoted) so a driver that parses a ",port"/":port"
     # suffix in SERVER can resolve the host — mirrors the SQL Server preset's rationale.
+    _refuse_none(s["server"], what="server", connection=connection)
     server = str(s["server"])
-    if _odbc_unsafe_text(server, ";{}="):
+    if _odbc_unsafe_text(server, _ODBC_UNBRACED_REFUSED):
         raise ValueError(
-            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a control character "
-            "or a non-ASCII character (ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a quote, a control "
+            "character or a non-ASCII character (ODBC injection risk)"
         )
-    parts = [
-        f"DRIVER={_odbc_literal(driver, what='odbc_driver', connection=connection)}",
-        f"SERVER={server}",
-    ]
+    # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
+    # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
+    _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
+    parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)
         parts.append(f"DATABASE={database}")
@@ -894,8 +1066,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _ODBC_PASSWORD_KEYS,
             connection=connection,
         )
-        # No refused characters: a password keeps the ODBC escape (see _odbc_literal).
-        secret = _odbc_literal(password, what="password", connection=connection, refused="")
+        secret = _odbc_password(password, driver=driver, connection=connection)
         parts.append(f"{pwd_key}={secret}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
@@ -917,12 +1088,23 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 f"{where}DATABASE odbc_params names {name} more than once "
                 "(keywords are case-insensitive); give it once"
             )
+        # Before anything reads the value: the remote-path screen reads its str() too.
+        _refuse_none(value, what=f"odbc_params value for '{name}'", connection=connection)
+        if isinstance(value, bool):
+            # str() would send True or False, which no driver is known to spell its own way
+            # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
+            raise ValueError(
+                f"{where}DATABASE odbc_params value for '{name}' must not be a boolean; write the "
+                "driver's own spelling as a string"
+            )
         named[name] = value
         if name in _ODBC_PATH_KEYS:
             _refuse_remote_path(value, name=name, connection=connection)
         literal = _odbc_literal(
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
+        if name == "sslmode":
+            _refuse_unread_sslmode(literal, driver=driver, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     _refuse_weak_driver_key(named, connection=connection)
@@ -938,12 +1120,11 @@ def _warn_generic_tls_unenforced(
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
-    is a deliberate operator-owned-TLS model, and it must not be *silent*.
+    is a deliberate operator-owned-TLS model.
 
-    So at construction we log the delegation loudly: a **WARNING** when :func:`generic_odbc_tls_unenforced`
-    says the hop may cross in plaintext — no ssl/tls/encrypt-ish keyword in ``odbc_params``, or one
-    pinned to a no-TLS value like ``SSLmode=disable`` — dropped to **DEBUG** when the operator has taken
-    TLS ownership.
+    So at construction we log the delegation: a **WARNING** when :func:`generic_odbc_tls_unenforced`
+    says the hop may cross in plaintext — no TLS mode in ``odbc_params``, or one pinned to a no-TLS
+    value like ``SSLmode=disable`` — dropped to **DEBUG** when that function returns ``None``.
 
     **This line is visibility, not the control.** It never gates or changes the connection, and until
     BACKLOG #1178 it was the whole of what stood between a generic PHI connection with no TLS keyword
@@ -964,7 +1145,7 @@ def _warn_generic_tls_unenforced(
     reason = generic_odbc_tls_unenforced(params)
     if reason is None:
         logger.debug(
-            "%s: TLS is delegated to the driver (a TLS keyword is set in odbc_params); "
+            "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
             "MessageFoundry does not enforce or verify it on this path",
             where,
         )
@@ -1014,10 +1195,9 @@ def generic_cleartext_hop_guard(
 
     ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
     Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
-    connection whose ``odbc_params`` addressed TLS returns ``None`` because
-    :func:`generic_odbc_tls_unenforced` found no reason to think the hop crosses in plaintext; the
+    connection returns ``None`` when :func:`generic_odbc_tls_unenforced` does, because it found no reason to think the hop crosses in plaintext; the
     engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
-    written down in :func:`generic_odbc_no_tls_params`.
+    written down above :data:`_ODBC_NO_TLS_VALUES`.
 
     Otherwise the hop is decided by the one shared authority, identically to every other cleartext
     transport: an on-box hop ALLOWs, a per-connection ``tls_hop_attested`` ALLOWs (audited),
@@ -1459,28 +1639,24 @@ def _import_aioodbc() -> Any:
     return aioodbc
 
 
-def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | None:
+def _login_timeout(s: Mapping[str, Any], label: str) -> int:
     """The login timeout, in seconds, for a DATABASE connection's pool: its ``connect_timeout``
-    setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Pool sites take it from here.
-
-    ``dialect`` is the one the caller built its DSN with, passed explicitly rather than read from
-    ``s``: ``db_lookup`` and reference sync always build the SQL Server DSN, whatever the mapping says.
+    setting, for either dialect (BACKLOG #2089, #2705). Pool sites take it from here.
 
     **Why it is not in the DSN.** ODBC Driver 18 ignores a login-timeout keyword in the connection
     string; the comment in ``store/sqlserver.py::connection_string`` records the #1626
     measurement. The driver reads pyodbc's ``timeout=`` argument instead, and :func:`_make_pool`
     passes the value there.
 
-    The ``generic`` dialect gets ``None``, as before: its DSN never carried a login timeout, and
-    whether an arbitrary operator-named driver accepts the attribute has not been measured.
+    The ``generic`` dialect gets the same value since BACKLOG #2705; the ``connect_timeout`` row in
+    docs/CONNECTIONS.md says which drivers were measured to honour it.
 
     ``connect_timeout`` is checked by :func:`check_db_connect_timeout` whatever the dialect, and
     ``label`` names the declaration in its refusal. The destination, poll source and lookup executor
     call this at construction, so ``serve`` and ``messagefoundry check`` refuse a bad value at start.
     ``DatabaseRef`` checks a literal value when it is declared; an ``env()`` value is checked here,
     at each sync, once resolved."""
-    value = check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
-    return None if dialect == "generic" else value
+    return check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
 
 
 class AutocommitNotConfirmed(RuntimeError):
@@ -1843,16 +2019,14 @@ class _AutocommitPool:
         return getattr(self._pool, name)
 
 
-async def _make_pool(
-    dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
-) -> Any:
+async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int) -> Any:
     """Create an aioodbc connection pool for ``dsn`` (lazy driver import). The destination wraps
     execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
     statement (``autocommit=True``).
 
     ``login_timeout`` is required, and callers take it from :func:`_login_timeout`, so no pool site
     can quietly go without one. aioodbc forwards ``timeout=`` to every ``pyodbc.connect`` the pool
-    makes. ``None``, for the generic dialect, passes nothing and the driver default applies.
+    makes, for the SQL Server preset and the generic dialect alike (BACKLOG #2705).
 
     **An ``autocommit=True`` pool is wrapped in :class:`_AutocommitPool`** (BACKLOG #2148), so every
     connection it hands out has autocommit set and read back first. The suspected cause is mostly
@@ -1866,10 +2040,13 @@ async def _make_pool(
     is returned unwrapped: pyodbc sets autocommit OFF itself, explicitly."""
     aioodbc = _import_aioodbc()
     disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
-    options: dict[str, Any] = {"minsize": 1, "maxsize": max(1, pool_max), "autocommit": autocommit}
-    if login_timeout is not None:
-        options["timeout"] = login_timeout
-    pool = await aioodbc.create_pool(dsn=dsn, **options)
+    pool = await aioodbc.create_pool(
+        dsn=dsn,
+        minsize=1,
+        maxsize=max(1, pool_max),
+        autocommit=autocommit,
+        timeout=login_timeout,
+    )
     return _AutocommitPool(pool) if autocommit else pool
 
 
@@ -2224,9 +2401,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
-        self._login_timeout = _login_timeout(
-            s, f"DATABASE connection {config.name!r}", dialect=self._dialect
-        )
+        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
         )
@@ -2606,11 +2781,16 @@ class DatabaseSource(SourceConnector):
             knob="poll_max_rows",
             transport="DATABASE source",
         )
-        self._encoding: str = s.get("encoding", "utf-8")
+        self._encoding: str = declared_encoding(s.get("encoding"))
+        # Refused here, when the source is built, by the probe config load uses (BACKLOG #2431). Each
+        # polled row is encoded with this name, so an unusable one would otherwise surface per row.
+        # Config load refuses an env() inbound encoding and a literal naming no codec (BACKLOG #2431),
+        # so this is a backstop for a graph built past load.
+        if not _is_text_codec(self._encoding):
+            raise ValueError("DATABASE source 'encoding' names no usable text codec")
         self._login_timeout = _login_timeout(
             s,
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
-            dialect=self._dialect,
         )
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
@@ -3214,7 +3394,7 @@ class DatabaseLookupExecutor:
             check_lookup_allowed(cname, s, egress)
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
-        self._login_timeout: dict[str, int | None] = {}
+        self._login_timeout: dict[str, int] = {}
         self._acquire_timeout: dict[str, float] = {}
         self._max_rows: dict[str, int | None] = {}
         for cname, s in connections.items():
@@ -3233,9 +3413,7 @@ class DatabaseLookupExecutor:
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )
-            self._login_timeout[cname] = _login_timeout(
-                s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
-            )
+            self._login_timeout[cname] = _login_timeout(s, f"DatabaseLookup {cname!r}")
             self._acquire_timeout[cname] = float_setting(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
                 knob="acquire_timeout",

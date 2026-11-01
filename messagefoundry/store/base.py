@@ -107,6 +107,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RestoreRecord,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -145,6 +146,7 @@ __all__ = [
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
     "ResendSourceNotFound",
+    "RestoreRecord",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -782,7 +784,12 @@ class QueueStore(StoreLifecycle, Protocol):
         headers; ``None``/empty stores ``NULL`` (byte-identical). It is JSON-encoded and encrypted at
         rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
         :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
-        ``response_get(dest).headers``)."""
+        ``response_get(dest).headers``). The store does not scrub it, because a scrub would rewrite
+        the values a Handler reads back; ``docs/PHI.md`` section 3 says what covers it (BACKLOG
+        #2984).
+
+        ``detail`` is scrubbed and bounded by ``safe_text(detail, limit=200)`` before the cipher on
+        every backend, as :meth:`record_ack_sent` does for its row (BACKLOG #2984)."""
         ...
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
@@ -1069,14 +1076,17 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
-    # The operator mutations. Each takes an ``audit`` that builds the operator's audit row from the
-    # result, and the row commits in the mutation's own transaction (BACKLOG #2624, OperatorAudit).
+    # The operator mutations. Each takes a REQUIRED ``audit`` that builds the operator's audit row
+    # from the result, and the row commits in the mutation's own transaction (BACKLOG #2624,
+    # OperatorAudit). Required with no default, so a caller cannot run one and record nothing by
+    # leaving the argument out; ``enqueue_ingress`` stays optional because a live receipt has no
+    # operator. An ``OperatorAudit`` may still return ``None``, which records nothing.
     async def replay(
         self,
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None: ...
@@ -1090,7 +1100,7 @@ class QueueStore(StoreLifecycle, Protocol):
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome: ...
 
@@ -1101,7 +1111,7 @@ class QueueStore(StoreLifecycle, Protocol):
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome: ...
 
@@ -1111,7 +1121,7 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def cancel_queued(
@@ -1271,15 +1281,12 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
-        inbound lifecycle (``established``/``closed``) + the pre-ingress failures
-        (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
-        + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
-        cleanly, such as a store outage at the ingress commit)
-        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
-        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621, and
-        the REMOTEFILE source's same kinds less ``file_decompress_failed``)
-        + the outbound lane transitions (``connection_lost``/``connection_restored``).
+        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): a
+        listener's lifecycle and pre-ingress refusals, a poll source's rejects, and the outbound lane
+        transitions. ``kind`` must be one of
+        :data:`messagefoundry.connection_events.CONNECTION_EVENT_KINDS`, the one vocabulary the
+        connectors, this store and the web console's filter share; an undeclared kind raises
+        :class:`ValueError` on every backend (BACKLOG #1624).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
         row and calling no finalizer, so it can never pin a message's disposition or inflate received
@@ -3099,6 +3106,32 @@ class AuthStore(Protocol):
         writes the count beside its sweep with the same clause, and the session-seal contract
         checks the pair on every backend. Changes nothing, takes no lock and raises no epoch,
         so a concurrent sign-in can still move the number before the revoke runs."""
+        ...
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
+        return how many it revoked (BACKLOG #2614).
+
+        Raises the session epoch of at most the accounts its read of the account list returns,
+        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
+        what it may miss. A kept session whose seal does not verify raises
+        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
+        ...
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Record, once, a restore the engine has not yet recorded (BACKLOG #2614).
+
+        ``messagefoundry restore`` writes a one-row marker into the store it places. The first
+        call after that reads the marker, revokes every session as :meth:`revoke_all_sessions`
+        does, appends one ``store_restored`` audit row and deletes the marker, all in one
+        transaction, and returns what it found. Every later call, and every call on a store no
+        restore placed, returns ``None`` and writes nothing.
+
+        Only the SQLite backend can hold a marker: a server database's backup and restore are the
+        DBA's (BACKLOG #52), so ``restore`` never places one there, and those backends return
+        ``None``."""
         ...
 
     async def enforce_session_cap(

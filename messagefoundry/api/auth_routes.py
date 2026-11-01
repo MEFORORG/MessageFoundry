@@ -137,6 +137,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     STEP_UP_ACTION_SESSION_TERMINATE,
     USERNAME_TAKEN,
@@ -1572,6 +1573,27 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         revoked = await service.revoke_sessions_for_user(user_id, actor=identity.username)
         return SimpleMessage(detail=f"revoked {revoked} session(s)")
 
+    @app.delete("/sessions", response_model=SimpleMessage)
+    async def admin_revoke_all_sessions(
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_REVOKE_ALL_SESSIONS, Permission.USERS_MANAGE)
+        ),
+    ) -> SimpleMessage:
+        """End every account's sessions at once (BACKLOG #2614), the response to a suspected
+        compromise. The caller's own session is kept, so the reply reaches them; their other
+        sessions end with everyone's. ``users:manage``, as the per-account revoke above, behind a
+        single-use proof bound to this action, since it ends sessions of the caller's own.
+        Audited, with the count, even when nothing was live."""
+        revoked, kept = await service.revoke_every_session(
+            actor=identity.username,
+            keep_token_hash=hash_token(bearer_token(request) or ""),
+            client=client_ip(request),
+        )
+        outcome = "this session was kept" if kept else "this session was ended too"
+        return SimpleMessage(detail=f"revoked {revoked} session(s); {outcome}")
+
     @app.put("/users/{user_id}/roles", response_model=SimpleMessage)
     async def set_user_roles(
         user_id: ResourceId,
@@ -2208,10 +2230,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         officer can produce a scoped, offline audit report without a downstream SIEM.
 
         Same filters and the same parameterized store query as ``GET /audit``, gated by the dedicated
-        ``audit:export`` permission. Only PHI-safe audit metadata is emitted — ``ts, actor, action,
+        ``audit:export`` permission. Only audit metadata is emitted — ``ts, actor, action,
         channel_id, client, detail`` — the exact columns ``GET /audit`` already returns; the audit writers store
-        only filter shapes / counts / ids in ``detail`` (never a raw message body), so no PHI leaves on
-        this path. The export itself is recorded as an ``audit.export`` event (who, which filter, how
+        at least filter shapes, counts and ids in ``detail`` (never a raw message body), so no message
+        body leaves on this path. The ``audit_log.detail`` row of docs/PHI.md says what else they
+        store. The export itself is recorded as an ``audit.export`` event (who, which filter, how
         many rows).
 
         A caller without ``users:manage`` exports the trail without the lock rows, exactly as it reads

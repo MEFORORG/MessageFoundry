@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import string
 from urllib.parse import unquote, urlsplit
 
 #: Schemes we will render an interstitial for. Anything else (``javascript:``, ``data:``, ``file:``)
@@ -207,14 +208,33 @@ def _matches_domain(host: str, domain: str) -> bool:
     An IPv4 entry, which ``[security]`` accepts in its canonical form, matches only that address:
     an address has no subdomains (vault BACKLOG #2843). No leading dot is stripped: settings refuse
     one at load, so a dot-led entry from any other caller matches nothing, which shows the
-    interstitial rather than widening the match (BACKLOG #3075).
+    interstitial rather than widening the match (BACKLOG #3075). A host that is an address gets the
+    same treatment, keyed on the host because a partial entry such as ``0.0`` is not one: only a
+    canonical IPv4 address can match, only exactly, and only if it is one host's (BACKLOG #3765).
+    Settings accept no other address, so this shows the interstitial for every other spelling.
+
+    A host here is always ASCII, so an entry holding anything else matches nothing. It is tested
+    before the fold, and only ASCII white space is stripped, because ``str.lower()`` turns the
+    Kelvin sign into an ASCII ``k`` and a plain ``strip()`` removes a no-break space, and either
+    would let such an entry cover an ASCII host (BACKLOG #3765).
     """
-    domain = domain.strip().lower()
-    if not domain or not host:
+    domain = domain.strip(string.whitespace)
+    if not domain or not domain.isascii() or not host:
         return False
-    if _is_ipv4(domain):
-        return host == domain
+    domain = domain.lower()
+    if _reads_as_address(host):
+        return host == domain and _is_ipv4(host) and _is_one_host(host)
     return host == domain or host.endswith("." + domain)
+
+
+#: A label a browser's URL parser reads as a number, which makes the host an IPv4 address to it.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _reads_as_address(host: str) -> bool:
+    """Whether a browser reads the lowercase ``host`` as an address rather than a name: an IPv6
+    literal, or a host whose last label is numeric, such as ``0x7f.1`` or ``3758096385``."""
+    return _is_ipv6(host) or _NUMERIC_LABEL.fullmatch(host.rpartition(".")[2]) is not None
 
 
 def _is_ipv4(entry: str) -> bool:
@@ -226,6 +246,19 @@ def _is_ipv4(entry: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: RFC 1122's "this network" block. ``ipaddress`` reads most of it as neither unspecified nor
+#: reserved, so neither flag can stand in for this.
+_THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
+
+
+def _is_one_host(entry: str) -> bool:
+    """Whether the IPv4 ``entry`` is one host's address. This console's copy of what settings
+    refuse at load, ``_not_a_host_address`` in ``config/settings.py``, kept here for the reason
+    :func:`_is_ipv4` gives; ``tests/test_domain_shape.py`` compares the two on a ``/16`` grid."""
+    address = ipaddress.IPv4Address(entry)
+    return not (address in _THIS_NETWORK or address.is_multicast or address.is_reserved)
 
 
 def is_external(url: str, organization_domains: list[str] | tuple[str, ...]) -> bool:

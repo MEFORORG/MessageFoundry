@@ -764,6 +764,11 @@ from typing import Any
 #: 9ad245683e8594e1; this branch at 75c4b3550c195a62). Neither parent's value covered both, so
 #: the value below was re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3811: the console imports ``api.security.ConfigWriteNotRecorded``, the 503 the
+#: connection flag handler raises for a toggle its audit row did not record, and names that fix by
+#: the type rather than by any 503. A newer console on an older engine would raise ImportError at
+#: mount, so it forces a bump. Re-derived with ``--write`` (from b634db50214474e2).
+#:
 #: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
 #: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
@@ -775,7 +780,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b634db50214474e2"
+ENGINE_UI_SEAM: str = "8774e324f0b1b7cf"
 
 
 @dataclass(frozen=True, slots=True)

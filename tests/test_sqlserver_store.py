@@ -39,13 +39,20 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
 from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
+from tests._keyed_reopen_contract import (
+    CONTROL_CELL,
+    KeyedReopenReport,
+    assert_names_the_control_cell_alone,
+    remove_seal_passes,
+    server_keyed_reopen_report,
+)
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
-from tests._store_audit import ALERT_AUDIT, no_purge_audit
+from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -587,7 +594,7 @@ async def test_replay_requeues(store) -> None:
     )
     item = (await store.claim_ready(now=200.0))[0]
     await store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1), now=200.0)  # -> dead
-    requeued = await store.replay(mid, now=300.0)
+    requeued = await store.replay(mid, now=300.0, audit=no_operator_audit)
     assert requeued == 1
     outbox = await store.outbox_for(mid)
     assert outbox[0]["status"] == OutboxStatus.PENDING.value and outbox[0]["attempts"] == 0
@@ -614,7 +621,7 @@ async def test_list_count_and_replay_dead(store) -> None:
     assert await store.count_dead(destination_name="OB1", allowed_channels=None) == 1
 
     # scoped replay leaves the other dead
-    assert await store.replay_dead(destination_name="OB1", now=300.0) == 1
+    assert await store.replay_dead(destination_name="OB1", now=300.0, audit=no_operator_audit) == 1
     assert await store.count_dead(allowed_channels=None) == 1
     assert (await store.list_dead(allowed_channels=None))[0]["destination_name"] == "OB2"
 
@@ -670,7 +677,7 @@ async def test_replay_dead_only_dead_rows(store) -> None:
     await store.mark_done(done.id, now=110.0)
     await store.mark_failed(dead.id, "boom", RetryPolicy(max_attempts=1), now=110.0)
 
-    assert await store.replay_dead(now=200.0) == 1  # only the dead row
+    assert await store.replay_dead(now=200.0, audit=no_operator_audit) == 1  # only the dead row
     rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert rows["OB1"]["status"] == OutboxStatus.DONE.value
     assert rows["OB2"]["status"] == OutboxStatus.PENDING.value and rows["OB2"]["attempts"] == 0
@@ -1903,7 +1910,7 @@ async def test_dead_letter_missing_inbounds_errors_the_message(store) -> None:
     assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
     assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
     # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
-    assert await store.replay(orphan, now=300.0) == 1
+    assert await store.replay(orphan, now=300.0, audit=no_operator_audit) == 1
     item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
     assert item is not None and item.payload == RAW
 
@@ -2416,7 +2423,7 @@ async def test_replay_two_mode_recover_then_resend(store) -> None:
     await store.mark_done(d1.id, now=110.0)
     await store.mark_failed(d2.id, "boom", RetryPolicy(max_attempts=1), now=110.0)  # -> dead
     # recover mode: a dead row exists -> re-pend ONLY it; the DONE sibling is NOT re-fired (M-2)
-    assert await store.replay(mid, now=200.0) == 1
+    assert await store.replay(mid, now=200.0, audit=no_operator_audit) == 1
     by = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert by["OB1"]["status"] == OutboxStatus.DONE.value
     assert by["OB2"]["status"] == OutboxStatus.PENDING.value
@@ -2425,7 +2432,7 @@ async def test_replay_two_mode_recover_then_resend(store) -> None:
     o2 = await store.claim_next_fifo("OB2", stage=Stage.OUTBOUND.value, now=200.0)
     await store.mark_done(o2.id, now=210.0)
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
-    assert await store.replay(mid, now=300.0) == 2
+    assert await store.replay(mid, now=300.0, audit=no_operator_audit) == 2
 
 
 async def test_dead_letter_missing_destinations_errors_the_message(store) -> None:
@@ -2504,6 +2511,21 @@ async def test_complete_with_response_captures_and_finalizes(store) -> None:
     r = resps[0]
     assert r.destination_name == "OB" and r.response_seq == 1 and r.outcome == "ok"
     assert r.body == "ACK^AA" and r.detail == "all good"  # both decrypted (both ciphertext at rest)
+
+
+async def test_complete_with_response_scrubs_detail_ss(store) -> None:
+    # BACKLOG #2984: a reply's detail is stored through safe_text(detail, limit=200), as an ack_sent
+    # row's is, whatever the connector put in it. Synthetic PID fragment, invented for this test.
+    detail = "partner note PID|1||MRN7731^^^H^MR||ZEPHYRTEST^QUINN||19700101"
+    mid, item = await _delivered_outbound(store)
+    await store.complete_with_response(
+        item.id, body="ACK^AA", outcome="accepted", detail=detail, now=110.0
+    )
+    (reply,) = await store.correlate_response(mid)
+    # The exact value is pinned against safe_text on SQLite (tests/test_b2984_reply_detail_scrub.py);
+    # importing redaction here would widen this suite's serverdb path gate.
+    assert reply.detail is not None and reply.detail.startswith("partner note ")
+    assert "ZEPHYRTEST" not in reply.detail and "MRN7731" not in reply.detail
 
 
 async def test_correlate_orders_by_seq_and_decrypts(store) -> None:
@@ -3278,6 +3300,27 @@ async def test_state_plaintext_migrated_on_keyed_reopen(store) -> None:
             await cleanup.close()
 
 
+async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
+    """BACKLOG #1723: a no-key -> key restart must seal every written cell IN PLACE on this backend,
+    and each must then read back through its real read path.
+
+    The cells are the ones ``tests/test_store_cipher_sweep_parity.py`` finds written in
+    ``sqlserver.py``, and the writers and readers are ``tests/_keyed_reopen_contract.py``, which the
+    ``postgres-store`` leg and the plain leg share. It takes ``state`` through its ``MERGE`` writer
+    and every other cell through its own, under the cell-bound format.
+    """
+    assert await server_keyed_reopen_report(store) == KeyedReopenReport()
+
+
+async def test_removing_a_cells_on_open_pass_reds_the_keyed_reopen_contract(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control on this backend's own sweep, so the test above is shown able to fail
+    here and not only on SQLite."""
+    remove_seal_passes(monkeypatch, type(store), {CONTROL_CELL})
+    assert_names_the_control_cell_alone(await server_keyed_reopen_report(store))
+
+
 # --- ADR 0006 reference snapshots (BACKLOG #235) — the T-SQL port proof --------------------------
 # Mirrors the Postgres suite (test_postgres_store.py) + the SQLite donor (test_reference_sets.py),
 # plus the T-SQL-only seams: the UTF-16 NVARCHAR(450) width guard, the BIN2 collation, and the
@@ -3906,7 +3949,8 @@ async def test_replay_resend_not_deduped_ss(store) -> None:
     assert item is not None
     await store.mark_done(item.id, now=300.0)
     assert len(await _ss_ledger(store)) == 1
-    assert await store.replay(mid, now=400.0) == 1  # re-send drops the ledger entry
+    # re-send drops the ledger entry
+    assert await store.replay(mid, now=400.0, audit=no_operator_audit) == 1
     assert await _ss_ledger(store) == []
     again = await store.claim_next_fifo("OB1", now=500.0)
     assert again is not None and again.id == item.id  # claimed normally, NOT deduped
@@ -4148,7 +4192,8 @@ async def test_pt_marker_is_stamped_and_a_mixed_replay_ends_processed_ss(store) 
     assert await _ss_deliver(store, now=120.0) == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
 
-    assert await store.replay(parent, now=200.0) == 1  # the real delivery only
+    # the real delivery only
+    assert await store.replay(parent, now=200.0, audit=no_operator_audit) == 1
     assert await _ss_deliver(store, now=210.0) == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
     assert await store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
@@ -4161,21 +4206,29 @@ async def test_pt_marker_is_never_a_resend_source_ss(store) -> None:
     parent = await _ss_pt_parent(store, outbound=True)
     assert await _ss_deliver(store, now=120.0) == 1
     outcome = await store.resend_to(
-        message_id=parent, to="OB_STANDBY", idempotency_key=uuid4().hex, now=200.0
+        message_id=parent,
+        to="OB_STANDBY",
+        idempotency_key=uuid4().hex,
+        now=200.0,
+        audit=no_operator_audit,
     )
     assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
 
     alone = await _ss_pt_parent(store, outbound=False)
     with pytest.raises(ResendSourceNotFound):
         await store.resend_to(
-            message_id=alone, to="OB_STANDBY", idempotency_key=uuid4().hex, now=300.0
+            message_id=alone,
+            to="OB_STANDBY",
+            idempotency_key=uuid4().hex,
+            now=300.0,
+            audit=no_operator_audit,
         )
 
 
 async def test_pt_depth_capped_marker_stays_out_of_bulk_dead_replay_ss(store) -> None:
     capped = await _ss_pt_parent(store, outbound=False, depth_capped=True)
     assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
-    assert await store.replay_dead(now=200.0) == 0
+    assert await store.replay_dead(now=200.0, audit=no_operator_audit) == 0
     assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
 
 
@@ -4724,7 +4777,9 @@ async def test_resend_plain_parity_ss(store) -> None:
     # at-least-once: a genuine NEW pending tail row shipping the retained TRANSFORMED body.
     mid = await _rs_seed(store)
     before = {r["id"] for r in await store.outbox_for(mid)}
-    out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    out = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert out.status == "resent" and out.to_destination == "OB2" and out.from_destination == "OB1"
     ob2 = [r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]
     assert len(ob2) == 1 and ob2[0]["id"] not in before and ob2[0]["id"] == out.outbox_id
@@ -4739,22 +4794,30 @@ async def test_resend_plain_parity_ss(store) -> None:
     assert seqs[ob2[0]["id"]] == max(seqs.values())
 
     # same-key duplicate -> exactly one row, reports the prior outcome.
-    dup = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    dup = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert dup.status == "duplicate" and dup.outbox_id == out.outbox_id
     assert len([r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]) == 1
     # new key -> a genuine second resend (source pinned; OB2 is now ambiguous).
-    out2 = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k2", from_="OB1")
+    out2 = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k2", from_="OB1", audit=no_operator_audit
+    )
     assert out2.status == "resent"
     assert len([r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]) == 2
 
     # key reused across a DIFFERENT message -> conflict (409), never a silent drop.
     m2 = await _rs_seed(store)
     with pytest.raises(ResendKeyConflict):
-        await store.resend_to(message_id=m2, to="OB2", idempotency_key="k1")
+        await store.resend_to(
+            message_id=m2, to="OB2", idempotency_key="k1", audit=no_operator_audit
+        )
     assert [r for r in await store.outbox_for(m2) if r["destination_name"] == "OB2"] == []
     # key reused for a DIFFERENT target -> conflict.
     with pytest.raises(ResendKeyConflict):
-        await store.resend_to(message_id=mid, to="OB3", idempotency_key="k1")
+        await store.resend_to(
+            message_id=mid, to="OB3", idempotency_key="k1", audit=no_operator_audit
+        )
 
     # retention-nulled source -> ResendSourceEmpty (never a zero-length PROCESSED body).
     m3 = await _rs_seed(store)
@@ -4762,20 +4825,26 @@ async def test_resend_plain_parity_ss(store) -> None:
         await store.mark_done(str(r["id"]))
     assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
     with pytest.raises(ResendSourceEmpty):
-        await store.resend_to(message_id=m3, to="OB2", idempotency_key="k3")
+        await store.resend_to(
+            message_id=m3, to="OB2", idempotency_key="k3", audit=no_operator_audit
+        )
 
     # no delivered body (ERROR-only) -> ResendSourceNotFound.
     eid = await store.record_received(
         channel_id="in1", raw=_RS_ADT, status=MessageStatus.ERROR, error="parse boom"
     )
     with pytest.raises(ResendSourceNotFound):
-        await store.resend_to(message_id=eid, to="OB2", idempotency_key="k4")
+        await store.resend_to(
+            message_id=eid, to="OB2", idempotency_key="k4", audit=no_operator_audit
+        )
 
     # a dead-lettered source is an eligible source (divert-to-standby, ADR 0090 §1).
     m4 = await _rs_seed(store)
     src = [r for r in await store.outbox_for(m4) if r["destination_name"] == "OB1"][0]
     await store.mark_failed(str(src["id"]), "permanent AR", RetryPolicy(max_attempts=0))
-    out4 = await store.resend_to(message_id=m4, to="OB2", idempotency_key="k5")
+    out4 = await store.resend_to(
+        message_id=m4, to="OB2", idempotency_key="k5", audit=no_operator_audit
+    )
     assert out4.status == "resent" and out4.from_destination == "OB1"
 
     # ambiguous multi-destination source requires from_; naming it ships THAT source's body.
@@ -4783,8 +4852,12 @@ async def test_resend_plain_parity_ss(store) -> None:
         store, deliveries=[("OB1", _RS_TRANSFORMED), ("OB3", _RS_TRANSFORMED + "X")]
     )
     with pytest.raises(ResendSourceAmbiguous):
-        await store.resend_to(message_id=m5, to="OB2", idempotency_key="k6")
-    out5 = await store.resend_to(message_id=m5, to="OB2", idempotency_key="k7", from_="OB3")
+        await store.resend_to(
+            message_id=m5, to="OB2", idempotency_key="k6", audit=no_operator_audit
+        )
+    out5 = await store.resend_to(
+        message_id=m5, to="OB2", idempotency_key="k7", from_="OB3", audit=no_operator_audit
+    )
     assert out5.status == "resent" and out5.from_destination == "OB3"
     p5 = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(m5)}
     assert p5["OB2"] == _RS_TRANSFORMED + "X"
@@ -4801,7 +4874,7 @@ async def test_resend_reopens_processed_to_routed_ss(store) -> None:
     for r in await store.outbox_for(mid):
         await store.mark_done(str(r["id"]))
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
-    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit)
     assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
     ob2 = [r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"][0]
     await store.mark_done(str(ob2["id"]))
@@ -4841,7 +4914,12 @@ async def test_resend_does_not_funnel_ss(store) -> None:
             )  # producer held uncommitted (seq N)
             out = await asyncio.wait_for(
                 other.resend_to(
-                    message_id=mid, to="OB2", idempotency_key="k1", from_="OB1", now=102.0
+                    message_id=mid,
+                    to="OB2",
+                    idempotency_key="k1",
+                    from_="OB1",
+                    now=102.0,
+                    audit=no_operator_audit,
                 ),
                 timeout=10.0,
             )
@@ -4925,7 +5003,12 @@ async def test_pooled_claim_skips_uncommitted_producer_ss(store) -> None:
             # the resend commits at seq M+1 on OB2B (no funnel) while the producer stays uncommitted.
             out = await asyncio.wait_for(
                 other.resend_to(
-                    message_id=mid, to="OB2B", idempotency_key="k1", from_="OB1", now=102.0
+                    message_id=mid,
+                    to="OB2B",
+                    idempotency_key="k1",
+                    from_="OB1",
+                    now=102.0,
+                    audit=no_operator_audit,
                 ),
                 timeout=10.0,
             )
@@ -4950,7 +5033,9 @@ async def test_reingress_parity_ss(store) -> None:
 
     origin = await _rs_seed(store)
     before = await store.get_message(origin)
-    out = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1")
+    out = await store.reingress(
+        origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     assert out.status == "resubmitted" and out.message_id == origin and out.new_message_id != origin
     assert out.channel_id == "in1"
 
@@ -4977,7 +5062,9 @@ async def test_reingress_parity_ss(store) -> None:
     assert after["status"] == before["status"] and after["metadata"] == before["metadata"]
 
     # same key -> duplicate, same child, still exactly one child + one ingress row (no double-inject).
-    dup = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1")
+    dup = await store.reingress(
+        origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     assert dup.status == "duplicate" and dup.new_message_id == out.new_message_id
     n = (
         await store._fetchone(
@@ -4990,15 +5077,21 @@ async def test_reingress_parity_ss(store) -> None:
     )
     assert n == 1 and len(ing) == 1
     # new key -> a distinct second child.
-    out2 = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k2")
+    out2 = await store.reingress(
+        origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k2", audit=no_operator_audit
+    )
     assert out2.status == "resubmitted" and out2.new_message_id != out.new_message_id
     # key reused across a DIFFERENT message -> conflict.
     other = await _rs_seed(store)
     with pytest.raises(ResendKeyConflict):
-        await store.reingress(origin_message_id=other, raw=_RS_EDITED, idempotency_key="k1")
+        await store.reingress(
+            origin_message_id=other, raw=_RS_EDITED, idempotency_key="k1", audit=no_operator_audit
+        )
     # missing origin -> ReingressOriginMissing.
     with pytest.raises(ReingressOriginMissing):
-        await store.reingress(origin_message_id="nope", raw=_RS_EDITED, idempotency_key="k9")
+        await store.reingress(
+            origin_message_id="nope", raw=_RS_EDITED, idempotency_key="k9", audit=no_operator_audit
+        )
     # the re-ingress records its DISJOINT target key (@reingress:<channel>).
     td = (
         await store._fetchone("SELECT to_destination FROM resend_log WHERE resend_key=?", ("k1",))
@@ -5015,7 +5108,11 @@ async def test_direct_edit_parity_ss(store) -> None:
     assert before["status"] == MessageStatus.ERROR.value
 
     out = await store.resend_to(
-        message_id=origin, to="OB2", idempotency_key="k1", body_override=_RS_EDITED
+        message_id=origin,
+        to="OB2",
+        idempotency_key="k1",
+        body_override=_RS_EDITED,
+        audit=no_operator_audit,
     )
     assert out.status == "resent" and out.to_destination == "OB2" and out.message_id == origin
 
@@ -5050,7 +5147,13 @@ async def test_direct_edit_parity_ss(store) -> None:
     # empty edited body -> ResendSourceEmpty, with NO partial mutation (no OB2E row, no child).
     m2 = await _rs_seed(store)
     with pytest.raises(ResendSourceEmpty):
-        await store.resend_to(message_id=m2, to="OB2E", idempotency_key="k2", body_override="")
+        await store.resend_to(
+            message_id=m2,
+            to="OB2E",
+            idempotency_key="k2",
+            body_override="",
+            audit=no_operator_audit,
+        )
     ne = await store._fetchall(
         "SELECT id FROM queue WHERE stage=? AND destination_name=?", (Stage.OUTBOUND.value, "OB2E")
     )
@@ -5058,10 +5161,18 @@ async def test_direct_edit_parity_ss(store) -> None:
 
     # idempotent: same key/body -> duplicate, exactly one OB3 delivery on one child.
     first = await store.resend_to(
-        message_id=m2, to="OB3", idempotency_key="k3", body_override=_RS_EDITED
+        message_id=m2,
+        to="OB3",
+        idempotency_key="k3",
+        body_override=_RS_EDITED,
+        audit=no_operator_audit,
     )
     second = await store.resend_to(
-        message_id=m2, to="OB3", idempotency_key="k3", body_override=_RS_EDITED
+        message_id=m2,
+        to="OB3",
+        idempotency_key="k3",
+        body_override=_RS_EDITED,
+        audit=no_operator_audit,
     )
     assert first.status == "resent" and second.status == "duplicate"
     ob3 = await store._fetchall(

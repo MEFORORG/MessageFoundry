@@ -386,16 +386,15 @@ def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
     tree is the HTTP 403 response BODY, whose event is ``peer_not_allowlisted``), and gave ``closed``
     a reason of ``error`` that ``close_reason`` never takes.
     """
-    pytest.importorskip("messagefoundry_webconsole")
     import re as _re
 
-    from messagefoundry_webconsole.pages.monitoring import _EVENT_KINDS
+    from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 
     section = _section_7()
     row = next(
         line for line in section.splitlines() if line.startswith("| **7. `connection_event`")
     )
-    missing = sorted(kind for kind in _EVENT_KINDS if f"`{kind}`" not in row)
+    missing = sorted(kind for kind in CONNECTION_EVENT_KINDS if f"`{kind}`" not in row)
     assert not missing, f"the connection_event row does not name these shipped kinds: {missing}"
     # Scoped to the "what events are logged" CELL — the row's other cells legitimately name column
     # names, wiring hooks and the table itself, none of which are event kinds.
@@ -409,12 +408,12 @@ def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
         # row names the close reasons on purpose (they are the `closed` kind's whole vocabulary), so
         # a reason has to be exempted here the way `eof` always has been. `idle_timeout` needs no
         # entry: it is a close reason on MLLP AND an event kind on the HTTP listener.
-        if token not in set(_EVENT_KINDS)
+        if token not in CONNECTION_EVENT_KINDS
         and token not in {"eof", "frame_deadline", "on_connection_event"}
     )
     assert not invented, (
         f"the connection_event row names kind(s) no code path emits: {invented}. The shipped "
-        f"vocabulary is {sorted(_EVENT_KINDS)}."
+        f"vocabulary is {sorted(CONNECTION_EVENT_KINDS)}."
     )
 
 
@@ -424,7 +423,8 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
     The only guard derived its truth set from ``messagefoundry_webconsole.pages.monitoring``'s filter
     DROPDOWN, which never opens a ``transports/`` file — so adding ``_emit_event("tls_handshake_failed")``
     and forgetting the dropdown left CI green with an undocumented kind in the stream. Derived here
-    from the literal call sites, and the console tuple is kept as a second cross-checked source.
+    from the literal call sites, and ``CONNECTION_EVENT_KINDS`` (which the console reads) is
+    cross-checked against them.
     """
     import ast as _ast
 
@@ -469,11 +469,13 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
         f"connection_event kind(s) emitted by the transports but absent from row 7: {missing}. Row 7 "
         "states its vocabulary is complete."
     )
-    # Cross-check the console dropdown against the same derived truth, so the two cannot diverge.
-    console = pytest.importorskip("messagefoundry_webconsole.pages.monitoring")
-    assert set(console._EVENT_KINDS) == emitted, (
-        "the console filter tuple and the shipped emit sites disagree: "
-        f"{sorted(set(console._EVENT_KINDS) ^ emitted)}"
+    # The shared vocabulary the store enforces and the console offers must equal the derived truth
+    # (BACKLOG #1624), so a new emit site fails here until its kind is declared.
+    from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
+
+    assert emitted == CONNECTION_EVENT_KINDS, (
+        "CONNECTION_EVENT_KINDS and the shipped emit sites disagree: "
+        f"{sorted(CONNECTION_EVENT_KINDS ^ emitted)}"
     )
 
 

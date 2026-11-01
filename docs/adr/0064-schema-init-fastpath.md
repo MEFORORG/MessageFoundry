@@ -31,6 +31,12 @@ round-trips and the same scan on every restart — just without the convoy.
    run the full idempotent batch + migrations, and upsert the marker in the same transaction.
    Content-addressing means there is no version constant to forget: **any** edit to `_SCHEMA`
    changes the hash and forces exactly one full run per database.
+
+   *Note (2026-10-30, BACKLOG #1720):* both server backends now fold a revision into the hash, not
+   only Postgres. A full run on both now ends in a live-schema check, Python the hash cannot see,
+   that runs before the marker is written and refuses the open when the schema is short of what the
+   build declares. SQL Server folds in `_SCHEMA_CHECK_REV` for it; Postgres still folds in
+   `_MIGRATION_REV`, which moved to 8 with it.
 2. **Index-seekable startup recovery.** `reset_stale_inflight(stage=None)` now issues one UPDATE per
    `Stage` (single transaction) with a plain `(status, stage)` equality pair — seekable on the
    existing `ix_queue_ready(stage, status, next_attempt_at)` on all three backends — instead of one
@@ -50,6 +56,11 @@ round-trips and the same scan on every restart — just without the convoy.
   fast-path trusts it. The remedy after any manual schema surgery is `DELETE FROM schema_meta`,
   which forces one full (idempotent) run at the next open. Tests that *simulate* an old database by
   hand-editing schema objects must delete the marker too (`test_fifo_index_migration.py` does).
+  *Note (2026-10-30, BACKLOG #1720):* deleting the marker no longer only heals. The next open runs
+  the batch and migrations and then the live-schema check, which refuses the open, and writes no
+  marker, when the schema is still short of what the build declares, for example a same-named
+  object of another shape that the existence guard skips, or a table missing a column no statement
+  adds. Fix that drift by hand, then open again.
 - **Future on-open migrations must live in `_SCHEMA`** (where the hash sees them). On Postgres, a
   behavioral change to `_migrate_lease_columns` must bump `_MIGRATION_REV` — the constant sits
   directly above the hash with that instruction.

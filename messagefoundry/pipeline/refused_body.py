@@ -242,6 +242,11 @@ def _stored_form(wire: bytes, text: str | None) -> tuple[bool, int]:
     return True, len(CARRIAGE_MARKER) + 4 * ((len(wire) + 2) // 3)  # mfb64:v1: byte carriage
 
 
+def with_refusal_note(note: str, error: str) -> str:
+    """``note`` then ``error``, fitted to the store's bound on the column; see :func:`_with_note`."""
+    return _with_note(note, error)
+
+
 def _with_note(note: str, error: str) -> str:
     """``note`` then ``error``, with ``error`` cut so the two fit the store's bound on the column.
 

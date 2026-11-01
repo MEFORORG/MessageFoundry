@@ -10,6 +10,9 @@ import { isRecord } from "./engineTrustModel";
 /**
  * The fields of messagefoundry/api/models.py:ReloadResult (the /config/reload response) that the
  * promote reads. The engine also sends `degraded` and `failures`; reporting those is BACKLOG #2259.
+ * `restart_required` holds setting names on an applied reload, and is null on a dry run, which did
+ * not check. It is `unknown` here because `isReloadResult` does not check it, so a reader has to go
+ * through `reloadShortfall`.
  */
 export interface ReloadResult {
   inbound: number;
@@ -18,6 +21,7 @@ export interface ReloadResult {
   handlers: number;
   running: boolean;
   dry_run: boolean;
+  restart_required?: unknown;
 }
 
 /**
@@ -86,9 +90,50 @@ export function preflightOutcome(
 }
 
 /**
+ * One `restart_required` entry: a setting name, such as `[auth].ad_tls_ca_cert_file`. This server
+ * text is headed for a notification, so a list holding anything else is reported as unreadable and
+ * never printed.
+ */
+const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
+
+/**
+ * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
+ * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, not reported here yet) can sit
+ * beside the restart sentence. The first entry leads the notification, so it reads on from the
+ * message's prefix. This reads applied replies only, so null or no value is unreadable, as any other
+ * shape is. An unreadable list keeps the counts and says so: the swap did happen, and it must not
+ * read as a clean promote.
+ */
+function reloadShortfall(r: ReloadResult): string[] {
+  const names = r.restart_required;
+  if (
+    !Array.isArray(names) ||
+    !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
+  ) {
+    return [
+      "check the engine's log for trust anchors that take a restart: the engine's list of them " +
+        "could not be read.",
+    ];
+  }
+  if (names.length === 0) {
+    return [];
+  }
+  return [
+    `restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
+      "does not load it, so the engine still trusts the old CA.",
+    'The settings list above is not complete: see the section "Outbound TLS trust anchor" of ' +
+      "docs/SECURITY.md in the MessageFoundry repository, at the paragraph " +
+      '"What a reload\'s restart_required list covers".',
+  ];
+}
+
+/**
  * The message for the apply step's outcome. A held reload is a warning that names the approval and
- * says the config is not live; it never prints graph counts, because no graph was swapped. Each
- * outcome is its own branch, so another one (a degraded apply, BACKLOG #2259) is one more case.
+ * says the config is not live; it never prints graph counts, because no graph was swapped. A live
+ * swap with a shortfall is a warning too, and it leads with the shortfall: VS Code starts a
+ * notification with no button collapsed to one clipped line, so the words to act on come first, in
+ * as few characters as they can. Held, invalid and live exclude each other, so each is its own
+ * branch.
  */
 export function promoteOutcomeMessage(
   targetName: string,
@@ -115,11 +160,15 @@ export function promoteOutcomeMessage(
         "result, so it is unknown whether the new config is live. Check the engine before retrying.",
     };
   }
+  const graph =
+    `to ${targetName} — live graph: ${r.inbound} inbound, ${r.outbound} outbound, ` +
+    `${r.routers} routers, ${r.handlers} handlers${r.running ? ", running" : ""}.`;
+  const [lead, ...rest] = reloadShortfall(r);
+  if (lead === undefined) {
+    return { level: "info", text: `MessageFoundry: promoted ${graph}` };
+  }
   return {
-    level: "info",
-    text:
-      `MessageFoundry: promoted to ${targetName} — live graph: ${r.inbound} inbound, ` +
-      `${r.outbound} outbound, ${r.routers} routers, ${r.handlers} handlers` +
-      `${r.running ? ", running" : ""}.`,
+    level: "warning",
+    text: [`MessageFoundry: ${lead}`, `Promoted ${graph}`, ...rest].join(" "),
   };
 }

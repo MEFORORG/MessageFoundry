@@ -137,8 +137,7 @@ outbound(
 # Entra ID, the other delegated kind, on the lookup pool -- so the quiet half is proven off the
 # outbound table too.
 DatabaseLookup("entra_pool", server="db6.example.invalid", database="C", auth="entra")
-# The written-down residual: a generic hop with no top-level credential. Anything in odbc_params
-# belongs to a driver vocabulary the engine cannot enumerate, so classifying it would be guessing.
+# The written-down residual: a generic hop with no top-level credential is not reported.
 outbound(
     "OB_GENERIC_NO_CRED",
     Database(
@@ -264,9 +263,7 @@ def test_integrated_auth_on_a_generic_hop_is_still_reported(reported: dict[str, 
 
 
 def test_a_generic_hop_with_no_top_level_credential_stays_quiet(reported: dict[str, str]) -> None:
-    """The written-down residual. A credential smuggled into ``odbc_params`` under an arbitrary
-    driver keyword is not classifiable, and a reader that guessed would put a wrong name in a
-    security report."""
+    """The written-down residual; ``static_credential_db_hops`` states it."""
     assert "OB_GENERIC_NO_CRED" not in reported
 
 

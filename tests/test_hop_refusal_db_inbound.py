@@ -22,6 +22,7 @@ SQLite + pure logic only (no optional extras).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ from messagefoundry.transports.database import (
     generic_cleartext_hop_guard,
 )
 from messagefoundry.transports.db_endpoint import generic_hop_endpoint
+from tests.test_database_transport import _NO_MODE_REASON, _TLS_KEYWORDS_WITH_NO_MODE
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -582,6 +584,77 @@ def test_generic_disabling_tls_value_refused_when_enforcing() -> None:
     # The other half of the classifier: a TLS keyword pinned to a value that means "not required".
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="SSLmode=disable"):
         DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "disable"}))
+
+
+_GENERIC_CONNECTORS = [(DatabaseDestination, _generic_dest), (DatabaseSource, _generic_source)]
+
+
+@pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_lone_tls_keyword_refused_when_enforcing(
+    keyword: str,
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2483: a key or certificate path does not count as a mode. The name is relative to an
+    # empty directory, so no file can turn this into a key or certificate refusal, and it stays
+    # printable ASCII whatever the host's temp path holds.
+    monkeypatch.chdir(tmp_path)
+    with (
+        active_hop_posture(PROD_PHI),
+        pytest.raises(InsecureHopRefused, match=_NO_MODE_REASON),
+    ):
+        connector(config(odbc_params={keyword: "absent"}))
+
+
+@pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
+@pytest.mark.parametrize("mode", ["require", "verify-full"])
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_tls_keyword_beside_an_enforcing_mode_is_not_gated(
+    keyword: str,
+    mode: str,
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control for the test above: the same keyword crosses once a mode is set beside it.
+    monkeypatch.chdir(tmp_path)
+    with active_hop_posture(PROD_PHI):
+        built = connector(config(odbc_params={keyword: "absent", "sslmode": mode}))
+    assert built._cleartext_guard is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"sslmode": ""},
+        {"sslmode": "  "},
+        {"Encrypt": ""},
+        {"sslmode": ["disable"]},
+        {"sslmode": " require"},
+        {"Encrypt": "yes "},
+    ],
+)
+@pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI])
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_blank_padded_or_list_mode_refused_at_build(
+    params: dict[str, object],
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+    posture: HopPosture,
+) -> None:
+    # Such a value is no evidence of a mode, and a padded one would reach a driver that does not trim
+    # as another word. Since BACKLOG #2705 the DSN builder refuses every one of these values on any
+    # posture, before the cleartext-hop guard is reached, so the build fails whether or not the
+    # instance enforces. The list is refused because its str() holds a quote character; a non-string
+    # scalar such as an int is not refused at build and reaches the cleartext-hop guard instead. The
+    # classifier still flags all of these (no usable mode) for the posture readers, which judge specs
+    # that were never built.
+    with active_hop_posture(posture), pytest.raises(ValueError, match="odbc_params value for"):
+        connector(config(odbc_params=params))
 
 
 def test_generic_inbound_poll_refused_when_enforcing() -> None:

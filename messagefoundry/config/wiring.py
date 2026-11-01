@@ -49,6 +49,7 @@ import traceback
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -150,6 +151,8 @@ __all__ = [
     "ReferenceSpec",
     "ReferenceSourceSpec",
     "resolve_env_settings",
+    "guarding_with_env_values",
+    "guarded_env_values",
     "referenced_env_keys",
     "connector_secret_env_values",
     "display_settings",
@@ -190,6 +193,7 @@ __all__ = [
     "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
+    "POSSIBLY_GENERIC_DB_HOP",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -251,6 +255,24 @@ class EnvRef:
     cast: Callable[[Any], Any] | None = None
 
     def __post_init__(self) -> None:
+        # By type where it is not text: built directly, a table here can carry a default=.
+        name = repr(self.key) if isinstance(self.key, str) else f"<{type(self.key).__name__}>"
+        # vault BACKLOG #2519: resolve_env_settings resolves one link and hands a default over
+        # unchanged, so a reference inside a default is never resolved, even with its key set, and
+        # the connector would get it with its own default= inside. Refused here because at least
+        # env(), parse_env_setting and _ftp_protocol construct through this, and ahead of the bool
+        # read so a chain with a bool cast gets this message. The scan stops at
+        # _MAX_ENVREF_SCAN_DEPTH, so a reference nested deeper is not seen here; on a list setting
+        # _reject_envref_in_lists reads one level further.
+        if _contains_envref(self.default):
+            raise WiringError(
+                f"env reference {name} has an env() reference inside its default= (value "
+                "withheld) - only one link is resolved, so that inner reference would reach the "
+                "connector unresolved, with any default= of its own. Give the outer env() a static "
+                "default. A table with an env key and no other key but default or cast counts as a "
+                "reference here, even as a real header table, because connections.toml spells the "
+                "two alike."
+            )
         # vault BACKLOG #3138: the builtin ``bool`` is the wrong cast for an environment value. Every
         # ``MEFOR_VALUE_*`` variable is text, and ``bool("false")``/``bool("0")`` are True, so
         # ``env("x", cast=bool)`` used to turn "false" into True on a ``tls_allow_expired`` or a
@@ -267,7 +289,7 @@ class EnvRef:
             object.__setattr__(
                 self,
                 "default",
-                _strict_bool_default(self.default, f"env reference {self.key!r} with a bool cast"),
+                _strict_bool_default(self.default, f"env reference {name} with a bool cast"),
             )
 
     def __repr__(self) -> str:
@@ -322,7 +344,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
-    ``cast=lambda s: bool(s)`` still keeps the builtin's trap."""
+    ``cast=lambda s: bool(s)`` still keeps the builtin's trap.
+
+    A ``default=`` may not hold another reference, directly or inside a table or list: only one link
+    is resolved, so :class:`EnvRef` refuses it when the reference is made, down to its scan's depth
+    (vault BACKLOG #2519)."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -434,13 +460,14 @@ def _envref_label(value: Any) -> str:
     leak into the operator log, ``messagefoundry check`` output and the support bundle rather than
     closing it -- the shape BACKLOG #1183 is about. Only the env KEY is ever named."""
     key = value.key if isinstance(value, EnvRef) else value.get("env")
-    return f"env({key!r})"
+    # A raw marker can hold a table in this slot, and that table can carry a default=.
+    return f"env({key!r})" if isinstance(key, str) else f"env(<{type(key).__name__}>)"
 
 
-#: How far into one header's value :func:`_contains_envref` looks. A header value is ultimately a
-#: string, so anything structured under it is already unusual; the cap exists so a pathological or
-#: self-referential structure cannot spin the loader, not because a legitimate table is ever deep.
-_MAX_HEADER_SCAN_DEPTH = 6
+#: How far into a value :func:`_contains_envref` looks, for a header value or an ``env()`` default.
+#: The cap exists so a self-referential structure ends, not because a legitimate table is ever
+#: deep. The walk keeps no visited set, so its cost on such a structure still grows with fan-out.
+_MAX_ENVREF_SCAN_DEPTH = 6
 
 
 def _contains_envref(value: Any, depth: int = 0) -> bool:
@@ -456,7 +483,7 @@ def _contains_envref(value: Any, depth: int = 0) -> bool:
     ordinary list or table under a header value is still the author's business."""
     if _is_nested_envref(value):
         return True
-    if depth >= _MAX_HEADER_SCAN_DEPTH:
+    if depth >= _MAX_ENVREF_SCAN_DEPTH:
         return False
     if isinstance(value, Mapping):
         return any(
@@ -544,7 +571,8 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     :class:`EnvRef` because it IS a top-level settings value -- put the reference where
     :func:`resolve_env_settings` does reach it, and it resolves to the real table before the connector
     runs. Measured: ``resolve_env_settings({"headers": env("all_headers")}, ...)`` returns the table.
-    Only a reference INSIDE the table is unresolvable, so only that is refused.
+    Only a reference INSIDE the table is unresolvable, so only that is refused. Such a reference's
+    own ``default=`` is judged when it is made, in :class:`EnvRef`, so it is not walked here.
 
     A non-mapping ``headers`` is refused here too, not merely skipped. ``connections.toml`` is untyped
     input, so ``headers = "not-a-table"`` reaches this function; iterating it raises ``AttributeError``,
@@ -605,47 +633,34 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
     would otherwise arrive at the connector exactly as a list item written directly does.
+    :class:`EnvRef` refuses a reference inside a default when it is made (vault BACKLOG #2519). This
+    walk still runs: it starts one level further in, at each item, and it reads the default as it is
+    now, so it also sees a default changed after the reference was made.
 
-    A default that is ITSELF a reference, in either spelling, is refused whole rather than followed.
-    :func:`resolve_env_settings` resolves one link only, so that inner reference is never resolved.
-    Wherever the outer key is unset, the connector gets the inner reference object instead of a list.
-    It gets it even when the environment sets the inner key. At least ``proxy_no_proxy`` then reads
-    as an empty list, and every host silently goes through the proxy. So the fallback link never
-    works, and there is no clean version of it to let through. Refusing at the first link also means
-    nothing walks a marker that is its own default. The ``connections.toml`` type check refuses this
-    shape first for at least the list settings it models, since it wants an array and finds a table.
-    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
-    items: list[str] = []
-    chains: list[str] = []
+    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here. At
+    least a value file answers for it when it is read; ``environment_values_from_bytes`` states
+    that check and its limit."""
+    offenders: list[str] = []
     for name, value in settings.items():
         label = name
         if isinstance(value, EnvRef):
             label, value = f"{name} env() default", value.default
             if _is_nested_envref(value):
-                chains.append(name)
+                offenders.append(label)
                 continue
         if isinstance(value, list | tuple | set | frozenset):
-            items += [
+            offenders += [
                 f"{label} item {index}"
                 for index, item in enumerate(value)
                 if _contains_envref(item)
             ]
-    problems: list[str] = []
-    if items:
-        problems.append(
-            f"{', '.join(items)} may not be an env() reference - nested settings are not "
-            "env-resolved, so it would reach the connector unresolved, where a str() of it carries "
-            "any default= inside it. Write the items as static values, or let one env() reference "
-            "stand for the whole setting."
+    if offenders:
+        raise WiringError(
+            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
+            "not env-resolved, so it would reach the connector unresolved, where a str() of it "
+            "carries any default= inside it. Write the items as static values, or let one env() "
+            "reference with a static default stand for the whole setting."
         )
-    if chains:
-        problems.append(
-            f"{', '.join(chains)} env() default may not itself be an env() reference - only one "
-            "link is resolved, so wherever the outer key is unset the connector gets the inner "
-            "reference, not a list. Give the outer env() a static list default instead."
-        )
-    if problems:
-        raise WiringError(f"{factory} " + f" {factory} ".join(problems))
 
 
 def parse_env_setting(value: Any) -> Any:
@@ -655,19 +670,28 @@ def parse_env_setting(value: Any) -> Any:
     :class:`EnvRef` — the inverse of :func:`display_settings`'s ``{"env": key[, "default"]}`` encoding;
     ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
     Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
-    returned verbatim. Raises :class:`WiringError` on a malformed env marker, an unknown cast name, or
-    a ``cast = "bool"`` default that is not a boolean spelling (vault BACKLOG #3138; :class:`EnvRef`
-    reads that default when it is made). The message names neither the connection nor the setting;
-    ``connections_file._build_spec`` adds both."""
+    returned verbatim. Raises :class:`WiringError` on a malformed env marker, an unknown cast name, a
+    ``cast = "bool"`` default that is not a boolean spelling (vault BACKLOG #3138), or a default that
+    holds another reference (vault BACKLOG #2519); :class:`EnvRef` reads the default when it is made.
+    The message names neither the connection nor the setting; ``connections_file._build_spec`` adds
+    both."""
     if not _is_env_marker(value):
         return value
     key = value["env"]
     if not isinstance(key, str) or not key:
-        raise WiringError(f"env reference must name a non-empty string key, got {key!r}")
+        # Named by type where it is not text: a table here can be a reference carrying a default=.
+        got = repr(key) if isinstance(key, str) else type(key).__name__
+        raise WiringError(f"env reference must name a non-empty string key, got {got}")
     cast_name = value.get("cast")
-    # `not isinstance(str)` first: a TOML array or table is unhashable, and the dict lookup would raise
-    # a raw TypeError that no caller turns into a message naming the connection.
-    if cast_name is not None and (not isinstance(cast_name, str) or cast_name not in _NAMED_CASTS):
+    # Ahead of the lookup: a TOML array or table is unhashable, so the dict lookup would raise a raw
+    # TypeError that no caller turns into a message naming the connection. By type, as the key is.
+    if cast_name is not None and not isinstance(cast_name, str):
+        raise WiringError(
+            f"env reference {key!r}: unknown cast - it must be a string, got "
+            f"{type(cast_name).__name__} "
+            f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
+        )
+    if cast_name is not None and cast_name not in _NAMED_CASTS:
         raise WiringError(
             f"env reference {key!r}: unknown cast {cast_name!r} "
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
@@ -1568,6 +1592,31 @@ def resolve_env_settings(
     if parts:
         raise WiringError("; ".join(parts))
     return resolved
+
+
+#: The ``env()`` values the graph a registry guard is judging resolves against, set only while
+#: :meth:`~messagefoundry.pipeline.engine.Engine.guard_registry` runs the guard. A guard takes the
+#: graph alone, and several are chained into one, so this carries the values to the one that reads
+#: them without changing what every other guard takes. ``None`` outside such a call.
+_GUARDED_ENV_VALUES: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "_GUARDED_ENV_VALUES", default=None
+)
+
+
+@contextmanager
+def guarding_with_env_values(values: Mapping[str, Any]) -> Iterator[None]:
+    """Make ``values`` what :func:`guarded_env_values` returns for the duration of the block."""
+    token = _GUARDED_ENV_VALUES.set(values)
+    try:
+        yield
+    finally:
+        _GUARDED_ENV_VALUES.reset(token)
+
+
+def guarded_env_values() -> Mapping[str, Any] | None:
+    """The values the graph being guarded resolves against, or ``None`` when the caller is not
+    inside :func:`guarding_with_env_values`, such as a guard called directly."""
+    return _GUARDED_ENV_VALUES.get()
 
 
 def referenced_env_keys(settings: Mapping[str, Any]) -> list[str]:
@@ -2814,9 +2863,10 @@ def Http(
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
     synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
-    (for example one it cannot decode, or one over the ingress ceiling) is recorded with status
-    ``ERROR`` and answered ``422`` with no ``message_id``, in either mode (ADR 0154 amendment
-    2026-09-26). ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
+    is recorded with status ``ERROR`` and answered, in either mode, ``503`` with ``Retry-After`` for a
+    temporary refusal, ``413`` over a size ceiling, and ``422`` otherwise; the body names that
+    ``ERROR`` row as ``refused_message_id``. Which refusal gets which code is in ADR 0154's amendment of
+    2026-10-30. ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
     an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
     reply described below.
 
@@ -2837,7 +2887,7 @@ def Http(
     per-connection**: this connector answers one request per connection, so a per-connection bucket
     would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
     nothing. A request refused before its body reaches the engine charges nothing either. Only a body
-    the engine reads and records spends the budget, including one it then refuses with a ``422``. Both
+    the engine reads and records spends the budget, including one it then refuses. Both
     keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
 
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
@@ -2895,7 +2945,7 @@ def Http(
     ``connection_event.reason`` or a ``message_events.detail``.
 
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
-    body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
+    body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {
@@ -3882,13 +3932,13 @@ def DICOM(
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the object is decoded, and so before the durable commit (the X12
     # max_interchange_bytes analog; OOM/DoS guard, §9)
-    max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
+    max_associations: int = 10,  # cap concurrent associations
     max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
     # intakes' max_messages_per_second: this one makes a real modality wait.
     association_burst: float | None = None,  # SCP: tokens the bucket holds (default = the rate)
-    max_pdu_size: int = 16384,  # cap one PDU's bytes (0 = unbounded); DoS guard
-    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout
+    max_pdu_size: int = 16384,  # largest PDU offered; the SCP aborts a longer one (SCP: 4096 to 1 MiB)
+    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
@@ -3919,15 +3969,16 @@ def DICOM(
     ``max_associations_per_second`` bounds how fast this SCP ACCEPTS new associations;
     ``association_burst`` is how large a burst passes before the sustained rate applies (default: one
     second's worth). Over budget the SCP **waits before reading the association request**, so the peer
-    is back-pressured by TCP and then served in full — nothing is dropped, refused or answered
-    differently, and a rejected association charges nothing. **The unit is an association, not a
+    is back-pressured by TCP and then served in full — the wait itself drops, refuses and answers
+    nothing differently, and a rejected association charges nothing. **The unit is an association, not a
     message**, and that is a property of DIMSE rather than a shortcut: ``pynetdicom`` owns the read
     loop, so by the time a C-STORE reaches this engine the object has already been read and decoded,
     and pacing there would delay a message the count-and-log invariant has already obliged us to
     account for. So an established association is NOT bounded in the objects it may push — those are
     bounded by ``max_object_bytes`` and ``timeout_seconds`` instead. Unset = no bound, deliberately: a
-    guessed rate throttles a real modality, so the number has to come from your own feed profile. Pair
-    it with ``max_associations``, which must be high enough to hold the peers waiting behind a pace.
+    guessed rate throttles a real modality, so the number has to come from your own feed profile.
+    Choose a rate that keeps few peers waiting: a waiting peer holds one of the SCP's slots for
+    connections with no association yet, and a connection over those fixed caps is closed.
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
@@ -5462,9 +5513,14 @@ def inbound_binding_conflicts(
 # --- declared text-encoding validation (BACKLOG #1613) -----------------------
 # A connection's `encoding` names a Python text codec. It is read once when the connector is built
 # and then used PER MESSAGE, so a name Python cannot resolve is invisible at load and at connection
-# start and would first fail on the first real message — where the ingress decode catches only
-# UnicodeDecodeError, so the LookupError escapes uncaught instead of dead-lettering that one message.
+# start and would first fail on the first real message. The ingress decode (`ingress_guards.
+# decode_body`) refuses that message as a `decode` ERROR row since BACKLOG #2431, so it is no longer
+# an escape, but every message on the connection would be refused the same way.
 # Registry.encoding_problems catches it statically; the probe below is how.
+
+#: The ``kind`` :meth:`Registry._declared_encodings` gives an inbound connection. An inbound's
+#: ``env()`` encoding is refused at load (BACKLOG #2431), so the passes below tell it apart by this.
+_INBOUND_ENCODING_KIND = "inbound connection"
 
 
 def _is_text_codec(value: str) -> bool:
@@ -5498,14 +5554,24 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
     :func:`resolve_env_settings`' resolution order — the environment value (cast if a ``cast`` was
     given), else the ``default`` — narrowed to a single ref and made **non-raising**, so a caller that
     only wants to *probe* a value can skip what it cannot resolve instead of pre-empting that
-    function's own loud, all-problems-at-once report."""
+    function's own loud, all-problems-at-once report.
+
+    A cast is an arbitrary callable, so **every** exception it raises is caught, as
+    :func:`resolve_env_settings` catches it (BACKLOG #1656): a ``KeyError`` from a lookup-table cast
+    carries the value. Only the exception's class is logged, at DEBUG, never its message, for the
+    same reason; that function reports the ref redacted when the connector is built."""
     if ref.key in values:
         raw = values[ref.key]
         if ref.cast is None:
             return raw
         try:
             return ref.cast(raw)
-        except (ValueError, TypeError):
+        except Exception as exc:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+            _logger.debug(
+                "env() value %r: its cast raised %s; skipped by this probe",
+                ref.key,
+                type(exc).__name__,
+            )
             return _UNSET
     if ref.default is not _UNSET:
         return ref.default
@@ -5525,11 +5591,11 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     **A ``deployed=False`` connection is SKIPPED (#233, ADR 0111), and the skip IS the design.** That
     ADR's bright line is that a not-deployed connection's ``env()`` values are never resolved on any
     path; reading one here to probe it would cross that line just as surely as building the connector
-    would. So an ``env()``-named encoding on a not-deployed connection stays unchecked until the
-    connection is deployed — the accepted cost of the owner ruling that chose this over amending
+    would. So an ``env()``-named encoding on a not-deployed outbound connection stays unchecked until
+    the connection is deployed — the accepted cost of the owner ruling that chose this over amending
     ADR 0111, counted by :meth:`Registry.encoding_census` rather than hidden.
 
-    An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` rejects — is skipped
+    An ``env()`` ref this cannot resolve — a missing key, or a value its ``cast`` raises on — is skipped
     rather than reported: for a connection, a database lookup and a FHIR lookup,
     :func:`resolve_env_settings` raises on it loudly moments later when the connector is built, and a
     second message here would only make the first read as the failure. :func:`_resolve_port` skips an
@@ -5543,33 +5609,37 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     other, so this is the missing-value gap and not an encoding gap — widening it belongs with the
     reference table's build-check resolution, unfiled and named rather than numbered.
 
-    **A clean pass here does NOT mean an ``env()``-supplied INBOUND encoding decodes.** Measured
-    2026-09-18: both listener decode sites read ``ic.spec.settings["encoding"]`` RAW, and
-    ``_source_config``'s :func:`resolve_env_settings` writes its result into a copy that is never read
-    back — so the value reaching ``bytes.decode`` is the ``EnvRef`` object itself (``TypeError``), and
-    ``ingress_guards.ingress_encoding`` stringifies the same ref into ``"EnvRef(key=...)"`` and fails
-    the preview with that as the codec name. The outbound half is fine: ``_dest_config`` resolves, so
-    an outbound ``env()`` encoding works and this pass guards it properly. Recorded here because a
-    validation pass that reads as certifying a config the runtime cannot execute is the
-    false-premise shape the repo's SDS-3.7 forbids: this pass rejects a bad codec NAME, and says
-    nothing about whether the inbound path can use a good one. Resolving the listener's encoding is a
-    separate change to the ingress hot path — unfiled, and named rather than numbered."""
+    **An INBOUND connection is skipped: an ``env()`` inbound encoding is refused outright at load**
+    (:meth:`Registry.encoding_problems`, BACKLOG #2431). The ingress text decode reads the
+    inbound's own ``spec.settings``, where an ``env()`` encoding is still the reference, so no
+    environment value this pass could accept would be the name the decode uses.
+
+    A value resolving to ``None`` or ``""`` is refused with its own message, because readers differ
+    on it and an env() value should not depend on which one reads it. At least the remote-file
+    destination reads a falsy name as ``utf-8``, a reference set's ``encoding`` is informational (its
+    loaders read ``utf-8``), and at least some other outbound connectors and the FHIR lookup read the
+    value as the codec name itself. So the message asks for a codec name rather than saying every send would
+    fail."""
     problems: list[str] = []
     for kind, name, value, deployed in registry._declared_encodings():
         if not isinstance(value, EnvRef):
             continue  # a literal — Registry.encoding_problems owns it and has already probed it
+        if kind == _INBOUND_ENCODING_KIND:
+            continue  # refused at load by Registry.encoding_problems, whatever its value here
         if not deployed:
             continue  # ADR 0111: never resolve a not-deployed connection's env() values
         resolved = _resolve_one_env_value(value, env_values)
         if resolved is _UNSET:
             continue  # no value here — reported loud by resolve_env_settings at connector build
         if resolved is None or resolved == "":
-            # `env("charset", default=None)` is a DECLARED opt-out, not a bad codec name: an explicit
-            # None means "not declared" and falls back to utf-8, which `ingress_guards.ingress_encoding`
-            # states as its own rule (`str(declared) if declared else "utf-8"`). Refusing it here would
-            # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that
-            # runs correctly — a per-environment override that this environment declines to set. Empty
-            # string falls the same way, being the same falsy "unset" spelling out of a TOML value.
+            # Not every reader would fail on it (the remote-file destination reads a falsy name as
+            # utf-8), so the message says a name is required rather than that sends would fail.
+            problems.append(
+                f"{kind} {name!r}: encoding from environment value {value.key!r} resolves to no "
+                f"codec name (empty or None); outside an inbound connection set a codec name such "
+                f"as 'utf-8', 'latin-1' or 'cp1252' in this environment's values "
+                f"(environments/<env>.toml or MEFOR_VALUE_*)"
+            )
             continue
         if isinstance(resolved, str) and _is_text_codec(resolved):
             continue
@@ -5852,8 +5922,9 @@ class Registry:
 
         Here and not in the factories: a SMART or OAuth2 token hop, which reads the CA, is composed
         onto a spec after its factory returns. The reasons are those of ``unread_ca_reason`` in
-        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems`: an ``env()``
-        value reads as unknown, and the check after resolution refuses it then."""
+        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
+        ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
+        check after resolution refuses it then."""
         from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
 
         dialling = [
@@ -5904,14 +5975,30 @@ class Registry:
         :meth:`port_collisions` catches a duplicate port before it becomes a bare bind ``OSError``
         (see the section comment above for the runtime failure this pre-empts).
 
-        **Literal names only**, exactly like :meth:`port_collisions`. An :func:`env` reference is
+        **Literal names only**, exactly like :meth:`port_collisions`, with one refusal that needs no
+        value. An :func:`env` reference on an outbound connection, a lookup or a reference set is
         skipped **deliberately, not by oversight**: it carries no value here (``resolve_env_settings``
         needs the instance's environment values and :func:`validate_config` is handed only a
-        directory). It is now **deferred rather than unchecked** (BACKLOG #1767):
+        directory). It is **deferred rather than unchecked** (BACKLOG #1767):
         :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, where the
         environment values exist, beside the second pass :func:`inbound_binding_conflicts` already runs
         for ``env()`` ports. :meth:`encoding_census` keeps deferred and unchecked apart, because they
         are not the same promise.
+
+        **An :func:`env` reference on an INBOUND connection is refused** (BACKLOG #2431), deployed or
+        not, from Python config and ``connections.toml`` alike, and whatever its ``content_type``.
+        The ingress text decode reads the inbound's own settings, where the reference is never
+        resolved, so a text inbound would refuse every message. A binary inbound never text-decodes;
+        it is refused too, so the rule does not turn on a second setting. Nothing is resolved to
+        refuse it, so ADR 0111 holds, and the message names the reference's key, never a value. An
+        inbound encoding is set per environment by editing the connection.
+
+        **``None`` is accepted on an inbound connection only**, whose decode reads it as "not
+        declared" and falls back to ``utf-8`` (:func:`~messagefoundry.transports.framing.
+        declared_encoding`). Elsewhere it is refused (BACKLOG #2431): at least most outbound
+        connectors and the FHIR lookup read the value as the codec name itself, so a ``None`` there
+        would fail every send. Not every reader would (the remote-file destination reads it as
+        ``utf-8``), so the message asks for a codec name rather than predicting a failure.
 
         **A ``deployed=False`` connection is checked HERE and nowhere else — the split is deliberate
         (BACKLOG #1767, owner ruling 2026-09-18), and the old blanket claim above it no longer holds.**
@@ -5920,18 +6007,45 @@ class Registry:
         ``inbound -> router`` check above treats a not-deployed connection the same way. **The resolved
         pass cannot follow it there.** Resolving an ``env()`` value on a not-deployed connection is what
         ADR 0111 forbids on every path, ``messagefoundry check`` included, so that stance now holds of
-        a LITERAL encoding name and NOT of an ``env()`` reference. A reader who takes the literal half
+        a LITERAL encoding name and of an inbound's ``env()`` reference, which is refused unresolved,
+        and NOT of any other ``env()`` reference. A reader who takes the literal half
         as covering both will read the resolved pass as a bug; it is the accepted cost of the ruling.
         (``port_collisions`` excludes a not-deployed connection for a reason that does not apply
         here — it never binds, so it genuinely cannot collide.)"""
         problems: list[str] = []
         for kind, name, value, _deployed in self._declared_encodings():
+            inbound = kind == _INBOUND_ENCODING_KIND
             if isinstance(value, EnvRef):
-                # Spelled out rather than swallowed: probing an EnvRef raises TypeError, and a
-                # try/except wide enough to catch that could not tell it from a real failure.
+                if inbound:
+                    problems.append(
+                        f"{kind} {name!r}: encoding is the environment reference {value.key!r}, and "
+                        f"an inbound encoding must be a literal codec name such as 'utf-8', "
+                        f"'latin-1' or 'cp1252', because the inbound decode never resolves an "
+                        f"env() reference — set it per environment by editing the connection"
+                    )
+                # Otherwise spelled out rather than swallowed: probing an EnvRef raises TypeError,
+                # and a try/except wide enough to catch that could not tell it from a real failure.
                 continue
+            if value is None:
+                if not inbound:
+                    problems.append(
+                        f"{kind} {name!r}: encoding is None, and outside an inbound connection it "
+                        f"must be a codec name such as 'utf-8', 'latin-1' or 'cp1252'"
+                    )
+                continue  # on an inbound, an explicit "not declared": the decode falls back to utf-8
             if not isinstance(value, str):
-                continue  # not a literal codec name — nothing this pass can probe
+                # A literal such as `encoding = 1252` or `true`. An encoding must be a codec NAME, a
+                # string. A number is ambiguous: the run-time rule stringifies it, and some numbers
+                # then name a real codec (1252 reads as cp1252, 8859 as iso8859-1, 437 as cp437)
+                # while others name none, so what it decodes with would depend on that accident. It
+                # is refused here, whatever str() would make of it (BACKLOG #2431). The type is
+                # named so the operator is not sent hunting a misspelling.
+                problems.append(
+                    f"{kind} {name!r}: encoding is a {type(value).__name__}, not a codec name "
+                    f"string; a number or other non-string value is ambiguous, so write the name "
+                    f"quoted, such as 'utf-8', 'latin-1' or 'cp1252'"
+                )
+                continue
             if not _is_text_codec(value):
                 problems.append(
                     f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
@@ -5948,8 +6062,10 @@ class Registry:
         because they carry three different promises (BACKLOG #1767) and collapsing the last two is
         the exact false-green BACKLOG #1613 built this census against:
 
-        * ``checked`` — a literal codec name, probed right here by :meth:`encoding_problems`.
-        * ``deferred`` — an :func:`env` ref on a DEPLOYED entry. Not probed here;
+        * ``checked`` — a value judged right here by :meth:`encoding_problems`: a literal codec name
+          is probed, any other literal is refused but ``None`` on an inbound, and an :func:`env` ref
+          on an inbound connection is refused whatever its value (BACKLOG #2431).
+        * ``deferred`` — an :func:`env` ref on a DEPLOYED entry other than an inbound. Not probed here;
           :func:`resolved_encoding_problems` probes it inside ``build_check_registry``, which has the
           environment values. The word is *deferred* and not *checked* because that pass can be
           absent: ``messagefoundry check`` SKIPs its ``build-check`` line on a bare config dir with no
@@ -5958,18 +6074,23 @@ class Registry:
           all is counted here and reported by the missing-value path instead, whose one gap
           :func:`resolved_encoding_problems` names.
         * ``unchecked`` — nothing probes it on any path. The population this bucket exists for is an
-          :func:`env` ref on a ``deployed=False`` connection, whose values ADR 0111 forbids resolving.
-          A value that is neither a literal string nor an ``env()`` ref falls here too — unreachable
-          from the factories, which all declare ``encoding: str``, and nothing probes it either.
+          :func:`env` ref on a ``deployed=False`` outbound connection, whose values ADR 0111 forbids
+          resolving.
 
         The three are derived from the total, so no entry can fall into a silent fourth bucket. Only a
         connector type with no ``encoding`` argument at all is in none of them — every other factory
         writes its ``utf-8`` default into ``settings``, so leaving the argument off still counts as
         checked."""
         declared = list(self._declared_encodings())
-        checked = sum(1 for _k, _n, value, _d in declared if isinstance(value, str))
+        checked = sum(
+            1
+            for kind, _n, value, _d in declared
+            if not isinstance(value, EnvRef) or kind == _INBOUND_ENCODING_KIND
+        )
         deferred = sum(
-            1 for _k, _n, value, deployed in declared if isinstance(value, EnvRef) and deployed
+            1
+            for kind, _n, value, deployed in declared
+            if isinstance(value, EnvRef) and deployed and kind != _INBOUND_ENCODING_KIND
         )
         return checked, deferred, len(declared) - checked - deferred
 
@@ -5988,7 +6109,7 @@ class Registry:
         them."""
         tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any], bool]]]] = [
             (
-                "inbound connection",
+                _INBOUND_ENCODING_KIND,
                 ((n, c.spec.settings, c.deployed) for n, c in self.inbound.items()),
             ),
             (
@@ -6492,26 +6613,76 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced, as
+#: Opens the reason :func:`unverified_generic_db_hops` gives for a hop whose ``env()`` dialect it
+#: could not resolve. ``GET /security/posture`` keeps only names, so it marks such a name with this
+#: text rather than state the hop is generic.
+POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
+
+
+def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
+    """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
+    this reader cannot resolve.
+
+    The build resolves the reference with :func:`resolve_env_settings` against the running instance's
+    values, so a reader handed those values resolves it the same way, default included. With no
+    values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
+    guess an arm, since each arm reads the same settings differently."""
+    dialect = settings.get("dialect", "sqlserver")
+    if not isinstance(dialect, EnvRef):
+        return str(dialect).lower()
+    if env_values is None:
+        return None
+    try:
+        resolved = resolve_env_settings({"dialect": dialect}, env_values)
+    except WiringError:
+        return None
+    return str(resolved["dialect"]).lower()
+
+
+def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
+    """Whether ``conn`` is ``deployed=False`` with an ``env()`` dialect, which both DATABASE readers
+    skip before :func:`_db_dialect` can resolve it.
+
+    ADR 0111 AC-1: a not-deployed connection's ``env()`` values are never resolved on any path, so an
+    operator's ``cast`` never runs for it, and the engine never builds it. Skipped rather than read as
+    unresolved, so neither reader lists a connection that is not built because of a value it never
+    reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
+    return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
+def unverified_generic_db_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """The generic-ODBC ``DATABASE`` connections the TLS classifier flags, as
     ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
 
     On ``dialect='generic'`` MessageFoundry cannot introspect an arbitrary driver's TLS posture, so the
     posture-keyed weakened-TLS refusal does not apply and TLS is delegated to the operator's own driver
     keyword. ADR 0092 accepted that exemption on the strength of ONE mitigation — construction logs it —
     and a log line emitted once at startup is not the surface anyone queries three months later. This is
-    that surface.
+    that surface for the hops the classifier flags only. A hop whose mode it cannot judge is logged at
+    DEBUG and listed on no surface, so this is not an inventory of delegated hops.
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
-    authority. This remains the INVENTORY of delegated hops — a hop can appear here and still be
-    crossed legitimately, on-box or under a declared attestation or acceptance — so read it as "who
-    owns TLS on this hop", never as "who is crossing in the clear".
+    authority. This lists what that classifier flags, not every delegated hop: one whose usable mode
+    value (see ``transports.database._sets_tls_mode``) is outside the no-TLS deny-list is absent. A
+    blank, padded or non-string mode value is flagged and listed. A hop can appear here and still be crossed legitimately, on-box or under a declared
+    attestation or acceptance, so never read it as "who is crossing in the clear".
 
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
     reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
     ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
+
+    A ``dialect`` given as ``env()`` is resolved against ``env_values`` when the caller has them, as
+    the build resolves it, so the live posture route lists such a hop only when it resolves to
+    generic. With no values (``messagefoundry check`` reads the graph alone) the hop is read as
+    possibly generic, and its reason opens with :data:`POSSIBLY_GENERIC_DB_HOP` and names the
+    reference's key, never its value. Comparing the reference's text with ``generic`` would never
+    match, and would leave off every surface a hop the build then gates or, on a non-enforcing
+    instance, builds with only a WARNING. A ``deployed=False`` connection with an ``env()`` dialect is
+    skipped before anything is resolved (ADR 0111 AC-1, :func:`_dark_env_dialect`).
 
     ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
     than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
@@ -6530,10 +6701,20 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     from messagefoundry.transports.database import generic_odbc_tls_unenforced
 
     def unenforced(settings: Mapping[str, Any]) -> str | None:
-        if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+        dialect = _db_dialect(settings, env_values)
+        if dialect is not None and dialect != "generic":
             return None
         params = settings.get("odbc_params") or {}
-        return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
+        if not isinstance(params, Mapping):
+            return None
+        reason = generic_odbc_tls_unenforced(params)
+        if reason is None or dialect is not None:
+            return reason
+        # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would
+        # make the entry a false alarm, the safe direction for an advisory list, and the reason opens
+        # with POSSIBLY_GENERIC_DB_HOP so a surface that keeps only names can still say so.
+        key = settings["dialect"].key
+        return f"{POSSIBLY_GENERIC_DB_HOP} (env({key})); if it is generic, {reason}"
 
     out: list[tuple[str, str]] = []
     for record_name, table in (
@@ -6541,7 +6722,7 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
         (inbound_record_name, registry.inbound),
     ):
         for conn in table.values():
-            if conn.spec.type is not ConnectorType.DATABASE:
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
             reason = unenforced(conn.spec.settings)
             if reason is not None:
@@ -6559,7 +6740,9 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
 _DELEGATED_DB_AUTH = frozenset({"integrated", "entra"})
 
 
-def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
+def static_credential_db_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """Every declared DATABASE hop that authenticates with an UNCHANGING credential, as
     ``(name, reason)`` (BACKLOG #1182, ASVS 13.2.1).
 
@@ -6605,21 +6788,28 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
       generic connection is reported as static, because that is what the DSN does with it.
 
     **One residual, written down rather than implied:** a generic hop that sets no top-level
-    ``username``/``password`` is NOT reported, even though its ``odbc_params`` may carry a credential
-    under an arbitrary driver keyword. The engine cannot enumerate an arbitrary driver's keywords —
-    the same limit :func:`unverified_generic_db_hops` records for TLS — so classifying that case would
-    be guessing, and a reader that guessed would put a wrong name in a security report.
+    ``username``/``password`` is NOT reported. ``odbc_params`` takes a fixed keyword list
+    (:data:`~messagefoundry.transports.database._ODBC_PARAM_ALLOWLIST`), and the only credential that
+    list can carry is a client certificate: ``sslcert`` and ``sslkey``, with ``sslpassword`` for the
+    key's passphrase. Such a hop may sign in with that certificate, on a driver that reads those
+    keywords, or as the service's own account, and this reader classifies neither (docs/CONNECTIONS.md,
+    *Static database credentials*).
+
+    **A ``dialect`` given as ``env()``** is resolved against ``env_values`` when the caller has them,
+    as the build resolves it. With none, both arms are read and the hop is listed when either would
+    list it, with a fixed reason saying the dialect is unresolved: an inventory that guessed the
+    SQL Server arm would drop a generic hop's static username/password. A ``deployed=False``
+    connection with an ``env()`` dialect is skipped before anything is resolved (ADR 0111 AC-1,
+    :func:`_dark_env_dialect`).
 
     Pure — it reads the loaded graph and touches nothing else."""
 
-    def kind(settings: Mapping[str, Any]) -> str | None:
-        """The reason this hop's credential is unchanging, or ``None`` when it is delegated."""
-        if str(settings.get("dialect", "sqlserver")).lower() == "generic":
-            if not (settings.get("username") or settings.get("password")):
-                return None
-            return (
-                "generic-ODBC hop emits a static username/password (auth= is not read on this arm)"
-            )
+    def generic_kind(settings: Mapping[str, Any]) -> str | None:
+        if not (settings.get("username") or settings.get("password")):
+            return None
+        return "generic-ODBC hop emits a static username/password (auth= is not read on this arm)"
+
+    def preset_kind(settings: Mapping[str, Any]) -> str | None:
         auth = str(settings.get("auth", "sql")).lower()
         if auth in _DELEGATED_DB_AUTH:
             return None
@@ -6627,13 +6817,30 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
         # which must not be able to carry an operator-typed string.
         return "static SQL login (auth='sql')" if auth == "sql" else "static SQL login"
 
+    def kind(settings: Mapping[str, Any]) -> str | None:
+        """The reason this hop's credential is unchanging, or ``None`` when it is delegated."""
+        dialect = _db_dialect(settings, env_values)
+        if dialect == "generic":
+            return generic_kind(settings)
+        if dialect is not None:
+            return preset_kind(settings)
+        # Fixed text, never the reference's key: see the closed-set note above.
+        generic, preset = generic_kind(settings), preset_kind(settings)
+        if generic and preset:
+            return "dialect is an unresolved env() reference, and either dialect sends a static credential"
+        if generic:
+            return "dialect is an unresolved env() reference; if generic, it sends a static username/password"
+        if preset:
+            return "dialect is an unresolved env() reference; if sqlserver, a static SQL login"
+        return None
+
     out: list[tuple[str, str]] = []
     for record_name, table in (
         (_outbound_record_name, registry.outbound),
         (inbound_record_name, registry.inbound),
     ):
         for conn in table.values():
-            if conn.spec.type is not ConnectorType.DATABASE:
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
             reason = kind(conn.spec.settings)
             if reason is not None:
@@ -9633,6 +9840,19 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
         if isinstance(exc, ImportError):
             cause = _textless_import_error(exc)
+    except SystemExit:
+        # A module that calls sys.exit() at import is a bad config, not a request to end the process
+        # (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module
+        # leave SystemExit alone because it is not their kind of failure; this runs the author's module:
+        # on a serving engine (a reload, a connection-flag write) the SystemExit would leave the
+        # event loop and stop every connection, and at `check` it would end the run as if it had
+        # passed. So it is refused like any failing module. KeyboardInterrupt still propagates. The
+        # exit code is not quoted, since it may be the author's text.
+        helpers.unregister(mod_name, module)
+        withheld = WiringError(
+            f"error loading config module {path.name}: it, or a helper it loads, called sys.exit() "
+            "at import, which config code may not do"
+        )
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
         # module, whose diagnostic would then name the wrong file.
