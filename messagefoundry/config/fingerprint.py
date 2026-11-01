@@ -66,7 +66,7 @@ _SCHEME = b"mefor-cfg-fp:v3\n"
 FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 
 #: The :func:`config_fingerprint_detail` key that marks a partial digest: the sorted relative paths of
-#: the covered files, and of the folders a glob reads, that could not be read and were left out
+#: the covered files, and of the folders a snapshot lists, that could not be read and were left out
 #: (vault BACKLOG #2944). Absent when the digest covers the whole bundle. Paths, not a count, so two
 #: partial digests can be compared like for like, and an operator can tell which file to fix. Not
 #: ``degraded``: an audit row merges this detail into its own, and there ``degraded`` already names
