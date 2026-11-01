@@ -67,6 +67,7 @@ from messagefoundry.transports.bounded_read import (
     build_strict_opener,
 )
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.remotefile import RemoteFileDestination
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
 from tests._wire_proxy import _WireProxy
@@ -280,6 +281,50 @@ def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None
     ``tls_hop_attested`` none). The refusal is the model's, so the target does not matter."""
     with pytest.raises(ValueError, match="opposite claims"):
         _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
+
+
+_FTP_ATTESTED: dict[str, Any] = {
+    "protocol": "ftp",
+    "host": "partner.example.test",
+    "remote_dir": "/in",
+    "tls_hop_attested": True,
+    "tls_hop_attested_reason": "IPsec tunnel to the partner",
+}
+
+
+def test_a_directly_built_destination_refuses_a_settings_attestation_beside_accepted() -> None:
+    """The anonymous-FTP guard reads the attestation out of ``Destination.settings``, where
+    ``_dest_config`` mirrors the typed field. A ``Destination`` built directly with the attestation
+    only there, beside ``cleartext_accepted``, used to build, and the cleartext hop crossed on the
+    attestation with no acceptance record."""
+    with (
+        active_hop_posture(HopPosture(enforcing=True)),
+        pytest.raises(ValueError, match="opposite claims"),
+    ):
+        RemoteFileDestination(
+            Destination(
+                name="OB_FTP",
+                type=ConnectorType.REMOTEFILE,
+                settings=dict(_FTP_ATTESTED),
+                cleartext_accepted=True,
+                cleartext_reason="legacy partner listener has no TLS",
+            )
+        )
+
+
+def test_control_the_mirrored_settings_attestation_alone_still_builds() -> None:
+    """The shape ``_dest_config`` produces: the typed field, mirrored into the settings, and no
+    acceptance. Refusing the settings key outright would refuse this."""
+    with active_hop_posture(HopPosture(enforcing=True)):
+        RemoteFileDestination(
+            Destination(
+                name="OB_FTP",
+                type=ConnectorType.REMOTEFILE,
+                settings=dict(_FTP_ATTESTED),
+                tls_hop_attested=True,
+                tls_hop_attested_reason="IPsec tunnel to the partner",
+            )
+        )
 
 
 _ACCEPTED: dict[str, Any] = {

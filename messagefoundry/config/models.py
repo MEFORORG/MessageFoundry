@@ -878,7 +878,14 @@ class Destination(BaseModel):
     def _validate_hop_attestation(self) -> Destination:
         _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
         _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
-        check_attested_and_accepted(self.tls_hop_attested, self.cleartext_accepted)
+        # The settings-driven seams (at least the anonymous-FTP guard) read the attestation from
+        # ``settings``, where _dest_config mirrors the typed field, so the pair is judged on either
+        # carrier. Read only beside an acceptance, so no other Destination meets a new check.
+        check_attested_and_accepted(
+            self.tls_hop_attested
+            or (self.cleartext_accepted and flag_from_settings(self.settings, "tls_hop_attested")),
+            self.cleartext_accepted,
+        )
         _check_revocation_attestation(
             self.tls_revocation_attested, self.tls_revocation_attested_reason
         )
