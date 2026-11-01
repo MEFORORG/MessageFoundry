@@ -5473,10 +5473,10 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
 
     Handles a literal ``int``, a string literal (``"2575"`` from ``connections.toml``), and an
     :func:`env` ref (resolved against ``env_values``, applying its cast), and reads the number by the
-    connectors' own rule (``transports.base.port_setting``), so this cannot skip a listener that
-    binds. A value that rule refuses, or an unresolved one, yields ``None`` so the caller simply
-    skips it — a missing ``env()`` value is reported loud elsewhere (when the connector is built),
-    not doubled here. Imported here: ``messagefoundry.transports`` imports this module."""
+    connectors' own rule (``transports.base.port_setting``). A value that rule refuses, or an
+    unresolved one, yields ``None`` so the caller simply skips it — a missing ``env()`` value is
+    reported loud elsewhere (when the connector is built), not doubled here. Imported here:
+    ``messagefoundry.transports`` imports this module."""
     from messagefoundry.transports.base import port_setting
 
     if isinstance(raw, EnvRef):

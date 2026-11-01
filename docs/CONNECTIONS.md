@@ -150,9 +150,12 @@ transport = "mllp"
   spellings and what it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
-  A connector reads its `port` one way too, whatever the cast: a whole number from 0 to 65535, as a
-  number or in digits. A bool, a fraction or anything else is refused when the connector is built
-  (BACKLOG #1650). An `[egress]` entry that pins a port compares the setting's text with it first.
+  A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
+  digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
+  #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
+  a fraction. At least the host-and-port `[egress]` lists that pin a port, such as `allowed_mllp`,
+  compare the setting's text with the pin before the connector is built; `allowed_db` compares
+  numbers.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
