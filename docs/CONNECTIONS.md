@@ -1611,8 +1611,13 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
   `[security].enforcement = warn` does not lift the refusal: the HTTP family's no-loosen floor
   turns that WARN back into a refusal.
 - **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses. A connection
-  cannot hold it and `cleartext_accepted` together, so an attested connection has no route to a
-  `proxy_user` login on a proxy off this machine.
+  cannot hold it and `cleartext_accepted` together, whether it is built by `outbound()`,
+  `FhirLookup()`, `connections.toml` or directly as a `Destination` or `FhirLookupExecutor`, so an
+  attested connection has no route to a `proxy_user` login on a proxy off this machine. Decision
+  d20261031T213402506-5d928c, taken under the owner's delegation of 2026-10-31, keeps it so: the
+  owner's 2026-10-05 ruling declined an unconditional refusal, and B462-R2 keeps `proxy_url` plus
+  `proxy_user`, so `cleartext_accepted` stays the declared route even at a site whose proxy leg
+  runs through a tunnel. A site that declares the tunnel with `tls_hop_attested` gets no route.
 - **No declaration lifts a credential written in a URL or the environment.** A user and password
   in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build. That
   holds at every `[security].enforcement` setting and for a proxy on this machine, and
