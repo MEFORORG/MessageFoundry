@@ -905,7 +905,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         description="Revoke every session of every account, directly against the store, on the "
         "same host gate as admin-unlock. Every signed-in user, administrators included, must sign "
         "in again, except for a session docs/SECURITY.md, Limits of the session sweep, says the "
-        "revoke could miss. Audited. The engine may be running or stopped.",
+        "revoke could leave live. Audited. The engine may be running or stopped.",
     )
     admin_revoke_sessions.add_argument(
         "--service-config",
@@ -12465,8 +12465,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
     code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11),
     ``admin-reset-totp``, ``admin-revoke-sessions`` (BACKLOG #2614) and ``backup``, and for
-    ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). The schema refusal rolls the open's DDL batch back and writes no schema marker,
-    and the command has written no store row, so it could not start, exit 2. Not "changed
+    ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). The schema refusal rolls the
+    open's DDL batch back and writes no schema marker, and the command has written no store row,
+    so it could not start, exit 2. Not "changed
     nothing": a SQL Server open under ``auto`` may already have switched the database's RCSI
     option on, before the batch. Its text lists the tables, columns and indexes that differ and
     the remedy, and names no row's content. ``audit-verify`` and ``audit-anchor`` open read-only,

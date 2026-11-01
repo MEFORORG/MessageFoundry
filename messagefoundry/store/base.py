@@ -3113,13 +3113,13 @@ class AuthStore(Protocol):
         session sweep*, says which sessions a backend can miss.
 
         :meth:`revoke_user_sessions` for every account at once, in one transaction: it raises the
-        session epoch of every account its one read of the account list returns, so an older
-        copy of any of their rows resolves to nothing, and re-seals the kept session under its
-        account's new epoch. An account that read does not return keeps its epoch. A kept session
+        session epoch of the accounts its one read of the account list returns, so an older copy
+        of any of their rows resolves to nothing, and re-seals the kept session under its
+        account's epoch. An account that read does not return keeps its epoch. A kept session
         whose seal does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError` and
         the whole transaction, revokes included, rolls back. An account whose record fails its
-        seal keeps its old epoch, and the sweep still ends its sessions, because ending a session
-        needs no key."""
+        seal keeps its old epoch, and the sweep still revokes the sessions of it that it reaches,
+        because ending a session needs no key."""
         ...
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
