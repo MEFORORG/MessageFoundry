@@ -8,8 +8,9 @@ The BACKLOG #2532 commands opened it with none. ``admin-revoke-sessions`` (BACKL
 later, follows the same rule and is listed with them. ``None`` is the strict answer for a
 weakened-TLS check and for a Vault hop, but not for the PostgreSQL revocation guard, which is a
 no-op with no posture. So on a first deployment at ``enforce`` each #2532 command would have
-crossed an off-box store hop with no revocation check, one ``serve`` itself refuses. At least ``support-bundle`` and ``verify`` still pass
-none; ``tests/test_vault_posture_census.py`` lists what each caller passes.
+crossed an off-box store hop with no revocation check, one ``serve`` itself refuses. At least
+``support-bundle`` and ``verify`` still pass none; ``tests/test_vault_posture_census.py`` lists
+what each caller passes.
 
 The tests drive each command through ``main`` to the real ``PostgresStore._create_pool``. Only the
 driver module is a stand-in, so what is proved is whether the guard let the command dial:

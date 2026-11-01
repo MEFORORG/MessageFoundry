@@ -12451,7 +12451,8 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     ``admin-revoke-sessions`` (BACKLOG #2614) and ``backup``, and for ``rotate-key``, where it is
     an aborted rotation's (BACKLOG #2109). Only the OPEN is wrapped. ``open_store`` resolves the
     key, builds the cipher and judges the store hop before the backend reads a row, and a Vault hop
-    refused there arrives as a ``KeyProviderError``. Under a ``vault_transit`` cipher the open also makes Transit calls after
+    refused there arrives as a ``KeyProviderError``. Under a ``vault_transit`` cipher the open
+    also makes Transit calls after
     it has read rows, at least its at-open sweep and the audit chain's genesis MAC. The Transit
     cipher raises each of their failures as ``CipherError``, which this does not catch. Whether
     one can raise a class caught here was not traced, so read "before a row" as the intent for at

@@ -3114,9 +3114,11 @@ class AuthStore(Protocol):
         :meth:`revoke_user_sessions` for every account at once, in one transaction: it raises the
         session epoch of every account its first read of the account list returns, so an older
         copy of any of their rows resolves to nothing, and re-seals the kept session under its
-        account's new epoch. An account created after that read keeps its epoch. A kept session whose seal does not verify
-        raises :class:`~messagefoundry.store.row_seal.RowSealError` and the whole transaction,
-        revokes included, rolls back. An account whose record fails its seal keeps its old epoch
+        account's new epoch. An account that read does not return keeps its epoch;
+        docs/SECURITY.md, *Limits of the session sweep*, says on which backends that can happen
+        and what it costs. A kept session whose seal does not verify raises
+        :class:`~messagefoundry.store.row_seal.RowSealError` and the whole transaction, revokes
+        included, rolls back. An account whose record fails its seal keeps its old epoch
         and still has its sessions revoked, because ending a session needs no key."""
         ...
 

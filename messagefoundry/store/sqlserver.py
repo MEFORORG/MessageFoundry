@@ -15106,10 +15106,12 @@ class SqlServerStore:
         """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
         :meth:`AuthStore.revoke_all_sessions`.
 
-        Every account's epoch is raised first, in id order, so the account row locks are taken
-        before any session row's, the order ``create_session`` takes them in. The count comes from
-        an ``OUTPUT`` rowset, as :meth:`revoke_user_sessions` counts. The borrow is the ordinary
-        bounded :meth:`_acquire`: this is a standalone act, not the tail of a committed write."""
+        The epoch of each account the first, unlocked read of the account list returns is raised
+        first, in id order, so those account row locks are taken before any session row's, the
+        order ``create_session`` takes them in. docs/SECURITY.md, *Limits of the session sweep*,
+        states what that read can miss. The count comes from an ``OUTPUT`` rowset, as
+        :meth:`revoke_user_sessions` counts. The borrow is the ordinary bounded :meth:`_acquire`:
+        this is a standalone act, not the tail of a committed write."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
