@@ -501,6 +501,12 @@ async def test_a_refused_peer_that_stalls_after_its_request_goes_round_nothing()
         try:
             for _ in range(6):
                 held.append(await asyncio.to_thread(_stall, scp.sockport, request + b"\x07"))
+            # A peer still in the listen backlog, or accepted with its thread not yet started, is
+            # no thread and no association, so the count below can pass while that peer waits. It
+            # then starts and takes the one slot, and the sender is rightly refused. A peer's close
+            # is the one reading that says it has been dealt with, and a blocked DUL never sends it.
+            closed = [await asyncio.to_thread(_closed_within, sock, 8.0) for sock in held]
+            assert all(closed), f"{closed.count(False)} of {len(held)} peers were never closed"
             await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=8.0)
             assert scp._server.active_associations == []
             assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (
