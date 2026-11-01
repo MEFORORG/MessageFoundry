@@ -340,7 +340,7 @@ async def test_a_body_over_max_body_bytes_is_413_before_any_row(store: MessageSt
 # --- the classifier itself ------------------------------------------------------------------------
 
 
-async def test_the_too_large_guard_is_oversize_and_every_other_guard_is_permanent(
+async def test_the_guards_are_classed_by_kind(
     store: MessageStore,
 ) -> None:
     reg = Registry()
@@ -351,6 +351,8 @@ async def test_the_too_large_guard_is_oversize_and_every_other_guard_is_permanen
     guards = {
         "too_large": ingress_guards.IngressTooLarge("r"),
         "decode": ingress_guards.IngressGuardError("r", phase="decode"),
+        # The codec NAME, not the body, is at fault: temporary (BACKLOG #2431).
+        "codec": ingress_guards.IngressCodecUnusable("r"),
         "type": ingress_guards.IngressGuardError("r", phase="type"),
         "parse": ingress_guards.IngressGuardError("r", phase="parse"),
         "strict": ingress_guards.IngressGuardError("r", phase="strict"),
@@ -363,6 +365,7 @@ async def test_the_too_large_guard_is_oversize_and_every_other_guard_is_permanen
     assert kinds == {
         "too_large": RefusalKind.OVERSIZE,
         "decode": RefusalKind.PERMANENT,
+        "codec": RefusalKind.TEMPORARY,
         "type": RefusalKind.PERMANENT,
         "parse": RefusalKind.PERMANENT,
         "strict": RefusalKind.PERMANENT,

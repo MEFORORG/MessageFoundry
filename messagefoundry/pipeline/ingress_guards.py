@@ -36,7 +36,7 @@ the next paragraph. And the live guards after it.
 **The strict-validation timeout is mirrored by measurement.** The listener runs ``hl7apy`` off the
 event loop under :func:`strict_validate_timeout` and records ``ERROR`` on expiry. What the sender
 hears differs: ``_handle_inbound`` builds an ``AE`` for a source that takes a reply (MLLP, TCP),
-while ``_handle_inbound_http`` returns ``None``, which the HTTP listener answers ``422``. The
+while ``_handle_inbound_http`` returns a permanent refusal, which the HTTP listener answers ``422``. The
 dry-run stays synchronous: it runs the same validate inline, measures its elapsed time against the
 same timeout, and reports a validate that took longer as an ``ERROR`` preview carrying the
 listener's text (BACKLOG #1689). Unlike the listener it does not abandon the validate at the

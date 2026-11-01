@@ -337,12 +337,11 @@ async def _live_rows(
     return [dict(r) for r in await cur.fetchall()]
 
 
-def _as_stored(listener: str, error: str, *, kind: str = "temporary") -> str:
-    """The stored reason for a refusal the dry run words as ``error``.
+def _as_stored(listener: str, error: str, *, kind: str) -> str:
+    """The stored reason for a refusal of ``kind`` the dry run words as ``error``.
 
     The receipt path leads its stored reason with the refusal's kind (BACKLOG #2105); the MLLP path
-    stores the reason alone. The default is the unusable codec name's kind, temporary on the receipt
-    path (BACKLOG #2431): the configuration is at fault, not the body."""
+    stores the reason alone."""
     return f"[refusal kind: {kind}] {error}" if listener == "_handle_inbound_http" else error
 
 
@@ -573,7 +572,10 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
     assert preview.disposition is MessageStatus.ERROR
     assert preview.error is not None and preview.error.startswith("decode error (")
     assert rows == [
-        {"status": MessageStatus.ERROR.value, "error": _as_stored(listener, preview.error)}
+        {
+            "status": MessageStatus.ERROR.value,
+            "error": _as_stored(listener, preview.error, kind="temporary"),
+        }
     ]
 
 
@@ -597,7 +599,10 @@ async def test_an_env_encoding_is_not_resolved_by_the_decode_even_with_a_value(
     assert preview.disposition is MessageStatus.ERROR
     assert preview.error is not None and preview.error.startswith("decode error (")
     assert rows == [
-        {"status": MessageStatus.ERROR.value, "error": _as_stored(listener, preview.error)}
+        {
+            "status": MessageStatus.ERROR.value,
+            "error": _as_stored(listener, preview.error, kind="temporary"),
+        }
     ]
 
 

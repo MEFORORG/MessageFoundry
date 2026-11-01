@@ -1449,9 +1449,8 @@ sources answer it in step.
 | Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers |
 | --- | --- | --- | --- |
 | the streaming detach's in-flight budget, held by other detaches | temporary | `503` with `Retry-After` | Out of Resources (`0xA700`) |
-| an inbound `encoding` naming no text codec, which refuses every body until the operator fixes it (BACKLOG #2431, merged after this amendment) | temporary | `503` with `Retry-After` | not reached: a DICOM object is not decoded |
 | over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes` or over strict validation's own engine-default cap as `validate()` itself measures and reports it, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
-| every other refusal: at least a decode failure in a usable charset, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
+| every other refusal: at least a decode failure, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
 
 A body larger than the whole in-flight budget is over-size, not temporary: it could never fit, so a
 re-send would meet the same refusal. The budget is engine-wide and `max_message_bytes` is set per
@@ -1507,3 +1506,12 @@ italic note in place. AC-8's second test,
 `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, now pins
 the `refused_message_id` in its exact body and carries only permanent causes. Its over-ceiling case moved to
 `tests/test_ingress_refusal_kinds.py`, which pins each kind with a control.
+
+*(Note 2026-11-01, BACKLOG #2431, added when batch 469 merged `main`: this amendment's decision did
+not cover it. One decode failure is temporary, not permanent: an inbound `encoding` naming no text
+codec. It refuses every body until an operator fixes the name, so the same body is accepted after,
+and it is the receipt form of the MLLP listener's `AE` for the same case. `Http()` answers it `503`
+with `Retry-After`, and its `ERROR` row's reason names the decode, not the in-flight budget. A DICOM
+object is never decoded, so the SCP never sees it. A decode failure in a usable charset stays
+permanent. A sender that honours `Retry-After` re-sends every 5 seconds until the name is fixed,
+leaving one `ERROR` row per attempt.)*
