@@ -386,10 +386,11 @@ roster alias of the Lander.
 > and throws, so the gate fails closed to REVIEW. The later rungs stay 10 and 5 minutes, so the
 > Steward's minutes default is (60, 10, 5), though the gate reads only the first.
 >
-> **The collector keeps the rate measurable.** Weekly usage moves in whole percents, and `usage.ps1`
-> needs two rows inside its 90-minute rate window. The `five_hour` column used to supply those rows.
-> `usage-collect.ps1` now also appends a row when the last one is 10 minutes old, so a slow or flat burn
-> reads as a low rate rather than as no rate.
+> **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
+> `usage-collect.ps1` writes a history row only on a move, and `usage.ps1` needs two rows inside its
+> 90-minute rate window. So a slow or flat burn reads as no rate, and the 90 percent level decides.
+> A timed row was tried and refused: an idle session keeps reporting its cached percentage, so its rows
+> read as a measured rate of zero while other sessions burn the pool, which lifted the backstop.
 
 ### Where it is enforced, and where it is not
 

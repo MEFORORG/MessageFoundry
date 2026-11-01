@@ -9,8 +9,8 @@
     statusLine is the only source). Adds the two things a raw reading cannot give you: a BURN RATE, and
     the only question that actually matters operationally -- WILL THIS WINDOW RUN OUT BEFORE IT RESETS?
 
-    A percentage on its own does not answer that. 80% with two hours left and nothing running is fine;
-    45% with 30 minutes left and six sessions compiling is not.
+    A percentage on its own does not answer that. 80% with a day left and nothing running is fine; 45%
+    with three hours left and six sessions compiling is not.
 
     ONE WINDOW: `seven_day`, so the verdict below is the weekly window's. usage-collect.ps1's header
     says why.
@@ -511,7 +511,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     if ($pct -ge 98) { $o.state = "CRITICAL"; $o.reason = "at the ceiling" }
     elseif ($null -ne $o.minutes_to_empty -and $null -ne $minsToReset -and $o.minutes_to_empty -lt $minsToReset) {
         $o.state = "CRITICAL"
-        $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, $minsToReset min before this window resets"
+        $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, $($minsToReset - $o.minutes_to_empty) min before this window resets"
     }
     elseif ($pct -ge 85) { $o.state = "WARN"; $o.reason = "high, but not projected to run out before reset" }
     elseif ($null -ne $o.projected_at_reset -and $o.projected_at_reset -ge 95) {
@@ -660,7 +660,7 @@ function Show-Window($o) {
         return
     }
     $colour = switch ($o.state) { "CRITICAL" { "Red" } "WARN" { "Yellow" } "UNKNOWN" { "DarkGray" } default { "Green" } }
-    $reset = if ($null -ne $o.minutes_to_reset) { "resets in {0}h{1:00}m" -f [int]($o.minutes_to_reset / 60), ($o.minutes_to_reset % 60) } else { "reset unknown" }
+    $reset = if ($null -ne $o.minutes_to_reset) { "resets in {0}h{1:00}m" -f [math]::Floor($o.minutes_to_reset / 60), ($o.minutes_to_reset % 60) } else { "reset unknown" }
     Write-Host ("  {0,-14} {1,5:0.0}%  {2}   [seen {3} min ago]" -f $o.label, $o.used_percentage, $reset, $o.reading_age_min) -ForegroundColor $colour
     if ($null -ne $o.rate_pct_per_hr) {
         $proj = if ($null -ne $o.projected_at_reset) { ", ~{0}% by reset" -f $o.projected_at_reset } else { "" }

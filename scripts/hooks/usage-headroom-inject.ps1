@@ -721,7 +721,7 @@ function Format-Window($w) {
     $line = "$label {0,5:0.0}% used   [{1}]" -f ([double]$w.used_percentage), $age
     if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
         $m = [int]$w.minutes_to_reset
-        $line += ("   resets in {0}h{1:00}m" -f [int]($m / 60), ($m % 60))
+        $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))
     }
     if ([string]$w.state -in @("WARN", "CRITICAL")) {
         $line += "   " + [string]$w.state + " -- " + (Get-Folded $w.reason 160)

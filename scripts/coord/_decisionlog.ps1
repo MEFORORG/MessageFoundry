@@ -794,11 +794,11 @@ function Get-DecisionThresholdsFile {
 function Get-DecisionRungLevels([string]$ThresholdsFile) {
     <#
       The weekly window's start-nothing rung: the HOLD NEW WORK percentage and its time-to-cutoff in
-      minutes. THE RUNG'S DEFAULTS LIVE HERE AND NOWHERE ELSE in this repository: 60 minutes and 90
-      percent, by the owner's ruling of 2026-10-31, which moved the stop to the weekly window when
-      Anthropic removed the five-hour limit and replaced the 2026-08-14 ruling that a weekly rung stops
-      nobody. 90 is the weekly HOLD level of the owner's ruling of 2026-09-17. The Steward's later rungs
-      stay 10 and 5 minutes, so its minutes default is (60, 10, 5); only HOLD is read here.
+      minutes. To change the rung's defaults, change the two assignments below this comment. They
+      carry the owner's ruling of 2026-10-31, which moved the stop to the weekly window when Anthropic
+      removed the five-hour limit and replaced the 2026-08-14 ruling that a weekly rung stops nobody.
+      The percentage is the weekly HOLD level of the owner's ruling of 2026-09-17. The Steward has
+      later rungs in minutes too; only HOLD is read here.
 
       The Steward's thresholds.json overrides them the way its watch.py does: `levels.weekly` and
       `minutes`, each three numbers, HOLD first. Any other key under `levels` is an unknown window,

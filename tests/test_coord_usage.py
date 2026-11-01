@@ -259,26 +259,22 @@ def test_a_flat_reading_does_not_append_history(tmp_path: Path) -> None:
     assert len(history(tmp_path)) == 1
 
 
-def test_a_flat_reading_writes_no_beat_before_the_last_row_is_ten_minutes_old(
-    tmp_path: Path,
-) -> None:
-    """The control for the test below: a beat that fired on every call would pass that one."""
+def test_an_idle_session_writes_no_row_on_a_timer(tmp_path: Path) -> None:
+    """An idle session keeps reporting its cached percentage. A row for it would read as a measured
+    rate of zero while other sessions burn the pool, and a rate of zero lifts the level backstop. So
+    however old the last row is, a flat reading adds nothing and the rate stays unmeasured."""
     seven = window(92.0, 280000)
-    write_history(tmp_path, [(5.0, 92.0)], seven["resets_at"])
+    write_history(tmp_path, [(60.0, 92.0)], seven["resets_at"])
     collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
     assert len(history(tmp_path)) == 1
-
-
-def test_a_flat_reading_past_the_beat_measures_a_rate_of_zero(tmp_path: Path) -> None:
-    """The weekly window moves in whole percents, so rows on a move alone leave a slow or flat burn
-    under the reader's two samples in 90 minutes. It would read as no rate, and the rung would fall
-    back to the level. With the beat, a window sitting at 92 percent reads as burning nothing."""
-    seven = window(92.0, 280000)
-    write_history(tmp_path, [(11.0, 92.0)], seven["resets_at"])
-    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
-    assert len(history(tmp_path)) == 2
     _, d = read(tmp_path)
-    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(0.0), d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+
+
+def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Path) -> None:
+    """90 minutes rounded to the even hour read as 2h30m."""
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5430)}})
+    assert re.search(r"resets 1h30m", line), line
 
 
 @pytest.mark.parametrize("bad", ["", "not json at all", "{truncated", "null"])
@@ -389,6 +385,8 @@ def test_burning_faster_than_the_window_resets_is_critical(tmp_path: Path) -> No
     assert code == CRITICAL
     assert d["seven_day"]["rate_pct_per_hr"] > 20
     assert 0 < d["seven_day"]["minutes_to_empty"] < 60, "must run out before the window resets"
+    gap = d["seven_day"]["minutes_to_reset"] - d["seven_day"]["minutes_to_empty"]
+    assert f"{gap:.0f} min before this window resets" in d["seven_day"]["reason"], d
 
 
 def test_a_high_but_stable_reading_is_not_critical(tmp_path: Path) -> None:

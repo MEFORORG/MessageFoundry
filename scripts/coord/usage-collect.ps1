@@ -178,13 +178,12 @@ try {
     if ($CaptureRaw) { Write-AtomicText (Join-Path $StateDir "raw-payload.json") $raw | Out-Null }
 
     $rl = $p.rate_limits
-    $nowUtc = (Get-Date).ToUniversalTime()
-    $now = $nowUtc.ToString("o")
+    $now = (Get-Date).ToUniversalTime().ToString("o")
 
     # ABSENT IS A VALUE. The docs are explicit that rate_limits "appears only for Claude.ai subscribers
     # (Pro/Max) after the first API response in the session" and that a window may be absent. So a
-    # missing window is recorded as null with a reason, never defaulted to 0 -- 0% used and "not
-    # reported yet" are opposite facts and must not share a representation.
+    # missing window is never defaulted to 0 -- 0% used and "not reported yet" are opposite facts and
+    # must not share a representation.
     function Get-Window($w) {
         if ($null -eq $w) { return $null }
         $pct = $w.used_percentage
@@ -280,22 +279,19 @@ try {
     $json = ($doc | ConvertTo-Json -Depth 6)
     $ok = Write-AtomicText (Join-Path $StateDir "latest.json") $json
 
-    # History drives burn rate. Append when a FRESHLY OBSERVED percentage moves, or when the last row
-    # is $HistoryBeatMinutes old. The statusline can fire many times a minute; a row per fire would be
-    # a large file describing a flat line, and rate over a dense flat series is noise.
+    # History drives burn rate. Append only when a FRESHLY OBSERVED percentage moves. The statusline can
+    # fire many times a minute; a row per fire would be a large file describing a flat line, and rate
+    # over a dense flat series is noise.
     #
-    # THE BEAT IS WHAT KEEPS THE WEEKLY WINDOW MEASURABLE. The window moves in whole percents, and
-    # usage.ps1 wants two rows inside its 90-minute rate window, so moves alone give a slow or flat burn
-    # no rate at all. The rung then reads that as "no rate" and falls back to the level, when the truth
-    # is a rate near zero.
-    $HistoryBeatMinutes = 10
+    # NO ROW ON A TIMER. A slow burn then has too few rows for a rate, and the rung falls back to the
+    # level, which is the safe side. A timed row would be worse: an idle session keeps reporting its
+    # cached percentage, so its rows would read as a measured rate of zero while other sessions burn the
+    # pool, and that would lift the level backstop.
     if ($ok -and $null -ne $freshSeven) {
         $histPath = Join-Path $StateDir "history.jsonl"
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
-        $prevAt = if ($prev -and $HaveConfigRoots) { ConvertTo-UtcDateTime $prev.at } else { $null }
-        $beatDue = $null -ne $prevAt -and ($nowUtc - $prevAt).TotalMinutes -ge $HistoryBeatMinutes
-        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $beatDue) {
+        if (-not $prev -or $prev.seven_day -ne $freshSeven) {
             $row = [ordered]@{
                 at          = $now
                 seven_day   = $freshSeven
@@ -309,7 +305,7 @@ try {
     $line = "7d {0:0}%" -f $seven.used_percentage
     if ($seven.resets_at_epoch) {
         $mins = [int](([System.DateTimeOffset]::FromUnixTimeSeconds([long]$seven.resets_at_epoch) - [System.DateTimeOffset]::UtcNow).TotalMinutes)
-        if ($mins -ge 0) { $line += ("  (resets {0}h{1:00}m)" -f [int]($mins / 60), ($mins % 60)) }
+        if ($mins -ge 0) { $line += ("  (resets {0}h{1:00}m)" -f [math]::Floor($mins / 60), ($mins % 60)) }
     }
 }
 catch {
