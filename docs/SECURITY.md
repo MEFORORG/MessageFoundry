@@ -1501,7 +1501,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends every account's sessions and keeps the caller's own, so the reply reaches them; their other sessions end with everyone's. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends every account's sessions and keeps the caller's own, so the reply reaches them; their other sessions end with everyone's. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). On the SQL Server store it has the limits that *Limits of the session sweep* states. `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -4651,8 +4651,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   unbind and for every other whole-account revoke, which run the same sweep: at least an
   administrator's revoke of a user's sessions, a role change and a password reset. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) runs
-  its own table-wide statement of the same `UPDATE ... OUTPUT` shape, after raising every
-  account's epoch in the same transaction, so treat it as having this limit too. That is a
+  its own table-wide statement of the same `UPDATE ... OUTPUT` shape, after raising, in the same
+  transaction, the epoch of every account its first read returns (the first exception below says
+  which it misses), so treat it as having this limit too. That is a
   reading by likeness to the per-account sweep, not one traced for the table-wide statement, and
   the lock-order bullet below does not cover its every-account lock footprint. **A missed
   session is refused the next time it is presented** (BACKLOG #2592), with at least the two
@@ -4661,10 +4662,12 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   session, and the user's own session list hides it and ends it the same way. **The first
   exception is the every-account revoke's.** It raises the epoch only of the accounts that its
   first read of the account list returns, and that read takes no lock. So an account created
-  after that read, which signs in before the sweep, keeps its epoch. A session of it that the
-  sweep misses would stay live after the revoke, with nothing to refuse it. That was read from
-  the code and has not been run. **The second exception:**
-  a request from that session to end the user's other sessions, accepted just before the
+  after that read keeps its epoch, and a session of it that the sweep misses would stay live
+  after the revoke, with nothing to refuse it. Any such session was made after the revoke
+  began, as a sign-in to an existing account during the revoke can be, and that one stays live
+  too. That was read from the code and has not been run. **The second exception,** for every
+  sweep this bullet names: a request from a missed session to end the user's other sessions,
+  accepted just before the
   sweep commits, waits for it and then stamps the session with the new epoch, so it stays
   usable. **At least three things are also wrong about a refused one.** Its ending is reported
   as a seal failure: a WARNING, an `integrity.authority_seal_failed` audit row and an

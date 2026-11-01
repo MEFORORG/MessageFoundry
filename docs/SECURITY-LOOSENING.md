@@ -660,8 +660,9 @@ is refused, so an opt-out does nothing and is not reported.
   the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
   BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
   (vault BACKLOG #2354): at least the CLI commands that open the store without one. That includes
-  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers, which pass the
-  instance posture only at `enforce` (see *Which callers know the posture* below).
+  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers and
+  `admin-revoke-sessions`, which pass the instance posture only at `enforce` (see *Which callers
+  know the posture* below).
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext

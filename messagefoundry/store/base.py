@@ -3108,9 +3108,10 @@ class AuthStore(Protocol):
         """Revoke every unrevoked session of every account, but for ``except_token_hash`` when it is
         given (BACKLOG #2614). Returns the number revoked.
 
-        :meth:`revoke_user_sessions` for every account at once, in one transaction: it raises every
-        account's session epoch, so an older copy of any row resolves to nothing, and re-seals the
-        kept session under its account's new epoch. A kept session whose seal does not verify
+        :meth:`revoke_user_sessions` for every account at once, in one transaction: it raises the
+        session epoch of every account its first read of the account list returns, so an older
+        copy of any of their rows resolves to nothing, and re-seals the kept session under its
+        account's new epoch. An account created after that read keeps its epoch. A kept session whose seal does not verify
         raises :class:`~messagefoundry.store.row_seal.RowSealError` and the whole transaction,
         revokes included, rolls back. An account whose record fails its seal keeps its old epoch
         and still has its sessions revoked, because ending a session needs no key."""
