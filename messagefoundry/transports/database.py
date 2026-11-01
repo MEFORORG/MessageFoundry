@@ -13,10 +13,10 @@ weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised
 job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
 any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
-list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), none of which names a host, and ``[egress].allowed_db``
-checks the ``server`` setting (vault BACKLOG #2577). The list covers keywords only, and a braced password
-(:func:`_odbc_password`) relies on the driver reading the ``}}`` escape. On the generic path TLS is the
-operator's responsibility (configured through the driver's own keyword) — MessageFoundry
+list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), chosen to carry no host, and ``[egress].allowed_db``
+reads the host from the ``server`` setting (vault BACKLOG #2577). The list covers keywords only, and a
+braced password (:func:`_odbc_password`) relies on the driver reading the ``}}`` escape. On the generic
+path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
 cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
 Construction logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
 :func:`_warn_generic_tls_unenforced`) and **gates it**: a generic hop whose ``odbc_params`` say TLS is not
@@ -940,13 +940,14 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     top-level ``username``/``password`` settings (``env()``-resolved + secret-redacted) under the
     ``odbc_user_key``/``odbc_password_key`` keyword names (default ``UID``/``PWD``).
 
-    **The lists check keywords only, and a braced password relies on the driver reading the ``}}``
-    escape** (vault BACKLOG #2577). An ``odbc_params`` keyword must be on
-    :data:`_ODBC_PARAM_ALLOWLIST`, and the two credential keywords on their own short lists, or the
-    build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
-    twice is refused. No listed keyword names a host, so a driver that takes its target under
-    another keyword cannot be configured on this path. The egress check itself is the caller's
-    (``pipeline.wiring_runner``).
+    **The keyword lists below check keywords, and a braced password relies on the driver reading the
+    ``}}`` escape** (vault BACKLOG #2577, BACKLOG #2705). An ``odbc_params`` keyword must be on
+    :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
+    the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
+    twice is refused. A driver that takes its target under a keyword off those lists cannot be
+    configured on this path. The egress check runs outside this builder, at least in
+    ``build_source`` and ``build_destination`` (``transports.base``). This builder sends ``server``
+    as written.
 
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
