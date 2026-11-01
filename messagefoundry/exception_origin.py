@@ -14,14 +14,20 @@ module can rebind ``__name__``, so the name alone is a claim. A config directory
 package, and its modules and helpers run as ``mefor_config_*``, so the file alone is not enough. The
 file name is fixed when code is compiled, so a module that compiles text under an engine path, and
 sets the name to match, still passes. This tells accident from engine wording: it does not stop code
-that sets out to forge a frame."""
+that sets out to forge a frame.
+
+A frame says who raised an instance, not what it prints. A module can catch a refusal and assign its
+``__class__``, which leaves the engine's frame on it, so :func:`worded_by_the_engine` also reads the
+real class, and a ``__str__`` of the class's own is not engine wording. That reads no ``args``, so
+a module that rewrites them, with text or with an object whose own ``__str__`` holds the value,
+still passes."""
 
 from __future__ import annotations
 
 import opcode
 import os
 from collections.abc import Iterator
-from types import TracebackType
+from types import TracebackType, WrapperDescriptorType
 from typing import Any, Final
 
 __all__ = ["exception_chain", "raised_by_the_engine", "worded_by_the_engine"]
@@ -82,11 +88,15 @@ def raised_by_the_engine(exc: BaseException) -> bool:
 
 
 def worded_by_the_engine(exc: BaseException) -> bool:
-    """Whether a ``raise`` statement in this package's own code raised ``exc``, so an engine author
-    wrote its text.
+    """Whether a ``raise`` statement in this package's own code raised ``exc``, and its class prints
+    through a builtin's ``__str__``, so an engine author wrote its text.
 
     It reads the instruction the innermost frame stopped on, because a builtin called from engine
     code leaves the same frame with a call there instead. It proves who wrote the text, not what the
-    text holds: a ``raise`` can interpolate a value or another exception's text."""
+    text holds: a ``raise`` can interpolate a value or another exception's text. The class is read
+    past its metaclass, and reading it can still run a descriptor of the class's own, so this can
+    raise whatever that does: a caller that holds author code's exception guards the call."""
     tb = _engine_frame(exc)
-    return tb is not None and tb.tb_frame.f_code.co_code[tb.tb_lasti] == _RAISE_STATEMENT
+    if tb is None or tb.tb_frame.f_code.co_code[tb.tb_lasti] != _RAISE_STATEMENT:
+        return False
+    return type(type.__getattribute__(type(exc), "__str__")) is WrapperDescriptorType

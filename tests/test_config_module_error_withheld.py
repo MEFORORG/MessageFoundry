@@ -619,12 +619,11 @@ def test_an_author_str_that_raises_withholds_the_whole_refusal(
 @pytest.mark.parametrize(
     "member",
     [
-        f"def __str__(self):\n        raise KeyboardInterrupt({NEEDLE!r})",
         f"def __str__(self):\n        raise BaseException({NEEDLE!r})",
         f"@property\n    def reason(self):\n        raise RuntimeError({NEEDLE!r})",
         f"def __getattr__(self, name):\n        raise LookupError({NEEDLE!r})",
     ],
-    ids=["str-interrupt", "str-base-exception", "reason-property", "getattr"],
+    ids=["str-base-exception", "reason-property", "getattr"],
 )
 def test_a_foreign_context_that_faults_when_read_withholds_the_refusal(
     tmp_path: Path, engine_probe: str, member: str
@@ -941,6 +940,92 @@ def test_a_class_answering_as_a_wiring_error_is_not_one(tmp_path: Path, engine_p
     assert type(_load_error(tmp_path)) is WiringError
 
 
+#: A refusal a module caught, given the module's class. The frame stays the engine's raise, so this
+#: needs no probe, and what prints is that class's text.
+_RECLASSED = (
+    "from messagefoundry import Http\n"
+    "from messagefoundry.config.wiring import WiringError\n\n"
+    "class Bad(WiringError):\n    def __str__(self):\n        {str_body}\n\n"
+    "try:\n"
+    "    Http(port=8080, reply_from='OB_X', reply_on_timeout='500')\n"
+    "except WiringError as exc:\n"
+    "    exc.__class__ = Bad\n"
+    "    raise\n"
+)
+
+
+@pytest.mark.parametrize(
+    "str_body",
+    [f"return {NEEDLE!r}", f"raise OSError({NEEDLE!r})", f"raise BaseException({NEEDLE!r})"],
+    ids=["returns-the-value", "faults", "faults-as-base-exception"],
+)
+def test_a_caught_refusal_given_a_class_with_its_own_str_is_withheld(
+    tmp_path: Path, str_body: str
+) -> None:
+    # The class's __str__ writes what prints, whoever raised the instance, so it cannot stand.
+    _write(tmp_path, "feed.py", _RECLASSED.format(str_body=str_body))
+    (msg,) = _messages(tmp_path)
+    assert NEEDLE not in msg
+    assert "feed.py: Bad at line" in msg and "withheld" in msg
+    err = _load_error(tmp_path)
+    assert type(err) is WiringError
+    assert err.__cause__ is None and err.__context__ is None
+
+
+@pytest.mark.parametrize("base", ["WiringError", "ValueError", "MemoryError"], ids=str.lower)
+def test_an_engine_raised_class_with_its_own_str_is_withheld(
+    tmp_path: Path, engine_probe: str, base: str
+) -> None:
+    # MemoryError because a runtime limit is kept by its frame, no reason to read a class's text.
+    bad_class = (
+        "from messagefoundry.config.wiring import WiringError\n\n"
+        f"class Bad({base}):\n    def __str__(self):\n        return {NEEDLE!r}\n"
+    )
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    _assert_no_needle_on(err)
+    assert "feed.py: Bad" in str(err) and "withheld" in str(err)
+
+
+def test_a_context_with_its_own_str_is_foreign_even_from_an_engine_frame(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    # Left on the chain, a printed traceback would run that __str__.
+    bad_class = f"class Bad(Exception):\n    def __str__(self):\n        return {NEEDLE!r}\n"
+    body = (
+        f"import {engine_probe} as probe\n\n{bad_class}\n"
+        "try:\n    probe.raises_this_type(Bad)\nexcept Bad:\n    probe.words_its_own()\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    assert str(err) == "error loading config module feed.py: engine wording 3765"
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_a_class_with_its_own_format_cannot_write_the_diagnostic(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    bad_class = (
+        f"class Bad(Exception):\n    def __format__(self, spec):\n        return {NEEDLE!r}\n"
+    )
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    assert NEEDLE not in str(_load_error(tmp_path))
+
+
+def test_an_engine_subclass_of_wiring_error_stands_as_raised(
+    tmp_path: Path, engine_probe: str
+) -> None:
+    # No __str__ of its own, so nothing prints but the builtin: an except clause can read the class.
+    body = (
+        "from messagefoundry.config.wiring import PortConflictError\n"
+        f"import {engine_probe} as probe\n\nprobe.raises_this_type(PortConflictError)\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    assert type(_load_error(tmp_path)) is wiring.PortConflictError
+
+
 def test_a_helper_left_to_its_guard_is_logged_by_its_real_type_name(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1118,6 +1203,97 @@ def test_an_interrupt_off_the_main_thread_is_a_refused_module(tmp_path: Path, bo
         left = pool.submit(outcome).result()
     assert isinstance(left, WiringError), repr(left)
     assert NEEDLE not in str(left) and "KeyboardInterrupt at line 1" in str(left)
+
+
+#: The two places the loader reads a failed module's exception: the withheld diagnostic, on a class
+#: the module raised itself, and the judgement of an engine refusal, on a context it was handling.
+_READ_WINDOWS = {
+    "module-failure": (
+        "class Bad(Exception):\n    def __getattr__(self, name):\n        {fault}\n\nraise Bad()\n"
+    ),
+    "refusal": (
+        "import {probe} as probe\n\n"
+        "class Bad(Exception):\n    def __str__(self):\n        {fault}\n\n"
+        "try:\n    raise Bad()\nexcept Bad:\n    probe.words_its_own()\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
+def test_an_interrupt_in_the_loaders_read_stops_the_load(
+    tmp_path: Path, engine_probe: str, window: str
+) -> None:
+    # Reading a failed module runs code, so an interrupt can land in that read. It is Ctrl-C, not a
+    # config error, and it leaves as a new, bare one with no module exception on it.
+    fault = f"raise KeyboardInterrupt({NEEDLE!r})"
+    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
+    with pytest.raises(KeyboardInterrupt) as ei:
+        load_config(tmp_path)
+    _assert_bare(ei.value)
+
+
+@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
+def test_a_real_interrupt_in_the_loaders_read_stops_the_load(
+    tmp_path: Path, engine_probe: str, window: str
+) -> None:
+    # A real signal, delivered while the loader reads. Sent in a loop for the reason given above.
+    fault = "import signal\n        while True:\n            signal.raise_signal(signal.SIGINT)"
+    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        with pytest.raises(KeyboardInterrupt) as ei:
+            load_config(tmp_path)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    _assert_bare(ei.value)
+
+
+@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
+def test_an_exit_in_the_loaders_read_leaves_with_no_module_exception_on_it(
+    tmp_path: Path, engine_probe: str, window: str
+) -> None:
+    # As a module's own SystemExit leaves: the loader does not handle one.
+    _write(tmp_path, "feed.py", window.format(fault="raise SystemExit(3)", probe=engine_probe))
+    with pytest.raises(SystemExit) as ei:
+        load_config(tmp_path)
+    assert ei.value.code == 3
+    assert ei.value.__context__ is None and ei.value.__cause__ is None
+
+
+@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
+def test_a_class_answering_as_an_exit_in_the_loaders_read_is_absorbed(
+    tmp_path: Path, engine_probe: str, window: str
+) -> None:
+    # Only the real class is an exit. Raised, this one would leave with its text.
+    fault = (
+        "class Liar(BaseException):\n            __class__ = SystemExit\n"
+        f"        raise Liar({NEEDLE!r})"
+    )
+    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
+    assert NEEDLE not in str(_load_error(tmp_path))
+
+
+@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
+@pytest.mark.parametrize("stop", ["KeyboardInterrupt", "SystemExit"], ids=["interrupt", "exit"])
+def test_a_stop_in_the_loaders_read_off_the_main_thread_is_absorbed(
+    tmp_path: Path, engine_probe: str, window: str, stop: str
+) -> None:
+    # No signal reaches a reload's worker, so a stop there is code, and it would end the event loop.
+    fault = f"raise {stop}({NEEDLE!r})"
+    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
+
+    def outcome() -> BaseException | None:
+        try:
+            load_config(tmp_path)
+        except BaseException as exc:  # noqa: BLE001 - what crosses the thread is the assertion
+            return exc
+        return None
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        left = pool.submit(outcome).result()
+    assert isinstance(left, WiringError), repr(left)
+    assert NEEDLE not in str(left)
+    assert left.__cause__ is None and left.__context__ is None
 
 
 def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:

@@ -9460,21 +9460,44 @@ def _module_failure(
     credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary.
 
     Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
-    withheld diagnostic, so the fault cannot escape with ``exc`` chained as its context. That
-    absorbs an interrupt landing in the read too: this runs inside a handler, so any raise from
-    here would carry ``exc``. The module is refused, which ends a load, and a ``validate`` run goes
-    on to its next module."""
+    withheld diagnostic: :func:`_read_fault` says what happens to one. The module is refused, which
+    ends a load, and a ``validate`` run goes on to its next module. Call this outside any handler of
+    ``exc``, so a stop leaving through here does not carry ``exc`` as its context."""
+    fault: BaseException | None = None
     try:
         detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
-    except BaseException as fault:  # noqa: BLE001 - see the docstring
-        _log_a_read_fault(path, fault)
+    except BaseException as caught:  # noqa: BLE001 - _read_fault lets the stops through
+        fault = caught
+    if fault is not None:
+        _read_fault(path, fault)
         detail = _type_name(exc)
     return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
 
 
-def _log_a_read_fault(path: Path, fault: BaseException) -> None:
-    """Say that reading a failed module's exception faulted: the file and the fault's type, never
+def _is_a_signal(exc: BaseException) -> bool:
+    """Whether ``exc`` can be what Ctrl-C raised. A subclass is not what a signal raises, and Python
+    delivers a signal only to the main thread, so on any other, such as a reload's worker, an
+    interrupt is code, and one leaving there would stop the event loop."""
+    return type(exc) is KeyboardInterrupt and threading.current_thread() is threading.main_thread()
+
+
+def _read_fault(path: Path, fault: BaseException) -> None:
+    """Act on ``fault``, which reading a failed module's exception raised.
+
+    Called after the ``except`` that caught it, so what this raises carries neither ``fault`` nor
+    the module's exception. A read runs the module's code, so a real Ctrl-C can land in it: that
+    stops the load as a new, bare interrupt, by the rule :func:`_run_author_code` gives. An exit
+    leaves as a module's own does, except on a worker, where it would stop the event loop as an
+    interrupt would. Anything else is absorbed, and logged: the file and the fault's type, never
     its text, which is the module's, so ``exc_info`` stays off too."""
+    if _is_a_signal(fault):
+        raise KeyboardInterrupt
+    # The real type, as _refusal_for reads it: isinstance would run a ``__class__`` of the module's.
+    if (
+        issubclass(type(fault), SystemExit)
+        and threading.current_thread() is threading.main_thread()
+    ):
+        raise fault
     _logger.warning(
         "config module %s: reading its failure raised %s, so the diagnostic is reduced",
         safe_name(path.name),
@@ -9645,9 +9668,10 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
     runtime limit, whose fixed text quotes nothing: the parser wall in the loader's ``compile``."""
     if isinstance(exc, _NAMED_EXCEPTIONS):
         return False
-    return worded_by_the_engine(exc) or (
-        isinstance(exc, _RUNTIME_LIMITS) and raised_by_the_engine(exc)
-    )
+    if worded_by_the_engine(exc):
+        return True
+    # The exact class: only the runtime's own has fixed text, and a subclass can write its own.
+    return any(type(exc) is limit for limit in _RUNTIME_LIMITS) and raised_by_the_engine(exc)
 
 
 def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
@@ -9692,11 +9716,13 @@ def _refusal_for(
     when ``exc`` stands as raised.
 
     The engine's own wording -- a factory or registry refusal naming a connection or a setting --
-    is the diagnostic an author needs, so it keeps its text. That relies on engine raise sites not
-    quoting a value; tests/test_config_module_error_withheld.py sweeps the factories for one, and
-    reaches no refusal that sits behind another. What it was raised from that the engine did not
-    word can hold a value: the whole text of such an exception is taken out of the refusal, and the
-    chain goes. A slice of that text, or a copy made before the raise, stays.
+    is the diagnostic an author needs, so it keeps its text. A class with its own ``__str__`` does
+    not, whoever raised it, because that method writes what prints: :func:`worded_by_the_engine`.
+    That relies on engine raise sites not quoting a value;
+    tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no refusal
+    that sits behind another. What it was raised from that the engine did not word can hold a value:
+    the whole text of such an exception is taken out of the refusal, and the chain goes. A slice of
+    that text, or a copy made before the raise, stays.
 
     An import failure keeps a textless stand-in of its type as the cause, because the engine-shard
     preflight (_config_preflight) reads the cause's type for its helper advice.
@@ -9704,7 +9730,9 @@ def _refusal_for(
     Every read here can run a config module's code: ``isinstance`` falls back to the instance's
     ``__class__``, and ``__str__``, ``__repr__``, a ``reason`` property and ``__getattribute__`` are
     the class's own. So the judgement sits in one guard, and a fault in it withholds the whole
-    refusal, with no stand-in, and absorbs an interrupt as :func:`_module_failure` says."""
+    refusal, with no stand-in, or stops the load: :func:`_read_fault`. Call this outside any handler
+    of ``exc``, as :func:`_module_failure` says."""
+    fault: BaseException | None = None
     try:
         if _keeps_engine_wording(exc):
             text = _rewritten_refusal(path, exc)
@@ -9713,16 +9741,18 @@ def _refusal_for(
                 # would leave ``validate_config``, which catches only the real one.
                 if issubclass(type(exc), WiringError):
                     return None
-                return WiringError(f"error loading config module {path.name}: {exc}"), exc
+                # ``!s``, or the f-string would run a ``__format__`` of the class's own.
+                return WiringError(f"error loading config module {path.name}: {exc!s}"), exc
             imported = exc.__cause__
         else:
             text = _module_failure(path, exc, source_of)
             imported = exc
         cause = _textless_import_error(imported) if isinstance(imported, ImportError) else None
         return WiringError(text), cause
-    except BaseException as fault:  # noqa: BLE001 - see the docstring
-        _log_a_read_fault(path, fault)
-        return WiringError(_module_failure(path, exc, source_of)), None
+    except BaseException as caught:  # noqa: BLE001 - _read_fault lets the stops through
+        fault = caught
+    _read_fault(path, fault)
+    return WiringError(_module_failure(path, exc, source_of)), None
 
 
 def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -> None:
@@ -9733,9 +9763,8 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     On the main thread, a ``KeyboardInterrupt`` stops the load, whatever is on it. A real interrupt
     raised during a handler has a context, and code raising one looks the same, so neither can be
     judged by what it carries; refusing one would make Ctrl-C a config error. What leaves is a new,
-    bare one, so the original's arguments, notes and chain stay behind. A subclass is not what a
-    signal raises. Python delivers a signal only to the main thread, so on any other, such as a
-    reload's worker, one is code, and it is refused rather than left to stop the event loop."""
+    bare one, so the original's arguments, notes and chain stay behind. :func:`_is_a_signal` says
+    which ones those are, and any other is refused."""
     failure: BaseException | None = None
     try:
         helpers.run(module, path)
@@ -9744,13 +9773,12 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     except (Exception, SystemExit):
         raise
     except BaseException as exc:
-        if type(exc) is KeyboardInterrupt and threading.current_thread() is threading.main_thread():
-            failure = KeyboardInterrupt()
-        else:
-            failure = WiringError(_module_failure(path, exc, helpers.source_of))
+        failure = exc
     if failure is not None:
-        # Raised AFTER the handler, for the reason _exec_module gives.
-        raise failure
+        # Judged AFTER the handler, for the reason _exec_module gives.
+        if _is_a_signal(failure):
+            raise KeyboardInterrupt
+        raise WiringError(_module_failure(path, failure, helpers.source_of))
 
 
 def _exec_module(path: Path, helpers: _HelperImporter) -> None:
@@ -9759,23 +9787,26 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     mod_name = _config_module_name(path)
     module = helpers.new_module(mod_name, path)
     helpers.register(mod_name, module)
-    refusal: tuple[WiringError, BaseException | None] | None = None
+    failure: Exception | None = None
     try:
         _run_author_code(path, module, helpers)
     except Exception as exc:
         helpers.unregister(mod_name, module)
-        refusal = _refusal_for(path, exc, helpers.source_of)
-        if refusal is None:
-            raise
+        failure = exc
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
         # module, whose diagnostic would then name the wrong file.
         helpers.drop_pending()
-    if refusal is not None:
-        # Raised AFTER the handler, so a withheld original is not the __context__: a rendered
-        # traceback, a structured log or a crash reporter would print it again from there.
-        withheld, cause = refusal
-        raise withheld from cause
+    if failure is None:
+        return
+    # Judged and raised AFTER the handler, so a withheld original is not the __context__ of a
+    # refusal or a stop: a rendered traceback, a structured log or a crash reporter would print it
+    # again from there.
+    refusal = _refusal_for(path, failure, helpers.source_of)
+    if refusal is None:
+        raise failure
+    withheld, cause = refusal
+    raise withheld from cause
 
 
 def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
