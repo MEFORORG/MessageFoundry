@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The generic ODBC dialect takes its connection target from ``server`` alone (vault BACKLOG #2577).
+"""The generic ODBC dialect's keyword lists cover keywords only (vault BACKLOG #2577).
 
-``[egress].allowed_db`` is checked against the ``server`` setting, so ``server`` has to be the only
-setting that can tell the driver where to connect. The generic dialect also takes free driver
-keywords in ``odbc_params``, and the name of the keyword each credential is sent under. Those are the
-other places a keyword can come from, so this file pins all three:
+``[egress].allowed_db`` reads the host from the ``server`` setting, so the list is hand-chosen, no
+keyword is on it in order to name a host, and a file keyword's value is screened
+separately by spelling. The lists rely on at least a driver named on the escape list reading the
+``}}`` escape in a braced password, and the driver reading ``SERVER`` as its target
+(docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). The generic dialect also takes free driver keywords in ``odbc_params``, and the name of
+the keyword each credential is sent under. Those are the other places a keyword can come from, so
+this file pins all three:
 
 * ``odbc_params`` accepts a fixed list of keywords. Anything else is refused when the connection is
   built, with the keyword and the connection named. The list is an allowlist on purpose: every ODBC

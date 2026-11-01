@@ -1800,9 +1800,12 @@ port compared.
 
 ##### Accepted `odbc_params` keywords
 
-`[egress].allowed_db` checks the host in `server`. **No `odbc_params` keyword can give the
-driver another host** (vault BACKLOG #2577): `odbc_params` takes a fixed list of keywords, and
-each one sets a port, a TLS mode, a local file or a session option:
+`[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords:
+the list is hand-chosen, no keyword is on it in order to name a host, and a file
+keyword's value is screened separately by spelling (vault BACKLOG #2577). **The list covers
+keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
+in a braced password (*The password*, below), and the driver reading `SERVER` as its target
+(*This is a rule about keywords*, below).** The keywords set at least a port, a TLS mode, a local file or a session option:
 
 <!-- odbc-params-allowlist:start -->
 | Group | Keywords |
@@ -1882,8 +1885,8 @@ these kinds:
 
 Two limits follow from this:
 
-- **A driver that takes its target under another keyword cannot be configured here.** The engine
-  sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
+- **A driver may take its target under another keyword, and the engine does not detect that.** The
+  engine sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
   target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
