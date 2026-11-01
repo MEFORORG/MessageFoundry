@@ -649,6 +649,7 @@ async def test_the_control_route_answers_a_stopped_check_as_a_store_fault(
             "action": action,
             "role": "source",
             "running": False,
+            "refused": True,
             "reason": "store_unavailable",
         }
     ]
@@ -752,6 +753,7 @@ async def test_an_outbound_start_the_store_stopped_answers_503_and_holds_its_row
                     "action": action,
                     "role": "destination",
                     "running": False,
+                    "refused": True,
                     "reason": "store_unavailable",
                 }
             ]
@@ -881,8 +883,45 @@ async def test_a_refused_row_records_the_lane_s_true_running_state(
         assert r.status_code == 503, r.text
         assert rr.outbound_running("OUT")
         rows = await _rows(store, "connection_control")
-        assert [row["running"] for row in rows] == [True]
+        assert [(row["running"], row["refused"]) for row in rows] == [(True, True)]
     finally:
+        await engine.stop()
+
+
+async def test_a_refused_row_cannot_read_as_a_completed_action(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3746: ``running`` is the lane's true state, so a start refused after its bind
+    reads running true, as a completed start does. Only the marker tells them apart. Red under:
+    the refused row carrying no ``refused`` key."""
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+    engine.add_registry(_poller_graph(Path("unused.pem"), None, auto_start=False))
+    await engine.start()
+    rr = engine.registry_runner
+    assert rr is not None
+
+    async def start(_name: str, *, operator: bool) -> None:
+        return None
+
+    async def refuse(_name: str, *, operator: bool) -> None:
+        raise WiringError("refused after the bind")
+
+    monkeypatch.setattr(rr, "inbound_running", lambda _name: True)
+    try:
+        monkeypatch.setattr(rr, "start_inbound", start)
+        assert (await _control(engine, "start")).status_code == 200
+        monkeypatch.setattr(rr, "start_inbound", refuse)
+        assert (await _control(engine, "start")).status_code == 409
+        refused, completed = await _rows(store, "connection_control")
+        assert completed == {
+            "connection": _IB,
+            "action": "start",
+            "role": "source",
+            "running": True,
+        }
+        assert refused == completed | {"refused": True}
+    finally:
+        monkeypatch.undo()
         await engine.stop()
 
 
