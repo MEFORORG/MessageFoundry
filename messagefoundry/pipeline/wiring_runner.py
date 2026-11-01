@@ -111,6 +111,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
     resolved_encoding_problems,
 )
+from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
@@ -231,6 +232,7 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
+from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
@@ -246,6 +248,7 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.egress import warn_url_query_credentials
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
@@ -811,6 +814,8 @@ _CONN_EVENT_BURST_MAX = 256
 # never reaches this; a run of them says the STORE is refusing, and every further attempt pays a full
 # acquire wait to learn the same thing. See `_rewrite_connection_events_singly`.
 _CONN_EVENT_SALVAGE_GIVE_UP = 3
+# How much of an undeclared connection-event kind the refusal warning keys on and shows (BACKLOG #1624).
+_UNDECLARED_KIND_SHOWN = 64
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -1775,6 +1780,9 @@ class RegistryRunner:
         self._conn_event_q: asyncio.Queue[ConnectionEventWrite] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
+        # Throttles the undeclared-kind warning per (connection, kind), and counts every refusal so
+        # the next line written reports the volume behind a quiet log (BACKLOG #1624).
+        self._undeclared_kind_log = RefusalLog()
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
         self._shard_watchdog: asyncio.Task[None] | None = None
         # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
@@ -2227,9 +2235,24 @@ class RegistryRunner:
         reason: str | None,
     ) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
-        connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
+        connection-event flood must never block a listener/delivery lane or grow memory unbounded.
+
+        **An undeclared kind is refused here, before it can join a burst** (BACKLOG #1624). The store
+        refuses one too, but there a single bad row fails the whole burst, and a run of them trips the
+        drainer's store-is-refusing cutoff and loses the declared rows behind them. Refused here it
+        is dropped, added to the overflow-drop tally, and warned about through a throttled line that
+        reports the running total; the store's check stays as the backstop for any other writer.
+
+        All of that holds only while the drain queue exists. With no queue the method returns first,
+        so any event, declared or not, is discarded with no row, no count and no warning. At least
+        one configuration reaches that: the ``[diagnostics].connection_events`` master switch off
+        with one inbound's ``capture_connection_errors`` on, which builds a sink but no queue."""
         q = self._conn_event_q
         if q is None:
+            return
+        if kind not in CONNECTION_EVENT_KINDS:
+            self._conn_events_dropped += 1
+            self._warn_undeclared_connection_event(connection, kind)
             return
         try:
             q.put_nowait(
@@ -2245,6 +2268,30 @@ class RegistryRunner:
             )
         except asyncio.QueueFull:
             self._conn_events_dropped += 1
+
+    def _warn_undeclared_connection_event(self, connection: str, kind: str) -> None:
+        """Log a refused undeclared kind, at most once per (connection, kind) per
+        :class:`RefusalLog` window and within its cross-key cap. Every refusal is noted, and each
+        line carries the running total, so refusals inside a quiet window show in the next line.
+
+        The kind is a code identifier, but it reached here through a variable, so it is treated as
+        free text. The throttle keys on its raw first ``_UNDECLARED_KIND_SHOWN`` characters, which
+        never reach the log. The line shows ``safe_text(kind, limit=_UNDECLARED_KIND_SHOWN)``:
+        redacted whole, then bounded. Cutting first would be the form ``messagefoundry.redaction``
+        documents as a leak, because a cut can leave a name fragment too short to match. A long
+        single-token kind therefore shows as an ellipsis with its length. The scrub runs only when a
+        line is written, so a refusal that is not logged pays no redaction pass."""
+        total = self._undeclared_kind_log.note(f"{connection}\x00{kind[:_UNDECLARED_KIND_SHOWN]}")
+        if total is None:
+            return
+        log.warning(
+            "connection %r emitted an undeclared connection_event kind %r; the event was dropped "
+            "(%d such event(s) dropped by this runner so far; repeats inside a minute are not "
+            "logged). Declare the kind in messagefoundry.connection_events",
+            connection,
+            safe_text(kind, limit=_UNDECLARED_KIND_SHOWN),
+            total,
+        )
 
     async def _connection_event_drainer(self) -> None:
         """Write queued connection events to the store OFF the listener/delivery hot path (#46), one
@@ -2361,7 +2408,9 @@ class RegistryRunner:
             reason=reason,
         )
         try:
-            self._alert_sink.connection_error(name, kind="connection_lost", detail=reason)
+            self._alert_sink.connection_error(
+                name, kind="connection_lost", detail=reason, error_class=type(exc).__name__
+            )
         except Exception:
             log.warning("alert sink raised on connection_error for %r", name)
 
@@ -2510,20 +2559,47 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` is passed to :class:`FhirLookupExecutor`; a reload passes False
-        (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
+        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
+        recorded while its lookup is down, whether its build or another setting failed (ASVS
+        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
+        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
+        and logs none. A caller
+        whose build check has already warned passes False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
 
-        def build(
-            names: Iterable[str], failed: Mapping[str, str] | None = None
-        ) -> FhirLookupExecutor:
+        def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
-            resolved = {
-                name: _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-                for name in names
-            }
+            return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
+
+        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
+            # ``resolved`` is None when a setting failed to resolve. The url alone is then
+            # resolved, so an env() URL is still named while the lookup is down.
+            if resolved is None:
+                try:
+                    resolved = resolve_env_settings(
+                        {"url": specs[name].settings.get("url")},
+                        self._env_values,
+                        connection=fhir_lookup_record_name(name),
+                    )
+                except WiringError:  # names the key, never a value
+                    # The lookup's own failure may name another setting, so say this one too.
+                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
+                    # as a secret, and a lookup name may end in a credential word.
+                    log.info(
+                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
+                        "check could not read it",
+                        name,
+                    )
+                    return
+            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
+
+        def build(
+            resolved: Mapping[str, Mapping[str, Any]],
+            failed: Mapping[str, str] | None = None,
+        ) -> FhirLookupExecutor:
             # #200 (ADR 0092): stamp the derived posture around the live executor build so each
             # connection's cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off)
             # captures THIS instance's posture rather than the unstamped fail-closed default.
@@ -2539,29 +2615,66 @@ class RegistryRunner:
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    warn_query_credentials=warn_query_credentials,
+                    # Logged once per lookup below; this method may build one three times.
+                    warn_query_credentials=False,
                 )
 
-        try:
-            return build(specs)  # a healthy graph builds once, as it always did
-        except Exception:
-            if isolated is None:
-                raise
-        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
-        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
-        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
-        # and attestation lines, so on this path each surviving lookup logs them again per build.
-        # That cost falls only on a start that already failed, and keeps the healthy start to one build.
+        # Settings resolve once, with no I/O, so the warning has one call site and comes before any
+        # build: a lookup that then fails to build keeps its record.
+        #
+        # Both steps isolate one lookup's failure as its build does (ADR 0031, vault BACKLOG #3008),
+        # so it costs that lookup only and never unwinds the start. WiringError is a configuration
+        # fault, recorded and alerted with the lookup. Anything else is a defect, so it is also
+        # logged at ERROR with its traceback. A lookup whose security warning step raises is
+        # degraded rather than started without its record, which fails safe.
+        settled: dict[str, dict[str, Any]] = {}
         errors: dict[str, Exception] = {}
         for name in specs:
             try:
-                build([name])
+                settled[name] = resolve(name)
+            except WiringError as exc:
+                errors[name] = exc
+            except Exception as exc:
+                log.error("FhirLookup %r settings failed to resolve", name, exc_info=True)
+                errors[name] = exc
+            if not warn_query_credentials:
+                continue
+            try:
+                warn(name, settled.get(name))
+            except Exception as exc:
+                log.error(
+                    "FhirLookup %r URL query-credential check failed, so it is not started",
+                    name,
+                    exc_info=True,
+                )
+                errors.setdefault(name, exc)
+                settled.pop(name, None)
+        if not errors:
+            try:
+                return build(settled)  # a healthy graph builds once, as it always did
+            except Exception:
+                if isolated is None:
+                    raise
+        if isolated is None:
+            raise next(iter(errors.values()))
+        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
+        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
+        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its TLS
+        # warning and attestation lines, so on this path each surviving lookup logs those again per
+        # build. That cost falls only on a start that already failed, and keeps the healthy start to
+        # one build.
+        for name, lookup_settings in settled.items():
+            try:
+                build({name: lookup_settings})
             except Exception as exc:
                 errors[name] = exc
+        errors = {name: errors[name] for name in specs if name in errors}  # in graph order
         failed = {name: safe_exc(err) for name, err in errors.items()}
-        executor = build([name for name in specs if name not in errors], failed)
+        survivors = {name: s for name, s in settled.items() if name not in errors}
+        # Before the final build, so a graph-wide failure there still leaves each lookup's own
+        # failure for the start's backstop to log.
         isolated.update(errors)
-        return executor
+        return build(survivors, failed)
 
     def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
@@ -5261,7 +5374,9 @@ class RegistryRunner:
                 self._resume_pooled_lane(dispatcher, stage, name)
         return True
 
-    async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
+    async def _start_outbound(
+        self, name: str, oc: OutboundConnection, *, warn_query_credentials: bool
+    ) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
         ``env()`` / cert, an egress-allowlist refusal, a capture/backend mismatch) is ISOLATED
         (ADR 0031): the connection is recorded failed and the worker is STILL spawned, but with no
@@ -5269,7 +5384,7 @@ class RegistryRunner:
         preserving the count-and-log + at-least-once invariants) and a later reload/restart that builds
         the connector self-heals the lane. retry/ordering/etc. are set regardless of build outcome
         because the worker reads them live per item (a reload can swap a working connector under the
-        already-spawned worker)."""
+        already-spawned worker). ``warn_query_credentials`` is :meth:`start`'s."""
         self._retry[name] = oc.retry or self._delivery_defaults
         self._ordering[name] = oc.ordering or self._ordering_default
         # ADR 0066 D4: pick this lane's delivery consumer NOW, before the park/spawn branches below and
@@ -5349,7 +5464,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
-                connector = build_destination(dest, egress=self._egress)
+                connector = build_destination(
+                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
             # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
@@ -5381,7 +5498,12 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
-    async def start(self) -> None:
+    async def start(self, *, warn_query_credentials: bool = True) -> None:
+        """Bring the graph up. ``warn_query_credentials=False`` is for a caller that has just run
+        :meth:`build_check` on this graph, which logged the URL query-credential WARNING, at least
+        ``Engine.reload_detail`` with no runner yet (vault BACKLOG #2910). It reaches only the
+        builds this call makes. A later window open or operator start builds a lane this start left
+        unbuilt, and that build logs the WARNING."""
         async with self._reload_lock:
             if self._running:
                 return
@@ -5493,7 +5615,9 @@ class RegistryRunner:
                 if self._log_write_stopped:
                     self._park_delivery_for_log_failure()
                 for name, oc in self.registry.outbound.items():
-                    await self._start_outbound(name, oc)
+                    await self._start_outbound(
+                        name, oc, warn_query_credentials=warn_query_credentials
+                    )
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
@@ -5504,7 +5628,7 @@ class RegistryRunner:
                 # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
                 # A restart and a clustered node's start on promotion both come through here.
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor(
-                    isolated=fhir_lookup_isolated
+                    isolated=fhir_lookup_isolated, warn_query_credentials=warn_query_credentials
                 )
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.

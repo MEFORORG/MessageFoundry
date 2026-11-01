@@ -196,7 +196,7 @@ def test_a_server_backend_store_prints_the_note_rather_than_passing_silently(
 
     reached: list[bool] = []
 
-    async def no_server(_settings: object) -> None:
+    async def no_server(_settings: object, **_kwargs: object) -> None:
         reached.append(True)
         raise NotImplementedError("test stub: no server is reached")
 

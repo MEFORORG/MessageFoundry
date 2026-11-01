@@ -584,7 +584,8 @@ def audit_cipher_cells(
 
 
 def connect_readonly(path: str | Path, *, busy_timeout: float) -> sqlite3.Connection:
-    """A read-only connection to the SQLite store at ``path``, for a walk of a LIVE store.
+    """A read-only connection to the SQLite store at ``path``, for a walk of a LIVE store or a
+    check of a DR snapshot.
 
     ``mode=ro`` through the store's own URI builder, so a path holding a space, ``#``, ``?`` or
     ``%``, or a UNC path, opens the file it names, and a missing file is refused rather than

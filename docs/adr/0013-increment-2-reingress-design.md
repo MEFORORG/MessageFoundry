@@ -381,6 +381,10 @@ BEGIN;
   -- Python: body = self._cipher.decrypt(body) if body is not None else ''.   (body IS NULL only if
   -- retention purged it; Q8 proves an outstanding work-row makes the message purge-INELIGIBLE, so in
   -- practice body is always present here; the NULL branch is defensive: treat as empty, still consume.)
+  -- Amendment (2026-10-30, BACKLOG #1560): SUPERSEDED. Q8 covers an OUTSTANDING work-row only. A DEAD
+  -- token is not outstanding, so retention can erase its reply, and a replay then reached this branch
+  -- and re-ingressed an empty child. The purge now blanks a dead token with its reply, a NULL body
+  -- dead-letters and blanks the token, and a missing response row is a corrupt reference. No child.
 
   -- 3. Read the ORIGIN's correlation lineage from messages.metadata (absent keys -> 0 / self).
   SELECT metadata FROM messages WHERE id = :origin_id;

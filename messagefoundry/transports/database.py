@@ -89,6 +89,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
+from messagefoundry.odbc_call_gate import CallGate, call_gate, install_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import prints_a_codec_error, safe_exc
@@ -271,7 +272,7 @@ def _build_dsn(
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
 # metacharacters (`; { } =`) and newlines is the STORE-5 guard for the operator-supplied generic keys
-# (the VALUES are additionally brace-quoted), so message-influenced data can't smuggle extra keywords.
+# (the VALUES are checked by _odbc_literal), so message-influenced data can't smuggle extra keywords.
 _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 
 # The ONLY keywords ``odbc_params`` may set on the generic dialect (vault BACKLOG #2577), in the form
@@ -509,24 +510,127 @@ def _odbc_unsafe_text(text: str, refused: str) -> bool:
     return not text.isascii() or has_control_char(text) or any(ch in refused for ch in text)
 
 
-def _odbc_literal(value: object, *, what: str, connection: str | None, refused: str = ";{}") -> str:
-    """``value`` brace-quoted for the generic connection string, or a ValueError when it is not
-    printable ASCII or holds a ``refused`` character (vault BACKLOG #2577).
-
-    The braces are the ODBC quoting rule and ``}}`` is its escape. Not every driver is known to read
-    that escape, and one that does not would see the value end at the first ``}`` and read what
-    follows as the next keyword. So for every value the engine can restrict at no cost, the
-    delimiters are refused instead of escaped. A password is the exception (``refused=""``): it must
-    be able to hold any printable ASCII character, so it keeps the ODBC escape and relies on the
-    driver reading it. The refusal names the setting and never the value."""
-    text = str(value)
+def _refuse_unsafe_text(text: str, *, what: str, connection: str | None, refused: str) -> None:
+    """A ValueError when ``text`` is not printable ASCII or holds a ``refused`` character
+    (vault BACKLOG #2577). The refusal names the setting and never the value."""
     if _odbc_unsafe_text(text, refused):
-        listed = ", ".join(f"'{ch}'" for ch in refused)
+        # repr, so a quote character prints readably: ';' stays ';', and ' prints as "'".
+        listed = ", ".join(repr(ch) for ch in refused)
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE {what} must hold only printable ASCII characters"
             + (f", and none of {listed}" if refused else "")
         )
-    return odbc_brace(text)
+
+
+def _refuse_none(value: object, *, what: str, connection: str | None) -> None:
+    """A ValueError when ``value`` is ``None`` (BACKLOG #2705). An unbraced setting is sent as its
+    ``str()``, so a ``None`` would reach the driver as the four letters ``None`` rather than as no
+    value. An unset ``database``, ``username`` or ``password`` is left out of the string instead,
+    and an ``odbc_params`` keyword with no value should be left out of the table."""
+    if value is None:
+        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {what} must not be None")
+
+
+# The characters a value sent WITHOUT braces must not hold (BACKLOG #2705): the three that end a
+# value or open a braced one, ``=``, and both quote characters. The quotes sat inside braces on
+# main, and how a driver reads one in a plain value has not been measured.
+_ODBC_UNBRACED_REFUSED = ";{}=\"'"
+
+
+def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
+    """``value`` as the generic connection string sends it, WITHOUT braces, or a ValueError (BACKLOG
+    #2705). Used for ``database``, ``username`` and every ``odbc_params`` value.
+
+    Braced values were measured to be misread (psqlODBC ran ``SSLmode={verify-full}`` with no TLS).
+    A plain value cannot be quoted, so at least these are refused instead: the characters in
+    :data:`_ODBC_UNBRACED_REFUSED`, a value that is not printable ASCII, ``None``, and an empty,
+    blank or padded value. docs/CONNECTIONS.md, *Values on the generic dialect*, holds the rules,
+    the reasons and the measurements; this docstring does not restate them.
+
+    The refusal names the setting and never the value. A password follows its own rule
+    (:func:`_odbc_password`), and the driver name stays braced."""
+    _refuse_none(value, what=what, connection=connection)
+    text = str(value)
+    _refuse_unsafe_text(text, what=what, connection=connection, refused=_ODBC_UNBRACED_REFUSED)
+    if not text or text != text.strip():
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE {what} must not be empty, blank, "
+            "or start or end with a space"
+        )
+    return text
+
+
+# MySQL Connector/ODBC's registered names, in lower case. The escape list below holds them, and
+# they alone keep MySQL's own ``SSLMODE`` spellings (:func:`_refuse_unread_sslmode`).
+_MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
+_MYSQL_ODBC_DRIVERS = re.compile(_MYSQL_ODBC_DRIVER_NAME)
+
+# The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
+# with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
+# names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
+# Server``, not probed then but relied on for the same escape by the SQL Server preset and the
+# store. psqlODBC's names include the bare ``PostgreSQL``, the section name RHEL registers it
+# under. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
+# has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
+# merely mentions a database, a library path, or another registered name that only folds to one of
+# these is unmeasured and does not match.
+_ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
+    r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
+    rf"|{_MYSQL_ODBC_DRIVER_NAME}"
+    r"|odbc driver [0-9]+ for sql server"
+)
+
+# The ``sslmode`` values the generic dialect sends for any driver but MySQL Connector/ODBC: libpq's
+# six modes, exactly, in lower case (BACKLOG #2705). psqlODBC's source reads an ``SSLmode`` value by
+# its first byte, and only a lower case one names a mode, so ``Require``, ``VERIFY-FULL``,
+# ``REQUIRED``, ``on`` or ``1`` would mean disable to it, while :func:`generic_odbc_tls_unenforced`
+# counts each as TLS addressed. Only these spellings mean the same thing to both.
+_LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+
+
+def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
+    """A ValueError when an ``sslmode`` value is not one of :data:`_LIBPQ_SSL_MODES`, exactly
+    (BACKLOG #2705). The keyword is matched in any case, as the build matches every keyword.
+
+    The rule depends on the driver family, read from the ``odbc_driver`` name: MySQL Connector/ODBC
+    sends the same keyword with its own upper case values (``REQUIRED``, ``VERIFY_IDENTITY``), so a
+    name :data:`_MYSQL_ODBC_DRIVERS` matches whole is left to MySQL's spellings, as before. Every
+    other driver, psqlODBC under any name included, takes the libpq spellings only. The refusal
+    lists the accepted values and never the value given."""
+    if _MYSQL_ODBC_DRIVERS.fullmatch(driver.lower()) or text in _LIBPQ_SSL_MODES:
+        return
+    raise ValueError(
+        f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslmode' must be one of "
+        f"{', '.join(_LIBPQ_SSL_MODES)}, in lower case (see Generic ODBC in docs/CONNECTIONS.md)"
+    )
+
+
+def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
+    """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
+
+    For a driver :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names, it is ALWAYS braced, with the ``}}``
+    escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
+    ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
+    literally, so only the braced form sends the password as written.
+
+    For any other driver it is sent plain, and only when it holds none of ``;``, ``{``, ``}`` or a
+    quote character and has no leading or trailing space: a driver that reads no braces (the Access
+    driver) takes it only that way, and one that does not read the escape would end a braced value
+    at the first ``}`` and read the rest as further keywords. Any other password is refused for
+    such a driver. A driver missing from the list is unmeasured, not known to be unsafe.
+
+    A password must be printable ASCII whatever the driver. A refusal names the setting and never
+    describes the value beyond saying the driver cannot carry it."""
+    text = str(password)
+    _refuse_unsafe_text(text, what="password", connection=connection, refused="")
+    if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
+        return odbc_brace(text)
+    if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
+        return text
+    raise ValueError(
+        f"{hop_name_prefix(connection)}DATABASE password cannot be carried by this odbc_driver; "
+        "change the password (see Generic ODBC in docs/CONNECTIONS.md)"
+    )
 
 
 def _is_remote_spelling(value: object) -> bool:
@@ -840,10 +944,15 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     target under another keyword cannot be configured on this path. The egress check itself is the
     caller's (``pipeline.wiring_runner``); this builder keeps the host that check read the host sent.
 
-    Every value is brace-quoted (STORE-5 injection guard) and must be printable ASCII
-    (:func:`_odbc_literal`). ``odbc_driver``, ``database``, ``username`` and every ``odbc_params``
-    value also refuse ``;``, ``{`` and ``}`` rather than escaping them. ``password`` keeps the ODBC
-    ``}}`` escape, so it may hold any printable ASCII character.
+    Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
+    every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
+    they refuse at least ``;``, ``{``, ``}``, ``=``, a quote, an empty or blank value and a leading
+    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
+    ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
+    :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
+    refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
+    on the escape list, and otherwise sent plain when it can be and refused when it cannot
+    (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
@@ -864,16 +973,17 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         raise ValueError(f"{where}DATABASE generic dialect requires an 'odbc_driver' setting")
     # SERVER is emitted UNBRACED (validated, not brace-quoted) so a driver that parses a ",port"/":port"
     # suffix in SERVER can resolve the host — mirrors the SQL Server preset's rationale.
+    _refuse_none(s["server"], what="server", connection=connection)
     server = str(s["server"])
-    if _odbc_unsafe_text(server, ";{}="):
+    if _odbc_unsafe_text(server, _ODBC_UNBRACED_REFUSED):
         raise ValueError(
-            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a control character "
-            "or a non-ASCII character (ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a quote, a control "
+            "character or a non-ASCII character (ODBC injection risk)"
         )
-    parts = [
-        f"DRIVER={_odbc_literal(driver, what='odbc_driver', connection=connection)}",
-        f"SERVER={server}",
-    ]
+    # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
+    # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
+    _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
+    parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)
         parts.append(f"DATABASE={database}")
@@ -893,8 +1003,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _ODBC_PASSWORD_KEYS,
             connection=connection,
         )
-        # No refused characters: a password keeps the ODBC escape (see _odbc_literal).
-        secret = _odbc_literal(password, what="password", connection=connection, refused="")
+        secret = _odbc_password(password, driver=driver, connection=connection)
         parts.append(f"{pwd_key}={secret}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
@@ -916,12 +1025,23 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 f"{where}DATABASE odbc_params names {name} more than once "
                 "(keywords are case-insensitive); give it once"
             )
+        # Before anything reads the value: the remote-path screen reads its str() too.
+        _refuse_none(value, what=f"odbc_params value for '{name}'", connection=connection)
+        if isinstance(value, bool):
+            # str() would send True or False, which no driver is known to spell its own way
+            # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
+            raise ValueError(
+                f"{where}DATABASE odbc_params value for '{name}' must not be a boolean; write the "
+                "driver's own spelling as a string"
+            )
         named[name] = value
         if name in _ODBC_PATH_KEYS:
             _refuse_remote_path(value, name=name, connection=connection)
         literal = _odbc_literal(
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
+        if name == "sslmode":
+            _refuse_unread_sslmode(literal, driver=driver, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     _refuse_weak_driver_key(named, connection=connection)
@@ -1458,28 +1578,24 @@ def _import_aioodbc() -> Any:
     return aioodbc
 
 
-def _login_timeout(s: Mapping[str, Any], label: str, *, dialect: str) -> int | None:
+def _login_timeout(s: Mapping[str, Any], label: str) -> int:
     """The login timeout, in seconds, for a DATABASE connection's pool: its ``connect_timeout``
-    setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Pool sites take it from here.
-
-    ``dialect`` is the one the caller built its DSN with, passed explicitly rather than read from
-    ``s``: ``db_lookup`` and reference sync always build the SQL Server DSN, whatever the mapping says.
+    setting, for either dialect (BACKLOG #2089, #2705). Pool sites take it from here.
 
     **Why it is not in the DSN.** ODBC Driver 18 ignores a login-timeout keyword in the connection
     string; the comment in ``store/sqlserver.py::connection_string`` records the #1626
     measurement. The driver reads pyodbc's ``timeout=`` argument instead, and :func:`_make_pool`
     passes the value there.
 
-    The ``generic`` dialect gets ``None``, as before: its DSN never carried a login timeout, and
-    whether an arbitrary operator-named driver accepts the attribute has not been measured.
+    The ``generic`` dialect gets the same value since BACKLOG #2705; the ``connect_timeout`` row in
+    docs/CONNECTIONS.md says which drivers were measured to honour it.
 
     ``connect_timeout`` is checked by :func:`check_db_connect_timeout` whatever the dialect, and
     ``label`` names the declaration in its refusal. The destination, poll source and lookup executor
     call this at construction, so ``serve`` and ``messagefoundry check`` refuse a bad value at start.
     ``DatabaseRef`` checks a literal value when it is declared; an ``env()`` value is checked here,
     at each sync, once resolved."""
-    value = check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
-    return None if dialect == "generic" else value
+    return check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
 
 
 class AutocommitNotConfirmed(RuntimeError):
@@ -1491,7 +1607,7 @@ class AutocommitNotConfirmed(RuntimeError):
     the DSN nor the server."""
 
 
-def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
+def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
     """Run ``fn`` on a worker thread and return a future that the THREAD resolves, once ``fn`` has
     returned or raised.
 
@@ -1499,7 +1615,13 @@ def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
     cancelled, it ends at once while ``fn`` runs on. This future is not a task, so no task cancel
     reaches it, loop teardown's cancel-every-task included. Its completion is therefore proof that
     ``fn`` is no longer running, which is what decides when a connection ``fn`` uses may go back to
-    its pool (PR 2593 review). If the loop is closed before ``fn`` ends, nothing is left to tell."""
+    its pool (PR 2593 review). If the loop is closed before ``fn`` ends, nothing is left to tell.
+
+    **With ``gate``, ``fn`` runs inside that connection's call gate** (BACKLOG #2394), so it never
+    runs beside another pyodbc call on the connection. When a call is running there, as after a
+    cancelled ``execute``, ``fn`` is handed to that call, which runs it on its own thread as it
+    returns. So no second thread waits for a statement that may have no timeout. Otherwise ``fn``
+    goes to a worker thread through the gate, as before."""
     loop = asyncio.get_running_loop()
     settled: asyncio.Future[T] = loop.create_future()
 
@@ -1529,7 +1651,10 @@ def _thread_settled[T](fn: Callable[[], T]) -> asyncio.Future[T]:
                 "connection was not returned to its pool"
             )
 
-    loop.run_in_executor(None, _work)
+    if gate is None:
+        loop.run_in_executor(None, _work)
+    elif not gate.run_after_running_call(_work):
+        loop.run_in_executor(None, partial(gate.run, _work))
     return settled
 
 
@@ -1566,6 +1691,13 @@ def _set_and_read_autocommit(raw: Any) -> bool:
     return bool(raw.autocommit)
 
 
+def _unwinding_a_cancel() -> bool:
+    """Whether the running task has a cancellation in flight, as when a ``finally`` runs because a
+    statement's await was cancelled. That statement may still be running on its worker thread."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 async def _return_to_pool(pool: Any, conn: Any) -> None:
     """Hand ``conn`` back to ``pool`` where no borrower holds it any more. Call it only once no
     worker thread can still be using ``conn`` (the rule :func:`_return_when_settled` enforces).
@@ -1594,9 +1726,70 @@ def _detach(coro: Coroutine[Any, Any, None]) -> None:
     task.add_done_callback(_DETACHED_SETTLES.discard)
 
 
+#: How many connections each pool has held back behind a cancelled borrow (BACKLOG #2394): ones
+#: :func:`_return_when_settled` or an abandoned autocommit set keeps out of the pool until a driver
+#: call returns. Keyed by the aioodbc pool itself, never the :class:`_AutocommitPool` wrapper, so a
+#: borrow and a close of one pool read one count whichever object each holds (:func:`_pool_key`).
+#: Weak, so a pool nothing else holds drops out. :func:`_close_pool_bounded` stops waiting at a bound
+#: only while this is above zero.
+_HELD_BACK: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+
+
+def _pool_key(pool: Any) -> Any:
+    """The aioodbc pool under ``pool``: the object :data:`_HELD_BACK` counts against."""
+    return pool._pool if isinstance(pool, _AutocommitPool) else pool
+
+
+def _adjust_held(pool: Any, delta: int) -> None:
+    """Move ``pool``'s held-back count by ``delta``, dropping its entry at zero."""
+    key = _pool_key(pool)
+    try:
+        left = _HELD_BACK.get(key, 0) + delta
+        if left > 0:
+            _HELD_BACK[key] = left
+        else:
+            _HELD_BACK.pop(key, None)
+    except TypeError:
+        # A pool that cannot be weakly keyed is not counted, so its close waits unbounded, as
+        # before BACKLOG #2394. Logged once per hold, since that wait can outlast a hung statement.
+        if delta > 0:
+            logger.warning("DATABASE: a held-back connection could not be counted against its pool")
+
+
+def _hold_back(pool: Any) -> None:
+    """Count one more connection of ``pool`` held back behind a cancelled borrow."""
+    _adjust_held(pool, 1)
+
+
+def _settle_held(pool: Any) -> None:
+    """Count one connection of ``pool`` no longer held back: it went back, or its return ended."""
+    _adjust_held(pool, -1)
+
+
+def _holds_back(pool: Any) -> int:
+    """How many connections of ``pool`` are held back behind a cancelled borrow now."""
+    try:
+        return _HELD_BACK.get(_pool_key(pool), 0)
+    except TypeError:
+        return 0
+
+
+async def _return_held(pool: Any, conn: Any) -> None:
+    """Return a held-back ``conn`` to ``pool``, then take it off the count, even if the return is
+    itself cancelled, so a later close of the pool waits as it would have before the cancel."""
+    try:
+        await _return_to_pool(pool, conn)
+    finally:
+        _settle_held(pool)
+
+
 def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: str) -> None:
     """Once ``work`` is done, return ``conn`` to ``pool``, but only if ``work`` ending proves the
     worker thread it waited on has finished with ``conn`` (PR 2593 review).
+
+    Until then ``conn`` counts as held back (:func:`_hold_back`), so a close of ``pool`` stops
+    waiting at :data:`_POOL_CLOSE_TIMEOUT_S` instead of waiting as long as the call runs. A
+    connection this keeps out for good stays counted, since its pool can then never finish closing.
 
     **Never return a connection while a worker thread may still be using it.** A thread inside a
     pyodbc call on a connection the pool hands to the next borrower is concurrent use of one ODBC
@@ -1616,8 +1809,9 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
                 what,
             )
             return
-        _detach(_return_to_pool(pool, conn))
+        _detach(_return_held(pool, conn))
 
+    _hold_back(pool)
     work.add_done_callback(_done)
 
 
@@ -1662,12 +1856,16 @@ class _AutocommitPool:
     runs on :func:`_thread_settled`, whose future only the thread resolves, and is shielded: the
     borrower leaves at once, so ``acquire_timeout`` still bounds the borrow, and the connection goes
     back to the pool only once the call has returned. No task cancel can decide that early, loop
-    teardown's included (PR 2593 review).
+    teardown's included (PR 2593 review). The call also runs through the connection's call gate,
+    installed at the borrow (BACKLOG #2394), so no other pyodbc call on that connection, a close
+    included, runs beside it.
 
     **What that does not bound.** Until a hung call returns, its connection is still in use, so a
-    ``pool.close(); await pool.wait_closed()`` on this pool waits for it: a ``DatabaseRef`` sync's
-    teardown, or a source's or lookup's ``aclose()``. How long is the driver's own network timeout.
-    That wait is the price of never freeing a connection under a running driver call."""
+    close of this pool waits for it. Every close of this pool goes through
+    :func:`_close_pool_bounded`, which stops waiting at a bound only while a connection is held back
+    behind a cancelled borrow (BACKLOG #2394), and the source's stop after a cancel always does.
+    Otherwise the close waits for the call to return: that wait is the price of never freeing a
+    connection under a running driver call."""
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
@@ -1683,13 +1881,18 @@ class _AutocommitPool:
 
     async def _acquire_confirmed(self) -> Any:
         conn = await self._pool.acquire()
+        # BACKLOG #2394: here, not only in _acquire, because a DatabaseRef sync borrows through
+        # acquire_pooled, and because the set below goes through the gate.
+        install_call_gate(conn)
         if conn in self._confirmed:  # False, not an error, for an object with no weak reference
             return conn
         try:
             # No driver call has run on it before this succeeds: _thread_settled raises at once
             # if the default executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
-            work = _thread_settled(partial(_set_and_read_autocommit, raw))
+            # Through the gate (BACKLOG #2394): the set uses the raw handle, which aioodbc's gated
+            # _execute never sees.
+            work = _thread_settled(partial(_set_and_read_autocommit, raw), gate=call_gate(conn))
         except (AutocommitNotConfirmed, RuntimeError):
             await _return_to_pool(self._pool, conn)
             raise
@@ -1704,7 +1907,9 @@ class _AutocommitPool:
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
                 # be inside the setter. Settled when the thread resolves ``work``, never sooner,
-                # and with no await here, so GeneratorExit is let through too.
+                # and with no await here, so GeneratorExit is let through too. Counted as held
+                # back meanwhile, so a close of this pool does not wait out a hung set.
+                _hold_back(self._pool)
                 work.add_done_callback(partial(self._settle_detached, conn))
             raise
         if not kept:
@@ -1731,14 +1936,14 @@ class _AutocommitPool:
         failure = work.exception()
         if failure is None and work.result():
             self._mark_confirmed(conn)
-            _detach(_return_to_pool(self._pool, conn))
+            _detach(_return_held(self._pool, conn))
             return
         logger.warning(
             "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
             "back unconfirmed and is set again on its next borrow",
             "not kept" if failure is None else safe_exc(failure),
         )
-        _detach(_return_to_pool(self._pool, conn))
+        _detach(_return_held(self._pool, conn))
 
     async def release(self, conn: Any) -> None:
         await self._pool.release(conn)
@@ -1753,16 +1958,14 @@ class _AutocommitPool:
         return getattr(self._pool, name)
 
 
-async def _make_pool(
-    dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
-) -> Any:
+async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int) -> Any:
     """Create an aioodbc connection pool for ``dsn`` (lazy driver import). The destination wraps
     execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
     statement (``autocommit=True``).
 
     ``login_timeout`` is required, and callers take it from :func:`_login_timeout`, so no pool site
     can quietly go without one. aioodbc forwards ``timeout=`` to every ``pyodbc.connect`` the pool
-    makes. ``None``, for the generic dialect, passes nothing and the driver default applies.
+    makes, for the SQL Server preset and the generic dialect alike (BACKLOG #2705).
 
     **An ``autocommit=True`` pool is wrapped in :class:`_AutocommitPool`** (BACKLOG #2148), so every
     connection it hands out has autocommit set and read back first. The suspected cause is mostly
@@ -1776,10 +1979,13 @@ async def _make_pool(
     is returned unwrapped: pyodbc sets autocommit OFF itself, explicitly."""
     aioodbc = _import_aioodbc()
     disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
-    options: dict[str, Any] = {"minsize": 1, "maxsize": max(1, pool_max), "autocommit": autocommit}
-    if login_timeout is not None:
-        options["timeout"] = login_timeout
-    pool = await aioodbc.create_pool(dsn=dsn, **options)
+    pool = await aioodbc.create_pool(
+        dsn=dsn,
+        minsize=1,
+        maxsize=max(1, pool_max),
+        autocommit=autocommit,
+        timeout=login_timeout,
+    )
     return _AutocommitPool(pool) if autocommit else pool
 
 
@@ -1794,13 +2000,18 @@ _DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
 async def _acquire(pool: Any, timeout: float) -> Any:
     """Acquire a connection from ``pool`` within ``timeout`` seconds, or raise a transient
     :class:`DeliveryError` with a clear, PHI-free message. Wraps the driver's own ``acquire`` so a
-    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await."""
+    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
+
+    The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
+    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded."""
     try:
-        return await asyncio.wait_for(pool.acquire(), timeout)
+        conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
         raise DeliveryError(
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
+    install_call_gate(conn)
+    return conn
 
 
 async def _close_cursor(cur: Any) -> None:
@@ -1839,20 +2050,44 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     teardown's included, so the connection always does go back, and a later ``wait_closed`` waits
     only for the close itself.
 
-    **What this does not cover.** A cancellation that lands during ``conn.cursor()``,
-    ``execute`` or a fetch, which also run on aioodbc's worker threads, reaches this function while
-    that call may still be running; this close then runs beside it. That is the same defect class,
-    wider than this function, and not closed here. A cursor with no ``_impl`` (a test double, or an
-    aioodbc that renamed it) is closed through its own ``close()`` as a task, and a teardown cancel
-    of that task keeps the connection out of the pool (:func:`_return_when_settled`)."""
+    **A cancellation during ``execute`` or a fetch does not free the cursor under it (BACKLOG
+    #2394).** That call may still be running on its worker thread when this function is reached.
+    The close runs inside the connection's call gate (:func:`_thread_settled`), handed to the
+    running call, so it runs only once that call has returned, and the connection goes back only
+    after the close. On that path the same job then rolls back what the cancelled statement may
+    have left open (:func:`_close_after_a_cancel`), since the caller's own ``except Exception``
+    rollback never ran. The cancelled task waits for none of it: while a cancellation is in flight,
+    the return is handed to :func:`_return_when_settled` at once. Until the running call returns,
+    the connection keeps its pool slot, and counts as held back, so a close of the pool stops
+    waiting for it at a bound (:func:`_close_pool_bounded`). Nothing in the engine bounds that time,
+    because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
+
+    **What this does not cover, at least.** A cancellation during ``conn.cursor()`` reaches this
+    function with no cursor, so the connection goes back while that call may still be running. The
+    gate holds the next borrower's calls behind it, and the cursor it makes is left for the
+    collector. A cancellation that lands after a call was handed to the connection's executor but
+    before that call entered the gate finds no call running, so the close is not handed to it: the
+    two race for the gate, the close may run first, and the connection can go back while that call
+    is still to run. A connection with no gate (a test double) closes its cursor beside a running
+    call, as before. A cursor with no ``_impl`` (a test double, or an aioodbc that renamed it) is closed
+    through its own ``close()`` as a task, and a teardown cancel of that task keeps the connection
+    out of the pool (:func:`_return_when_settled`)."""
     if cur is None:
         await pool.release(conn)
         return
     raw_cur = getattr(cur, "_impl", None)
+    cancelled = _unwinding_a_cancel()
     work: asyncio.Future[Any]
     if raw_cur is not None:
+        gate = call_gate(conn)
+        # Only inside a gate: on an ungated connection a rollback would run beside the statement.
+        close = (
+            partial(_close_after_a_cancel, conn, raw_cur)
+            if cancelled and gate is not None
+            else partial(_close_raw_cursor, raw_cur)
+        )
         try:
-            work = _thread_settled(partial(_close_raw_cursor, raw_cur))
+            work = _thread_settled(close, gate=gate)
         except RuntimeError as exc:
             # The default executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
@@ -1864,6 +2099,10 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
+    if cancelled:
+        # The close may be waiting for a cancelled statement; the cancellation must not.
+        _return_when_settled(pool, conn, work, "a cursor close")
+        return
     try:
         await asyncio.shield(work)
     except BaseException:
@@ -1879,6 +2118,138 @@ def _close_raw_cursor(raw_cur: Any) -> None:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
         logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+
+
+def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
+    """On a worker thread, inside ``conn``'s call gate: close the cursor a cancelled borrow left,
+    then roll back what its statement may have left open (BACKLOG #2394, ADR 0159).
+
+    A cancellation skips every caller's ``except Exception: rollback``. On the destination's
+    manual-commit pool the connection would otherwise go back holding the cancelled INSERT
+    uncommitted, with its locks, for the next send's commit or rollback to settle. On an autocommit
+    connection the rollback has nothing to undo. Never raises.
+
+    **A failed rollback is logged, and the connection still goes back.** Discarding it would drop
+    its handle, and aioodbc wakes neither a waiting borrower nor a waiting ``wait_closed`` for a
+    closed connection, so that wait could last until something else woke it. A rollback usually
+    fails because the session is gone, and its transaction with it. A session still alive keeps
+    the transaction until the next borrower's own commit or rollback, as before this function."""
+    _close_raw_cursor(raw_cur)
+    raw = getattr(conn, "_conn", None)
+    if raw is None:
+        return
+    try:
+        raw.rollback()
+    except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
+        logger.warning(
+            "DATABASE: rollback after a cancelled statement failed; the connection goes back to "
+            "its pool: %s",
+            _safe_db_error(exc),
+        )
+
+
+async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = None) -> None:
+    """Close ``pool``. Wait for its connections in use as an unbounded ``wait_closed`` would, but
+    stop waiting once a connection of it is held back behind a cancelled borrow (BACKLOG #2394).
+
+    **The bound applies only while that count is above zero** (:func:`_holds_back`), read at the end
+    of each tick of :data:`_POOL_CLOSE_TIMEOUT_S`: a close that starts with one held back waits one
+    tick, and one held back mid-wait ends the wait at the end of its tick. Such a connection goes back only once its
+    cancelled call returns, which nothing bounds (ADR 0159, amendment of 2026-10-30), so a stop or a
+    reload would otherwise wait as long as that call runs. With no connection held back, an
+    in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
+    long it takes. ``bound`` instead stops the wait at that many seconds whatever the count: the
+    source's stop after a cancel (BACKLOG #1620) passes it.
+
+    **Stopping the wait frees nothing.** The close is waited on through :func:`asyncio.wait`, which
+    never cancels it, so a close cut halfway never leaves a connection's handle for aioodbc's
+    ``__del__`` to free; it goes on by itself, and the held connection is still released only once
+    its call has returned, to a pool already closing. A caller that then opens a new pool has two
+    open beside each other until that call returns, the trade the source's stop after a cancel
+    already makes. A close that fails while waited on raises, as before; one that fails after the
+    wait has stopped is logged.
+
+    **A retried close waits on the close already in flight** (:func:`_pool_closing`), never a
+    second ``wait_closed`` beside it: aioodbc wakes one waiter per returned connection, so a second
+    waiter on the same pool might never be woken."""
+    pool.close()
+    closing = _pool_closing(pool)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    tick = _POOL_CLOSE_TIMEOUT_S if bound is None else bound
+    try:
+        while True:
+            done, _pending = await asyncio.wait({closing}, timeout=tick)
+            # Re-read each tick: a cancelled borrow can be held back after the close began.
+            held = _holds_back(pool)
+            if done or held or bound is not None:
+                break
+    except BaseException:  # a cancelled caller: the close goes on, and a failure is still logged
+        closing.add_done_callback(partial(_log_late_pool_close, what))
+        raise
+    if done:
+        closing.result()
+        return
+    closing.add_done_callback(partial(_log_late_pool_close, what))
+    waited = loop.time() - started
+    if held:
+        logger.warning(
+            "%s pool did not close in %.1fs of waiting; %d connection(s) held behind a cancelled "
+            "call go back when that call returns, and the close goes on meanwhile",
+            what,
+            waited,
+            held,
+        )
+    else:  # only a caller's own bound ends the wait with nothing held back
+        logger.warning(
+            "%s pool did not close in %.1fs of waiting; the close goes on, and a connection still "
+            "in use closes when its borrower returns it",
+            what,
+            waited,
+        )
+
+
+#: The close in flight for each pool, keyed as :data:`_HELD_BACK` is (:func:`_pool_closing`).
+_CLOSING: weakref.WeakKeyDictionary[Any, asyncio.Future[None]] = weakref.WeakKeyDictionary()
+
+
+def _pool_closing(pool: Any) -> asyncio.Future[None]:
+    """``pool``'s ``wait_closed``, run detached: the one already in flight if a close that stopped
+    waiting, or was cancelled, left one, otherwise a new one. A finished one, a failed close
+    included, is not reused, so a retry after a failure closes again."""
+    key = _pool_key(pool)
+    try:
+        closing = _CLOSING.get(key)
+    except TypeError:
+        # Logged, not swallowed: a retried close of such a pool waits on a second wait_closed.
+        logger.warning("DATABASE: a pool close could not be tracked against its pool")
+        closing, key = None, None
+    if closing is not None and not closing.done():
+        return closing
+    fresh: asyncio.Task[None] = asyncio.ensure_future(pool.wait_closed())
+    _DETACHED_SETTLES.add(fresh)
+    fresh.add_done_callback(_DETACHED_SETTLES.discard)
+    if key is not None:
+        _CLOSING[key] = fresh
+        # Dropped once done: a failed close's traceback holds the pool, which would keep the weak
+        # key alive through its own value.
+        fresh.add_done_callback(partial(_forget_close, key))
+    return fresh
+
+
+def _forget_close(key: Any, closing: asyncio.Future[None]) -> None:
+    if _CLOSING.get(key) is closing:
+        del _CLOSING[key]
+
+
+def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:
+    error = None if closing.cancelled() else closing.exception()
+    if error is not None:
+        logger.warning(
+            "%s pool close failed after its caller stopped waiting: %s",
+            what,
+            _safe_db_error(error),
+        )
 
 
 async def _probe_db(
@@ -1969,9 +2340,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
-        self._login_timeout = _login_timeout(
-            s, f"DATABASE connection {config.name!r}", dialect=self._dialect
-        )
+        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
         )
@@ -2173,9 +2542,11 @@ class DatabaseDestination(DestinationConnector):
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
 
     async def aclose(self) -> None:
+        """Close the pool. It waits for an in-flight send, as before, but not for a connection a
+        cancelled send's statement still holds, which has no time limit (BACKLOG #2394,
+        :func:`_close_pool_bounded`)."""
         if self._pool is not None:
-            self._pool.close()
-            await self._pool.wait_closed()
+            await _close_pool_bounded(self._pool, "DATABASE destination")
             self._pool = None
 
 
@@ -2202,9 +2573,13 @@ _ROW_STEP_GRACE_S = 2.0
 #: close behind a hung statement; stop() then returns with the task still referenced, so the next
 #: stop() joins it before closing the pool under it.
 _CUT_JOIN_TIMEOUT_S = 2.0
-#: How long a cancelled DatabaseSource.stop() waits for the pool to close (BACKLOG #1620). The pool
-#: waits for every connection in use to come back, so one a hung driver call holds would make it
-#: wait forever.
+#: How long a pool close waits once it has a reason to stop waiting (:func:`_close_pool_bounded`).
+#: A pool waits for every connection in use to come back, so one a hung driver call holds would make
+#: it wait forever. A cancelled DatabaseSource.stop() waits this long whatever its pool holds
+#: (BACKLOG #1620). Every other close of a DATABASE pool, the source's ordinary stop, the
+#: destination's, the db_lookup executor's and a DatabaseRef sync's teardown, waits this long only
+#: while a connection is held back behind a cancelled borrow (BACKLOG #2394), and otherwise waits
+#: for its in-flight calls without a bound.
 _POOL_CLOSE_TIMEOUT_S = 2.0
 #: How often the row grace re-reads leadership, so a demotion during it ends it (BACKLOG #1620).
 _LEADER_RECHECK_S = 0.05
@@ -2349,7 +2724,6 @@ class DatabaseSource(SourceConnector):
         self._login_timeout = _login_timeout(
             s,
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
-            dialect=self._dialect,
         )
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
@@ -2400,9 +2774,14 @@ class DatabaseSource(SourceConnector):
         :data:`_CUT_JOIN_TIMEOUT_S`, and the pool close waits at most :data:`_POOL_CLOSE_TIMEOUT_S`,
         so a driver call hung on a thread cannot hold a cancelled stop(). The pool is closed even
         when the cut task is still running: a connection the task still holds is closed when the
-        task releases it, though a close that times out leaves the connections it had not closed
-        yet to the driver. That task stays referenced, and the next stop() joins it. A close
-        failure after a cancel is logged, never raised over it.
+        task releases it, and a close that stops waiting goes on by itself. That task stays
+        referenced, and the next stop() joins it. A close failure after a cancel is logged, never
+        raised over it.
+
+        **An ordinary stop() waits for the pool as before, unless a borrow was cancelled.** It
+        waits for an in-flight call without a bound, but stops at :data:`_POOL_CLOSE_TIMEOUT_S` once
+        a connection is held back behind a cancelled borrow (BACKLOG #2394), such as a
+        ``test_connection`` probe whose ``SELECT 1`` was cancelled while it hung.
         """
         self._stop.set()
         task = self._task
@@ -2792,30 +3171,23 @@ class DatabaseSource(SourceConnector):
 
     async def aclose(self, *, timeout: float | None = None) -> None:
         """Close the pool, waiting at most ``timeout`` seconds when one is given (BACKLOG #1620).
+        With none, it waits without a bound, except that it stops at :data:`_POOL_CLOSE_TIMEOUT_S`
+        once a connection is held back behind a cancelled borrow (BACKLOG #2394). Either way the
+        wait goes through :func:`_close_pool_bounded`, which never cancels the close.
 
-        Unbounded, the reference is kept until the close succeeds, so a stop() retried after a
-        failed close finishes it. Bounded, it is dropped before the wait, so neither a cancel nor
-        the timeout leaves this source holding a closing pool; the next :meth:`_get_pool` opens a
-        fresh one, and on a timeout the connections the pool had not yet closed are left to the
-        driver."""
+        With no ``timeout`` the reference is kept until the close succeeds, so a stop() retried
+        after a failed close finishes it; it is dropped when the wait stops at the bound, as for a
+        bounded close. With one, it is dropped before the wait, so neither a cancel nor the timeout
+        leaves this source holding a closing pool. In both cases the next :meth:`_get_pool` then
+        opens a fresh pool beside the one still closing."""
         pool = self._pool
         if pool is None:
             return
-        pool.close()
-        if timeout is None:
-            await pool.wait_closed()
-            if self._pool is pool:
-                self._pool = None
-            return
-        self._pool = None
-        try:
-            await asyncio.wait_for(pool.wait_closed(), timeout)
-        except TimeoutError:
-            logger.warning(
-                "DATABASE source pool did not close within %.1fs; the connections it had not "
-                "closed yet are left to the driver",
-                timeout,
-            )
+        if timeout is not None:
+            self._pool = None
+        await _close_pool_bounded(pool, "DATABASE source", bound=timeout)
+        if self._pool is pool:
+            self._pool = None
 
 
 register_destination(ConnectorType.DATABASE, DatabaseDestination)
@@ -2955,7 +3327,7 @@ class DatabaseLookupExecutor:
             check_lookup_allowed(cname, s, egress)
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
-        self._login_timeout: dict[str, int | None] = {}
+        self._login_timeout: dict[str, int] = {}
         self._acquire_timeout: dict[str, float] = {}
         self._max_rows: dict[str, int | None] = {}
         for cname, s in connections.items():
@@ -2974,9 +3346,7 @@ class DatabaseLookupExecutor:
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )
-            self._login_timeout[cname] = _login_timeout(
-                s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
-            )
+            self._login_timeout[cname] = _login_timeout(s, f"DatabaseLookup {cname!r}")
             self._acquire_timeout[cname] = float_setting(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
                 knob="acquire_timeout",
@@ -3081,8 +3451,21 @@ class DatabaseLookupExecutor:
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:
-        """Close every opened pool (idempotent; safe if no pool was ever opened)."""
-        for pool in self._pools.values():
-            pool.close()
-            await pool.wait_closed()
-        self._pools.clear()
+        """Close every opened pool (idempotent; safe if no pool was ever opened). Each close stops
+        waiting at a bound only while a cancelled lookup holds a connection back, as the
+        destination's does (BACKLOG #2394, :func:`_close_pool_bounded`)."""
+        pools = list(self._pools.items())  # a snapshot: a lookup may open a pool meanwhile
+        outcomes = await asyncio.gather(
+            *(_close_pool_bounded(pool, f"DatabaseLookup {name!r}") for name, pool in pools),
+            return_exceptions=True,
+        )
+        failures: list[BaseException] = []
+        for (name, pool), outcome in zip(pools, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                failures.append(outcome)  # kept, as before, so a later aclose() closes it again
+            elif self._pools.get(name) is pool:  # not a pool a lookup opened under it meanwhile
+                del self._pools[name]
+        for failure in failures[1:]:  # the first is raised; nothing else would report these
+            logger.warning("DatabaseLookup pool close failed: %s", _safe_db_error(failure))
+        if failures:
+            raise failures[0]

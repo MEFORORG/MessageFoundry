@@ -47,6 +47,8 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
+from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -339,6 +341,24 @@ async def test_complete_with_response_parity(store) -> None:
     await store.complete_with_response(item2.id, body="MSA|AA|2", outcome="accepted", now=600.0)
     caps2 = await store.correlate_response(mid)
     assert [(c.response_seq, c.body) for c in caps2] == [(1, "MSA|AA"), (2, "MSA|AA|2")]
+
+
+async def test_complete_with_response_scrubs_detail_pg(store) -> None:
+    # BACKLOG #2984: a reply's detail is stored through safe_text(detail, limit=200), as an ack_sent
+    # row's is, whatever the connector put in it. Synthetic PID fragment, invented for this test.
+    detail = "partner note PID|1||MRN7731^^^H^MR||ZEPHYRTEST^QUINN||19700101"
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(
+        item.id, body="MSA|AA", outcome="accepted", detail=detail, now=300.0
+    )
+    (reply,) = await store.correlate_response(mid)
+    # The exact value is pinned against safe_text on SQLite (tests/test_b2984_reply_detail_scrub.py);
+    # importing redaction here would widen this suite's serverdb path gate.
+    assert reply.detail is not None and reply.detail.startswith("partner note ")
+    assert "ZEPHYRTEST" not in reply.detail and "MRN7731" not in reply.detail
 
 
 # --- ADR 0021 "Response Sent" inbound ACK capture parity (MLLP-20) -----------------------------
@@ -1294,6 +1314,35 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
     )
 
     await _assert_bind_sweeps_and_unbound_guard_contract(store)
+
+
+async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
+    """BACKLOG #2738 on the real Postgres backend: ``delete_user`` takes the account's ``users``
+    row before its sessions, as the bind does, so the two cannot deadlock.
+
+    The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
+    request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
+    from typing import Any
+
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_and_user_delete_take_one_lock_order,
+    )
+
+    async def _backend_pid(conn: Any) -> object:
+        return conn.get_server_pid()
+
+    async def _is_blocking(pid: object) -> bool:
+        return bool(
+            await store._fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
+                " AND $1::int = ANY(pg_blocking_pids(pid)))",
+                pid,
+            )
+        )
+
+    await _assert_bind_and_user_delete_take_one_lock_order(
+        store, holder_of=_backend_pid, is_blocking=_is_blocking
+    )
 
 
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
@@ -4861,6 +4910,9 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
     setenv_at_rest_opt_out(monkeypatch)
@@ -4896,6 +4948,7 @@ async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")  # as above (BACKLOG #2532)
     setenv_at_rest_opt_out(monkeypatch)  # a keyless chain, as above (vault BACKLOG #3054)
 
     await store.record_audit("message_view", actor="alice", detail="v1")
@@ -5001,6 +5054,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)  # new active
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)  # old, decrypt-only bridge
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     rc = await asyncio.to_thread(main, ["rotate-key"])  # asyncio.run inside → off the loop
     assert rc == 0
     assert "re-encrypted" in capsys.readouterr().out
@@ -5594,6 +5650,60 @@ async def test_queue_tag_contract(store) -> None:
         await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
     finally:
         await keyed.close()
+
+
+def _raw_adapters(s) -> tuple[object, object]:
+    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    from tests._session_seal_contract import dollar_placeholders
+
+    async def raw(sql: str, params: tuple[object, ...]) -> None:
+        async with s._pool.acquire() as conn:
+            await conn.execute(dollar_placeholders(sql), *params)
+
+    async def fetch(sql: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+        async with s._pool.acquire() as conn:
+            return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
+
+    return raw, fetch
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
+@pytest.mark.parametrize("case", ERASED_REPLY_CASES)
+async def test_erased_reply_contract(store, case, keyed) -> None:
+    """BACKLOG #1560: a replay never re-ingresses a reply retention erased, the same contract the
+    SQLite suite runs, on both cipher shapes."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    raw, fetch = _raw_adapters(store)
+    if not keyed:
+        await case(store, fetch, raw)
+        return
+    sealed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
+async def test_keyless_blank_contract(store, case) -> None:
+    """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
+    runs. The ``store`` fixture is the keyless handle, and it clears ``keyed_surface`` on entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    key = generate_key()
+
+    async def open_keyed() -> PostgresStore:
+        return await PostgresStore.open(
+            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+        )
+
+    raw, fetch = _raw_adapters(store)
+    await case(store, open_keyed, fetch, raw)
 
 
 async def test_cell_tag_contract(store) -> None:
