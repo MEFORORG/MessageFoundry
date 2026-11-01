@@ -1812,16 +1812,7 @@ def _build_approval_gate(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
                 raise ApprovalError(422, answer) from exc
-            registry = outcome.registry
-            return {
-                "inbound": len(registry.inbound),
-                "outbound": len(registry.outbound),
-                "degraded": outcome.applied and bool(failures),
-                "failures": failures,
-                # The settings anchors a restart must apply, as the inline route reports them
-                # (BACKLOG #3015).
-                "restart_required": _restart_required(outcome),
-            }
+            return _reload_result(engine, outcome, failures).model_dump()
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped. A refusal
@@ -2194,11 +2185,25 @@ async def _reload_or_record_interruption(
         raise
 
 
-def _restart_required(outcome: ReloadOutcome) -> list[str] | None:
-    """:attr:`ReloadOutcome.restart_required` as :attr:`ReloadResult.restart_required` reports it:
-    a list, or ``None`` when the reload did not check (BACKLOG #3015)."""
-    names = outcome.restart_required
-    return None if names is None else list(names)
+def _reload_result(
+    engine: Engine, outcome: ReloadOutcome, failures: list[str], *, dry_run: bool = False
+) -> ReloadResult:
+    """A reload's answer, one shape for the inline route and a released hold, so dual control is
+    never the quieter of the two (BACKLOG #1111, #3015)."""
+    registry = outcome.registry
+    runner = engine.registry_runner
+    restart_required = outcome.restart_required
+    return ReloadResult(
+        inbound=len(registry.inbound),
+        outbound=len(registry.outbound),
+        routers=len(registry.routers),
+        handlers=len(registry.handlers),
+        running=bool(runner and runner.running),
+        dry_run=dry_run,
+        degraded=outcome.applied and bool(failures),
+        failures=failures,
+        restart_required=None if restart_required is None else list(restart_required),
+    )
 
 
 async def _reload_and_record(
@@ -6998,7 +7003,6 @@ def create_app(
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
-            registry = outcome.registry
         except Exception as exc:  # noqa: BLE001 - a reload's faults are audited too (#3157)
             await _answer_refused_reload(engine, exc, req, request, user)
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
@@ -7018,26 +7022,15 @@ def create_app(
                 detail=json.dumps(
                     {
                         "dir": str(outcome.directory),
-                        "inbound": len(registry.inbound),
-                        "outbound": len(registry.outbound),
+                        "inbound": len(outcome.registry.inbound),
+                        "outbound": len(outcome.registry.outbound),
                         "dry_run": True,
                         **(fingerprint or {}),
                     }
                 ),
                 client=client_ip(request),
             )
-        rr = engine.registry_runner
-        return ReloadResult(
-            inbound=len(registry.inbound),
-            outbound=len(registry.outbound),
-            routers=len(registry.routers),
-            handlers=len(registry.handlers),
-            running=bool(rr and rr.running),
-            dry_run=req.dry_run,
-            degraded=outcome.applied and bool(failures),
-            failures=failures,
-            restart_required=_restart_required(outcome),
-        )
+        return _reload_result(engine, outcome, failures, dry_run=req.dry_run)
 
     # --- messages ------------------------------------------------------------
 

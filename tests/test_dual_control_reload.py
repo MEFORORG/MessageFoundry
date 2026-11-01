@@ -38,6 +38,7 @@ from messagefoundry.api.app import (
     _compare_start_config,
     _record_reload_audit,
 )
+from messagefoundry.api.models import ReloadResult
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -209,6 +210,21 @@ async def test_config_reload_requires_distinct_second_approver(engine: Engine) -
         out = ok.json()
         assert out["requested_by"] == "admin1" and out["approved_by"] == "admin2"
         assert out["result"]["inbound"] == 1  # the held reload executed on release
+
+
+async def test_a_released_reload_answers_the_whole_inline_shape(engine: Engine) -> None:
+    """A released reload's ``result`` is a dumped ``ReloadResult``, so neither path can drop a field
+    the other reports (vault BACKLOG #3746). Compared whole, as
+    ``test_reload_endpoint_applies_config`` compares the inline one: a hand-copied dict would pass a
+    field-by-field check."""
+    _approval_id, r = await _hold_then_release(engine, await _service(engine), {})
+    assert r.status_code == 200, r.text
+    assert (
+        r.json()["result"]
+        == ReloadResult(
+            inbound=1, outbound=1, routers=1, handlers=1, running=True, restart_required=[]
+        ).model_dump()
+    )
 
 
 # --- AC-7: release re-executes + audits both identities + the fingerprint -------
