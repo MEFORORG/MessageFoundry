@@ -177,6 +177,9 @@ def rename_code_set(
     is rejected if **any** supported file already exists for ``new`` (a stem collision). Raises
     :class:`WiringError` if ``old``/``new`` is missing or unsafe, the source is absent, or the stem
     collides."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import replace_generated
+
     if not old:
         raise WiringError("--name is required for `codeset rename`")
     if not new:
@@ -210,7 +213,7 @@ def rename_code_set(
         # byte-identical to the pre-#152 shape.
         plan = _plan_code_set_referents(config_dir, old, new)
         with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
-            os.replace(src, dest)
+            replace_generated(src, dest)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
@@ -230,6 +233,9 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
     ``validate`` is accepted for signature symmetry with the other mutators (a delete has nothing to
     re-load) and is intentionally unused."""
     del validate  # a delete leaves nothing to re-validate; kept for a uniform mutator signature
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import unlink_generated
+
     if not name:
         raise WiringError("--name is required for `codeset remove`")
     codesets_dir = _codesets_dir(config_dir)
@@ -249,7 +255,7 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
         # graph yields no referrers.
         dangling = _code_set_referrers(config_dir, name)
         with atomic_edit.refused_as(path, WiringError, "remove it"):
-            path.unlink()
+            unlink_generated(path)
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling

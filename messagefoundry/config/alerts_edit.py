@@ -100,11 +100,7 @@ def add_rule(
     _validate_input(obj)
     path = Path(service_config)
     with atomic_edit.edit_lock(path, busy_error=AlertRuleError, refused_error=AlertRuleError):
-        original, crlf = (
-            atomic_edit.read_text(path, refused_error=AlertRuleError)
-            if path.is_file()
-            else (None, False)
-        )
+        original, crlf = atomic_edit.read_text_if_present(path, refused_error=AlertRuleError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         alerts = doc.get("alerts")

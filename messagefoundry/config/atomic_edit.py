@@ -63,6 +63,7 @@ __all__ = [
     "is_candidate_dir_name",
     "lock_path_for",
     "read_text",
+    "read_text_if_present",
     "refused_as",
     "replace_validated",
 ]
@@ -132,18 +133,23 @@ def is_candidate_dir_name(name: str, *, of: str | None = None) -> bool:
     return match is not None and (of is None or match.group("name") == of)
 
 
-def read_text(
-    path: Path, *, refused_error: Callable[[str], Exception] | None = None
-) -> tuple[str, bool]:
+def read_text(path: Path, *, refused_error: Callable[[str], Exception]) -> tuple[str, bool]:
     """``path`` as UTF-8 text with ``\n`` line endings, and whether EVERY line ended ``\r\n``.
 
     A file with mixed endings reads as ``\n``, the editors' own form, rather than being
-    reflowed to ``\r\n`` on the strength of one line. With ``refused_error`` set, a refused read is
-    raised as ``refused_error(message)``, as :func:`refused_as` says."""
+    reflowed to ``\r\n`` on the strength of one line. A refused read is raised as
+    ``refused_error(message)``, as :func:`refused_as` says."""
     with refused_as(path, refused_error, "read it"):
         raw = path.read_bytes()
     crlf = raw.count(b"\r\n")
     return raw.decode("utf-8").replace("\r\n", "\n"), crlf > 0 and crlf == raw.count(b"\n")
+
+
+def read_text_if_present(
+    path: Path, *, refused_error: Callable[[str], Exception]
+) -> tuple[str | None, bool]:
+    """:func:`read_text`, or ``(None, False)`` for a file an edit is about to create."""
+    return read_text(path, refused_error=refused_error) if path.is_file() else (None, False)
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -232,6 +238,9 @@ def replace_validated(
     did not pass) is raised as ``refused_error(message)``. Those steps leave the live file as it
     was, since a rename that fails has not happened. What follows the replace, any other
     ``OSError``, and whatever ``validate`` raises are never converted."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import replace_generated
+
     _remove_stale_candidates(path)
     with refused_as(path, refused_error, "create its edit candidate"):
         private = Path(
@@ -252,30 +261,11 @@ def replace_validated(
                     shutil.copyfile(companion, private / companion.name)
         validate(candidate)
         with refused_as(path, refused_error, "replace it with the validated edit"):
-            _replace(candidate, path)
+            replace_generated(candidate, path)
     finally:
         _remove_private_dir(private)
     _fsync_dir(path.parent)
     _secure_file(path)
-
-
-def _replace(candidate: Path, path: Path) -> None:
-    """Rename ``candidate`` over ``path``, riding out a momentary Windows hold on either file.
-
-    Both codes count, because a hold on the candidate answers the sharing violation and a hold on
-    the live file answers access denied (measured on Windows 11, as the minted TLS pair's replace
-    found). So a true denial waits out the short retry before it is reported. Imported here, as
-    :func:`_secure_file` imports its primitive, so this module pulls in no auth code at import."""
-    from messagefoundry.restricted_file import (
-        WINERROR_ACCESS_DENIED,
-        WINERROR_SHARING_VIOLATION,
-        ride_out_a_held_file,
-    )
-
-    ride_out_a_held_file(
-        lambda: os.replace(candidate, path),
-        frozenset({WINERROR_SHARING_VIOLATION, WINERROR_ACCESS_DENIED}),
-    )
 
 
 @contextlib.contextmanager

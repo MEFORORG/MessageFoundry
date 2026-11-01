@@ -209,11 +209,7 @@ def upsert_connection(
     _validate_input(obj)
     path = _path(config_dir)
     with locked(config_dir):
-        original, crlf = (
-            atomic_edit.read_text(path, refused_error=WiringError)
-            if path.is_file()
-            else (None, False)
-        )
+        original, crlf = atomic_edit.read_text_if_present(path, refused_error=WiringError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         direction = obj["direction"]

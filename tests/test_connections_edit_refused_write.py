@@ -205,20 +205,6 @@ def test_a_replace_it_is_refused_is_a_wiring_error_and_the_live_file_stays(
     assert _leftovers(tmp_path) == []
 
 
-def test_a_replace_error_that_is_not_a_refusal_keeps_its_own_type(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _live(tmp_path)
-    fault = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-
-    monkeypatch.setattr(os, "replace", _raising(fault))
-
-    with pytest.raises(OSError) as caught:
-        connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)
-
-    assert caught.value is fault
-
-
 def test_an_error_after_the_replace_is_never_converted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -392,21 +378,26 @@ def test_the_other_editors_refuse_each_step_in_their_own_type(
 
 
 @pytest.mark.parametrize(
-    "edit",
-    [_alerts_add, _alerts_remove, _security_set],
+    ("edit", "refused"),
+    [
+        (_alerts_add, alerts_edit.AlertRuleError),
+        (_alerts_remove, alerts_edit.AlertRuleError),
+        (_security_set, security_edit.SecurityEditError),
+    ],
     ids=["alerts-add", "alerts-remove", "security"],
 )
 def test_the_settings_editors_refuse_a_read_in_their_own_type(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edit: Callable[[Path], Any]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: Callable[[Path], Any],
+    refused: type[Exception],
 ) -> None:
     path = tmp_path / "messagefoundry.toml"
     path.write_text(RULES_TOML, encoding="utf-8")
     refusal = PermissionError(errno.EACCES, "Permission denied")
     _refuse_reads(monkeypatch, refusal, path.name)
 
-    with pytest.raises(
-        (alerts_edit.AlertRuleError, security_edit.SecurityEditError), match="read it"
-    ) as caught:
+    with pytest.raises(refused, match="read it") as caught:
         edit(path)
 
     assert caught.value.__cause__ is refusal
@@ -524,6 +515,36 @@ def test_a_momentary_hold_on_the_replace_is_ridden_out(
     assert "flagged" in path.read_text(encoding="utf-8")
 
 
+def test_a_code_set_rename_and_remove_ride_out_a_momentary_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _code_set(tmp_path)
+    real_replace = os.replace
+    real_unlink = Path.unlink
+    refusals = [_Held(restricted_file.WINERROR_SHARING_VIOLATION) for _ in range(2)]
+
+    def held_replace(src: Any, dst: Any) -> None:
+        if len(refusals) == 2:
+            raise refusals.pop()
+        real_replace(src, dst)
+
+    def held_unlink(self: Path, missing_ok: bool = False) -> None:
+        if refusals:
+            raise refusals.pop()
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(os, "replace", held_replace)
+    monkeypatch.setattr(Path, "unlink", held_unlink)
+
+    codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_noop)
+    moved = path.with_name("meals.csv")
+    assert moved.is_file() and not path.exists()
+
+    codeset_edit.remove_code_set(tmp_path, "meals", validate=_noop)
+    assert not moved.exists()
+    assert refusals == []
+
+
 def test_a_hold_that_does_not_pass_is_refused_and_says_try_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -604,13 +625,17 @@ def test_a_real_hold_that_lets_go_inside_the_retry_lets_the_edit_land(tmp_path: 
 
 
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.ENOENT], ids=["disk-full", "missing"])
+@pytest.mark.parametrize("refuse", [_refuse_lock, _refuse_replace], ids=["lock", "replace"])
 def test_an_error_that_is_not_a_refusal_keeps_its_own_type(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    code: int,
+    refuse: Callable[[pytest.MonkeyPatch, OSError], None],
 ) -> None:
     # A full disk or a missing directory is not a permission problem, so it is not reported as one.
     _live(tmp_path)
     refusal = OSError(code, os.strerror(code))
-    _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
+    refuse(monkeypatch, refusal)
 
     with pytest.raises(OSError) as caught:
         connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)

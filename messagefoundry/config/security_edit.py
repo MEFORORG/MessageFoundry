@@ -60,11 +60,7 @@ def set_security(
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
     with atomic_edit.edit_lock(path, busy_error=SecurityEditError, refused_error=SecurityEditError):
-        original, crlf = (
-            atomic_edit.read_text(path, refused_error=SecurityEditError)
-            if path.is_file()
-            else (None, False)
-        )
+        original, crlf = atomic_edit.read_text_if_present(path, refused_error=SecurityEditError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         sec = doc.get("security")

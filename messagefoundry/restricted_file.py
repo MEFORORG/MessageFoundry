@@ -58,6 +58,7 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "replace_generated",
     "ride_out_a_held_file",
     "unlink_generated",
     "write_restricted_file",
@@ -285,6 +286,18 @@ def unlink_generated(path: Path) -> None:
     """Delete one file the engine wrote, riding out a brief Windows sharing violation. Shared by
     the API's minted pair and the `cert` commands' cleanup, so neither imports the other."""
     ride_out_a_held_file(path.unlink, frozenset({WINERROR_SHARING_VIOLATION}))
+
+
+def replace_generated(staged: Path, live: Path) -> None:
+    """Move ``staged`` over ``live``, riding out a brief Windows hold on either file.
+
+    Both codes count: a hold on ``staged`` answers the sharing violation and a hold on ``live``
+    answers access denied, the same code a true denial answers, so a true denial waits out the
+    short retry before it propagates. Shared by the API's minted pair and the config editors."""
+    ride_out_a_held_file(
+        lambda: os.replace(staged, live),
+        frozenset({WINERROR_SHARING_VIOLATION, WINERROR_ACCESS_DENIED}),
+    )
 
 
 # --- creating the file ----------------------------------------------------------------------------
