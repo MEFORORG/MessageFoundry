@@ -1920,10 +1920,14 @@ class DicomScpSource(SourceConnector):
         """Tell the refusal observers about an association rejected because ``max_associations``
         is full (vault BACKLOG #2613), the counterpart of a socket listener's connection cap.
 
-        ``EVT_REJECTED`` fires on the association's thread for every A-ASSOCIATE-RJ this SCP sends,
-        after the RJ is stored as the acceptor's primitive. pynetdicom sends local-limit-exceeded
-        only for ``max_associations``, so that reason alone is counted: the intake pause's
-        temporary-congestion rejection and the AE-title and user-identity rejections are not.
+        ``EVT_REJECTED`` fires on the association's thread for each A-ASSOCIATE-RJ an
+        ``Association`` sends, after the RJ is stored as the acceptor's primitive. The RJs
+        ``_check_association_request`` writes before any association exists fire no event.
+        pynetdicom sends local-limit-exceeded only from its ``max_associations`` check, so that
+        reason alone is counted: the intake pause's temporary-congestion rejection is not. pynetdicom
+        checks the limit last, so at the limit an AE-title or user-identity failure is sent, and
+        counted, as local-limit-exceeded; below it, it is not counted. Like the socket listeners, a
+        stopping server counts nothing.
         """
         try:
             assoc = event.assoc
@@ -1936,7 +1940,7 @@ class DicomScpSource(SourceConnector):
         except Exception as exc:  # noqa: BLE001 - on pynetdicom's thread: never raise into it
             logger.debug("DICOM rejection not read for the refusal observers: %s", safe_exc(exc))
             return
-        if at_limit:
+        if at_limit and not self._stopping.is_set():
             notify_refusal(self._refusal_name)
 
     def _charge_association(self, event: Any) -> None:

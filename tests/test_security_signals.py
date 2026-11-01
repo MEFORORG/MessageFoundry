@@ -932,14 +932,20 @@ async def test_a_dicom_refusal_at_a_connection_cap_reaches_the_refusal_observers
     assert seen == ["IB_PACS"]
 
 
-def _verification_association(port: int) -> Any:
+def _verification_association(port: int, calling_ae: str = "MODALITY1") -> Any:
     """An association request from a stand-in modality, held open if the SCP accepts it."""
     from pynetdicom import AE
     from pynetdicom.sop_class import Verification
 
-    ae = AE(ae_title="MODALITY1")
+    ae = AE(ae_title=calling_ae)
     ae.add_requested_context(Verification)
     return ae.associate("127.0.0.1", port, ae_title="MEFOR_SCP")
+
+
+def _rj(assoc: Any) -> tuple[int, int, int]:
+    """The (result, source, reason) of the A-ASSOCIATE-RJ the requestor received."""
+    rj = assoc.acceptor.primitive
+    return (rj.result, rj.result_source, rj.diagnostic)
 
 
 async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers() -> None:
@@ -954,6 +960,7 @@ async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers(
                 "host": "127.0.0.1",
                 "port": 0,
                 "max_associations": 1,
+                "calling_ae_allowlist": ["MODALITY1"],
             },
         )
     )
@@ -965,18 +972,20 @@ async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers(
     add_refusal_observer(seen.append)
     held: Any = None
     try:
-        # The control: an association under the limit is admitted and notifies nothing.
+        # The controls, both below the limit: a calling AE outside the allowlist is rejected and
+        # not counted, and a listed one is admitted and notifies nothing.
+        stranger = await asyncio.to_thread(_verification_association, scp.sockport, "STRANGER")
+        assert stranger.is_rejected and _rj(stranger) == (0x01, 0x01, 0x03)
         held = await asyncio.to_thread(_verification_association, scp.sockport)
         assert held.is_established
-        assert seen == []
         rejected = await asyncio.to_thread(_verification_association, scp.sockport)
-        assert rejected.is_rejected
-        # EVT_REJECTED fires on the SCP's thread after the RJ is sent, so wait for it briefly.
+        assert rejected.is_rejected and _rj(rejected) == (0x02, 0x03, 0x02)  # local limit
+        # The requestor can read the RJ before the SCP's thread fires EVT_REJECTED, so poll.
         for _ in range(100):
             if seen:
                 break
             await asyncio.sleep(0.02)
-        await asyncio.sleep(0.1)  # and give a second notify the chance to show
+        await asyncio.sleep(0.2)  # and give a second notify the chance to show
         assert seen == ["IB_PACS"]
     finally:
         remove_refusal_observer(seen.append)
