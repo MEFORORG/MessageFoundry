@@ -4673,13 +4673,13 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   account's sign-ins and sessions while its record fails. The SQLite store takes its write lock
   before it reads the account list, so another writer cannot commit an account or a session
   between that read and its sweep. All of this was read from the code and has not been run.
-  **The second exception,** for every sweep this bullet names, the every-account revoke included: a request from a missed session to end the user's
-  other sessions, accepted just before the sweep commits, waits for it and then stamps the
-  session with the new epoch, so it stays usable. **At least three things are also wrong about a
-  refused one.** Its ending is reported as a seal failure: a WARNING, an
-  `integrity.authority_seal_failed` audit row and an `integrity_drift` alert. The report is
-  rate-limited per session, and the alert goes through the alert notifier's re-alert throttle, or
-  only to the log where no alert notifier is running.
+  **The second exception,** for every sweep this bullet names, the every-account revoke included:
+  a request from a missed session to end the user's other sessions, accepted just before the
+  sweep commits, waits for it and then stamps the session with the new epoch, so it stays usable.
+  **At least three things are also wrong about a refused one.** Its ending is reported as a seal
+  failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
+  alert. The report is rate-limited per session, and the alert goes through the alert notifier's
+  re-alert throttle, or only to the log where no alert notifier is running.
   **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
   alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
   The count the bind, the unbind or the revoke reports leaves out each session it missed. The
