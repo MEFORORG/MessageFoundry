@@ -343,6 +343,24 @@ async def test_complete_with_response_parity(store) -> None:
     assert [(c.response_seq, c.body) for c in caps2] == [(1, "MSA|AA"), (2, "MSA|AA|2")]
 
 
+async def test_complete_with_response_scrubs_detail_pg(store) -> None:
+    # BACKLOG #2984: a reply's detail is stored through safe_text(detail, limit=200), as an ack_sent
+    # row's is, whatever the connector put in it. Synthetic PID fragment, invented for this test.
+    detail = "partner note PID|1||MRN7731^^^H^MR||ZEPHYRTEST^QUINN||19700101"
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(
+        item.id, body="MSA|AA", outcome="accepted", detail=detail, now=300.0
+    )
+    (reply,) = await store.correlate_response(mid)
+    # The exact value is pinned against safe_text on SQLite (tests/test_b2984_reply_detail_scrub.py);
+    # importing redaction here would widen this suite's serverdb path gate.
+    assert reply.detail is not None and reply.detail.startswith("partner note ")
+    assert "ZEPHYRTEST" not in reply.detail and "MRN7731" not in reply.detail
+
+
 # --- ADR 0021 "Response Sent" inbound ACK capture parity (MLLP-20) -----------------------------
 # record_ack_sent's PHI fail-safe on the SERVER store — mirrors tests/test_ack_sent_store.py (SQLite):
 # an AA body is stored ONLY when the store is encrypted and is ciphertext at rest; a NAK never stores a
@@ -1296,6 +1314,35 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
     )
 
     await _assert_bind_sweeps_and_unbound_guard_contract(store)
+
+
+async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
+    """BACKLOG #2738 on the real Postgres backend: ``delete_user`` takes the account's ``users``
+    row before its sessions, as the bind does, so the two cannot deadlock.
+
+    The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
+    request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
+    from typing import Any
+
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_and_user_delete_take_one_lock_order,
+    )
+
+    async def _backend_pid(conn: Any) -> object:
+        return conn.get_server_pid()
+
+    async def _is_blocking(pid: object) -> bool:
+        return bool(
+            await store._fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
+                " AND $1::int = ANY(pg_blocking_pids(pid)))",
+                pid,
+            )
+        )
+
+    await _assert_bind_and_user_delete_take_one_lock_order(
+        store, holder_of=_backend_pid, is_blocking=_is_blocking
+    )
 
 
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
@@ -4928,6 +4975,9 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
     setenv_at_rest_opt_out(monkeypatch)
@@ -4963,6 +5013,7 @@ async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")  # as above (BACKLOG #2532)
     setenv_at_rest_opt_out(monkeypatch)  # a keyless chain, as above (vault BACKLOG #3054)
 
     await store.record_audit("message_view", actor="alice", detail="v1")
@@ -5068,6 +5119,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)  # new active
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)  # old, decrypt-only bridge
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     rc = await asyncio.to_thread(main, ["rotate-key"])  # asyncio.run inside → off the loop
     assert rc == 0
     assert "re-encrypted" in capsys.readouterr().out

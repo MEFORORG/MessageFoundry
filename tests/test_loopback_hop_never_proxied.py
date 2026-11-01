@@ -13,9 +13,9 @@ cleartext guard accepts as loopback is dialled direct, whatever proxy the opener
 replaces it with a recorder. So the whole opener runs as shipped, request processors and proxy
 handler included, and the test reads the host the request would have gone to.
 
-Each rule is paired with a control on the same opener: an off-box host still goes to the proxy. The
-alert webhook, the OIDC legs and the AI broker have no proxy setting of their own, so the
-environment proxy is their only route out on a network that requires one.
+Each rule is paired with a control on the same opener: a host the guard does not accept still goes
+to the proxy. The alert webhook, the OIDC legs and the AI broker have no proxy setting of their
+own, so the environment proxy is their only route out on a network that requires one.
 
 Synthetic data only: every host name is reserved or made up.
 """
@@ -33,7 +33,13 @@ import pytest
 
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused, active_hop_posture
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    active_hop_posture,
+    hop_url_host,
+    is_loopback_hop_host,
+)
 from messagefoundry.config.wiring import Rest
 from messagefoundry.pipeline import alert_sinks
 from messagefoundry.transports import build_destination, rest
@@ -62,7 +68,10 @@ _LOOPBACK_URLS = (
     "https://[::1]/x",
 )
 
-#: Hosts the guard does not accept. Three of them only look like loopback.
+#: Hosts the guard does not accept, so the opener hands them to a proxy. Three of them only look
+#: like loopback. The last five spell a loopback host the predicate reads as remote, so they are
+#: off-box to the guard and the proxy handler, and a direct leg could still land on this box: at
+#: least ``%6cocalhost`` does (vault BACKLOG #2706).
 _OFF_BOX_URLS = (
     "http://partner.invalid/x",
     "https://partner.invalid/x",
@@ -71,6 +80,11 @@ _OFF_BOX_URLS = (
     "http://127.partner.invalid/x",
     "http://10.0.0.5/x",
     "http://[2001:db8::1]:18080/x",
+    "http://localhost./x",
+    "https://localhost./x",
+    "http://LOCALHOST./x",
+    "http://127.0.0.1./x",
+    "http://%6cocalhost/x",
 )
 
 
@@ -112,10 +126,13 @@ def environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", _PROXY)
 
 
-def _dialled(opener: urllib.request.OpenerDirector, url: str) -> str:
+def _dialled(
+    opener: urllib.request.OpenerDirector, url: str, headers: dict[str, str] | None = None
+) -> str:
     """The ``host:port`` ``opener`` would connect to for ``url``."""
+    request = urllib.request.Request(url, data=b"synthetic", headers=headers or {}, method="POST")
     with pytest.raises(_Dialled) as caught:
-        opener.open(urllib.request.Request(url, data=b"synthetic", method="POST"), timeout=1)
+        opener.open(request, timeout=1)
     return caught.value.host
 
 
@@ -156,8 +173,9 @@ def test_a_loopback_hop_is_dialled_direct_under_an_environment_proxy(
 def test_an_off_box_hop_still_goes_through_the_environment_proxy(
     environment_proxy: None, family: str, url: str
 ) -> None:
-    """CONTROL for the test above, on the same openers: the rule removes the proxy from a loopback
-    hop only. A name that merely starts or ends like a loopback one is off-box."""
+    """CONTROL for the test above, on the same openers: the rule removes the proxy only from a hop
+    the guard accepts as on-box. A name that merely starts or ends like a loopback one is not
+    accepted, and nor is a spelling the predicate reads as remote."""
     assert _dialled(_FAMILIES[family](), url) == _PROXY_HOST
 
 
@@ -404,3 +422,90 @@ def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target()
         "OB", settings, None, targets=["http://127.0.0.1:18080/x", "https://partner.invalid/x"]
     )
     assert hop is not None and hop.name == "proxy:OB"
+
+
+# --- the limit stated on is_loopback_hop_host: spellings it reads as remote ----------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "on_box"),
+    [
+        ("localhost.", False),
+        ("LOCALHOST.", False),
+        ("127.0.0.1.", False),
+        ("%6cocalhost", False),
+        ("localhost", True),  # CONTROL: the plain spellings
+        ("LOCALHOST", True),
+        ("127.0.0.1", True),
+    ],
+)
+def test_the_three_predicates_agree_on_each_spelling(host: str, on_box: bool) -> None:
+    """Read as written, because ``urlsplit`` would lowercase the host. The two transport readers
+    delegate to the guard's predicate, so this pins the answer, not an agreement; the openers' own
+    reading of the URLs in ``_OFF_BOX_URLS`` is held by
+    ``test_an_off_box_hop_still_goes_through_the_environment_proxy`` (vault BACKLOG #2706)."""
+    assert is_loopback_hop_host(host) is on_box
+    assert is_never_proxied_host(host) is on_box
+    assert rest._is_loopback_target(host) is on_box
+
+
+def test_for_host_keeps_the_credential_on_a_spelling_read_as_remote() -> None:
+    """``for_host`` keeps the pre-emptive header for ``localhost.``, and a request carrying it is
+    dialled to the proxy, not refused (vault BACKLOG #2706). CONTROL: ``for_host`` resolves
+    ``localhost`` to no proxy and no credential. The proxy is on the box, so the guard admits the
+    credential in every posture."""
+    settings = {"proxy_url": "http://127.0.0.1:3128", "proxy_user": "pu", "proxy_password": "pw"}
+    config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
+    assert config is not None
+    resolved = config.for_host("https://localhost./x")
+    assert resolved is not None
+    headers = resolved.auth_headers()
+    assert headers["Proxy-Authorization"].startswith("Basic ")
+    # The header rides the request: a refusal of it would raise here in place of the dial.
+    opener = build_strict_opener(*resolved.opener_handlers())
+    assert _dialled(opener, "https://localhost./x", headers) == "127.0.0.1:3128"
+    assert config.for_host("https://localhost/x") is None
+
+
+def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out(
+    environment_proxy: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_proxy_bypasses`` strips the dot and the predicate does not, so the two disagree on
+    ``localhost.``. The match takes the connection's own proxy off the hop, a proxy from the
+    environment still takes it, and the cleartext guard, which reads the predicate, still refuses
+    it (vault BACKLOG #2706). CONTROLS: with no entry there is no match, and the plain spelling
+    builds. The connection's own proxy is a host apart from the environment's, so the dial shows
+    which proxy took the hop."""
+    settings = {"proxy_url": "http://own-proxy.invalid:9", "proxy_no_proxy": "localhost"}
+    assert rest.proxy_bypasses_host("localhost.", ["localhost"])
+    assert not rest.proxy_bypasses_host("localhost.", None)
+    config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
+    assert config is not None
+    assert config.for_host("https://localhost./x") is None
+    # The connection sends on the shared opener, rebuilt here because the one built at import read
+    # whatever the environment held then.
+    monkeypatch.setattr(rest, "_NO_REDIRECT_OPENER", rest._no_redirect_opener())
+    dest = _rest("https://localhost./x", **settings)
+    assert dest._opener is rest._NO_REDIRECT_OPENER
+    assert _dialled(dest._opener, "https://localhost./x") == _PROXY_HOST
+    with active_hop_posture(HopPosture(enforcing=True)):
+        with pytest.raises(InsecureHopRefused, match="HTTP cleartext egress"):
+            _rest("http://localhost./x", **settings)
+        _rest("http://localhost/x", **settings)
+
+
+def test_a_percent_encoded_host_goes_to_this_box_on_a_direct_leg() -> None:
+    """The predicate reads ``%6cocalhost`` as remote, and with no proxy urllib decodes it and dials
+    ``localhost``. So that hop is judged as remote and lands on the box, which is the direction
+    the limit errs in (vault BACKLOG #2706)."""
+    opener = build_strict_opener(urllib.request.ProxyHandler({}))
+    assert _dialled(opener, "http://%6cocalhost:18080/x") == "localhost:18080"
+
+
+def test_the_host_a_plain_rstrip_would_empty_stays_off_box() -> None:
+    """Why a plain ``rstrip`` is not the fix. ``http://./x`` names the host ``.``, which is remote
+    today; stripped, it would be the empty host, which the predicate reads as loopback."""
+    host = hop_url_host("http://./x", cell="test")
+    assert host == "."
+    assert not is_loopback_hop_host(host)
+    assert is_loopback_hop_host(host.rstrip("."))

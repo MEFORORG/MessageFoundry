@@ -1161,7 +1161,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532); at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice and logs it twice), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
@@ -1200,10 +1200,19 @@ named it as still open, waiting on engine PR 1877.
 
 - CORRECTED 2026-10-01: this list named the three Vault hops' missing scheme gate, vault BACKLOG
   #2317. Engine PR 1880 closed it; see the Vault rows above.
-- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`, because
-  they pass no posture. At least `provision-admin`, `store provision-schema` and `check-privileges`
-  pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a
-  verifying certificate, or the command is changed to pass its posture.
+- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`. At
+  least `provision-admin`, `store provision-schema` and `check-privileges` pass the posture and
+  keep the escape at `warn`. A site that needs the others on a dev store gives it a verifying
+  certificate. That refusal at `warn` began as a side effect of passing no posture (vault BACKLOG
+  #2354), never as a ruling. BACKLOG #2532 keeps it on purpose (Manager decision
+  d20261031T021248404-699a64: no command loosens). Whether the CLI should honour the escape at
+  `warn` is the owner question in BACKLOG #1886, still open.
+- At least `support-bundle` and `verify` would cross an off-loopback PostgreSQL store hop with no
+  revocation check on a first deployment, at `enforcement = enforce` too, because they pass no
+  posture, no CLI process stamps one, and `RevocationHopGuard` does nothing with neither. `serve`
+  and the commands BACKLOG #2532 covers refuse that hop at `enforce`. #2532 left this open: the
+  fix is a guard that fails closed with no posture, in the store files, rather than another call
+  site.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 
@@ -4624,7 +4633,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
   account**, in the bind's own transaction, so nothing minted before the bind outlives it,
-  with one limit on the SQL Server store that the next bullet states. The
+  with one limit on the SQL Server store that *Limits of the session sweep* below states. The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
@@ -4637,18 +4646,40 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
 - **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
-  in the instant the sweep runs can be missed, and it then lasts until it expires. The same
-  holds on that store for an unbind and for an administrator's revoke of a user's sessions,
-  which run the same sweep. The Postgres store follows a rotated row and the SQLite store runs
-  one writer at a time, so neither has this limit. This was read from the code and not run
-  against a server. A bind ends sessions only: an engine factor already enrolled on the
-  account stays.
-- **A bind and a user delete can collide on the SQL Server and Postgres stores.** A bind locks
-  the account's row and then its sessions, and deleting a user locks the sessions and then
-  the row. If both run against one account at the same moment, the database ends one of
-  them, so one administrator request fails and is retried. No bound account keeps its
-  sessions and no user is left half deleted. The SQLite store runs one writer at a time and
-  does not have this.
+  in the instant the sweep runs can be missed by it. The same holds on that store for an
+  unbind and for every other whole-account revoke, which run the same sweep: at least an
+  administrator's revoke of a user's sessions, a role change and a password reset. **A missed
+  session is refused the next time it is presented** (BACKLOG #2592), with at least the
+  exception below. Each of these raises the account's session epoch in the same transaction,
+  and a rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
+  session, and the user's own session list hides it and ends it the same way. **The exception:**
+  a request from that session to end the user's other sessions, accepted just before the
+  sweep commits, waits for it and then stamps the session with the new epoch, so it stays
+  usable. **At least three things are also wrong about a refused one.** Its ending is reported
+  as a seal failure: a WARNING, an `integrity.authority_seal_failed` audit row and an
+  `integrity_drift` alert. The report is rate-limited per session, and the alert goes through the
+  alert notifier's re-alert throttle, or only to the log where no alert notifier is running.
+  **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
+  alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
+  The count the bind, the unbind or the revoke reports leaves out each session it missed. The
+  bind's and the unbind's are read from the driver's row count, so where a session-wide
+  `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
+  until the session is presented or listed, the store still holds it as live. A follow-up row,
+  not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
+  session, so nothing is missed. That would not change the -1 count. The Postgres store follows a
+  rotated row and the SQLite store runs one writer at a time, so neither has this limit. All
+  of this was read from the code; the skip has not been reproduced against a server. A bind
+  ends sessions only: an engine factor already enrolled on the account stays.
+- **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
+  bind, an unbind and a whole-account revoke lock the account's row and then its sessions.
+  Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
+  on Postgres since #2738, so the two cannot deadlock against one account. The order was read
+  from the code. `test_bind_and_user_delete_take_one_lock_order` runs on both server legs: it
+  pauses a bind while it holds the row, waits until the delete is queued behind it, then
+  releases the bind and requires both to finish. Under the old Postgres order, by the same
+  reading, the database would end one of them as a deadlock; that was not run. No bind,
+  unbind, revoke or user delete retries a deadlock, so a deadlock between any of them and
+  another write still fails that request, and it has to be made again by hand. The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
   first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
   of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.

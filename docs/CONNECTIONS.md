@@ -627,7 +627,9 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
-  accepted-with-warning (delivered, **not** retried, logged). **A TA1 is acted on only when its
+  accepted-with-warning (delivered, **not** retried, logged). An empty TA1-04, or one outside that
+  code set, is accepted too, and its captured `detail` is a fixed phrase, never the partner's text;
+  only a TA1-04 of `A` records `TA1*A` (BACKLOG #2984). **A TA1 is acted on only when its
   TA1-01 names the ISA13 just sent.** Both are compared as nine-digit control numbers, and a shorter
   all-digit TA1-01 is zero-padded. If the sent ISA13 is not nine digits, only an exact echo matches;
   a blank one matches nothing. If the sent payload has no readable ISA there is nothing to
@@ -2065,8 +2067,8 @@ Listeners are **not** on the list. On an inbound MLLP, TCP, X12, DICOM or HTTP l
 presents a credential to the engine, not the other way round. A connection declared with
 `deployed=False` is not on it either, because the engine never opens it. The same rule covers the
 rows above: a forward-proxy credential is not listed when `proxy_no_proxy` (the connection's own, or
-the inherited `[egress].proxy_no_proxy`) sends the connection's URL and its token endpoint direct.
-A loopback host is always sent direct, with no entry needed, so a connection whose every target is
+the inherited `[egress].proxy_no_proxy`) takes the connection's URL and its token endpoint off its
+proxy. A loopback host is always sent direct, with no entry needed, so a connection whose every target is
 loopback lists no proxy credential either. The `[egress]` section of
 [CONFIGURATION.md](CONFIGURATION.md) states that loopback rule. And the `[auth]` rows and their
 Vault secrets are listed only while `[auth]` and that feature are on. OAuth2 counts as compliant by
