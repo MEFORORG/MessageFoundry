@@ -103,7 +103,12 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.credential import QUALIFIED_CERT_NAME
-from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
+from messagefoundry.domainshape import (
+    MAX_MAIL_DOMAIN,
+    domain_shape_problem,
+    is_canonical_ipv4,
+    upn_suffix_key,
+)
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
@@ -3832,7 +3837,8 @@ class AuthSettings(_Section):
     # control before, because `preferred_username` is neither unique nor stable (OIDC Core §5.7) and is
     # self-editable on many IdPs. Empty = fall back to [auth].ad_domain; if neither is set while
     # strip_domain is on, oidc_enabled is refused at load rather than stripping unchecked. List the alternate UPN suffixes
-    # of a multi-domain forest here.
+    # of a multi-domain forest here. An ASCII suffix matches without regard to case; one holding a
+    # non-ASCII character matches only as written (upn_suffix_key in domainshape.py).
     oidc_allowed_username_domains: list[str] = Field(default_factory=list)
     oidc_clock_skew_seconds: int = 60  # wall clock; validator-capped 0..300
     # The BACKLOG #99(g) control: refuse a login whose verified token carries no configured MFA claim.
@@ -4683,19 +4689,30 @@ class AuthSettings(_Section):
 
     @property
     def effective_oidc_username_domains(self) -> tuple[str, ...]:
-        """The UPN suffixes a federated ``username`` claim may carry, lower-cased.
+        """The UPN suffixes a federated ``username`` claim may carry, in the compare form.
 
         Explicit ``oidc_allowed_username_domains`` wins; otherwise fall back to the single
         ``ad_domain`` the LDAP layer already builds UPNs from (``auth/ldap.py``). Empty means no
-        suffix source is configured at all, which the validator above refuses when stripping is on.
+        suffix source applies, which the validator above refuses with OIDC enabled and stripping on.
         """
         # Its own rule, not the shared domain rule (BACKLOG #3075 item 3, declined): an entry is
         # compared with the raw suffix an identity provider writes into a claim, not with a DNS
         # name the engine resolves, and a UPN suffix may be non-ASCII or hold an underscore,
-        # both of which the shared rule refuses.
+        # both of which the shared rule refuses. upn_suffix_key is the form the claim is compared
+        # in, so a change to one side of this compare cannot stop or start a match on its own.
+        # A TOML list of only blanks still takes this arm: it gives () and keeps ad_domain out, so
+        # with OIDC enabled and stripping on the load refusal above fires even when ad_domain is
+        # set. The env string form lost its blanks at the split, so it falls back instead.
         if self.oidc_allowed_username_domains:
-            return tuple(d.strip().lower() for d in self.oidc_allowed_username_domains if d.strip())
-        return (self.ad_domain.strip().lower(),) if self.ad_domain else ()
+            return tuple(
+                upn_suffix_key(d.strip()) for d in self.oidc_allowed_username_domains if d.strip()
+            )
+        # A blank ad_domain is no source: its key would allow-list the empty suffix past the load
+        # refusal above. The plain strip() is for operator text, which a paste can pad; a claim
+        # gets only the ASCII strip in upn_suffix_key.
+        if self.ad_domain and self.ad_domain.strip():
+            return (upn_suffix_key(self.ad_domain.strip()),)
+        return ()
 
 
 #: Characters permitted in a free-form environment NAME (it selects ``environments/<name>.toml``, so
@@ -5231,14 +5248,23 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
+#: RFC 1122's "this network" block. ``ipaddress`` names only its first address, as unspecified: it
+#: reads the rest, such as ``0.1.2.3``, as neither unspecified nor reserved (BACKLOG #3765).
+_THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
+
+
 def _not_a_host_address(text: str) -> bool:
-    """Whether the canonical IPv4 ``text`` is not one host's address: at least the unspecified
-    ``0.0.0.0``, a multicast group, and the reserved class E range, which holds the limited
-    broadcast ``255.255.255.255`` (BACKLOG #3075). No identity provider or link is served from one,
-    and some browsers route ``0.0.0.0`` to the local machine. This does not refuse loopback: a
-    ``127.0.0.1`` entry still loads, as ``localhost`` does."""
+    """Whether the canonical IPv4 ``text`` is not one host's address: at least the whole
+    ``0.0.0.0/8`` block, a multicast group, and the reserved class E range, which holds the limited
+    broadcast ``255.255.255.255`` (BACKLOG #3075, #3765). No identity provider or link is served
+    from one, and some browsers route ``0.0.0.0`` to the local machine. This does not refuse
+    loopback: a ``127.0.0.1`` entry still loads, as ``localhost`` does.
+
+    The console keeps its own copy, ``_is_one_host`` in ``messagefoundry_webconsole/_external.py``,
+    for an entry that reaches it another way. ``tests/test_domain_shape.py`` compares the two on a
+    ``/16`` grid."""
     address = ipaddress.IPv4Address(text)
-    return address.is_unspecified or address.is_multicast or address.is_reserved
+    return address in _THIS_NETWORK or address.is_multicast or address.is_reserved
 
 
 def _bare_domain_entries(
