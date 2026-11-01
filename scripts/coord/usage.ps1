@@ -23,9 +23,9 @@
     it converts "I should check" into "I already know".
 
       1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed.
-      2. REFUSE TO PROJECT ON STALE OR THIN DATA. Below two fresh samples in the current window, or past
-         -MaxAgeMinutes, the answer is UNKNOWN. Not an extrapolation, not a last-known value dressed up
-         as current.
+      2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the answer is UNKNOWN. Not an
+         extrapolation, not a last-known value dressed up as current. Below two samples in the current
+         window there is no rate and no projection, and the percentage bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -47,7 +47,7 @@
         0  OK
         10 WARN        -- high, or projected to exhaust before reset with slack
         11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling
-        20 UNKNOWN     -- no data, stale data, not enough samples, or a reading this root may not trust
+        20 UNKNOWN     -- no data, stale data, or a reading this root may not trust
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
     FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
@@ -416,13 +416,15 @@ function Get-Rate($CurrentResetEpoch) {
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
     $oldest = $rows | Sort-Object AgeMin -Descending | Select-Object -First 1
     $newest = $rows | Sort-Object AgeMin | Select-Object -First 1
-    $spanH = ($oldest.AgeMin - $newest.AgeMin) / 60.0
+    # THE SPAN RUNS TO NOW, NOT TO THE NEWEST ROW. Rows land only on a move, so the flat time since the
+    # last one is in no row, and ending the span there would keep a stopped burn reading as a live one.
+    $spanH = $oldest.AgeMin / 60.0
     if ($spanH -le 0) { return $null }
     $delta = $newest.Pct - $oldest.Pct
     return [pscustomobject]@{
         PctPerHour = [math]::Round($delta / $spanH, 2)
         Samples    = $rows.Count
-        SpanMin    = [math]::Round($oldest.AgeMin - $newest.AgeMin, 1)
+        SpanMin    = [math]::Round($oldest.AgeMin, 1)
     }
 }
 
@@ -513,7 +515,10 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         $o.state = "CRITICAL"
         $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, $($minsToReset - $o.minutes_to_empty) min before this window resets"
     }
-    elseif ($pct -ge 85) { $o.state = "WARN"; $o.reason = "high, but not projected to run out before reset" }
+    elseif ($pct -ge 85) {
+        $o.state = "WARN"
+        $o.reason = if ($null -eq $rate) { "high, with no rate, so nothing is projected" } else { "high, but not projected to run out before reset" }
+    }
     elseif ($null -ne $o.projected_at_reset -and $o.projected_at_reset -ge 95) {
         $o.state = "WARN"; $o.reason = "projected to reach $($o.projected_at_reset)% by reset"
     }

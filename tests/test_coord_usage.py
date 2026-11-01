@@ -401,6 +401,25 @@ def test_a_high_but_stable_reading_is_not_critical(tmp_path: Path) -> None:
     assert d["seven_day"]["minutes_to_empty"] is None, "a flat rate cannot project exhaustion"
 
 
+def test_a_burn_that_stopped_does_not_read_as_a_live_one(tmp_path: Path) -> None:
+    """Rows land only on a move, so the flat time since the last one is in no row. Ended at the
+    newest row, this span is a minute, and the rate reads 60 percent an hour on a stopped pool."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=50.0, seven_epoch=epoch)
+    write_history(tmp_path, [(85, 49.0), (84, 50.0)], epoch)
+
+    _, d = read(tmp_path)
+    assert 0 < d["seven_day"]["rate_pct_per_hr"] < 1, d
+
+
+def test_a_high_reading_with_no_rate_does_not_claim_a_projection(tmp_path: Path) -> None:
+    publish(tmp_path, seven=91.0)
+    code, d = read(tmp_path)
+    assert code == WARN
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert "nothing is projected" in d["seven_day"]["reason"], d
+
+
 def test_rate_is_not_computed_across_a_window_reset(tmp_path: Path) -> None:
     """THE EPOCH-BOUNDARY TRAP. When a window resets the percentage legitimately collapses (90 -> 5).
     A rate spanning that boundary is large and NEGATIVE, which reads as 'consumption has stopped' at the

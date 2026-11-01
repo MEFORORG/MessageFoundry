@@ -241,7 +241,7 @@ def test_below_the_level_with_no_rate_does_not_halt(sb: Sandbox) -> None:
     ("to_empty", "to_reset", "expected"),
     [
         pytest.param(60, 90, HALT, id="at-sixty-minutes"),
-        pytest.param(61, 90, NO_REVIEW, id="just-past-sixty-minutes"),
+        pytest.param(61, 90, REVIEW, id="just-past-sixty-minutes"),
         pytest.param(45, 45, NO_REVIEW, id="resets-as-it-runs-out"),
     ],
 )
@@ -249,11 +249,18 @@ def test_the_rate_limb_is_inside_sixty_minutes_and_before_the_reset(
     sb: Sandbox, to_empty: int, to_reset: int, expected: int
 ) -> None:
     """The first limb of the owner's rung of 2026-10-31, on both its edges. Below the level
-    backstop and the ceiling, so only the projection can decide."""
+    backstop and the ceiling, so only the projection can decide. usage.ps1 grades any run-out
+    before the reset CRITICAL, so past the hour that reading is REVIEW, not a clear path."""
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),
-        usage(50.0, rate_pct_per_hr=50.0, minutes_to_empty=to_empty, minutes_to_reset=to_reset),
+        usage(
+            50.0,
+            state="CRITICAL" if to_empty < to_reset else "OK",
+            rate_pct_per_hr=50.0,
+            minutes_to_empty=to_empty,
+            minutes_to_reset=to_reset,
+        ),
     )
     code, doc = gate(sb)
     assert code == expected, why(doc)
@@ -261,12 +268,14 @@ def test_the_rate_limb_is_inside_sixty_minutes_and_before_the_reset(
         assert f"run out in about {to_empty} min" in why(doc)
 
 
-def test_a_flat_rate_does_not_halt_at_the_level(sb: Sandbox) -> None:
-    """A rate of zero is a rate, and it governs: only with no rate at all is 90 the backstop."""
+@pytest.mark.parametrize("rate", [0.0, -1.0], ids=["flat", "falling"])
+def test_a_rate_of_zero_or_below_counts_as_no_rate(sb: Sandbox, rate: float) -> None:
+    """It must not lift the 90 percent backstop: usage does not fall inside a reset period, so such
+    a rate comes from sessions reporting cached readings. watch.py treats it the same way."""
     seed_vault(sb, calibrated("manager"))
-    write_fake_usage(_usage_path(sb), usage(92.0, state="WARN", rate_pct_per_hr=0.0))
+    write_fake_usage(_usage_path(sb), usage(92.0, state="WARN", rate_pct_per_hr=rate))
     code, doc = gate(sb)
-    assert code == NO_REVIEW, why(doc)
+    assert code == HALT and "the level is the backstop" in why(doc), why(doc)
 
 
 def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
@@ -357,12 +366,14 @@ def test_the_thresholds_file_moves_the_minutes_clause(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),
-        usage(50.0, rate_pct_per_hr=50.0, minutes_to_empty=45, minutes_to_reset=90),
+        usage(
+            50.0, state="CRITICAL", rate_pct_per_hr=50.0, minutes_to_empty=45, minutes_to_reset=90
+        ),
     )
     assert gate(sb)[0] == HALT, "control: 45 minutes is inside the default 60"
     _thresholds(sb).write_text(json.dumps({"minutes": [20, 10, 5]}), encoding="utf-8")
     code, doc = gate(sb)
-    assert code == NO_REVIEW, why(doc)
+    assert code == REVIEW and "does not reach the rung" in why(doc), why(doc)
 
 
 @pytest.mark.parametrize(

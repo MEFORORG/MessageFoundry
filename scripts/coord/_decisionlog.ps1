@@ -843,7 +843,9 @@ function Get-DecisionCostRung {
       THE WEEKLY WINDOW, the only one (owner ruling 2026-10-31; Get-DecisionRungLevels holds the
       numbers). RATE GOVERNS (STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung
       is hit when the window is projected to run out within HoldMin minutes and before it resets,
-      whatever the level. Only with no rate is the level the backstop.
+      whatever the level. Only with no rate is the level the backstop. A rate of zero or below counts
+      as no rate, as it does in watch.py: usage inside one reset period does not fall, so such a rate
+      comes from cached readings, and it must not lift the backstop.
 
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
@@ -904,8 +906,8 @@ function Get-DecisionCostRung {
     $at = "weekly at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
     $rung = if ($pct -ge 98) {
         New-DecisionRung 'HIT' "$at. At the ceiling (98 percent, usage.ps1's own CRITICAL band), whatever the rate"
-    } elseif ($null -ne $rate) {
-        $cut = [double]$rate -gt 0 -and $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
+    } elseif ($null -ne $rate -and [double]$rate -gt 0) {
+        $cut = $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
         if ($cut -and [double]$toEmpty -le $lv.HoldMin) {
             New-DecisionRung 'HIT' "$at. Projected to run out in about $toEmpty min, before the window resets"
         } else {
