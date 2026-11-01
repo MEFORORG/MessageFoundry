@@ -6478,7 +6478,8 @@ A listener's refusal of a peer at its source allowlist or a connection cap write
 listeners and the DICOM server tell the layer directly, with the inbound's name and never the
 peer's address. Once a listener's burst raises, its refusals are not counted again for the window,
 or for five minutes when the window is longer. A refusal at a connection cap counts too, so a
-listener held full by ordinary load raises it as well.
+listener held full by ordinary load raises it as well. Which DICOM refusals count is in the
+`[alerts]` table too.
 
 **Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
 a detector count of `0` or above its default, or a window shorter than its default while any
