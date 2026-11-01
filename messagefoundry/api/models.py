@@ -686,7 +686,7 @@ class ConfigProvenance(BaseModel):
     ``fingerprint`` and best-effort git ``git_head`` captured at load, plus whether the on-disk config
     has since **drifted** from it. Read-only and non-secret — a one-way content hash and a commit sha,
     never resolved ``env()`` / ``MEFOR_VALUE_*`` values. ``loaded`` is False before any graph is loaded
-    (or if the fingerprint could not be computed); ``drift`` is only meaningful when ``loaded`` is True."""
+    (or if the fingerprint could not be computed); ``drift`` still answers then, as its comment says."""
 
     loaded: bool
     fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v3)

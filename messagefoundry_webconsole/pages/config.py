@@ -20,9 +20,9 @@ __all__ = ["config_page", "reload_pending", "reload_result"]
 
 
 def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
-    """A small 'running commit — clean|DRIFTED|NOT COMPARED' pill (ADR 0041 D1). Empty when the
-    engine hasn't loaded a graph yet or provenance is unavailable, so the page renders unchanged on
-    an older engine."""
+    """A small 'running commit — clean|DRIFTED|NOT COMPARED' pill (ADR 0041 D1). Empty when
+    ``loaded`` is false, which a running graph with no baseline also reads as, or when provenance is
+    unavailable, so the page renders unchanged on an older engine."""
     if prov is None or not prov.loaded:
         return Markup("")
     if prov.git_head:
