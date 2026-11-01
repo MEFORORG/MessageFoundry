@@ -1317,30 +1317,35 @@ class Engine:
         after the graph is live, so nothing it raises may fail the activation: the coordinator
         would then record an abort, and report the box as not active, while it serves the profile.
         With no digest of the running graph there is nothing to compare, and the verdict is
-        ``unknown``. The log line carries digests and the directory path, never config content."""
-        from messagefoundry.config.fingerprint import fingerprint_matches
+        ``unknown``. Two digests match only over the same files
+        (:func:`~messagefoundry.config.fingerprint.same_digest`). What either left out is recorded
+        as ``disk_config_left_out``, because the verdict says nothing about those files (vault
+        BACKLOG #3765). The log line carries digests and the directory path, never config
+        content."""
+        from messagefoundry.config.fingerprint import digest_coverage, same_digest
 
+        running = digest_coverage(self.loaded_config_fingerprint)
         activated = await self._dr_config_fingerprint()
         fields: dict[str, object] = {"config_fingerprint": activated}
         directory = self.running_config_dir
         if directory is None:
             return fields
         reason: str | None
-        disk: object = None
+        disk: tuple[str, tuple[str, ...]] | None = None
         try:
             async with asyncio.timeout(self._dr_settings.takeover_timeout_seconds):
                 if not await asyncio.to_thread(directory.is_dir):
                     reason = "the directory is not there"
                 else:
                     bundle, reason = await self.fingerprint_bundle(directory)
-                    disk = (bundle or {}).get("fingerprint")
+                    disk = digest_coverage(bundle)
         except TimeoutError:
             reason = f"no answer within {self._dr_settings.takeover_timeout_seconds:g}s"
         except Exception as exc:
             # Broad on purpose, and logged below: fingerprint_bundle lets anything but OSError and
             # ValueError through, and this record must not undo an activation that has applied.
             reason = safe_exc(exc)
-        if not isinstance(disk, str):
+        if disk is None:
             fields["disk_config"] = "unreadable"
             fields["disk_config_error"] = reason or "no digest was taken"
             log.warning(
@@ -1350,22 +1355,25 @@ class Engine:
                 fields["disk_config_error"],
             )
             return fields
-        if activated is None:
+        left_out = sorted({*disk[1], *(running[1] if running is not None else ())})
+        if left_out:
+            fields["disk_config_left_out"] = left_out
+        if activated is None or running is None:
             fields["disk_config"] = "unknown"
-            fields["disk_config_fingerprint"] = disk
+            fields["disk_config_fingerprint"] = disk[0]
             return fields
-        if fingerprint_matches(disk, activated):
+        if same_digest(running, disk):
             fields["disk_config"] = "matches"
             return fields
         fields["disk_config"] = "differs"
-        fields["disk_config_fingerprint"] = disk
+        fields["disk_config_fingerprint"] = disk[0]
         log.warning(
             "DR activation applied the running graph (config fingerprint %s), and did not apply the "
             "config dir %s, which now differs on disk (fingerprint %s). POST /config/reload applies "
             "it, under that route's approval gate.",
             activated,
             directory,
-            disk,
+            disk[0],
         )
         return fields
 
@@ -3238,12 +3246,20 @@ class Engine:
         The start's first load is the lifespan's, not :meth:`reload_detail`, so without this call
         :attr:`loaded_config_fingerprint` stayed ``None`` until the first reload and ``GET
         /config/provenance`` could not see drift after a plain start (vault BACKLOG #2597). The
-        caller runs it right after the first load, so the digest covers the bytes that load read.
-        An unreadable bundle leaves the baseline ``None`` and the start goes on. Returns the
-        failure reason, or ``None`` when the digest was taken or there is no config dir."""
+        digest is of the snapshot that load ran, as a reload's is, so an edit or a file lock after
+        the load's read cannot reach it: it names the bytes that run (vault BACKLOG #2944, #3765).
+        Only a file the load does not read, in ``environments/``, can be left out of it. The
+        directory is read for the advisory VCS head alone, and for the digest only when the running
+        graph carries no snapshot. An unreadable bundle leaves the baseline ``None`` and the start
+        goes on. Returns the failure reason, or ``None`` when the digest was taken or there is no
+        config dir."""
         if self.config_dir is None:
             return None
-        self.loaded_config_fingerprint, reason = await self.fingerprint_bundle(self.config_dir)
+        rr = self._registry_runner
+        snapshot = rr.registry.config_snapshot if rr is not None else None
+        self.loaded_config_fingerprint, reason = await self.fingerprint_bundle(
+            self.config_dir, snapshot
+        )
         return reason
 
     def guard_registry(self, registry: Registry) -> None:

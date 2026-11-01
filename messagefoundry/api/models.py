@@ -693,6 +693,10 @@ class ConfigProvenance(BaseModel):
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
     drift: bool = False  # the on-disk config now differs from what was loaded
+    #: The files and folders the loaded digest or the on-disk digest left out as unreadable, so
+    #: ``drift`` says nothing about them (vault BACKLOG #3765). Relative paths, as an audit row's
+    #: ``unreadable_files`` names them; ``.`` is the config directory itself.
+    unreadable_files: list[str] = Field(default_factory=list)
     #: The refusal ``POST /config/reload`` gives THIS caller whatever it proves, or ``None`` when no
     #: such refusal applies (BACKLOG #3189). Today that is :data:`RELOAD_REFUSED_CHANNEL_SCOPED`
     #: for a channel-scoped caller. It is computed by the engine's own rule, so a page can stop

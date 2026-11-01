@@ -839,6 +839,35 @@ async def test_an_unchanged_dir_is_recorded_as_matching(box: _Box) -> None:
     assert "disk_config_fingerprint" not in row
 
 
+async def test_a_digest_that_left_a_file_out_matches_only_like_for_like(box: _Box) -> None:
+    """Vault BACKLOG #3765, item 23: the fold does not hash what a digest left out, so the running
+    digest can fold to the disk's value over other files. The check compared the folds alone and
+    recorded ``matches`` for files it never saw."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    loaded = engine.loaded_config_fingerprint
+    assert loaded is not None
+    engine.loaded_config_fingerprint = {**loaded, fp.UNREADABLE_FILES_KEY: ["environments/x.toml"]}
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+
+    row = await _activate_row(engine)
+    assert row["config_fingerprint"] == loaded["fingerprint"]
+    assert row["disk_config"] == "differs"
+    assert row["disk_config_fingerprint"] == loaded["fingerprint"], "the folds alone match"
+    assert row["disk_config_left_out"] == ["environments/x.toml"]
+
+
+async def test_a_whole_match_records_nothing_left_out(box: _Box) -> None:
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    assert "disk_config_left_out" not in await _activate_row(engine)
+
+
 async def test_an_activation_succeeds_with_the_config_dir_removed(
     box: _Box, monkeypatch: pytest.MonkeyPatch
 ) -> None:

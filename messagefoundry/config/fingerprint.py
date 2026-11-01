@@ -44,6 +44,7 @@ __all__ = [
     "fingerprint_matches",
     "digest_coverage",
     "is_missing_directory",
+    "same_digest",
     "snapshot_fingerprint",
 ]
 
@@ -66,9 +67,9 @@ FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 #: The :func:`config_fingerprint_detail` key that marks a partial digest: the sorted relative paths of
 #: the covered files, and of the folders a glob reads, that could not be read and were left out
 #: (vault BACKLOG #2944). Absent when the digest covers the whole bundle. Paths, not a count, so two
-#: partial digests can be compared like for like, and an operator can tell which file to fix. Not
-#: ``degraded``: an audit row merges this detail into its own, and there ``degraded`` already names
-#: failed reload steps.
+#: partial digests can be compared like for like, and an operator can tell which file to fix. The
+#: entry ``.`` is the config directory itself, which could not be listed. Not ``degraded``: an audit
+#: row merges this detail into its own, and there ``degraded`` already names failed reload steps.
 UNREADABLE_FILES_KEY = "unreadable_files"
 
 # What is hashed is what :func:`~messagefoundry.config.snapshot.read_config_snapshot` reads: every
@@ -171,7 +172,8 @@ def digest_coverage(detail: Mapping[str, object] | None) -> tuple[str, tuple[str
 
     Two digests are comparable only when their second elements are equal: then they cover the same
     files, and differ only when one of those files did. An ``unreadable_files`` value that is not a
-    list of strings reads as ``("?",)``, which equals no list a digest records."""
+    list of strings reads as ``("?",)``, which equals no list a digest records. :func:`same_digest`
+    compares two of these."""
     if detail is None:
         return None
     fingerprint = detail.get("fingerprint")
@@ -183,6 +185,14 @@ def digest_coverage(detail: Mapping[str, object] | None) -> tuple[str, tuple[str
     if isinstance(left_out, list) and all(isinstance(rel, str) for rel in left_out):
         return fingerprint, tuple(left_out)
     return fingerprint, ("?",)
+
+
+def same_digest(one: tuple[str, tuple[str, ...]], other: tuple[str, tuple[str, ...]]) -> bool:
+    """Whether two :func:`digest_coverage` results name the same bytes of the same files. The fold
+    does not hash what a digest left out, so a partial digest can fold to a whole one's value over
+    other files: the lists are compared too (vault BACKLOG #3765). Every reader that asks whether
+    two digests differ asks here, so a left-out file reads as different everywhere."""
+    return one[1] == other[1] and fingerprint_matches(one[0], other[0])
 
 
 def fingerprint_matches(current: object, loaded: str) -> bool:
