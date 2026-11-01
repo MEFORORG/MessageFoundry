@@ -22,11 +22,14 @@ by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob 
 origin/main``, because once step 2 merges ``origin/main`` IS the head, and the comparison would become
 the head against itself; and because a CI checkout need not hold that ref. The vendored file is never
 edited. The baseline the guard runs is that file plus the amendments in ``_STEP1_AMENDMENTS``, made
-as it loads: the changes the step 1 code path has gained on purpose since that tree. There is one,
-BACKLOG #2632, and ``test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line`` bounds
-what it may change against the file exactly as vendored. The bound is one rule: the amended
-baseline, and the head wherever the gate is closed, are never QUIETER than that file. No refusal
-goes, no marked ending goes, and nothing main counted unmapped goes uncounted (:func:`_quieter`).
+as it loads: the changes the step 1 code path has gained on purpose since that tree. There are two.
+The fail-closed amendment (BACKLOG #2526) loads first: it switches off live code main rendered from
+switched-off or misplaced source, and ``test_the_fail_closed_amendment_adds_no_live_code`` bounds it
+against the file exactly as vendored. The label amendment (BACKLOG #2632) loads on top of it, and
+``test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line`` bounds what that one may
+change against the tree it loads onto (``step1_unlabelled``). That bound is one rule: the amended
+baseline, and the head wherever the gate is closed, are never QUIETER than that tree. No refusal
+goes, no marked ending goes, and nothing it counted unmapped goes uncounted (:func:`_quieter`).
 ``test_no_raw_list_is_quieter_than_main`` asks the same of lists drawn with no grammar.
 
 **The invariant (the whole-list gate, ADR 0086).** For every shape, EITHER the head's generated
@@ -180,7 +183,7 @@ _UNKNOWN_ARM = "    if tag.lower() not in _STATEMENT_TAGS:\n"
 _UNKNOWN_RETURN = '        return [Control("unknown", tag, statement or note, body=tuple(body))]\n'
 _BLOCK_RETURN = "return [Control(kind, source, statement or note or tag, body=tuple(body))]\n"
 _CONSTRUCT_RETURN = "    return [Control(kind, source, detail, body=inner, branches=branches)]\n"
-_STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
+_LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
     # The rule and its marker, just after ``_statement_kind``, which the rule calls.
     (_SOURCE_LABEL_DEF, _LABEL_RULE + _SOURCE_LABEL_DEF),
     # The scan: a list holding such a statement holds no handle at all.
@@ -253,6 +256,68 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
     (_CONSTRUCT_RETURN, _CONSTRUCT_RETURN.replace("[Control(", "[*marker, Control(")),
 )
 
+# BACKLOG #2526, the second amendment, applied BEFORE the one above. A ``<List>``/``<Actions>``
+# wrapper carrying ``@Disabled`` was flattened, so the statements an operator switched off came
+# back as live code, and the scan walked them to agree. It is now commented out as one disabled
+# step, the scan skips it, and a disabled step stands between no construct and the sibling branch
+# written after it. Written apart from the head: here the adoption looks back past such steps,
+# where the head holds them out of the list until a step that runs follows them.
+_LIVE_SKIP = "        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:\n"
+_WRAPPER_NOTE = "            # A doubly-wrapped list: flatten rather than lose the statements.\n"
+_PARSE_LIST_DEF = "def _parse_list(\n"
+_ADOPTED_FROM_LAST = (
+    "            and steps\n"
+    "            and isinstance(steps[-1], Control)\n"
+    "            and steps[-1].kind == _BRANCH_PARENT[produced[0].kind]\n"
+    "        ):\n"
+    "            previous = steps[-1]\n"
+    "            steps[-1] = replace(previous, branches=(*previous.branches, produced[0]))\n"
+)
+_LOOK_BACK = """\
+def _off(step: Step) -> bool:
+    if isinstance(step, Control):
+        return step.kind == "disabled"
+    # The label amendment's marker, a subclass, when that amendment is loaded too.
+    return isinstance(step, UnmappedAction) and type(step) is not UnmappedAction
+
+
+def _construct_at(steps: list[Step]) -> int:
+    at = len(steps) - 1
+    while at >= 0 and _off(steps[at]):
+        at -= 1
+    return at
+
+
+"""
+_FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
+    (_LIVE_SKIP, "        if _is_disabled(elem):\n"),
+    (
+        _WRAPPER_NOTE,
+        _WRAPPER_NOTE + "            if _is_disabled(child):\n"
+        '                said = strip_markup(_attr(child, "Data")) or strip_markup(\n'
+        '                    _attr(child, "Comment")\n'
+        "                )\n"
+        "                inner = tuple(_parse_list(child, subject, held, in_control, depth + 1))\n"
+        "                steps.append(\n"
+        '                    Control("disabled", _local(child.tag), said or _local(child.tag), '
+        "body=inner)\n"
+        "                )\n"
+        "                continue\n",
+    ),
+    (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
+    (
+        _ADOPTED_FROM_LAST,
+        "            and (at := _construct_at(steps)) >= 0\n"
+        "            and isinstance(steps[at], Control)\n"
+        "            and steps[at].kind == _BRANCH_PARENT[produced[0].kind]\n"
+        "        ):\n"
+        "            previous = steps[at]\n"
+        "            steps[at] = replace(previous, branches=(*previous.branches, produced[0]))\n",
+    ),
+)
+#: Every amendment the baseline carries, in the order it loads them.
+_STEP1_AMENDMENTS = (*_FAIL_CLOSED_AMENDMENTS, *_LABEL_AMENDMENTS)
+
 
 def _load_step1(name: str, amendments: tuple[tuple[str, str], ...]) -> Any:
     if name in sys.modules:
@@ -274,8 +339,13 @@ def _load_step1(name: str, amendments: tuple[tuple[str, str], ...]) -> Any:
 
 #: The baseline: the step 1 code path as it stands, which a gate-declined list must match.
 step1: Any = _load_step1("_mefor_corepoint_import_step1", _STEP1_AMENDMENTS)
-#: The vendored tree exactly as main held it, with no amendment. Only the amendment's own test reads it.
+#: The vendored tree exactly as main held it, with no amendment.
 step1_as_vendored: Any = _load_step1("_mefor_corepoint_import_step1_as_vendored", ())
+#: The tree the label amendment (BACKLOG #2632) is bounded against: the vendored tree with the
+#: amendments that load before it. Only the label amendment's own tests read it.
+step1_unlabelled: Any = _load_step1(
+    "_mefor_corepoint_import_step1_unlabelled", _FAIL_CLOSED_AMENDMENTS
+)
 
 
 def test_the_step1_fixture_is_mains_step1_importer_byte_for_byte() -> None:
@@ -3002,7 +3072,7 @@ def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
     closed. On the battery that is what the head-equals-baseline check already implies. On a list
     drawn with no grammar nothing else compares the head with main. A fully understood list takes
     the step 2 path, where a refusal may become a delivery the oracle proves."""
-    was, now = _generate(step1_as_vendored, xml), _generate(step1, xml)
+    was, now = _generate(step1_unlabelled, xml), _generate(step1, xml)
     broken = [f"{name}: the amended baseline: {b}" for b in _breaches(xml, was, now)]
     # The head's own output is judged only where it is not the baseline's, which was just judged.
     if not _fully_understood(xml) and (ahead := _generate(head, xml)) != now:
@@ -3095,7 +3165,7 @@ def _structure_moved(name: str, xml: str) -> tuple[int, list[str]]:
 
     Also says how many branches main adopts in the list: where it adopts none, or refuses the
     list, there is no branch for the amendment to orphan."""
-    was = _skeleton(step1_as_vendored, xml)
+    was = _skeleton(step1_unlabelled, xml)
     modules = [("the amended baseline", step1)]
     if not _fully_understood(xml):
         modules.append(("the head", head))
@@ -3236,7 +3306,7 @@ def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
     quiet = _quiet_baseline()
 
     def breaches(xml: str) -> list[str]:
-        return _breaches(xml, _generate(step1_as_vendored, xml), _generate(quiet, xml))
+        return _breaches(xml, _generate(step1_unlabelled, xml), _generate(quiet, xml))
 
     gone = "(b) a send or a refusal of main's is gone"
     seeds = [
@@ -3262,7 +3332,7 @@ def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
     assert any(b.startswith(gone) for b in breaches(masked))
     # Each clause of the rule, on one handler. main refuses this send and names no destination.
     lone = next(s for s in _label_statement_shapes() if s.name.endswith("-naming-no-destination"))
-    was = _generate(step1_as_vendored, _render(lone.nodes, lone.inp))
+    was = _generate(step1_unlabelled, _render(lone.nodes, lone.inp))
     assert not _quieter(was, was)
     lines = was[0].splitlines()
     assert _REFUSAL.match(lines[-2]) and lines[-1].startswith("    return None  # TODO")
@@ -3304,9 +3374,100 @@ def test_the_bound_sees_each_mutant_of_the_ending_and_the_guard(
     string. Each mutant breaks one of them, and the bound is red on the seed written for it."""
     shape = next(s for s in _label_statement_shapes() if s.name == seed)
     xml = _render(shape.nodes, shape.inp)
-    assert not _breaches(xml, _generate(step1_as_vendored, xml), _generate(step1, xml))
-    found = _breaches(xml, _generate(step1_as_vendored, xml), _generate(_mutant(mutant), xml))
+    assert not _breaches(xml, _generate(step1_unlabelled, xml), _generate(step1, xml))
+    found = _breaches(xml, _generate(step1_unlabelled, xml), _generate(_mutant(mutant), xml))
     assert any(b.startswith(breach) for b in found), found
+
+
+# --- the baseline's fail-closed amendment (BACKLOG #2526) -----------------------------------------
+
+#: Code lines the fail-closed amendment may write where main wrote none: the dead placeholder or
+#: the handler a branch it adopts is put under, the ``pass`` an emptied block needs, the guard that
+#: re-raises a refusal ahead of a Catch, and the ``return None`` of a handler left with no live
+#: send. Each runs nothing, or makes the body beneath it conditional where main ran it always.
+_DEAD_LINE = re.compile(
+    r"(?:(?:el)?if False:|except (?:Exception|NotImplementedError):|pass$|raise$|return None\b)"
+)
+
+
+def _added_live_code(was: str, now: str) -> list[str]:
+    """Every code line of ``now``'s handler that ``was`` does not hold at the same indent or
+    shallower. A line one level deeper runs under a condition it did not have; a line that is not
+    in ``was`` at all is new code. Neither may appear, past :data:`_DEAD_LINE`."""
+    shallowest: dict[str, int] = {}
+    for line in _code_lines(was):
+        text, indent = line.strip(), len(line) - len(line.lstrip())
+        shallowest[text] = min(indent, shallowest.get(text, indent))
+    return [
+        line
+        for line in _code_lines(now)
+        if not _DEAD_LINE.match(line.strip())
+        and shallowest.get(line.strip(), -1) not in range(len(line) - len(line.lstrip()) + 1)
+    ]
+
+
+def _code_lines(src: str) -> list[str]:
+    """The handler's lines that are code: not blank, and not a comment."""
+    return [
+        line
+        for line in src.split("@handler")[-1].splitlines()[1:]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _holds_a_disabled_wrapper(xml: str) -> bool:
+    """Whether a ``<List>``/``<Actions>`` wrapper in the list carries a ``@Disabled`` that switches
+    it off. Written apart from the importer's rule: present, and not empty or a falsey word."""
+    from messagefoundry._vendor.defusedxml.ElementTree import fromstring
+
+    return any(
+        elem.tag.rsplit("}", 1)[-1].lower() in ("list", "actions")
+        and value.strip().lower() not in ("", "0", "false", "no")
+        for elem in fromstring(_package(xml)).iter()
+        for key, value in elem.attrib.items()
+        if key.rsplit("}", 1)[-1].lower() == "disabled"
+    )
+
+
+#: The fewest lists of the battery and the raw draw the fail-closed amendment changes, by whether
+#: the list holds a disabled wrapper, and the fewest the control reads the other way.
+_FAIL_CLOSED_FLOORS = {True: 500, False: 5}
+_FAIL_CLOSED_REVERSE_FLOOR = 1
+
+
+def test_the_fail_closed_amendment_adds_no_live_code() -> None:
+    """The fail-closed amendment switches live code off, and nothing else, against the file
+    exactly as vendored: it adds no code line, moves none shallower, adds no closing send, and
+    refuses no list main renders. It is quieter than main on purpose: a send main made from
+    switched-off source is gone.
+
+    One partition is exempt from the code rule: a list holding a disabled wrapper. The scan now
+    skips the statements it holds, as it skips a disabled statement, so a switched-off overwrite
+    of the input no longer makes a later send of the input a refusal (BACKLOG #2526). The unit
+    tests pin that the wrapper's own statements emit no code. The control: read the other way,
+    main adds live code to the lists the amendment changes, so the check is not blind."""
+    changed = {True: 0, False: 0}
+    reverse = 0
+    broken: list[str] = []
+    for name, xml in _STRUCTURE_SHAPES:
+        was, now = _generate(step1_as_vendored, xml), _generate(step1_unlabelled, xml)
+        if now == was:
+            continue
+        exempt = _holds_a_disabled_wrapper(xml)
+        changed[exempt] += 1
+        if bool(was[0]) != bool(now[0]):
+            broken.append(f"{name}: one of the two refuses the list")
+            continue
+        if exempt:
+            continue
+        added = _added_live_code(was[0], now[0])
+        if Counter(_trailing_sends(now[0])) - Counter(_trailing_sends(was[0])):
+            added.append("a closing return that delivers where main's does not")
+        broken.extend(f"{name}: {line}" for line in added)
+        reverse += bool(_added_live_code(now[0], was[0]))
+    assert not broken, "\n".join(broken[:20]) + f"\n... {len(broken)} in all"
+    assert all(changed[part] >= floor for part, floor in _FAIL_CLOSED_FLOORS.items()), changed
+    assert reverse >= _FAIL_CLOSED_REVERSE_FLOOR
 
 
 def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
@@ -3323,16 +3484,14 @@ def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
     raw = [xml for _, xml in _RAW_LISTS]
     marked = [xml for xml in raw if step1._LABEL_STATEMENT_WHY in _generate(step1, xml)[0]]
     assert len(raw) == _RAW and len(marked) >= _RAW // 2
-    assert (
-        sum(_adopted(h) for xml in marked for h in _skeleton(step1_as_vendored, xml) or ()) >= 500
-    )
+    assert sum(_adopted(h) for xml in marked for h in _skeleton(step1_unlabelled, xml) or ()) >= 500
     # And every seed with a wrapper between a construct and a sibling branch main adopts is one
     # the bound sees change.
     nested = [s for s in _label_statement_shapes() if "-before-a-sibling-" in s.name]
     held = [
         s
         for s in nested
-        if any(_adopted(h) for h in _skeleton(step1_as_vendored, _render(s.nodes, s.inp)) or ())
+        if any(_adopted(h) for h in _skeleton(step1_unlabelled, _render(s.nodes, s.inp)) or ())
     ]
     filled = sum(name.startswith("filled") for name in _NESTED_WRAPPERS)
     assert len(nested) == len(_SIBLING_PAIRS) * 2 * (1 + len(_NESTED_WRAPPERS))

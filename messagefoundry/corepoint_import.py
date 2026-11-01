@@ -922,14 +922,14 @@ def _clones_of(source: str, root_copies: list[tuple[str, str]]) -> set[str]:
 def _live_elements(action_list: Element) -> list[Element]:
     """Every element under ``action_list`` in document order, less each ``@Disabled`` subtree.
 
-    A ``<List>``/``<Actions>`` wrapper is walked even when it carries ``@Disabled``, because
-    :func:`_parse_list` flattens it and renders its statements live; the scan must see the same
-    statements the render emits."""
+    A ``<List>``/``<Actions>`` wrapper carrying ``@Disabled`` is skipped like any other element:
+    :func:`_parse_list` renders it commented out, and the scan must see only the statements the
+    render emits. Both ask :func:`_is_disabled` (BACKLOG #2526)."""
     live: list[Element] = []
     stack = list(reversed(list(action_list)))
     while stack:
         elem = stack.pop()
-        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:
+        if _is_disabled(elem):
             continue
         live.append(elem)
         stack.extend(reversed(list(elem)))
@@ -1530,12 +1530,13 @@ def _parse_list(
             f"export nests statements more than {_MAX_NESTING} levels deep — refusing to parse"
         )
     steps: list[Step] = []
-    # Label markers written after the last statement position. They wait here, outside ``steps``,
-    # until the next one arrives. So ``steps[-1]`` is always a statement position, and a marker
-    # never comes between a construct and a branch written after it: not from a wrapper beside
-    # the construct, not from one nested in another, not at the end of a body flattened to this
-    # level. Seen as a step, a marker would orphan the branch, and an orphan's body renders live
-    # (BACKLOG #2632). It keeps its place in source order among the steps that are not adopted.
+    # Steps that run nothing (:func:`_runs_nothing`), written after the last step that does. They
+    # wait here, outside ``steps``, until the next step that runs arrives. So ``steps[-1]`` always
+    # runs, and none of these comes between a construct and a branch written after it: not from a
+    # wrapper beside the construct, not from one nested in another, not at the end of a body
+    # flattened to this level. Seen as a step, it would orphan the branch, and an orphan's body
+    # renders live (BACKLOG #2632, #2526). It keeps its place in source order among the steps that
+    # are not adopted.
     waiting: list[Step] = []
     for child in container:
         tag = _local(child.tag).lower()
@@ -1543,11 +1544,14 @@ def _parse_list(
         if tag in _LIST_TAGS:
             # A doubly-wrapped list: flatten rather than lose the statements. A statement the rule
             # finds in the wrapper's own ``@Data`` is marked where the wrapper sits, ahead of the
-            # statements it holds (:func:`_label_marker`).
-            produced = [
-                *_label_marker(child),
-                *_parse_list(child, subject, held, in_control, depth + 1),
-            ]
+            # statements it holds (:func:`_label_marker`). A wrapper carrying ``@Disabled`` is
+            # switched off like any other element: flattening it rendered every statement it
+            # holds as live code (BACKLOG #2526).
+            inner = _parse_list(child, subject, held, in_control, depth + 1)
+            if _is_disabled(child):
+                produced = [_disabled_step(child, _local(child.tag), inner)]
+            else:
+                produced = [*_label_marker(child), *inner]
         else:
             # EVERY other child is a statement position and goes through _parse_statement — including
             # a tag this layer does not model, which comes back as an "unknown" marker plus its parsed
@@ -1560,7 +1564,7 @@ def _parse_list(
             if _adopt_branch(steps, produced):
                 continue
         for step in produced:
-            if isinstance(step, LabelMarker):
+            if _runs_nothing(step):
                 waiting.append(step)
             else:
                 steps.extend(waiting)
@@ -1573,9 +1577,9 @@ def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
     """Attach ``produced`` to the construct written before it, when ``produced`` is one branch
     marker that construct continues. Says whether it did. THE one adoption rule.
 
-    It reads ``steps[-1]`` alone. :func:`_parse_list` keeps every :class:`LabelMarker` out of
-    that position, so a marker never changes which branch is adopted: the answer is the one this
-    list gives with every marker taken out of it."""
+    It reads ``steps[-1]`` alone. :func:`_parse_list` keeps every step that runs nothing out of
+    that position, a :class:`LabelMarker` among them, so such a step never changes which branch
+    is adopted: the answer is the one this list gives with every such step taken out of it."""
     if len(produced) != 1 or not steps:
         return False
     branch, previous = produced[0], steps[-1]
@@ -1588,6 +1592,18 @@ def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
         return False
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
+
+
+def _runs_nothing(step: Step) -> bool:
+    """Whether ``step`` renders as comment lines alone, so it is no position a sibling branch is
+    adopted from (:func:`_parse_list`): a :class:`LabelMarker`, or a ``@Disabled`` element.
+
+    A ``@Disabled`` element never runs, so it must not orphan a branch the same list adopts with
+    that element taken out. A disabled ``<List>`` wrapper was flattened away, so it never stood
+    there; it is a disabled step now (BACKLOG #2526), and a disabled statement always was one."""
+    if isinstance(step, LabelMarker):
+        return True
+    return isinstance(step, Control) and step.kind == "disabled"
 
 
 def _container_steps(
@@ -1640,10 +1656,7 @@ def _parse_statement(
     body = _container_steps(elem, subject, held, in_control or kind in _NESTING_KINDS, depth)
 
     if _is_disabled(elem):
-        # Preserved in full as commented-out pseudo-source — the subtree is parsed (so it is visible and
-        # counted) but is never emitted as live code.
-        label = statement or note or tag
-        return [Control("disabled", source, label, body=tuple(body))]
+        return [_disabled_step(elem, source, body)]
 
     # A statement written anywhere but on a ``<Line>`` is marked and counted, and never emitted as
     # a write or a delivery: whether Corepoint runs it there is not known. A send in a Block's
@@ -1734,6 +1747,15 @@ def _parse_statement(
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
     return [*marker, Control(kind, source, detail, body=inner, branches=branches)]
+
+
+def _disabled_step(elem: Element, source: str, body: list[Step]) -> Control:
+    """The one node a ``@Disabled`` element becomes, a statement and a list wrapper alike.
+
+    Preserved in full as commented-out pseudo-source: the subtree is parsed, so it is visible and
+    counted, but it is never emitted as live code."""
+    label = strip_markup(_attr(elem, "Data")) or strip_markup(_attr(elem, "Comment"))
+    return Control("disabled", source, label or _local(elem.tag), body=tuple(body))
 
 
 def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:

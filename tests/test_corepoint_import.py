@@ -1569,13 +1569,18 @@ def test_a_write_to_the_sent_clone_still_maps() -> None:
 
 
 def test_a_disabled_list_wrapper_is_scanned_as_the_render_emits_it() -> None:
-    """The render flattens a ``<List>`` wrapper even under ``@Disabled``, so the scan must see its
-    statements too, or the field write maps live beside a send the scan never counted."""
-    wrapped = '<List Disabled="1">' + _role_send("other-handle", "%OUT", "OB_ACME") + "</List>"
-    body = _handler_body(
-        _handler_source(_WRITE_INPUT + wrapped + _role_send("input-handle", "%ADT", "OB_IN"))
-    )
-    assert 'set_field(msg, "MSH-6"' not in body
+    """The render comments out a ``<List>`` wrapper under ``@Disabled`` (BACKLOG #2526), so the
+    scan skips its statements too. The send it holds never runs, so the input is the one message
+    the list sends and the write to it maps. The control: the same wrapper live (an empty
+    ``@Disabled`` is absent), whose send of another handle leaves no handle to map the write
+    onto."""
+    send_out = _role_send("other-handle", "%OUT", "OB_ACME")
+    send_in = _role_send("input-handle", "%ADT", "OB_IN")
+    for wrapper, maps in (('<List Disabled="1">', True), ('<List Disabled="">', False)):
+        body = _handler_body(
+            _handler_source(_WRITE_INPUT + wrapper + send_out + "</List>" + send_in)
+        )
+        assert ('    set_field(msg, "MSH-6", "X")' in body) is maps, wrapper
 
 
 def test_a_refused_send_with_no_destination_still_raises() -> None:
@@ -1932,8 +1937,9 @@ def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
         # A ``<List>`` wrapper is flattened and its own ``@Data`` was never rendered at all.
         pytest.param(_container("Actions", _CLONE_LINE), True, id="actions-wrapper"),
         pytest.param(_container("List", _CLONE_LINE), True, id="list-wrapper"),
+        # A wrapper switched off is commented out, as a disabled Block is (BACKLOG #2526).
         pytest.param(
-            _container("List", _CLONE_LINE, disabled=True), True, id="disabled-list-wrapper"
+            _container("List", _CLONE_LINE, disabled=True), False, id="disabled-list-wrapper"
         ),
         # An element the import does not model is already marked as that. Its statement is too.
         pytest.param(_container("Switch", _CLONE_LINE), True, id="unmodelled-tag-clone"),
@@ -2863,3 +2869,77 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     assert "\nos.system(" not in src
     assert 'set_field(msg, "MSH-6", "A\\nimport os")' in src  # escaped, inert literal
     ast.parse(src)  # still one well-formed module — no literal or comment breakout
+
+
+# --- a <List>/<Actions> wrapper carrying @Disabled (BACKLOG #2526) --------------------------------
+#
+# A disabled wrapper used to be flattened into its parent's steps with no ``@Disabled`` check, so
+# the statements an operator switched off came back as live code, and the handle scan walked them
+# so that it agreed with that render. A wrapper is now judged by the rule every other element is,
+# in the render and in the scan alike. All fixtures are synthetic.
+
+_SWITCHED_OFF = '<Line Data="ItemClear %ADT/PID-19"/>' + _role_send(
+    "other-handle", "%OUT", "OB_OFF"
+)
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        pytest.param('<List Disabled="1">{x}</List>', id="list"),
+        pytest.param('<Actions Disabled="true">{x}</Actions>', id="actions"),
+        pytest.param('<List><List Disabled="1">{x}</List></List>', id="inside-a-live-wrapper"),
+        pytest.param('<List Disabled="1"><List>{x}</List></List>', id="around-a-live-wrapper"),
+    ],
+)
+def test_a_disabled_list_wrapper_renders_its_statements_commented_out(wrapped: str) -> None:
+    """The row's closing test. The wrapper's statements render as commented-out pseudo-source and
+    count as one disabled element. The scan agrees: the send the render no longer emits is not a
+    delivery, so the input is the one message the list sends and the write before it maps."""
+    body = _WRITE_INPUT + wrapped.replace("{x}", _SWITCHED_OFF) + _SEND_INPUT
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert "    # DISABLED in Corepoint (@Disabled)" in handler
+    # Preserved for review, as comments, and nowhere as code.
+    assert [line for line in handler.splitlines() if "PID-19" in line and "#" in line]
+    assert "OB_OFF" in handler
+    assert not [line for line in _code(handler) if "PID-19" in line or "OB_OFF" in line]
+    assert "raise NotImplementedError" not in handler
+    assert 'outbound("OB_OFF"' not in src  # a switched-off send declares no outbound
+    assert _message_handles(_hardened_fromstring(_package(body))[0]) == (
+        frozenset({"%ADT"}),
+        frozenset({"%ADT"}),
+    )
+    assert '    set_field(msg, "MSH-6", "X")' in handler
+    assert '    sends.append(Send("OB_IN", msg))' in handler
+    assert _count_steps(_handler_steps(body), in_loop=False) == (2, [], 1)
+    ast.parse(src)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "2", "", "0", "false", "No"])
+def test_a_wrapper_and_a_statement_are_judged_disabled_by_one_rule(value: str) -> None:
+    """``Disabled=""`` and the falsey spellings leave a statement live, and every other value
+    switches it off. A wrapper carrying the same value goes the same way."""
+    live = '    set_field(msg, "PID-19", "")'
+    line = _handler_body(
+        _handler_source(f'<Line Disabled="{value}" Data="ItemClear %ADT/PID-19"/>')
+    )
+    wrapper = _handler_body(
+        _handler_source(f'<List Disabled="{value}"><Line Data="ItemClear %ADT/PID-19"/></List>')
+    )
+    assert (live in wrapper) is (live in line)
+    assert ("DISABLED in Corepoint" in wrapper) is ("DISABLED in Corepoint" in line)
+    assert (live in line) is (value.lower() in ("", "0", "false", "no"))
+
+
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(pair: str) -> None:
+    """Flattened, an empty disabled wrapper left nothing between a construct and a sibling branch.
+    As one disabled step it must not orphan the branch either, and the branch's send stays under
+    its dead condition. The control is the same wrapper live, holding nothing."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    for wrapper in ('<List Disabled="1"><Line Data="MsgLog %ADT"/></List>', "<List/>"):
+        src = _handler_body(_handler_source(construct + wrapper + _sibling_arm(branch)))
+        assert _ORPHAN not in src, wrapper
+        assert '        sends.append(Send("OB_FLAT", msg))' in src, wrapper
+        assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
