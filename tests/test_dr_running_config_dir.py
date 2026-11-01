@@ -859,6 +859,23 @@ async def test_a_digest_that_left_a_file_out_matches_only_like_for_like(box: _Bo
     assert row["disk_config_left_out"] == ["environments/x.toml"]
 
 
+async def test_a_partial_running_digest_says_so_when_the_dir_cannot_be_read(box: _Box) -> None:
+    """The early returns: a verdict of ``unreadable`` still must not read as a whole digest."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    loaded = engine.loaded_config_fingerprint
+    assert loaded is not None
+    engine.loaded_config_fingerprint = {**loaded, fp.UNREADABLE_FILES_KEY: ["environments/x.toml"]}
+    shutil.rmtree(box.staging)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+
+    row = await _activate_row(engine)
+    assert row["disk_config"] == "unreadable"
+    assert row["disk_config_left_out"] == ["environments/x.toml"]
+
+
 async def test_a_whole_match_records_nothing_left_out(box: _Box) -> None:
     engine = box.engine
     await engine.reload_detail(box.staging)

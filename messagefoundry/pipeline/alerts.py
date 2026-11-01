@@ -100,8 +100,10 @@ def config_changed_detail(
     """The one-line description of a ``config_changed`` alert both sinks show (vault BACKLOG #2597).
 
     It must hold for a config that changed on purpose and for one node that diverged from the rest,
-    so it states the two digests and where the older one came from and judges neither. Digests are
-    cut to 12 hex characters here; the event carries them whole. No path and no git commit.
+    so it states the two digests and where the older one came from and judges neither. It says
+    ``found``, not ``started on``: ``fingerprint`` can be the directory's after an edit this
+    process did not run. Digests are cut to 12 hex characters here; the event carries them whole.
+    No path and no git commit.
 
     The alert instance's reason column keeps only about the first 200 characters, and its cut drops
     a token that straddles the limit whole. So a marker (any ``comparison`` but ``compared``) leads,
@@ -113,7 +115,7 @@ def config_changed_detail(
     lead = "" if comparison == "compared" else f"{comparison}: "
     node = _short_node(baseline_node, _DETAIL_NODE_MAX - len(lead)) if baseline_node else "unknown"
     return (
-        f"{lead}baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): started on "
+        f"{lead}baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): found "
         f"config {fingerprint[:12]}, baseline config {previous_fingerprint[:12]}"
     )
 

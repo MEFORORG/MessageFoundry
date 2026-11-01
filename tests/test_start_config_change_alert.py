@@ -1118,7 +1118,7 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
     assert event["comparison"] == "partial_start_digest"
     assert event["detail"] == (
         "partial_start_digest: baseline 2026-10-04T00:00:00+00:00 on node host:2:y (config_reload): "
-        "started on config aaaaaaaaaaaa, baseline config bbbbbbbbbbbb"
+        "found config aaaaaaaaaaaa, baseline config bbbbbbbbbbbb"
     )
     assert (event["fingerprint"], event["previous_fingerprint"]) == ("a" * 64, "b" * 64)
     assert set(event) <= {
@@ -1737,6 +1737,7 @@ async def test_an_edit_after_the_load_pages_and_is_not_recorded_as_loaded(
     after = config_fingerprint(cfg)
     assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts] == [(after, before)]
     assert rows[-1]["fingerprint"] == before, "the row names the bytes that ran"
+    assert rows[-1]["judged_fingerprint"] == after, "and the digest the page named"
     assert loaded is not None and loaded["fingerprint"] == before
     rows = await _start(tmp_path, cfg)
     assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts][1:] == [(after, before)]
@@ -1775,10 +1776,12 @@ async def test_a_file_locked_after_the_load_leaves_a_whole_fingerprint(
 class _OneRowStore:
     """The store a comparison reads: one baseline row."""
 
-    def __init__(self, detail: dict[str, object]) -> None:
+    def __init__(self, detail: dict[str, object] | None) -> None:
         self._detail = detail
 
     async def recent_audit_of(self, _actions: Any, *, limit: int) -> list[dict[str, Any]]:
+        if self._detail is None:
+            return []
         return [
             {
                 "action": "config_loaded",
@@ -1837,3 +1840,28 @@ async def test_no_digest_pair_pages_less_than_the_directory_alone(
         assert disk is not None and loaded is not None
         assert disk.get(UNREADABLE_FILES_KEY) == loaded.get(UNREADABLE_FILES_KEY)
         assert disk["fingerprint"] != loaded["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    ("baseline", "expected"),
+    [
+        (None, "no_baseline"),
+        ({"node": "n"}, "degraded_baseline"),
+        ({"fingerprint": "a" * 64, "scheme": "mefor-cfg-fp:v0"}, "scheme_mismatch"),
+    ],
+    ids=["no-baseline", "degraded", "other-scheme"],
+)
+async def test_a_start_with_no_digest_of_its_bytes_stays_unchecked_with_no_comparison(
+    baseline: dict[str, object] | None, expected: str
+) -> None:
+    """Whatever stopped the comparison, a start with no digest of its bytes writes a digest-less
+    row, and an unmarked one would read as a degraded baseline at the next start."""
+    engine = cast(Engine, SimpleNamespace(store=_OneRowStore(baseline)))
+    outcome, comparison = await app_module._compare_start_config(engine, None, on_disk=_digest("a"))
+    assert (outcome, comparison) == ("no_start_digest", None)
+    assert outcome in app_module._UNCHECKED_OUTCOMES
+    # Positive control: with the digest it is the outcome the name says.
+    outcome, comparison = await app_module._compare_start_config(
+        engine, _digest("a"), on_disk=_digest("a")
+    )
+    assert (outcome, comparison) == (expected, None)

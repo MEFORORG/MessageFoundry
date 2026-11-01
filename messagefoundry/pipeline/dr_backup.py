@@ -1277,11 +1277,12 @@ class BackupRunner:
         goes on, because the store snapshot is worth keeping; a config-only pass fails, in
         :meth:`_do_backup`. The digest itself catches what
         :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
-        a load tolerates cannot fail a backup. What it left out as unreadable is recorded beside it
-        and logged at WARNING, so the record does not read as the digest of the whole bundle (vault
-        BACKLOG #3765). Each warning names the directory and an error class, a scrubbed reason or a
-        relative file name, never config content. With ``include_config`` off nothing is bundled,
-        so a fault is not one the operator needs to hear about, and none is recorded."""
+        a load tolerates cannot fail a backup. What it left out as unreadable is recorded beside it,
+        so the record does not read as the digest of the whole bundle (vault BACKLOG #3765), and
+        logged at WARNING when the bundle is being archived. Each warning names the directory and an
+        error class, a scrubbed reason or a relative file name, never config content. With
+        ``include_config`` off nothing is bundled, so a listing fault is not one the operator needs
+        to hear about, and none is recorded; the digest is still taken, so its left-out list is."""
         if config_dir is None:
             return _ConfigBundle(path=None, bundled=False, fingerprint=None, error=None)
         from messagefoundry.config.fingerprint import describe_left_out, snapshot_fingerprint
@@ -1313,7 +1314,7 @@ class BackupRunner:
             log.warning(
                 "DR backup: config fingerprint failed for %s: %s", config_dir, safe_exc(exc)
             )
-        if left_out:
+        if left_out and include:
             log.warning(
                 "DR backup: the config fingerprint of %s left out what it could not read: %s",
                 config_dir,

@@ -2926,7 +2926,7 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
 
 # The markers below are information only (vault BACKLOG #3765, items 15 to 17, the Lander's
 # send-back of engine PR 2370): a start pages whenever the directory after its load differs from the
-# baseline, the page main raised, and whenever the bytes it loaded do. A partial digest, a partial
+# baseline, and whenever the bytes it loaded do. A partial digest, a partial
 # baseline or a directory that moved during the load names the page's outcome; it never turns a page
 # into a WARNING or adopts an unjudged baseline. The cost is accepted: a file an antivirus lock holds
 # at one start and not at the next pages on the same bytes, as it did on main.
@@ -2966,12 +2966,12 @@ async def _compare_start_config(
 
     ``snapshot`` is the digest of the bytes the load ran, and ``on_disk`` the digest of the
     directory just after the load, the start's one digest read (vault BACKLOG #2944, #3765). The
-    start judges both: ``on_disk`` first, the digest main compared, then ``snapshot``. A comparison
-    carries the first that differs from the baseline, so a page fires when either differs, and
-    names what main's named wherever main's fired. A start that loaded edited bytes and saw them
-    reverted before ``on_disk`` pages too, on the bytes it ran. A digest that could not be taken is
-    not judged. A ``snapshot`` with no digest is ``no_start_digest`` whatever ``on_disk`` says,
-    with a comparison when ``on_disk`` has a digest, so it still pages and its row is no baseline.
+    start judges both: ``on_disk`` first, then ``snapshot``. A comparison carries the first that
+    differs from the baseline, so a page fires when either differs, and names the directory
+    wherever the directory differs. A start that loaded edited bytes and saw them reverted before
+    ``on_disk`` pages too, on the bytes it ran. A digest that could not be taken is not judged. A
+    ``snapshot`` with no digest is ``no_start_digest`` whatever ``on_disk`` says, with a comparison
+    when one can be made, so it still pages, and its row is no baseline either way.
 
     The outcome is ``changed_during_load`` when the two digests cover the same files and differ, so
     bytes moved after the load read them. The row still names ``snapshot``, the bytes this process
@@ -3016,6 +3016,12 @@ async def _compare_start_config(
             "so the bytes on disk are not the bytes this process runs; both are compared"
         )
     scheme = ((snapshot if loaded is not None else on_disk) or {}).get("scheme")
+
+    def unjudged(outcome: _StartOutcome) -> _StartOutcome:
+        """``outcome``, for a start that made no comparison: one with no digest of the bytes it
+        loaded stays unchecked whatever stopped the comparison."""
+        return "no_start_digest" if loaded is None else outcome
+
     try:
         rows = await _bounded(
             engine.store.recent_audit_of(_CONFIG_BASELINE_ACTIONS, limit=_CONFIG_BASELINE_WINDOW),
@@ -3043,14 +3049,14 @@ async def _compare_start_config(
                 )
             else:
                 _log.info("config change check: no earlier config row; this start is the baseline")
-            return "no_baseline", None
+            return unjudged("no_baseline"), None
         baseline = digest_coverage(detail)
         if baseline is None:
             _log.info(
                 "config change check skipped: the store's newest usable %s row has no fingerprint",
                 row.get("action"),
             )
-            return "degraded_baseline", None
+            return unjudged("degraded_baseline"), None
         if scheme is None or detail.get("scheme") != scheme:
             _log.info(
                 "config change check skipped: the store's newest usable %s row used fingerprint "
@@ -3059,11 +3065,9 @@ async def _compare_start_config(
                 detail.get("scheme"),
                 scheme,
             )
-            return "scheme_mismatch", None
-        outcome: _StartOutcome = (
-            "no_start_digest"
-            if loaded is None
-            else "changed_during_load"
+            return unjudged("scheme_mismatch"), None
+        outcome: _StartOutcome = unjudged(
+            "changed_during_load"
             if moved
             else "partial_start_digest"
             if left_out
@@ -3136,8 +3140,9 @@ async def _record_start_audit(
     could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is.
 
     ``outcome`` and ``comparison`` are :func:`_compare_start_config`'s result. The row records
-    the outcome as ``comparison``, and ``previous_fingerprint`` and ``changed``, both ``None`` when
-    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`.
+    the outcome as ``comparison``, and ``previous_fingerprint``, ``judged_fingerprint`` and
+    ``changed``, each ``None`` when no comparison was made. The caller raises the alert, through
+    :func:`_raise_config_changed`.
 
     ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
     #2838). The row names that, so the digest it records is the one the comparison used. When the
@@ -3209,6 +3214,9 @@ async def _record_start_audit(
             **({"superseded": True} if superseded else {}),
             **({_BASELINE_UNCHECKED: True} if untrusted or outcome in _UNCHECKED_OUTCOMES else {}),
             "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
+            # The digest a page names, which is the directory's where that differs: the row's own
+            # ``fingerprint`` is the bytes this process runs (vault BACKLOG #3765).
+            "judged_fingerprint": comparison.fingerprint if comparison else None,
             "changed": comparison.changed if comparison else None,
         },
     )
@@ -9341,7 +9349,7 @@ def create_app(
             git_head=git_head if isinstance(git_head, str) else None,
             files=files if isinstance(files, int) else None,
             drift=drift,
-            unreadable_files=left_out_of(running, on_disk),
+            left_out_files=len(left_out_of(running, on_disk)),
             reload_refused=reload_refused,
         )
 
@@ -11925,8 +11933,8 @@ def create_managed_app(
                 # leaves the baseline empty and the start goes on.
                 start_fingerprint_failure = await engine.capture_start_provenance()
                 # The start's one digest read: the directory as it is now, set against those bytes
-                # below, so an edit after the load read a file still pages at this start, as main
-                # paged on this digest (vault BACKLOG #3765, items 18 and 21).
+                # below, so an edit after the load read a file still pages at this start (vault
+                # BACKLOG #3765, items 18 and 21).
                 # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
                 # and the bytes the load read are compared alone.
                 on_disk: Mapping[str, object] | None = None

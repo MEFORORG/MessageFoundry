@@ -43,12 +43,9 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
     else:
         # The page says this caller cannot reload, so the badge does not tell them to.
         note = " — the config on disk differs from the running graph"
-    if prov.unreadable_files:
+    if prov.left_out_files:
         # A clean badge must not read as covering a file neither digest saw (vault BACKLOG #3765).
-        left_out = ", ".join(
-            "the config directory" if r == "." else r for r in prov.unreadable_files
-        )
-        note += f". Not compared, because it could not be read: {left_out}"
+        note += f". {prov.left_out_files} could not be read, so they were not compared"
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
 
 

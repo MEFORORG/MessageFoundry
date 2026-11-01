@@ -6,6 +6,7 @@
   when either differs from the baseline, and on a change after the load the next start raises it
   again. `GET /config/provenance`, a DR activation's `disk_config` verdict and a backup's
   `config_fingerprint` now treat two fingerprints as equal only over the same files, and name what
-  was left out, in `unreadable_files`, `disk_config_left_out` and `config_unreadable_files`. The
+  was left out: `left_out_files` counts it, and `disk_config_left_out` and
+  `config_unreadable_files` list it. The
   alert's reason now leads with its marker, such as `changed_during_load`, and the logging sink
   carries the baseline node whole. See [CONFIGURATION.md](../docs/CONFIGURATION.md).

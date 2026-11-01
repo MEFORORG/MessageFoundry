@@ -10873,6 +10873,9 @@ def _backup(args: argparse.Namespace) -> int:
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
+        if result.config_unreadable_files:
+            left_out = ", ".join(result.config_unreadable_files)
+            print(f"WARNING: the config fingerprint left out {left_out}", file=sys.stderr)
     return 0
 
 

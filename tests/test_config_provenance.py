@@ -72,7 +72,7 @@ async def test_provenance_before_any_load(client: httpx.AsyncClient) -> None:
         "git_head": None,
         "files": None,
         "drift": False,
-        "unreadable_files": [],
+        "left_out_files": 0,
         # The open-mode caller holds every channel, so its reload is not refused (BACKLOG #3189).
         "reload_refused": None,
     }
@@ -163,12 +163,13 @@ async def test_provenance_reads_a_change_in_what_a_digest_left_out_as_drift(
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
     body = (await client.get("/config/provenance")).json()
-    assert body["drift"] is False and body["unreadable_files"] == [], "control: a whole digest"
+    assert body["drift"] is False and body["left_out_files"] == 0, "control: a whole digest"
     engine.loaded_config_fingerprint = {**loaded, UNREADABLE_FILES_KEY: ["environments/x.toml"]}
     body = (await client.get("/config/provenance")).json()
     assert body["fingerprint"] == loaded["fingerprint"] == config_fingerprint(cfg)
     assert body["drift"] is True
-    assert body["unreadable_files"] == ["environments/x.toml"]
+    assert body["left_out_files"] == 1
+    assert "x.toml" not in str(body), "a count: this route answers a channel-scoped caller"
 
 
 async def test_provenance_names_a_file_the_on_disk_digest_left_out(
@@ -182,7 +183,7 @@ async def test_provenance_names_a_file_the_on_disk_digest_left_out(
     _unreadable(monkeypatch, "dev.toml")
     body = (await client.get("/config/provenance")).json()
     assert body["drift"] is True
-    assert body["unreadable_files"] == ["environments/dev.toml"]
+    assert body["left_out_files"] == 1
 
 
 async def test_provenance_requires_auth(engine: Engine) -> None:

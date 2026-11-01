@@ -1324,6 +1324,7 @@ class Engine:
         content."""
         from messagefoundry.config.fingerprint import (
             DigestCoverage,
+            describe_left_out,
             digest_coverage,
             left_out_of,
             same_digest,
@@ -1332,6 +1333,8 @@ class Engine:
         running = digest_coverage(self.loaded_config_fingerprint)
         activated = running.fold if running is not None else None
         fields: dict[str, object] = {"config_fingerprint": activated}
+        if running is not None and running.left_out:
+            fields["disk_config_left_out"] = left_out_of(running)
         directory = self.running_config_dir
         if directory is None:
             return fields
@@ -1374,11 +1377,12 @@ class Engine:
         fields["disk_config_fingerprint"] = disk.fold
         log.warning(
             "DR activation applied the running graph (config fingerprint %s), and did not apply the "
-            "config dir %s, which now differs on disk (fingerprint %s). POST /config/reload applies "
-            "it, under that route's approval gate.",
+            "config dir %s, which now differs on disk (fingerprint %s, left out: %s). POST "
+            "/config/reload applies it, under that route's approval gate.",
             activated,
             directory,
             disk.fold,
+            scrub_log_argument(describe_left_out(left_out)) or "nothing",
         )
         return fields
 

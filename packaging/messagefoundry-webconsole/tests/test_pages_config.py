@@ -37,12 +37,12 @@ def test_config_page_badge_names_what_it_did_not_compare() -> None:
             loaded=True,
             fingerprint="a" * 64,
             drift=False,
-            unreadable_files=["environments/dev.toml"],
+            left_out_files=2,
             reload_refused=None,
         )
     )
     assert ">clean<" in html
-    assert "could not be read: environments/dev.toml" in html
+    assert "2 could not be read, so they were not compared" in html
 
 
 def test_config_page_badge_drifted() -> None:
