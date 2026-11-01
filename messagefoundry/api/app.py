@@ -15,9 +15,10 @@ be driven two ways:
 Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and no setting
 turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
 bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
-protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
-requests run as the full-access system identity (SYS-1). Both factories refuse that opt-in beside
-an auth service or auth settings. Only embedders and tests pass it; ``serve`` never does.
+protected route is refused unless the caller passes ``allow_no_auth=True``, in which case the
+bearer-token gates admit a caller as the full-access system identity (SYS-1). Both factories refuse
+that opt-in beside an auth service or auth settings. Only embedders and tests pass it; ``serve``
+never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -11568,9 +11569,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
-    and a build with neither logs one WARNING. Beside ``auth_settings`` that opt-in raises
-    ``ValueError``.
+    unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes, and
+    the build logs one WARNING naming which of the two it got. Beside ``auth_settings`` that opt-in
+    raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -12544,15 +12545,24 @@ def create_managed_app(
         phi_read_hop_secure=phi_read_hop_secure,
         configured_log_level=configured_log_level,
     )
-    if auth_settings is None and not allow_no_auth:
-        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app fails closed.
-        # Said here, once create_app has accepted the build, and not in create_app, which every
-        # managed app calls with auth=None before the lifespan attaches a service.
-        _log.warning(
-            "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
-            "service attaches and the permission-gated routes are refused (%s). auth_settings "
-            "attaches sign-in; allow_no_auth=True instead answers those routes to any caller as the "
-            "full-access system identity",
-            AUTH_NOT_CONFIGURED,
-        )
+    if auth_settings is None:
+        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app is in one
+        # of two modes. Said here, once create_app has accepted the build, and not in create_app,
+        # which every managed app calls with auth=None before the lifespan attaches a service.
+        # auth_settings stays an argument because app.state.auth is None at build on every managed
+        # app. The mode comes from app.state, the flag the gates read, not from this argument.
+        if open_mode(app.state):
+            _log.warning(
+                "create_managed_app: built with allow_no_auth=True and no auth_settings, so no "
+                "service attaches and the API's bearer-token gates admit any caller as the "
+                "full-access system identity, with no sign-in"
+            )
+        else:
+            _log.warning(
+                "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
+                "service attaches and the API's bearer-token gates refuse every caller (%s). "
+                "auth_settings attaches sign-in; allow_no_auth=True instead admits any caller as "
+                "the full-access system identity",
+                AUTH_NOT_CONFIGURED,
+            )
     return app

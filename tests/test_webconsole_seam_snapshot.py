@@ -26,6 +26,8 @@ from typing import Any
 
 import pytest
 
+from tests.test_shipped_line_endings_pinned import _check_attr
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "webconsole_seam_snapshot.py"
 _GOLDEN = _REPO_ROOT / "tests" / "golden" / "webconsole_seam.snapshot"
@@ -107,6 +109,12 @@ def test_webconsole_seam_snapshot_matches_golden() -> None:
             )
         )
         raise AssertionError(f"{_FAILURE_HINT}\n\n{diff}")
+
+
+def test_the_golden_is_pinned_to_lf() -> None:
+    """Vault BACKLOG #3746 item 25. Not a shipped path, so it has its own line in `.gitattributes`."""
+    golden = _GOLDEN.relative_to(_REPO_ROOT).as_posix()
+    assert _check_attr([golden])[golden] == {"text": "auto", "eol": "lf"}
 
 
 def test_console_supports_exactly_the_engine_seam() -> None:

@@ -146,7 +146,7 @@ with its gate, in [Route → permission map](#route--permission-map-engine-api) 
 implicit.
 
 Both app factories are **fail-closed**. With no `AuthService` attached, `create_app(engine)`
-and `create_managed_app(...)` deny every protected route (503) unless the caller explicitly opts out
+and `create_managed_app(...)` deny every protected route unless the caller explicitly opts out
 with `allow_no_auth=True`, the escape hatch for embedders and tests. Neither factory reaches
 that mode by omission, both refuse the opt-in beside an auth service or auth settings, and `serve`
 never passes it. `serve` always requires sign-in, on every bind, loopback included (vault BACKLOG
@@ -6969,7 +6969,7 @@ these sit outside the list:
   to compare with, so a changed one is never listed, and it can still need a restart or a rebuild
   of the connections that use it;
 - another engine shard. A reload is per process with no fleet coordination (ADR 0073), so an engine
-  shard reports only once a reload reaches its own API;
+  shard reports at least when a reload or a DR activation reaches its own API;
 - another cluster node, converging on the reload. It has no response to carry a list, and the
   `auth.trust_anchor` row names no node, so it says so only in its own log, and only once its
   convergence reload reaches this check.

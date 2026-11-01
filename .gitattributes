@@ -145,3 +145,9 @@ messagefoundry/auth/data/common_passwords.NOTICE text=auto eol=lf
 # scrape to them BYTE FOR BYTE, so a CRLF checkout would fail that test with no defect anywhere.
 # They hold pure LF; `eol=lf` keeps a regenerated copy that way too.
 tests/golden/*.prom text=auto eol=lf
+
+# The web console seam golden (vault BACKLOG #3746 item 25). `scripts/webconsole_seam_snapshot.py
+# --write` writes it LF and the blob holds LF, so this pin is an empty content diff: it stops
+# `core.autocrlf=true` from checking out CRLF. tests/test_webconsole_seam_snapshot.py reads it with
+# newline translation, so that test passes either way.
+tests/golden/webconsole_seam.snapshot text=auto eol=lf

@@ -12,12 +12,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient, WebSocketDenialResponse
 
+import messagefoundry.api.app as api_app
 from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.api.security import AUTH_NOT_CONFIGURED
 from messagefoundry.auth import Role
@@ -88,7 +90,9 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
     )
     # The refusal is the handshake's HTTP answer, sent before accept (refuse_websocket), so the test
     # client raises the denial itself; a bare WebSocketDisconnect would also pass a socket that
-    # accepted and then dropped (vault BACKLOG #2731 item 6).
+    # accepted and then dropped (vault BACKLOG #2731 item 6). The test client always offers the denial
+    # extension, so the 1008 close arm is test_without_the_extension_every_refusal_is_still_a_bare_close
+    # in tests/test_ws_handshake_header_floor.py, on the same route.
     with (
         TestClient(refused) as tc,
         pytest.raises(WebSocketDenialResponse) as denied,
@@ -112,34 +116,46 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
 _FACTORY_LOGGER = create_managed_app.__module__
 
 
-def _factory_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    """Every WARNING the factory's logger wrote, so a second line worded differently counts too."""
-    return [r for r in caplog.records if r.name == _FACTORY_LOGGER and r.levelno >= logging.WARNING]
+def _assert_build_lines(caplog: pytest.LogCaptureFixture, *wordings: str) -> None:
+    """Every WARNING the factory's logger wrote, so a second line worded differently counts too:
+    exactly one line per wording, each holding it."""
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _FACTORY_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert len(lines) == len(wordings), lines
+    assert all(wording in line for line, wording in zip(lines, wordings, strict=True)), lines
+
+
+#: Each build line's own words: neither line holds the other's.
+_DENIED_LINE = AUTH_NOT_CONFIGURED
+_OPEN_LINE = "with no sign-in"
 
 
 @pytest.mark.parametrize(
     ("auth_settings", "allow_no_auth", "expected"),
     [
-        pytest.param(None, False, 1, id="nothing-passed"),
-        pytest.param(None, True, 0, id="opted-in"),
+        pytest.param(None, False, (_DENIED_LINE,), id="nothing-passed"),
+        pytest.param(None, True, (_OPEN_LINE,), id="opted-in"),
         pytest.param(
             AuthSettings(require_mfa=False, notify_security_events=False),
             False,
-            0,
+            (),
             id="auth-settings",
         ),
     ],
 )
-def test_a_deny_all_build_says_so_once(
+def test_a_build_with_no_auth_settings_names_its_mode_once(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     auth_settings: AuthSettings | None,
     allow_no_auth: bool,
-    expected: int,
+    expected: tuple[str, ...],
 ) -> None:
-    """Vault BACKLOG #2731 item 1: the deny-all default fails closed, and the build logs one WARNING
-    naming it. The opt-in and enabled settings are the controls: neither denies everything, and
-    neither warns. The factory is called and not started, so the line is the build's own."""
+    """Vault BACKLOG #2731 item 1 and #3746 item 17: a build with no settings logs one WARNING
+    naming the mode it got, the deny-all default or the open mode. Enabled settings are the control:
+    they need no warning. The factory is called and not started, so the line is the build's own."""
     caplog.set_level(logging.WARNING, logger=_FACTORY_LOGGER)
     create_managed_app(
         db_path=tmp_path / "warn.db",
@@ -148,9 +164,42 @@ def test_a_deny_all_build_says_so_once(
         allow_no_auth=allow_no_auth,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    warnings = _factory_warnings(caplog)
-    assert len(warnings) == expected
-    assert all(AUTH_NOT_CONFIGURED in r.getMessage() for r in warnings)
+    _assert_build_lines(caplog, *expected)
+
+
+@pytest.mark.parametrize(
+    ("state", "wording"),
+    [
+        pytest.param(True, _OPEN_LINE, id="state-opens"),
+        pytest.param(False, _DENIED_LINE, id="state-closes"),
+    ],
+)
+def test_the_build_line_reads_the_state_the_gates_read(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    state: bool,
+    wording: str,
+) -> None:
+    """Vault BACKLOG #3746 item 18: the line reads ``open_mode``, as the gates do, and not the
+    build argument. ``create_app`` writes the flag from that argument, so the two agree in a real
+    build; the stand-in makes them part, or a test could not tell which one the line read."""
+    real_create_app = api_app.create_app
+
+    def create_app_setting_the_other_flag(*args: Any, **kwargs: Any) -> FastAPI:
+        app = real_create_app(*args, **kwargs)
+        app.state.allow_no_auth = state
+        return app
+
+    monkeypatch.setattr(api_app, "create_app", create_app_setting_the_other_flag)
+    caplog.set_level(logging.WARNING, logger=_FACTORY_LOGGER)
+    create_managed_app(
+        db_path=tmp_path / "state.db",
+        poll_interval=0.05,
+        allow_no_auth=not state,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    _assert_build_lines(caplog, wording)
 
 
 async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signed_in_one(
