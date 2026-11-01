@@ -391,6 +391,27 @@ def test_a_bool_cast_chain_hears_the_chain_refusal_not_the_boolean_one(
     assert "not a boolean" not in str(excinfo.value), str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(
+            lambda: {"default": messagefoundry.env("inner")},
+            id="reference-in-the-default",
+        ),
+        pytest.param(lambda: {"default": "maybe", "cast": bool}, id="unreadable-bool-default"),
+    ],
+)
+def test_a_directly_built_reference_names_a_table_key_by_type(
+    fields: Callable[[], dict[str, Any]],
+) -> None:
+    """``env()`` lowers its key and ``parse_env_setting`` checks it, so only a direct ``EnvRef`` can
+    hold a table there. A refusal that printed the key would carry the default it withholds."""
+    with pytest.raises(WiringError) as excinfo:
+        EnvRef(key={"env": "inner", "default": SENTINEL}, **fields())  # type: ignore[arg-type]
+    assert "env reference <dict> " in str(excinfo.value), str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
 def test_a_self_referential_default_is_refused_at_the_first_link() -> None:
     """A raw marker whose default list holds the sentinel and the marker itself. The refusal stops at
     the first link, so nothing walks the cycle, and the message withholds what the cycle holds."""

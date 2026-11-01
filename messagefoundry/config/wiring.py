@@ -251,6 +251,8 @@ class EnvRef:
     cast: Callable[[Any], Any] | None = None
 
     def __post_init__(self) -> None:
+        # By type where it is not text: built directly, a table here can carry a default=.
+        name = repr(self.key) if isinstance(self.key, str) else f"<{type(self.key).__name__}>"
         # vault BACKLOG #2519: resolve_env_settings resolves one link and hands a default over
         # unchanged, so a reference inside a default is never resolved, even with its key set, and
         # the connector would get it with its own default= inside. Refused here because at least
@@ -260,7 +262,7 @@ class EnvRef:
         # _reject_envref_in_lists reads one level further.
         if _contains_envref(self.default):
             raise WiringError(
-                f"env reference {self.key!r} has an env() reference inside its default= (value "
+                f"env reference {name} has an env() reference inside its default= (value "
                 "withheld) - only one link is resolved, so that inner reference would reach the "
                 "connector unresolved, with any default= of its own. Give the outer env() a static "
                 "default. A table with an env key and no other key but default or cast counts as a "
@@ -283,7 +285,7 @@ class EnvRef:
             object.__setattr__(
                 self,
                 "default",
-                _strict_bool_default(self.default, f"env reference {self.key!r} with a bool cast"),
+                _strict_bool_default(self.default, f"env reference {name} with a bool cast"),
             )
 
     def __repr__(self) -> str:
