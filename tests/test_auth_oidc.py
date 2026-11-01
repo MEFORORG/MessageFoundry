@@ -339,7 +339,8 @@ def test_a_non_ascii_upn_suffix_is_compared_as_written(
     Mutation: the settings property calls ``d.strip().lower()`` in place of ``upn_suffix_key``.
     Red: the capital non-ASCII True row, and the False rows whose entry is the Kelvin sign or mixed
     case.
-    Mutation: ``upn_suffix_key`` calls a plain ``strip()``. Red: the two white space False rows."""
+    Mutation: ``upn_suffix_key`` calls a plain ``strip()``. Red: the two white space False rows.
+    Mutation: the settings property passes an entry unstripped. Red: the last row."""
     allowed = AuthSettings(oidc_allowed_username_domains=[entry]).effective_oidc_username_domains
     jws = _mint(rsa_key, "k1", _good_claims(preferred_username=f"jdoe@{suffix}"))
     policy = _policy(allowed_username_domains=frozenset(allowed))
@@ -365,7 +366,8 @@ def test_a_blank_ad_domain_is_no_suffix_source(blank: str) -> None:
 
 def test_the_ad_domain_fallback_keeps_a_non_ascii_suffix_as_written() -> None:
     """The allow-list's other source goes through the same compare form, or a suffix written with
-    a capital non-ASCII letter would match neither its own spelling nor any other.
+    a capital non-ASCII letter would stop matching its own spelling and match only its lower-cased
+    one, which the operator did not write.
 
     Mutation: put ``.lower()`` back on the ``ad_domain`` arm. Red: this test."""
     written = "M\u00dcLLER.example"

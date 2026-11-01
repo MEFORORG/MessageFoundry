@@ -1194,6 +1194,19 @@ def test_auth_oidc_disabled_is_default(tmp_path: Path) -> None:
             _OIDC_ENV,
             "oidc_allowed_username_domains",
         ),
+        # a blank ad_domain is no such source either: its key was the empty suffix, which passed
+        # this refusal (BACKLOG #3765). Mutation: test only `self.ad_domain` in the property.
+        # Red: both rows, DID NOT RAISE.
+        (
+            _OIDC_AD.replace('ad_domain = "example.com"', 'ad_domain = "   "') + _OIDC_BLOCK,
+            _OIDC_ENV,
+            "oidc_allowed_username_domains",
+        ),
+        (
+            _OIDC_AD.replace('ad_domain = "example.com"', 'ad_domain = "\\u00a0"') + _OIDC_BLOCK,
+            _OIDC_ENV,
+            "oidc_allowed_username_domains",
+        ),
         # an MFA gate that can never fire
         (
             _OIDC_AD + _OIDC_BLOCK + "oidc_mfa_amr_values = []\noidc_required_acr_values = []\n",

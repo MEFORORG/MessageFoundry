@@ -4698,13 +4698,16 @@ class AuthSettings(_Section):
         # name the engine resolves, and a UPN suffix may be non-ASCII or hold an underscore,
         # both of which the shared rule refuses. upn_suffix_key is the form the claim is compared
         # in, so a change to one side of this compare cannot stop or start a match on its own.
+        # A TOML list of only blanks still takes this arm: it gives () and keeps ad_domain out, so
+        # with stripping on the load refusal above fires even when ad_domain is set. The env string
+        # form lost its blanks at the split, so it falls back to ad_domain instead.
         if self.oidc_allowed_username_domains:
             return tuple(
                 upn_suffix_key(d.strip()) for d in self.oidc_allowed_username_domains if d.strip()
             )
-        # A blank ad_domain is no source, as a blank list entry is: its key would allow-list the
-        # empty suffix past the load refusal above. The plain strip() is for operator text, which
-        # a paste can pad; a claim gets only the ASCII strip in upn_suffix_key.
+        # A blank ad_domain is no source: its key would allow-list the empty suffix past the load
+        # refusal above. The plain strip() is for operator text, which a paste can pad; a claim
+        # gets only the ASCII strip in upn_suffix_key.
         if self.ad_domain and self.ad_domain.strip():
             return (upn_suffix_key(self.ad_domain.strip()),)
         return ()
