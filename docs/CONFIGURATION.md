@@ -1224,9 +1224,14 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
 >   graph and names each connection. At startup the engine does not start. On a reload the running
 >   graph stays.
-> - Without it, under `warn`, the engine logs a warning naming each connection and loads the graph.
-> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection,
->   each time it passes one. A dry-run reload counts.
+> - Without it, under `warn`, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming
+>   each connection, with the remedy (owner ruling 2026-11-01). Nothing is relaxed: those bodies are
+>   still kept forever.
+> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection.
+>
+> The gate writes its `AUDIT:` line each time it passes such a graph. A dry-run reload counts, and
+> each engine shard writes its own. The startup gate for the global windows differs: it writes its
+> `AUDIT:` line only under `enforce`.
 >
 > **That switch is not scoped to one connection.** It also turns off the 30-day default for each
 > unset window that carries one (those named in the posture paragraph above), and it acknowledges
@@ -1237,8 +1242,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a
 > required check, `retention-overrides`, so a graph an enforcing engine would refuse fails the check
 > in the same words. `supervise` reads it once before it starts an engine shard, and refuses to start
-> the fleet on a graph each engine shard would refuse. Neither writes the warning or the `AUDIT:`
-> line; those belong to the engine that loads the graph.
+> the fleet on a graph each engine shard would refuse. Neither writes the `AUDIT:` line; that belongs
+> to the engine that loads the graph.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are

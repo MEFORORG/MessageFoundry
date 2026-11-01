@@ -5,7 +5,7 @@
 An inbound ``messages_days = 0`` or an outbound ``dead_letter_days = 0`` keeps that connection's PHI
 bodies forever. The ``serve`` gate read only the global windows, so the override needed no
 acknowledgement and wrote no AUDIT line. The overrides live in the graph, so a registry guard judges
-them: refuse under enforce, warn under warn, AUDIT once acknowledged.
+them: refuse under enforce unless acknowledged, and otherwise pass the graph and write an AUDIT line.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -25,13 +26,15 @@ from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
     auto_bounded_windows,
+    evaluate_retention_gate,
     keep_forever_overrides,
     make_retention_override_guard,
 )
-from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.settings import EgressSettings, ServiceSettings, StoreBackend
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.engine import Engine
+from tests._doc_blockquote import blockquote_lines
 from tests._phi_gate_provisions import (
     make_syslog_ca_and_crl,
     setenv_declared_egress,
@@ -39,6 +42,7 @@ from tests._phi_gate_provisions import (
 )
 from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
 
+_ROOT = Path(__file__).resolve().parent.parent
 _LOG = logging.getLogger("tests.retention_override_gate")
 _ACK = "[security].allow_keeping_phi_indefinitely"
 
@@ -103,16 +107,21 @@ def test_enforce_refuses_an_unacknowledged_override_and_names_the_connection(
     assert f"{_ACK}=true" in str(exc.value)
 
 
-def test_warn_enforcement_warns_instead_of_refusing(
+def test_warn_enforcement_audits_instead_of_refusing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # Owner ruling 2026-11-01: this arm keeps those bodies forever, so it leaves an AUDIT record even
+    # though nobody acknowledged anything. It still passes the graph.
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
     capsys.readouterr()
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=False, enforcing=False)(registry)
     (record,) = _guard_records(caplog)
     text = record.getMessage()
-    assert "IB_FEED" in text and "OB_FEED" in text and not text.startswith("AUDIT:")
+    assert record.levelno == logging.WARNING and text.startswith("AUDIT:")
+    assert "IB_FEED" in text and "OB_FEED" in text
+    # It must not read as the acknowledged line: no switch was set here.
+    assert "[security].enforcement = warn" in text and f"{_ACK}=true;" not in text
     # The remedy names the switch and says how far it reaches.
     assert f"{_ACK}=true" in text and "covers the whole instance" in text
     # Only the auto-bounded windows lose a default, and the remedy names each of them.
@@ -141,14 +150,95 @@ def test_an_acknowledged_override_loads_and_is_audited_by_name(
     assert f"warning: {text}" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (True, False), (False, False)]
+)
+def test_the_audit_line_is_written_each_time_the_guard_passes_a_graph(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool, enforcing: bool
+) -> None:
+    # The cadence is the same in every arm that passes the graph: one line per pass, so a reload and
+    # a dry-run reload each write one, and so does each engine shard.
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    guard = _guard(acknowledged=acknowledged, enforcing=enforcing)
+    with caplog.at_level(logging.WARNING, logger=_LOG.name):
+        guard(registry)
+        guard(registry)
+    lines = [r.getMessage() for r in _guard_records(caplog)]
+    assert len(lines) == 2 and all(line.startswith("AUDIT:") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (True, False), (False, True), (False, False)]
+)
 def test_a_graph_with_no_keep_forever_override_is_silent(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool, enforcing: bool
 ) -> None:
     registry = _graph(tmp_path / "cfg", inbound_days=7, outbound_days=None)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
-        _guard(acknowledged=acknowledged, enforcing=True)(registry)
+        _guard(acknowledged=acknowledged, enforcing=enforcing)(registry)
     assert _guard_records(caplog) == []
+
+
+def _configuration_doc() -> str:
+    return (_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+
+
+def _override_note() -> list[str]:
+    """The *Per-connection overrides* blockquote, unquoted, one entry per paragraph or bullet."""
+    quoted = blockquote_lines(_configuration_doc(), "**Per-connection overrides (")
+    text = "\n".join(line.removeprefix(">").strip() for line in quoted)
+    # A wrapped line joins the one above it, so a phrase is found wherever the doc wraps it.
+    return [entry.replace("\n", " ") for entry in re.split(r"\n\n|\n(?=- )", text)]
+
+
+def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each bullet is read beside the arm it describes, so a change to either side reds here."""
+    enforce, warn, acknowledged = [e for e in _override_note() if e.startswith("- ")]
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+
+    assert enforce.startswith(f"- Without `{_ACK} = true`, under `enforce`,")
+    assert "refuses the graph and names each connection" in enforce
+    with pytest.raises(WiringError):
+        _guard(acknowledged=False, enforcing=True)(registry)
+
+    assert warn.startswith("- Without it, under `warn`, the gate passes the graph")
+    assert "still kept forever" in warn
+    assert acknowledged.startswith("- With it, the gate passes the graph")
+    for bullet, ack in ((warn, False), (acknowledged, True)):
+        assert "logs a WARNING-level `AUDIT:` line naming each connection" in bullet
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=_LOG.name):
+            _guard(acknowledged=ack, enforcing=False)(registry)
+        (record,) = _guard_records(caplog)
+        assert record.getMessage().startswith("AUDIT:")
+
+
+def test_the_configuration_doc_keeps_the_guard_apart_from_the_global_gate() -> None:
+    note = " ".join(_override_note())
+    assert "each time it passes such a graph" in note and "A dry-run reload counts" in note
+    assert "each engine shard writes its own" in note
+    # The dead_letter_days row hands the reader to this note, so the row and the note stay joined.
+    (row,) = [
+        line
+        for line in _configuration_doc().splitlines()
+        if line.startswith("| `dead_letter_days`")
+    ]
+    assert "An override of `0` meets its own gate, described there." in row
+    # The global gate's line is the older rule, left alone by the 2026-11-01 ruling.
+    assert "it writes its `AUDIT:` line only under `enforce`" in note
+    settings = ServiceSettings()
+    settings.retention.allow_unbounded_phi = True
+    settings.retention.messages_days = 0
+
+    def audit_lines(*, enforcing: bool) -> int:
+        outcome = evaluate_retention_gate(
+            settings, enforcing=enforcing, production=True, env_name="prod"
+        )
+        return sum(line.audit and "retained INDEFINITELY" in line.text for line in outcome.lines)
+
+    assert audit_lines(enforcing=False) == 0 and audit_lines(enforcing=True) == 1
 
 
 def test_chained_guards_run_in_order_and_the_first_refusal_wins() -> None:
@@ -234,6 +324,18 @@ def test_serve_reads_the_acknowledgement_into_the_guard(
 ) -> None:
     guard = _served_guard(tmp_path, monkeypatch, "security.allow_keeping_phi_indefinitely = true\n")
     guard(_graph(tmp_path / "cfg", inbound_days=0, outbound_days=0))
+
+
+@_SERVE_PROVISIONS
+def test_serve_under_warn_hands_over_a_guard_that_audits_and_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    guard = _served_guard(tmp_path, monkeypatch, 'security.enforcement = "warn"\n')
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    capsys.readouterr()
+    guard(registry)
+    (line,) = [ln for ln in capsys.readouterr().err.splitlines() if "IB_FEED" in ln]
+    assert line.startswith("warning: AUDIT:")
 
 
 @_SERVE_PROVISIONS
@@ -368,10 +470,10 @@ def test_check_refuses_the_graph_the_guard_refuses_in_the_guards_words(
 
 
 @pytest.mark.parametrize(
-    ("switch", "written"),
+    ("switch", "arm"),
     [
-        ("security.allow_keeping_phi_indefinitely = true\n", "audit record: the retention gate"),
-        ('security.enforcement = "warn"\n', "a per-connection retention override keeps"),
+        ("security.allow_keeping_phi_indefinitely = true\n", f"{_ACK}=true;"),
+        ('security.enforcement = "warn"\n', "[security].enforcement = warn"),
     ],
 )
 def test_check_passes_and_carries_what_the_guard_would_write(
@@ -380,7 +482,7 @@ def test_check_passes_and_carries_what_the_guard_would_write(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
     switch: str,
-    written: str,
+    arm: str,
 ) -> None:
     _clear_posture_env(monkeypatch)
     _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
@@ -391,11 +493,12 @@ def test_check_passes_and_carries_what_the_guard_would_write(
 
     assert leg.ok and not leg.skipped
     assert leg.detail.startswith(
-        f"the retention override guard would pass this graph and report: {written}"
+        "the retention override guard would pass this graph and report: audit record: the "
+        "retention gate"
     )
     # check relabels the guard's AUDIT line, so its own output never reads as an audited load.
     assert "AUDIT:" not in leg.detail
-    assert "IB_FEED" in leg.detail
+    assert "IB_FEED" in leg.detail and arm in leg.detail
     # The leg reports what the guard would write. It writes no AUDIT line or warning of its own.
     assert "AUDIT:" not in capsys.readouterr().err
     assert not [r for r in caplog.records if "retention" in r.getMessage()]
@@ -546,5 +649,5 @@ def test_the_supervise_guard_passes_what_an_engine_shard_would_load(
     guard = _supervise_guard(tmp_path, monkeypatch, switch)
     capsys.readouterr()
     guard(registry)
-    # Refusal only: the warning and the AUDIT line are each engine shard's to write.
+    # Refusal only: the AUDIT line is each engine shard's to write.
     assert capsys.readouterr().err == ""

@@ -4257,8 +4257,8 @@ def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2368: a connection may override either body window, and its own 0 keeps that
     # connection's bodies forever. Those overrides are in the graph, which this function does not
     # load, so the gate above cannot see them. A registry guard judges them, at least at the first
-    # load and on every reload. What it refuses, warns and audits, and how that differs from the
-    # gate above, is stated once, on make_retention_override_guard.
+    # load and on every reload. What it refuses and audits, and how that differs from the gate
+    # above, is stated once, on make_retention_override_guard.
     from messagefoundry.config.retention_classification import make_retention_override_guard
 
     retention_override_guard = make_retention_override_guard(
@@ -5471,8 +5471,8 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2368: a connection's own keep-forever retention override. Each engine shard's
     # `serve` refuses the whole graph on it, so the supervisor would only restart them. It is a
     # graph refusal, so it runs where the supervisor loads the graph, and is reported the way
-    # that load's other refusals are. Refusal only: the warning and the AUDIT line belong to the
-    # engine shards, which each write their own.
+    # that load's other refusals are. Refusal only: the AUDIT line belongs to the engine shards,
+    # which each write their own.
     from messagefoundry.config.retention_classification import judge_keep_forever_overrides
     from messagefoundry.config.wiring import WiringError
 
@@ -11546,7 +11546,7 @@ def _connection(args: argparse.Namespace) -> int:
         )
         # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
         # as the engine's registry guard refuses it, so an edit a reload would reject is not
-        # written. Refusal only: the guard's warning and AUDIT line belong to a graph load.
+        # written. Refusal only: the guard's AUDIT line belongs to a graph load.
         verdict = judge_keep_forever_overrides(
             registry,
             acknowledged=settings.retention.allow_unbounded_phi,

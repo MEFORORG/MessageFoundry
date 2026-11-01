@@ -562,6 +562,21 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     )
 
 
+def _keep_forever_remedy() -> str:
+    """What an operator does about a keep-forever override. The refusal and the ``AUDIT:`` line
+    under ``enforcement = warn`` both end with it, so the two give the same advice."""
+    # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
+    # window on a tier where a window is the wrong answer, such as transform state.
+    auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
+    return (
+        "Set each override to a positive number of days, or remove it to inherit the global "
+        f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
+        "(audited). That switch covers the whole instance: it also turns off the default bound "
+        f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
+        "explicit number of days first"
+    )
+
+
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
     """The refusal text for ``kept``, the non-empty result of :func:`keep_forever_overrides`.
 
@@ -569,17 +584,25 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
     ``supervise`` and ``connection upsert`` reach it through that, so an edit is refused in the
     words a reload would use. ``env_name`` is ``None`` where no environment is active."""
     where = f" ({env_name!r})" if env_name is not None else ""
-    # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
-    # window on a tier where a window is the wrong answer, such as transform state.
-    auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
     return (
         "a per-connection retention override keeps PHI message bodies indefinitely on a PHI "
-        f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). Set "
-        "each override to a positive number of days, or remove it to inherit the global "
-        f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
-        "(audited). That switch covers the whole instance: it also turns off the default bound "
-        f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
-        "explicit number of days first"
+        f"instance{where}: {'; '.join(kept)} (unbounded PHI at rest, ASVS 14.2.4/14.2.7). "
+        f"{_keep_forever_remedy()}"
+    )
+
+
+def _override_audit_line(
+    kept: tuple[str, ...], *, env_name: str | None, basis: str, status: str
+) -> str:
+    """The ``AUDIT:`` line for a graph the gate passes with ``kept`` keeping bodies forever.
+
+    ``basis`` says why the gate passed it and ``status`` what that means. One sentence for every
+    arm, so a search of the logs for a keep-forever override finds each of them."""
+    return (
+        f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a graph "
+        f"with per-connection unbounded data retention ({basis}; {'; '.join(kept)}) -- once that "
+        "graph is live, these connections' PHI message bodies are retained INDEFINITELY "
+        f"({status})."
     )
 
 
@@ -589,8 +612,8 @@ class OverrideVerdict:
 
     #: Why an enforcing instance refuses the graph, or ``None`` when it does not.
     refusal: str | None
-    #: The line a graph load reports and still passes the graph: the ``AUDIT:`` line once
-    #: acknowledged, or the same reason as a warning under ``enforcement = warn``. Else ``None``.
+    #: The ``AUDIT:`` line a graph load writes and still passes the graph, once acknowledged or
+    #: under ``enforcement = warn``. Else ``None``.
     report: str | None
 
 
@@ -605,27 +628,33 @@ def judge_keep_forever_overrides(
     and logs nothing.
 
     ``acknowledged`` is the loaded ``[security].allow_keeping_phi_indefinitely``. With it the
-    graph passes and :attr:`OverrideVerdict.report` is the ``AUDIT:`` line, on either dial.
-    Without it an enforcing instance refuses, and under ``enforcement = warn`` the reason is
-    reported instead."""
+    graph passes and :attr:`OverrideVerdict.report` is an ``AUDIT:`` line, on either dial. Without
+    it an enforcing instance refuses. Under ``enforcement = warn`` the graph passes and the report
+    is an ``AUDIT:`` line that says nobody acknowledged it and gives the remedy (owner ruling
+    2026-11-01). That arm relaxes nothing: the bodies are kept forever either way, so a site on
+    that dial gets the audited record it would otherwise lack."""
     kept = keep_forever_overrides(registry)
     if not kept:
         return OverrideVerdict(refusal=None, report=None)
     if acknowledged:
-        return OverrideVerdict(
-            refusal=None,
-            report=(
-                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
-                "graph with per-connection unbounded data retention "
-                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
-                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
-                "opt-out override)."
-            ),
+        report = _override_audit_line(
+            kept,
+            env_name=env_name,
+            basis=f"{BODY_ACKNOWLEDGEMENT_SETTING}=true",
+            status="retention opt-out override",
         )
-    reason = keep_forever_override_refusal(kept, env_name=env_name)
+        return OverrideVerdict(refusal=None, report=report)
     if enforcing:
-        return OverrideVerdict(refusal=reason, report=None)
-    return OverrideVerdict(refusal=None, report=reason)
+        return OverrideVerdict(
+            refusal=keep_forever_override_refusal(kept, env_name=env_name), report=None
+        )
+    report = _override_audit_line(
+        kept,
+        env_name=env_name,
+        basis="[security].enforcement = warn, no acknowledgement",
+        status="not acknowledged; enforcement = enforce would refuse this graph",
+    )
+    return OverrideVerdict(refusal=None, report=f"{report} {_keep_forever_remedy()}.")
 
 
 def make_retention_override_guard(
@@ -637,12 +666,12 @@ def make_retention_override_guard(
     Without the acknowledgement (``acknowledged``, the loaded
     ``[security].allow_keeping_phi_indefinitely``) an enforcing instance refuses the graph by
     raising ``WiringError``: a first load fails the start, and a ``/config/reload`` is refused with
-    the running graph kept. Without it under ``enforcement = warn``, the guard warns. With the
-    acknowledgement the guard passes the graph and a WARNING-level ``AUDIT:`` line names each
-    connection, on either dial.
+    the running graph kept. In every other case the guard passes the graph and a WARNING-level
+    ``AUDIT:`` line names each connection: with the acknowledgement on either dial, and without it
+    under ``enforcement = warn``, where the line also gives the remedy.
 
     It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
-    line only under ``enforce``, and this guard writes one on either dial.
+    line only under ``enforce``, and this guard writes one whenever it passes such a graph.
 
     It runs only where the engine calls its registry guard. At least these do not call it:
     ``Engine.add_registry`` called by an embedder, and the DR re-apply path.
@@ -650,13 +679,13 @@ def make_retention_override_guard(
     makes, :func:`judge_keep_forever_overrides`, and reports a refusal in its own way; neither
     writes the AUDIT line.
 
-    The AUDIT line is written each time the guard passes such a graph. That includes a dry-run
-    reload, and a reload a later check then refuses, so the line says the gate passed the graph and
-    never that the graph went live.
+    The AUDIT line is written each time the guard passes such a graph, so each engine shard writes
+    its own. That includes a dry-run reload, and a reload a later check then refuses, so the line
+    says the gate passed the graph and never that the graph went live.
 
-    The AUDIT line and the warning go to the logger AND to stderr. A
-    ``[logging].level`` above WARNING would otherwise drop the only record of an acknowledged
-    override. Under NSSM both streams are captured, so a line can appear in both.
+    The AUDIT line goes to the logger AND to stderr. A ``[logging].level`` above WARNING would
+    otherwise drop the only record of the override. Under NSSM both streams are captured, so a line
+    can appear in both.
 
     Like the static-credential guard, it judges every graph against the settings the process started
     with: a reload re-reads the graph and never ``[security]``."""
