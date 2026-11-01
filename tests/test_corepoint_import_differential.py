@@ -259,8 +259,8 @@ _LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
 # BACKLOG #2526 and #2685, the second amendment, applied BEFORE the one above. A
 # ``<List>``/``<Actions>`` wrapper carrying ``@Disabled`` was flattened, so the statements an
 # operator switched off came back as live code, and the scan walked them to agree. It is still
-# flattened, exactly as main flattened it, so every test of where a step lands sees what main saw;
-# each step it held is marked, and once the whole list is placed, the marked steps are switched
+# flattened, exactly as main flattened it, so every test of where a step lands sees what main saw,
+# but for the look-back below, which reads the mark; each step it held is marked, and once the whole list is placed, the marked steps are switched
 # off. The scan skips the wrapper. A step that runs nothing (a disabled one, a marked one, a line
 # with no statement, a ``MsgLog``, an empty label) stands between no construct and the sibling
 # branch written after it. And a branch left with no construct renders its body under a dead
@@ -3782,7 +3782,7 @@ def test_the_scan_half_of_the_fail_closed_amendment_changes_its_seeds() -> None:
 
 _RANK = {"dead": 0, "except": 1, "live": 2}
 _NEVER = re.compile(r"\s*(?:(?:el)?if False|for _item in \[\]|while False):")
-_EFFECT = re.compile(r"set_field\(|Send\(")
+_EFFECT = re.compile(r"(?:set_field|append_to_field|copy_field)\(|Send\(")
 
 
 def _liveness(src: str) -> dict[str, list[str]]:

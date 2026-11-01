@@ -163,7 +163,9 @@ class _SwitchedOff:
     """The ``@Disabled`` ``<List>``/``<Actions>`` wrapper a step was written in (BACKLOG #2526).
 
     The parse flattens such a wrapper exactly as it flattens a live one, so every test of where a
-    step lands sees what it would see with the wrapper live. Each step it held carries this mark,
+    step lands sees what it would see with the wrapper live, but for one: :func:`_runs_nothing`
+    reads the mark, so a sibling branch carrying its own body may be adopted across a marked step
+    where main orphaned it. Each step it held carries this mark,
     at any depth, and :func:`_switch_off` then renders it commented out. ``source`` is the
     wrapper's tag and ``label`` its ``@Data`` or ``@Comment``, for the comment's header. Each
     wrapper is its own mark, compared by identity, so two wrappers that read alike are still two
@@ -1587,6 +1589,9 @@ def _parse_list(
     # level: an ``if`` chain has no line between its arms where a step could stand, and none of
     # these runs anything, so where it sits changes no message.
     waiting: list[Step] = []
+    # Whether every step in ``waiting`` is a label marker: kept as they arrive, so no adoption
+    # walks ``waiting`` again.
+    hollow = True
     for child in container:
         tag = _local(child.tag).lower()
         produced: list[Step]
@@ -1599,8 +1604,9 @@ def _parse_list(
                 *_parse_list(child, subject, held, in_control, depth + 1),
             ]
             if _is_disabled(child):
-                # Flattened all the same, so every step lands where it would with the wrapper live.
-                # Each is marked, and :func:`_switch_off` renders it commented out (BACKLOG #2526).
+                # Flattened all the same, so every step lands where it would with the wrapper live,
+                # but for one rule: a marked step runs nothing (:func:`_runs_nothing`). Each is
+                # marked, and :func:`_switch_off` renders it commented out (BACKLOG #2526).
                 off = _SwitchedOff(_local(child.tag), _disabled_label(child))
                 produced = [_mark_off(step, off) for step in produced]
         else:
@@ -1612,24 +1618,27 @@ def _parse_list(
             # statements live and a <Switch> — or a <Lines> typo — vanished with its body. Untrusted
             # input is still never a crash.
             produced = _parse_statement(child, subject, held, in_control, depth + 1)
-            if _adopt_branch(steps, produced, waiting):
+            if _adopt_branch(steps, produced, hollow=hollow):
                 continue
         for step in produced:
             if _runs_nothing(step):
                 waiting.append(step)
+                hollow = hollow and isinstance(step, LabelMarker)
             else:
                 steps.extend(waiting)
                 waiting.clear()
+                hollow = True
                 steps.append(step)
     return [*steps, *waiting]
 
 
-def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) -> bool:
+def _adopt_branch(steps: list[Step], produced: list[Step], *, hollow: bool) -> bool:
     """Attach ``produced`` to the construct written before it, when ``produced`` is one branch
     marker that construct continues. Says whether it did. THE one adoption rule.
 
     It reads ``steps[-1]`` alone. :func:`_parse_list` keeps every step that runs nothing out of
-    that position, a :class:`LabelMarker` among them, and passes them as ``between``. A marker
+    that position, a :class:`LabelMarker` among them, and says in ``hollow`` whether those it
+    kept out since the last step that runs are all label markers. A marker
     never changes which branch is adopted: the answer is the one this list gives with every
     marker taken out of it. Any other such step is skipped only for a branch that carries its
     own body, and holds no branch of its own. Across one, the rest is adopted as it was before,
@@ -1653,7 +1662,6 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
         and previous.kind == _BRANCH_PARENT[branch.kind]
     ):
         return False
-    hollow = all(isinstance(step, LabelMarker) for step in between)
     if (_opens_a_branch(branch) or branch.branches or branch.kind == "except") and not hollow:
         return False
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
@@ -1673,8 +1681,9 @@ def _runs_nothing(step: Step) -> bool:
       marker: with the wrapper flattened it stands where it stood live, and opens its branch;
     * a ``<Line>`` holding no statement (:class:`_NoStatement`), and the ``@Comment`` beside it;
     * a ``MsgLog``, which maps to no vocabulary helper, so it is always a TODO;
-    * a ``<Block>`` label over nothing but such steps. Not "over nothing at all": a label
-      marker in its body would then decide the shape of the tree, which a marker never does.
+    * a ``<Block>`` label over nothing but such steps, an empty one among them. The test reads
+      each step in its body, not whether it has one, so a label marker in it decides nothing,
+      as a marker never does.
 
     Each used to orphan a branch written after it, and an orphan's body rendered live, so its
     send was made for every message (BACKLOG #2685). A step that runs, such as a field write, a

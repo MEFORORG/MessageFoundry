@@ -783,8 +783,11 @@ from source that does not run:
 **How a disabled wrapper is switched off: placement is main's, by construction.** The wrapper is
 flattened into its parent exactly as main flattened it, so every test of where a step lands
 (whether a marker opens its branch, which construct adopts a sibling, how a list splits into
-branches, whether a body makes a branch group) sees exactly what main saw. No placement test
-special-cases the wrapper. Each step it held, at any depth and through nested disabled wrappers,
+branches, whether a body makes a branch group) sees exactly what main saw, but for one rule.
+The adoption rule of the second bullet above reads the mark: a step the wrapper held runs
+nothing, unless it holds an `If`, a `Try` or a `ChooseFrom` or is a bare marker. So a sibling
+branch carrying its own body, a `Catch` excepted, is adopted across it where main orphaned the
+branch, which puts that body under a dead arm rather than on a more live path. Each step it held, at any depth and through nested disabled wrappers,
 carries a mark naming the wrapper. Once the whole list is placed, one pass switches off what the
 operator switched off, and decides no placement:
 
