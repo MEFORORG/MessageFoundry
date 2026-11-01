@@ -212,8 +212,10 @@ it could reach only its own copy.
    it. It does feed the console's Flagged-only filter, and select-all honours that filter, so a
    database writer with no key can move a marker and could shape a bulk action's target set. The
    owner accepted that reach on 2026-11-01; *Accepted residual* below records what bounds it.
-   `tests/test_connection_flag_readers.py` fails when a new reader appears. That test is what brings
-   the seal question back if the flag ever comes to drive an engine path.
+   `tests/test_connection_flag_readers.py` fails on a new reader in the Python it scans, by name. In
+   the browser it only counts the literal `getAttribute("data-flagged")` in `static/app.js`, so a
+   read spelled any other way, or one that replaces a counted read, passes it. That test is what
+   brings the seal question back if the flag ever comes to drive an engine path.
 3. **A row is the flag.** A flagged connection has a row, keyed by name and direction, and an
    unflagged one has none. No value is parsed or validated. Nothing in a start or a reload
    reads the table, and the flag is off the `Registry`, so no stored row can refuse either. The
@@ -259,8 +261,12 @@ what a failed read could do, and the ruling accepts nothing beyond them. What bo
 filter has hidden a row select-all takes as it is taken, the toolbar counts the selection beside Go,
 and an operator must press Go. Purge then adds a confirm page naming each outbound. Every other bulk
 action has no such page, a row below the fold is still taken, and a selected row a later refresh
-hides stays selected, so it is still acted on. The toggle gives the same reach with an audit row: at
-least the Deployment role holds `config:deploy` and no bulk-action permission.
+hides stays selected, so it is still acted on. The header box shows the part-selected mark when the
+selection holds a row select-all could not take, and that mark covers opposite next clicks. Ticked,
+which it also is when a selection has no row left to take, a click clears the whole selection,
+hidden rows included. Unticked, a click adds every row it can take and leaves the rest selected.
+That states what the box does, and accepts nothing further. The toggle gives the same reach with an
+audit row: at least the Deployment role holds `config:deploy` and no bulk-action permission.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.
@@ -274,8 +280,8 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
 - **AC-3** — WHEN the store holds a row no toggle could write, THE SYSTEM SHALL start and reload as
   though it were absent.
   → `tests/test_connection_flag.py::test_a_stored_row_refuses_neither_a_start_nor_a_reload`
-- **AC-4** — WHEN a module other than the listed dashboard and console code reads the flag, THE build
-  SHALL fail.
+- **AC-4** — WHEN a Python module the census scans, other than the listed dashboard and console code,
+  reads the flag by name, THE build SHALL fail.
   → `tests/test_connection_flag_readers.py`
 - **AC-5** — WHEN the flag read fails, THE SYSTEM SHALL answer the dashboard with each row's flag
   unknown, offer no toggle, hide no row under Flagged only, leave such a row out of select-all under

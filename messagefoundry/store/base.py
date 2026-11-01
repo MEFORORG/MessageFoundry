@@ -1424,8 +1424,8 @@ class QueueStore(StoreLifecycle, Protocol):
         """Every ``(connection, direction)`` holding the flag (BACKLOG #2623).
 
         The dashboard rows are the one reader, and ``tests/test_connection_flag_readers.py`` fails on
-        a second. No engine path acts on a row, so nothing here checks one against the graph: a row
-        that names no connection matches no dashboard row."""
+        a second it can see. No engine path acts on a row, so nothing here checks one against the
+        graph: a row that names no connection matches no dashboard row."""
         ...
 
     # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The

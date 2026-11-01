@@ -23,8 +23,9 @@ bare local such as ``if flagged:``, is not seen, and a local of that name means 
 at least the sign-in code keeps one of its own. The arms above catch the value at the road in, so a
 bare local is still downstream of a read this file lists. The IDE extension and the PySide6 harness
 are not read. Neither reads the flag today, and neither shares this process. ``static/app.js`` is
-where the reach lives and the AST walk cannot read it, so its reads of ``data-flagged`` are counted
-by a text census of their own.
+where the reach lives and the AST walk cannot read it, so a text census of its own counts the
+literal ``getAttribute("data-flagged")``, and a read spelled any other way, or one that replaces a
+counted read, is not seen.
 """
 
 from __future__ import annotations
@@ -72,8 +73,8 @@ FIELD_READERS: dict[tuple[str, str], str] = {
         "POST /connections/{name}/flag hands req.flagged to the engine and echoes it"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_selection_checkbox"): (
-        "the row's data-flagged attribute, which the client-side filter and select-all read. That "
-        "is the flag's one reach past a marker (the accepted residual)"
+        "the row's data-flagged attribute. The client-side filter's read of it is the reach the "
+        "owner accepted. Select-all's read narrows that reach and accepts nothing further"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_flag_cell"): (
         "the flag cell's glyph, and whether the toggle is offered"

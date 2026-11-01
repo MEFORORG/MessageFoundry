@@ -677,13 +677,15 @@ async def _connection_flags(engine: Engine, state: Any) -> set[tuple[str, str]] 
     """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows, or
     ``None`` when the read failed.
 
-    The flag's one reader (BACKLOG #2623), and ``tests/test_connection_flag_readers.py`` fails on a
-    second. No engine path reads the flag, so a read that fails costs the markers and never the
-    page: a row a database writer planted that the driver cannot decode reads as flags unknown. It
-    is ``None`` and not an empty set so that the console cannot take a failed read for an answer:
-    an empty set would hide every row under Flagged only, and every toggle would post a value
-    derived from it. Logged at WARNING once per failure run, because the stats socket reads this
-    every second per console. ``state`` is the app's, so a run belongs to one app."""
+    The flag's one reader (BACKLOG #2623). ``tests/test_connection_flag_readers.py`` fails on a
+    second in the Python it scans, by name; in the browser it only counts the literal
+    ``getAttribute("data-flagged")`` in ``app.js``. No engine path reads the flag, so a read that
+    fails costs the markers and never the page: a row a database writer planted that the driver
+    cannot decode reads as flags unknown. It is ``None`` and not an empty set so that the console
+    cannot take a failed read for an answer: an empty set would hide every row under Flagged only,
+    and every toggle would post a value derived from it. Logged at WARNING once per failure run,
+    because the stats socket reads this every second per console. ``state`` is the app's, so a run
+    belongs to one app."""
     try:
         flags = await engine.store.list_connection_flags()
     except Exception as exc:  # noqa: BLE001 - the page outlives this read; see the docstring

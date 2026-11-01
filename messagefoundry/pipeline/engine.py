@@ -2491,8 +2491,8 @@ class Engine:
         Flagged-only filter, and select-all honours that filter, so a database writer could shape a
         bulk action's target set. An operator still presses Go, and the owner accepted that reach on
         2026-11-01; ADR 0007's amendment of 2026-10-31 records what bounds it.
-        ``tests/test_connection_flag_readers.py`` fails on a new reader, because a value that drives
-        an engine path would need the seal this one was decided without.
+        ``tests/test_connection_flag_readers.py`` fails on a new reader it can see, because a value
+        that drives an engine path would need the seal this one was decided without.
 
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
