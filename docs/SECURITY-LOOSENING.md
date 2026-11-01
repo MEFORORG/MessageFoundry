@@ -660,8 +660,9 @@ is refused, so an opt-out does nothing and is not reported.
   the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
   BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
   (vault BACKLOG #2354): at least the CLI commands that open the store without one. That includes
-  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers, which pass the
-  instance posture only at `enforce` (see *Which callers know the posture* below).
+  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers and
+  `admin-revoke-sessions`, which pass the instance posture only at `enforce` (see *Which callers
+  know the posture* below).
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
@@ -1412,10 +1413,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `restore-verify`. The commands that open the store under BACKLOG #2532, at least `rotate-key`,
   `backup`, `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-set-notify-email`,
   `admin-reset-totp` and `store attest-transit-bound` / `withdraw-transit-bound`, pass the
-  instance posture only at `enforce`, where it refuses as no posture does. At `warn` they pass
-  none, so they refuse that Vault there too. That keeps what they did before #2532: no command
-  loosens (Manager decision d20261031T021248404-699a64, under the owner's delegation of
-  2026-10-22).
+  instance posture only at `enforce`, where it refuses as no posture does. So does
+  `admin-revoke-sessions` (BACKLOG #2614), which came later. At `warn` they pass none, so they
+  refuse that Vault there too. For the #2532 commands that keeps what they did before #2532, and
+  `admin-revoke-sessions` has refused that way since it was added: no command loosens (Manager
+  decision d20261031T021248404-699a64, under the owner's delegation of 2026-10-22).
   **`verify` passes no posture to either of its Vault hops, on
   purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
   `warn` instance `verify` dials neither unattested off-box Vault. Its store rows FAIL there,
@@ -1485,6 +1487,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What the engine refuses without it:** each hop verifies the peer's certificate, and its
   handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
   off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
+  Both hold on a host the `smtp_allowed_hosts` or `webhook_allowed_hosts` allowlist admits; a host
+  off it is left to the per-send refusal.
   A relay with no login takes no guard at all, so the `email` pair does nothing there.
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
@@ -1508,10 +1512,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **How it is reported:** `security_loosenings()` names it as `alerts.email_tls_revocation_attested`
   or `alerts.webhook_tls_revocation_attested`, with the reason, so `security show`,
   `GET /security/posture` and the serve-time loosening WARNING list it. It is named whenever the
-  flag is set, whether or not the hop it covers is configured. A hop that crosses an enforcing
-  posture on it logs a WARNING carrying the reason. That line names the declaration as
-  `tls_revocation_attested`, the shared guard's spelling, with no connection; its cell names the
-  `[alerts]` hop. `messagefoundry check` has no line for these pairs.
+  flag is set, whether or not the hop it covers is configured. When a crossing on it logs a
+  WARNING carrying the reason is stated once, in the `email_tls_revocation_attested` and
+  `webhook_tls_revocation_attested` rows of [CONFIGURATION.md `[alerts]`](CONFIGURATION.md#alerts).
+  That line names the setting as
+  `[alerts].email_tls_revocation_attested` or `[alerts].webhook_tls_revocation_attested`, and no
+  connection; its cell names the `[alerts]` hop. `messagefoundry check` has no line for these pairs.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused.
 - **Reversible:** yes. Delete both lines and restart.

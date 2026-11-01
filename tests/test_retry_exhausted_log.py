@@ -46,6 +46,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from tests._refusal_log_capture import TOKEN, assert_no_token, until
+from tests._store_audit import no_operator_audit
 
 OUT = "file_out"
 LOGGER = "messagefoundry.pipeline.wiring_runner"
@@ -398,7 +399,7 @@ async def test_a_replay_right_after_the_dead_letter_does_not_hide_the_line(
 
     async def then_replay(*args: Any, **kwargs: Any) -> Any:
         outcome = await real(*args, **kwargs)
-        assert await store.replay_dead(audit=None) == 1
+        assert await store.replay_dead(audit=no_operator_audit) == 1
         return outcome
 
     monkeypatch.setattr(store, "mark_failed", then_replay)
@@ -491,7 +492,7 @@ async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
     # and replaying each named message re-queues its row.
     assert await store.count_dead(allowed_channels=None) == dead_before + len(mids)
     for m in mids:
-        assert await store.replay(m) == 1
+        assert await store.replay(m, audit=no_operator_audit) == 1
     assert [r["status"] for m in mids for r in await store.outbox_for(m)] == [
         OutboxStatus.PENDING.value
     ] * len(mids)
@@ -574,7 +575,7 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     # Both claims hold in every shape, the two-handler one included: the view does not list the
     # row, and replaying the message re-queues it (with any sibling still PENDING).
     assert await store.count_dead(allowed_channels=None) == 0
-    assert await store.replay(mid) == handlers
+    assert await store.replay(mid, audit=no_operator_audit) == handlers
     assert await _status(store, item.id) == OutboxStatus.PENDING.value
 
 

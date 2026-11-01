@@ -58,6 +58,7 @@ from pydantic import (
     ConfigDict,
     Field,
     GetCoreSchemaHandler,
+    PrivateAttr,
     ValidationError,
     ValidationInfo,
     ValidatorFunctionWrapHandler,
@@ -102,7 +103,12 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.credential import QUALIFIED_CERT_NAME
-from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
+from messagefoundry.domainshape import (
+    MAX_MAIL_DOMAIN,
+    domain_shape_problem,
+    is_canonical_ipv4,
+    upn_suffix_key,
+)
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
@@ -388,11 +394,12 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     hides the input from ``str`` and ``repr`` only, and only on the outermost model.
 
     Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
-    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
-    and ``ctx`` are written by the validator, and a validator that quotes the value it refused
-    still shows it there. :func:`settings_error_detail` keeps the list of those that do. None is
-    meant to hold a secret, but a URL
-    can carry one, so a validator message must name the setting, never quote a secret value.
+    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT
+    ONLY. The message and ``ctx`` stay as raised, and they can quote the value: a validator that
+    quotes what it refused still shows it there, and so does at least one error a library raised
+    inside a validator. :func:`settings_error_detail` names at least the ones known. None is meant
+    to hold a secret, but a URL can carry one, so a validator message must name the setting, never
+    quote a secret value.
     """
     try:
         return handler(value)
@@ -3830,7 +3837,8 @@ class AuthSettings(_Section):
     # control before, because `preferred_username` is neither unique nor stable (OIDC Core §5.7) and is
     # self-editable on many IdPs. Empty = fall back to [auth].ad_domain; if neither is set while
     # strip_domain is on, oidc_enabled is refused at load rather than stripping unchecked. List the alternate UPN suffixes
-    # of a multi-domain forest here.
+    # of a multi-domain forest here. An ASCII suffix matches without regard to case; one holding a
+    # non-ASCII character matches only as written (upn_suffix_key in domainshape.py).
     oidc_allowed_username_domains: list[str] = Field(default_factory=list)
     oidc_clock_skew_seconds: int = 60  # wall clock; validator-capped 0..300
     # The BACKLOG #99(g) control: refuse a login whose verified token carries no configured MFA claim.
@@ -4681,19 +4689,30 @@ class AuthSettings(_Section):
 
     @property
     def effective_oidc_username_domains(self) -> tuple[str, ...]:
-        """The UPN suffixes a federated ``username`` claim may carry, lower-cased.
+        """The UPN suffixes a federated ``username`` claim may carry, in the compare form.
 
         Explicit ``oidc_allowed_username_domains`` wins; otherwise fall back to the single
         ``ad_domain`` the LDAP layer already builds UPNs from (``auth/ldap.py``). Empty means no
-        suffix source is configured at all, which the validator above refuses when stripping is on.
+        suffix source applies, which the validator above refuses with OIDC enabled and stripping on.
         """
         # Its own rule, not the shared domain rule (BACKLOG #3075 item 3, declined): an entry is
         # compared with the raw suffix an identity provider writes into a claim, not with a DNS
         # name the engine resolves, and a UPN suffix may be non-ASCII or hold an underscore,
-        # both of which the shared rule refuses.
+        # both of which the shared rule refuses. upn_suffix_key is the form the claim is compared
+        # in, so a change to one side of this compare cannot stop or start a match on its own.
+        # A TOML list of only blanks still takes this arm: it gives () and keeps ad_domain out, so
+        # with OIDC enabled and stripping on the load refusal above fires even when ad_domain is
+        # set. The env string form lost its blanks at the split, so it falls back instead.
         if self.oidc_allowed_username_domains:
-            return tuple(d.strip().lower() for d in self.oidc_allowed_username_domains if d.strip())
-        return (self.ad_domain.strip().lower(),) if self.ad_domain else ()
+            return tuple(
+                upn_suffix_key(d.strip()) for d in self.oidc_allowed_username_domains if d.strip()
+            )
+        # A blank ad_domain is no source: its key would allow-list the empty suffix past the load
+        # refusal above. The plain strip() is for operator text, which a paste can pad; a claim
+        # gets only the ASCII strip in upn_suffix_key.
+        if self.ad_domain and self.ad_domain.strip():
+            return (upn_suffix_key(self.ad_domain.strip()),)
+        return ()
 
 
 #: Characters permitted in a free-form environment NAME (it selects ``environments/<name>.toml``, so
@@ -5229,14 +5248,23 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
+#: RFC 1122's "this network" block. ``ipaddress`` names only its first address, as unspecified: it
+#: reads the rest, such as ``0.1.2.3``, as neither unspecified nor reserved (BACKLOG #3765).
+_THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
+
+
 def _not_a_host_address(text: str) -> bool:
-    """Whether the canonical IPv4 ``text`` is not one host's address: at least the unspecified
-    ``0.0.0.0``, a multicast group, and the reserved class E range, which holds the limited
-    broadcast ``255.255.255.255`` (BACKLOG #3075). No identity provider or link is served from one,
-    and some browsers route ``0.0.0.0`` to the local machine. This does not refuse loopback: a
-    ``127.0.0.1`` entry still loads, as ``localhost`` does."""
+    """Whether the canonical IPv4 ``text`` is not one host's address: at least the whole
+    ``0.0.0.0/8`` block, a multicast group, and the reserved class E range, which holds the limited
+    broadcast ``255.255.255.255`` (BACKLOG #3075, #3765). No identity provider or link is served
+    from one, and some browsers route ``0.0.0.0`` to the local machine. This does not refuse
+    loopback: a ``127.0.0.1`` entry still loads, as ``localhost`` does.
+
+    The console keeps its own copy, ``_is_one_host`` in ``messagefoundry_webconsole/_external.py``,
+    for an entry that reaches it another way. ``tests/test_domain_shape.py`` compares the two on a
+    ``/16`` grid."""
     address = ipaddress.IPv4Address(text)
-    return address.is_unspecified or address.is_multicast or address.is_reserved
+    return address in _THIS_NETWORK or address.is_multicast or address.is_reserved
 
 
 def _bare_domain_entries(
@@ -5574,6 +5602,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # edited on disk with no reload. Keyed by the inbound's name, once per refusal. Not in
         # _ALERT_CONTROL_EVENT_TYPES: a restart reloads nothing, so it cannot clear the cause.
         "sandbox_worker_refused",
+        # BACKLOG #2614: the first start on a store `restore` placed revoked every session. Keyed
+        # `store:restored`, which no connection can be named. An event, with no inverse.
+        "store_restored",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
@@ -6214,10 +6245,22 @@ _RENEW_CLAMP_CEILING_SECONDS = 5.0
 #: fit inside it are CONCURRENT, not sequential: at the fence moment the ex-leader starts tearing the
 #: graph down while a renew it issued beforehand may still be in flight. Each gets half, each is
 #: strictly inside the margin, and neither has to know the other's number.
+#:
+#: **That holds on Postgres only**, where the renew's borrow and statement share one deadline
+#: (``pipeline.cluster._call_within``), so a renew lands within the clamp of being issued. On SQL
+#: Server the borrow and the statement each get the full clamp (``SqlServerStore._fetchone_clamped``),
+#: plus a COMMIT the clamp does not bound, so the derived default is NOT safe by construction there.
+#: At the shipped 10/20/30 the clamp is 4.5, which runs as a 4.5 s borrow plus a 4 s statement: about
+#: 8.5 s of the 9.0 s margin. At the failover profile (fence 4.0 / TTL 6.0, margin 1.2 s) the floor
+#: makes the clamp 1.0, which runs as about 2 s, past the margin.
+#: ``ServiceSettings.sqlserver_renew_bound_warning`` names, for ``serve`` to log at start-up, a config
+#: where ``2 * clamp >= margin``.
 _RENEW_CLAMP_MARGIN_FRACTION = 0.5
 
 #: FLOOR on the derived clamp, and the reason it exists is a LIVENESS bound the margin does not see.
-#: The clamp is asyncpg's per-statement timeout on the lease renew, so a renew slower than it RAISES
+#: The clamp is the lease renew's statement timeout: on Postgres asyncpg's per-call timeout, shared
+#: with the borrow; on SQL Server the ODBC statement timeout, in whole seconds rounded down
+#: (``store.sqlserver._clamped_statement_timeout``). Either way a renew slower than it RAISES
 #: and ``_last_renew_ok`` is not advanced; enough consecutive failures and the watchdog self-fences a
 #: leader whose database was merely slow. The margin bounds the clamp from ABOVE (correctness: a stray
 #: renew must not outlive the fence). Nothing in the margin bounds it from BELOW, and at a tight
@@ -6331,11 +6374,10 @@ class ClusterSettings(_Section):
     # stamped before the renew is issued, so the detection margin holds either way) — a standby cannot
     # take over until the lease it just re-extended expires again.
     #
-    # SCOPE, stated because a control that claims more than it covers is worse than none: this clamps
-    # the POSTGRES coordinator, where it is asyncpg's own per-statement `timeout=`. The SQL Server
-    # coordinator's renew still inherits `[store].command_timeout` from the ODBC connection, because a
-    # per-statement override there lives in `store/sqlserver.py`. That is a NAMED, open residual of
-    # ADR 0157 Inc 0 — not something this setting silently covers.
+    # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
+    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER only
+    # the claim/renew, as SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused
+    # there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -6345,13 +6387,20 @@ class ClusterSettings(_Section):
     # `clamp < (ttl - fence - fence_tick)`, which is a function of the fence/TTL pair, so a constant is
     # wrong for some legitimate pair -- a fixed 5.0 refused this repository's own failover profiles
     # (fence 4.0 / ttl 6.0, margin 1.2 s) at config load. Deriving it gives a tight pair a
-    # proportionally tight clamp instead of a refusal, and the default can never contradict the margin
-    # by construction. At the shipped 10/20/30 the margin is 9.0 s and this resolves to 4.5.
+    # proportionally tight clamp instead of a refusal. It is still not safe by construction: the 1.0 s
+    # floor can exceed half a small margin, or the margin itself, so the derived value is checked like
+    # an explicit one; and on SQL Server the renew can land up to about twice the clamp after it is
+    # issued (the comment on _RENEW_CLAMP_MARGIN_FRACTION says why). At the shipped 10/20/30 the
+    # margin is 9.0 s and this resolves to 4.5.
     #
     # Set it EXPLICITLY and it is checked, not clamped: a value that does not fit the margin is
     # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
     # fit would make the check unfalsifiable -- it would accept everything. Must be > 0.
     lease_renew_timeout_seconds: float | None = None
+    # True when _renew_fits_the_margin filled lease_renew_timeout_seconds in, so the SQL Server
+    # start-up warning names the fence/TTL pair rather than a value the operator never set. A
+    # private attribute because the validator's own assignment adds the field to model_fields_set.
+    _renew_clamp_derived: bool = PrivateAttr(default=False)
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
     # (byte-identical to before this knob existed). A preferred site keeps its nodes at 0.0 and a warm
@@ -6482,10 +6531,15 @@ class ClusterSettings(_Section):
         **It is not a proof that the teardown fits** -- the DEMOTE budget (ADR 0157 Inc 4/5) is derived
         from the same margin and bounds the source phase only.
 
-        **Backend scope.** ``lease_renew_timeout_seconds`` clamps the Postgres coordinator's renew.
-        The SQL Server coordinator's renew still inherits ``[store].command_timeout``, an open ADR 0157
-        Inc 0 residual, so on that backend this checks a value the renew does not yet use. Said here
-        rather than left to be inferred from a green config load."""
+        **Backend scope.** The comparison is with the clamp alone, which is the renew's whole bound
+        on Postgres only, where its borrow and statement share one deadline. **On SQL Server a green
+        load does not prove the renew lands inside the margin:** there the borrow and the statement
+        each get the full clamp, so a renew can land up to about twice the clamp after it is issued,
+        plus a COMMIT the clamp does not bound (``SqlServerStore._fetchone_clamped``).
+        :meth:`ServiceSettings.sqlserver_renew_bound_warning` is the start-up warning, not a refusal,
+        when twice the clamp reaches this margin. The SQL Server rounding, and its refusal of a sub-second clamp, are
+        :meth:`ServiceSettings._sqlserver_renew_clamp_whole_seconds`'s. Both live there because this
+        section cannot see ``[store]``."""
         tick = _fence_tick_seconds(self.leader_fence_timeout_seconds)
         margin = _detection_margin_seconds(
             self.leader_fence_timeout_seconds, self.leader_lease_ttl_seconds
@@ -6505,6 +6559,7 @@ class ClusterSettings(_Section):
             )
         if self.lease_renew_timeout_seconds is None:
             self.lease_renew_timeout_seconds = _derived_renew_timeout_seconds(margin)
+            self._renew_clamp_derived = True
         # The derived value FALLS THROUGH the same check rather than returning early, and since the
         # derivation gained a floor it can genuinely fail here: any margin at or below the floor. That
         # is the intended refusal -- such a pair cannot carry a clamp that is both inside the margin
@@ -6963,16 +7018,16 @@ _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 _URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
 
 
-def _url_scheme(value: str) -> str | None:
-    """The ``<scheme>://`` that ``value`` starts with, or ``None``. Any scheme of two or more characters: these settings take
-    a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as
-    a bogus local path (vault BACKLOG #2600).
+def _looks_like_url(value: str) -> bool:
+    """Whether ``value``, stripped and lower-cased, starts with ``<scheme>://``, where the scheme is
+    a letter and then at least one more letter, digit, ``+``, ``.`` or ``-``. These settings take a
+    LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as a
+    bogus local path (vault BACKLOG #2600). A value with any other shape once stripped is not
+    detected, and can load as a path.
 
-    A refusal quotes this and never the URL. A URL can carry a credential (``https://user:pw@``,
-    a signed query), and :func:`settings_error_detail` prints a validator's message as written:
-    to stderr, a service log, and since vault BACKLOG #2600 ``security show``'s JSON."""
-    match = _URL_SCHEME.match(value.strip().lower())
-    return match.group(0) if match else None
+    It hands back no text, because a refusal quotes no part of the value: see
+    :func:`settings_error_detail`."""
+    return _URL_SCHEME.match(value.strip().lower()) is not None
 
 
 class BackupSettings(_Section):
@@ -7058,10 +7113,9 @@ class BackupSettings(_Section):
     def _no_cloud_destination(cls, value: str) -> str:
         # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a URL destination
         # at config load rather than silently treating it as a (bogus) local path at 02:00.
-        scheme = _url_scheme(value)
-        if scheme is not None:
+        if _looks_like_url(value):
             raise ValueError(
-                f"[backup].destination must be a LOCAL or UNC path, not a URL ({scheme}...); "
+                "[backup].destination must be a LOCAL or UNC path, not a URL; "
                 "MessageFoundry DR backups have no cloud target (ADR 0049 — no new egress)"
             )
         return value
@@ -7197,10 +7251,9 @@ class DrSettings(_Section):
     @field_validator("seed_archive", "seed_dir")
     @classmethod
     def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
-        scheme = _url_scheme(value)
-        if scheme is not None:
+        if _looks_like_url(value):
             raise ValueError(
-                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL ({scheme}...); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL; "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
         return value
@@ -7214,7 +7267,7 @@ class DrSettings(_Section):
         # that will resolve it: a rooted path with no drive is relative on Windows.
         value = value.strip()
         if value and not os.path.isabs(value):
-            # The value is not quoted: a URL whose scheme _url_scheme missed could carry a
+            # The value is not quoted: a URL that _looks_like_url missed could carry a
             # credential (vault BACKLOG #2600).
             raise ValueError("[dr].seed_dir must be an absolute path, or omitted")
         return value
@@ -7224,10 +7277,9 @@ class DrSettings(_Section):
     def _no_cloud_restore_token(cls, value: str) -> str:
         # The restore-token is a DBA-placed local artifact on the DR box (BACKLOG #223, ADR 0102); like
         # seed_archive it is LOCAL/UNC only — a URL would imply new egress, which DR forbids.
-        scheme = _url_scheme(value)
-        if scheme is not None:
+        if _looks_like_url(value):
             raise ValueError(
-                f"[dr].restore_token must be a LOCAL or UNC path, not a URL ({scheme}...); "
+                "[dr].restore_token must be a LOCAL or UNC path, not a URL; "
                 "the DR restore-token is a local artifact on the DR box (ADR 0102 — no new egress)"
             )
         return value
@@ -7730,6 +7782,86 @@ class ServiceSettings(_InputHidingModel):
                     "pool_size >= 3 for a clustered node (Postgres or SQL Server)"
                 )
         return self
+
+    @model_validator(mode="after")
+    def _sqlserver_renew_clamp_whole_seconds(self) -> ServiceSettings:
+        """On SQL Server a clamp under one second would run at 1 s
+        (``store.sqlserver._clamped_statement_timeout`` says why), a bound above the value
+        ``ClusterSettings._renew_fits_the_margin`` checked, so it is refused here rather than quietly
+        widened. The derived clamp is floored at 1 s and never trips this. Spans two sections, so it
+        lives here."""
+        clamp = self.cluster.lease_renew_timeout_seconds
+        if (
+            self.cluster.enabled
+            and self.store.backend == StoreBackend.SQLSERVER
+            and clamp is not None
+            and not clamp >= 1.0
+        ):
+            raise ValueError(
+                "[cluster].lease_renew_timeout_seconds must be >= 1 on [store].backend = 'sqlserver' "
+                f"(got {clamp}): there it is the ODBC statement timeout, which counts whole seconds, "
+                "so a sub-second clamp cannot be applied. Raise it, or unset it to derive it from the "
+                "detection margin"
+            )
+        return self
+
+    def sqlserver_renew_bound_warning(self) -> str | None:
+        """The start-up warning for a SQL Server renew that may land outside the detection margin,
+        or ``None``.
+
+        ``ClusterSettings._renew_fits_the_margin`` compares the clamp alone with the margin. On SQL
+        Server the claim's borrow and its statement each get the full clamp, so a renew can land up
+        to about twice the clamp after it is issued, plus a COMMIT the clamp does not bound
+        (``store.sqlserver.SqlServerStore._fetchone_clamped``). This names a configuration where
+        twice the clamp reaches the same margin that check uses. A warning, not a refusal: the bound
+        is approximate and the refusal rule is the margin check's (Manager decision
+        d20261030T213636115-0af931). Spans two sections, so it lives here.
+
+        Pure, and logged by ``serve`` once ``configure_logging`` has run, as
+        :meth:`AuthSettings.breaker_budget_warning` is: a validator would log while settings load,
+        which in ``serve`` is before logging reaches its handlers."""
+        clamp = self.cluster.lease_renew_timeout_seconds
+        if not (
+            self.cluster.enabled
+            and self.store.backend == StoreBackend.SQLSERVER
+            and clamp is not None
+        ):
+            return None
+        margin = _detection_margin_seconds(
+            self.cluster.leader_fence_timeout_seconds, self.cluster.leader_lease_ttl_seconds
+        )
+        if not 2 * clamp >= margin:
+            return None
+        # A clamp left unset was derived from the fence/TTL pair, so "lower it" would name a value
+        # the operator never wrote. The set-it remedy is offered only while a clamp both under half
+        # the margin and at the 1 s SQL Server floor exists; below that only widening helps.
+        gap = "the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds"
+        half = margin / 2
+        if self.cluster._renew_clamp_derived:
+            cause = (
+                "lease_renew_timeout_seconds is not set, and the value derived from"
+                " leader_fence_timeout_seconds and leader_lease_ttl_seconds leaves the renew little"
+                f" or no headroom on SQL Server: twice it (2 x {clamp:g} = {2 * clamp:g} s)"
+            )
+            other = f"set lease_renew_timeout_seconds explicitly, below {half:g} s"
+            first = f"Widen {gap}"
+        else:
+            cause = f"twice lease_renew_timeout_seconds (2 x {clamp:g} = {2 * clamp:g} s)"
+            other = f"widen {gap}"
+            first = f"Lower lease_renew_timeout_seconds below {half:g} s"
+        if half > 1.0:
+            remedy = f"{first}, or {other}"
+        else:
+            remedy = (
+                f"Widen {gap}: no clamp of at least 1 s, the SQL Server floor, is below half this"
+                " margin"
+            )
+        return (
+            f"[cluster] on SQL Server: {cause} reaches the demotion detection margin"
+            f" ({margin:g} s). There the lease claim's pool wait and its statement each get the full"
+            " clamp, and its COMMIT is not bounded by it, so a renew issued just before this node"
+            f" self-fences can still land and re-extend the lease. {remedy}"
+        )
 
     @model_validator(mode="after")
     def _dr_activate_not_clustered(self) -> ServiceSettings:
@@ -10721,7 +10853,9 @@ def security_loosenings(
 
 
 def settings_error_detail(exc: Exception) -> str:
-    """Render a :func:`load_settings` failure WITHOUT echoing any configured value.
+    """Return a :func:`load_settings` failure as text, WITHOUT pydantic's ``input``.
+
+    Each message is returned as written, so what a message quotes is still in the text.
 
     WHY ``str(exc)`` WAS NOT SAFE. Pydantic gives every error an ``input``, and for an ``after``-mode
     model validator that is the whole section's input mapping. The secrets in ``_FILE_SECRET_KEYS``
@@ -10746,16 +10880,23 @@ def settings_error_detail(exc: Exception) -> str:
     rule``) and ``security show``'s read of the file's own ``[security]`` table: none of those
     reads the environment.
 
-    THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
+    THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION RETURNS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
-    refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
-    message must name the setting and never quote a secret value. The OIDC URL refusals quote no
-    part of the URL for that reason, and since vault BACKLOG #2600 the ``[backup]`` and ``[dr]``
-    URL refusals quote only the scheme (:func:`_url_scheme`).
+    refusals do, several path and enum refusals, and the ``[auth]`` ``oidc_allowed_endpoints``
+    refusal, which quotes the host and the allow-list. A URL can carry a credential, so a validator
+    message must name the setting and never quote a secret value. Callers print the returned text
+    to at least stderr, a service log and ``security show``'s JSON. At least the ``[backup]`` and
+    ``[dr]`` URL refusals quote no part of the URL for that reason, the text in front of ``://``
+    included, because that text is the value's own and not a known word (vault BACKLOG #2850,
+    :func:`_looks_like_url`).
+
+    NOT COVERED: A MESSAGE NO VALIDATOR WROTE. At least the ``AuthSettings`` OIDC endpoint loop lets
+    the ``ValueError`` from ``urlsplit`` pass, and that message quotes the URL's netloc, its
+    userinfo included.
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
-    is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
-    not a settings model, such as an ``[[alerts.rules]]`` rule.
+    is capped at ``_ERROR_DETAIL_ROWS``, and drops the ``input`` of a ``ValidationError`` from a model
+    that is not a settings model, such as an ``[[alerts.rules]]`` rule.
     """
     from pydantic import ValidationError
 
@@ -10771,8 +10912,8 @@ def settings_error_detail(exc: Exception) -> str:
             else f" (+{len(errors) - _ERROR_DETAIL_ROWS} more)"
         )
         return "; ".join(rows) + extra
-    # Our own model validators raise plain ValueError with hand-authored text naming the key, and
-    # FileNotFoundError/OSError carry a path. Neither reflects a configured value back.
+    # Any other exception is returned as its own text: at least a plain ValueError from the loader,
+    # with whatever text it was raised with, and FileNotFoundError/OSError, which carry a path.
     return str(exc)
 
 

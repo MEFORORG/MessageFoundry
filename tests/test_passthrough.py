@@ -43,6 +43,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
 )
 from messagefoundry.transports.passthrough import PassThroughSource
+from tests._store_audit import no_operator_audit
 
 
 @pytest.fixture
@@ -495,7 +496,7 @@ async def test_replay_of_a_passthrough_only_parent_creates_no_work(pt_store: Mes
     assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
 
     # Nothing to re-send: the marker has no body and nothing could drain it.
-    assert await pt_store.replay(parent, now=200.0) == 0
+    assert await pt_store.replay(parent, now=200.0, audit=no_operator_audit) == 0
     assert await _pending_on(pt_store, "PT_NEXT") == 0
     assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
     # And a restart's orphan sweep finds nothing to kill, so the parent stays truthful.
@@ -511,7 +512,7 @@ async def test_replay_of_a_mixed_parent_ends_processed_across_a_restart(
     assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
 
     # RE-SEND mode: only the real delivery goes back into flight.
-    assert await pt_store.replay(parent, now=200.0) == 1
+    assert await pt_store.replay(parent, now=200.0, audit=no_operator_audit) == 1
     assert await _pending_on(pt_store, "PT_NEXT") == 0
     assert await _status(pt_store, parent) == MessageStatus.ROUTED.value
     assert await _deliver(pt_store, "OB_REAL", now=210.0) == 1
@@ -530,7 +531,7 @@ async def test_recover_replay_of_a_mixed_parent_redelivers_and_ends_processed(
     assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
     assert await _status(pt_store, parent) == MessageStatus.ERROR.value
 
-    assert await pt_store.replay(parent, now=200.0) == 1
+    assert await pt_store.replay(parent, now=200.0, audit=no_operator_audit) == 1
     assert await _deliver(pt_store, "OB_REAL", now=210.0) == 1
     assert await _pending_on(pt_store, "PT_NEXT") == 0
     assert await _status(pt_store, parent) == MessageStatus.PROCESSED.value
@@ -545,7 +546,7 @@ async def test_replay_leaves_a_depth_capped_marker_dead_and_the_parent_truthfull
     parent = await _handoff(pt_store, outbound=True, depth_capped=True)
     assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
 
-    assert await pt_store.replay(parent, now=200.0) == 1
+    assert await pt_store.replay(parent, now=200.0, audit=no_operator_audit) == 1
     assert await _pending_on(pt_store, "PT_NEXT") == 0
     assert await _deliver(pt_store, "OB_REAL", now=210.0) == 1
     assert await _status(pt_store, parent) == MessageStatus.ERROR.value
@@ -553,7 +554,7 @@ async def test_replay_leaves_a_depth_capped_marker_dead_and_the_parent_truthfull
     # A parent whose ONLY row is the dead marker: nothing is replayable, and it stays ERROR.
     alone = await _handoff(pt_store, outbound=False, depth_capped=True, routed_id="routed-2")
     assert await _status(pt_store, alone) == MessageStatus.ERROR.value
-    assert await pt_store.replay(alone, now=300.0) == 0
+    assert await pt_store.replay(alone, now=300.0, audit=no_operator_audit) == 0
     assert await _pending_on(pt_store, "PT_NEXT") == 0
     assert await _status(pt_store, alone) == MessageStatus.ERROR.value
 
@@ -566,13 +567,16 @@ async def test_bulk_dead_replay_skips_a_depth_capped_marker(pt_store: MessageSto
     )
     assert await _fail(pt_store, "OB_REAL", now=110.0) == 1
 
-    assert await pt_store.replay_dead(now=200.0) == 1
+    assert await pt_store.replay_dead(now=200.0, audit=no_operator_audit) == 1
     assert await _pending_on(pt_store, "PT_NEXT") == 0
     # The capped parent is not reverted to ROUTED with nothing re-queued behind it.
     assert await _status(pt_store, capped) == MessageStatus.ERROR.value
     assert await _status(pt_store, control) == MessageStatus.ROUTED.value
     # Scoped to the marker's own lane, it re-queues nothing and changes nothing.
-    assert await pt_store.replay_dead(destination_name="PT_NEXT", now=300.0) == 0
+    assert (
+        await pt_store.replay_dead(destination_name="PT_NEXT", now=300.0, audit=no_operator_audit)
+        == 0
+    )
     assert await _status(pt_store, capped) == MessageStatus.ERROR.value
 
 
@@ -604,7 +608,11 @@ async def test_resend_to_never_takes_a_marker_as_its_source(pt_store: MessageSto
     parent = await _handoff(pt_store, outbound=True)
     assert await _deliver(pt_store, "OB_REAL", now=110.0) == 1
     outcome = await pt_store.resend_to(
-        message_id=parent, to="OB_STANDBY", idempotency_key="k-mixed", now=200.0
+        message_id=parent,
+        to="OB_STANDBY",
+        idempotency_key="k-mixed",
+        now=200.0,
+        audit=no_operator_audit,
     )
     assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
     assert await _pending_on(pt_store, "PT_NEXT") == 0
@@ -613,7 +621,11 @@ async def test_resend_to_never_takes_a_marker_as_its_source(pt_store: MessageSto
     alone = await _handoff(pt_store, outbound=False, routed_id="routed-2")
     with pytest.raises(ResendSourceNotFound):
         await pt_store.resend_to(
-            message_id=alone, to="OB_STANDBY", idempotency_key="k-alone", now=300.0
+            message_id=alone,
+            to="OB_STANDBY",
+            idempotency_key="k-alone",
+            now=300.0,
+            audit=no_operator_audit,
         )
 
 

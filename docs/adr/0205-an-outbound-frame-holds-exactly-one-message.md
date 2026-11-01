@@ -85,9 +85,13 @@ as the accepted draft wrote them except where a point below says otherwise.
      bytes it frames. For a shadow single send, MLLP's `check_frame` judges the payload after the
      same delimiter rewrites `send()` applies (`encoding_characters`, `hl7_raw_separators`),
      which drop a frame byte at either end, and the shadow path re-attaches a detached document
-     first, so it sees the bytes a live send would frame. Shadow mirrors rule 1 only: a re-attach
-     or rewrite failure there is skipped and the row completes, as before this change, although a
-     live send would retry it. A batch member is judged as it sits in the envelope, with no rewrite
+     first, so it sees the bytes a live send would frame. Shadow mirrors rule 1 only: a retryable
+     re-attach or rewrite failure (a `DeliveryError`) there is skipped and the row completes, as before this
+     change, although a live send would retry it. *Amended 2026-11-01 (vault BACKLOG #2809):* on an
+     MLLP or TCP outbound, the only ones on which shadow re-attaches, a re-attach the payload
+     itself breaks dead-letters in shadow as live, and a stored document
+     holding a CR or LF takes the outbound's internal-error policy in shadow as live; ADR 0105,
+     Phase 1b, says which is which. A batch member is judged as it sits in the envelope, with no rewrite
      (`rewrite=False`), because `send()` rewrites the whole envelope and the envelope carries each
      member as stored. A member's refusal is dead-lettered only after the rest of the batch is
      resolved, or before a lane stop, so a store fault there cannot reach the clean members. A

@@ -73,6 +73,8 @@ __all__ = [
     "DOC_REF_MARKER",
     "BinaryCarriageError",
     "DocRefError",
+    "EscapedDocumentError",
+    "UnreattachableDocumentError",
     "encode",
     "decode",
     "is_marked",
@@ -112,6 +114,25 @@ class DocRefError(ValueError):
     ``mfdoc:v1:ref:`` marker, or a malformed body (a content address that is not a 64-hex SHA-256).
     Subclasses ``ValueError`` so a mis-formed handle propagates to the error/dead-letter path rather
     than dereferencing garbage."""
+
+
+class EscapedDocumentError(ValueError):
+    """An OBX-5 ED Base64 document's ``OBX-5.5`` holds the message's HL7 escape character, so it
+    cannot be detached verbatim (vault BACKLOG #2809). The read decodes an escape such as ``\\X0D\\``
+    to the character it names, so the stored value would not be the sender's bytes, and a decoded CR
+    would make every later re-attach raise. Base64 needs no escape, so the ingress detach refuses the
+    message instead. The text names the OBX occurrence only, never a byte of the value."""
+
+
+class UnreattachableDocumentError(ValueError):
+    """The payload itself stops a re-attach (vault BACKLOG #2809). Two shapes only: the parser
+    refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault`` set), or its
+    MSH-1 and MSH-2 do not name its separators. The same payload fails the same way on every
+    attempt, so the delivery path refuses it permanently. Every other
+    ``ValueError`` in the re-attach may be an engine fault and stays the outbound's internal-error
+    policy to judge, at least a parser fault and a stored document that holds a CR or LF. The
+    ingress detach refuses an escape and a raw LF ends the segment, so no payload can leave a stored
+    CR or LF. The text names the step, never a byte of the payload."""
 
 
 def _b64encode_unbroken(data: bytes) -> str:
@@ -323,6 +344,37 @@ def parse_doc_ref(value: str) -> tuple[str, str]:
 # put_attachment + the OBX-5.5 replace are orchestrated by the ingress path (pipeline/), which owns the
 # store. The value returned per document IS the exact OBX-5.5 base64 string: the base64 alphabet carries
 # no HL7 delimiter, so the message's own escaping is a no-op on it and Message.field yields it verbatim.
+# A value that holds the escape character anyway is refused rather than yielded (vault BACKLOG #2809).
+
+
+def _obx_5_5_holds_escape(message: Message, occurrence: int) -> bool:
+    """Whether the RAW (still escaped) ``OBX-5.5`` text of that OBX holds the message's escape
+    character. ``Message.field`` decodes escapes on a component read, so the raw field is scanned by
+    position instead, on the first repetition as that read takes it. Nothing is copied, and clean
+    base64 costs one scan for the escape character from the start of component 5."""
+    _field_sep, comp_sep, rep_sep, esc, _sub_sep = message._encoding_chars()
+    raw = message.field("OBX-5", occurrence=occurrence) or ""
+    start = 0
+    for _ in range(4):  # past the separators ahead of component 5
+        start = raw.find(comp_sep, start)
+        if start == -1:
+            return False
+        start += 1
+    if raw.find(rep_sep, 0, start) != -1:
+        return False  # the first repetition ends before component 5
+    hit = raw.find(esc, start)
+    # The escape counts only if no separator closes component 5 before it.
+    return (
+        hit != -1 and raw.find(comp_sep, start, hit) == -1 and raw.find(rep_sep, start, hit) == -1
+    )
+
+
+def _is_base64_ed(message: Message, occurrence: int) -> bool:
+    """Whether that OBX carries an ED value encoded ``Base64`` (``OBX-2`` and ``OBX-5.4``)."""
+    if (message.field("OBX-2", occurrence=occurrence) or "").upper() != "ED":
+        return False
+    encoding = message.field("OBX-5.4", occurrence=occurrence) or ""
+    return encoding.strip().lower() == _ED_ENCODING.lower()
 
 
 def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tuple[int, str, str]]:
@@ -333,13 +385,22 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
     ``"Base64"``, ``OBX-5.5`` non-empty and not already a tombstone **or** a live ``mfdoc:v1:ref:``
     handle — a re-scan of an already-detached skeleton yields nothing, so a re-run is a no-op). The
     ``content_type`` is the ED type-of-data component (``OBX-5.2``), the same label the tombstone uses.
-    Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``."""
+    Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``.
+
+    Raises :class:`EscapedDocumentError` when any ED Base64 ``OBX-5.5`` holds the escape character,
+    whose value would be decoded rather than verbatim (vault BACKLOG #2809). Every document is checked
+    before the first is yielded, so a caller that stores each one as it goes has stored none of them
+    when the refusal comes."""
     count = message.count_segments("OBX")
-    for occ in range(1, count + 1):
-        if (message.field("OBX-2", occurrence=occ) or "").upper() != "ED":
-            continue
-        if (message.field("OBX-5.4", occurrence=occ) or "").strip().lower() != _ED_ENCODING.lower():
-            continue  # not Base64-encoded ED — leave it
+    occurrences = [occ for occ in range(1, count + 1) if _is_base64_ed(message, occ)]
+    for occ in occurrences:
+        if _obx_5_5_holds_escape(message, occ):
+            raise EscapedDocumentError(
+                f"OBX occurrence {occ}: the Base64 document in OBX-5.5 holds an HL7 escape "
+                "sequence, which base64 never needs; refusing to detach a value that is not the "
+                "sender's verbatim bytes"
+            )
+    for occ in occurrences:
         data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
         if not data_b64 or is_document_tombstone(data_b64) or is_doc_ref(data_b64):
             continue  # empty / already-stripped / already-detached — idempotent
@@ -501,7 +562,9 @@ async def reattach_documents_in_hl7(
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
     :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
-    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched."""
+    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The two
+    payload-caused shapes :class:`UnreattachableDocumentError` names raise it; every other
+    ``ValueError`` propagates as it is, a stored document holding a CR or LF included."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -509,6 +572,7 @@ async def reattach_documents_in_hl7(
     import asyncio
 
     from messagefoundry.parsing.message import Message
+    from messagefoundry.parsing.peek import HL7PeekError
 
     # The parse, each splice and the re-encode run in a thread (vault BACKLOG #2757): the splice and
     # the encode scale with the document, and this runs on every delivery attempt. Measured 2026-10-06
@@ -517,7 +581,23 @@ async def reattach_documents_in_hl7(
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
     def _handles() -> tuple[Message, list[tuple[int, str]]]:
-        message = Message.parse(text)
+        refused: str | None = None
+        try:
+            message = Message.parse(text)
+        except HL7PeekError as exc:
+            if exc.parser_fault:
+                raise  # a fault in the parser, not the payload: the internal-error policy judges it
+            refused = "the payload does not parse as HL7"
+        if refused is not None:
+            # Raised after the handler, so the parse error, which may quote the payload, is on no
+            # chain.
+            raise UnreattachableDocumentError(refused)
+        # The separators every OBX-5.5 read below needs, by the rule Message._encoding_chars applies:
+        # an MSH-1 or MSH-2 that cannot name them is the payload's, and every read would raise on it.
+        if len(message._raw_field("MSH", 1)) != 1 or len(message._raw_field("MSH", 2)) < 4:
+            raise UnreattachableDocumentError(
+                "the payload's MSH-1 and MSH-2 do not name its separators"
+            )
         found: list[tuple[int, str]] = []
         for occ in range(1, message.count_segments("OBX") + 1):
             value = message.field("OBX-5.5", occurrence=occ) or ""
@@ -540,6 +620,17 @@ async def reattach_documents_in_hl7(
             raise DocRefError(
                 f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
                 "deliver an un-hydrated document handle"
+            )
+        if "\r" in verbatim or "\n" in verbatim:
+            # Message.set refuses a CR or LF in a field value. No payload can leave one in the store:
+            # the ingress detach refuses an escaped OBX-5.5, and a raw LF ends the segment before the
+            # read. So a stored CR or LF is store corruption or an engine bug: a plain ValueError for
+            # the outbound's internal-error policy to judge (STOP stops the lane), never the
+            # payload's permanent refusal (vault BACKLOG #2809). Checked here rather than caught from
+            # set, so the text names the OBX occurrence and no byte of the value.
+            raise ValueError(
+                f"the stored document for OBX-5.5 occurrence {occ} holds a CR or LF, so it cannot "
+                "be set back"
             )
         await asyncio.to_thread(message.set, "OBX-5.5", verbatim, occurrence=occ)
     return await asyncio.to_thread(message.encode)

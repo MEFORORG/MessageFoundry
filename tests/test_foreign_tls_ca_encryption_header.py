@@ -153,7 +153,7 @@ def test_an_sslca_file_with_an_encryption_header_is_refused(
 def test_a_plain_sslca_file_still_builds(tmp_path: Path) -> None:
     """The control: the same certificate without the headers goes to the driver unchanged."""
     ca = _write(tmp_path, _certificate())
-    assert f"SSLCA={{{ca}}}" in _build(SSLCA=ca)
+    assert f"SSLCA={ca};" in _build(SSLCA=ca)
 
 
 #: BACKLOG #3745: a key block with no encryption header, PKCS#8 encrypted and plain.
@@ -189,7 +189,7 @@ def test_an_sslca_file_with_a_private_key_is_refused(tmp_path: Path, label: str)
 
 def test_a_missing_sslca_file_is_left_to_the_driver(tmp_path: Path) -> None:
     ca = str(tmp_path / "no-such-ca.pem")
-    assert f"sslca={{{ca}}}" in _build(sslca=ca)
+    assert f"sslca={ca};" in _build(sslca=ca)
 
 
 def test_an_sslca_file_the_check_cannot_read_is_refused(
@@ -225,14 +225,17 @@ def test_an_sslca_file_past_the_read_cap_is_refused_not_read_in_part(
         _build(sslca=ca)
 
 
-def test_a_padded_sslca_value_is_checked_as_a_driver_may_trim_it(tmp_path: Path) -> None:
-    """``_refuse_remote_path`` judges the trimmed spelling, so a driver may trim the value."""
+def test_a_padded_sslca_value_is_refused(tmp_path: Path) -> None:
+    """BACKLOG #2705: values are sent unbraced, and a driver may trim a padded one or keep it, so
+    a padded value is refused at build, whatever the file holds."""
     ca = _write(tmp_path, _headered(_certificate()))
-    with pytest.raises(ValueError, match=re.escape(f"the CA file {ENCRYPTION_HEADER_SCOPE}")):
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
         _build(sslca=f" {ca} ")
-    # The control: the same padding around a plain file builds, on every platform.
     plain = _write(tmp_path, _certificate(), "plain.pem")
-    assert f"sslca={{ {plain} }}" in _build(sslca=f" {plain} ")
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
+        _build(sslca=f" {plain} ")
+    # The control: the same file unpadded builds.
+    assert f"sslca={plain};" in _build(sslca=plain)
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need POSIX mkfifo")
@@ -240,15 +243,15 @@ def test_a_pipe_named_as_sslca_is_not_opened(tmp_path: Path) -> None:
     """Opening a pipe with no writer would wait, which is what the check exists to prevent."""
     pipe = tmp_path / "ca.pipe"
     os.mkfifo(pipe)
-    assert f"sslca={{{pipe}}}" in _build(sslca=str(pipe))
+    assert f"sslca={pipe};" in _build(sslca=str(pipe))
 
 
 def test_a_ca_directory_still_reaches_the_driver(tmp_path: Path) -> None:
     """The stated remainder: a directory is not changed, whether it is named as ``sslcapath``,
     where it belongs, or as ``sslca``. Each holds an encrypted block, and each still builds."""
     _write(tmp_path, _headered(_certificate()), "0a1b2c3d.0")
-    assert f"sslcapath={{{tmp_path}}}" in _build(sslcapath=str(tmp_path))
-    assert f"sslca={{{tmp_path}}}" in _build(sslca=str(tmp_path))
+    assert f"sslcapath={tmp_path};" in _build(sslcapath=str(tmp_path))
+    assert f"sslca={tmp_path};" in _build(sslca=str(tmp_path))
 
 
 @pytest.mark.parametrize("keyword", ["sslrootcert", "sslcrl", "sslcrldir", "ServerCertificate"])

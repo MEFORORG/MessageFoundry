@@ -56,9 +56,9 @@ argon2-cffi-bindings==26.1.0 \
     --hash=sha256:f9c4420a7a864fe1b86ce35befc95b8e39fb852493b81cf798671ddc265de638 \
     --hash=sha256:ffff613aaa9ce6236766e2fc6dc560bb5abde7a2e2416e3db1f9ae395a2b4dd4
     # via argon2-cffi
-certifi==2026.10.19 \
-    --hash=sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae \
-    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
+certifi==2026.10.23 \
+    --hash=sha256:a9895e6e2758b371e0545e321a3a8fd1fcfd9829ada8824a936dfb16aaaf36cd \
+    --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
     # via
     #   httpcore
     #   httpx
@@ -177,9 +177,9 @@ cryptography==50.0.2 \
     # via
     #   messagefoundry
     #   pyspnego
-fastapi==0.146.0 \
-    --hash=sha256:0eb9985a7d5bb11ce9a962d4b65e0cf1a2e13d6aca2e14da57bc526370e26748 \
-    --hash=sha256:e96047fc353ff43f7fda069c3578a7d94902a762d9aca2e065f7f801abd91a49
+fastapi==0.162.0 \
+    --hash=sha256:3785963de305dd09912426cb81f2d230fce98ab3521cdfe97265c8d14983128c \
+    --hash=sha256:6a22c1e2e6e32e0633ee7e170f00009a29b8228b16feb219ee42f32fd8d88a8f
     # via messagefoundry
 h11==0.16.0 \
     --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
@@ -325,26 +325,26 @@ pydantic-core==2.50.1 \
     --hash=sha256:f5187624823423e1d1b82b1072ac41dc837389e18d3d0572cc19bbee46cd550a \
     --hash=sha256:fe90228920fd8ff2be62622b6bb8a2b11acd65046d50c6b130614b5879605a20
     # via pydantic
-pyside6==6.11.2 \
-    --hash=sha256:0444ac71d0791a19bded35f6d9a94515941f23a6eb7098ca45a1b64a338be697 \
-    --hash=sha256:13a3c79816879d9743672a669f1988f74459a78f89a97a2624fae4fe059ffa3a \
-    --hash=sha256:3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f \
-    --hash=sha256:57fe867a6c93821a085d74e8a26f863fc2363516848181c466032595b33b1729 \
-    --hash=sha256:dc6d03990489a5085842770718392ef5de36352d8f608d9a9fe03e60af4d7b66
+pyside6==6.11.3 \
+    --hash=sha256:aa85bea06acb593564ec9cc1b0218510115341bcaa9585348760e4b9cac260cf \
+    --hash=sha256:adf77fd541dd97a3e96ccc081982231afbeae2af3b74b98253176f463703085c \
+    --hash=sha256:c01ca54bb64f065129ab23eeb82696b4d4b47f594078ee18ac9b0698009b096c \
+    --hash=sha256:ef2bdb61b1ad7e5e8db8ca7fb1a60d8b7960dfd490c582d005d8903044ab44f1 \
+    --hash=sha256:f52e98bfcc409e2cec4d70b4ca47e11a51737d48b3ea2a0a1af23652bfb8395a
     # via messagefoundry
-pyside6-addons==6.11.2 \
-    --hash=sha256:354c574a839f7d0751960ba03f33bec87c95e0f2796dca3287f54d03abe97dac \
-    --hash=sha256:a2ca3c73e5f060d4aca49451abd9fba68dd0e1c66ff40cea3a1fe0415def579a \
-    --hash=sha256:a8b00956925fbdeffc7052cf933506391289f35ac4f3f71a0a167ec195cd47b4 \
-    --hash=sha256:d5606af369484b862b4d5741cfc179e19d2b8819c3e04d210b8188e0c9f85988 \
-    --hash=sha256:f449ea4431da20e7b86752cca8d166f93434516fe417f981c27e5f8e1b554407
+pyside6-addons==6.11.3 \
+    --hash=sha256:5cab663fbff1b7a1fa7e641754de3ca1ea410407fc70bd4e240144b42d09a69c \
+    --hash=sha256:6d536493003c5f409ba1bf52d8053e23f9c97f291e2a347a676902bfe0a1a31e \
+    --hash=sha256:70bc141b13db2a36323bf0288b9e8a6f7e9bb3c3d0faeaa722ea61334f555e01 \
+    --hash=sha256:94a17b92bd9285e4044b11e78c18d4b452c5ed637906dabd383a11836f24f86f \
+    --hash=sha256:a9af3d2719578f2bb8899098754183d5bee9c8d707b777aac98e10f2e9e55002
     # via pyside6
-pyside6-essentials==6.11.2 \
-    --hash=sha256:77795c145202e65a78d88f7cd409d186e3ba23d159bdb3ba2dcd159ae5e5f0d9 \
-    --hash=sha256:aaf9f25f0f324874085fa5b26a610318db8a8e243cf85bb3e5400595191c7778 \
-    --hash=sha256:c8a29def77032773a30879f7f24415b5395ad08592d147c170824ef4c735dfc1 \
-    --hash=sha256:d3ec6e1885c46e57f16364f38ea8040ffc5dc0b18341058f608fede3ba930567 \
-    --hash=sha256:fadd75c5c20800d64dd0a586ea8cb337c5e630aa2246df0e5105738afa46e02c
+pyside6-essentials==6.11.3 \
+    --hash=sha256:b7d77901d5fb413e96788cb15c56177cbbad0ff12605c716abdc79eabe4ba859 \
+    --hash=sha256:c6a5c3b58bf55aef6e09a7de690ff6133335014ab81a7f22f56363ea08e8f6a3 \
+    --hash=sha256:ca3a6dc165d66d714f443f22cb8631be8d3c5d0c27d0a104d394ee662f1f853a \
+    --hash=sha256:e153290e03ef5bae4b29c584db0193e14d291a21c32030f6953fe98879b3202c \
+    --hash=sha256:ea61687d2c27f8cc7a851c259481be1001dbffa3bebacea4491d9905e7a5d0cf
     # via
     #   pyside6
     #   pyside6-addons
@@ -352,12 +352,12 @@ pyspnego==0.12.4 \
     --hash=sha256:a29a34de1abe9e9b30d9aa1d363f8e49fc159eb7355b1f2ee86ccb3a2ce3bba9 \
     --hash=sha256:acb314d6ca5c9ce87994b1eebbe2d8b687e0d564f9d650b306afb4c8f9c2ffd5
     # via messagefoundry
-shiboken6==6.11.2 \
-    --hash=sha256:4bbbd6fa4d7cff5ec5e12bc4c10e1d845fa30c89457ecb13cc64f7bddb77f6f9 \
-    --hash=sha256:53659683b1f7a08e9f87eff9b1065f1ceb7110cd7a4bc09fdf5efe43d286604d \
-    --hash=sha256:6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a \
-    --hash=sha256:7a7a0a72a9ed26c9bf77d42246b1c736486befb8f31aa2fb29957ea4cdd1c1c2 \
-    --hash=sha256:97c49432488df958f0308736f3d15b6915d8826fc380af17bb4b9ec5c4a5e81b
+shiboken6==6.11.3 \
+    --hash=sha256:01d172ec9599fed315aec025b1424ff945ae5358f87588a848797616a18de6e7 \
+    --hash=sha256:1d38919492d08417b7579ad077bc81110d05183d21eb21d66316bc556140a8a3 \
+    --hash=sha256:28c826799dba54bbea95417130127b70e05ddcb0190f4d28e9da8fc8808bdc1b \
+    --hash=sha256:9287279112201e18a7820d29ce9dc4ceca4148c681f4189aff6f4cea652d43af \
+    --hash=sha256:e601c957011345c741b88f661a12486f478db881d6777bdf37e3dc7a8d3387c6
     # via
     #   pyside6
     #   pyside6-addons
@@ -374,9 +374,9 @@ sspilib==0.6.0 ; sys_platform == 'win32' \
     --hash=sha256:b4d4e3402230f14cd93999f3953619163075bcaca3e13dcf2ab5942c269627f4 \
     --hash=sha256:b841fabe630101d9e2be6ba56407a2a539087ee85d6ca1477748c21135c9f636
     # via pyspnego
-starlette==1.9.0 \
-    --hash=sha256:3d931de246ed870e35ce605974440816ef895e592f255d1396cfdf191d4c4318 \
-    --hash=sha256:fd3f159936e882d06c1108f84688f7cda2cf85fc6a592a50edbd175e882c2ddc
+starlette==1.10.0 \
+    --hash=sha256:478c0ab3b4ced6e82719849c118fa406f0278a3499c1a898cd15cd31bdc38ce4 \
+    --hash=sha256:b8399098d4c1e3522734f7235dc79b1fc967f96cf139c81e0fa30479e0685f9b
     # via
     #   fastapi
     #   messagefoundry

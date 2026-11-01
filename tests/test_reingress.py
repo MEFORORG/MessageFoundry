@@ -31,6 +31,7 @@ from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.store.queue_tag import queue_payload_aad, queue_row_aad
 from messagefoundry.transports.loopback import LoopbackSource
+from tests._store_audit import no_operator_audit
 
 
 @pytest.fixture
@@ -631,7 +632,7 @@ async def test_reingressed_handler_loses_response_view_after_retention_purge(tmp
 
             # Pass 2: replay the DEAD routed row. The Handler RUNS, but with no correlation_id to key
             # the response_view on, response_get returns None — so it can emit different CONTENT.
-            assert await store.replay(child_id) >= 1
+            assert await store.replay(child_id, audit=no_operator_audit) >= 1
             for _ in range(200):
                 await asyncio.sleep(0.02)
                 if len(calls) > 1:

@@ -121,7 +121,7 @@ jobs:
         with:
           persist-credentials: false # CodeQL uploads via the job token, not a persisted git credential
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           # security-extended adds higher-recall security queries on top of the default suite.
@@ -159,6 +159,6 @@ jobs:
         #      results while every check stays green. The correct form leads with
         #      `github.event_name == 'pull_request' &&`, which short-circuits before the null read.
         #      Do not "simplify" that conjunct away.
-        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"

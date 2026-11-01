@@ -1328,6 +1328,7 @@ _BACKEND_OPEN_OUTSIDE_THE_SEAM = {
 #: refuses any open without a key before it opens anything and so keeps the refusing default.
 _CLI_OPENERS = {
     "_admin_unlock.run",
+    "_admin_revoke_sessions.run",  # BACKLOG #2614
     "_admin_set_notify_email.run",
     # ADR 0171 Amendment B: one opener, shared by the refusal checks before the key is shown and
     # by the write

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from messagefoundry.auth.oidc.jwks import JwksCache, JwksError
 from messagefoundry.config.models import SignatureAlgorithm
+from messagefoundry.domainshape import upn_suffix_key
 from messagefoundry.transports.signing import (
     SigningError,
     require_public_key_for_alg,
@@ -91,7 +92,8 @@ class OidcClaimPolicy:
     max_age_seconds: int
     username_claim: str = "preferred_username"
     username_strip_domain: bool = True
-    #: Lower-cased UPN suffixes the username claim may carry when ``username_strip_domain`` is on.
+    #: UPN suffixes the username claim may carry when ``username_strip_domain`` is on, each in the
+    #: form :func:`~messagefoundry.domainshape.upn_suffix_key` gives.
     #: Empty + stripping enabled means every login is refused — fail-closed by construction, so a
     #: caller that forgets to populate it cannot accidentally strip unchecked.
     allowed_username_domains: frozenset[str] = frozenset()
@@ -435,7 +437,7 @@ def _resolve_username(claims: Mapping[str, object], policy: OidcClaimPolicy) -> 
         )
     # rpartition would let "admin@evil.example@corp.example" pass by matching only the LAST label,
     # so the suffix is everything after the FIRST '@' — matching how the local part is taken.
-    if domain.strip().lower() not in policy.allowed_username_domains:
+    if upn_suffix_key(domain) not in policy.allowed_username_domains:
         raise ClaimsError(
             "username_domain_not_allowed",
             f"{policy.username_claim!r} UPN suffix is not in the configured allow-list",

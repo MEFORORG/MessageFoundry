@@ -47,6 +47,7 @@ from messagefoundry.transports.mllp import (
     build_ack,
     frame,
 )
+from messagefoundry.transports.receipt import RefusalKind
 
 _INBOUND = "IB_HL7"
 _HEADER = "MSH|^~\\&|SEND|SFAC|RECV|RFAC|20260101||ADT^A01|CTRL1594|P|2.5.1"
@@ -150,9 +151,9 @@ async def test_the_http_listener_commits_a_message_with_a_blank_segment(
     store: MessageStore,
 ) -> None:
     rr, ic = runner
-    mid = await rr._handle_inbound_http(ic, _SHAPES[shape].encode())
+    receipt = await rr._handle_inbound_http(ic, _SHAPES[shape].encode())
 
-    assert isinstance(mid, str) and mid
+    assert receipt.refusal is None and receipt.message_id
     rows = await _rows(store)
     assert len(rows) == 1 and rows[0]["status"] == MessageStatus.RECEIVED.value
     assert rows[0]["control_id"] == "CTRL1594"
@@ -291,9 +292,9 @@ async def test_a_faulting_peek_read_records_error_on_http(
     rr, ic = runner
     _faulting_control_id(monkeypatch)
 
-    mid = await rr._handle_inbound_http(ic, _SHAPES["control"].encode())
+    receipt = await rr._handle_inbound_http(ic, _SHAPES["control"].encode())
 
-    assert mid is None
+    assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store)
     assert len(rows) == 1 and rows[0]["status"] == MessageStatus.ERROR.value
     assert await _queue_depth(store) == 0

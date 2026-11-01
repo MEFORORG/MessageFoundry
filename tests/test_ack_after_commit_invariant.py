@@ -50,6 +50,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.receipt import IngressReceipt
 
 _INBOUND = "IB_HL7"
 
@@ -108,7 +109,7 @@ async def _raise_injected(*args: Any, **kwargs: Any) -> NoReturn:
     raise _InjectedStoreFailure("injected store failure at the ingress commit boundary")
 
 
-async def _outcome(call: Awaitable[str | None]) -> object:
+async def _outcome(call: Awaitable[object]) -> object:
     """Await ``call`` and return what it produced, or ``_RAISED`` if the injected failure propagated."""
     try:
         return await call
@@ -179,7 +180,7 @@ async def test_http_ingress_commit_failure_returns_no_receipt_and_persists_nothi
 
     # HTTP's receipt is the engine message_id the source maps to a 202-with-id (ADR 0023 D3). An id
     # handed back over an empty store is the same defect as an AA over an empty store.
-    assert not isinstance(outcome, str), "a receipt id came back though the commit failed"
+    assert not isinstance(outcome, IngressReceipt), "a receipt came back though the commit failed"
     assert await _counts(store) == (0, 0), "a row landed though the ingress commit failed"
     assert outcome is _RAISED, "the commit failure was swallowed instead of propagating"
 
@@ -189,9 +190,9 @@ async def test_control_http_ingress_commit_succeeds_returns_receipt_and_persists
 ) -> None:
     runner, ic = inbound
 
-    mid = await runner._handle_inbound_http(ic, _HL7_OK)
+    receipt = await runner._handle_inbound_http(ic, _HL7_OK)
 
-    assert isinstance(mid, str) and mid
+    assert receipt.refusal is None and receipt.message_id
     assert await _counts(store) == (1, 1)
 
 

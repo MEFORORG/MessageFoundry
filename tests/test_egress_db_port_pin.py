@@ -79,7 +79,7 @@ def test_generic_port_keyword_off_the_pin_is_refused(
     # The probe: `port` agrees with the entry, the PORT keyword the driver is sent does not. The
     # shipped code read `port` and ADMITTED this hop.
     kw = _generic(server=HOST, port=5432, odbc_params={"PORT": "6432"})
-    assert "PORT={6432}" in _build_odbc_dsn(dict(Database(statement=STATEMENT, **kw).settings))
+    assert "PORT=6432;" in _build_odbc_dsn(dict(Database(statement=STATEMENT, **kw).settings))
     with pytest.raises(WiringError, match="at port 6432, the port this connection names"):
         check(kw, PINNED)
 

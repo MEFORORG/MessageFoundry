@@ -197,9 +197,7 @@ def _refuse_an_unrevoked_ai_hop(
     once per process for each host. Any other answer refuses, so a new one fails closed.
 
     It acts on the answer itself rather than through ``RevocationHopGuard.enforce_construction``,
-    for three reasons: that method's attested-crossing line names a connection's
-    ``tls_revocation_attested`` as the declaration, where this hop's lever is the ``[ai]`` pair; it
-    logs on every build, and the broker is built per request; and it raises
+    for two reasons: it logs on every build, and the broker is built per request; and it raises
     ``InsecureHopRefused``, which the route does not map, so a refusal would surface as an
     unhandled 500. :class:`AiBrokerError` is answered 503."""
     # Each ValueError below is re-raised as this module's single error type OUTSIDE its handler,
@@ -251,6 +249,7 @@ def _refuse_an_unrevoked_ai_hop(
         context=context,
         posture=held,
         connection=None,  # the [ai] endpoint, not a connection
+        declaration="[ai].endpoint_revocation_attested",
     )
     disposition = guard.disposition()
     enforcing = held.enforcing
@@ -259,10 +258,10 @@ def _refuse_an_unrevoked_ai_hop(
         "certificate, but NO certificate revocation checking (OCSP/CRL) is performed"
     )
     if disposition is HopDisposition.ALLOW:
-        # Not when the context checks a CRL: that hop crossed on a real check, not on the
+        # Not when the context's CRL is a real check: that hop crossed on it, not on the
         # attestation, and the line would be a false record. No CRL reaches it today; a later CRL
         # lever must revisit this arm and the refusal's lever text together.
-        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_checked
+        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_is_a_check
         if crossed_on_attestation and _first_crossing("attested", host):
             log_attested_crossing(
                 logger,
@@ -270,7 +269,7 @@ def _refuse_an_unrevoked_ai_hop(
                 connection=None,
                 detail=f"{_AI_HOP_CELL}: {detail}",
                 reason=revocation_reason,
-                declaration="[ai].endpoint_revocation_attested",
+                declaration=guard.declaration,
             )
         return
     if disposition is HopDisposition.WARN:

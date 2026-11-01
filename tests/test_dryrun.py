@@ -123,6 +123,67 @@ def test_router_exception_is_error() -> None:
     assert result.error and "router/handler error" in result.error
 
 
+@pytest.mark.parametrize(
+    ("code", "named"),
+    [(0, " with code 0"), (3, " with code 3"), (None, ""), ("bad MRN 12345", "")],
+    ids=["zero", "three", "none", "text"],
+)
+@pytest.mark.parametrize("where", ["router", "handler"])
+def test_sys_exit_in_user_code_is_an_error_not_an_exit(
+    where: str, code: object, named: str
+) -> None:
+    """``SystemExit`` is not an ``Exception``, so a Router or Handler calling ``sys.exit()`` left
+    ``dry_run`` and ended ``messagefoundry check`` with the script's own code, 0 included, which reads
+    as a pass. It is an ERROR naming only an integer exit code: ``sys.exit("...")`` carries the
+    author's text, which could quote a field."""
+
+    def exits(msg: Message) -> Any:
+        raise SystemExit(code)
+
+    if where == "router":
+        registry = _registry(exits, {})
+    else:
+        registry = _registry(lambda m: ["h"], {"h": exits})
+
+    result = dry_run(registry, ADT_A01)
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == (
+        f"router/handler error: Router or Handler code raised SystemExit{named} "
+        "(sys.exit() at run time)"
+    )
+
+
+@pytest.mark.parametrize("where", ["router", "handler"])
+def test_a_converted_sys_exit_does_not_chain_the_authors_text(where: str) -> None:
+    """``raise ... from None`` still leaves the caught exit on ``__context__``, and with it the text
+    ``sys.exit("...")`` carried; the conversion must chain nothing a traceback printer could read."""
+    from messagefoundry.pipeline.dryrun import UserCodeCalledSysExit
+
+    def exits(msg: Message) -> Any:
+        raise SystemExit("bad MRN 12345")
+
+    registry = (
+        _registry(exits, {}) if where == "router" else _registry(lambda m: ["h"], {"h": exits})
+    )
+
+    with pytest.raises(UserCodeCalledSysExit) as caught:
+        route_message(registry, registry.inbound["in"], ADT_A01)
+
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert "12345" not in str(caught.value)
+
+
+def test_keyboard_interrupt_in_user_code_still_stops_the_dry_run() -> None:
+    """An interrupt is the operator's, not a fault in the message, so it is not converted."""
+
+    def interrupted(msg: Message) -> list[str]:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        dry_run(_registry(interrupted, {}), ADT_A01)
+
+
 def test_strict_validation_error() -> None:
     bad = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|N1|P|2.5.1\rEVN|A01|20260101\r"  # no PID
     result = dry_run(_registry(lambda m: ["h"], {"h": lambda m: Send("out", m)}, strict=True), bad)
