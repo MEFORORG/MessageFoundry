@@ -20,6 +20,9 @@ first: the planted secret is in ``str(exc)``. Each arm must then render it throu
 ``_ARMS`` holds at least the operator commands vault BACKLOG #2760 moved onto the renderer and
 the ones that already used it, except ``serve`` and ``supervise``, which start the engine. A new
 CLI arm that loads the whole settings file belongs in it.
+
+The URL refusal cases (vault BACKLOG #2850) go at the models instead of through an arm. Every arm
+prints a validator's message as written, so a message that quotes nothing is what they rest on.
 """
 
 from __future__ import annotations

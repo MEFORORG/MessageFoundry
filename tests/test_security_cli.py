@@ -342,7 +342,7 @@ def test_a_cloud_url_refusal_in_the_partial_reason_quotes_no_part_of_the_url(
     assert data["loosenings_partial"] is True
     reason = data["loosenings_partial_reason"]
     assert f"{table}.{key}" in reason and "not a URL" in reason
-    assert f"{scheme}://" not in reason
+    assert scheme not in reason
     dumped = json.dumps(data)
     assert planted not in dumped and "SYNTHTOKEN" not in dumped
 
