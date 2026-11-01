@@ -49,6 +49,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import load_settings
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.crypto import (
     _V4_PREFIX,
@@ -75,8 +76,11 @@ _SHARED = ("OB_SHARED_A", "OB_SHARED_B")
 _QUEUED, _DEAD, _REPLIED = "OB_QUEUED", "OB_DEAD", "OB_REPLIED"
 #: A kind the store accepts: connection_event kinds are a closed vocabulary
 #: (messagefoundry.connection_events.CONNECTION_EVENT_KIND_ORDER), refused outside it. An MLLP
-#: listener records this one for a bad frame, so it carries a reason like the one written here.
+#: listener records this one for a bad frame; only its membership matters here, not the reason's
+#: shape. Checked at import, so a vocabulary change fails collection naming this contract rather
+#: than every leg partway through a half-written keyless store.
 _EVENT_KIND = "framing_error"
+check_connection_event_kind(_EVENT_KIND)
 
 #: The cells every open decrypts to warm a cache, through the strict cipher. A plaintext value left in
 #: one fails a keyed open itself, and a sealed one fails a keyless open.
