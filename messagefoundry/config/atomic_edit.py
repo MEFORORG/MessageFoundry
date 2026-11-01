@@ -58,11 +58,13 @@ from pathlib import Path
 
 from messagefoundry.config.key_file_access import _UNREACHABLE_WINERRORS
 from messagefoundry.config.snapshot import is_missing_directory
+from messagefoundry.controlchars import scrub_log_argument
 
 __all__ = [
     "CANDIDATE_DIR_SUFFIX",
     "DEFAULT_LOCK_TIMEOUT_S",
     "LOCK_FILE_NAME",
+    "READ_STEP",
     "edit_lock",
     "encode_text",
     "is_candidate_dir_name",
@@ -115,7 +117,7 @@ _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
 #: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
 #: directory refuses no read, so the write advice would send an operator to the wrong fix.
-_READ_STEP = "read it"
+READ_STEP = "read it"
 
 #: The ``step`` of a stat that failed with no refusal in it: a broken link or a fault, which no
 #: change of account cures.
@@ -155,7 +157,7 @@ def read_text(path: Path, *, refused_error: Callable[[str], Exception]) -> tuple
     A file with mixed endings reads as ``\n``, the editors' own form, rather than being
     reflowed to ``\r\n`` on the strength of one line. A refused read is raised as
     ``refused_error(message)``, as :func:`refused_as` says."""
-    with refused_as(path, refused_error, _READ_STEP):
+    with refused_as(path, refused_error, READ_STEP):
         raw = path.read_bytes()
     crlf = raw.count(b"\r\n")
     return raw.decode("utf-8").replace("\r\n", "\n"), crlf > 0 and crlf == raw.count(b"\n")
@@ -172,7 +174,7 @@ def read_text_if_present(
 
 
 def is_file(path: Path, *, refused_error: Callable[[str], Exception] | None) -> bool:
-    """Whether ``path`` is a regular file, by the stat every config gate shares.
+    """Whether ``path`` is a regular file, by the stat the four editors share.
 
     Not ``Path.is_file``, which answers ``False`` for every stat that fails: a config file that is a
     link to an unmounted share, or into a directory this account cannot search, would read as absent,
@@ -205,7 +207,7 @@ def _is_a(
             return False
         if refused_error is None:
             raise
-        step = _READ_STEP if exc.errno in _REFUSED else _STAT_STEP
+        step = READ_STEP if exc.errno in _REFUSED else _STAT_STEP
         raise refused_error(_refusal(path, exc, step)) from exc
 
 
@@ -214,10 +216,14 @@ def _nothing_there(path: Path, exc: OSError) -> bool:
     the first entry that exists, so it costs a few calls, and only on a stat that failed."""
     if not is_missing_directory(exc) or getattr(exc, "winerror", None) in _UNREACHABLE_WINERRORS:
         return False
-    for entry in (path, *path.parents):
-        if os.path.exists(entry):
+    # Anything at the path itself is a file the stat could not answer for, however it got there: a
+    # link or a Windows junction that cannot be followed, or a share that came back a moment later.
+    if os.path.lexists(path):
+        return False
+    for folder in path.parents:
+        if os.path.exists(folder):
             return True
-        if os.path.lexists(entry):  # a link or a Windows junction that cannot be followed
+        if os.path.lexists(folder):
             return False
     return True
 
@@ -256,7 +262,7 @@ def edit_lock(
     # needs no more, and asking for write would be refused by a backup agent or scanner holding the
     # file with read sharing only. The cost, off Windows: a lock file this account cannot write, at
     # 0444 or at 0644 under another account, refuses the edit where a read-only open would have
-    # locked it. The refusal names the lock file, and fixing its owner or mode cures it.
+    # locked it. The refusal names the lock file, though its advice speaks of owners, not modes.
     # Owner-only, like the files it guards: every edit leaves the edited file 0600, so an account
     # that could not open a lock an editor created could not edit that file either, and root opens
     # a 0600 file regardless. Wider access gains nothing.
@@ -264,6 +270,9 @@ def edit_lock(
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
     flags = (os.O_RDONLY if _WINDOWS else os.O_RDWR) | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if refused_error is not None:
+        # For its refusal alone: a folder that is a broken link would fail the open as plain ENOENT.
+        is_dir(path.parent, refused_error=refused_error)
     try:
         with refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
             fd = os.open(lock_path, flags, 0o600)
@@ -368,7 +377,12 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
     operator through the API, where an absolute host path adds nothing the file name does not. The
     full error, with the path, is logged. On Windows ``EACCES`` may only mean another program has
     the file open (``_WINDOWS``), so the cause a second attempt cures comes first."""
-    _log.warning("this account could not %s, for %s: %s", step, path, exc)
+    _log.warning(
+        "this account could not %s, for %s: %s",
+        step,
+        scrub_log_argument(str(path)),  # a name from a directory listing, which nothing has checked
+        scrub_log_argument(str(exc)),
+    )
     code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
     reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
     held = (
@@ -383,7 +397,7 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
             "on a share, that cannot be reached, so it was not taken to be absent. Restore the "
             "share or the link's target, or remove the link"
         )
-    if step == _READ_STEP:
+    if step == READ_STEP:
         return (
             f"{path.name} could not be read: {reason}. {held}Another account owns the file or its "
             "directory; read it as that account, or give this account access to it"

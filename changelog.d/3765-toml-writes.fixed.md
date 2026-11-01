@@ -13,8 +13,8 @@
   overwritten a table it could not stat, a listing would have answered empty, and a candidate could
   have validated without its policy. A path with nothing at it, or a name no file can have, still
   reads as absent. So does a link to a directory or to anything else that is not a file, and a share
-  that Windows reports as a plain missing path. The loader and `codeset show` still read a policy
-  sidecar they cannot stat as no policy. (`BACKLOG #3765`)
+  that Windows reports as a plain missing path. `codeset show` still reads a policy sidecar it cannot
+  stat as no policy, and a config load does so for a dangling one. (`BACKLOG #3765`)
 - **The edit lock's handle is read-write off Windows.** An NFS client's exclusive `flock` fails
   `EBADF` on a read-only handle, which would have failed every edit on an NFS mount with working
   locks. This rests on `flock(2)` and a modelled test, not on a real NFS mount. A mount with no

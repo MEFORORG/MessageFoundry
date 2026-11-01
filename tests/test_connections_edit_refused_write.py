@@ -649,8 +649,9 @@ NO_SUCH_FILE = pytest.mark.parametrize(
     ids=["enotdir", "enametoolong", "winerror-123", "winerror-161", "winerror-206"],
 )
 
-# Nothing in these says the file is not there: a link cycle, the Windows cycle, a disk fault, and
-# the two shares Windows says it could not reach.
+# Nothing in these says the file is not there: a link cycle, the Windows cycle, a disk fault, the
+# two shares Windows says it could not reach, and ENOENT for a file that is there all the same,
+# as from a share reconnecting or a writer between an unlink and a create.
 UNKNOWN = pytest.mark.parametrize(
     "make_failure",
     [
@@ -659,8 +660,9 @@ UNKNOWN = pytest.mark.parametrize(
         lambda: OSError(errno.EIO, "Input/output error"),
         lambda: _Unreachable(53),
         lambda: _Unreachable(67),
+        lambda: FileNotFoundError(errno.ENOENT, "No such file or directory"),
     ],
-    ids=["eloop", "winerror-1921", "eio", "winerror-53", "winerror-67"],
+    ids=["eloop", "winerror-1921", "eio", "winerror-53", "winerror-67", "enoent-yet-there"],
 )
 
 
@@ -668,7 +670,7 @@ UNKNOWN = pytest.mark.parametrize(
 def test_a_name_no_file_can_have_reads_as_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_failure: Callable[[], OSError]
 ) -> None:
-    path = _live(tmp_path)
+    path = tmp_path / "connections.toml"
     _refuse_stat(monkeypatch, make_failure(), path.name)
 
     assert not atomic_edit.is_file(path, refused_error=WiringError)
@@ -733,7 +735,8 @@ def test_a_real_code_set_name_no_file_can_have_is_no_such_code_set(tmp_path: Pat
 def test_a_code_set_path_no_file_can_have_reads_as_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_failure: Callable[[], OSError]
 ) -> None:
-    path = _code_set(tmp_path)
+    path = tmp_path / "codesets" / "diets.csv"
+    path.parent.mkdir()
     _refuse_stat(monkeypatch, make_failure(), path.name)
 
     with pytest.raises(WiringError, match="no such code set"):
@@ -819,26 +822,19 @@ def test_a_link_it_cannot_follow_is_refused_rather_than_replaced(
     assert not (tmp_path / "unmounted").exists()
 
 
-@pytest.mark.parametrize(
-    ("edit", "refused"),
-    [
-        (connections_edit.list_connections, WiringError),
-        (lambda d: alerts_edit.list_rules(d / "messagefoundry.toml"), alerts_edit.AlertRuleError),
-        (
-            lambda d: security_edit.read_security(d / "messagefoundry.toml"),
-            security_edit.SecurityEditError,
-        ),
-    ],
-    ids=["connections", "alerts", "security"],
-)
-def test_a_config_folder_that_is_a_broken_link_is_refused_rather_than_listed_empty(
-    tmp_path: Path, edit: Callable[[Path], Any], refused: type[Exception]
+@GATES
+def test_a_config_folder_that_is_a_broken_link_is_refused_at_every_gate(
+    tmp_path: Path,
+    relative: str,
+    edit: Callable[[Path], Any],
+    refused: type[Exception],
 ) -> None:
+    # A listing would answer empty, and an edit would fail its lock open as a raw FileNotFoundError.
     config = tmp_path / "config"
     _link(config, tmp_path / "unmounted")
 
     with pytest.raises(refused, match="could not be read"):
-        edit(config)
+        edit(config / relative)
 
 
 def test_a_file_that_is_not_there_under_a_healthy_link_is_absent(tmp_path: Path) -> None:
@@ -995,6 +991,40 @@ def test_a_listing_is_not_refused_over_an_editors_lock_link(tmp_path: Path) -> N
     _link(path.with_name(".#diets.csv"), path.with_name("user@host.1234"))
 
     assert [entry["name"] for entry in codeset_edit.list_code_sets(tmp_path)] == ["diets"]
+
+
+def test_a_table_named_like_a_lock_link_is_still_listed(tmp_path: Path) -> None:
+    # The loader reads it, so the skip above must stop at a link that dangles.
+    path = _code_set(tmp_path)
+    path.with_name(".#hidden.csv").write_bytes(path.read_bytes())
+
+    assert ".#hidden" in [entry["name"] for entry in codeset_edit.list_code_sets(tmp_path)]
+
+
+def test_a_codesets_folder_it_cannot_list_is_a_wiring_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stat passes, as at mode 0311, so the gate alone does not catch this.
+    _code_set(tmp_path)
+    refusal = PermissionError(errno.EACCES, "Permission denied")
+    monkeypatch.setattr(Path, "iterdir", _raising(refusal))
+
+    with pytest.raises(WiringError, match="codesets could not be read") as caught:
+        codeset_edit.list_code_sets(tmp_path)
+
+    assert caught.value.__cause__ is refusal
+
+
+def test_a_refusal_logs_a_listed_name_without_its_control_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    name = "forged\r\nCRITICAL line.csv"
+    _refuse_stat(monkeypatch, OSError(errno.EIO, "Input/output error"), name)
+
+    with pytest.raises(WiringError):
+        atomic_edit.is_file(tmp_path / name, refused_error=WiringError)
+
+    assert [record for record in caplog.records if "\n" in record.getMessage()] == []
 
 
 def test_a_folder_with_a_tables_name_still_collides(tmp_path: Path) -> None:

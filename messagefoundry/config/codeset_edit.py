@@ -372,6 +372,7 @@ def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
     """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
     target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
     toml = codesets_dir / f"{name}.toml"
+    # The gate for its refusal, then exists() too, because a folder of that name has always collided.
     if atomic_edit.is_file(toml, refused_error=WiringError) or toml.exists():
         raise WiringError(_collision_message(name, codesets_dir))
 
@@ -418,12 +419,16 @@ def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
         # TRUE sidecar (companion code set present) is skipped; a standalone x.policy.toml still lists
         # as a code set, mirroring the loader (code_sets.is_policy_sidecar).
         if p.suffix.lower() in _SUPPORTED_EXTS
-        # An editor's lock link, as Emacs leaves for unsaved edits to a table: no load reads it, so
-        # the gate must not refuse the whole listing over it.
-        and not p.name.startswith(".#")
+        and not _is_editor_lock_link(p)
         and atomic_edit.is_file(p, refused_error=WiringError)
         and not is_policy_sidecar(p)
     ]
+
+
+def _is_editor_lock_link(path: Path) -> bool:
+    """A dangling ``.#<name>`` link, as Emacs leaves for unsaved edits to a table. The loader skips
+    a dangling link, so the listing's gate must not refuse every table over this one."""
+    return path.name.startswith(".#") and path.is_symlink() and not path.exists()
 
 
 def _existing_path(codesets_dir: Path, name: str) -> Path:
@@ -452,7 +457,8 @@ def _load_all(codesets_dir: Path) -> dict[str, CodeSet]:
     Translate the loader's :class:`CodeSetError` to :class:`WiringError` so a read path raises the
     one exception type the CLI catches (the message is preserved verbatim — the loader's wording)."""
     try:
-        return load_code_sets(codesets_dir)
+        with atomic_edit.refused_as(codesets_dir, WiringError, atomic_edit.READ_STEP):
+            return load_code_sets(codesets_dir)
     except CodeSetError as exc:
         raise WiringError(str(exc)) from exc
 
