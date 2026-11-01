@@ -20,7 +20,7 @@ import signal
 import subprocess
 import sys
 import textwrap
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
@@ -988,6 +988,19 @@ def test_an_engine_raised_class_with_its_own_str_is_withheld(
     assert "feed.py: Bad" in str(err) and "withheld" in str(err)
 
 
+def test_a_str_descriptor_cannot_answer_as_the_builtin(tmp_path: Path, engine_probe: str) -> None:
+    # Read through the class, this answers BaseException's method. An instance prints the value.
+    bad_class = (
+        "class Str:\n    def __get__(self, obj, kind=None):\n"
+        "        if obj is None:\n            return BaseException.__str__\n"
+        f"        return lambda: {NEEDLE!r}\n\n"
+        "class Bad(Exception):\n    __str__ = Str()\n"
+    )
+    body = f"import {engine_probe} as probe\n\n{bad_class}\nprobe.raises_this_type(Bad)\n"
+    _write(tmp_path, "feed.py", body)
+    assert NEEDLE not in str(_load_error(tmp_path))
+
+
 def test_a_context_with_its_own_str_is_foreign_even_from_an_engine_frame(
     tmp_path: Path, engine_probe: str
 ) -> None:
@@ -1164,6 +1177,26 @@ def _assert_bare(exc: BaseException) -> None:
     assert exc.__cause__ is None and exc.__context__ is None
 
 
+def _load_on_a_worker(d: Path) -> BaseException | None:
+    def outcome() -> BaseException | None:
+        try:
+            load_config(d)
+        except BaseException as exc:  # noqa: BLE001 - what crosses the thread is the assertion
+            return exc
+        return None
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(outcome).result()
+
+
+@pytest.fixture
+def sigint_raises() -> Iterator[None]:
+    """A pytest-xdist worker can run with SIGINT ignored."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, previous)
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -1191,16 +1224,7 @@ def test_an_interrupt_stops_the_load_with_nothing_on_it(tmp_path: Path, body: st
 def test_an_interrupt_off_the_main_thread_is_a_refused_module(tmp_path: Path, body: str) -> None:
     # No signal reaches a reload's worker thread, and one leaving it would stop the event loop.
     _write(tmp_path, "feed.py", body)
-
-    def outcome() -> BaseException | None:
-        try:
-            load_config(tmp_path)
-        except BaseException as exc:  # noqa: BLE001 - what crosses the thread is the assertion
-            return exc
-        return None
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        left = pool.submit(outcome).result()
+    left = _load_on_a_worker(tmp_path)
     assert isinstance(left, WiringError), repr(left)
     assert NEEDLE not in str(left) and "KeyboardInterrupt at line 1" in str(left)
 
@@ -1219,78 +1243,66 @@ _READ_WINDOWS = {
 }
 
 
-@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
+@pytest.fixture(params=list(_READ_WINDOWS.values()), ids=list(_READ_WINDOWS))
+def fails_in_the_read(
+    request: pytest.FixtureRequest, tmp_path: Path, engine_probe: str
+) -> Callable[[str], Path]:
+    """Writes a module whose exception runs ``fault`` when the loader reads it, in each window."""
+    return lambda fault: _write(
+        tmp_path, "feed.py", request.param.format(fault=fault, probe=engine_probe)
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        f"raise KeyboardInterrupt({NEEDLE!r})",
+        # Sent in a loop for the reason test_a_real_interrupt_inside_a_handler_stops_the_load gives.
+        "import signal\n        while True:\n            signal.raise_signal(signal.SIGINT)",
+    ],
+    ids=["from-code", "real-signal"],
+)
+@pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_in_the_loaders_read_stops_the_load(
-    tmp_path: Path, engine_probe: str, window: str
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path], fault: str
 ) -> None:
     # Reading a failed module runs code, so an interrupt can land in that read. It is Ctrl-C, not a
     # config error, and it leaves as a new, bare one with no module exception on it.
-    fault = f"raise KeyboardInterrupt({NEEDLE!r})"
-    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
+    fails_in_the_read(fault)
     with pytest.raises(KeyboardInterrupt) as ei:
         load_config(tmp_path)
     _assert_bare(ei.value)
 
 
-@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
-def test_a_real_interrupt_in_the_loaders_read_stops_the_load(
-    tmp_path: Path, engine_probe: str, window: str
-) -> None:
-    # A real signal, delivered while the loader reads. Sent in a loop for the reason given above.
-    fault = "import signal\n        while True:\n            signal.raise_signal(signal.SIGINT)"
-    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
-    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
-    try:
-        with pytest.raises(KeyboardInterrupt) as ei:
-            load_config(tmp_path)
-    finally:
-        signal.signal(signal.SIGINT, previous)
-    _assert_bare(ei.value)
-
-
-@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
 def test_an_exit_in_the_loaders_read_leaves_with_no_module_exception_on_it(
-    tmp_path: Path, engine_probe: str, window: str
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path]
 ) -> None:
     # As a module's own SystemExit leaves: the loader does not handle one.
-    _write(tmp_path, "feed.py", window.format(fault="raise SystemExit(3)", probe=engine_probe))
+    fails_in_the_read("raise SystemExit(3)")
     with pytest.raises(SystemExit) as ei:
         load_config(tmp_path)
     assert ei.value.code == 3
     assert ei.value.__context__ is None and ei.value.__cause__ is None
 
 
-@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
 def test_a_class_answering_as_an_exit_in_the_loaders_read_is_absorbed(
-    tmp_path: Path, engine_probe: str, window: str
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path]
 ) -> None:
     # Only the real class is an exit. Raised, this one would leave with its text.
-    fault = (
+    fails_in_the_read(
         "class Liar(BaseException):\n            __class__ = SystemExit\n"
         f"        raise Liar({NEEDLE!r})"
     )
-    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
     assert NEEDLE not in str(_load_error(tmp_path))
 
 
-@pytest.mark.parametrize("window", _READ_WINDOWS.values(), ids=_READ_WINDOWS.keys())
 @pytest.mark.parametrize("stop", ["KeyboardInterrupt", "SystemExit"], ids=["interrupt", "exit"])
 def test_a_stop_in_the_loaders_read_off_the_main_thread_is_absorbed(
-    tmp_path: Path, engine_probe: str, window: str, stop: str
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path], stop: str
 ) -> None:
     # No signal reaches a reload's worker, so a stop there is code, and it would end the event loop.
-    fault = f"raise {stop}({NEEDLE!r})"
-    _write(tmp_path, "feed.py", window.format(fault=fault, probe=engine_probe))
-
-    def outcome() -> BaseException | None:
-        try:
-            load_config(tmp_path)
-        except BaseException as exc:  # noqa: BLE001 - what crosses the thread is the assertion
-            return exc
-        return None
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        left = pool.submit(outcome).result()
+    fails_in_the_read(f"raise {stop}({NEEDLE!r})")
+    left = _load_on_a_worker(tmp_path)
     assert isinstance(left, WiringError), repr(left)
     assert NEEDLE not in str(left)
     assert left.__cause__ is None and left.__context__ is None
@@ -1316,6 +1328,7 @@ def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:
     assert done.stdout.strip() == "True", done.stderr
 
 
+@pytest.mark.usefixtures("sigint_raises")
 def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> None:
     # Python sets a signal's KeyboardInterrupt's __context__ to whatever was being handled. Sent in a
     # loop because the handler can run inside a weakref callback, which swallows the interrupt.
@@ -1325,13 +1338,8 @@ def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> Non
         "except ValueError:\n    while True:\n        signal.raise_signal(signal.SIGINT)\n"
     )
     _write(tmp_path, "feed.py", body)
-    # A pytest-xdist worker can run with SIGINT ignored.
-    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
-    try:
-        with pytest.raises(KeyboardInterrupt) as ei:
-            load_config(tmp_path)
-    finally:
-        signal.signal(signal.SIGINT, previous)
+    with pytest.raises(KeyboardInterrupt) as ei:
+        load_config(tmp_path)
     _assert_bare(ei.value)
 
 

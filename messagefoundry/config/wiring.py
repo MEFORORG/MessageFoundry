@@ -109,7 +109,7 @@ from messagefoundry.exception_origin import (
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.redaction import safe_name
+from messagefoundry.redaction import _BUILTIN_EXC_RENDERS, _class_attribute, safe_name
 from messagefoundry.secretscrub import (
     _QUERY_NAME_SEPARATORS,
     _QUERY_NOT_CREDENTIAL_TAILS,
@@ -9474,11 +9474,15 @@ def _module_failure(
     return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
 
 
+def _on_the_main_thread() -> bool:
+    return threading.current_thread() is threading.main_thread()
+
+
 def _is_a_signal(exc: BaseException) -> bool:
     """Whether ``exc`` can be what Ctrl-C raised. A subclass is not what a signal raises, and Python
     delivers a signal only to the main thread, so on any other, such as a reload's worker, an
     interrupt is code, and one leaving there would stop the event loop."""
-    return type(exc) is KeyboardInterrupt and threading.current_thread() is threading.main_thread()
+    return type(exc) is KeyboardInterrupt and _on_the_main_thread()
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -9493,10 +9497,7 @@ def _read_fault(path: Path, fault: BaseException) -> None:
     if _is_a_signal(fault):
         raise KeyboardInterrupt
     # The real type, as _refusal_for reads it: isinstance would run a ``__class__`` of the module's.
-    if (
-        issubclass(type(fault), SystemExit)
-        and threading.current_thread() is threading.main_thread()
-    ):
+    if issubclass(type(fault), SystemExit) and _on_the_main_thread():
         raise fault
     _logger.warning(
         "config module %s: reading its failure raised %s, so the diagnostic is reduced",
@@ -9659,6 +9660,16 @@ def _textless_import_error(exc: ImportError) -> ImportError:
     return ModuleNotFoundError() if isinstance(exc, ModuleNotFoundError) else ImportError()
 
 
+def _is_engine_text(exc: BaseException) -> bool:
+    """Whether what ``exc`` prints is what a ``raise`` in this package wrote: an engine frame raised
+    it, and its class prints through a builtin's ``__str__``. A class's own method writes what
+    prints, whoever raised the instance. Read from the class dicts, so no code of the class runs."""
+    return (
+        worded_by_the_engine(exc)
+        and id(_class_attribute(type(exc), "__str__")) in _BUILTIN_EXC_RENDERS
+    )
+
+
 def _keeps_engine_wording(exc: BaseException) -> bool:
     """Whether the loader may print ``exc``'s own text: a ``raise`` in this package wrote it.
 
@@ -9668,9 +9679,10 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
     runtime limit, whose fixed text quotes nothing: the parser wall in the loader's ``compile``."""
     if isinstance(exc, _NAMED_EXCEPTIONS):
         return False
-    if worded_by_the_engine(exc):
+    if _is_engine_text(exc):
         return True
-    # The exact class: only the runtime's own has fixed text, and a subclass can write its own.
+    # The exact class: only the runtime's own has fixed text, and a subclass can write its own. By
+    # identity, because ``in`` would run a metaclass's ``__eq__``.
     return any(type(exc) is limit for limit in _RUNTIME_LIMITS) and raised_by_the_engine(exc)
 
 
@@ -9691,7 +9703,7 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
     the place to convert a failure. A short quotation can also take a word of the engine's prose
     with it, which is the cheaper failure."""
     links = list(exception_chain(exc))
-    foreign = [link for link in links if link is not exc and not worded_by_the_engine(link)]
+    foreign = [link for link in links if link is not exc and not _is_engine_text(link)]
     if not foreign and not any(hasattr(link, "__notes__") for link in links):
         return None
     quoted = {
@@ -9717,8 +9729,7 @@ def _refusal_for(
 
     The engine's own wording -- a factory or registry refusal naming a connection or a setting --
     is the diagnostic an author needs, so it keeps its text. A class with its own ``__str__`` does
-    not, whoever raised it, because that method writes what prints: :func:`worded_by_the_engine`.
-    That relies on engine raise sites not quoting a value;
+    not, whoever raised it: :func:`_is_engine_text`. That relies on engine raise sites not quoting a value;
     tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no refusal
     that sits behind another. What it was raised from that the engine did not word can hold a value:
     the whole text of such an exception is taken out of the refusal, and the chain goes. A slice of
@@ -9732,7 +9743,7 @@ def _refusal_for(
     the class's own. So the judgement sits in one guard, and a fault in it withholds the whole
     refusal, with no stand-in, or stops the load: :func:`_read_fault`. Call this outside any handler
     of ``exc``, as :func:`_module_failure` says."""
-    fault: BaseException | None = None
+    fault: BaseException
     try:
         if _keeps_engine_wording(exc):
             text = _rewritten_refusal(path, exc)
