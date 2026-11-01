@@ -42,7 +42,7 @@ def test_config_page_badge_names_what_it_did_not_compare() -> None:
         )
     )
     assert ">clean<" in html
-    assert "2 could not be read, so they were not compared" in html
+    assert "Config files or folders not compared, as unreadable: 2" in html
 
 
 def test_config_page_badge_drifted() -> None:

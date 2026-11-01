@@ -305,7 +305,7 @@ class _ConfigBundle:
 
     def manifest_fields(self) -> dict[str, object]:
         """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
-        directory path, a digest and an exception class name."""
+        directory path, a digest, an exception class name and relative config file names."""
         return {
             "config_fingerprint": self.fingerprint,
             "config_bundled": self.bundled,

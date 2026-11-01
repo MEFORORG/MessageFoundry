@@ -2924,6 +2924,18 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
     return task.result()
 
 
+def _moved_after_load(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest shows bytes moved after the load read them: both were taken,
+    over the same files, and differ. Not two digests that left out different files, which is a
+    lock and shows no change (vault BACKLOG #3765, LF8)."""
+    return (
+        loaded is not None
+        and disk is not None
+        and loaded.left_out == disk.left_out
+        and not same_digest(loaded, disk)
+    )
+
+
 # The markers below are information only (vault BACKLOG #3765, items 15 to 17, the Lander's
 # send-back of engine PR 2370): a start pages whenever the directory after its load differs from the
 # baseline, and whenever the bytes it loaded do. A partial digest, a partial
@@ -3004,12 +3016,7 @@ async def _compare_start_config(
             "read: %s",
             scrub_log_argument(describe_left_out(left_out)),
         )
-    moved = (
-        loaded is not None
-        and disk is not None
-        and loaded.left_out == disk.left_out
-        and not same_digest(loaded, disk)
-    )
+    moved = _moved_after_load(loaded, disk)
     if moved:
         _log.warning(
             "config change check: the config directory changed after this start's load read it, "
@@ -3217,6 +3224,11 @@ async def _record_start_audit(
             # The digest a page names, which is the directory's where that differs: the row's own
             # ``fingerprint`` is the bytes this process runs (vault BACKLOG #3765).
             "judged_fingerprint": comparison.fingerprint if comparison else None,
+            **(
+                {"judged_unreadable_files": list(comparison.left_out)}
+                if comparison and comparison.left_out
+                else {}
+            ),
             "changed": comparison.changed if comparison else None,
         },
     )
@@ -11981,6 +11993,16 @@ def create_managed_app(
                 # row that names no snapshot, or that a reload superseded, is no baseline itself,
                 # but its comparison still ran, and a flag row vouches for no more than that.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
+                if compared and _moved_after_load(
+                    digest_coverage(compared), digest_coverage(on_disk)
+                ):
+                    # The VCS head is read after the load, so here it may be the commit the
+                    # directory moved to, which the digest of the bytes that ran must not be bound
+                    # to (vault BACKLOG #3765). Advisory, so it is dropped.
+                    unbound = {k: v for k, v in compared.items() if k != "git_head"}
+                    engine.loaded_config_fingerprint = unbound
+                    if start_loaded is not None:
+                        start_loaded = replace(start_loaded, fingerprint=unbound)
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises. Vault BACKLOG #3145
                 # item 1 (a gate-refused restart pages on every attempt) is declined: that is this

@@ -1771,6 +1771,34 @@ async def test_a_file_locked_after_the_load_leaves_a_whole_fingerprint(
     assert UNREADABLE_FILES_KEY not in loaded and UNREADABLE_FILES_KEY not in rows[-1]
     assert [a["comparison"] for a in alerts] == ["partial_start_digest"]
     assert rows[-1]["comparison"] == "partial_start_digest" and rows[-1]["changed"] is True
+    assert rows[-1]["judged_unreadable_files"] == ["cfg.py"], "the row says why it changed"
+
+
+async def test_a_moved_start_binds_no_later_commit_to_the_bytes_it_ran(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pull after the load read its files is the likeliest way to move a directory. The head is
+    read after the load, so it would name the new commit beside the digest of the old bytes."""
+    await _start(tmp_path, cfg)
+
+    def _load_then_edit(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        _edit(cfg)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(fp_mod, "_git_head", lambda _start: "c" * 40)
+        rows = await _start(tmp_path, cfg)
+        assert rows[-1]["git_head"] == "c" * 40, "control: an unmoved start keeps its head"
+        m.setattr(app_module, "load_config", _load_then_edit)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            loaded = engine.loaded_config_fingerprint
+            rows = await _start_rows(engine)
+    assert rows[-1]["comparison"] == "changed_during_load"
+    assert "git_head" not in rows[-1]
+    assert loaded is not None and "git_head" not in loaded and loaded["fingerprint"]
 
 
 class _OneRowStore:
@@ -1812,7 +1840,7 @@ _DIGESTS = (
 
 @pytest.mark.parametrize(
     ("baseline", "disk", "loaded"),
-    itertools.product(_DIGESTS, (None, *_DIGESTS), (None, *_DIGESTS)),
+    list(itertools.product(_DIGESTS, (None, *_DIGESTS), (None, *_DIGESTS))),
 )
 async def test_no_digest_pair_pages_less_than_the_directory_alone(
     baseline: dict[str, object],

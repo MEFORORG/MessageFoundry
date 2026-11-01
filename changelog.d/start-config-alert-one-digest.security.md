@@ -1,4 +1,4 @@
-- **A start's config fingerprint now names the bytes it ran.** A start read the config directory
+- **A start's config fingerprint now names the bytes its load read.** A start read the config directory
   for a fingerprint twice around its load and recorded the later read, so an edit after the load
   was recorded as loaded, and the next start saw no change. A file locked after the load left a
   partial loaded fingerprint. The fingerprint now comes from the load's own read, as a reload's

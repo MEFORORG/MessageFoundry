@@ -1865,12 +1865,16 @@ started together, can each raise it; the alert list folds them into one instance
   `disk_config` verdict and a backup's `config_fingerprint` apply the same rule and name what was
   left out, as the count `left_out_files`, `disk_config_left_out` and `config_unreadable_files`
   (vault BACKLOG #3765).
-- A start's fingerprint is of the bytes its load read and ran. Just after the load it fingerprints
+- A start's fingerprint is of the bytes its load read. A start resolves `env()` values earlier,
+  when the engine is built, so for `environments/` files that means the bytes the load read, not
+  the bytes the values came from. Just after the load it fingerprints
   the directory once more, and compares both with the baseline, so `config_changed` fires when
   either differs. When the two cover the same files and differ, an edit landed after the load read
   that file, and the comparison is `changed_during_load`. The alert then names the directory's
   fingerprint, or the loaded one when only that differs from the baseline. The `config_loaded` row
-  names the bytes that ran as `fingerprint`, and what the alert named as `judged_fingerprint`. So
+  names the bytes that ran as `fingerprint`, with no `git_head`, since the head is read after the
+  load and may be the commit the directory moved to. It names what the alert named as
+  `judged_fingerprint`, and what that left out as `judged_unreadable_files`. So
   the next start, on the edited bytes, raises the alert again, and
   `GET /config/provenance` reports drift until a reload. A directory that cannot be read just after
   the load costs that second comparison only. Together the two reads miss at least an edit that
@@ -1878,7 +1882,9 @@ started together, can each raise it; the alert list folds them into one instance
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed or it took no fingerprint,
-  marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
+  marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A start
+  with no fingerprint of the bytes it loaded does so even when the directory's own fingerprint was
+  compared and raised the alert, with `comparison` `no_start_digest`. A
   later start passes over those rows, and over any row whose detail is not a JSON object (at
   WARNING), and compares against the newest usable row before them. So the change the unchecked
   start could not see is reported by the next start that can read. A config reload's row is
