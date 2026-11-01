@@ -3590,6 +3590,7 @@ jobs:
           tests/test_claim_fifo_heads.py
           tests/test_seq_only_fifo.py
           tests/test_fifo_index_migration.py
+          tests/test_sqlserver_postgres_schema_verify_1720.py
           tests/test_per_lane_wake.py
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
@@ -3597,6 +3598,7 @@ jobs:
           tests/test_sqlserver_audit_applock.py
           tests/test_adr0157_sqlserver_fence.py
           tests/test_uploads_shard_quota_interleave.py
+          tests/test_adr0157_b1497_sqlserver_renew_clamp.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
@@ -4031,6 +4033,7 @@ jobs:
           tests/test_claim_fifo_heads.py
           tests/test_seq_only_fifo.py
           tests/test_fifo_index_migration.py
+          tests/test_sqlserver_postgres_schema_verify_1720.py
           tests/test_per_lane_wake.py
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
@@ -4255,6 +4258,7 @@ jobs:
           tests/test_claim_fifo_heads.py
           tests/test_seq_only_fifo.py
           tests/test_fifo_index_migration.py
+          tests/test_sqlserver_postgres_schema_verify_1720.py
           tests/test_per_lane_wake.py
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py

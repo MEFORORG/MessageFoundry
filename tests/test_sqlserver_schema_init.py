@@ -29,6 +29,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _SCHEMA_LOCK, SqlServerStore, _schema_hash
+from tests._server_schema_rows import mssql_live_rows
 
 
 class _FakeCursor:
@@ -63,7 +64,9 @@ class _FakeCursor:
     applock_rc: int = 0
 
     async def fetchall(self) -> list[object]:
-        return []
+        # The BACKLOG #1720 live-schema reads see what the batch declares; nothing else is there.
+        params = self._executed[-1][1] if self._executed else None
+        return list(mssql_live_rows(self._last_sql, params))  # type: ignore[arg-type]
 
     async def close(self) -> None:
         pass
@@ -845,12 +848,14 @@ def _pre_scope_source_hash() -> str:
     """The marker a build WITHOUT the #1927 ADD would have written: the same batch minus that one
     statement. It is a counterfactual, not a recorded hash. The property under test is that the ADD
     is itself an element of the hashed ``_SCHEMA``: moved into Python beside the batch, which the
-    ``_schema_hash`` docstring forbids, it would change nothing the marker check can see."""
+    ``_schema_hash`` docstring forbids, it would change nothing the marker check can see. The
+    check revision is kept as the module hashes it, so only the missing statement can move it."""
     from messagefoundry.store import sqlserver
 
     without = [s for s in sqlserver._SCHEMA if not _is_scope_source_add(s)]
     assert len(without) == len(sqlserver._SCHEMA) - 1, "the ADD is not one _SCHEMA statement"
-    return hashlib.sha256("\n".join(without).encode()).hexdigest()
+    payload = "\n".join(without) + f"\nschema_check_rev={sqlserver._SCHEMA_CHECK_REV}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class _PreScopeSourceCursor(_FakeCursor):

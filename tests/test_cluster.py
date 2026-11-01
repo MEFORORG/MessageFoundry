@@ -1458,6 +1458,8 @@ async def test_sqlserver_non_promotable_claim_touches_no_db() -> None:
         async def _fetchone(self, *a: object, **k: object) -> object:
             raise AssertionError("non-promotable node must not query the store to claim")
 
+        _fetchone_clamped = _fetchone  # the claim's own entry point (ADR 0157 Inc 0)
+
     coord = SqlServerCoordinator(_Store(), "N", promotable=False)
     # Even if it were somehow already leader, the tick demotes it without a DB round-trip.
     coord._is_leader = True
@@ -1509,6 +1511,8 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
             if sql == "SELECT owner FROM leader_lease WHERE lease_key = ?":
                 return {"owner": "N"}  # the row this node released still names it
             raise AssertionError("a paused node must not send the claim")
+
+        _fetchone_clamped = _fetchone  # the claim's own entry point (ADR 0157 Inc 0)
 
     store = _Store()
     coord = SqlServerCoordinator(store, "N", heartbeat_seconds=10.0, monotonic=lambda: 0.0)
