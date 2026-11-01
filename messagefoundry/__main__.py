@@ -8830,6 +8830,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
     store_slot = _ProvisionStore()
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
@@ -8898,6 +8899,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # The store hop, refused at the open as `serve` refuses it now that the posture is passed:
         # a server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`.
         # Its text names the hop and the setting that clears it. Exit 2: could not start.
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
+    except ServerSchemaMismatchError as exc:
+        # BACKLOG #1720: a server store's live schema falls short of this build's DDL batch. The
+        # open rolled the batch back and wrote no marker. Its text lists the differences and the
+        # remedy. Exit 2: could not start, never the dispatch floor's 1, this command's refusal.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
     except TrustAnchorError as exc:
@@ -9056,8 +9063,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except key_unresolved + (InsecureHopRefused,) as exc:
-        # Refused before the prompt already; one that changed since is refused the same way.
+    except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
+        # Refused before the prompt already; one that changed since is refused the same way. A
+        # short server schema (#1720) can first arrive here: with no `schema_meta` table the
+        # pre-check finds no store, and only this create=True open runs the DDL batch.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:
@@ -9520,7 +9529,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
-        _StoreOpenRefused,  # a hop the posture refused at the OPEN only (BACKLOG #2532)
+        _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
         *_key_unresolved(),
     )
     open_refusals: tuple[type[Exception], ...] = (
@@ -9567,8 +9576,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     async def opened() -> Store:
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         # Could not start, exit 2, for a hop refusal (#2532) or a short server schema (#1720) the
-        # OPEN raised, as `store withdraw-transit-bound` scopes it. A hop refusal raised after the
-        # open would not be reported as a store that did not open. None is known: the Transit
+        # OPEN raised; `store withdraw-transit-bound` scopes its hop refusal to the open the same
+        # way. A hop refusal raised after the open would not be reported as a store that did not
+        # open. None is known: the Transit
         # cipher raises its failures as CipherError, which `open_refused` reports as a refusal,
         # exit 1. A key the open cannot resolve arrives wrapped too, and `could_not_start` prints
         # it with the same text it printed unwrapped.
@@ -10655,7 +10665,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except could_not_start as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except _StoreOpenRefused as exc:  # #2109, #2532: the open refused; nothing was changed
+    except _StoreOpenRefused as exc:  # #2109, #2532, #1720: the open refused; nothing re-encrypted
         print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -12214,11 +12224,11 @@ def _emit_key_unresolved(exc: Exception, *, as_json: bool) -> int:
 
 
 class _StoreOpenRefused(RuntimeError):
-    """The store open refused, having changed nothing: the key the settings name could not be
-    resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532), or a server
-    store's live schema falls short of this build's (BACKLOG #1720). Its text is the refusal's,
-    which names settings, variables, files, the hop's host, or the tables, columns and indexes
-    that differ."""
+    """The store open refused, so the command could not start: the key the settings name could not
+    be resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532), or a
+    server store's live schema falls short of this build's DDL batch (BACKLOG #1720). Its text is
+    the refusal's, which names settings, variables, files, the hop's host, or the tables, columns
+    and indexes that differ."""
 
 
 def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
@@ -12287,10 +12297,12 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
     code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11),
     ``admin-reset-totp`` and ``backup``, and for ``rotate-key``, where it is an aborted rotation's
-    (BACKLOG #2109). The schema refusal rolls back the open's DDL transaction and marks nothing
-    current, so nothing was changed and the command could not start, exit 2, as SQLite's
-    ``SchemaMismatchError`` exits through its ``sqlite3.DatabaseError`` arm. Its text lists the
-    tables, columns and indexes that differ and the remedy, and names no row's content. Only the
+    (BACKLOG #2109). The schema refusal rolls the open's DDL batch back and writes no schema marker,
+    and the command has read and written no store row, so it could not start, exit 2. Not "changed
+    nothing": a SQL Server open under ``auto`` may already have switched the database's RCSI
+    option on, before the batch. Its text lists the tables, columns and indexes that differ and
+    the remedy, and names no row's content. ``audit-verify`` and ``audit-anchor`` open read-only,
+    which runs no DDL batch and so never raises it. Only the
     OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop
     before the backend reads a row, and a Vault hop refused there arrives as a
     ``KeyProviderError``. Under a ``vault_transit`` cipher the open also makes Transit calls after
