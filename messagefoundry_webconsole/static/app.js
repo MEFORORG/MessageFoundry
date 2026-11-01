@@ -373,11 +373,14 @@
           // A failed flag read leaves every row on screen under Flagged only, and none of them is
           // known to be flagged, so one transient error must not widen a selection scoped to flagged
           // rows to every connection. The operator can still tick such a row by hand.
-          if (t.checked && onlyFlagged && cbs[i].getAttribute("data-flagged") === "unknown") continue;
+          if (t.checked && onlyFlagged && cbs[i].getAttribute("data-flagged") !== "1") continue;
           cbs[i].checked = t.checked;
           if (t.checked) selected.add(cbs[i].value);
           else selected.delete(cbs[i].value);
         }
+        // At once, so a click that took nothing leaves the box clear: a ticked box's next click
+        // would be the uncheck that clears every row, those ticked by hand included.
+        syncSelectAll();
         refresh();
       }
     });

@@ -37,8 +37,7 @@ this line.**
   `ConnectionRow.toml_managed`. (`BACKLOG #2623`)
 - **A failed flag read reads as unknown, not as unflagged.** Until the read recovers, a row offers
   no toggle, Flagged only hides no row, select-all under it takes no such row, and a notice above
-  the table says why. Before, Flagged only emptied the page and every toggle posted `flagged=true`.
-  (`BACKLOG #2623`)
+  the table says why. (`BACKLOG #2623`)
 - **The page for a toggle the store did not confirm no longer says the flag did not change.** A
   commit whose answer was lost still lands, so it sends the operator to read the flag first, and it
   no longer says to try again. Its heading is now "Flag change not confirmed". (`BACKLOG #2623`)

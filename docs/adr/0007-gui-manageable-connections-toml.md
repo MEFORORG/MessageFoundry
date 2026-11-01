@@ -253,10 +253,12 @@ toggle and turns Flagged only off for the whole estate.
 rows, select-all takes only the rows left on screen, and that selection then goes into a bulk action
 such as Stop, Restart, Reset or Purge. So a database writer who sets or clears rows could add a
 connection to that target set or keep one out of it. Asked whether to accept this, the owner chose
-*"Accept, record the reach"*, so the filter and select-all stay as they are. What bounds it: a row
-select-all takes is on screen as it is taken, the toolbar counts the selection beside Go, and an
-operator must press Go. Purge then adds a confirm page naming each outbound. Stop, Restart and Reset
-have no such page, and a selected row a later refresh hides stays selected, so it is still acted on.
+*"Accept, record the reach"*, so the filter and select-all stay as they are. What bounds it: no
+filter has hidden a row select-all takes as it is taken, the toolbar counts the selection beside Go,
+and an operator must press Go. Purge then adds a confirm page naming each outbound. Every other bulk
+action has no such page, a row below the fold is still taken, and a selected row a later refresh
+hides stays selected, so it is still acted on. The toggle gives the same reach with an audit row: at
+least the Deployment role holds `config:deploy` and no bulk-action permission.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.

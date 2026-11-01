@@ -198,7 +198,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == 409:
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
             if exc.status_code == 503:
-                # The route's only 503: the store did not commit the toggle and its audit row
+                # The route's only 503: the store did not confirm the toggle and its audit row
                 # (BACKLOG #2623), whose fix is not flag_rejected's.
                 return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
             raise

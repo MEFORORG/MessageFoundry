@@ -22,7 +22,9 @@ Scope, stated rather than implied. It reads the packages ``package_trees`` parse
 bare local such as ``if flagged:``, is not seen, and a local of that name means nothing by itself:
 at least the sign-in code keeps one of its own. The arms above catch the value at the road in, so a
 bare local is still downstream of a read this file lists. The IDE extension and the PySide6 harness
-are not read. Neither reads the flag today, and neither shares this process.
+are not read. Neither reads the flag today, and neither shares this process. ``static/app.js`` is
+where the reach lives and the AST walk cannot read it, so its reads of ``data-flagged`` are counted
+by a text census of their own.
 """
 
 from __future__ import annotations
@@ -30,10 +32,13 @@ from __future__ import annotations
 import ast
 import re
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import pytest
 
 from tests._ast_sites import code_strings, package_trees
+
+REPO = Path(__file__).resolve().parents[1]
 
 #: The store's read, and the one wrapper over it, by name. The wrapper counts as the read, so a new
 #: caller of it is a new reader.
@@ -165,6 +170,13 @@ def test_the_store_read_has_one_caller() -> None:
 def test_only_the_backends_name_the_table() -> None:
     found = _table_modules(package_trees())
     assert found == TABLE_MODULES, sorted(found ^ TABLE_MODULES)
+
+
+def test_the_browser_reads_the_flag_in_the_filter_and_in_select_all_only() -> None:
+    """Those two are the reach the owner accepted. A third branch on the value in ``app.js``, such as
+    preselecting flagged rows, would widen it, so it fails here until someone has looked at it."""
+    source = (REPO / "messagefoundry_webconsole/static/app.js").read_text(encoding="utf-8")
+    assert source.count('getAttribute("data-flagged")') == 2
 
 
 def test_every_load_of_the_field_is_listed() -> None:

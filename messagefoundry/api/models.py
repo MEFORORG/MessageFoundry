@@ -770,8 +770,9 @@ class ConnectionRow(PhiGatedModel):
     # Read from the store, and no engine path reads it. The console's filter does, which is the
     # reach ADR 0007's 2026-10-31 amendment records. None means the read failed, so the flag is
     # unknown, not unset, and a client must take it that way. Console-settable via
-    # POST /connections/{name}/flag.
-    flagged: bool | None = False
+    # POST /connections/{name}/flag. Defaults to None so a row built without it says unknown, and
+    # offers no toggle, rather than claiming a read that never ran.
+    flagged: bool | None = None
     # #136 (ADR 0065 amendment): destination-only per-message "Waiting for Reply" display state — True
     # while this outbound's live connector is awaiting an MLLP ACK past its waiting_display_delay. DISPLAY
     # ONLY (no delivery effect); False for source rows, non-ACK-waiting connectors, and no-ack mode.

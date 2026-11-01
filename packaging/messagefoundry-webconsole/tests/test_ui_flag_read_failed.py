@@ -16,6 +16,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -98,24 +99,26 @@ onChange({ target: all });
 console.log(JSON.stringify({
   visible: rows.filter((r) => r.style.display !== "none").map((r) => r.value),
   selected: rows.filter((r) => r.cb.checked).map((r) => r.value),
+  header: all.checked,
 }));
 """
 
 
-def _run_app_js(tmp_path: Path, *, flagged_only: bool) -> dict[str, list[str]]:
+def _run_app_js(
+    tmp_path: Path, *, flagged_only: bool, values: tuple[str, ...] = ("1", "0", "unknown")
+) -> dict[str, Any]:
     harness = tmp_path / "harness.js"
     harness.write_text(_HARNESS, encoding="utf-8")
     assert _NODE is not None
-    values = json.dumps(["1", "0", "unknown"])
     proc = subprocess.run(
-        [_NODE, str(harness), str(_APP_JS), values, json.dumps(flagged_only)],
+        [_NODE, str(harness), str(_APP_JS), json.dumps(values), json.dumps(flagged_only)],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    result: dict[str, list[str]] = json.loads(proc.stdout.strip().splitlines()[-1])
+    result: dict[str, Any] = json.loads(proc.stdout.strip().splitlines()[-1])
     return result
 
 
@@ -198,4 +201,13 @@ def test_select_all_with_flagged_only_off_takes_every_row(tmp_path: Path) -> Non
     assert _run_app_js(tmp_path, flagged_only=False) == {
         "visible": ["1", "0", "unknown"],
         "selected": ["1", "0", "unknown"],
+        "header": True,
     }
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
+def test_a_select_all_that_took_nothing_leaves_its_box_clear(tmp_path: Path) -> None:
+    """RED when the box stays ticked: the next click is then the uncheck, which clears every row,
+    including those the operator ticked by hand."""
+    run = _run_app_js(tmp_path, flagged_only=True, values=("unknown", "unknown"))
+    assert run["selected"] == [] and run["header"] is False

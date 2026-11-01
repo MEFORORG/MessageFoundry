@@ -212,8 +212,9 @@ def _flag_cell(r: ConnectionRow) -> Markup:
 #: every marker and toggle gone and Flagged only showing rows that may not be flagged, with no reason.
 FLAGS_UNREAD_NOTICE = (
     "The connection flags could not be read, so no row shows a flag or offers the toggle. Flagged "
-    "only shows every connection, and select-all takes none of them while it is ticked. This "
-    "clears when the read recovers. The engine log names the cause."
+    "only shows every connection, and while Flagged only is ticked select-all takes none of them. "
+    "This clears when the read recovers. If it does not, see the engine log: a stored flag row "
+    "that cannot be decoded stops every read until it is deleted from the database by hand."
 )
 
 
@@ -570,7 +571,8 @@ def flag_not_recorded(name: str, detail: str) -> Markup:
             "p",
             "The store did not confirm the change, and a commit whose answer was lost still "
             "lands. So read the flag on Connections first. If it shows what you asked for, the "
-            "change landed, and clicking it again would undo that. If it does not, click it once.",
+            "change landed, and clicking it again would undo that. If it does not, click it once. "
+            "If Connections says the flags could not be read, wait until it can.",
             class_="muted",
         ),
         el("p", el("a", "Back to Connections", href="/ui")),
