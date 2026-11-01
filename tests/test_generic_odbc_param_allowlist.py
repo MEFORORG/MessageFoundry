@@ -3,7 +3,7 @@
 """The generic ODBC dialect's keyword lists cover keywords only (vault BACKLOG #2577).
 
 ``[egress].allowed_db`` reads the host from the ``server`` setting, so the list is hand-chosen, no
-keyword is on it in order to name a connection target, and a file keyword's value is screened
+keyword is on it in order to name a host, and a file keyword's value is screened
 separately by spelling. The lists rely on at least a driver named on the escape list reading the
 ``}}`` escape in a braced password, and the driver reading ``SERVER`` as its target
 (docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). The generic dialect also takes free driver keywords in ``odbc_params``, and the name of

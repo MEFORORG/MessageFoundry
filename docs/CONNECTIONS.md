@@ -1801,7 +1801,7 @@ port compared.
 ##### Accepted `odbc_params` keywords
 
 `[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords:
-the list is hand-chosen, no keyword is on it in order to name a connection target, and a file
+the list is hand-chosen, no keyword is on it in order to name a host, and a file
 keyword's value is screened separately by spelling (vault BACKLOG #2577). **The list covers
 keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
 in a braced password (*The password*, below), and the driver reading `SERVER` as its target
