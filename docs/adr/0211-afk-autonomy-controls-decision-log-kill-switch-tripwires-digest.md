@@ -370,6 +370,27 @@ a Desktop session at the rung gets REVIEW, not HALT; that gap is open. The Lande
 HALT and from the rung entirely, as STEWARD.md 3e exempts it from all three states, and so is a
 roster alias of the Lander.
 
+> **Amendment (2026-10-31): the rung moves to the weekly window.** Anthropic removed the five-hour
+> limit, and the owner ruled the same day that the weekly window now carries the stop. That replaces
+> the 2026-08-14 ruling the section above leans on, that a weekly rung stops nobody. Where this note
+> and the section above differ, this note wins; the rest of the section stands.
+>
+> The gate reads the `seven_day` window of `usage.ps1 -Json`, the only window that reader now
+> publishes. The burn rate still governs: the rung is hit when the rate is above zero, the window is
+> projected to run out within 60 minutes, and that falls before it resets. With no rate, the level is
+> the backstop at 90 percent, the weekly HOLD level of the owner's ruling of 2026-09-17. At 98 percent
+> or more the rung is hit whatever the rate. A reading with a rate but no reset time still counts as
+> before the reset, because a missing reset must not loosen the rung.
+> `Get-DecisionRungLevels` holds the two defaults, and `thresholds.json` overrides them through
+> `levels.weekly` and `minutes`. Any other key under `levels`, `5-hour` included, is an unknown window
+> and throws, so the gate fails closed to REVIEW. The later rungs stay 10 and 5 minutes, so the
+> Steward's minutes default is (60, 10, 5), though the gate reads only the first.
+>
+> **The collector keeps the rate measurable.** Weekly usage moves in whole percents, and `usage.ps1`
+> needs two rows inside its 90-minute rate window. The `five_hour` column used to supply those rows.
+> `usage-collect.ps1` now also appends a row when the last one is 10 minutes old, so a slow or flat burn
+> reads as a low rate rather than as no rate.
+
 ### Where it is enforced, and where it is not
 
 **`-Log` is the enforcement point.** A `decision` record of Class B with `-Reviewed no` is locked,

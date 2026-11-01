@@ -1394,7 +1394,7 @@ whole shape:
 | [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the others share: what a config root is, which one am I in, where does its state live, is it still spendable |
 
 **One publisher, N readers — per account.** The quota is **account-wide**: every session in every repo
-draws down the same 5-hour and 7-day pools, so any one session's reading is the truth for all sessions
+draws down the same 7-day pool, so any one session's reading is the truth for all sessions
 *on that account*. Do not run a collector per session expecting to sum them; that double-counts a shared
 pool.
 
@@ -1402,9 +1402,9 @@ pool.
 config roots at once, and **a config root holds one credential set and therefore one Anthropic account**
 — measured on this box, five account roots carrying five different account emails and five separate
 pools. Publishing them all to one user-level file is last-writer-wins across unrelated quotas, and the
-damage compounds: the percentage flaps, the carry-forward can leave `five_hour` from one account beside
-`seven_day` from another in one document, and `usage.ps1`'s staleness guard **never fires** because some
-other account keeps the file warm. That last one is the worst — the guard looks present and is disarmed.
+damage compounds: the percentage flaps, the carry-forward can keep one account's `seven_day` in a
+document another account wrote, and `usage.ps1`'s staleness guard **never fires** because some other
+account keeps the file warm. That last one is the worst — the guard looks present and is disarmed.
 So the publish path is per config root, derived by one shared function that the collector, the reader and
 the installer all call. The full statement of the rule lives in
 [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1)'s header; everything else links to it.
@@ -1422,9 +1422,13 @@ never publish it itself. `refreshInterval` is set because statusLine updates are
 silent when a session is idle — Anthropic's docs name *"a coordinator waits on background subagents"* as
 exactly the case where that leaves you blind.
 
-**Two of the four Settings > Usage numbers are not available.** The payload carries `five_hour` and
-`seven_day` only; the **model-scoped weekly bucket** (the "Weekly / Fable" bar) and the **plan tier** are
-absent, and the request to expose them was closed as not-planned. `usage.ps1` prints that every run.
+**Only the weekly window is read.** Anthropic removed the five-hour limit (owner instruction 2026-10-31),
+so the collector reads `seven_day` alone and ignores any other key in a payload, an older `latest.json` or
+a `history.jsonl` row. The weekly window also carries the stop, in the owner's rung that
+[ADR 0211](adr/0211-afk-autonomy-controls-decision-log-kill-switch-tripwires-digest.md) records. Two other
+numbers in Settings > Usage are not available: the **model-scoped weekly bucket** (the "Weekly / Fable"
+bar) and the **plan tier** are absent, and the request to expose them was closed as not-planned.
+`usage.ps1` prints that every run.
 
 **Opus is not one of the gaps** — and the first version of this section said it was. Opus and Sonnet have
 **no separate weekly bucket**: they draw on *All models*, which is the `seven_day` window this reads, so
@@ -1475,7 +1479,7 @@ statusLine, and so on — each with a different fix, instead of saying "not inst
 
 > **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
 > summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its
-> "5-hour block" is a client-side reconstruction and its statusline percentage is context-window.
+> billing blocks are a client-side reconstruction and its statusline percentage is context-window.
 > `claude-usage-tracker` is the same mistake in cruder form — real token parsing compared against a
 > hardcoded limit table. Anything reading plan state from either is confidently wrong at exactly the
 > moment it matters. Tokens and plan-limit consumption are different quantities.
