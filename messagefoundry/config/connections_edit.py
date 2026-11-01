@@ -162,12 +162,12 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     ``runJson``, and direct Python callers all see the same canonical form. The string form is
     read-schema-legal on write-back (pydantic re-parses ISO strings — ``ActiveWindow.start``/``end``).
 
-    A file the file system will not let this account read raises :class:`WiringError`: the engine's
-    flag toggle lists before it writes, so this is the first read that toggle makes."""
-    path = _path(config_dir)
-    if not path.is_file():
+    A file the file system will not let this account read raises :class:`WiringError`, because the
+    engine's flag toggle lists through here before it writes."""
+    text, _crlf = atomic_edit.read_text_if_present(_path(config_dir), refused_error=WiringError)
+    if text is None:
         return []
-    doc = tomlkit.parse(atomic_edit.read_for_listing(path, refused_error=WiringError))
+    doc = tomlkit.parse(text)
     out: list[dict[str, Any]] = []
     for direction in ("inbound", "outbound"):
         for table in doc.get(direction, []):
@@ -237,7 +237,7 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
     """Remove the data-authored connection ``name``. Raises :class:`WiringError` if it isn't in
     ``connections.toml`` (a code-first connection can't be removed here)."""
     path = _path(config_dir)
-    if not path.is_file():
+    if not atomic_edit.is_file(path, refused_error=WiringError):
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
     with locked(config_dir):
         text, crlf = atomic_edit.read_text(path, refused_error=WiringError)

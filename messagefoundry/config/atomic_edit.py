@@ -32,9 +32,11 @@ runs on an event loop: the engine's one caller already moves the whole write to 
 :func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
 ``\n``, and a file written wholly in ``\r\n`` is written back that way rather than reflowed.
 
-:func:`refused_as` turns a refusal from the file system into the editor's own refusal type, for every
-step that leaves the edited file as it was. Each editor names that type, so a root-owned or read-only
-config directory reaches an operator as a refused edit and not as an unhandled ``OSError``.
+:func:`refused_as` turns a refusal from the file system into the editor's own refusal type, for at
+least the lock, the read, the candidate, its companions and the replace, each of which leaves the
+edited file as it was. Each editor names that type, so a root-owned or read-only config directory
+reaches an operator as a refused edit and not as an unhandled ``OSError``. ``validate`` is not one of
+those steps: what it raises is its own.
 """
 
 from __future__ import annotations
@@ -54,6 +56,8 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
+from messagefoundry.config.snapshot import _is_file
+
 __all__ = [
     "CANDIDATE_DIR_SUFFIX",
     "DEFAULT_LOCK_TIMEOUT_S",
@@ -62,7 +66,7 @@ __all__ = [
     "encode_text",
     "is_candidate_dir_name",
     "lock_path_for",
-    "read_for_listing",
+    "is_file",
     "read_text",
     "read_text_if_present",
     "refused_as",
@@ -154,24 +158,21 @@ def read_text(path: Path, *, refused_error: Callable[[str], Exception]) -> tuple
 def read_text_if_present(
     path: Path, *, refused_error: Callable[[str], Exception]
 ) -> tuple[str | None, bool]:
-    """:func:`read_text`, or ``(None, False)`` for a file an edit is about to create.
-
-    The read decides, not ``is_file``: that answers ``False`` for a path it could not stat, so a
-    file in a directory this account cannot search would read as absent, and the edit would write
-    a new file over it with every other setting gone."""
-    try:
-        return read_text(path, refused_error=refused_error)
-    except FileNotFoundError:
+    """:func:`read_text`, or ``(None, False)`` for a path that is no regular file, as for a file an
+    edit is about to create."""
+    if not is_file(path, refused_error=refused_error):
         return None, False
+    return read_text(path, refused_error=refused_error)
 
 
-def read_for_listing(path: Path, *, refused_error: Callable[[str], Exception]) -> str:
-    """``path``'s text for a list or show, with a refused read raised as ``refused_error(message)``.
+def is_file(path: Path, *, refused_error: Callable[[str], Exception]) -> bool:
+    """Whether ``path`` is a regular file, with a refused stat raised as ``refused_error(message)``.
 
-    Not :func:`read_text`, which keeps the bytes an edit will write back: a listing has always read
-    in Python's text mode, whose newline translation also takes a lone ``\r``."""
+    Not ``Path.is_file``, which answers ``False`` for a path it could not stat: a config file that
+    is a link into a directory this account cannot search would read as absent, and an edit would
+    start from an empty document and replace the link with it."""
     with refused_as(path, refused_error, _READ_STEP):
-        return path.read_text(encoding="utf-8")
+        return _is_file(path)
 
 
 def encode_text(text: str, crlf: bool) -> bytes:
@@ -299,7 +300,7 @@ def refused_as(
     """Raise a refusal (``_REFUSED``) from the body, which does ``step`` to ``path``, as
     ``refused_error(message)``; any other ``OSError``, or any at all when ``refused_error`` is
     ``None``, propagates unchanged. Only for a step that leaves ``path`` as it was when it fails,
-    because the message says the file was not changed."""
+    because the message says so."""
     try:
         yield
     except OSError as exc:
@@ -324,17 +325,16 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
         if _WINDOWS and exc.errno == errno.EACCES
         else ""
     )
-    advice = (
-        "Another account owns the file or its directory; read it as that account, or give this "
-        "account access to it"
-        if step == _READ_STEP
-        else "Its directory is read-only or another account owns it, as a root-owned or read-only "
-        "config directory is, or another account owns the file named; change the file where this "
-        "account can write it, or as the account that owns it"
-    )
+    if step == _READ_STEP:
+        return (
+            f"{path.name} could not be read: {reason}. {held}Another account owns the file or its "
+            "directory; read it as that account, or give this account access to it"
+        )
     return (
         f"{path.name} was not changed: the file system would not let this account {step}: "
-        f"{reason}. {held}{advice}"
+        f"{reason}. {held}Its directory is read-only or another account owns it, as a root-owned or "
+        "read-only config directory is, or another account owns the file named; change the file "
+        "where this account can write it, or as the account that owns it"
     )
 
 

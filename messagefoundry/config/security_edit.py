@@ -41,10 +41,12 @@ def read_security(service_config: str | Path) -> dict[str, Any]:
     """The ``[security]`` table as authored in ``service_config`` (``{}`` if the file or the ``[security]``
     table is absent). These are the EXPLICITLY-set switches — a caller resolves the secure defaults for
     the unset ones. Comment/format trivia is not returned (values only)."""
-    path = Path(service_config)
-    if not path.is_file():
+    text, _crlf = atomic_edit.read_text_if_present(
+        Path(service_config), refused_error=SecurityEditError
+    )
+    if text is None:
         return {}
-    doc = tomlkit.parse(atomic_edit.read_for_listing(path, refused_error=SecurityEditError))
+    doc = tomlkit.parse(text)
     sec = doc.get("security")
     return dict(sec.unwrap()) if sec is not None else {}
 

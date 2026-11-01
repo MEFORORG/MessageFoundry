@@ -100,9 +100,14 @@ def _raising(exc: OSError) -> Callable[..., Any]:
     return fake
 
 
-def _assert_refused(exc: WiringError, tmp_path: Path, refusal: OSError) -> None:
+def _assert_refused(
+    exc: WiringError,
+    tmp_path: Path,
+    refusal: OSError,
+    lead: str = "connections.toml was not changed",
+) -> None:
     message = str(exc)
-    assert "connections.toml was not changed" in message
+    assert lead in message
     assert refusal.errno is not None
     assert errno.errorcode[refusal.errno] in message
     # The message reaches the operator over the API; the host's directory stays in the log.
@@ -238,20 +243,24 @@ def test_an_error_from_the_validate_callback_is_never_converted(
 
 def _refuse_reads(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) -> None:
     real_bytes = Path.read_bytes
-    real_text = Path.read_text
 
     def fake_bytes(self: Path) -> bytes:
         if self.name == name:
             raise refusal
         return real_bytes(self)
 
-    def fake_text(self: Path, *args: Any, **kwargs: Any) -> str:
+    monkeypatch.setattr(Path, "read_bytes", fake_bytes)
+
+
+def _refuse_stat(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) -> None:
+    real_stat = Path.stat
+
+    def fake_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
         if self.name == name:
             raise refusal
-        return real_text(self, *args, **kwargs)
+        return real_stat(self, follow_symlinks=follow_symlinks)
 
-    monkeypatch.setattr(Path, "read_bytes", fake_bytes)
-    monkeypatch.setattr(Path, "read_text", fake_text)
+    monkeypatch.setattr(Path, "stat", fake_stat)
 
 
 @REFUSALS
@@ -275,10 +284,10 @@ def test_a_file_it_cannot_read_is_a_wiring_error(
     _live(tmp_path)
     _refuse_reads(monkeypatch, refusal, "connections.toml")
 
-    with pytest.raises(WiringError, match="read it") as caught:
+    with pytest.raises(WiringError) as caught:
         edit(tmp_path)
 
-    _assert_refused(caught.value, tmp_path, refusal)
+    _assert_refused(caught.value, tmp_path, refusal, lead="connections.toml could not be read")
 
 
 RULE: dict[str, Any] = {"event_type": "connection_failed", "severity": "warning"}
@@ -381,9 +390,12 @@ def test_the_other_editors_refuse_each_step_in_their_own_type(
     [
         (_alerts_add, alerts_edit.AlertRuleError),
         (_alerts_remove, alerts_edit.AlertRuleError),
+        (alerts_edit.list_rules, alerts_edit.AlertRuleError),
         (_security_set, security_edit.SecurityEditError),
+        # The security CLI reads through here before it sets, so this read comes first there.
+        (security_edit.read_security, security_edit.SecurityEditError),
     ],
-    ids=["alerts-add", "alerts-remove", "security"],
+    ids=["alerts-add", "alerts-remove", "alerts-list", "security-set", "security-read"],
 )
 def test_the_settings_editors_refuse_a_read_in_their_own_type(
     tmp_path: Path,
@@ -396,34 +408,8 @@ def test_the_settings_editors_refuse_a_read_in_their_own_type(
     refusal = PermissionError(errno.EACCES, "Permission denied")
     _refuse_reads(monkeypatch, refusal, path.name)
 
-    with pytest.raises(refused, match="read it") as caught:
+    with pytest.raises(refused, match="could not be read") as caught:
         edit(path)
-
-    assert caught.value.__cause__ is refusal
-
-
-@pytest.mark.parametrize(
-    ("list_it", "refused"),
-    [
-        (alerts_edit.list_rules, alerts_edit.AlertRuleError),
-        (security_edit.read_security, security_edit.SecurityEditError),
-    ],
-    ids=["alerts", "security"],
-)
-def test_the_settings_listings_refuse_a_read_in_their_own_type(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    list_it: Callable[[Path], Any],
-    refused: type[Exception],
-) -> None:
-    # The security CLI reads through here before it sets, so this read comes first on that path.
-    path = tmp_path / "messagefoundry.toml"
-    path.write_text(RULES_TOML, encoding="utf-8")
-    refusal = PermissionError(errno.EACCES, "Permission denied")
-    _refuse_reads(monkeypatch, refusal, path.name)
-
-    with pytest.raises(refused, match="read it") as caught:
-        list_it(path)
 
     assert caught.value.__cause__ is refusal
 
@@ -441,39 +427,80 @@ def test_a_read_refusal_gives_read_advice_not_write_advice(
         connections_edit.list_connections(tmp_path)
 
     assert "read-only" not in str(caught.value)
+    assert "was not changed" not in str(caught.value)
     assert "give this account access" in str(caught.value)
 
 
+def _connection_upsert(path: Path) -> Any:
+    return connections_edit.upsert_connection(path.parent, ENTRY, validate=_noop)
+
+
+def _connection_remove(path: Path) -> Any:
+    return connections_edit.remove_connection(path.parent, "OB_TOML", validate=_noop)
+
+
+def _connection_list(path: Path) -> Any:
+    return connections_edit.list_connections(path.parent)
+
+
 @pytest.mark.parametrize(
-    ("edit", "refused"),
+    ("name", "content", "edit", "refused"),
     [
-        (_alerts_add, alerts_edit.AlertRuleError),
-        (_security_set, security_edit.SecurityEditError),
+        ("messagefoundry.toml", RULES_TOML, _alerts_add, alerts_edit.AlertRuleError),
+        ("messagefoundry.toml", RULES_TOML, _alerts_remove, alerts_edit.AlertRuleError),
+        ("messagefoundry.toml", RULES_TOML, alerts_edit.list_rules, alerts_edit.AlertRuleError),
+        ("messagefoundry.toml", RULES_TOML, _security_set, security_edit.SecurityEditError),
+        (
+            "messagefoundry.toml",
+            RULES_TOML,
+            security_edit.read_security,
+            security_edit.SecurityEditError,
+        ),
+        ("connections.toml", CONNECTIONS_TOML, _connection_upsert, WiringError),
+        ("connections.toml", CONNECTIONS_TOML, _connection_remove, WiringError),
+        ("connections.toml", CONNECTIONS_TOML, _connection_list, WiringError),
     ],
-    ids=["alerts", "security"],
+    ids=[
+        "alerts-add",
+        "alerts-remove",
+        "alerts-list",
+        "security-set",
+        "security-read",
+        "connection-upsert",
+        "connection-remove",
+        "connection-list",
+    ],
 )
-def test_a_file_it_cannot_stat_is_refused_rather_than_read_as_absent(
+def test_a_path_it_cannot_stat_is_refused_rather_than_read_as_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    content: str,
     edit: Callable[[Path], Any],
     refused: type[Exception],
 ) -> None:
-    # is_file() answers False for a path it could not stat. Reading that as "no file" would start
-    # from an empty document and replace the file with it.
-    path = tmp_path / "messagefoundry.toml"
-    path.write_text(RULES_TOML, encoding="utf-8")
-    before = path.read_bytes()
-    validated: list[Path] = []
-    monkeypatch.setattr(Path, "is_file", lambda _self: False)
-    _refuse_reads(monkeypatch, PermissionError(errno.EACCES, "Permission denied"), path.name)
-    monkeypatch.setattr(os, "replace", lambda src, _dst: validated.append(Path(src)))
+    # Path.is_file answers False for a path it could not stat, as for a link into a directory this
+    # account cannot search. Reading that as "no file" would make an edit start from an empty
+    # document and replace the link, and a listing answer empty.
+    path = tmp_path / name
+    path.write_bytes(content.encode("utf-8"))
+    replaced: list[Path] = []
+    _refuse_stat(monkeypatch, PermissionError(errno.EACCES, "Permission denied"), name)
+    monkeypatch.setattr(os, "replace", lambda src, _dst: replaced.append(Path(src)))
 
-    with pytest.raises(refused, match="read it"):
+    with pytest.raises(refused, match="could not be read"):
         edit(path)
 
-    monkeypatch.undo()
-    assert validated == []
-    assert path.read_bytes() == before
+    assert replaced == []
+    assert path.read_bytes() == content.encode("utf-8")
+
+
+def test_a_path_that_is_no_regular_file_is_never_opened_to_read(tmp_path: Path) -> None:
+    # The gate is a stat, not a read: a FIFO planted here would block the read, under the lock.
+    path = tmp_path / "messagefoundry.toml"
+    path.mkdir()
+
+    assert atomic_edit.read_text_if_present(path, refused_error=WiringError) == (None, False)
 
 
 def test_an_edit_of_a_file_that_is_not_there_creates_it(tmp_path: Path) -> None:

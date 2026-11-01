@@ -391,7 +391,8 @@ def _write_targets(call: ast.Call) -> list[ast.expr]:
     """The path expressions ``call`` writes to, for the shapes this guard knows: ``x.write_text``,
     ``x.write_bytes``, ``x.open("w")`` and ``open(x, "w")`` with the mode positional or keyword
     (any of ``w``/``a``/``x``/``+``), the destination of ``os.replace``/``os.rename`` and the
-    ``shutil`` copies and move, and of the one-argument ``Path.replace``/``Path.rename``."""
+    ``shutil`` copies and move, of the one-argument ``Path.replace``/``Path.rename``, and of
+    ``replace_generated``, the held-file wrapper around ``os.replace`` the config editors use too."""
     func = call.func
 
     def mode_writes(mode: ast.expr | None) -> bool:
@@ -424,10 +425,9 @@ def _write_targets(call: ast.Call) -> list[ast.expr]:
             return [call.args[0]]
     if isinstance(func, ast.Name) and func.id == "open" and call.args and mode_writes(mode_of(1)):
         return [call.args[0]]
-    # The held-file wrapper around os.replace, which the config editors use too.
     name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-    if name == "replace_generated" and len(call.args) > 1:
-        return [call.args[1]]
+    if name == "replace_generated":
+        return call.args[1:2] or [k.value for k in call.keywords if k.arg == "live"]
     return []
 
 
@@ -462,6 +462,7 @@ def test_no_engine_code_writes_a_config_path_directly() -> None:
         "tmp.rename(config_dir / 'codesets' / 'x.csv')",
         "replace_generated(tmp, cfg_dir / CONNECTIONS_FILE_NAME)",
         "restricted_file.replace_generated(tmp, cfg_dir / CONNECTIONS_FILE_NAME)",
+        "replace_generated(staged=tmp, live=cfg_dir / CONNECTIONS_FILE_NAME)",
     ],
 )
 def test_the_direct_write_scan_sees_each_shape(line: str) -> None:

@@ -1,12 +1,13 @@
-- **A config edit the file system denies (`EACCES`, `EPERM` or `EROFS`) is a refused edit at every
-  step that leaves the file as it was.** `connections.toml`'s editor now also answers a denied read
-  or a denied replace with `WiringError`, which the API maps to 409, and the alert, security and
-  code-set editors refuse in their own types instead of raising `OSError`. A failed replace leaves
-  the live file whole; an error after the replace still propagates, because the edit has landed.
+- **A config edit the file system denies (`EACCES`, `EPERM` or `EROFS`) is a refused edit at more
+  steps.** At least the lock, the read, the candidate, its companion copy and the replace now raise
+  the editor's own refusal, and each of them leaves the file as it was. For `connections.toml` that
+  is `WiringError`, which the API maps to 409; the alert, security and code-set editors use their
+  own types instead of raising `OSError`. An error after the replace still propagates, because the
+  edit has landed, and what a `validate` callback raises is its own. (`BACKLOG #3765`)
+- **A config path this account cannot stat no longer reads as absent.** Such a path, a link into a
+  directory it cannot search, is now a refused read. Before, an edit would have started from an
+  empty document and replaced the link with it, and a listing would have answered empty.
   (`BACKLOG #3765`)
-- **A file in a directory this account cannot search no longer reads as absent to an edit.** Such
-  a settings or connections file is now a refused read. Before, the edit would have started from
-  an empty document and written it over the file. (`BACKLOG #3765`)
 - **The edit lock's handle is read-write off Windows.** An NFS client's exclusive `flock` fails
   `EBADF` on a read-only handle, which would have failed every edit on an NFS mount with working
   locks. This rests on `flock(2)` and a modelled test, not on a real NFS mount. A mount with no

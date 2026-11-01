@@ -73,10 +73,12 @@ def list_rules(service_config: str | Path) -> list[dict[str, Any]]:
     """The operator-authored ``[[alerts.rules]]`` in ``service_config`` (``[]`` if the file or the
     ``[alerts].rules`` table is absent). Each entry is the rule as a plain dict with its ordinal
     ``index`` added — the positional handle the GUI uses for ``remove``."""
-    path = Path(service_config)
-    if not path.is_file():
+    text, _crlf = atomic_edit.read_text_if_present(
+        Path(service_config), refused_error=AlertRuleError
+    )
+    if text is None:
         return []
-    doc = tomlkit.parse(atomic_edit.read_for_listing(path, refused_error=AlertRuleError))
+    doc = tomlkit.parse(text)
     rules = _existing_rules(doc)
     if rules is None:
         return []
@@ -121,7 +123,7 @@ def remove_rule(service_config: str | Path, index: int, *, validate: Validate) -
     """Remove the rule at ordinal ``index`` from ``[[alerts.rules]]``. Raises :class:`AlertRuleError`
     if the file/table is absent or the index is out of range (every other table's trivia survives)."""
     path = Path(service_config)
-    if not path.is_file():
+    if not atomic_edit.is_file(path, refused_error=AlertRuleError):
         raise AlertRuleError(f"no settings file at {path}")
     with atomic_edit.edit_lock(path, busy_error=AlertRuleError, refused_error=AlertRuleError):
         text, crlf = atomic_edit.read_text(path, refused_error=AlertRuleError)

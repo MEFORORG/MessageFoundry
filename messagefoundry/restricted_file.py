@@ -14,6 +14,8 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
 Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
 the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
 here so the `cert` commands, which write through this module, need not import the API TLS module.
+:func:`replace_generated` is its twin for a replace. The config editors use both on files that hold
+no key, because a hold looks the same there.
 
 ``store._secure_file`` is the other mechanism, and it is for files that hold no key: it tightens a
 file that already exists and only logs when it cannot. A file that holds a key must never have that
