@@ -256,12 +256,15 @@ _LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
     (_CONSTRUCT_RETURN, _CONSTRUCT_RETURN.replace("[Control(", "[*marker, Control(")),
 )
 
-# BACKLOG #2526, the second amendment, applied BEFORE the one above. A ``<List>``/``<Actions>``
-# wrapper carrying ``@Disabled`` was flattened, so the statements an operator switched off came
-# back as live code, and the scan walked them to agree. It is now commented out as one disabled
-# step, the scan skips it, and a disabled step stands between no construct and the sibling branch
-# written after it. Written apart from the head: here the adoption looks back past such steps,
-# where the head holds them out of the list until a step that runs follows them.
+# BACKLOG #2526 and #2685, the second amendment, applied BEFORE the one above. A
+# ``<List>``/``<Actions>`` wrapper carrying ``@Disabled`` was flattened, so the statements an
+# operator switched off came back as live code, and the scan walked them to agree. It is now
+# commented out as one disabled step, and the scan skips it. A step that runs nothing (a disabled
+# one, a line with no statement, a ``MsgLog``, an empty label) stands between no construct and
+# the sibling branch written after it. And a branch left with no construct renders its body
+# under a dead placeholder, where main ran it for every message. Written apart from the head:
+# here the adoption looks back past such steps, where the head holds them out of the list until
+# a step that runs follows them.
 _LIVE_SKIP = "        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:\n"
 _WRAPPER_NOTE = "            # A doubly-wrapped list: flatten rather than lose the statements.\n"
 _PARSE_LIST_DEF = "def _parse_list(\n"
@@ -276,9 +279,22 @@ _ADOPTED_FROM_LAST = (
 _LOOK_BACK = """\
 def _off(step: Step) -> bool:
     if isinstance(step, Control):
-        return step.kind == "disabled"
-    # The label amendment's marker, a subclass, when that amendment is loaded too.
-    return isinstance(step, UnmappedAction) and type(step) is not UnmappedAction
+        if step.kind == "disabled":
+            return True
+        # A label over nothing that runs. The label amendment's demoted call keeps its kind.
+        return (
+            step.kind == "block"
+            and not getattr(step, "was", "")
+            and not [s for s in step.body if not _off(s)]
+        )
+    if not isinstance(step, UnmappedAction):
+        return False
+    return (
+        # The label amendment's marker, a subclass, when that amendment is loaded too.
+        type(step) is not UnmappedAction
+        or step.source_class.lower() == "msglog"
+        or step.detail == f"<{step.source_class}> carries no statement to translate"
+    )
 
 
 def _construct_at(steps: list[Step]) -> int:
@@ -289,8 +305,21 @@ def _construct_at(steps: list[Step]) -> int:
 
 
 """
+_ORPHAN_INLINE = (
+    '    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]\n'
+    "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
+)
 _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     (_LIVE_SKIP, "        if _is_disabled(elem):\n"),
+    # BACKLOG #2685: a branch with no construct renders its body under a dead placeholder.
+    (
+        _ORPHAN_INLINE,
+        "    never = (\n"
+        '        f" with no enclosing construct, so this branch never runs{suffix}"\n'
+        "    )\n"
+        '    out = [f"{pad}if False:  # TODO: Corepoint {ctrl.source_verb}{never}"]\n'
+        "    out.extend(_block_body(ctrl.body, indent + 1, in_loop=in_loop))\n",
+    ),
     (
         _WRAPPER_NOTE,
         _WRAPPER_NOTE + "            if _is_disabled(child):\n"
@@ -3408,11 +3437,7 @@ def _added_live_code(was: str, now: str) -> list[str]:
 
 def _code_lines(src: str) -> list[str]:
     """The handler's lines that are code: not blank, and not a comment."""
-    return [
-        line
-        for line in src.split("@handler")[-1].splitlines()[1:]
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    return [line for line in _handler_lines(src)[1:] if not line.lstrip().startswith("#")]
 
 
 def _holds_a_disabled_wrapper(xml: str) -> bool:
@@ -3429,13 +3454,15 @@ def _holds_a_disabled_wrapper(xml: str) -> bool:
     )
 
 
-#: The fewest lists of the battery and the raw draw the fail-closed amendment changes, by whether
-#: the list holds a disabled wrapper, and the fewest the control reads the other way.
-_FAIL_CLOSED_FLOORS = {True: 500, False: 5}
-_FAIL_CLOSED_REVERSE_FLOOR = 1
+#: Over one chunk of the battery and the raw draw: the fewest lists the fail-closed amendment
+#: changes, by whether the list holds a disabled wrapper, and the fewest the control reads the
+#: other way. About half the smallest chunk's count, measured 2026-10-31 (27, 62 and 15).
+_FAIL_CLOSED_FLOORS = {True: 13, False: 30}
+_FAIL_CLOSED_REVERSE_FLOOR = 7
 
 
-def test_the_fail_closed_amendment_adds_no_live_code() -> None:
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_the_fail_closed_amendment_adds_no_live_code(chunk: int) -> None:
     """The fail-closed amendment switches live code off, and nothing else, against the file
     exactly as vendored: it adds no code line, moves none shallower, adds no closing send, and
     refuses no list main renders. It is quieter than main on purpose: a send main made from
@@ -3449,7 +3476,7 @@ def test_the_fail_closed_amendment_adds_no_live_code() -> None:
     changed = {True: 0, False: 0}
     reverse = 0
     broken: list[str] = []
-    for name, xml in _STRUCTURE_SHAPES:
+    for name, xml in _STRUCTURE_SHAPES[chunk::_CHUNKS]:
         was, now = _generate(step1_as_vendored, xml), _generate(step1_unlabelled, xml)
         if now == was:
             continue

@@ -201,6 +201,15 @@ class LabelMarker(UnmappedAction):
 
 
 @dataclass(frozen=True)
+class _NoStatement(UnmappedAction):
+    """The counted TODO for a ``<Line>`` holding no statement: an empty line, or one carrying only
+    an operator's ``@Comment``.
+
+    It renders and counts as any :class:`UnmappedAction`. It is its own type so
+    :func:`_runs_nothing` can tell it from a statement the import could not map (BACKLOG #2685)."""
+
+
+@dataclass(frozen=True)
 class Control:
     """A non-leaf element of the ``<Package>`` control-flow tree — a construct with a nested body.
 
@@ -1534,9 +1543,11 @@ def _parse_list(
     # wait here, outside ``steps``, until the next step that runs arrives. So ``steps[-1]`` always
     # runs, and none of these comes between a construct and a branch written after it: not from a
     # wrapper beside the construct, not from one nested in another, not at the end of a body
-    # flattened to this level. Seen as a step, it would orphan the branch, and an orphan's body
-    # renders live (BACKLOG #2632, #2526). It keeps its place in source order among the steps that
-    # are not adopted.
+    # flattened to this level. Seen as a step, it would orphan the branch (BACKLOG #2632, #2526,
+    # #2685). It keeps its place in source order among the steps that are not adopted. So one
+    # written between a construct and its branch renders after the whole chain, still at this
+    # level: an ``if`` chain has no line between its arms where a step could stand, and none of
+    # these runs anything, so where it sits changes no message.
     waiting: list[Step] = []
     for child in container:
         tag = _local(child.tag).lower()
@@ -1595,15 +1606,31 @@ def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
 
 
 def _runs_nothing(step: Step) -> bool:
-    """Whether ``step`` renders as comment lines alone, so it is no position a sibling branch is
-    adopted from (:func:`_parse_list`): a :class:`LabelMarker`, or a ``@Disabled`` element.
+    """Whether ``step`` renders as comment lines alone and changes no control flow, so it is no
+    position a sibling branch is adopted from (:func:`_parse_list`). At least these are:
 
-    A ``@Disabled`` element never runs, so it must not orphan a branch the same list adopts with
-    that element taken out. A disabled ``<List>`` wrapper was flattened away, so it never stood
-    there; it is a disabled step now (BACKLOG #2526), and a disabled statement always was one."""
-    if isinstance(step, LabelMarker):
+    * a :class:`LabelMarker`, which is no statement position of the export (BACKLOG #2632);
+    * a ``@Disabled`` element, which never runs. A disabled ``<List>`` wrapper was flattened
+      away, so it never stood there; it is a disabled step now (BACKLOG #2526);
+    * a ``<Line>`` holding no statement (:class:`_NoStatement`), and the ``@Comment`` beside it;
+    * a ``MsgLog``, which maps to no vocabulary helper, so it is always a TODO;
+    * a ``<Block>`` label over nothing but such steps. Not "over nothing at all": a label
+      marker in its body would then decide the shape of the tree, which a marker never does.
+
+    Each used to orphan a branch written after it, and an orphan's body rendered live, so its
+    send was made for every message (BACKLOG #2685). A step that runs, such as a field write, a
+    send or an unmapped verb, still stands between a construct and its branch: an ``if`` chain
+    has no place for it, so the branch stays an orphan and fails closed in the render."""
+    if isinstance(step, LabelMarker | _NoStatement):
         return True
-    return isinstance(step, Control) and step.kind == "disabled"
+    if isinstance(step, Action):
+        return False
+    if isinstance(step, UnmappedAction):
+        return step.source_class.lower() == "msglog"
+    if step.kind == "disabled":
+        return True
+    # A label demoted from a call keeps the shape the call had (:func:`_structural_kind`).
+    return step.kind == "block" and not step.demoted_from and all(map(_runs_nothing, step.body))
 
 
 def _container_steps(
@@ -1615,7 +1642,7 @@ def _container_steps(
 ) -> list[Step]:
     """The nested body of ``elem``, in document order — every child, whatever shape it takes.
 
-    :func:`_parse_list` already flattens a ``<List>``/``<Actions>`` wrapper, so walking ``elem`` itself
+    :func:`_parse_list` already flattens a live ``<List>``/``<Actions>`` wrapper, so walking ``elem`` itself
     covers BOTH forms (the usual wrapped body and a direct statement child) *and* keeps a statement that
     is a **sibling** of the wrapper. Returning only the wrapper's children — as an earlier cut did the
     moment any wrapper existed — silently discarded those siblings, including an ``Else`` marker and its
@@ -1712,7 +1739,7 @@ def _parse_statement(
         else:
             # No statement at all — reported rather than skipped, because a silently-ignored element is
             # exactly the accept-and-drop this importer refuses (count-and-log).
-            mapped = UnmappedAction(tag, f"<{tag}> carries no statement to translate")
+            mapped = _NoStatement(tag, f"<{tag}> carries no statement to translate")
         # An operator's ``@Comment`` — and the ``description``/``comment`` prose the role layer lifts
         # OUT of the statement — is preserved beside the step it annotates, never dropped.
         prose = note or _role_prose(roles)
@@ -2682,10 +2709,16 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         return out
     if ctrl.kind in ("if", "case"):
         return _generate_conditional(ctrl, indent, in_loop=in_loop)
-    # A branch marker with no construct to continue (a malformed / unexpected placement). Emitting a
-    # bare ``else:`` would not even parse, so it degrades to a marker + its body inline — never lost.
-    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]
-    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
+    # A branch marker with no construct to continue: a malformed placement, or a step that runs
+    # written between a construct and its branch (:func:`_runs_nothing`). A bare ``else:`` would
+    # not parse. Its body inlined at THIS level ran for every message, a branch's send among it
+    # (BACKLOG #2685), so it fails closed: under a dead placeholder, as every branch is until
+    # someone writes its condition. Never lost, and never live.
+    out = [
+        f"{pad}if False:  # TODO: Corepoint {ctrl.source_verb} with no enclosing construct, so "
+        f"this branch never runs{suffix}"
+    ]
+    out.extend(_block_body(ctrl.body, indent + 1, in_loop=in_loop))
     return out
 
 
@@ -3145,7 +3178,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
                 # marker standing where a statement should be, with no construct to continue: its
                 # kind names real Python control flow, so it sits in ``_MAPPED_CONTROL_KINDS``, but
                 # only an ADOPTED marker is ever EMITTED as control flow and an orphan degrades to a
-                # TODO marker (BACKLOG #1854). Either way it is counted here (and surfaced by name in
+                # TODO marker over a dead placeholder (BACKLOG #1854, #2685): it is no branch of
+                # anything. Either way it is counted here (and surfaced by name in
                 # ``unmapped_classes``) so it is reported, never skipped — its body counts on below.
                 # A "break" reaches here only outside a loop, where the render marks it (#1860).
                 unmapped.append(step.source_verb)

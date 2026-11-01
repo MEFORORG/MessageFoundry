@@ -1084,15 +1084,17 @@ def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -
 
 
 def test_a_branch_marker_with_no_construct_is_counted_unmapped() -> None:
-    """An orphaned marker emits a TODO and nothing else, so it may not be counted mapped (#1854).
+    """An orphaned marker emits a TODO over a dead placeholder, so it may not be counted mapped
+    (#1854, #2685).
 
     ``else``/``elif``/``except``/``match`` are all in ``_MAPPED_CONTROL_KINDS`` -- they name real
     Python control flow when a construct adopts them. Standing alone there is no construct to
-    continue, the render degrades to a marker, and the count has to follow the render."""
+    continue, the render degrades to a marker, and the count has to follow the render. The
+    statement after the marker is its sibling, not its body, so it still runs."""
     body = '<Line Data="Else"/><Line Data="ItemClear %ADT/PID-21"/>'
     src = _handler_source(body)
-    assert "# TODO: Corepoint Else with no enclosing construct" in src
-    assert 'set_field(msg, "PID-21", "")' in src
+    assert "    if False:  # TODO: Corepoint Else with no enclosing construct" in src
+    assert '\n    set_field(msg, "PID-21", "")' in src
     assert _count_steps(_handler_steps(body), in_loop=False) == (1, ["Else"], 0)
 
 
@@ -2129,12 +2131,15 @@ def test_a_wrappers_marker_changes_nothing_where_main_already_orphans(
 ) -> None:
     """The control for the test above, and the limit it leaves. A wrapper with a statement of its
     own between a construct and its sibling branch orphans that branch on main, whatever the
-    wrapper's ``@Data``. The marker neither repairs that nor adds to it."""
+    wrapper's ``@Data``. The marker neither repairs that nor adds to it. The orphan fails closed:
+    its send sits under a dead placeholder, where main made it for every message (BACKLOG
+    #2685)."""
     construct, branch = _SIBLING_BRANCHES[pair]
     template = construct + _FILLED_WRAPPERS[between] + _sibling_arm(branch)
     src = _assert_the_markers_change_no_code(template, 1)
     assert src.count(_ORPHAN) == 1
-    assert '    sends.append(Send("OB_FLAT", msg))' in src
+    assert '\n        sends.append(Send("OB_FLAT", msg))' in src
+    assert '\n    sends.append(Send("OB_FLAT"' not in src
 
 
 @pytest.mark.parametrize("between", ["<List{S}/>", "<List><List{S}/></List>"])
@@ -2942,4 +2947,115 @@ def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(p
         src = _handler_body(_handler_source(construct + wrapper + _sibling_arm(branch)))
         assert _ORPHAN not in src, wrapper
         assert '        sends.append(Send("OB_FLAT", msg))' in src, wrapper
-        assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
+        assert not _send_lines(src, 1)
+
+
+# --- a step between a construct and the branch written after it (BACKLOG #2685) ------------------
+#
+# A branch marker written after its construct as a sibling is adopted by it only when that
+# construct is the step before it. Any other step in between used to leave the marker standing
+# alone, and an orphan rendered its body live at the handler's own level: its send was then made
+# for every message. A step that renders as a comment alone now leaves the adoption alone, and an
+# orphan that remains renders its body under a dead placeholder. All fixtures are synthetic.
+
+_INTERVENING = {
+    "empty-line": ("<Line/>", "<Line> carries no statement to translate"),
+    "comment-line": ('<Line Comment="checked by hand"/>', "# Corepoint Comment: checked by hand"),
+    "flat-log": ('<Line Data="MsgLog %ADT"/>', "# TODO: Corepoint MsgLog"),
+    "role-log": (
+        _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%ADT")),
+        "# TODO: Corepoint MsgLog",
+    ),
+    "disabled-elseif": ('<Line Disabled="1" Data="ElseIf (y)"/>', "ElseIf: ElseIf (y)"),
+    "disabled-wrapper": (
+        '<List Disabled="1"><Line Data="ItemClear %ADT/PID-20"/></List>',
+        "List: List",
+    ),
+    "one-of-each": (
+        '<Line/><Line Comment="checked by hand"/><Line Data="MsgLog %ADT"/>'
+        '<Line Disabled="1" Data="ElseIf (y)"/>',
+        "ElseIf: ElseIf (y)",
+    ),
+}
+_SIBLING_SHAPES = {
+    "sibling": "{construct}{between}{arm}",
+    "wrapper-between": "{construct}<List>{between}</List>{arm}",
+}
+
+
+def _send_lines(src: str, indent: int) -> list[str]:
+    """The ``sends.append`` lines of a rendered handler at exactly ``indent`` levels."""
+    pad = "    " * indent
+    return [line for line in src.splitlines() if line.startswith(pad + "sends.append")]
+
+
+@pytest.mark.parametrize("shape", _SIBLING_SHAPES)
+@pytest.mark.parametrize("kind", [*_INTERVENING, "nothing"])
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_step_that_renders_as_a_comment_never_orphans_a_sibling_branch(
+    pair: str, kind: str, shape: str
+) -> None:
+    """Each kind the row names, between each construct and its branch. The branch is adopted,
+    so its send stays under a dead condition, and the step is still rendered. ``nothing`` is the
+    plain construct-then-branch control."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    between, rendered = _INTERVENING.get(kind, ("", ""))
+    body = (
+        _SIBLING_SHAPES[shape]
+        .replace("{construct}", construct)
+        .replace("{between}", between)
+        .replace("{arm}", _sibling_arm(branch))
+    )
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert _ORPHAN not in handler
+    assert len(_send_lines(handler, 2)) == 1 and not _send_lines(handler, 1)
+    assert not [line for line in handler.splitlines() if line.startswith("    set_field")]
+    assert rendered in handler
+    unmapped = _count_steps(_handler_steps(body), in_loop=False)[1]
+    assert branch.split()[0] not in unmapped
+    ast.parse(src)
+
+
+def test_the_filed_repro_keeps_its_send_conditional(tmp_path: Path) -> None:
+    """The row's own repro: a branch-group ``<If>``, a disabled ``ElseIf``, then an ``Else``
+    holding a role-marked send of the input. It used to send for every message."""
+    body = (
+        '<If><Line Data="If $X = &quot;1&quot;"><List/></Line>'
+        '<Line Disabled="1" Data="ElseIf $X = &quot;2&quot;"/>'
+        f'<Line Data="Else"><List>{_SEND_INPUT}</List></Line></If>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert _ORPHAN not in handler
+    assert '        sends.append(Send("OB_IN", msg))' in handler
+    assert not _send_lines(handler, 1)
+    assert "    elif False:  # TODO: Corepoint Else" in handler
+    assert _run_handler(tmp_path, body) == []
+
+
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_branch_left_with_no_construct_runs_nothing(pair: str) -> None:
+    """A live statement between a construct and its branch still leaves the branch an orphan,
+    because it has no place in a Python ``if`` chain. The orphan fails closed: a marker counted
+    unmapped, and its body under a dead placeholder rather than at the handler's own level."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    body = construct + _CLEAR + _sibling_arm(branch)
+    handler = _handler_body(_handler_source(body))
+    verb = branch.split()[0]
+    assert f"    if False:  # TODO: Corepoint {verb} {_ORPHAN}" in handler
+    assert len(_send_lines(handler, 2)) == 1 and not _send_lines(handler, 1)
+    # The live step stays where it was, and the branch's copy of it is dead with the branch.
+    assert '\n    set_field(msg, "PID-19", "")' in handler
+    assert '\n        set_field(msg, "PID-19", "")' in handler
+    assert verb in _count_steps(_handler_steps(body), in_loop=False)[1]
+
+
+def test_an_orphan_branch_with_no_construct_at_all_sends_nothing(tmp_path: Path) -> None:
+    """The runtime check: the handler loads, runs, and returns no ``Send``. The control is the same
+    send on a plain ``<Line>``, which is delivered."""
+    orphan = f'<Line Data="Else"><List>{_SEND_INPUT}</List></Line>'
+    (tmp_path / "orphan").mkdir()
+    (tmp_path / "control").mkdir()
+    assert _run_handler(tmp_path / "orphan", orphan) == []
+    sent = _run_handler(tmp_path / "control", _SEND_INPUT)
+    assert isinstance(sent, list) and len(sent) == 1
