@@ -776,9 +776,12 @@ from source that does not run:
   between its arms. A bare marker, one holding no statement, is adopted across label markers
   alone, as before: in its construct's own list the steps after it are its branch. So is a
   `Catch`: adopted across a step, it would give its `Try` an `except` main's did not have, which
-  catches a raise and runs the steps after the `try`. A step that runs, such as a field write,
-  still orphans the branch. The orphan now fails closed: its marker
-  heads an `if False:` with its body beneath, and it still counts unmapped.
+  catches a raise and runs the steps after the `try`. A branch adopted across such a step, not a
+  label marker alone, renders as a dead arm whose comment says a step stands between it and its
+  construct, and still counts unmapped, as main counted its orphan: whether Corepoint continues
+  the construct across that step is not known. A step that runs, such as a field write, still
+  orphans the branch. The orphan now fails closed: its marker heads an `if False:` with its body
+  beneath, and it still counts unmapped.
 
 **How a disabled wrapper is switched off: placement is main's, by construction.** The wrapper is
 flattened into its parent exactly as main flattened it, so every test of where a step lands
@@ -805,29 +808,56 @@ operator switched off, and decides no placement:
   and fails closed the same way, its comment naming the switched-off construct.
 - A `Try` whose `Catch` is switched off closes every `Catch` after it too. Main rendered each
   `Catch` as `except Exception:`, so a later one never ran; left in place, it would catch what the
-  first caught. With no `Catch` left, the `try` re-raises.
+  first caught. With no `Catch` left, the `try` does not re-raise with a plain `raise`: main's
+  `Catch` caught that raise, so a `Catch` of a `try` around it never ran on that path, and a plain
+  `raise` would reach it. The `try` raises a refusal (`NotImplementedError`) instead, and every
+  `try` around it re-raises that past its own handlers, as it does a refused send's. The message
+  goes to ERROR where main ran the switched-off `Catch`. A live `Catch` written before the
+  switched-off one still catches, as on main.
 
 A step main placed outside a switched-off branch stays exactly where main placed it. A
 switched-off step does not run, and every live step the pass moves goes under a dead placeholder.
 That is the aim: no step on a path more live than main gave it. The limits below are where it does
 not hold, at least.
 
-This is quieter than main on purpose. A send or a refusal main made from a disabled wrapper, or
-from an orphan's body, no longer runs. A refusal there no longer sends the message to ERROR, so a
-message only an orphan's refused send would have stopped is FILTERED or delivered elsewhere, as in
-any branch whose condition is still a placeholder. A switched-off statement also no longer raises,
-so a step after it in a `try:` body runs where main's raise sent the message to the `Catch`. "Never
+**A branch of a branch is an orphan too.** A bare marker written in a branch's own list opens a
+branch of that branch. No chain renders one, and neither the count nor the inline-send test read
+one, but the send walk did, so a send in it selected the handler's closing `return Send(...)`
+wherever the handler had no inline send left: a delivery for every message. That defect is main's,
+and switching off an inline send, from a wrapper or a `@Disabled` statement, reached it more
+often. Once placement and the switch-off pass are done, each branch of a branch moves to the end
+of the body of the branch it was written in, where it is an orphan like any other: dead under its
+placeholder, its comment saying no construct continues it, its marker counted unmapped, its steps
+counted, and its send inline. The send walk and the inline-send test now share one walk of the
+tree the render emits, so a send the walk names always renders inline, and no send selects a
+closing `return Send(...)`. This changes main's output on lists with no wrapper too, in one
+direction only: a send main made for every message through that `return` now never runs.
+
+**What this changes that is not fail-closed in main's terms.** A send or a refusal main made from
+a disabled wrapper, or from an orphan's body, no longer runs. A refused send raised to ERROR on
+main: a `try` around it re-raised it past every `Catch`, so the steps after it in that body, and
+after that `try`, never ran. Switched off, it no longer raises, and those steps now run, so a
+message main sent to ERROR there may be delivered by a later step, or FILTERED. That is what the
+operator switched off, and it is a change of behaviour, not a quieter form of main's. "Never
 quieter than main" in §2(b.4) bounds that amendment. The differential guard loads this amendment
 first, written apart from the head (a tuple mark, a look-back adoption, one switch-off function),
-and bounds §2(b.4) against the tree it loads onto. Two tests bound this amendment against main.
-One reads code lines by depth: against the tree with only its scan half, the rest adds no code
-line, moves none shallower, and adds no closing send, on the battery and the raw draw. The other
-reads each line that writes a field or sends as dead, in an `except`, or live, by the nearest
-opener that is not dead, and holds the head to no line more live than main over every list of a
-battery of disabled wrappers, the review rounds' repros among them. Against the first cut of this
-amendment, which commented a wrapper out as one node, it finds lists more live than main; against
-this one it finds none. That is a reading of that battery, not a proof: it holds the closing
-`return` only to destinations main names, for the reason the last limit below gives.
+and bounds §2(b.4) against the tree it loads onto.
+
+Two tests bound this amendment against a baseline, and the baseline is not origin/main: it is the
+vendored step 1 tree with only this amendment's scan half loaded, so it lacks the label amendment
+of §2(b.4) (BACKLOG #2632) that main carries. A send in a `<Block>` label, which main refuses and
+that tree delivers, is therefore left out of the second test's battery. One test reads code lines
+by depth: against that tree, the rest of the amendment adds no code line outside a dead
+placeholder, moves none shallower, and adds no closing send, on the battery and the raw draw. The
+other reads each line that writes a field, sends, or refuses a send as dead, in an `except`, or
+live, by the nearest opener that is not dead, and holds the head to no line more live than the
+baseline over every list of a battery of disabled wrappers, refused sends and branches of branches
+among them, with the review rounds' repros. It holds the closing `return` to the destinations the
+baseline's own closing `return` delivers to. Against the first cut of this amendment, which
+commented a wrapper out as one node, and against the cut before the branch-of-a-branch fix, it
+finds lists more live than the baseline; against this one it finds none. That is a reading of that
+battery, not a proof. It reads no `except` path: which `Catch` a raise reaches is held by the
+nested-`Try` tests, not by it.
 
 At least these limits remain:
 
@@ -835,12 +865,7 @@ At least these limits remain:
   gives a construct that cannot continue it, an element whose tag is not modelled, the steps after
   a bare marker standing at the handler's own level or in a `<Block>` body, and the steps after a
   bare marker adopted by a nested construct written directly before it.
-- Main's own defect stands: a branch of a branch is never rendered, while a send in it still
-  selects the handler's closing `return Send(...)`, which delivers for every message. It is reached
-  wherever a handler has no inline send left. Switching off an inline send, from a wrapper or a
-  `@Disabled` statement alike, can leave a handler on that `return` where main had the inline
-  send, so a destination main never sent to then gets every message. This is a live delivery on a
-  path more live than main's, and it is not fixed here.
+- A switched-off refusal no longer stops the steps after it, as the paragraph above says.
 
 ## 3. Acceptance criteria
 

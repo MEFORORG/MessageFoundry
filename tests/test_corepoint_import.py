@@ -2270,11 +2270,12 @@ def test_a_demoted_label_changes_no_shape_around_it(
 
 def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
     """A handler with no send the render reaches ends on ``return Send(...)`` for every
-    destination in its tree, and main leaves one kind of send in the tree unrendered: a send in a
+    destination in its tree. Main left one kind of send in the tree unrendered: a send in a
     branch that another branch holds. So when a send off a Line is the handler's only visible
     send, refusing it must not move the handler to that form. It is still a send, so the handler
     keeps its ``sends`` list, and delivers nothing. The control is the same list with that send
-    on a Line."""
+    on a Line. The branch of a branch now renders, dead, as an orphan (the branch-of-a-branch
+    closing return)."""
     hidden = (
         '<Block Data="Matching &quot;M&quot;"><Line Data="Matching &quot;M&quot;"/>'
         '<Line Data="MsgSend %ADT [OB_HIDDEN]"/></Block>'
@@ -2286,9 +2287,11 @@ def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
             '<Line Data="MsgSend %ADT [OB_LABEL]"/>',
         )
     )
-    assert _LABEL_MARKER in marked and "Send(" not in marked
+    assert _LABEL_MARKER in marked and 'Send("OB_LABEL"' not in marked
+    for handler in (marked, control):
+        assert _enclosing(handler, "OB_HIDDEN").lstrip().startswith("if False:")
     assert "    return sends" in marked and "    return sends" in control
-    assert 'Send("OB_HIDDEN"' not in control and 'Send("OB_LABEL", msg)' in control
+    assert _ORPHAN in _enclosing(control, "OB_HIDDEN") and 'Send("OB_LABEL", msg)' in control
 
 
 _SEND_OUT = _role_send("other-handle", "%OUT", "OB_R")
@@ -3036,7 +3039,9 @@ def test_a_switched_off_catch_closes_every_catch_after_it(tmp_path: Path) -> Non
     closed = _enclosing(handler, "OB_TWO")
     assert closed.startswith(f"    if False:  # TODO: Corepoint Catch {_ORPHAN}")
     assert "a Catch before it on this Try is in a @Disabled List" in closed
-    assert "    except Exception:  # TODO: Corepoint Try with no Catch" in handler
+    # No Catch is left, and main's first one caught every raise: a raise here is refused.
+    assert "its Catch is in a @Disabled List, so a raise here is refused" in handler
+    assert "Try with no Catch" not in handler
     assert _run_handler(tmp_path, body) == []
     off = '<List Disabled="1"><Line Data="Catch"/></List>'
     quiet = _handler_body(_handler_source(f"<Try><List>{off}</List></Try>"))
@@ -3464,8 +3469,11 @@ def test_a_step_that_renders_as_a_comment_never_orphans_a_sibling_branch(
     assert len(_send_lines(handler, 2)) == 1 and not _send_lines(handler, 1)
     assert not [line for line in handler.splitlines() if line.startswith("    set_field")]
     assert rendered in handler
+    # Main orphaned the branch across any of these and counted it unmapped. Adopted, it still
+    # counts unmapped, and its arm says a step stands between it and its construct.
     unmapped = _count_steps(_handler_steps(body), in_loop=False)[1]
-    assert (branch.split()[0] in unmapped) is closed
+    assert (branch.split()[0] in unmapped) is (kind != "nothing")
+    assert ("a step stands between it and its" in handler) is (kind != "nothing" and not closed)
     ast.parse(src)
 
 
@@ -3677,3 +3685,111 @@ def test_two_disabled_wrappers_that_read_alike_are_two_disabled_steps() -> None:
     two = one + one.replace("PID-3", "PID-4")
     assert _count_steps(_handler_steps(one), in_loop=False)[2] == 1
     assert _count_steps(_handler_steps(two), in_loop=False)[2] == 2
+
+
+# --- review round 3 of the re-cut: the nested Try and the branch-of-a-branch closing return --------
+
+
+def _nested_try(inner_catch: str) -> str:
+    """An outer Try around an inner Try whose body raises on the test message (it holds no OBX
+    segment), then ``inner_catch``, then a send main placed in the inner Catch. The outer Catch
+    sends elsewhere."""
+    return (
+        '<Line Data="Try"><List><Line Data="Try"><List>'
+        '<Line Data="ItemClear %ADT/OBX-5"/>'
+        + inner_catch
+        + '<Line Data="MsgSend %ADT [OB_IN]"/></List></Line></List></Line>'
+        '<Line Data="Catch"><List><Line Data="MsgSend %ADT [OB_OUTER]"/></List></Line>'
+    )
+
+
+def test_a_switched_off_catch_never_hands_its_raise_to_a_catch_around_it(tmp_path: Path) -> None:
+    """Main's inner Catch caught the raise, so the outer Catch never ran on that path. With the
+    inner Catch switched off, a plain re-raise reached the outer Catch, which sent. The inner
+    ``try`` now raises a refusal, which the outer ``try`` re-raises past its Catch, as it does a
+    refused send: the message goes to ERROR, and nothing is sent. The control is the inner Catch
+    live, which delivers where main delivered."""
+    off = _nested_try('<List Disabled="1"><Line Data="Catch"/></List>')
+    handler = _handler_body(_handler_source(off))
+    assert "its Catch is in a @Disabled List, so a raise here is refused" in handler
+    assert "except NotImplementedError:  # a refused Catch above" in handler
+    (tmp_path / "off").mkdir()
+    with pytest.raises(NotImplementedError, match="its Catch is in a @Disabled List"):
+        _run_handler(tmp_path / "off", off)
+    (tmp_path / "live").mkdir()
+    sent = _run_handler(tmp_path / "live", _nested_try('<Line Data="Catch"/>'))
+    assert [send.to for send in sent] == ["OB_IN"]  # type: ignore[attr-defined]
+
+
+def test_a_live_catch_before_a_switched_off_one_still_catches() -> None:
+    """With a live Catch left ahead of the switched-off one, that Catch caught every raise on main
+    too: no refusal, and no guard on the outer ``try``."""
+    handler = _handler_body(
+        _handler_source(
+            _nested_try('<Line Data="Catch"/><List Disabled="1"><Line Data="Catch"/></List>')
+        )
+    )
+    assert "a raise here is refused" not in handler
+    assert "except NotImplementedError" not in handler
+
+
+# A branch of a branch: an ``Else`` written bare in an ``Else`` branch's own list. Main rendered
+# it nowhere, but named its send as the handler's closing ``return Send(...)``.
+_BRANCH_OF_A_BRANCH = (
+    '<Line Data="Else"><List><Line Data="ItemClear %ADT/PID-3"/><Line Data="Else"/>'
+    '<Line Data="MsgSend %ADT [OB_B]"/></List></Line>'
+)
+_IF_HOLDING = {
+    "no-wrapper": '<Line Data="ItemClear %ADT/PID-4"/>',
+    "disabled-wrapper": '<List Disabled="1"><Line Data="MsgSend %ADT [OB_B]"/></List>',
+    "disabled-line": '<Line Data="MsgSend %ADT [OB_B]" Disabled="1"/>',
+    "nothing": "",
+}
+
+
+@pytest.mark.parametrize("held", _IF_HOLDING)
+def test_a_branch_of_a_branch_renders_dead_and_never_selects_the_closing_return(
+    held: str, tmp_path: Path
+) -> None:
+    """The branch-of-a-branch closing return. The send in a branch of a branch renders under the
+    orphan's dead placeholder, counted unmapped, and the handler ends on its ``sends`` list, so
+    nothing is sent. Main ended this handler on ``return Send("OB_B", msg)`` wherever it had no
+    inline send: a delivery for every message. With the If's send switched off, by a wrapper or
+    on its own line, main delivered nothing, and the re-cut delivered for every message."""
+    body = f'<Line Data="If (x)"><List>{_IF_HOLDING[held]}</List></Line>{_BRANCH_OF_A_BRANCH}'
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert "return Send(" not in handler and "    return sends" in handler
+    opener = _enclosing(handler, 'Send("OB_B"')
+    assert opener.startswith(f"        if False:  # TODO: Corepoint Else {_ORPHAN}")
+    assert "a branch of the Else it is written in, which no construct continues" in opener
+    assert "Else" in _count_steps(_handler_steps(body), in_loop=False)[1]
+    assert _run_handler(tmp_path, body) == []
+    ast.parse(src)
+
+
+def test_a_branch_of_a_branch_counts_its_steps() -> None:
+    """Main counted no step of a branch of a branch, though the summary must name every element.
+    Its marker counts unmapped and its write mapped, as an orphan's do."""
+    body = (
+        '<Line Data="If (x)"><List/></Line><Line Data="Else"><List><Line Data="Else"/>'
+        '<Line Data="ItemClear %ADT/PID-9"/></List></Line>'
+    )
+    mapped, unmapped, disabled = _count_steps(_handler_steps(body), in_loop=False)
+    assert (mapped, sorted(unmapped), disabled) == (3, ["Else"], 0)
+    assert 'set_field(msg, "PID-9", "")' in _handler_body(_handler_source(body))
+
+
+def test_a_branch_adopted_across_a_msglog_is_dead_and_counted_unmapped() -> None:
+    """Main orphaned an ``Else`` written after a ``MsgLog`` and counted it unmapped. The re-cut
+    adopts it as a dead arm; the count still names it, and the arm says a step stands between
+    it and its If."""
+    body = (
+        '<Line Data="If (x)"><List><Line Data="ItemClear %ADT/PID-4"/></List></Line>'
+        '<Line Data="MsgLog %ADT"/>'
+        '<Line Data="Else"><List><Line Data="MsgSend %ADT [OB_E]"/></List></Line>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert _enclosing(handler, "OB_E").lstrip().startswith("elif False:")
+    assert "a step stands between it and its If" in _enclosing(handler, "OB_E")
+    assert sorted(_count_steps(_handler_steps(body), in_loop=False)[1]) == ["Else", "MsgLog"]

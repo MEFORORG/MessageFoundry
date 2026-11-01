@@ -289,6 +289,25 @@ _UNMAPPED_LAST = "    source_class: str\n    detail: str\n"
 _CONTROL_LAST = '    refusal: str = ""\n'
 _MARK_FIELD = "    wrapped_off: tuple[object, ...] = ()\n"
 _LIFTED_FIELD = "    lifted: bool = False\n"
+# On a Try left with no Catch by a switched-off one, why; on a branch adopted across a step that
+# runs nothing but is no label, ``True``.
+_REFUSED_FIELDS = '    refused: str = ""\n    across: bool = False\n'
+_COUNT_ARM = "                if _renders_as_branch(step.kind, branch.kind):\n"
+_ARM_NOTE = "        note = _comment_text(branch.detail)\n"
+_LAST_ELSE = (
+    '                f"message. Write the If condition, then restore `else:`."\n            )\n'
+)
+_NO_HANDLER = (
+    "        if not handlers:\n"
+    '            out.append(f"{pad}except Exception:  # TODO: Corepoint Try with no Catch'
+    ' — hand-finish")\n'
+)
+_GUARD_LINE = (
+    "            out.append(\n"
+    '                f"{pad}except NotImplementedError:  # a refused MsgSend above — never caught"\n'
+    "            )\n"
+)
+_REFUSED_TEST = "    return _any_live_send(steps, lambda send: bool(send.refusal))\n"
 _GENERATE_EACH = "            out.extend(_generate_control(step, indent, in_loop=in_loop))\n"
 _COUNT_BREAK = '                and (step.kind != "break" or in_loop)\n'
 _COUNT_BODY = "                (step.body, in_loop or is_loop),\n"
@@ -381,7 +400,7 @@ def _turned_off(step: Step) -> tuple[Step, list[Step]]:
         return replace(step, branches=tuple(b for b in step.branches if b.wrapped_off)), after
     kept: list[Control] = []
     after = []
-    shut = ""
+    shut = refused = ""
     for b in step.branches:
         if b.wrapped_off:
             after.extend(_orphaned(b, "its marker is in a @Disabled " + b.wrapped_off[0]))
@@ -389,6 +408,8 @@ def _turned_off(step: Step) -> tuple[Step, list[Step]]:
                 shut = "a {} before it on this {} is in a @Disabled {}".format(
                     b.source_verb, step.source_verb, b.wrapped_off[0]
                 )
+                if all(k.kind != "except" for k in kept):
+                    refused = "its {} is in a @Disabled {}".format(b.source_verb, b.wrapped_off[0])
             continue
         if shut:
             after.extend(_orphaned(b, shut))
@@ -399,7 +420,34 @@ def _turned_off(step: Step) -> tuple[Step, list[Step]]:
     if step.kind in _LOOP_KINDS:
         # Lifted out of its loop: a LoopExit in it named that loop, not one around it.
         after = [replace(s, lifted=True) if isinstance(s, Control) else s for s in after]
-    return replace(step, body=_off_list(step.body), branches=tuple(kept)), after
+    return replace(step, body=_off_list(step.body), branches=tuple(kept), refused=refused), after
+
+
+def _refused_try(steps: tuple[Step, ...]) -> bool:
+    # A live Try left raising a refusal (above), at any depth.
+    for step in steps:
+        if isinstance(step, Control) and step.kind != "disabled":
+            if step.refused or _refused_try(step.body):
+                return True
+            if any(_refused_try(b.body) for b in step.branches):
+                return True
+    return False
+
+
+def _unbranch(steps: tuple[Step, ...]) -> tuple[Step, ...]:
+    # A branch's own branches go to the end of its body, where each is an orphan.
+    out: list[Step] = []
+    for step in steps:
+        if isinstance(step, Control) and step.kind != "disabled":
+            arms = []
+            for b in step.branches:
+                said = "a branch of the " + b.source_verb + " it is written in, "
+                said += "which no construct continues"
+                strays = [replace(c, detail="; ".join(filter(None, (said, c.detail)))) for c in b.branches]
+                arms.append(replace(b, body=_unbranch((*b.body, *strays)), branches=()))
+            step = replace(step, body=_unbranch(step.body), branches=tuple(arms))
+        out.append(step)
+    return tuple(out)
 
 
 def _all_wrapped(step: Step) -> bool:
@@ -452,7 +500,7 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     _SCAN_SKIP_PAIR,
     (_ACTION_LAST, _ACTION_LAST + _MARK_FIELD),
     (_UNMAPPED_LAST, _UNMAPPED_LAST + _MARK_FIELD),
-    (_CONTROL_LAST, _CONTROL_LAST + _MARK_FIELD + _LIFTED_FIELD),
+    (_CONTROL_LAST, _CONTROL_LAST + _MARK_FIELD + _LIFTED_FIELD + _REFUSED_FIELDS),
     # A construct lifted out of its loop renders and counts outside every loop.
     (
         _GENERATE_EACH,
@@ -510,10 +558,50 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
         "            and steps[at].kind == _BRANCH_PARENT[produced[0].kind]\n"
         "        ):\n"
         "            previous = steps[at]\n"
-        "            steps[at] = replace(previous, branches=(*previous.branches, produced[0]))\n",
+        # Taken across a step that runs nothing but is no label: main orphaned it, and counted
+        # it unmapped. The count still does, and the arm says why.
+        "            arm = produced[0]\n"
+        "            if [s for s in steps[at + 1 :] if not _label(s)]:\n"
+        "                arm = replace(arm, across=True)\n"
+        "            steps[at] = replace(previous, branches=(*previous.branches, arm))\n",
     ),
-    # Once the whole list is placed, what was marked is switched off.
-    (_HANDLER_STEPS, _HANDLER_STEPS.replace("tuple(", "_off_list(")),
+    (_COUNT_ARM, _COUNT_ARM.replace("branch.kind):", "branch.kind) and not branch.across:")),
+    (
+        _ARM_NOTE,
+        _ARM_NOTE
+        + "        if branch.across:\n"
+        + "            said = 'a step stands between it and its ' + ctrl.source_verb\n"
+        + "            note = '; '.join(filter(None, (said, note)))\n",
+    ),
+    (
+        _LAST_ELSE,
+        _LAST_ELSE.replace(
+            "\n            )",
+            "\n                + (_hint(note) if branch.across else '')\n            )",
+        ),
+    ),
+    # A Try a switched-off Catch left with none raises a refusal, which every Try around it
+    # re-raises past its handlers: main's Catch caught that raise, so none around it ran.
+    (
+        _NO_HANDLER,
+        "        if not handlers and ctrl.refused:\n"
+        "            message = _lit('Corepoint import: ' + ctrl.source_verb + ': ' + ctrl.refused)\n"
+        "            out.append(\n"
+        "                pad + 'except Exception:  # TODO: Corepoint ' + ctrl.source_verb\n"
+        "                + _hint(_comment_text(ctrl.refused) + ', so a raise here is refused')\n"
+        "            )\n"
+        "            out.append(pad + '    raise NotImplementedError(' + message + ')')\n"
+        "        el" + _NO_HANDLER.lstrip(),
+    ),
+    (
+        _GUARD_LINE,
+        "            why = 'MsgSend' if _any_live_send(ctrl.body, lambda s: bool(s.refusal)) "
+        "else 'Catch'\n" + _GUARD_LINE.replace("refused MsgSend above", "refused {why} above"),
+    ),
+    (_REFUSED_TEST, _REFUSED_TEST.replace("    return ", "    return _refused_try(steps) or ")),
+    # Once the whole list is placed, what was marked is switched off, and a branch of a branch,
+    # which no chain renders, is an orphan at the end of the branch it was written in.
+    (_HANDLER_STEPS, _HANDLER_STEPS.replace("tuple(", "_unbranch(_off_list(").replace("\n", ")\n")),
 )
 #: Every amendment the baseline carries, in the order it loads them.
 _STEP1_AMENDMENTS = (*_FAIL_CLOSED_AMENDMENTS, *_LABEL_AMENDMENTS)
@@ -2025,6 +2113,29 @@ def _switched_off_wrapper_repros() -> Iterator[Shape]:
         "else-in-a-loop": loop.replace(
             "{x}", '<List Disabled="1">' + _line("Else") + "</List>" + after
         ),
+        # Code review of the re-cut, round 3. A send main left in a branch of a branch, which no
+        # chain renders, made the handler's closing ``return Send(...)`` once the wrapper's
+        # inline send was switched off: a delivery for every message.
+        "branch-of-a-branch": _line(
+            "If (x)", '<List Disabled="1">' + _line("MsgSend %ADT [OB_B]") + "</List>"
+        )
+        + _line(
+            "Else", _line("ItemClear %ADT/PID-3") + _line("Else") + _line("MsgSend %ADT [OB_B]")
+        ),
+        # And a switched-off Catch left its Try re-raising into the Catch of a Try around it,
+        # where main's Catch caught the raise.
+        "nested-try-catch-off": _line(
+            "Try",
+            _line(
+                "Try",
+                _line("ItemClear %ADT/PID-3")
+                + '<List Disabled="1">'
+                + _line("Catch")
+                + "</List>"
+                + _line("MsgSend %ADT [OB_IN]"),
+            ),
+        )
+        + _line("Catch", _line("MsgSend %ADT [OB_OUTER]")),
     }
     for name, xml in repros.items():
         yield Shape(f"2526-{name}", "%ADT", (Raw(xml),))
@@ -3660,20 +3771,32 @@ def test_the_bound_sees_each_mutant_of_the_ending_and_the_guard(
 #: the handler a branch it adopts is put under, the ``pass`` an emptied block needs, the guard that
 #: re-raises a refusal ahead of a Catch, and the ``return None`` of a handler left with no live
 #: send. Each runs nothing, or makes the body beneath it conditional where main ran it always.
+#: Also the ``sends`` list a handler takes once a send main never rendered renders dead, and
+#: returns in place of main's closing ``return Send(...)``; and the refusal a ``try`` raises once
+#: its only ``Catch`` is switched off, where main's ``Catch`` caught the raise.
+#: The refusal a ``try`` raises once its only ``Catch`` is switched off, after its opening quote.
+_TRY_REFUSAL = r"Corepoint import: \w+: its \w+ is in a @Disabled \w+\""
 _DEAD_LINE = re.compile(
-    r"(?:(?:el)?if False:|except (?:Exception|NotImplementedError):|pass$|raise$|return None\b)"
+    r"(?:(?:el)?if False:|except (?:Exception|NotImplementedError):|pass$|raise$|return None\b"
+    r"|sends = \[\]$|return sends$"
+    rf'|raise NotImplementedError\("{_TRY_REFUSAL}\)$)'
 )
 
 
 def _added_live_code(was: str, now: str) -> list[str]:
     """Every code line of ``now``'s handler that ``was`` does not hold at the same indent or
     shallower. A line one level deeper runs under a condition it did not have; a line that is not
-    in ``was`` at all is new code. Neither may appear, past :data:`_DEAD_LINE`."""
+    in ``was`` at all is new code. Neither may appear, past :data:`_DEAD_LINE`. A line under a
+    dead opener (:data:`_NEVER`) never runs, so it is read in neither: a send the amendment
+    renders dead where main never rendered it adds nothing, and a line main ran dead is no
+    counterpart for one that runs."""
 
     def indents(src: str) -> dict[str, list[int]]:
         found: dict[str, list[int]] = {}
-        for line in _code_lines(src):
-            found.setdefault(line.strip(), []).append(len(line) - len(line.lstrip()))
+        lines = _code_lines(src)
+        for line, rank in zip(lines, _path_ranks(lines), strict=True):
+            if rank != "dead":
+                found.setdefault(line.strip(), []).append(len(line) - len(line.lstrip()))
         return {text: sorted(at) for text, at in found.items()}
 
     # Matched as multisets, one line of ``was`` to each line of ``now``, shallowest first: a
@@ -3782,7 +3905,16 @@ def test_the_scan_half_of_the_fail_closed_amendment_changes_its_seeds() -> None:
 
 _RANK = {"dead": 0, "except": 1, "live": 2}
 _NEVER = re.compile(r"\s*(?:(?:el)?if False|for _item in \[\]|while False):")
-_EFFECT = re.compile(r"(?:set_field|append_to_field|copy_field)\(|Send\(")
+# A write, a send, or a refused send's raise: a refusal on a more live path sends a message to
+# ERROR that main delivered. The refusal a ``try`` raises once its only ``Catch`` is switched off
+# is not read here: it stands where main's ``Catch`` caught the raise (:data:`_DEAD_LINE`).
+_EFFECT = re.compile(
+    r"(?:set_field|append_to_field|copy_field)\(|Send\("
+    rf'|raise NotImplementedError\("(?!{_TRY_REFUSAL})Corepoint import: '
+)
+_REFUSAL_KEY = re.compile(
+    r'^(raise NotImplementedError\("Corepoint import: \w+ (?:to \S+|\(no destination named\))): .*$'
+)
 
 
 def _liveness(src: str) -> dict[str, list[str]]:
@@ -3790,41 +3922,51 @@ def _liveness(src: str) -> dict[str, list[str]]:
     most live first. The closing ``return`` is read apart (:func:`_trailing_sends`)."""
     lines = _code_lines(src)
     found: dict[str, list[str]] = {}
-    for at, line in enumerate(lines):
+    for line, rank in zip(lines, _path_ranks(lines), strict=True):
         if line.lstrip().startswith("return ") or not _EFFECT.search(line):
             continue
-        depth, rank = len(line) - len(line.lstrip()), "live"
-        for opener in reversed(lines[:at]):
-            indent = len(opener) - len(opener.lstrip())
-            if indent >= depth:
-                continue
-            depth = indent
-            if _NEVER.match(opener):
-                rank = "dead"
-                break
-            if opener.lstrip().startswith("except "):
-                rank = "except"
-        found.setdefault(line.strip(), []).append(rank)
+        # A refusal is read by the send it refuses: its reason names what the scan saw, and the
+        # scan skips a disabled wrapper where main walked it.
+        found.setdefault(_REFUSAL_KEY.sub(r"\1", line.strip()), []).append(rank)
     return {
         text: sorted(ranks, key=_RANK.__getitem__, reverse=True) for text, ranks in found.items()
     }
+
+
+def _path_ranks(lines: list[str]) -> list[str]:
+    """How live each code line runs: ``dead`` under a dead opener, ``except`` under an ``except``
+    and no dead opener, else ``live``. One pass, with the enclosing lines on a stack."""
+    ranks: list[str] = []
+    # Each enclosing line's indent, and the rank of a line nested under it.
+    stack: list[tuple[int, str]] = []
+    for line in lines:
+        depth = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        rank = stack[-1][1] if stack else "live"
+        ranks.append(rank)
+        if rank != "dead" and _NEVER.match(line):
+            below = "dead"
+        elif rank == "live" and line.lstrip().startswith("except "):
+            below = "except"
+        else:
+            below = rank
+        stack.append((depth, below))
+    return ranks
 
 
 def _more_live_than_main(was: str, now: str) -> list[str]:
     """Every effect line of ``now`` on a path more live than ``was`` gives it: copy by copy, most
     live first. A copy ``was`` does not hold at all may only be dead.
 
-    The closing ``return`` delivers for every message, and it may name no destination ``was``
-    does not name somewhere. Main already ends a handler that has a send in a branch no chain
-    renders (a branch of a branch) with such a ``return``, wherever it has no inline send left;
-    switching an inline send off can leave a list there, and that is main's defect, not this
-    one's. So the destinations it names are held to the ones ``was`` names, not to its own
-    ``return``."""
+    The closing ``return`` delivers for every message, so it may deliver to no destination
+    ``was``'s own closing ``return`` does not. A send main named only under a dead arm, or in a
+    branch of a branch no chain rendered, is no excuse: the head renders that branch dead too
+    (the branch-of-a-branch closing return), so it never selects such a ``return``."""
     before = _liveness(was)
-    named = set(_RETURNED_SEND.findall(was))
     worse = [
-        f"the closing return delivers to {name}, which main names nowhere"
-        for name in sorted(set(_trailing_sends(now)) - named)
+        f"the closing return delivers to {name}, where main's does not"
+        for name in sorted(Counter(_trailing_sends(now)) - Counter(_trailing_sends(was)))
     ]
     for text, ranks in _liveness(now).items():
         main = before.get(text, [])
@@ -3856,6 +3998,9 @@ _OFF_HELD = (
     '<List Disabled="1"/>',
     _line("Catch", _line("Else") + _line("MsgSend %ADT [OB_OFF]")),
     _line("Else", _line("ItemClear %ADT/PID-90")),
+    # A refused send, of a handle not provably the input. Not one in a Block's label: main
+    # delivered that one, and the label amendment refuses it, apart from this amendment.
+    _line(_leaf_data(SendS(_OUT, "OB_R"), "%ADT") or ""),
 )
 _OFF_WRAPPINGS = (
     '<List Disabled="1">{m}</List>',
@@ -3896,7 +4041,15 @@ def _off_wrapper_battery() -> list[str]:
                 lists.extend(around.replace("{x}", tail) for around in _AROUND)
     lists.extend(_render(s.nodes, s.inp) for s in _switched_off_wrapper_repros())
     rng = random.Random(_SEED)
-    pieces = (*_OFF_HELD, *_THEN, _line("ItemClear %ADT/PID-19"), _line("MsgSend %ADT [OB_X]"))
+    pieces = (
+        *_OFF_HELD,
+        *_THEN,
+        _line("ItemClear %ADT/PID-19"),
+        _line("MsgSend %ADT [OB_X]"),
+        _line(
+            "Else", _line("ItemClear %ADT/PID-92") + _line("Else") + _line("MsgSend %ADT [OB_X]")
+        ),
+    )
 
     def drawn(depth: int) -> str:
         out = ""
