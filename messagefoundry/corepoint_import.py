@@ -1457,6 +1457,7 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     The export writes ``Else``/``ElseIf``/``Catch``/``Matching`` as ordinary statements *inside* the
     construct's own ``<List>``, so everything after such a marker belongs to that branch. Walk once
     to keep successive branches siblings without consuming stack space for a wide list."""
+    steps = _seal_switched_off_branches(steps)
     body: tuple[Step, ...] = ()
     branches: list[Control] = []
     marker: Control | None = None
@@ -1473,6 +1474,52 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
         return tuple(steps), ()
     branches.append(replace(marker, body=(*marker.body, *steps[start:])))
     return body, tuple(branches)
+
+
+def _seal_switched_off_branches(steps: list[Step]) -> list[Step]:
+    """``steps`` with each run main placed in a switched-off marker's branch made an orphan.
+
+    A bare marker inside a ``@Disabled`` ``<List>``/``<Actions>`` wrapper opened its branch while
+    the wrapper was flattened, so the steps after the wrapper, up to the next marker, ran in it:
+    in an ``except``, or under a dead arm. With the wrapper commented out whole (BACKLOG #2526)
+    they would run in the construct's own body, for every message. They fail closed instead: the
+    marker's orphan holds them, which renders them under a dead placeholder and counts the marker
+    unmapped. A run of steps that runs nothing is left where it is."""
+    out: list[Step] = []
+    i = 0
+    while i < len(steps):
+        step = steps[i]
+        out.append(step)
+        i += 1
+        if not isinstance(step, Control) or (marker := _switched_off_marker(step)) is None:
+            continue
+        end = next((j for j in range(i, len(steps)) if _opens_a_branch(steps[j])), len(steps))
+        run = steps[i:end]
+        if all(map(_runs_nothing, run)):
+            continue
+        why = f"its marker is in a @Disabled {step.source_verb}"
+        detail = f"{marker.detail}; {why}" if marker.detail else why
+        out.append(replace(marker, detail=detail, body=tuple(run)))
+        i = end
+    return out
+
+
+def _switched_off_marker(step: Step) -> Control | None:
+    """The bare marker a ``@Disabled`` ``<List>``/``<Actions>`` wrapper leaves open, or ``None``:
+    the last one in its body, a nested disabled wrapper's included, as main flattened them all."""
+    if not (
+        isinstance(step, Control)
+        and step.kind == "disabled"
+        and step.source_verb.lower() in _LIST_TAGS
+    ):
+        return None
+    left: Control | None = None
+    for inner in step.body:
+        if _opens_a_branch(inner):
+            left = inner
+        elif (nested := _switched_off_marker(inner)) is not None:
+            left = nested
+    return left
 
 
 def _opens_a_branch(step: Step) -> TypeGuard[Control]:

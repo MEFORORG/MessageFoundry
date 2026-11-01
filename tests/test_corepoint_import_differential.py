@@ -264,7 +264,10 @@ _LABEL_AMENDMENTS: tuple[tuple[str, str], ...] = (
 # the sibling branch written after it. And a branch left with no construct renders its body
 # under a dead placeholder, where main ran it for every message. Written apart from the head:
 # here the adoption looks back past such steps, where the head holds them out of the list until
-# a step that runs follows them.
+# a step that runs follows them. A bare branch marker inside a disabled wrapper opened its branch
+# while the wrapper was flattened, so the steps after the wrapper in its construct's own list,
+# up to the next marker, become that marker's orphan, and never run. Written apart from the head
+# too: here the run is gathered as the list is walked, and the marker found from the back.
 _LIVE_SKIP = "        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:\n"
 _WRAPPER_NOTE = "            # A doubly-wrapped list: flatten rather than lose the statements.\n"
 _PARSE_LIST_DEF = "def _parse_list(\n"
@@ -314,15 +317,66 @@ def _construct_at(steps: list[Step], marker: Control) -> int:
     # A marker holding nothing but label markers takes the steps after it in its own
     # construct's list, and a branch with branches of its own would lose them in a chain. Either
     # looks back past nothing: the label amendment has already lifted its markers off the end.
-    if not marker.branches and [
-        s for s in marker.body if type(s) is UnmappedAction or not isinstance(s, UnmappedAction)
-    ]:
+    if not marker.branches and not _bare(marker):
         while at >= 0 and _off(steps[at]):
             at -= 1
     return at
 
 
+def _bare(step: Step) -> bool:
+    return (
+        isinstance(step, Control)
+        and step.kind in _BRANCH_PARENT
+        and not [
+            s for s in step.body if type(s) is UnmappedAction or not isinstance(s, UnmappedAction)
+        ]
+    )
+
+
+def _left_open(step: Step) -> Control | None:
+    # A disabled wrapper keeps its tag as its source. Its last bare marker, at any depth of
+    # disabled wrappers, is the one whose branch the steps after it ran in.
+    if not (
+        isinstance(step, Control)
+        and step.kind == "disabled"
+        and step.source_verb.lower() in _LIST_TAGS
+    ):
+        return None
+    for inner in reversed(step.body):
+        if _bare(inner):
+            return inner
+        if (deeper := _left_open(inner)) is not None:
+            return deeper
+    return None
+
+
+def _settle(marker: Control, tag: str, run: list[Step]) -> list[Step]:
+    if all(map(_off, run)):
+        return run
+    why = "its marker is in a @Disabled " + tag
+    return [replace(marker, detail="; ".join(filter(None, (marker.detail, why))), body=tuple(run))]
+
+
+def _sealed(steps: list[Step]) -> list[Step]:
+    out: list[Step] = []
+    held: tuple[Control, str, list[Step]] | None = None
+    for step in steps:
+        if held is not None and not _bare(step):
+            held[2].append(step)
+            continue
+        if held is not None:
+            out.extend(_settle(*held))
+            held = None
+        out.append(step)
+        if (marker := _left_open(step)) is not None:
+            held = (marker, step.source_verb, [])
+    if held is not None:
+        out.extend(_settle(*held))
+    return out
+
+
 """
+_SPLIT_START = "    body: tuple[Step, ...] = ()\n"
 _ORPHAN_INLINE = (
     '    out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]\n'
     "    out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))\n"
@@ -367,6 +421,8 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
         "                continue\n",
     ),
     (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
+    # A bare marker switched off in a wrapper leaves the steps after it dead, not live.
+    (_SPLIT_START, "    steps = _sealed(steps)\n" + _SPLIT_START),
     (
         _ADOPTED_FROM_LAST,
         "            and (at := _construct_at(steps, produced[0])) >= 0\n"

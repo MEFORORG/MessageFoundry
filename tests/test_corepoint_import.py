@@ -2951,6 +2951,96 @@ def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(p
         assert not _send_lines(src, 1)
 
 
+# A bare branch marker inside a disabled wrapper, in a construct's own list. Flattened, the marker
+# opened its branch, and the steps after the wrapper ran in it: in an ``except``, or under a dead
+# arm. Commented out whole, it opens nothing, and those steps landed in the ``try`` body or the
+# ChooseFrom pre-arm, where they run for every message. Code review of this change, round 3.
+_MARKER_CONSTRUCTS = {
+    "try-catch": ("<Try><List>{x}</List></Try>", '<Line Data="Catch"/>'),
+    "case-matching": (
+        '<Case Data="ChooseFrom (a)"><List>{x}</List></Case>',
+        '<Line Data="Matching &quot;M&quot;"/>',
+    ),
+    "if-else": ('<Line Data="If (a)"><List>{x}</List></Line>', '<Line Data="Else"/>'),
+}
+_MARKER_WRAPPINGS = {
+    "list": '<List Disabled="1">{m}</List>',
+    "actions-among-statements": (
+        '<Actions Disabled="1"><Line Data="ItemClear %ADT/PID-3"/>{m}'
+        '<Line Data="ItemClear %ADT/PID-4"/></Actions>'
+    ),
+    "around-a-live-wrapper": '<List Disabled="1"><List>{m}</List></List>',
+    "inside-a-live-wrapper": '<List><List Disabled="1">{m}</List></List>',
+    "disabled-in-disabled": '<List Disabled="1"><List Disabled="1">{m}</List></List>',
+}
+_AFTER_THE_WRAPPER = _CLEAR + '<Line Data="MsgSend %ADT [OB_FLAT]"/>'
+
+
+def _enclosing(handler: str, needle: str) -> str:
+    """The line that opens the block holding the one line containing ``needle``."""
+    lines = handler.splitlines()
+    (at,) = (i for i, line in enumerate(lines) if needle in line)
+    depth = len(lines[at]) - len(lines[at].lstrip())
+    return next(
+        line
+        for line in reversed(lines[:at])
+        if line.strip() and not line.lstrip().startswith("#")
+        if len(line) - len(line.lstrip()) < depth
+    )
+
+
+@pytest.mark.parametrize("wrapping", _MARKER_WRAPPINGS)
+@pytest.mark.parametrize("construct", _MARKER_CONSTRUCTS)
+def test_a_marker_switched_off_in_a_wrapper_leaves_the_steps_after_it_dead(
+    construct: str, wrapping: str, tmp_path: Path
+) -> None:
+    """The steps main put in the switched-off marker's branch never run: they render under the
+    orphan's dead placeholder, and the marker counts unmapped. The control is the same wrapper
+    live, whose marker opens the branch the send runs in, as on main."""
+    template, marker = _MARKER_CONSTRUCTS[construct]
+    verb = marker.split('"')[1].split()[0]
+    wrapped = _MARKER_WRAPPINGS[wrapping].replace("{m}", marker)
+    body = template.replace("{x}", wrapped + _AFTER_THE_WRAPPER)
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    dead = f"if False:  # TODO: Corepoint {verb} {_ORPHAN}"
+    assert dead in _enclosing(handler, "OB_FLAT") and dead in _enclosing(handler, "PID-19")
+    assert verb in _count_steps(_handler_steps(body), in_loop=False)[1]
+    assert _run_handler(tmp_path, body) == []
+    ast.parse(src)
+    live = _handler_body(_handler_source(body.replace('Disabled="1"', 'Disabled=""')))
+    assert f"Corepoint {verb}" in _enclosing(live, "OB_FLAT")
+    assert _ORPHAN not in live
+
+
+def test_a_switched_off_marker_seals_only_up_to_the_next_marker() -> None:
+    """A marker after the wrapper opens its own branch as before, and a wrapper followed by steps
+    that run nothing seals nothing."""
+    second = '<Line Data="MsgSend %ADT [OB_TWO]"/>'
+    body = (
+        f'<Try><List><List Disabled="1"><Line Data="Catch"/></List>{_AFTER_THE_WRAPPER}'
+        f'<Line Data="Catch"/>{second}</List></Try>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert f"# TODO: Corepoint Catch {_ORPHAN}" in _enclosing(handler, "OB_FLAT")
+    assert _enclosing(handler, "OB_TWO").startswith(
+        "    except Exception:  # TODO: Corepoint Catch"
+    )
+    quiet = '<Try><List><List Disabled="1"><Line Data="Catch"/></List><Line Data="MsgLog %ADT"/>'
+    assert _ORPHAN not in _handler_body(_handler_source(quiet + "</List></Try>"))
+
+
+def test_a_switched_off_marker_at_the_handlers_own_level_changes_nothing() -> None:
+    """The limit: at the handler's own level main split no branch, so a bare marker there opened
+    nothing, and the step after it ran for every message. It still does, as after a bare marker
+    written live there (ADR 0086 §2(c.2))."""
+    handler = _handler_body(
+        _handler_source('<List Disabled="1"><Line Data="Else"/></List>' + _AFTER_THE_WRAPPER)
+    )
+    assert _ORPHAN not in handler
+    assert len(_send_lines(handler, 1)) == 1
+
+
 # --- a step between a construct and the branch written after it (BACKLOG #2685) ------------------
 #
 # A branch marker written after its construct as a sibling is adopted by it only when that
