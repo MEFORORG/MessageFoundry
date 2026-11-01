@@ -100,7 +100,7 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
             c, toml_engine, await _login(c, "own"), "IB_TOML", "inbound"
         )
         assert status == 200, body
-        assert ("connection_flag_set", None) in audit
+        assert ("connection_flag_set", "IB_TOML") in audit
         assert await toml_engine.store.list_connection_flags() == {("IB_TOML", "inbound")}
 
         # An all-channels caller is unchanged: 409 for a name the graph lacks, no denial row.

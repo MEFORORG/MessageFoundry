@@ -15,7 +15,8 @@ file and the def it sits in, and must be listed with a verdict. A new call site 
 would bring back the write access, and a baseline row with it.
 
 Scope, stated rather than implied. The census finds references to the writer functions in
-:data:`WRITERS`, by name, whether called or handed on as a callable, across :data:`PACKAGES`. A
+:data:`WRITERS`, by name, whether called or handed on as a callable, across the packages
+``package_trees`` parses. A
 writer reached under another name (an alias, or a wrapper outside :data:`LIBRARY`) is not seen. A
 direct ``write_text`` or ``os.replace`` into a config directory is a different shape:
 :func:`test_no_engine_code_writes_a_config_path_directly` catches one whose target expression names

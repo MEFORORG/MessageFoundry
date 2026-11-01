@@ -8284,8 +8284,8 @@ CREATE TABLE IF NOT EXISTS known_login_addresses (
 );
 
 -- The operator's object-of-interest flag (BACKLOG #2623, ADR 0007 amendment of 2026-10-31). A row IS
--- the flag: a flagged connection has one and an unflagged connection has none, so no stored value
--- exists to be malformed. Display only. No start, reload or delivery path reads it, and no key seals
+-- the flag: a flagged connection has one and an unflagged connection has none, so no value is parsed
+-- or validated. Display only. No start, reload or delivery path reads it, and no key seals
 -- it, so a database writer can move a marker on the console and nothing else. Keyed by name and
 -- direction because a name may be both an inbound and an outbound. Not cleaned when a connection
 -- leaves the graph: the row then matches nothing, and the name keeps its flag if it comes back.

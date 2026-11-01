@@ -296,8 +296,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 Two things the console deliberately **cannot** do. It has no editor for Connection/Router/Handler
 Python — the reload above always runs the engine's own startup config dir, never a browser-supplied
 path — and it cannot write service settings: `[security]` and the rest of `messagefoundry.toml` are
-read-only to it (`GET /security/posture`), so changing posture is a file/IDE operation. The
-connection-flag row is the single exception to "no config writes".
+read-only to it (`GET /security/posture`), so changing posture is a file/IDE operation.
 
 The exhaustive per-route table — reads as well as writes, the exact gate on each, and the places a
 `/ui` route is deliberately weaker than its JSON counterpart — lives in

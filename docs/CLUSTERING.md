@@ -583,8 +583,8 @@ sensitive: the **row** leases (see below) and the `nodes.last_seen` heartbeat be
    its **own** config dir; convergence coordinates the reload *version*, not the files. Deploy the same
    config dir to all nodes.
 
-   No engine path writes a node's config dir. A CLI edit changes that node's copy only, so compare
-   the directories rather than assume they match. The connection flag lives in the store the nodes
+   A CLI edit changes that node's copy only, so compare the directories rather than assume they
+   match. The connection flag lives in the store the nodes
    share, so a toggle on one node shows on all of them (BACKLOG #2623).
 3. **Coordinated config changes.** Apply a config change as a **coordinated (not rolling) restart**, so
    nodes don't run divergent graphs across the change window.

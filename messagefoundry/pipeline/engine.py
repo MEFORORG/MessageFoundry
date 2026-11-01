@@ -2491,6 +2491,8 @@ class Engine:
         audit = AuditAppend(
             "connection_flag_set",
             actor=actor,
+            # As the other per-connection rows do, so an inbound's row sits beside its channel's.
+            channel_id=name if direction == "inbound" else None,
             detail=json.dumps(
                 {
                     "connection": name,
@@ -2504,7 +2506,7 @@ class Engine:
         try:
             await self.store.set_connection_flag(name, direction, flagged=flagged, audit=audit)
         except Exception as exc:
-            log.error("the connection flag was not changed: %s", safe_exc(exc))
+            log.error("the store did not confirm a connection flag change: %s", safe_exc(exc))
             raise ConnectionFlagNotRecorded(
                 "the store did not confirm this toggle, so the flag has probably not changed. "
                 "Try again; if it keeps failing, the engine log names the cause"

@@ -663,17 +663,27 @@ def _method_label(type_value: str) -> str:
     return _METHOD_LABELS.get(type_value, type_value.upper())
 
 
+#: Whether the last flag read failed, so a run of failures logs once.
+_connection_flags_failing = False
+
+
 async def _connection_flags(engine: Engine) -> set[tuple[str, str]]:
     """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows.
 
     The flag's one reader (BACKLOG #2623), and ``tests/test_connection_flag_readers.py`` fails on a
     second. It decides nothing, so a read that fails costs the markers and never the page: a row a
-    database writer planted that the driver cannot decode reads as no flags at all, at WARNING."""
+    database writer planted that the driver cannot decode reads as no flags at all. Logged at
+    WARNING once per failure run, because the stats socket reads this every second per console."""
+    global _connection_flags_failing
     try:
-        return await engine.store.list_connection_flags()
+        flags = await engine.store.list_connection_flags()
     except Exception as exc:  # noqa: BLE001 - display only; see the docstring
-        _log.warning("the connection flags could not be read: %s", safe_exc(exc))
+        if not _connection_flags_failing:
+            _log.warning("the connection flags could not be read: %s", safe_exc(exc))
+        _connection_flags_failing = True
         return set()
+    _connection_flags_failing = False
+    return flags
 
 
 def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
@@ -4947,15 +4957,14 @@ def create_app(
         # One grouped read on the lockfree path, replacing the stubbed alerts_active=0. A connection with
         # no open instances is simply absent from the map (→ 0).
         open_alerts = await engine.store.count_open_alerts_by_connection()
-        # Display only, and read after the two above so it adds nothing to a store that has failed
-        # them. See _connection_flags for why its own failure stays out of the page.
-        flags = await _connection_flags(engine)
         rows: list[ConnectionRow] = []
 
         # A source row per inbound connection, and a destination row per (inbound → outbound)
         # edge that has carried traffic (the outbox metrics are keyed that way).
         rr = engine.registry_runner
         if rr is not None:
+            # Display only. See _connection_flags for why its own failure stays out of the page.
+            flags = await _connection_flags(engine)
             reg = rr.registry
             for iname, ic in reg.inbound.items():
                 if not identity.can_access_channel(iname):
@@ -5416,7 +5425,9 @@ def create_app(
         if identity.allowed_channels is not None and (
             req.direction != "inbound"
             or not identity.can_access_channel(name)
-            or (rr is not None and name not in rr.registry.inbound)
+            # inbound_names(), as the engine's own guard reads it: an engine shard's view holds only
+            # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
+            or (rr is not None and name not in rr.registry.inbound_names())
         ):
             await _deny_connection(engine, identity, name, client_ip(request))
         try:

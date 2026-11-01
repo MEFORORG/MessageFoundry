@@ -213,10 +213,10 @@ it could reach only its own copy.
    `tests/test_connection_flag_readers.py` fails when a new reader appears. That test is what brings
    the seal question back if the flag ever comes to act.
 3. **A row is the flag.** A flagged connection has a row, keyed by name and direction, and an
-   unflagged one has none. No stored value exists to be malformed. Nothing in a start or a reload
+   unflagged one has none. No value is parsed or validated. Nothing in a start or a reload
    reads the table, and the flag is off the `Registry`, so no stored row can refuse either. The
-   dashboard read fails soft: a row the driver cannot decode costs the markers, at WARNING, and never
-   the page.
+   dashboard read fails soft: a row the driver cannot decode costs every marker, logged once per run
+   of failures at WARNING, and never the page.
 4. **The store is the only source.** The `flagged` TOML key and the `flagged=` declaration argument
    are removed, and the loader refuses both. Ignoring the key would leave a hand edit that reads as
    flagging a connection and flags nothing. There are no deployments, so there is nothing to migrate

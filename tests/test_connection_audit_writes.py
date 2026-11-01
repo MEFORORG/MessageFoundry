@@ -242,10 +242,12 @@ async def test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page(
         h = await _login(c)
         with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
             r = await c.get("/connections", headers=h)
-    assert r.status_code == 200, r.text
+            again = await c.get("/connections", headers=h)
+    assert r.status_code == again.status_code == 200, r.text
     assert r.json(), "control: the page has rows"
     assert not any(row["flagged"] for row in r.json())
-    assert "the connection flags could not be read" in caplog.text
+    # Once, however many frames read it: the stats socket reads this every second per console.
+    assert caplog.text.count("the connection flags could not be read") == 1
 
 
 async def test_credential_test_route_audits_under_the_acting_user(

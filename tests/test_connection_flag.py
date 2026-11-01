@@ -416,7 +416,7 @@ async def test_a_toggle_writes_its_row_with_no_digest(engine: Engine) -> None:
         "OB_TOML", direction="outbound", flagged=True, actor="tester", client="10.0.0.5"
     )
     [row] = await engine.store.list_audit(action="connection_flag_set")
-    assert (row["actor"], row["client"]) == ("tester", "10.0.0.5")
+    assert (row["actor"], row["client"], row["channel_id"]) == ("tester", "10.0.0.5", None)
     assert json.loads(str(row["detail"])) == {
         "connection": "OB_TOML",
         "direction": "outbound",
@@ -448,7 +448,7 @@ async def test_a_failed_row_changes_no_flag_and_names_the_store(
     assert await engine.store.list_connection_flags() == {("IB_TOML", "inbound")}
     assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
     assert isinstance(refused.value.__cause__, AppendFailed)
-    assert "the connection flag was not changed" in caplog.text
+    assert "the store did not confirm a connection flag change" in caplog.text
 
 
 # --- What no longer holds the flag ---------------------------------------------------------------

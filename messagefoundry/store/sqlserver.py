@@ -7685,31 +7685,27 @@ class SqlServerStore:
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`. ``HOLDLOCK`` makes
         the MERGE's match-then-insert one decision, so two toggles cannot both take the insert
-        branch and collide on the key. It is the transaction's first statement, so it is retried
-        as :meth:`_claim_keyed_surface` is. The append takes the audit applock at the tail, as
+        branch and collide on the key. The set or clear is the transaction's first statement and
+        safe to re-run, so it is retried as :meth:`_claim_keyed_surface` is. The append takes the audit applock at the tail, as
         :meth:`_alert_write`'s does."""
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
-                    if flagged:
 
-                        async def merge() -> None:
-                            await cur.execute(
-                                "MERGE connection_flag WITH (HOLDLOCK) AS t"
-                                " USING (SELECT ? AS connection, ? AS direction) AS s"
-                                " ON t.connection = s.connection AND t.direction = s.direction"
-                                " WHEN NOT MATCHED THEN INSERT (connection, direction)"
-                                " VALUES (s.connection, s.direction);",
-                                (connection, direction),
-                            )
-
-                        await _retry_idempotent_merge(merge, on_retry=conn.rollback)
-                    else:
+                    async def write_flag() -> None:
                         await cur.execute(
-                            "DELETE FROM connection_flag WHERE connection=? AND direction=?",
+                            "MERGE connection_flag WITH (HOLDLOCK) AS t"
+                            " USING (SELECT ? AS connection, ? AS direction) AS s"
+                            " ON t.connection = s.connection AND t.direction = s.direction"
+                            " WHEN NOT MATCHED THEN INSERT (connection, direction)"
+                            " VALUES (s.connection, s.direction);"
+                            if flagged
+                            else "DELETE FROM connection_flag WHERE connection=? AND direction=?",
                             (connection, direction),
                         )
+
+                    await _retry_idempotent_merge(write_flag, on_retry=conn.rollback)
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
                     await self._commit(conn)
             except Exception:
