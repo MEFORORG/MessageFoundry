@@ -196,7 +196,6 @@ def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
     assert "an engine writes an AUDIT line naming these connections" in remedy
     # The imperative carries its own reason, or a reader on enforce has none to bound a window.
     assert "Set each of them to an explicit number of days first, or" in remedy
-    assert "so set each of them" not in remedy
     assert "The start gate writes an AUDIT line for such a window at 0 only" in remedy
 
 

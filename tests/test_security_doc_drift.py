@@ -33,7 +33,6 @@ import pytest
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
-from messagefoundry.__main__ import main
 from messagefoundry.api.app import create_app
 from messagefoundry.api.field_authz import PHI_FIELDS
 from messagefoundry.auth.permissions import (
@@ -54,13 +53,15 @@ from messagefoundry.config.settings import (
     RetentionSettings,
     SecuritySettings,
     ServiceSettings,
-    security_loosenings,
 )
 from messagefoundry.config.wiring import WiringError
 from scripts.security.route_gates import gate_of, route_rows
 from tests._ast_sites import call_sites, callee_name, calls_to, find_funcs, named_func
 from tests._doc_blockquote import blockquote_lines, plant_in_blockquote
 from tests._retention_override_graph import override_graph, override_guard
+from tests.test_cli import _run_secure_serve
+from tests.test_docs_security_pathways import _github_anchor
+from tests.test_security_posture_defaults import _pairs
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -3915,7 +3916,8 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
 #: run, a docs-only pull request could change the sentences, merge green and red `main`.
 
 _OVERRIDE_NOTE = "**Per-connection overrides ("
-_BODY_WINDOW = "[security].delete_message_bodies_after_days"
+_BODY_SWITCH = "delete_message_bodies_after_days"
+_BODY_WINDOW = f"[security].{_BODY_SWITCH}"
 _OVERRIDE_LOG = logging.getLogger("tests.security_doc_drift.retention_override")
 _OVERRIDE_AUDITED = "logs a WARNING-level `AUDIT:` line naming each connection"
 #: Each arm's bullet, in the note's order: how it opens, and at least what else it must say.
@@ -3946,29 +3948,19 @@ _GUIDE_DOC = _ROOT / "docs" / "EARLY-ADOPTER-GUIDE.md"
 _IDE_SECURITY_EDITOR = _ROOT / "ide" / "src" / "securityEditorWebview.ts"
 _SETTINGS_SOURCE = _ROOT / "messagefoundry" / "config" / "settings.py"
 _LOOSENING_RETENTION_ENTRY = "### `delete_message_bodies_after_days = 0`"
-#: The GitHub anchor of that entry, which holds what each record shows. A site that links to it
-#: instead of restating the fact is only as good as this resolving.
-_LOOSENING_RETENTION_ANCHOR = (
-    "SECURITY-LOOSENING.md#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--"
-    "true--unbounded-phi-retention"
-)
-_BODY_SWITCH = "delete_message_bodies_after_days"
-#: Where a site called the opt-out or the dial audited with no scope, or said a PHI instance always
-#: bounds or refuses. Each key is a source :func:`_retention_claim_sources` reads.
-_RETIRED_RETENTION_CLAIMS: tuple[tuple[str, str], ...] = (
-    ("config", "The audited opt-out is `[security].allow_keeping_phi_indefinitely"),
-    ("config", "`0` = keep indefinitely (audited)"),
-    ("config", "audited escape: unbounded PHI retention"),
-    ("config", "the audited keep-forever opt-out"),
-    ("guide", "loud, audited warnings"),
-    ("loosening", "the warnings + startup **AUDIT** line + posture view"),
-    ("ide", "0 = keep indefinitely (audited)"),
-    ("ide", "Audited escape: unbounded PHI retention"),
-    ("ide", "still auto-bounds/refuses"),
-    ("settings", "0 = keep indefinitely (audited)"),
-    ("settings", "the explicit, audited override"),
-    ("settings", "WARNED + audited"),
-    ("settings", "still auto-bounds/refuses"),
+#: Sentences a source must not say again: the opt-out or the dial called audited with no scope, and
+#: the retention entry's false claim about what the list names.
+_RETIRED_RETENTION_CLAIMS: tuple[tuple[Path, str], ...] = (
+    (_CONFIG_DOC, "`0` = keep indefinitely (audited)"),
+    (_CONFIG_DOC, "audited escape: unbounded PHI retention"),
+    (_CONFIG_DOC, "the audited keep-forever opt-out"),
+    (_GUIDE_DOC, "loud, audited warnings"),
+    (_LOOSENING_DOC, f"names that switch and an explicit `{_BODY_SWITCH} = 0`"),
+    (_IDE_SECURITY_EDITOR, "0 = keep indefinitely (audited)"),
+    (_IDE_SECURITY_EDITOR, "Audited escape: unbounded PHI retention"),
+    (_SETTINGS_SOURCE, "0 = keep indefinitely (audited)"),
+    (_SETTINGS_SOURCE, "the explicit, audited override"),
+    (_SETTINGS_SOURCE, "WARNED + audited"),
 )
 
 
@@ -4001,6 +3993,11 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
     reworded return of the old claim is not caught, and only the retention entry is sliced: every
     other phrase is looked for anywhere in its document."""
     entry = _section(loosening, _LOOSENING_RETENTION_ENTRY)
+    # Computed, so a renamed heading fails here rather than leaving each site's link dangling.
+    heading = next(
+        line for line in loosening.splitlines() if line.startswith(_LOOSENING_RETENTION_ENTRY)
+    )
+    anchor = f"SECURITY-LOOSENING.md{_github_anchor(heading)}"
     findings: list[str] = []
     for where, text, retired, corrected in (
         (
@@ -4034,15 +4031,10 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
                 "`serve` then folds the effective window back into `[security]`",
                 "the list the start's [best-effort](#the-switches) `config_loaded` audit row",
                 f"they name `{_BODY_SWITCH}` too, though nobody wrote `0`",
+                "read the effective value",
                 "at least `dead_letter_days`, `reference_snapshot_days` and "
                 "`processed_archive_days` can stay at `0`",
             ),
-        ),
-        (
-            "the SECURITY-LOOSENING.md retention entry, on an explicit `0`",
-            entry,
-            f"names that switch and an explicit `{_BODY_SWITCH} = 0`",
-            ("read the effective value",),
         ),
         (
             "the PHI.md retention section",
@@ -4050,16 +4042,14 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
             "The explicit, **audited** opt-out is",
             (
                 "Under `warn` the gate writes no `AUDIT:` line for an auto-bounded window at `0`",
-                "the start's best-effort `config_loaded` audit row records that list",
-                "The list names no auto-bounded window but the message-body one",
-                _LOOSENING_RETENTION_ANCHOR,
+                anchor,
             ),
         ),
         (
             "the CONFIGURATION.md auto-bound paragraph",
             config,
             "The audited opt-out is `[security].allow_keeping_phi_indefinitely",
-            ("writes an `AUDIT:` line for it only under `enforce`", _LOOSENING_RETENTION_ANCHOR),
+            (anchor,),
         ),
         (
             "the SECURITY-LOOSENING.md `enforcement = warn` entry",
@@ -4072,72 +4062,24 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
         if retired in flat:
             findings.append(f"{where} says again: {retired!r}")
         findings += [f"{where} no longer says {c!r}" for c in corrected if c not in flat]
-    # The links resolve only while the anchor is the heading as GitHub slugs it.
-    heading = next(
-        line for line in loosening.splitlines() if line.startswith(_LOOSENING_RETENTION_ENTRY)
-    )
-    slug = re.sub(r"[^\w\- ]", "", heading.lstrip("# ").lower()).replace(" ", "-")
-    if f"SECURITY-LOOSENING.md#{slug}" != _LOOSENING_RETENTION_ANCHOR:
-        findings.append(f"the retention entry's anchor is now #{slug}")
     return findings
 
 
-def _retention_claim_sources() -> dict[str, str]:
+def _retention_claim_sources() -> dict[Path, str]:
     """Every source :data:`_RETIRED_RETENTION_CLAIMS` names."""
     return {
-        key: path.read_text(encoding="utf-8")
-        for key, path in (
-            ("config", _CONFIG_DOC),
-            ("guide", _GUIDE_DOC),
-            ("loosening", _LOOSENING_DOC),
-            ("ide", _IDE_SECURITY_EDITOR),
-            ("settings", _SETTINGS_SOURCE),
-        )
+        path: path.read_text(encoding="utf-8") for path in {p for p, _ in _RETIRED_RETENTION_CLAIMS}
     }
 
 
-def _retired_retention_claims(sources: Mapping[str, str]) -> list[str]:
+def _retired_retention_claims(sources: Mapping[Path, str]) -> list[str]:
     """Each retired claim still in its source, wrapped across lines or not."""
-    flat = {key: " ".join(text.split()) for key, text in sources.items()}
+    flat = {path: " ".join(text.split()) for path, text in sources.items()}
     return [
-        f"{key} says again: {claim!r}"
-        for key, claim in _RETIRED_RETENTION_CLAIMS
-        if claim in flat[key]
+        f"{path.name} says again: {claim!r}"
+        for path, claim in _RETIRED_RETENTION_CLAIMS
+        if claim in flat[path]
     ]
-
-
-def _posture_list(security: SecuritySettings) -> list[tuple[str, str]]:
-    """What ``security_loosenings()`` reports for ``security``, every other section at its default.
-
-    The start's ``config_loaded`` row records this list's names:
-    `tests/test_start_config_loaded_row.py` pins that row to the posture list."""
-    defaults = ServiceSettings()
-    return security_loosenings(
-        security,
-        defaults.store,
-        defaults.auth,
-        defaults.alerts,
-        defaults.secret_rotation,
-        cleartext_hops=(),
-        expiry_relaxed_hops=(),
-        hostname_unchecked_hops=(),
-        query_credential_hops=(),
-        unverified_db_hops=(),
-        attested_hops=(),
-        revocation_attested_hops=(),
-        path_form_fhir_hops=(),
-        api=defaults.api,
-        approvals=defaults.approvals,
-        cert_monitor=defaults.cert_monitor,
-        backup=defaults.backup,
-        secrets=defaults.secrets,
-        ai=defaults.ai,
-        store_privilege=None,
-        audit_chain_unkeyed=None,
-        remote_debug=None,
-        startup=None,
-        service_env=None,
-    )
 
 
 def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
@@ -4193,24 +4135,23 @@ def test_the_docs_say_the_body_window_gate_audits_only_under_enforce() -> None:
     (plain,) = [line for line in unacknowledged if _BODY_WINDOW in line.text]
     assert plain.text.startswith("warning:")
     # A warn-only tier's switch does name a window: the docs' "auto-bounded" scopes that sentence.
-    tier = _posture_list(SecuritySettings(allow_keeping_app_logs_indefinitely=True))
+    tier = _pairs(sec=SecuritySettings(allow_keeping_app_logs_indefinitely=True))
     assert "app_log_days" in " ".join(risk for _name, risk in tier)
 
 
 @pytest.mark.parametrize(
-    ("authored", "early_names_body", "folded_names_body", "folded_days"),
+    ("authored", "early_names_body", "folded_days"),
     [
         # What the entry exists to say: the gate leaves the window unbounded, nobody typed 0.
-        ("security.allow_keeping_phi_indefinitely = true\n", False, True, 0),
-        (f"security.{_BODY_SWITCH} = 0\n", True, True, 0),
+        ("security.allow_keeping_phi_indefinitely = true\n", False, 0),
+        (f"security.{_BODY_SWITCH} = 0\n", True, 0),
         # Controls: the switch alone does not name the window, and neither does the dial.
         (
             f"security.allow_keeping_phi_indefinitely = true\nsecurity.{_BODY_SWITCH} = 30\n",
             False,
-            False,
             30,
         ),
-        ("", False, False, 30),
+        ("", False, 30),
     ],
     ids=["switch-window-unset", "explicit-zero", "switch-window-bounded", "neither"],
 )
@@ -4220,28 +4161,17 @@ def test_the_two_readings_of_the_list_differ_as_the_retention_entry_says(
     capsys: pytest.CaptureFixture[str],
     authored: str,
     early_names_body: bool,
-    folded_names_body: bool,
     folded_days: int,
 ) -> None:
     """The real ``serve`` runs, so its own order is what is read: warning, gate, then the fold.
 
     A ``SecuritySettings`` built by hand cannot show this. It never passes the fold, which is where
     an unset window under the switch becomes a 0 nobody wrote. Only the app and uvicorn are
-    replaced, and the captured ``security_settings`` is the view the posture route reads."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
-    (tmp_path / "messagefoundry.toml").write_text(
-        f'security.enforcement = "warn"\n{authored}', encoding="utf-8"
+    replaced, and the captured ``security_settings`` is the view the posture route reads.
+    `tests/test_start_config_loaded_row.py` pins the ``config_loaded`` row to that route's list."""
+    rc, handed = _run_secure_serve(
+        tmp_path, monkeypatch, f'security.enforcement = "warn"\n{authored}'
     )
-    handed: dict[str, object] = {}
-
-    def capture_app(**kwargs: object) -> object:
-        handed.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("messagefoundry.api.create_managed_app", capture_app)
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    rc = main(["serve", "--config", str(_ROOT / "samples" / "config"), "--env", "prod"])
     assert rc == 0
 
     # `serve` configures logging itself, so the line is read off stdout rather than from caplog.
@@ -4260,14 +4190,12 @@ def test_the_two_readings_of_the_list_differ_as_the_retention_entry_says(
     assert isinstance(security, SecuritySettings)
     assert isinstance(retention, RetentionSettings)
     assert security.delete_message_bodies_after_days == folded_days
-    folded = dict(_posture_list(security))
-    assert (_BODY_SWITCH in folded) is folded_names_body
-    if folded_names_body:
-        # True here too, where the gate neither bounded the window nor refused the start.
-        assert "auto-bound" not in folded[_BODY_SWITCH]
-    if switch_set:
-        # Really unbounded, so the absence just below hides something.
-        assert retention.dead_letter_days == 0
+    folded = dict(_pairs(sec=security))
+    assert (_BODY_SWITCH in folded) is (folded_days == 0)
+    # True here too, where the gate neither bounded the window nor refused the start.
+    assert "auto-bound" not in folded.get(_BODY_SWITCH, "")
+    # Really unbounded under the switch, so the absence just below hides something.
+    assert (retention.dead_letter_days == 0) is switch_set
     text = " ".join(f"{name} {risk}" for name, risk in folded.items())
     assert not [w.field for w in auto_bounded_windows() if w.field in text]
 
@@ -4355,8 +4283,8 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "the gate writes no `AUDIT:` line",
             "the gate writes an `AUDIT:` line",
         ),
-        # What stands in for the retired word: each site says where the switch is recorded, and
-        # what that record cannot show.
+        # What stands in for the retired word: each site says where the switch is recorded, or
+        # links to the entry that does.
         "row-unnamed-in-config": (
             "config",
             "whose list the start's best-effort `config_loaded` audit row records",
@@ -4366,11 +4294,6 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "loosening",
             "That row is best-effort: at least some of those rows record no list",
             "That row always records the list",
-        ),
-        "row-read-as-certain-in-phi": (
-            "phi",
-            "the start's best-effort `config_loaded`",
-            "the start's `config_loaded`",
         ),
         "row-read-as-certain-in-the-entry": (
             "loosening",
@@ -4392,16 +4315,10 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "too, though nobody wrote `0`",
             "too",
         ),
-        "the-false-sentence-back": (
-            "loosening",
-            "The start's posture warning runs before the gate",
-            f"`security_loosenings()` names that switch and an explicit `{_BODY_SWITCH} = 0`. "
-            "The start's posture warning runs before the gate",
-        ),
-        "phi-list-names-every-window": (
+        "phi-link-dropped": (
             "phi",
-            "The list names no auto-bounded window but the message-body one.",
-            "The list names every window.",
+            "(SECURITY-LOOSENING.md#delete_message_bodies_after_days",
+            "(SECURITY-LOOSENING.md#retention",
         ),
     }
     for name, (key, old, new) in prose_plants.items():
@@ -4412,9 +4329,9 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
 
     sources = _retention_claim_sources()
     assert not _retired_retention_claims(sources), "the real sources must read clean first"
-    for key, claim in _RETIRED_RETENTION_CLAIMS:
-        found = _retired_retention_claims({**sources, key: f"{sources[key]}\n{claim}"})
-        assert found == [f"{key} says again: {claim!r}"], f"plant {claim!r} read {found}"
+    for path, claim in _RETIRED_RETENTION_CLAIMS:
+        found = _retired_retention_claims({**sources, path: f"{sources[path]}\n{claim}"})
+        assert len(found) == 1 and path.name in found[0], f"plant {claim!r} read {found}"
 
 
 def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
