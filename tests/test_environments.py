@@ -8,11 +8,13 @@ from __future__ import annotations
 import argparse
 import logging
 import textwrap
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.environments import (
+    environment_values_from_bytes,
     load_environment_values,
     resolve_values_base_dir,
 )
@@ -305,6 +307,146 @@ def test_load_environment_values_lowercases_file_keys(tmp_path: Path) -> None:
         environ={"MEFOR_VALUE_EPIC_HOST": "10.9.9.9"},
     )
     assert values == {"epic_host": "10.9.9.9"}
+
+
+# --- a table inside an array in a value file (BACKLOG #1820) ------------------
+
+#: Invented by this test. It stands in for a fallback an author would write as ``default``.
+ARRAY_SENTINEL = "MFTEST-VALUE-FILE-ARRAY-DEFAULT-MUST-NOT-SHIP"
+_MARKER = f'{{ env = "k", default = "{ARRAY_SENTINEL}" }}'
+
+#: ``(value file body, the offender it must name)``. Every shape carries the sentinel.
+TABLE_IN_ARRAY_FILES = {
+    "inline-marker": (f'recips = ["a@example.invalid", {_MARKER}]\n', "'recips' item 1"),
+    "plain-table": (f'recips = [{{ a = "{ARRAY_SENTINEL}" }}]\n', "'recips' item 0"),
+    "marker-with-another-key": (
+        f'recips = [{{ env = "k", default = "{ARRAY_SENTINEL}", note = "x" }}]\n',
+        "'recips' item 0",
+    ),
+    "nested-array": (f'recips = [["x", {_MARKER}]]\n', "'recips' item 0.1"),
+    "array-of-tables-header": (f'[[recips]]\na = "{ARRAY_SENTINEL}"\n', "'recips' item 0"),
+    "past-the-wiring-scan-depth": (
+        f"recips = {'[' * 8}{_MARKER}{']' * 8}\n",
+        "'recips' item 0.0.0.0.0.0.0.0",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(TABLE_IN_ARRAY_FILES))
+def test_a_table_inside_an_array_in_a_value_file_is_refused(shape: str, tmp_path: Path) -> None:
+    """Every reader passes through the bytes function. The disk read goes through it here, and the
+    serve reader's snapshot read has its own test below."""
+    body, offender = TABLE_IN_ARRAY_FILES[shape]
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text(body, encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        load_environment_values(
+            base_dir=tmp_path, dir_name="environments", environment="dev", environ={}
+        )
+    message = str(caught.value)
+    assert offender in message, message
+    assert ARRAY_SENTINEL not in message, message
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_the_walk_has_no_depth_cap_a_value_file_could_reach() -> None:
+    """The wiring scan stops at its depth cap, so a marker past it reads as clean there."""
+    from messagefoundry.config.wiring import _contains_envref
+
+    parsed = tomllib.loads(TABLE_IN_ARRAY_FILES["past-the-wiring-scan-depth"][0])
+    assert not _contains_envref(parsed["recips"]), "the premise: a capped scan misses this"
+    body = f"deep = {'[' * 400}{_MARKER}{']' * 400}\n".encode()
+    with pytest.raises(ValueError, match="deep"):
+        environment_values_from_bytes(body, path=Path("dev.toml"), environ={})
+
+
+def test_the_first_offender_and_a_count_are_named_even_for_an_unreferenced_key() -> None:
+    body = f'kept = "x"\nfirst = [{_MARKER}]\nsecond = [["y", {_MARKER}]]\n'.encode()
+    with pytest.raises(ValueError) as caught:
+        environment_values_from_bytes(body, path=Path("dev.toml"), environ={})
+    assert "2 found, first 'first' item 0" in str(caught.value)
+    assert ARRAY_SENTINEL not in str(caught.value)
+
+
+def test_a_key_is_rendered_so_it_cannot_forge_the_message() -> None:
+    """A TOML quoted key can hold a control character, and ``check`` prints the message raw."""
+    body = f'"a\\nb" = [{_MARKER}]\n'.encode()
+    with pytest.raises(ValueError) as caught:
+        environment_values_from_bytes(body, path=Path("dev.toml"), environ={})
+    assert "\n" not in str(caught.value)
+    assert "'a\\nb' item 0" in str(caught.value)
+
+
+def test_serve_s_snapshot_read_reaches_the_refusal_as_a_wiring_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reload path. ``load_environment_values`` is not on it, so a check there would miss it.
+    A ``WiringError`` is the arm ``POST /config/reload`` answers with an audited 422."""
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.config.snapshot import read_config_snapshot
+
+    monkeypatch.setattr(
+        "messagefoundry.config.wiring.assert_trusted_start_paths", lambda *_a, **_k: None
+    )
+    cfg = tmp_path / "cfg"
+    (cfg / "environments").mkdir(parents=True)
+    value_file = cfg / "environments" / "dev.toml"
+    value_file.write_text(f"recips = [{_MARKER}]\n", encoding="utf-8")
+    snapshot = read_config_snapshot(cfg, strict=True)
+    value_file.write_text('recips = ["edited.example.invalid"]\n', encoding="utf-8")
+
+    reader = _environment_values_reader(base_dir=cfg, dir_name="environments", environment="dev")
+    with pytest.raises(WiringError) as caught:
+        reader.from_snapshot(snapshot)
+    message = str(caught.value)
+    assert "'recips' item 0" in message, message
+    assert ARRAY_SENTINEL not in message, message
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('v = ["a", "b"]', ["a", "b"]),
+        ("v = [1, 2]", [1, 2]),
+        ('v = [["a"], ["b", "c"]]', [["a"], ["b", "c"]]),
+        ("v = []", []),
+        ("v = 5", 5),
+    ],
+)
+def test_an_array_of_scalars_still_loads(line: str, expected: object) -> None:
+    """Over-widening control."""
+    values = environment_values_from_bytes(f"{line}\n".encode(), path=Path("dev.toml"), environ={})
+    assert values == {"v": expected}
+
+
+def test_a_top_level_table_is_still_skipped_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The neighbouring branch keeps its behaviour, an array inside the skipped table included."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.environments"):
+        values = environment_values_from_bytes(
+            b"[reserved]\nv = [{ a = 1 }]\n", path=Path("dev.toml"), environ={}
+        )
+    assert values == {}
+    assert "ignoring nested table" in caplog.text
+
+
+def test_the_shipped_value_files_still_load() -> None:
+    """Over-widening control on the real files. The census is not empty, or it proves nothing."""
+    files = sorted((Path(__file__).parents[1] / "environments").glob("*.toml"))
+    assert files
+    for file in files:
+        environment_values_from_bytes(file.read_bytes(), path=file, environ={})
+
+
+def test_a_mapping_handed_in_directly_is_not_checked() -> None:
+    """The stated limit: resolving reads a value whole, so only the file read refuses this shape."""
+    item = {"env": "k", "default": ARRAY_SENTINEL}
+    resolved = resolve_env_settings({"recipients": env("recips")}, {"recips": ["a", item]})
+    assert resolved["recipients"][1] == item
 
 
 def test_env_ref_key_is_lowercased() -> None:

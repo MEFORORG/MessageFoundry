@@ -469,7 +469,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. Resolved against `base_dir` (below). |
+| `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. A table anywhere inside an array stops the load, naming the key and index, even for a key nothing references (vault BACKLOG #1820). Arrays of scalars, nested ones included, load. Resolved against `base_dir` (below). |
 | `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. |
 
 - A graph value that differs by environment is authored as `env("acme_adt_host")`; the running

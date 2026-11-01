@@ -629,7 +629,9 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
     walk still runs: it starts one level further in, at each item, and it reads the list as it is
     now, so it also sees a list changed after the reference was made.
 
-    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here. At
+    least a value file answers for it when it is read; ``environment_values_from_bytes`` states
+    that check and its limit."""
     offenders: list[str] = []
     for name, value in settings.items():
         label = name
