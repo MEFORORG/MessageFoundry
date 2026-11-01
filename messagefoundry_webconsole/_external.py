@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import string
 from urllib.parse import unquote, urlsplit
 
 #: Schemes we will render an interstitial for. Anything else (``javascript:``, ``data:``, ``file:``)
@@ -200,6 +201,17 @@ def is_idn_disguised(url: str) -> bool:
     return "xn--" in host_of(url)
 
 
+def _entry_key(entry: str) -> str:
+    """The form a list entry is compared in: ASCII white space stripped, then lower-cased only if
+    all ASCII. A host here is always ASCII, so an entry holding anything else matches nothing,
+    where ``str.lower()`` would turn the Kelvin sign into an ASCII ``k`` and a plain ``strip()``
+    would remove a no-break space, and either would let it cover an ASCII host (BACKLOG #3765).
+    This console's copy of ``upn_suffix_key`` in ``messagefoundry/domainshape.py``, kept here for
+    the reason :func:`_is_ipv4` gives; ``tests/test_domain_shape.py`` compares the two."""
+    entry = entry.strip(string.whitespace)
+    return entry.lower() if entry.isascii() else entry
+
+
 def _matches_domain(host: str, domain: str) -> bool:
     """``host`` is ``domain`` or a subdomain of it — matched on a LABEL boundary.
 
@@ -212,7 +224,7 @@ def _matches_domain(host: str, domain: str) -> bool:
     canonical IPv4 address can match, only exactly, and only if it is one host's (BACKLOG #3765).
     Settings accept no other address, so this shows the interstitial for every other spelling.
     """
-    domain = domain.strip().lower()
+    domain = _entry_key(domain)
     if not domain or not host:
         return False
     if _reads_as_address(host):

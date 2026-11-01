@@ -293,8 +293,35 @@ def test_the_console_matches_an_ipv4_entry_exactly() -> None:
 )
 def test_the_console_and_the_engine_agree_on_what_is_an_ipv4_entry(value: str) -> None:
     # The console keeps its own stdlib check rather than import the engine module, so the two
-    # must not drift: an entry would move between exact and label-boundary matching.
+    # must not drift. A host that reads as an address can match only if this says it is canonical:
+    # read wider, a spelling settings refuse would cover itself, and read narrower, an address
+    # settings accept would cover nothing.
     assert _external._is_ipv4(value) is is_canonical_ipv4(value)
+
+
+@pytest.mark.parametrize("entry", ["Korp.example", " korp.example", "korp.example "])
+def test_a_non_ascii_entry_covers_no_ascii_host(entry: str) -> None:
+    """BACKLOG #3765, the class of item 9 on the console's side. ``str.lower()`` turned the Kelvin
+    sign into an ASCII ``k`` and a plain ``strip()`` removed a non-ASCII space, so such an entry,
+    which settings would refuse or strip at load, covered an ASCII host if it reached the console
+    another way. Control: an ASCII entry's padding and capitals still go.
+
+    Mutation: put ``domain.strip().lower()`` back in ``_matches_domain``. Red: every case.
+    Mutation: ``_entry_key`` lower-cases every entry. Red: the first case.
+    Mutation: ``_entry_key`` calls a plain ``strip()``. Red: the two white space cases."""
+    url = "https://korp.example/"
+    assert is_external(url, (entry,))
+    assert not is_allowlisted(url, (entry,))
+    assert not is_external(url, (" KORP.example\t",))
+
+
+@pytest.mark.parametrize(
+    "value", [" Corp.Example\t", "Korp.example", " corp.example", "MÜLLER.example"]
+)
+def test_the_console_and_the_engine_agree_on_the_compare_form(value: str) -> None:
+    # The console's _entry_key is a copy of upn_suffix_key, kept for the reason _is_ipv4's docstring
+    # gives, so a fix to one must not leave the other behind.
+    assert _external._entry_key(value) == upn_suffix_key(value)
 
 
 def test_the_upn_compare_form_accepts_nothing_that_lowering_both_sides_refused() -> None:
