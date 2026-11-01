@@ -6963,16 +6963,17 @@ _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 _URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
 
 
-def _url_scheme(value: str) -> str | None:
-    """The ``<scheme>://`` that ``value`` starts with, or ``None``. Any scheme of two or more characters: these settings take
-    a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as
-    a bogus local path (vault BACKLOG #2600).
+def _url_scheme(value: str) -> bool:
+    """Whether ``value`` starts with a ``<scheme>://``. Any scheme of two or more characters: these
+    settings take a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or
+    ``s3a://`` load as a bogus local path (vault BACKLOG #2600).
 
-    A refusal quotes this and never the URL. A URL can carry a credential (``https://user:pw@``,
-    a signed query), and :func:`settings_error_detail` prints a validator's message as written:
-    to stderr, a service log, and since vault BACKLOG #2600 ``security show``'s JSON."""
-    match = _URL_SCHEME.match(value.strip().lower())
-    return match.group(0) if match else None
+    It answers yes or no, and hands back no text, because a refusal quotes no part of the value
+    (vault BACKLOG #2850). A URL can carry a credential (``https://user:pw@``, a signed query), the
+    matched scheme is whatever text sits in front of ``://``, and :func:`settings_error_detail`
+    prints a validator's message as written: to stderr, a service log, and since vault BACKLOG
+    #2600 ``security show``'s JSON."""
+    return _URL_SCHEME.match(value.strip().lower()) is not None
 
 
 class BackupSettings(_Section):
@@ -7058,10 +7059,9 @@ class BackupSettings(_Section):
     def _no_cloud_destination(cls, value: str) -> str:
         # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a URL destination
         # at config load rather than silently treating it as a (bogus) local path at 02:00.
-        scheme = _url_scheme(value)
-        if scheme is not None:
+        if _url_scheme(value):
             raise ValueError(
-                f"[backup].destination must be a LOCAL or UNC path, not a URL ({scheme}...); "
+                "[backup].destination must be a LOCAL or UNC path, not a URL; "
                 "MessageFoundry DR backups have no cloud target (ADR 0049 — no new egress)"
             )
         return value
@@ -7197,10 +7197,9 @@ class DrSettings(_Section):
     @field_validator("seed_archive", "seed_dir")
     @classmethod
     def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
-        scheme = _url_scheme(value)
-        if scheme is not None:
+        if _url_scheme(value):
             raise ValueError(
-                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL ({scheme}...); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a URL; "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
         return value
@@ -7224,10 +7223,9 @@ class DrSettings(_Section):
     def _no_cloud_restore_token(cls, value: str) -> str:
         # The restore-token is a DBA-placed local artifact on the DR box (BACKLOG #223, ADR 0102); like
         # seed_archive it is LOCAL/UNC only — a URL would imply new egress, which DR forbids.
-        scheme = _url_scheme(value)
-        if scheme is not None:
+        if _url_scheme(value):
             raise ValueError(
-                f"[dr].restore_token must be a LOCAL or UNC path, not a URL ({scheme}...); "
+                "[dr].restore_token must be a LOCAL or UNC path, not a URL; "
                 "the DR restore-token is a local artifact on the DR box (ADR 0102 — no new egress)"
             )
         return value
@@ -10750,8 +10748,8 @@ def settings_error_detail(exc: Exception) -> str:
     refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
     refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
     message must name the setting and never quote a secret value. The OIDC URL refusals quote no
-    part of the URL for that reason, and since vault BACKLOG #2600 the ``[backup]`` and ``[dr]``
-    URL refusals quote only the scheme (:func:`_url_scheme`).
+    part of the URL for that reason, and since vault BACKLOG #2850 neither do the ``[backup]`` and
+    ``[dr]`` URL refusals (:func:`_url_scheme`).
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
