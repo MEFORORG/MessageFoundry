@@ -25,8 +25,8 @@ caching) are copied verbatim and only the DB layer differs:
 - **DDL race guard:** the store's transaction-scoped ``sp_getapplock`` (``store._applock``), the T-SQL
   analog of PG's ``pg_advisory_xact_lock``.
 
-It is duck-typed on the store (``store._acquire`` / ``store._applock`` / ``store._fetchone`` /
-``store._fetchall`` / ``store._execute``) so this module imports cleanly without
+It is duck-typed on the store (``store._acquire`` / ``store._cursor`` / ``store._applock`` /
+``store._fetchone`` / ``store._fetchall`` / ``store._execute``) so this module imports cleanly without
 the optional ``aioodbc`` extra and never hard-imports the concrete store.
 
 .. note::
@@ -342,8 +342,10 @@ class SqlServerCoordinator:
         # store package at import time for no benefit.
         from messagefoundry.store.sqlserver import CLUSTER_SCHEMA
 
-        async with self._store._acquire() as conn:
-            cur = await conn.cursor()
+        # `_cursor`, not a bare cursor: it closes the cursor before release (EF-6), and on a
+        # cancellation hands it to the connection's call gate instead, so it is freed only once the
+        # statement running on its executor thread returns (BACKLOG #2394).
+        async with self._store._acquire() as conn, self._store._cursor(conn) as cur:
             try:
                 # A real statement MUST precede sp_getapplock @LockOwner='Transaction', or it does not
                 # release on commit (the Phase-1 audit-chain gotcha). This benign SELECT is that statement.

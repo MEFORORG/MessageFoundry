@@ -6984,12 +6984,18 @@ class AuthService:
         # inside that insert's transaction.) The federated caller has
         # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
         # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
-        federated = federated_subject is not None or mech == "oidc"
+        if mech == "oidc" and federated_subject is None:
+            # BACKLOG #2738 item 8, a programming error too. ``mech="oidc"`` alone used to count as
+            # federated: the login then skipped the bound-row refusal below, and its session insert
+            # required no pair, so it could sign in an account bound to another identity. No
+            # production caller did.
+            raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
+        federated = federated_subject is not None
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
             # other mechanism would let that OIDC session step up by password (ADR 0142 Amendment B).
             raise ValueError(
-                "a federated login (federated_subject or mech='oidc') needs the OIDC session"
+                "a federated login (one carrying federated_subject) needs the OIDC session"
                 " mechanism, and only a federated login may use it"
             )
         if federated and idp_auth_time is None:
@@ -11484,8 +11490,10 @@ class AuthService:
           gate refuses it for that reason, and does not audit it as a lapse.
         - ``"epoch"``: a whole-account revoke raised the account's epoch after this session was
           sealed, so the session belongs to sessions that were ended (BACKLOG #2592). That revoke
-          blanked every seal under the account's lock, so no write of the store's own leaves such
-          a row live: it is ended and reported like a row that fails its seal.
+          blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
+          a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
+          epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal;
+          docs/SECURITY.md, *Limits of the session sweep*, states what that costs.
 
         :meth:`logout` and :meth:`_supersede_session_hash` act on ``"credential"`` only. They read
         the account after their own revoke committed, so a whole-account revoke landing between
@@ -16473,11 +16481,14 @@ class AuthService:
         used to say a first bind "adds a way in and withdraws none" and revoked nothing.
 
         The sweep is the write's own transaction (``Store.set_user_federated_subject``), so there
-        is no moment at which the pair is written and the earlier sessions are live. A Windows SSO
+        is no moment at which the pair is written and the earlier sessions are live, with the one
+        SQL Server exception at the end of this paragraph. A Windows SSO
         sign-in that read the row unbound either inserts its session before that transaction,
         which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
         the row bound and is refused. The account's own session never performs the bind: both
-        routes refuse a caller binding its own account.
+        routes refuse a caller binding its own account. One limit (BACKLOG #2738): on SQL Server
+        the sweep can miss a session rotated mid-scan. docs/SECURITY.md, *Limits of the session
+        sweep*, states what becomes of that session.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).

@@ -4015,13 +4015,18 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
     ), "check_http_intake_auth no longer warns under warn; restate docs/DEPLOYMENT.md"
     gate(True, intake_auth="api_key", intake_api_key="k")
     gate(True, intake_auth="bearer", intake_api_key="k")
-    gate(True, intake_auth="mtls_subject", tls_ca_file="ca.pem", intake_client_subjects=["CN:p"])
+    gate(
+        True,
+        intake_auth="mtls_subject",
+        tls_ca_file="ca.pem",
+        intake_client_subjects={"CN=Partner CA": ["CN:p"]},
+    )
     gate(True, source_ip_allowlist=["10.0.0.0/8", "2001:db8::/32"])
     # Once intake_auth names a mode, only that mode is judged: a narrow allow-list does not rescue
     # a key mode with no key (docs/DEPLOYMENT.md says the allow-list is then not consulted).
     for incomplete in (
         {"intake_auth": "bearer", "intake_api_key": ""},
-        {"intake_auth": "mtls_subject", "tls_ca_file": "ca.pem", "intake_client_subjects": []},
+        {"intake_auth": "mtls_subject", "tls_ca_file": "ca.pem", "intake_client_subjects": {}},
     ):
         with pytest.raises(WiringError):
             gate(True, source_ip_allowlist=["10.0.0.0/24"], **incomplete)

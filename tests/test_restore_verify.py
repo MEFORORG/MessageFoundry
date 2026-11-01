@@ -868,14 +868,12 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
     iso = _isolate_tempdir(tmp_path, monkeypatch)
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
     monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
-    real_open = open
 
-    def open_refusing_writes(file, mode="r", *args, **kwargs):
-        if mode == "r+b":
-            raise PermissionError(13, "synthetic sharing violation", str(file))
-        return real_open(file, mode, *args, **kwargs)
+    def open_refusing_writes(entry: Path, dir_fd: int | None) -> int:
+        raise PermissionError(13, "synthetic sharing violation", str(entry))
 
-    monkeypatch.setattr(dr_backup, "open", open_refusing_writes, raising=False)
+    # The fail-safe's open for truncation (BACKLOG #2420), not the module's every open.
+    monkeypatch.setattr(dr_backup, "_open_unfollowed", open_refusing_writes)
     with caplog.at_level(logging.ERROR, logger=dr_backup.__name__):
         res = _verify_archive_blocking(
             staging_root=iso,
