@@ -503,10 +503,15 @@ async def test_a_refused_peer_that_stalls_after_its_request_goes_round_nothing()
                 held.append(await asyncio.to_thread(_stall, scp.sockport, request + b"\x07"))
             # A peer still in the listen backlog, or accepted with its thread not yet started, is
             # no thread and no association, so the count below can pass while that peer waits. It
-            # then starts and takes the one slot, and the sender is rightly refused. A peer's close
-            # is the one reading that says it has been dealt with, and a blocked DUL never sends it.
+            # then starts and takes the one slot, and the sender is rightly refused. So each peer's
+            # close is awaited first: it shows the SCP has reached that peer, and a blocked DUL
+            # never sends it.
             closed = [await asyncio.to_thread(_closed_within, sock, 8.0) for sock in held]
-            assert all(closed), f"{closed.count(False)} of {len(held)} peers were never closed"
+            assert all(closed), f"{closed.count(False)} of {len(held)} peers not closed within 8 s"
+            # An Association thread outlives the close its peer reads, and the baseline can hold a
+            # dying thread of the test before, so the count below may not wait for this one. A slot
+            # still held here runs this wait out, as a slot held for good always has.
+            await _until(lambda: scp._server.active_associations == [], within=8.0)
             await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=8.0)
             assert scp._server.active_associations == []
             assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (
