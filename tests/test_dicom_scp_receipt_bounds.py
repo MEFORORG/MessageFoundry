@@ -359,16 +359,32 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
         try:
             # WARNING: pynetdicom's 'Received unexpected ... service message' line is one.
             with caplog.at_level(logging.WARNING):
+                # A planted pynetdicom line, so the absence lists below are known to read a capture
+                # pynetdicom's records reach. It names none of the strings they look for.
+                logging.getLogger("pynetdicom").warning("planted capture control")
                 sock.sendall(sends)
                 answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_INVALID))
                 assert answer == _ABORT_INVALID, answer
                 await _until(lambda: len(_threads_outside_the_test()) <= baseline)
         finally:
             sock.close()
-    # The capture saw the SCP's own line for this end, so the two empty lists below are read from a
-    # capture that works, not from one that caught nothing.
+    # The bare assert stays although the next lines imply it: it is the guard
+    # tests/test_vacuous_absence_assert_lint.py reads for the two absence asserts below.
     assert caplog.records
-    assert any("ended an association" in r.getMessage() for r in caplog.records), caplog.text
+    planted = [
+        r
+        for r in caplog.records
+        if r.name == "pynetdicom" and r.getMessage() == "planted capture control"
+    ]
+    assert len(planted) == 1, caplog.text
+    # The SCP's own end of this association, so the abort the peer read came from that path and not
+    # from pynetdicom's own AA-8, which sends the same bytes.
+    ended = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _LOG and "ended an association with 127.0.0.1" in r.getMessage()
+    ]
+    assert len(ended) == 1, caplog.text
     tracebacks = [r for r in caplog.records if r.exc_info and r.name.startswith("pynetdicom")]
     assert tracebacks == [], [r.getMessage() for r in tracebacks]
     unthrottled = [

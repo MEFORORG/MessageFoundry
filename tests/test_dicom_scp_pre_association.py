@@ -525,16 +525,25 @@ async def test_a_stray_byte_behind_a_request_does_not_delay_the_association_chec
             for _ in range(40):
                 held.append(await asyncio.to_thread(_stall, scp.sockport, request + b"\x07"))
 
-            def only_the_two_accepted_are_left() -> bool:
-                # Both halves are awaited, not read once: the last peers' own connection threads
-                # can still be running, about to answer or just after it, when the association
-                # count first reads two. Measured: a lone process_request_thread as a fifth thread.
-                added = len(_threads_outside_the_test()) - baseline
-                return len(scp._server.active_associations) <= 2 and added <= 4
-
-            await _until(only_the_two_accepted_are_left)  # well inside the 30 s deadline
+            # Every peer over the limit is answered first, so what is counted below is the settled
+            # state, not one read while the last connections still sat in the listen backlog.
             rejected = [await asyncio.to_thread(_closed_within, sock, 0.2) for sock in held]
             assert rejected.count(True) >= 38, "a peer over max_associations was not closed at once"
+
+            def counts() -> tuple[int, int]:
+                added = len(_threads_outside_the_test()) - baseline
+                return len(scp._server.active_associations), added
+
+            # Awaited, not read once: a rejected peer's own connection thread outlives the close
+            # its peer reads by a moment. Measured on Windows: a lone process_request_thread as a
+            # fifth thread. The wait is well inside the 30 s deadline a delayed check would take.
+            try:
+                await _until(lambda: counts()[0] <= 2 and counts()[1] <= 4)
+            except AssertionError:
+                associations, added = counts()
+                raise AssertionError(
+                    f"{associations} associations and {added} threads for two associations"
+                ) from None
         finally:
             for sock in held:
                 sock.close()
@@ -571,10 +580,16 @@ async def test_a_peer_that_never_reads_cannot_block_the_association_for_good(
         # SCP could go on answering for longer than this test waits without a send ever blocking:
         # measured as a red on ubuntu-latest, where the association outlived the 15 s wait below.
         accept = scp._server.get_request
+        shrunk: list[int] = []
 
         def accept_with_a_small_send_buffer() -> tuple[socket.socket, Any]:
             conn, address = accept()
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            except BaseException:
+                conn.close()
+                raise
+            shrunk.append(conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))
             return conn, address
 
         monkeypatch.setattr(scp._server, "get_request", accept_with_a_small_send_buffer)
@@ -586,6 +601,7 @@ async def test_a_peer_that_never_reads_cannot_block_the_association_for_good(
         try:
             sock.sendall(request)
             assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+            assert len(shrunk) == 1, "the SCP did not accept through the patched get_request"
 
             def flood() -> None:
                 # Far more responses than the two socket buffers hold, and none of them read.
