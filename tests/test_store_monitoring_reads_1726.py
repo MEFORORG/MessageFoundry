@@ -33,6 +33,7 @@ import pytest
 from messagefoundry.store import MessageStore, OutboxStatus
 from messagefoundry.store import store as sqlite_store
 from messagefoundry.store.store import _LAST_RECEIVED_SQL, Stage
+from tests._server_schema_rows import pg_live_rows
 
 _INDEX = "ix_messages_received"
 
@@ -460,7 +461,8 @@ class _RecordingPgConn:
         self.args: list[tuple[object, ...]] = []  # each execute's bind arguments, in step
 
     async def fetch(self, sql: str, *args: object) -> list[Any]:
-        return []
+        # The BACKLOG #1720 live-schema reads see what the batch declares; nothing else is there.
+        return pg_live_rows(sql, args)
 
     async def execute(self, sql: str, *args: object, timeout: object = None) -> str:
         self.executed.append((sql, timeout))
@@ -517,6 +519,7 @@ def _pg_schema_store(
     store = postgres.PostgresStore.__new__(postgres.PostgresStore)
     store._settings = SimpleNamespace(  # type: ignore[assignment]
         db_schema=None,
+        database=None,  # named by the BACKLOG #1720 live-schema check
         resolved_schema_management=lambda: SchemaManagement.AUTO,
         schema_lock_timeout=(
             StoreSettings().schema_lock_timeout

@@ -2865,6 +2865,11 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+#: sqlite3's own default. Nothing else writes a snapshot these checks open, the backup's own or an
+#: extracted one, so it never waits.
+_SNAPSHOT_BUSY_TIMEOUT = 5.0
+
+
 def _count_tables(db_path: Path) -> dict[str, int]:
     """Row counts for EVERY table in ``db_path``'s own schema, via a plain read-only sqlite3
     connection (no engine store). The table set is DERIVED from ``sqlite_master`` at count time
@@ -2890,10 +2895,11 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
     ``sqlite_%`` names are excluded: they are sqlite's own bookkeeping (e.g. ``sqlite_sequence`` for
     an ``AUTOINCREMENT`` column), not store data, and are not guaranteed to exist at all until some
-    other operation (a first autoincrement insert, an ``ANALYZE``) creates them."""
-    import sqlite3
+    other operation (a first autoincrement insert, an ``ANALYZE``) creates them.
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    Opened through :func:`connect_readonly`, so a ``#`` or ``?`` in the staging path cannot cut the
+    URI and count an empty stand-in (BACKLOG #2186)."""
+    conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         names = sorted(
             r[0]
@@ -2915,10 +2921,9 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
 
 def _integrity_check(db_path: Path) -> tuple[bool, str]:
-    """``PRAGMA integrity_check`` on a snapshot via a plain read-only sqlite3 connection."""
-    import sqlite3
-
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    """``PRAGMA integrity_check`` on a snapshot, opened through :func:`connect_readonly`, so a ``#``
+    or ``?`` in the staging path cannot cut the URI and check an empty stand-in (BACKLOG #2186)."""
+    conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         results = [str(r[0]) for r in conn.execute("PRAGMA integrity_check")]
     finally:
@@ -3055,10 +3060,6 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
-#: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
-_SNAPSHOT_BUSY_TIMEOUT = 5.0
-
-
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> tuple[str, str, int]:
@@ -3087,8 +3088,6 @@ def _decrypt_check(
     store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
     this pass reads anything.
     """
-    import sqlite3
-
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
     first_blob: str | None = None

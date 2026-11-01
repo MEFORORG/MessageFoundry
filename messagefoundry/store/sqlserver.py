@@ -175,11 +175,13 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
+from messagefoundry.store.schema_verify import IndexShape, SchemaShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
 )
+from messagefoundry.store.server_schema_verify import declared_schema, refuse_short_schema
 from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
@@ -945,6 +947,36 @@ def _applock_timeout_ms(command_timeout: int) -> int:
     applock). The schema lock does not use this: it passes ``[store].schema_lock_timeout`` instead
     (BACKLOG #1726)."""
     return int(command_timeout * 1000) if command_timeout else -1
+
+
+def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
+    """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
+    (ADR 0157 Inc 0: the cluster lease claim/renew).
+
+    pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
+    rounded up could land past the detection margin the clamp was checked against. It never drops
+    below 1, because 0 means no limit at all. A clamp under one second cannot be expressed, and
+    ``ServiceSettings._sqlserver_renew_clamp_whole_seconds`` refuses one at config load. A
+    ``command_timeout`` shorter than the clamp still wins, and ``command_timeout == 0`` (no limit)
+    leaves the clamp as the only bound."""
+    whole = max(1, math.floor(clamp_seconds))
+    return min(whole, command_timeout) if command_timeout > 0 else whole
+
+
+def _restore_statement_timeout(raw: Any, previous: int) -> None:
+    """Put back the statement timeout :meth:`SqlServerStore._statement_timeout` replaced.
+
+    Best-effort: by now the statement has returned, and a renew that committed must not be reported
+    as failed, nor a driver error be replaced, because the restore failed. The next borrow
+    re-applies ``[store].command_timeout`` anyway."""
+    try:
+        raw.timeout = previous
+    except Exception:  # noqa: BLE001 - any driver fault; see the docstring
+        log.warning(
+            "sqlserver: could not restore command_timeout after a clamped statement; the next"
+            " borrow re-applies it",
+            exc_info=True,
+        )
 
 
 def _applock_params(resource: str, timeout_ms: int) -> tuple[Any, ...]:
@@ -2663,13 +2695,77 @@ _SCHEMA: list[str] = [
 ]
 
 
+# The revision of the live-schema check _ensure_schema runs after the batch and before the marker
+# (BACKLOG #1720). That check is Python, so the content hash cannot see it, and a store marked before
+# it existed would take the fast path past it forever. Bump this when the check changes what it
+# refuses. It is NOT for migrations: those still live in _SCHEMA, which moves the hash on its own.
+# 1 (BACKLOG #1720): the check is added.
+_SCHEMA_CHECK_REV = 1
+
+
 def _schema_hash() -> str:
-    """Content hash of the shipped DDL batch. The ``schema_meta`` marker stores it; a match at open
-    means this exact batch already ran, so the batch (and its exclusive applock) is skipped. Any
-    edit to ``_SCHEMA`` — new table, new index, a B10-style guarded migration — changes the hash and
-    forces one full (idempotent) run, so there is no version constant to forget to bump. On-open
-    migrations MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code."""
-    return hashlib.sha256("\n".join(_SCHEMA).encode()).hexdigest()
+    """Content hash of the shipped DDL batch, plus the live-schema check's revision. The
+    ``schema_meta`` marker stores it; a match at open means this exact batch already ran and passed
+    that check, so the batch (and its exclusive applock) is skipped. Any edit to ``_SCHEMA`` — new
+    table, new index, a B10-style guarded migration — changes the hash and forces one full
+    (idempotent) run, so a migration has no version constant to forget to bump. On-open migrations
+    MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code. Only the check,
+    which cannot live there, has ``_SCHEMA_CHECK_REV``."""
+    payload = "\n".join(_SCHEMA) + f"\nschema_check_rev={_SCHEMA_CHECK_REV}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _declared_schema() -> SchemaShape:
+    """What the live-schema check expects: every object the batch declares (BACKLOG #1720)."""
+    return declared_schema(tuple(_SCHEMA))
+
+
+def _object_kind_label(type_desc: object) -> str | None:
+    """``sys.objects.type_desc`` as the compare words it: ``table`` for a user table, the type in
+    lower-case words otherwise, ``None`` where nothing holds the name.
+
+    Through ``_ensure_schema`` a label other than ``table`` cannot reach the refusal: every
+    ``CREATE TABLE`` in the batch is guarded by ``OBJECT_ID('<name>', 'U')``, which skips only a user
+    table, so another kind of object holding the name lets that ``CREATE TABLE`` run and fail with
+    the server's own error before the check reads anything. Kept so the check names such an object
+    should a guard ever stop being type-scoped, rather than reporting the table missing."""
+    if type_desc is None:
+        return None
+    return "table" if type_desc == "USER_TABLE" else str(type_desc).lower().replace("_", " ")
+
+
+def _live_columns_sql(count: int) -> str:
+    """The live columns of ``count`` tables, named as bound parameters (BACKLOG #1720).
+
+    ``OBJECT_ID`` resolves each name the way the batch's unqualified DDL did, in the login's default
+    schema and then ``dbo``. The object's type is read too, so a name held by something other than a
+    user table is named as such. The placeholder list is built from a count, never from a name."""
+    values = ", ".join(["(?)"] * count)
+    return (
+        "SELECT v.name, o.type_desc, c.name"
+        f" FROM (VALUES {values}) AS v(name)"
+        " LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(v.name)"
+        " LEFT JOIN sys.columns AS c ON c.object_id = o.object_id AND o.type = 'U'"
+    )
+
+
+def _live_indexes_sql(count: int) -> str:
+    """The key columns of ``count`` (table, index) pairs, bound as parameters (BACKLOG #1720). An
+    index name is unique only within its table here, so each is looked up on the table the batch
+    declared it on, as its ``INDEXPROPERTY`` guard did. ``key_ordinal`` is 0 for an INCLUDE column.
+    ``INDEXPROPERTY`` also answers for a statistics object of the name, so ``sys.stats`` is read
+    too: a name it holds with no index behind it is taken, and the refusal says by what."""
+    values = ", ".join(["(?, ?)"] * count)
+    return (
+        "SELECT v.idx, i.index_id, i.is_unique, i.has_filter, i.is_disabled, i.is_hypothetical,"
+        " s.stats_id, ic.key_ordinal, c.name, ic.is_descending_key"
+        f" FROM (VALUES {values}) AS v(tbl, idx)"
+        " LEFT JOIN sys.stats AS s ON s.object_id = OBJECT_ID(v.tbl) AND s.name = v.idx"
+        " LEFT JOIN sys.indexes AS i ON i.object_id = OBJECT_ID(v.tbl) AND i.name = v.idx"
+        " LEFT JOIN sys.index_columns AS ic ON ic.object_id = i.object_id"
+        " AND ic.index_id = i.index_id AND ic.key_ordinal > 0"
+        " LEFT JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id"
+    )
 
 
 def check_pinned_certificate(
@@ -4664,6 +4760,11 @@ class SqlServerStore:
                         await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
                         for statement in _SCHEMA:
                             await cur.execute(statement)
+                        # BACKLOG #1720: before the marker, on this cursor and under its lifted
+                        # query timeout. Every guarded CREATE above skips a name that is already
+                        # taken, so only a read of the live catalog can say the batch built what
+                        # the marker is about to record. A refusal rolls the batch back below.
+                        await self._verify_live_schema(cur)
                         await cur.execute("DELETE FROM schema_meta WHERE id=1")
                         await cur.execute(
                             "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, ?, ?)",
@@ -4697,6 +4798,59 @@ class SqlServerStore:
                 if lock_bounded:
                     await self._reset_schema_lock_timeout(conn)
                 raise
+
+    async def _verify_live_schema(self, cur: Any) -> None:
+        """Refuse the open when the live schema lacks a table, column or index the batch declares
+        (BACKLOG #1720). Runs on the batch's own cursor, before the marker.
+
+        Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
+        are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
+        what is not. Reads only."""
+        expected = _declared_schema()
+        tables = sorted(expected.columns)
+        await cur.execute(_live_columns_sql(len(tables)), tables)
+        # Lower-cased, as the DDL reader spells a name for this backend's default collations.
+        column_rows = [
+            (table, _object_kind_label(kind), None if column is None else str(column).lower())
+            for table, kind, column in await cur.fetchall()
+        ]
+        names = sorted(expected.named_indexes)
+        pairs = [v for name in names for v in (expected.named_indexes[name].table, name)]
+        await cur.execute(_live_indexes_sql(len(names)), pairs)
+        taken: dict[str, str] = {}
+        unusable: dict[str, str] = {}
+        found: dict[str, tuple[bool, bool, dict[int, str]]] = {}
+        for row in await cur.fetchall():
+            name, index_id, unique, has_filter, disabled, hypothetical, stats_id = row[:7]
+            ordinal, column, desc = row[7:]
+            if index_id is None:
+                if stats_id is not None:
+                    taken[name] = "statistics object"  # INDEXPROPERTY answered for it
+                continue  # otherwise no index of that name on its table
+            if disabled or hypothetical:
+                # The guard skips either, and neither enforces a key nor serves a read.
+                unusable[name] = "disabled" if disabled else "hypothetical"
+            entry = found.setdefault(name, (bool(unique), bool(has_filter), {}))
+            if ordinal is not None:
+                entry[2][int(ordinal)] = str(column).lower() + (" DESC" if desc else "")
+        indexes = {
+            name: IndexShape(
+                expected.named_indexes[name].table,
+                tuple(keys[k] for k in sorted(keys)),
+                unique,
+                partial,
+            )
+            for name, (unique, partial, keys) in found.items()
+        }
+        refuse_short_schema(
+            self.backend.value,
+            self._settings.database,
+            expected,
+            column_rows,
+            indexes,
+            taken,
+            unusable,
+        )
 
     async def _reset_schema_lock_timeout(self, conn: Any) -> None:
         """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
@@ -5138,10 +5292,17 @@ class SqlServerStore:
         limit, and a rotation's fail-closed revokes run under that lock after it. ``tests/test_store_pool_acquire_timeout.py`` pins which methods reach this borrow."""
         return self._borrow(self._settings.acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR)
 
+    def _acquire_clamped(self, clamp_seconds: float) -> AbstractAsyncContextManager[Any]:
+        """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
+        and ``clamp_seconds``. Only the cluster lease claim/renew borrows this way
+        (:meth:`_fetchone_clamped` says why)."""
+        return self._borrow(min(self._settings.acquire_timeout, clamp_seconds))
+
     @asynccontextmanager
     async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
-        """The body of :meth:`_acquire` and :meth:`_acquire_after_commit`, and the sole place this
-        store borrows from its pool. ``timeout`` is the acquire limit, never ``None``."""
+        """The body of :meth:`_acquire`, :meth:`_acquire_after_commit` and :meth:`_acquire_clamped`,
+        and the sole place this store borrows from its pool. ``timeout`` is the acquire limit, never
+        ``None``."""
         t0 = perf_counter()
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
@@ -5331,15 +5492,71 @@ class SqlServerStore:
                 except Exception:  # noqa: BLE001 - a close failure must not mask the in-flight error
                     log.debug("cursor close on connection release failed", exc_info=True)
 
+    @asynccontextmanager
+    async def _statement_timeout(self, conn: Any, seconds: int | None) -> AsyncIterator[None]:
+        """Run the body with ``seconds`` as this connection's statement timeout, then put back the
+        one :meth:`_borrow` applied (ADR 0157 Inc 0). ``None`` changes nothing.
+
+        Enter it BEFORE :meth:`_cursor`: pyodbc copies ``Connection.timeout`` onto a statement handle
+        when the cursor is created, so a timeout set after that would not bind the statement.
+
+        **A cancellation skips the restore.** The cancelled statement may still be running on an
+        executor thread, and setting the attribute is an ODBC call on the same connection handle
+        (BACKLOG #2049). :meth:`_borrow` quarantines that connection on the same exit, so it is never
+        lent again and the timeout left on it is never read."""
+        if seconds is None:
+            yield
+            return
+        raw = getattr(conn, "_conn", None)
+        if raw is None:
+            log.warning(
+                "sqlserver: cannot reach the raw pyodbc connection to apply a %ds statement"
+                " timeout; the statement runs under [store].command_timeout instead",
+                seconds,
+            )
+            yield
+            return
+        previous = raw.timeout
+        raw.timeout = seconds
+        try:
+            yield
+        except Exception:
+            _restore_statement_timeout(raw, previous)
+            raise
+        _restore_statement_timeout(raw, previous)
+
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        return await self._fetch_rows(sql, params)
+
+    async def _fetch_rows(
+        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+    ) -> list[dict[str, Any]]:
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
+        ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
+        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets both bounds, so
+        neither can be set without the other."""
+        if timeout_clamp is None:
+            borrow, statement_timeout = self._acquire(), None
+        else:
+            # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
+            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow.
+            borrow = self._acquire_clamped(max(1.0, timeout_clamp))
+            statement_timeout = _clamped_statement_timeout(
+                timeout_clamp, self._settings.command_timeout
+            )
+        async with (
+            borrow as conn,
+            self._statement_timeout(conn, statement_timeout),
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute(sql, params) if params else await cur.execute(sql)
                 columns = [c[0] for c in cur.description]
                 rows = await cur.fetchall()
                 # Read-snapshot release, NOT a durable write — commit without counting (A1). This is the
-                # single read helper (_fetchone delegates here); routing every read through _commit was
-                # what made committed_txns a superset of the write cost model on a live SQL Server.
+                # single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here); routing
+                # every read through _commit was what made committed_txns a superset of the write cost
+                # model on a live SQL Server.
                 await self._commit_read(conn)
             except Exception:
                 # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
@@ -5351,6 +5568,29 @@ class SqlServerStore:
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         rows = await self._fetchall(sql, params)
+        return rows[0] if rows else None
+
+    async def _fetchone_clamped(
+        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+    ) -> dict[str, Any] | None:
+        """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
+        claim/renew is its only caller.
+
+        Two windows, each at most the clamp floored at 1 s. The wait for a pooled connection is the
+        smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
+        fence would otherwise still extend the lease after this node self-fenced. The statement's
+        own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
+
+        **Not the Postgres bound.** ``DbCoordinator``'s borrow and statement SHARE one deadline
+        (``pipeline.cluster._call_within``), so its renew is in flight for at most the clamp after
+        it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
+        leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
+        clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
+        clamp alone with the margin. The COMMIT and a ROLLBACK after the statement are calls on the
+        connection, not statements, so neither the clamp nor ``[store].command_timeout`` is known to
+        bound them, by a reading of pyodbc's documentation, not a measurement."""
+        rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
