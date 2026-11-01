@@ -149,7 +149,8 @@ def upsert_code_set(
     codesets_dir = _codesets_dir(config_dir)
     _validate_name(codesets_dir, name)
     path = codesets_dir / f"{name}.csv"
-    codesets_dir.mkdir(parents=True, exist_ok=True)
+    with atomic_edit.refused_as(path, WiringError, "create its directory"):
+        codesets_dir.mkdir(parents=True, exist_ok=True)
     # The existence checks sit inside the lock with the write, so a concurrent create of the same stem
     # cannot pass the check between them.
     with _directory_lock(codesets_dir):
@@ -208,7 +209,8 @@ def rename_code_set(
         # rename is the core operation, so a config that doesn't load leaves the result
         # byte-identical to the pre-#152 shape.
         plan = _plan_code_set_referents(config_dir, old, new)
-        os.replace(src, dest)
+        with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
+            os.replace(src, dest)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
@@ -246,7 +248,8 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
         # (plan-before-move). Best-effort + additive: the delete is the core op, so an unloadable
         # graph yields no referrers.
         dangling = _code_set_referrers(config_dir, name)
-        path.unlink()
+        with atomic_edit.refused_as(path, WiringError, "remove it"):
+            path.unlink()
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling
@@ -393,7 +396,7 @@ def _directory_lock(codesets_dir: Path) -> AbstractContextManager[None]:
     It is the CONFIG directory's lock, the one ``connections_edit`` takes, because the engine's
     flag toggle holds it across two digests of the whole bundle, code sets included. Keyed on
     the directory, never on an operator-supplied name, so no name can steer the lock file."""
-    return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError)
+    return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError, refused_error=WiringError)
 
 
 def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
@@ -601,6 +604,7 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
         new_text.encode("utf-8"),
         validate,
         companions=(_policy_sidecar_path(path),),
+        refused_error=WiringError,
     )
 
 

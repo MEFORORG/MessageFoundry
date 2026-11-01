@@ -31,6 +31,10 @@ runs on an event loop: the engine's one caller already moves the whole write to 
 
 :func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
 ``\n``, and a file written wholly in ``\r\n`` is written back that way rather than reflowed.
+
+:func:`refused_as` turns a refusal from the file system into the editor's own refusal type, for every
+step that leaves the edited file as it was. Each editor names that type, so a root-owned or read-only
+config directory reaches an operator as a refused edit and not as an unhandled ``OSError``.
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ __all__ = [
     "is_candidate_dir_name",
     "lock_path_for",
     "read_text",
+    "refused_as",
     "replace_validated",
 ]
 
@@ -99,6 +104,13 @@ _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 #: disk or a missing directory keeps its own ``OSError``, so it is not reported as a permission.
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
+#: Windows also answers ``EACCES`` when another program holds the file open, and for most of these
+#: steps nothing tells the two apart: ``open`` reports a sharing violation through the C runtime as
+#: bare ``EACCES`` with no ``winerror``, and a replace over a held file reports the same
+#: ``ERROR_ACCESS_DENIED`` as a true denial (both measured on Windows 11). So the wording on Windows
+#: names both causes.
+_WINDOWS = sys.platform == "win32"
+
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
@@ -120,12 +132,16 @@ def is_candidate_dir_name(name: str, *, of: str | None = None) -> bool:
     return match is not None and (of is None or match.group("name") == of)
 
 
-def read_text(path: Path) -> tuple[str, bool]:
+def read_text(
+    path: Path, *, refused_error: Callable[[str], Exception] | None = None
+) -> tuple[str, bool]:
     """``path`` as UTF-8 text with ``\n`` line endings, and whether EVERY line ended ``\r\n``.
 
     A file with mixed endings reads as ``\n``, the editors' own form, rather than being
-    reflowed to ``\r\n`` on the strength of one line."""
-    raw = path.read_bytes()
+    reflowed to ``\r\n`` on the strength of one line. With ``refused_error`` set, a refused read is
+    raised as ``refused_error(message)``, as :func:`refused_as` says."""
+    with refused_as(path, refused_error, "read it"):
+        raw = path.read_bytes()
     crlf = raw.count(b"\r\n")
     return raw.decode("utf-8").replace("\r\n", "\n"), crlf > 0 and crlf == raw.count(b"\n")
 
@@ -158,15 +174,17 @@ def edit_lock(
     if key in held:
         yield
         return
-    # Read-only, because a lock needs only an open handle. Owner-only, like the files it guards:
-    # every edit leaves the edited file 0600, so an account that could not open this lock could
-    # not edit that file either, and root opens a 0600 file regardless. Wider access gains nothing.
+    # Read-write, although nothing is written to it: an NFS client emulates flock with a byte-range
+    # lock, and an exclusive one needs a writable handle or it fails EBADF (flock(2)), so a read-only
+    # handle would fail every edit on NFS. Owner-only, like the files it guards: every edit leaves
+    # the edited file 0600, so an account that could not open this lock could not edit that file
+    # either, and root opens a 0600 file regardless. Wider access gains nothing.
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
-    flags = os.O_RDONLY | os.O_CREAT | _O_BINARY
+    flags = os.O_RDWR | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        with _refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
+        with refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
             fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
         if exc.errno != errno.ELOOP:
@@ -208,18 +226,20 @@ def replace_validated(
     ``path`` and re-restricted to its owner. The private directory is removed either way, and a
     stale one a killed editor of ``path`` left behind is removed first.
 
-    With ``refused_error`` set, a refusal creating or writing the candidate (``EACCES``, ``EPERM`` or
-    ``EROFS``: a root-owned or read-only directory) is raised as ``refused_error(message)``. Only
-    those steps: they run before the replace, so the live file is untouched. An error from the
-    replace onward, and any other ``OSError``, is never converted."""
+    On Windows the replace rides out a momentary hold on either file, such as a virus scanner reading
+    the new candidate. With ``refused_error`` set, a refusal building the candidate or making the
+    replace (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory, or a hold that
+    did not pass) is raised as ``refused_error(message)``. Those steps leave the live file as it
+    was, since a rename that fails has not happened. What follows the replace, any other
+    ``OSError``, and whatever ``validate`` raises are never converted."""
     _remove_stale_candidates(path)
-    with _refused_as(path, refused_error, "create its edit candidate"):
+    with refused_as(path, refused_error, "create its edit candidate"):
         private = Path(
             tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
         )
     try:
         candidate = private / path.name
-        with _refused_as(path, refused_error, "write its edit candidate"):
+        with refused_as(path, refused_error, "write its edit candidate"):
             fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
@@ -228,23 +248,44 @@ def replace_validated(
                 os.fsync(handle.fileno())
         for companion in companions:
             if companion.is_file():
-                shutil.copyfile(companion, private / companion.name)
+                with refused_as(path, refused_error, f"copy {companion.name} to validate it"):
+                    shutil.copyfile(companion, private / companion.name)
         validate(candidate)
-        os.replace(candidate, path)
+        with refused_as(path, refused_error, "replace it with the validated edit"):
+            _replace(candidate, path)
     finally:
         _remove_private_dir(private)
     _fsync_dir(path.parent)
     _secure_file(path)
 
 
+def _replace(candidate: Path, path: Path) -> None:
+    """Rename ``candidate`` over ``path``, riding out a momentary Windows hold on either file.
+
+    Both codes count, because a hold on the candidate answers the sharing violation and a hold on
+    the live file answers access denied (measured on Windows 11, as the minted TLS pair's replace
+    found). So a true denial waits out the short retry before it is reported. Imported here, as
+    :func:`_secure_file` imports its primitive, so this module pulls in no auth code at import."""
+    from messagefoundry.restricted_file import (
+        WINERROR_ACCESS_DENIED,
+        WINERROR_SHARING_VIOLATION,
+        ride_out_a_held_file,
+    )
+
+    ride_out_a_held_file(
+        lambda: os.replace(candidate, path),
+        frozenset({WINERROR_SHARING_VIOLATION, WINERROR_ACCESS_DENIED}),
+    )
+
+
 @contextlib.contextmanager
-def _refused_as(
+def refused_as(
     path: Path, refused_error: Callable[[str], Exception] | None, step: str
 ) -> Iterator[None]:
-    """Raise a refusal (``_REFUSED``) from the body, which does ``step``, as
+    """Raise a refusal (``_REFUSED``) from the body, which does ``step`` to ``path``, as
     ``refused_error(message)``; any other ``OSError``, or any at all when ``refused_error`` is
-    ``None``, propagates unchanged. Only for steps before the replace, when the live file is known
-    to be untouched."""
+    ``None``, propagates unchanged. Only for a step that leaves ``path`` as it was when it fails,
+    because the message says the file was not changed."""
     try:
         yield
     except OSError as exc:
@@ -254,17 +295,24 @@ def _refused_as(
 
 
 def _refusal(path: Path, exc: OSError, step: str) -> str:
-    """The message for an edit of ``path`` the file system refused before anything was written.
+    """The message for an edit of ``path`` the file system refused, which left the file as it was.
 
     It names the file, the step that was refused and the cause, not the directory: it reaches an
     operator through the API, where an absolute host path adds nothing the file name does not. The
-    full error, with the path, is logged."""
+    full error, with the path, is logged. On Windows ``EACCES`` may only mean another program has
+    the file open (``_WINDOWS``), so the cause a second attempt cures comes first."""
     _log.warning("the file system refused an edit of %s: %s", path, exc)
     code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
     reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
+    held = (
+        "Another program may have the file open, such as an editor or a virus scanner, so try "
+        "again once it closes it. If that is not it: "
+        if _WINDOWS and exc.errno == errno.EACCES
+        else ""
+    )
     return (
         f"{path.name} was not changed: the file system would not let this account {step}: "
-        f"{reason}. Its directory is read-only or another account owns it, as a root-owned or "
+        f"{reason}. {held}Its directory is read-only or another account owns it, as a root-owned or "
         "read-only config directory is, or another account owns the file named; change the file "
         "where this account can write it, or as the account that owns it"
     )

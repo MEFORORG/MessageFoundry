@@ -141,7 +141,8 @@ def locked(config_dir: str | Path) -> Iterator[None]:
     wraps the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event
     loop. A holder that does not let go within the timeout raises :class:`WiringError`, and so does a
     directory the file system will not let this account write (root-owned or read-only), which the
-    API answers 409 rather than 500 (vault BACKLOG #3106)."""
+    API answers 409 rather than 500 (vault BACKLOG #3106). A refused read or replace under the lock
+    is a :class:`WiringError` too (vault BACKLOG #3765)."""
     with atomic_edit.edit_lock(
         _path(config_dir), busy_error=WiringError, refused_error=WiringError
     ):
@@ -159,11 +160,16 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     to ISO strings recursively **at this boundary** — deliberately here and NOT via a ``default=``
     hook on the CLI's ``_print_json`` (``__main__.py`` is unchanged), so the CLI, the IDE's
     ``runJson``, and direct Python callers all see the same canonical form. The string form is
-    read-schema-legal on write-back (pydantic re-parses ISO strings — ``ActiveWindow.start``/``end``)."""
+    read-schema-legal on write-back (pydantic re-parses ISO strings — ``ActiveWindow.start``/``end``).
+
+    A file the file system will not let this account read raises :class:`WiringError`: the engine's
+    flag toggle lists before it writes, so this is the first read that toggle makes."""
     path = _path(config_dir)
     if not path.is_file():
         return []
-    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    with atomic_edit.refused_as(path, WiringError, "read it"):
+        text = path.read_text(encoding="utf-8")
+    doc = tomlkit.parse(text)
     out: list[dict[str, Any]] = []
     for direction in ("inbound", "outbound"):
         for table in doc.get(direction, []):
@@ -203,7 +209,11 @@ def upsert_connection(
     _validate_input(obj)
     path = _path(config_dir)
     with locked(config_dir):
-        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
+        original, crlf = (
+            atomic_edit.read_text(path, refused_error=WiringError)
+            if path.is_file()
+            else (None, False)
+        )
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         direction = obj["direction"]
@@ -236,7 +246,7 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
     if not path.is_file():
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
     with locked(config_dir):
-        text, crlf = atomic_edit.read_text(path)
+        text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
         removed = False
@@ -396,6 +406,6 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
         with validating_candidate(config_dir, candidate):
             validate(config_dir)
 
-    # A candidate the file system will not let this account create is a WiringError like any other
-    # refused edit (vault BACKLOG #3106); an error from the replace onward still propagates.
+    # A candidate or a replace the file system refuses is a WiringError like any other refused edit
+    # (vault BACKLOG #3106, #3765). An error after the replace still propagates: the file changed.
     atomic_edit.replace_validated(path, data, check, refused_error=WiringError)
