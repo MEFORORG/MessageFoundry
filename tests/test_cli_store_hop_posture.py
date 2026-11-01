@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #2532: the commands in :data:`_COMMANDS` pass the instance's hop posture to the store.
+"""BACKLOG #2532: the commands in :data:`_COMMANDS` pass the instance's hop posture to the store at
+``enforce``, and none at ``warn``.
 
 ``serve`` and ``provision-admin`` open a server store with the posture ``hop_posture_from_ai`` derives.
-These commands opened it with none. ``admin-revoke-sessions`` (BACKLOG #2614) was written passing
-none too, and takes the posture since its branch merged BACKLOG #2532's change; it is listed here
-so it is held to the same rule. ``None`` is the strict answer for a weakened-TLS check and for
+These commands opened it with none. ``admin-revoke-sessions`` (BACKLOG #2614) follows the same rule
+and is listed with them. ``None`` is the strict answer for a weakened-TLS check and for
 a Vault hop, but not for the PostgreSQL revocation guard, which is a no-op with no posture. So on a
 first deployment at ``enforce`` each of them would have crossed an off-box store hop with no
 revocation check, one ``serve`` itself refuses. At least ``support-bundle`` and ``verify`` still pass

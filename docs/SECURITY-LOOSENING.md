@@ -1411,12 +1411,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   Vault even on a `warn` instance.** That includes at least `support-bundle`, `restore` and
   `restore-verify`. The commands that open the store under BACKLOG #2532, at least `rotate-key`,
   `backup`, `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-set-notify-email`,
-  `admin-reset-totp`, `store attest-transit-bound` / `withdraw-transit-bound` and
-  `admin-revoke-sessions` (BACKLOG #2614, which follows the same rule), pass the
-  instance posture only at `enforce`, where it refuses as no posture does. At `warn` they pass
-  none, so they refuse that Vault there too. That keeps what they did before #2532: no command
-  loosens (Manager decision d20261031T021248404-699a64, under the owner's delegation of
-  2026-10-22).
+  `admin-reset-totp` and `store attest-transit-bound` / `withdraw-transit-bound`, pass the
+  instance posture only at `enforce`, where it refuses as no posture does. So does
+  `admin-revoke-sessions` (BACKLOG #2614), which came later. At `warn` they pass none, so they
+  refuse that Vault there too. For the #2532 commands that keeps what they did before #2532, and
+  `admin-revoke-sessions` has refused that way since it was added: no command loosens (Manager
+  decision d20261031T021248404-699a64, under the owner's delegation of 2026-10-22).
   **`verify` passes no posture to either of its Vault hops, on
   purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
   `warn` instance `verify` dials neither unattested off-box Vault. Its store rows FAIL there,

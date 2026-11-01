@@ -1161,7 +1161,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532), and `_admin_revoke_sessions` (BACKLOG #2614), which does the same and counts below as one of the BACKLOG #2532 commands; at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice and logs it twice), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532), and `_admin_revoke_sessions` (BACKLOG #2614), which does the same and is one of the BACKLOG #2532 commands in the cells to its right; at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice and logs it twice), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
@@ -1210,9 +1210,9 @@ named it as still open, waiting on engine PR 1877.
 - At least `support-bundle` and `verify` would cross an off-loopback PostgreSQL store hop with no
   revocation check on a first deployment, at `enforcement = enforce` too, because they pass no
   posture, no CLI process stamps one, and `RevocationHopGuard` does nothing with neither. `serve`
-  and the commands BACKLOG #2532 covers refuse that hop at `enforce`. #2532 left this open: the
-  fix is a guard that fails closed with no posture, in the store files, rather than another call
-  site.
+  and the commands BACKLOG #2532 covers, `admin-revoke-sessions` among them, refuse that hop at
+  `enforce`. #2532 left this open: the fix is a guard that fails closed with no posture, in the
+  store files, rather than another call site.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 
@@ -4653,8 +4653,15 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) runs
   its own table-wide statement of the same `UPDATE ... OUTPUT` shape, after raising every
   account's epoch in the same transaction, so treat it as having this limit too. That is a
-  reading by likeness to the per-account sweep, not one traced for the table-wide statement, and
-  the lock-order bullet below does not cover its every-account lock footprint. **A missed
+  reading by likeness to the per-account sweep, not one traced for the table-wide statement. It
+  reads the account list under `UPDLOCK, HOLDLOCK`, so no account can be created until it
+  commits, and every account a missed session can belong to has had its epoch raised, but for
+  one whose record fails its seal, which keeps its old epoch. Without those locks, an account
+  created between that read and the sweep would keep its epoch, and a session of it rotated in
+  the instant the sweep runs would stay live with nothing to refuse it.
+  `test_revoke_all_holds_off_a_new_account_until_it_commits`, on the SQL Server leg, checks that
+  an account insert queues behind the revoke. While the revoke runs, account creation waits for
+  it, and the lock-order bullet below does not cover its every-account lock footprint. **A missed
   session is refused the next time it is presented** (BACKLOG #2592), with at least the
   exception below. Each of these raises the account's session epoch in the same transaction,
   and a rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
