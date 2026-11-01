@@ -109,6 +109,15 @@ def test_webconsole_seam_snapshot_matches_golden() -> None:
         raise AssertionError(f"{_FAILURE_HINT}\n\n{diff}")
 
 
+def test_the_golden_is_pinned_to_lf() -> None:
+    """Vault BACKLOG #3746 item 25. Not a shipped path, so it has its own line in `.gitattributes`."""
+    # Imported here so a fault in that module's import-time work cannot stop this gate collecting.
+    from tests.test_shipped_line_endings_pinned import _check_attr
+
+    golden = _GOLDEN.relative_to(_REPO_ROOT).as_posix()
+    assert _check_attr([golden])[golden] == {"text": "auto", "eol": "lf"}
+
+
 def test_console_supports_exactly_the_engine_seam() -> None:
     """The console accepts ONE seam — the engine's (BACKLOG #279, option (b)).
 

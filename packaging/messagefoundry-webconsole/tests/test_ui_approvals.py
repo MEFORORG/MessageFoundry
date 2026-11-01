@@ -30,6 +30,7 @@ from messagefoundry.api.models import (
     ApprovalList,
     PendingApprovalInfo,
     ReleaseBlocked,
+    ReloadResult,
     ResolveOutcome,
 )
 from messagefoundry.auth import Role
@@ -680,14 +681,15 @@ def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:
     assert "anything" not in str(pages.approvals_page(empty, notice="anything"))
 
 
+def _page(result: dict[str, object], operation: str = "connection_purge") -> str:
+    outcome = ApprovalDecisionResult(
+        operation=operation, requested_by="maker", approved_by="checker", result=result
+    )
+    return str(pages.approval_approved(outcome))
+
+
 def test_a_release_that_did_no_work_says_so() -> None:
     # A purge released while its outbound still runs skips, and the request is closed anyway.
-    def _page(result: dict[str, object]) -> str:
-        outcome = ApprovalDecisionResult(
-            operation="connection_purge", requested_by="maker", approved_by="checker", result=result
-        )
-        return str(pages.approval_approved(outcome))
-
     skipped = _page({"cancelled": 0, "skipped": "no such outbound connection: OB"})
     assert "The operation skipped its work: no such outbound connection: OB." in skipped
     degraded = _page({"inbound": 1, "outbound": 1, "degraded": True, "failures": ["audit"]})
@@ -698,6 +700,28 @@ def test_a_release_that_did_no_work_says_so() -> None:
     clean = _page({"requeued": 2})
     assert "skipped its work" not in clean and "follow-on step failed" not in clean
     assert "Restart the engine" not in _page({"inbound": 1, "restart_required": []})
+
+
+def test_a_released_reload_reads_as_the_inline_one_does() -> None:
+    """Vault BACKLOG #3746: the same banners as the reload result page, one per sentence, with a
+    released reload's whole result in the facts except the list its banner already says."""
+    reload = ReloadResult(
+        inbound=1,
+        outbound=2,
+        routers=3,
+        handlers=4,
+        running=True,
+        degraded=True,
+        failures=["audit"],
+        restart_required=["[auth].ad_tls_ca_cert_file"],
+    )
+    released = _page(reload.model_dump(), operation="config_reload")
+    banner = re.compile(r'<p class="banner">(.*?)</p>')
+    assert len(banner.findall(released)) == 2
+    assert banner.findall(released) == banner.findall(str(pages.reload_result(reload)))
+    shown = set(re.findall(r"<td>(\w+)</td><td>", released)) & set(ReloadResult.model_fields)
+    # The banner says the list, in words.
+    assert shown == set(ReloadResult.model_fields) - {"restart_required"}
 
 
 def test_a_bulk_purge_with_a_held_destination_links_to_approvals() -> None:

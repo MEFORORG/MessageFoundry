@@ -347,8 +347,9 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
     return page("Approvals", el("div", *parts, class_="card"), active="approvals")
 
 
-def _shortfall(result: dict[str, object]) -> str | None:
-    """The sentence for a release whose operation returned without doing all of its work, or None.
+def _shortfall(result: dict[str, object]) -> list[str]:
+    """The sentences for a release whose operation returned without doing all of its work, or an
+    empty list.
 
     At least these shapes are known: a purge that skips (``skipped``, for example an outbound still
     running), and a reload that swapped the graph with a follow-on step failed (``degraded``) or
@@ -357,34 +358,37 @@ def _shortfall(result: dict[str, object]) -> str | None:
     success."""
     skipped = result.get("skipped")
     if skipped:
-        return (
+        return [
             f"The operation skipped its work: {skipped}. Nothing was changed, and this request is "
             "closed. Clear the cause, then request the operation again."
-        )
+        ]
     failures, restart = result.get("failures"), result.get("restart_required")
-    sentences = _reload_shortfall(
+    return _reload_shortfall(
         degraded=bool(result.get("degraded")),
         failures=[str(f) for f in failures] if isinstance(failures, list) else [],
         restart_required=[str(s) for s in restart] if isinstance(restart, list) else None,
     )
-    return " ".join(sentences) or None
 
 
 def approval_approved(result: ApprovalDecisionResult) -> Markup:
     """The release outcome, including the operation's own summary (for example ``requeued`` or a
     purge's ``skipped`` reason), which a redirect would drop."""
     summary = result.result or {}
-    shortfall = _shortfall(summary)
     facts: list[list[object]] = [
         ["Operation", result.operation],
         ["Requested by", result.requested_by],
         ["Approved by", result.approved_by or "—"],
     ]
-    facts += [[str(key), str(value)] for key, value in sorted(summary.items())]
+    # restart_required stays out: _shortfall says it in words.
+    facts += [
+        [str(key), str(value)]
+        for key, value in sorted(summary.items())
+        if key != "restart_required"
+    ]
     body = el(
         "div",
         el("h1", "Request approved"),
-        el("p", shortfall, class_="banner") if shortfall else Markup(""),
+        *(el("p", sentence, class_="banner") for sentence in _shortfall(summary)),
         el("p", "The held operation was released. Its own result is below.", class_="muted"),
         rows_table(["", ""], facts, adjustable=False),
         _back(),

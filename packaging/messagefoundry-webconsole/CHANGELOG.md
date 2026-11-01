@@ -39,6 +39,10 @@ this line.**
   cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
 - **A refused start, stop or restart on the dashboard redirects back with a notice.** A 409 or a
   503 from the per-name control routes used to show as raw JSON. (BACKLOG #3746)
+- **A released config reload shows each thing it left undone in its own banner.** The approvals
+  page now matches the configuration page there, and drops the raw `restart_required` row. Its
+  facts gain `routers`, `handlers`, `running` and `dry_run`. The restart banner on both pages says
+  the list is not complete. (vault BACKLOG #3746)
 
 ### Security
 

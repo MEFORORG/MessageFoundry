@@ -37,7 +37,9 @@ from messagefoundry.api.app import (
     _audit_reload_attempt,
     _compare_start_config,
     _record_reload_audit,
+    _reload_result,
 )
+from messagefoundry.api.models import ReloadResult
 from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
@@ -53,8 +55,8 @@ from messagefoundry.config.settings import (
     StoreSettings,
     TlsSettings,
 )
-from messagefoundry.config.wiring import WiringError
-from messagefoundry.pipeline import Engine
+from messagefoundry.config.wiring import Registry, WiringError
+from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
@@ -209,6 +211,35 @@ async def test_config_reload_requires_distinct_second_approver(engine: Engine) -
         out = ok.json()
         assert out["requested_by"] == "admin1" and out["approved_by"] == "admin2"
         assert out["result"]["inbound"] == 1  # the held reload executed on release
+
+
+async def test_a_released_reload_answers_the_whole_inline_shape(engine: Engine) -> None:
+    """A released reload's ``result`` is a dumped ``ReloadResult``, so neither path can drop a field
+    the other reports (vault BACKLOG #3746). Compared whole, as
+    ``test_reload_endpoint_applies_config`` compares the inline one: a hand-copied dict would pass a
+    field-by-field check."""
+    _approval_id, r = await _hold_then_release(engine, await _service(engine), {})
+    assert r.status_code == 200, r.text
+    whole = ReloadResult(
+        inbound=1, outbound=1, routers=1, handlers=1, running=True, restart_required=[]
+    ).model_dump()
+    assert r.json()["result"] == whole
+    rows = await engine.store.list_audit(action="approval.approved")
+    assert json.loads(rows[0]["detail"])["result"] == whole
+
+
+async def test_a_reload_answer_makes_the_preflights_names_text(tmp_path: Path) -> None:
+    """The answer is built after the swap, where a validation error would report a reload that ran
+    as failed (BACKLOG #1940), and the names come from a callback. Text suits every reader."""
+    outcome = ReloadOutcome(
+        registry=Registry(),
+        applied=True,
+        directory=tmp_path,
+        restart_required=cast(tuple[str, ...], (7,)),
+    )
+    engine = cast(Engine, SimpleNamespace(registry_runner=None))
+    answer = _reload_result(engine, outcome, [], dry_run=False)
+    assert answer.restart_required == ["7"]
 
 
 # --- AC-7: release re-executes + audits both identities + the fingerprint -------
