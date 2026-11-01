@@ -419,9 +419,10 @@ def _graph_hops(
     undeployed = {oc.name for oc in registry.outbound.values() if not oc.deployed} | {
         inbound_record_name(ic.name) for ic in registry.inbound.values() if not ic.deployed
     }
-    # The database arm is the shipped reader, reused rather than restated. Every database hop has a
-    # compliant kind: auth='integrated'/'entra' on the SQL Server preset; on generic, a client
-    # certificate through the odbc_params keywords, on a driver that reads them.
+    # The database arm is the shipped reader, reused rather than restated. compliant_kind is True for
+    # every database hop and is not judged per driver: auth='integrated'/'entra' on the SQL Server
+    # preset; on generic, a client certificate on a driver that reads those odbc_params keywords, or
+    # the service's own account.
     out = [
         StaticCredentialHop(name, "static", reason, True)
         for name, reason in static_credential_db_hops(registry)
