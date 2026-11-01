@@ -1917,9 +1917,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   TLS posture, so the posture-keyed weakened-TLS refusal does not apply and TLS is delegated entirely to
   the driver's own keyword. With no such keyword — or with one pinned to a no-TLS value — the rows, and
   the credential in the DSN, may cross in plaintext.
-- **Why a set mode stays a delegation:** the engine cannot tell whether an arbitrary driver's value
-  verifies anything, and a guess-based refusal would break legitimate drivers. The delegation is
-  correct; what was wrong, until #333, was that its only control was a log line.
+- **Why it is a delegation rather than a refusal:** the engine cannot tell whether a keyword's value
+  verifies the peer, and a guess-based refusal would break legitimate drivers. The delegation is correct; what
+  was wrong, until #333, was that its only control was a log line.
 - **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.

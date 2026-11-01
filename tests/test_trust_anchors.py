@@ -1985,11 +1985,16 @@ def test_the_section_the_restart_required_pointers_cite_is_there() -> None:
     assert f"**What a reload's {title}" in text("docs/SECURITY.md")
     for pointer in (
         "docs/CONFIGURATION.md",
+        "ide/src/promoteOutcome.ts",
         "messagefoundry/api/models.py",
         "messagefoundry/pipeline/engine.py",
         "messagefoundry_webconsole/pages/_common.py",
     ):
         assert title in text(pointer), pointer
+    # The two operator-facing pointers name the real heading first, since the title has no anchor.
+    assert "### Outbound TLS trust anchor" in text("docs/SECURITY.md")
+    for pointer in ("ide/src/promoteOutcome.ts", "messagefoundry_webconsole/pages/_common.py"):
+        assert '"Outbound TLS trust anchor"' in text(pointer), pointer
 
 
 # --- QA round two: a blank pin refuses, never reads as no pin (BACKLOG #1142) ----------------------

@@ -111,8 +111,9 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
       "MessageFoundry: restart the engine for [auth].oidc_tls_ca_cert_file, " +
         "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file: this reload checked each changed " +
         `CA file but does not load it, so the engine still trusts the old CA. Promoted ${graph} ` +
-        'The settings list above is not complete: see the section "What a reload\'s ' +
-        'restart_required list covers" of docs/SECURITY.md in the MessageFoundry repository.',
+        'The settings list above is not complete: see the section "Outbound TLS trust anchor" of ' +
+        "docs/SECURITY.md in the MessageFoundry repository, at the paragraph " +
+        '"What a reload\'s restart_required list covers".',
     );
   });
 

@@ -388,12 +388,13 @@ def approval_approved(result: ApprovalDecisionResult) -> Markup:
         ["Requested by", result.requested_by],
         ["Approved by", result.approved_by or "—"],
     ]
-    # restart_required stays out only when _shortfall says it in words.
-    reported = bool(_reported_restart(summary))
+    # restart_required stays out when _shortfall says it in words, and when it is empty: a raw []
+    # would read as "no restart needed", which an empty list does not say (docs/SECURITY.md).
+    hide_restart = summary.get("restart_required") == [] or bool(_reported_restart(summary))
     facts += [
         [str(key), str(value)]
         for key, value in sorted(summary.items())
-        if key != "restart_required" or not reported
+        if key != "restart_required" or not hide_restart
     ]
     body = el(
         "div",
