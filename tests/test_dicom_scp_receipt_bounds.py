@@ -29,6 +29,7 @@ pytest.importorskip("pydicom", reason="DICOM SCP tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
 
 from messagefoundry.transports import dicom as dicom_module  # noqa: E402
+from messagefoundry.transports.receipt import IngressReceipt, receipt_handler  # noqa: E402
 from tests._dicom_sample import make_sr_part10  # noqa: E402
 from tests.test_dicom_scp import _SCP_AE, _build_scp, _scu_cstore  # noqa: E402
 from tests.test_dicom_scp_admission import _LOG, _running_scp, _until, _warnings  # noqa: E402
@@ -436,13 +437,13 @@ async def test_a_peer_that_does_not_wait_for_its_statuses_is_held_back() -> None
     release = asyncio.Event()
     captured: list[bytes] = []
 
-    async def held(data: bytes) -> str | None:
+    async def held(data: bytes) -> IngressReceipt:
         captured.append(data)
         await release.wait()
-        return f"mid-{len(captured)}"
+        return IngressReceipt.accepted(f"mid-{len(captured)}")
 
     scp = _build_scp(captured, timeout_seconds=30.0)
-    await scp.start(held)
+    await scp.start(receipt_handler(held))
     opened: list[Any] = []
     try:
         ds = dcmread(BytesIO(make_sr_part10()))
@@ -673,14 +674,14 @@ async def test_the_scp_refuses_to_run_with_chunked_receipt_on(
         patched.setattr(_config, "STORE_RECV_CHUNKED_DATASET", True)
         scp = _build_scp([])
         with pytest.raises(RuntimeError, match="STORE_RECV_CHUNKED_DATASET is set"):
-            await scp.start(_never_called)
+            await scp.start(receipt_handler(_never_called))
     async with _running_scp({"timeout_seconds": 30.0}) as scp:
         monkeypatch.setattr(_config, "STORE_RECV_CHUNKED_DATASET", True)
         assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (False, None)
         await _until(lambda: scp._refusal_log.refusals == 1)
 
 
-async def _never_called(data: bytes) -> str | None:
+async def _never_called(data: bytes) -> IngressReceipt:
     raise AssertionError("no object should reach the handler")
 
 

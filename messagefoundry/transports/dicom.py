@@ -136,6 +136,12 @@ from messagefoundry.transports.mllp import (
     InsecureHopGuard,
     _MessagePacer,
 )
+from messagefoundry.transports.receipt import (
+    IngressReceipt,
+    ReceiptHandler,
+    RefusalKind,
+    require_receipt,
+)
 
 __all__ = [
     "DicomScpSource",
@@ -1393,7 +1399,7 @@ class DicomScpSource(SourceConnector):
     double-read)."""
 
     #: The C-STORE status must tell a committed object from a refused one, and only the receipt
-    #: handler's ``None`` means "refused" (BACKLOG #1910). See :attr:`SourceConnector.wants_receipt`.
+    #: handler says which, and why (BACKLOG #1910, #2105). See :attr:`SourceConnector.wants_receipt`.
     wants_receipt: ClassVar[bool] = True
 
     def __init__(self, config: Source) -> None:
@@ -1555,7 +1561,8 @@ class DicomScpSource(SourceConnector):
                 "silently, and while connections.toml [[inbound]] tables do accept the key, none of "
                 "their transports is DICOM."
             )
-        self._handler: InboundHandler | None = None
+        #: The runner's receipt handler (``wants_receipt``), never the generic InboundHandler.
+        self._handler: ReceiptHandler | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ae: Any = None
         self._server: Any = None
@@ -1585,11 +1592,17 @@ class DicomScpSource(SourceConnector):
         return min(self._max_object_bytes, _dicom_inflate.DEFAULT_MAX_INFLATED_BYTES)
 
     async def start(
-        self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
+        self,
+        handler: ReceiptHandler | InboundHandler,
+        *,
+        leader_gate: Callable[[], bool] | None = None,
     ) -> None:
         # leader_gate is ignored: a listen source binds its own per-node endpoint, so there is no
         # shared-resource double-read to gate (accepted only so the runner's call is uniform).
-        self._handler = handler
+        # wants_receipt makes the runner pass its receipt handler here (BACKLOG #2105). The parameter
+        # keeps the base class's InboundHandler beside it only so the override stays substitutable;
+        # require_receipt refuses any other handler here, before a single message is accepted.
+        self._handler = require_receipt(handler, source="DICOM SCP source")
         self._stopping.clear()  # a restart must not inherit the previous stop's cut-short signal
         self._tls_failures.open()
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
@@ -2050,14 +2063,15 @@ class DicomScpSource(SourceConnector):
         """Bridge the received bytes onto the loop-owned ingress and block THIS thread until durably
         committed (commit-before-SUCCESS). Returns the DIMSE status.
 
-        The handler returns the committed message id, or ``None`` when it refused the object: it then
-        recorded ``ERROR`` and committed no ingress row. That refusal is a DIMSE failure, never Success
-        (BACKLOG #1910). It is Cannot Understand, the status the decode-failure path already answers for
-        an object the engine will not take, rather than the Out of Resources a commit timeout answers:
-        the refusal is deterministic, so the same object would be refused again on a re-send. A handler
-        that RAISES, or does not answer in time, has committed nothing for a reason that may clear, such
-        as a store that is down, so both answer Out of Resources and the sender re-sends (BACKLOG
-        #2103)."""
+        The handler returns a receipt: the committed message id, or a refusal, when it then recorded
+        ``ERROR`` and committed no ingress row. A refusal is a DIMSE failure, never Success (BACKLOG
+        #1910), mapped in step with the HTTP listener's answer (BACKLOG #2105). A TEMPORARY refusal
+        may clear on a re-send, so it answers Out of Resources, as the HTTP listener answers ``503``. A
+        permanent or over-size one is Cannot Understand, the status the decode-failure path already
+        answers for an object the engine will not take: the same object would be refused again. A
+        handler that RAISES, or does not answer in time, has committed nothing for a reason that may
+        clear, such as a store that is down, so both answer Out of Resources and the sender re-sends
+        (BACKLOG #2103)."""
         loop, handler = self._loop, self._handler
         if loop is None or handler is None:  # never started
             return _STATUS_OUT_OF_RESOURCES
@@ -2072,9 +2086,9 @@ class DicomScpSource(SourceConnector):
                 sop_instance,
             )
             return _STATUS_OUT_OF_RESOURCES
-        # The runner's receipt handler is an async def (a Coroutine), but InboundHandler is typed as the
+        # The runner's receipt handler is an async def (a Coroutine), but ReceiptHandler is typed as the
         # Awaitable; run_coroutine_threadsafe needs a Coroutine, so narrow it.
-        coro = cast("Coroutine[Any, Any, str | None]", handler(object_bytes))
+        coro = cast("Coroutine[Any, Any, IngressReceipt]", handler(object_bytes))
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError as exc:
@@ -2109,13 +2123,17 @@ class DicomScpSource(SourceConnector):
                 safe_exc(exc),
             )
             return _STATUS_OUT_OF_RESOURCES
-        if receipt is None:
+        if receipt.refusal is not None:
             logger.warning(
-                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR, "
+                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR %s (%s), "
                 "returning failure",
                 peer_ip,
                 sop_instance,
+                receipt.message_id,
+                receipt.refusal.value,
             )
+            if receipt.refusal is RefusalKind.TEMPORARY:
+                return _STATUS_OUT_OF_RESOURCES
             return _STATUS_CANNOT_UNDERSTAND
         logger.info(
             "DICOM C-STORE accepted from %s (SOP class %s, instance %s)",

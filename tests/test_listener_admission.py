@@ -40,6 +40,7 @@ from messagefoundry.transports.mllp import (
     MLLPSource,
     build_ack,
 )
+from messagefoundry.transports.receipt import receipt_handler
 from messagefoundry.transports.tcp import TcpSource
 from messagefoundry.transports.x12 import X12Source
 from tests.test_x12_transport import _interchange
@@ -105,7 +106,7 @@ async def _run(
     body: Callable[[int], Awaitable[None]],
     handler: Callable[[bytes], Awaitable[str | None]] = _reply_handler,
 ) -> None:
-    await source.start(handler)
+    await source.start(receipt_handler(handler))
     try:
         await body(source.sockport)  # type: ignore[attr-defined]
     finally:

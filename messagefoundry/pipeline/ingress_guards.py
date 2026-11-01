@@ -81,6 +81,7 @@ __all__ = [
     "IngressGuardError",
     "IngressMultipleMessagesRejected",
     "IngressNulRejected",
+    "IngressTooLarge",
     "admit_resubmission",
     "admit_resubmitted_body",
     "carry_binary_ingress",
@@ -244,11 +245,19 @@ def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
     return ingress_size_error(len(body))
 
 
+class IngressTooLarge(IngressGuardError):
+    """The ``size``-phase refusal of a body over the engine ceiling, told apart by its type so a
+    receipt source can answer it as over-size (BACKLOG #2105) without matching the phase text."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, phase="size")
+
+
 def _raise_if_oversize(size: int) -> None:
     """Raise the ``size``-phase refusal when :func:`ingress_size_error` reports an overrun."""
     oversize = ingress_size_error(size)
     if oversize is not None:
-        raise IngressGuardError(oversize, phase="size")
+        raise IngressTooLarge(oversize)
 
 
 def store_safe_raw(raw: str | bytes, content_type: str, *, text: str | None = None) -> str:
