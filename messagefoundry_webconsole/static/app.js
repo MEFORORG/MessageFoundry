@@ -201,6 +201,7 @@
     var select = toolbar.querySelector("[data-mf-conns-action]");
     var applyBtn = toolbar.querySelector("[data-mf-conns-apply]");
     var feedback = toolbar.querySelector("[data-mf-conns-feedback]");
+    var flaggedOnly = document.querySelector("[data-mf-conns-flagged]"); // un-polled, as toolbar is
     var selected = new Set(); // keyed by checkbox .value (the stable _row_key)
 
     function rowCheckboxes() {
@@ -296,14 +297,14 @@
       if (applyBtn) applyBtn.disabled = eligible < 1;
     }
 
-    // Whether select-all takes this row. It takes the VISIBLE rows only (offsetParent is null for a
-    // display:none row), so the operator never sweeps in — and then Stop/Restart/Reset — connections
-    // they can't see. A failed flag read leaves every row on screen under Flagged only, and none of
-    // them is known to be flagged, so one transient error must not widen a selection scoped to
-    // flagged rows to every connection. The operator can still tick such a row by hand.
+    // Whether select-all takes this row. It takes the VISIBLE rows only, so the operator never sweeps
+    // in — and then Stop/Restart/Reset — connections they can't see. The row's own style, not
+    // offsetParent, because this runs on every swap and a layout read would force a table layout. A
+    // failed flag read leaves every row on screen under Flagged only, and none of them is known to
+    // be flagged, so one transient error must not widen a selection scoped to flagged rows to every
+    // connection. The operator can still tick such a row by hand.
     function selectAllTakes(cb) {
-      if (cb.offsetParent === null) return false;
-      var flaggedOnly = document.querySelector("[data-mf-conns-flagged]");
+      if (cb.closest("tr").style.display === "none") return false;
       return !(flaggedOnly && flaggedOnly.checked) || cb.getAttribute("data-flagged") === "1";
     }
 

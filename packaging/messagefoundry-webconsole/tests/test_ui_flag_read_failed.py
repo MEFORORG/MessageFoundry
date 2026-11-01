@@ -35,7 +35,7 @@ _NODE = shutil.which("node")
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
-const [appPath, valuesJson, flaggedOnlyJson, stepsJson, query] = process.argv.slice(2);
+const [appPath, valuesJson, flaggedOnlyJson, stepsJson] = process.argv.slice(2);
 const makeRows = () => JSON.parse(valuesJson).map((value) => {
   const row = { value, style: {}, textContent: `row ${value}` };
   row.cb = {
@@ -43,7 +43,7 @@ const makeRows = () => JSON.parse(valuesJson).map((value) => {
     checked: false,
     getAttribute(name) { return name === "data-flagged" ? value : null; },
     hasAttribute(name) { return name === "data-mf-conns-cb"; },
-    get offsetParent() { return row.style.display === "none" ? null : row; },
+    closest() { return row; },
   };
   row.querySelector = () => row.cb;
   return row;
@@ -63,7 +63,7 @@ const poll = {
   addEventListener(type, fn) { listeners[type] = fn; },
   dispatchEvent(event) { listeners[event.type]?.(event); },
 };
-const input = { value: query, addEventListener(_type, fn) { input.onInput = fn; } };
+const input = { value: "", addEventListener(_type, fn) { input.onInput = fn; } };
 const flaggedOnly = { checked: JSON.parse(flaggedOnlyJson), addEventListener() {} };
 const toolbar = { querySelector() { return null; } };
 const hooks = {
@@ -139,6 +139,8 @@ def _run_app_js(
     steps: tuple[str | dict[str, str], ...] = ("click",),
     query: str = "",
 ) -> dict[str, Any]:
+    if query:
+        steps = ({"query": query}, *steps)
     harness = tmp_path / "harness.js"
     harness.write_text(_HARNESS, encoding="utf-8")
     assert _NODE is not None
@@ -150,7 +152,6 @@ def _run_app_js(
             json.dumps(values),
             json.dumps(flagged_only),
             json.dumps(steps),
-            query,
         ],
         capture_output=True,
         text=True,
