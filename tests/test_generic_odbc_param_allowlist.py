@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The generic ODBC dialect's keyword lists cover keywords only (vault BACKLOG #2577).
 
-``[egress].allowed_db`` reads the host from the ``server`` setting, so no listed keyword names the
-connection target. The lists rely on at least the driver reading the ``}}`` escape in a braced
+``[egress].allowed_db`` reads the host from the ``server`` setting, so no listed keyword is one the
+engine knows to name a host. The lists rely on at least the driver reading the ``}}`` escape in a braced
 password and reading ``SERVER`` as its target (docs/CONNECTIONS.md, *Accepted ``odbc_params``
 keywords*). The generic dialect also takes free driver keywords in ``odbc_params``, and the name of
 the keyword each credential is sent under. Those are the other places a keyword can come from, so
