@@ -2940,9 +2940,9 @@ def test_a_wrapper_and_a_statement_are_judged_disabled_by_one_rule(value: str) -
 
 @pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
 def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(pair: str) -> None:
-    """Flattened, an empty disabled wrapper left nothing between a construct and a sibling branch.
-    As one disabled step it must not orphan the branch either, and the branch's send stays under
-    its dead condition. The control is the same wrapper live, holding nothing."""
+    """A disabled wrapper holding a step that runs nothing leaves nothing between a construct and
+    a sibling branch, so it must not orphan the branch, and the branch's send stays under its dead
+    condition. The control is the same wrapper live, holding nothing."""
     construct, branch = _SIBLING_BRANCHES[pair]
     for wrapper in ('<List Disabled="1"><Line Data="MsgLog %ADT"/></List>', "<List/>"):
         src = _handler_body(_handler_source(construct + wrapper + _sibling_arm(branch)))
@@ -2953,8 +2953,9 @@ def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(p
 
 # A bare branch marker inside a disabled wrapper, in a construct's own list. Flattened, the marker
 # opened its branch, and the steps after the wrapper ran in it: in an ``except``, or under a dead
-# arm. Commented out whole, it opens nothing, and those steps landed in the ``try`` body or the
-# ChooseFrom pre-arm, where they run for every message. Code review of this change, round 3.
+# arm. Commented out as one step, it would open nothing, and those steps would land in the ``try``
+# body or the ChooseFrom pre-arm, where they run for every message. Code review of this change,
+# round 3. The marker still opens its branch, and the branch fails closed (:func:`_switch_off`).
 _MARKER_CONSTRUCTS = {
     "try-catch": ("<Try><List>{x}</List></Try>", '<Line Data="Catch"/>'),
     "case-matching": (
@@ -3015,29 +3016,31 @@ def test_a_marker_switched_off_in_a_wrapper_leaves_the_steps_after_it_dead(
     assert _ORPHAN not in live
 
 
-def test_a_switched_off_marker_seals_only_up_to_the_next_marker() -> None:
-    """A marker after the wrapper opens its own branch as before, and a wrapper followed by steps
-    that run nothing seals nothing."""
+def test_a_switched_off_catch_closes_every_catch_after_it(tmp_path: Path) -> None:
+    """Main rendered both ``Catch`` branches as ``except Exception:``, so the second one never ran:
+    the first caught everything. With the first switched off, the second left in place would
+    catch what the first caught, where on main it never ran. So it fails closed too, and the
+    ``try`` has no handler left: a raise in it re-raises. A wrapper followed only by steps that
+    run nothing leaves the marker holding live steps, so it is an orphan too; one whose marker
+    holds nothing live is one disabled step."""
     second = '<Line Data="MsgSend %ADT [OB_TWO]"/>'
     body = (
         f'<Try><List><List Disabled="1"><Line Data="Catch"/></List>{_AFTER_THE_WRAPPER}'
         f'<Line Data="Catch"/>{second}</List></Try>'
     )
     handler = _handler_body(_handler_source(body))
-    assert f"# TODO: Corepoint Catch {_ORPHAN}" in _enclosing(handler, "OB_FLAT")
-    assert _enclosing(handler, "OB_TWO").startswith(
-        "    except Exception:  # TODO: Corepoint Catch"
-    )
+    assert "its marker is in a @Disabled List" in _enclosing(handler, "OB_FLAT")
+    closed = _enclosing(handler, "OB_TWO")
+    assert closed.startswith(f"    if False:  # TODO: Corepoint Catch {_ORPHAN}")
+    assert "a Catch before it on this Try is in a @Disabled List" in closed
+    assert "    except Exception:  # TODO: Corepoint Try with no Catch" in handler
+    assert _run_handler(tmp_path, body) == []
     off = '<List Disabled="1"><Line Data="Catch"/></List>'
-    for after in ('<Line Data="MsgLog %ADT"/>', '<Line Disabled="1" Data="If (b)"><List/></Line>'):
-        quiet = _handler_body(_handler_source(f"<Try><List>{off}{after}</List></Try>"))
-        assert _ORPHAN not in quiet, after
-    # Two such wrappers: each seals its own run, under its own marker.
-    two = f"<Try><List>{off}{_CLEAR}{off}{second}</List></Try>"
-    handler = _handler_body(_handler_source(two))
-    first, last = _enclosing(handler, "PID-19"), _enclosing(handler, "OB_TWO")
-    assert f"# TODO: Corepoint Catch {_ORPHAN}" in first and first == last
-    assert handler.count(first) == 2
+    quiet = _handler_body(_handler_source(f"<Try><List>{off}</List></Try>"))
+    assert _ORPHAN not in quiet
+    assert [
+        line for line in quiet.splitlines() if line.lstrip().startswith("#") and "Catch:" in line
+    ]
 
 
 def test_no_branch_is_adopted_across_a_switched_off_marker(tmp_path: Path) -> None:
@@ -3059,7 +3062,7 @@ def test_no_branch_is_adopted_across_a_switched_off_marker(tmp_path: Path) -> No
     assert _run_handler(tmp_path, body) == []
 
 
-def test_a_disabled_statement_named_like_a_wrapper_seals_nothing() -> None:
+def test_a_disabled_statement_named_like_a_wrapper_closes_nothing() -> None:
     """Only a ``<List>``/``<Actions>`` wrapper was flattened. A disabled ``<Line>`` whose verb
     reads ``List`` never was, so a marker under it opened nothing on main, and the step after it
     stays live in the ``try`` body. Code review of this change, round 4."""
@@ -3083,17 +3086,17 @@ _FOR = "    for _item in []:"
         pytest.param(_LOOP, _FOR, id="else-in-a-loop"),
     ],
 )
-def test_a_stray_switched_off_marker_seals_its_run_too(template: str, opener: str) -> None:
+def test_a_stray_switched_off_marker_fails_closed_too(template: str, opener: str) -> None:
     """A construct that cannot continue the marker made its branch a stray on main, inlined after
     the construct. Left in a ``try:`` body, a raise in those steps would send the message to the
     ``Catch``, where on main it reached none, so the ``Catch`` would run more often. They fail
     closed, as in a construct that renders the marker: under the orphan's dead placeholder,
-    inside the construct. In a loop its body was dead already. Code review of this change,
-    rounds 5 and 7."""
+    after the construct, where main inlined them. Code review of this change, rounds 5 and 7."""
     off = '<List Disabled="1"><Line Data="Else"/></List>'
     handler = _handler_body(_handler_source(template.replace("{x}", off + _AFTER_THE_WRAPPER)))
     dead = _enclosing(handler, "OB_FLAT")
-    assert dead.startswith(f"        if False:  # TODO: Corepoint Else {_ORPHAN}")
+    # After the construct, where main inlined the stray, and under the dead placeholder.
+    assert dead.startswith(f"    if False:  # TODO: Corepoint Else {_ORPHAN}")
     assert _enclosing(handler, "PID-19") == dead
     assert any(line.startswith(opener) for line in handler.splitlines())
 
@@ -3140,8 +3143,9 @@ def test_a_switched_off_marker_at_the_handlers_own_level_changes_nothing() -> No
 
 
 # A disabled wrapper never moves a live step. Main flattened it, so every test of where a step
-# lands saw the statements it held, or nothing where it held none. Commented out whole, it is one
-# step, and each such test now reads it as main did. Code review of this change, round 6.
+# lands saw the statements it held, or nothing where it held none. It is still flattened, so each
+# such test reads it as main did, and only what it held is commented out. Code review of this
+# change, round 6.
 _HOLLOW_BODIES = {
     "empty": '<List Disabled="1"/>',
     "label-marker": '<List Disabled="1"><List Data="MsgLog %ADT"/></List>',
@@ -3183,12 +3187,13 @@ def test_a_marker_whose_body_main_flattened_bare_still_opens_its_branch(
     """A branch marker whose own body is a disabled wrapper main flattened to label markers, to
     nothing, or to bare markers it split off, held no statement on main, so it opened its branch
     and the steps after it ran there. They run there still, under the dead condition or in the
-    ``except``, with the wrapper commented out at the head of the branch."""
+    ``except``, with what the wrapper held commented out at the head of the branch. A wrapper
+    that held nothing renders nothing, as on main."""
     opener = _HOLLOW_CONSTRUCTS[construct][2]
     body = _marker_over(construct, _HOLLOW_BODIES[hollow])
     src = _handler_source(body)
     handler = _handler_body(src)
-    assert "# DISABLED in Corepoint (@Disabled)" in handler
+    assert ("# DISABLED in Corepoint (@Disabled)" in handler) is ("empty" not in hollow)
     assert _enclosing(handler, "OB_FLAT").startswith(opener)
     assert _enclosing(handler, "PID-19").startswith(opener)
     assert _ORPHAN not in handler
@@ -3319,7 +3324,7 @@ def test_a_marker_closed_by_a_switched_off_construct_keeps_its_counted_todos() -
         pytest.param('<Line Data="If (a)"><List>{x}</List></Line>', id="in-an-if"),
     ],
 )
-def test_a_marker_switched_off_in_a_branch_markers_own_list_seals_its_run(template: str) -> None:
+def test_a_marker_switched_off_in_a_branch_markers_own_list_fails_closed(template: str) -> None:
     """In a branch marker's own list, main split the steps after a switched-off bare marker off
     into a branch of that branch, which no render emits. Left in the marker's body, they would
     run wherever the marker's branch runs: after a loop or a ``try``, as a stray, for every
@@ -3335,7 +3340,7 @@ def test_a_marker_switched_off_in_a_branch_markers_own_list_seals_its_run(templa
     ast.parse(src)
 
 
-def test_a_sibling_branchs_own_switched_off_marker_seals_its_run() -> None:
+def test_a_sibling_branchs_own_switched_off_marker_fails_closed() -> None:
     """The same in the list of a branch written beside its construct: the steps after the
     switched-off marker no longer run in the ``except``. Code review of this change, round 7."""
     body = (
