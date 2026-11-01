@@ -55,6 +55,7 @@ from messagefoundry.transports.admission import (
     remove_refusal_observer,
 )
 from messagefoundry.transports.dicom import DicomScpSource
+from messagefoundry.transports.receipt import receipt_handler
 
 
 class _Sink(LoggingAlertSink):
@@ -918,7 +919,7 @@ async def test_a_dicom_refusal_at_a_connection_cap_reaches_the_refusal_observers
     async def handler(_data: bytes) -> str | None:
         return None
 
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         server = cast(Any, scp._server)
         server._take_slot = lambda _host: "the pending-connection cap is full"
@@ -969,7 +970,7 @@ async def test_a_dicom_max_associations_rejection_reaches_the_refusal_observers(
     async def handler(_data: bytes) -> str | None:
         return None
 
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     add_refusal_observer(seen.append)
     held: Any = None
     try:
