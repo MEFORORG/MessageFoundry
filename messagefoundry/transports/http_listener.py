@@ -1515,8 +1515,9 @@ class HttpSource(SourceConnector):
                 if receipt.refusal is RefusalKind.TEMPORARY
                 else None
             )
-            # ``refused_message_id``, never ``message_id``: that key means a committed message on
-            # every other answer this listener writes, so a refusal must not read as one.
+            # ``refused_message_id``, never ``message_id``: where this listener's own answer carries
+            # ``message_id``, it names a committed message, so a refusal must not read as one. A
+            # proxied reply_from 200 or 502 carries the partner's own bytes, which may hold its own.
             refused = json.dumps({"error": _NOT_ACCEPTED, "refused_message_id": message_id})
             await self._respond(
                 writer,

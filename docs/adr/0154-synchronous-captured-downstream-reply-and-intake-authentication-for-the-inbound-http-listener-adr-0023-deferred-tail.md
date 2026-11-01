@@ -1463,9 +1463,11 @@ that a temporary refusal, should a binary path ever produce one, is answered as 
 `Retry-After` is 5 seconds, from the module constant `TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS` in
 [`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py). Every answer to a
 refused body is `{"error": "message was not accepted", "refused_message_id": "<id>"}`, where the id is
-the `ERROR` row the runner wrote before it answered. The key is not `message_id`, which on every other
-answer names a committed message, so a refusal cannot be read as an acceptance (Lander decision
-d20261101T013132231-ef9540, under the owner's delegation). An operator can match a refusal to its row
+the `ERROR` row the runner wrote before it answered. The key is not `message_id`, which, where this
+listener's own answer carries it, names a committed message, so a refusal cannot be read as an
+acceptance. A proxied `reply_from` `200` or `502` answer carries the partner's own bytes, which may hold
+a `message_id` of the partner's (Lander decision d20261101T013132231-ef9540, decided under the owner's
+delegation of 2026-11-01). An operator can match a refusal to its row
 by id rather than by time and peer, and that row's error text opens with `[refusal kind: <kind>]`,
 ahead of any refused-body allowance note, so the kind is known before anyone resends the row. The `HL7MessageTooLarge` type the parse raises for an over-size body is
 named in that row's stored reason, where `HL7PeekError` was before.
@@ -1493,13 +1495,14 @@ its own `RetryPolicy` sets the delay, and a temporary refusal that never clears 
 
 **What did not change.** Count-and-log: the `ERROR` row is still written before the answer. Each
 refused attempt is its own row, so a temporary refusal re-sent until it is accepted leaves one `ERROR`
-row per refused attempt beside the accepted one. The kind is not stored on the row; its `error` text
-names the in-flight budget. The
+row per refused attempt beside the accepted one. Each of those rows names its kind in the
+`[refusal kind: <kind>]` tag its `error` text opens with, as above, and its reason names the in-flight
+budget. The
 pre-ingress refusals, the `202` on a committed body, and the `closed` connection event after a refusal
 are unchanged. The refusal still emits no `connection_event` kind of its own.
 
 **Where the original text stays.** D5's note and AC-8 keep their wording, each with a second dated
 italic note in place. AC-8's second test,
 `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, now pins
-the `message_id` in its exact body and carries only permanent causes. Its over-ceiling case moved to
+the `refused_message_id` in its exact body and carries only permanent causes. Its over-ceiling case moved to
 `tests/test_ingress_refusal_kinds.py`, which pins each kind with a control.
