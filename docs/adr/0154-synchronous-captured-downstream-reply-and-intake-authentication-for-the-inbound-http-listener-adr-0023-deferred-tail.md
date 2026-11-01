@@ -1506,3 +1506,12 @@ italic note in place. AC-8's second test,
 `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, now pins
 the `refused_message_id` in its exact body and carries only permanent causes. Its over-ceiling case moved to
 `tests/test_ingress_refusal_kinds.py`, which pins each kind with a control.
+
+*(Note 2026-11-01, BACKLOG #2431, added when batch 469 merged `main`: this amendment's decision did
+not cover it. One decode failure is temporary, not permanent: an inbound `encoding` naming no text
+codec. It refuses every body until an operator fixes the name, so the same body is accepted after,
+and it is the receipt form of the MLLP listener's `AE` for the same case. `Http()` answers it `503`
+with `Retry-After`, and its `ERROR` row's reason names the decode, not the in-flight budget. A DICOM
+object is never decoded, so the SCP never sees it. A decode failure in a usable charset stays
+permanent. A sender that honours `Retry-After` re-sends every 5 seconds until the name is fixed,
+leaving one `ERROR` row per attempt.)*

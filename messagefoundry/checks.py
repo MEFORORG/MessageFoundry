@@ -1707,7 +1707,9 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
     # problems. Three populations, never collapsed into two — a literal probed here; an env() ref
     # DEFERRED to the `build-check` line, which resolves it against this environment; and one left
     # UNCHECKED on every path because its connection is not deployed, whose env() values ADR 0111
-    # forbids resolving anywhere. A census that folded the last two would read as a clean pass over
+    # forbids resolving anywhere. An env() ref on an INBOUND connection is in neither of the last two:
+    # validate refuses it above (BACKLOG #2431), so a config reaching this line holds none.
+    # A census that folded the last two would read as a clean pass over
     # values nothing had looked at, which is the false-green this line exists to prevent.
     # load_config here rather than a second return value out of validate_config, matching the sibling
     # checks above; the config is known to load, since every error diagnostic returned already.

@@ -728,14 +728,17 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 `ERROR`, so it is counted and never silently dropped, and the answer's body names that row:
 `{"error": "message was not accepted", "refused_message_id": "<id>"}`. The status says whether to re-send:
 
-- **`503`** with `Retry-After` when the refusal is temporary, the engine's own and expected to clear.
-  Only the streaming detach's in-flight budget, while other detaches hold it, is classed so; re-send
-  the same body later. A body larger than that whole budget is over-size instead.
+- **`503`** with `Retry-After` when the refusal is temporary: the engine's own, not the body's.
+  At least two refusals are classed so: the streaming detach's in-flight budget, while other
+  detaches hold it, and an inbound `encoding` naming no text codec, which refuses every body until
+  an operator fixes the name (BACKLOG #2431), so a sender re-sending every few seconds meanwhile
+  leaves one `ERROR` row per attempt. Re-send the same body later. A body larger than that whole
+  budget is over-size instead.
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
   with `max_message_bytes`.
 - **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
-  body the engine cannot decode, one that does not match the declared `content_type`, or an HL7 parse
+  body the engine cannot decode in a usable charset, one that does not match the declared `content_type`, or an HL7 parse
   or strict-validation failure. A strict-validation timeout is one too, deliberately: even one caused
   by load answers `422` and is final. BACKLOG #2105's filing listed that timeout as temporary; it is
   reclassified as permanent.
@@ -746,6 +749,8 @@ the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-
 The owner ruling of 2026-09-26 answered a refused body `422`. The owner ruling of 2026-09-30 set a
 temporary refusal at `503` with `Retry-After` and kept a permanent one at `422`; which refusals are
 temporary, and the one `413` for over-size, are Manager decision d20261030T155119571-255c98. The
+unusable codec name joined the temporary class later, under BACKLOG #2431, and was not part of that
+decision. The
 `ERROR` row's error text opens with `[refusal kind: <kind>]`, ahead of any refused-body allowance note.
 A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
