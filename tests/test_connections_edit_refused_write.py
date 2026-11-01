@@ -1170,7 +1170,7 @@ def test_a_momentary_hold_on_the_replace_is_ridden_out(
     connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)
 
     assert refusals == []
-    assert "flagged" in path.read_text(encoding="utf-8")
+    assert "deployed = false" in path.read_text(encoding="utf-8")
 
 
 def test_a_code_set_rename_and_remove_ride_out_a_momentary_hold(
@@ -1293,7 +1293,7 @@ def test_a_real_hold_that_lets_go_inside_the_retry_lets_the_edit_land(
         holder.close()
 
     assert len(refused) == 1
-    assert "flagged" in path.read_text(encoding="utf-8")
+    assert "deployed = false" in path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.ENOENT], ids=["disk-full", "missing"])

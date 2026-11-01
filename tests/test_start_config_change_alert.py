@@ -1375,7 +1375,7 @@ def test_the_detail_leads_with_a_marker_and_still_fits_the_reason_column(marker:
     detail = _long_node_detail(marker)
     assert len(detail) <= 200
     assert detail.startswith(f"{marker}: baseline 2026-10-04T00:00:00+00:00 on node hhh")
-    assert ":4194304:abcdef12 (connection_flag_set)" in detail
+    assert ":4194304:abcdef12 (config_reload)" in detail
     assert detail.endswith("baseline config bbbbbbbbbbbb")
 
 
