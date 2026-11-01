@@ -27,6 +27,7 @@ from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
     auto_bounded_windows,
     evaluate_retention_gate,
+    judge_keep_forever_overrides,
     keep_forever_overrides,
     make_retention_override_guard,
 )
@@ -179,13 +180,10 @@ def test_a_graph_with_no_keep_forever_override_is_silent(
     assert _guard_records(caplog) == []
 
 
-def _configuration_doc() -> str:
-    return (_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
-
-
 def _override_note() -> list[str]:
     """The *Per-connection overrides* blockquote, unquoted, one entry per paragraph or bullet."""
-    quoted = blockquote_lines(_configuration_doc(), "**Per-connection overrides (")
+    doc = (_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+    quoted = blockquote_lines(doc, "**Per-connection overrides (")
     text = "\n".join(line.removeprefix(">").strip() for line in quoted)
     # A wrapped line joins the one above it, so a phrase is found wherever the doc wraps it.
     return [entry.replace("\n", " ") for entry in re.split(r"\n\n|\n(?=- )", text)]
@@ -194,7 +192,7 @@ def _override_note() -> list[str]:
 def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Each bullet is read beside the arm it describes, so a change to either side reds here."""
+    """Each bullet is read beside the arm it describes. At least the phrases below are bound."""
     enforce, warn, acknowledged = [e for e in _override_note() if e.startswith("- ")]
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
 
@@ -204,7 +202,7 @@ def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
         _guard(acknowledged=False, enforcing=True)(registry)
 
     assert warn.startswith("- Without it, under `warn`, the gate passes the graph")
-    assert "those bodies are kept forever" in warn
+    assert "with the remedy" in warn and "those bodies are kept forever" in warn
     assert acknowledged.startswith("- With it, the gate passes the graph")
     for bullet, ack in ((warn, False), (acknowledged, True)):
         assert "logs a WARNING-level `AUDIT:` line naming each connection" in bullet
@@ -212,7 +210,29 @@ def test_the_configuration_doc_states_what_each_arm_of_the_guard_does(
         with caplog.at_level(logging.WARNING, logger=_LOG.name):
             _guard(acknowledged=ack, enforcing=False)(registry)
         (record,) = _guard_records(caplog)
-        assert record.getMessage().startswith("AUDIT:")
+        assert record.getMessage().startswith("AUDIT:") and "IB_FEED" in record.getMessage()
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_the_audit_line_names_no_environment_when_none_is_active(
+    tmp_path: Path, acknowledged: bool
+) -> None:
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=False, env_name=None
+    )
+    assert verdict.report is not None and "(environment" not in verdict.report
+
+
+def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:
+    # Under warn a global 0 passes the start gate. Inheriting it keeps the bodies forever with the
+    # line gone, so removing the override is the remedy only where the global window is bounded.
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=False, enforcing=False, env_name="prod"
+    )
+    assert verdict.report is not None
+    assert "inherit the global window where that window is bounded" in verdict.report
 
 
 def test_the_configuration_doc_keeps_the_guard_apart_from_the_global_gate() -> None:

@@ -1217,9 +1217,10 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
 >
-> **An override of `0` needs the same acknowledgement as a global `0`** (BACKLOG #2368). It keeps that
-> connection's PHI bodies forever, whatever the global window says. The overrides live in the graph, so
-> `serve` checks them when it loads the graph, at least at startup and on every config reload:
+> **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
+> #2368). It keeps that connection's PHI bodies forever, whatever the global window says. The
+> overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
+> and on every config reload:
 >
 > - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
 >   graph and names each connection. At startup the engine does not start. On a reload the running

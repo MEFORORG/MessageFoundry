@@ -570,7 +570,8 @@ def _keep_forever_remedy() -> str:
     auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
     return (
         "Set each override to a positive number of days, or remove it to inherit the global "
-        f"window; or, to deliberately retain forever, set {BODY_ACKNOWLEDGEMENT_SETTING}=true "
+        "window where that window is bounded; or, to deliberately retain forever, set "
+        f"{BODY_ACKNOWLEDGEMENT_SETTING}=true "
         "(audited). That switch covers the whole instance: it also turns off the default bound "
         f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
         "explicit number of days first"
@@ -668,7 +669,8 @@ def make_retention_override_guard(
     ``AUDIT:`` line names each connection: with the acknowledgement on either dial, and without it
     under ``enforcement = warn``, where the line says nobody acknowledged it and gives the remedy
     (owner ruling 2026-11-01). That second arm keeps the bodies forever with no acknowledgement, so
-    the line is the only audited record that a site on that dial has of the choice.
+    the line is what a site on that dial has to show for the choice. Like the other ``AUDIT:``
+    lines at start it is a log line: it is not an ``audit_log`` row, and it ages with the logs.
 
     It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
     line only under ``enforce``, and this guard writes one whenever it passes such a graph.
