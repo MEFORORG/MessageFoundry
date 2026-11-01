@@ -959,8 +959,7 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   per hop. `supervise` checks the service-settings hops too, before it starts any engine shard
   (BACKLOG #2356); the connection graph's hops stay with each engine shard. Each honoured opt-out is logged at start by hop name, never by secret, and is named by
   `security_loosenings()`. The refuse/warn split is `[security].enforcement`. What it counts as a
-  hop, and what it leaves out (listeners, plugin connector types, and a generic-ODBC credential
-  hidden in a driver keyword), is stated in `messagefoundry/config/static_credentials.py`.
+  hop, and what it leaves out, is stated in `messagefoundry/config/static_credentials.py`.
   **Several hops have no compliant credential kind in the product today.** The table in
   [`docs/CONNECTIONS.md`](CONNECTIONS.md#static-credentials-on-every-backend-hop) is the one list
   of them, and each listed hop's `compliant_kind` flag is the source of record. With the refusal on,

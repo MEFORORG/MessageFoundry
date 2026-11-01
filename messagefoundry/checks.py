@@ -2983,8 +2983,8 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     """Surface every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced.
 
     #66 / ADR 0092's 2026-07-12 amendment delegates TLS to the operator's driver keyword on
-    ``dialect='generic'``, because MessageFoundry cannot enumerate an arbitrary driver's keywords — that
-    delegation is right and this check does not challenge it. What #333 fixes is that the delegation's
+    ``dialect='generic'``, because MessageFoundry cannot judge whether a keyword's value verifies the
+    peer — that delegation is right and this check does not challenge it. What #333 fixes is that the delegation's
     ONLY control was a construction log line, which is not a surface anyone reviews. Covers inbound
     (``DatabasePoll``) as well as outbound: the poll link crosses the same hop with the same credential
     in the same DSN.
