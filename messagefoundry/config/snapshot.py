@@ -270,8 +270,9 @@ class ConfigSnapshot:
 def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapshot:
     """Read every file a load of ``directory`` reads, once, into a :class:`ConfigSnapshot`.
 
-    The config modules (:func:`config_py_files`), ``connections.toml`` (or the candidate an edit is
-    validating), each table in ``codesets/``
+    The config modules, by :func:`_covered_name`, which gives the list a load digests and runs (of
+    the reads a load makes, only its trust check lists by :func:`config_py_files`),
+    ``connections.toml`` (or the candidate an edit is validating), each table in ``codesets/``
     (:func:`~messagefoundry.config.code_sets.is_code_set_name`), and each ``environments/*.toml``,
     which the fingerprint covers and the loader never reads. Only regular
     files, following links, are read: a link is read through, and its target's bytes are what a
@@ -281,10 +282,10 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
     at its first listing, and the ``OSError`` when a folder cannot be listed or a file cannot be
     stat'ed or read. A directory removed after that listing raises nothing and reads as the files
     still found, down to none. Without ``strict``, a missing directory reads as an empty snapshot
-    and each fault is recorded in :attr:`ConfigSnapshot.unreadable` instead. A file removed between
-    the listing and the read is gone, not unreadable, unless ``strict``. A share Windows reports as
-    unreachable is a fault in each case, not a missing folder or a removed file
-    (:func:`is_missing_directory`)."""
+    and each fault is recorded in :attr:`ConfigSnapshot.unreadable` instead. A file removed before
+    its stat is dropped, with or without ``strict``. One removed after its stat raises with
+    ``strict``, and without it is gone, not unreadable. A share Windows reports as unreachable is a
+    fault in each case, not a missing folder or a removed file (:func:`is_missing_directory`)."""
     # Lazy: connections_file imports the loader, which imports this module.
     from messagefoundry.config.connections_file import connections_file_path
 

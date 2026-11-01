@@ -74,10 +74,12 @@ FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 UNREADABLE_FILES_KEY = "unreadable_files"
 
 # What is hashed is what :func:`~messagefoundry.config.snapshot.read_config_snapshot` reads: every
-# config module (``config.snapshot.config_py_files``, the one rule the loader and ADR 0036's guard
-# also use, ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble ``._X.py``
-# skipped), ``connections.toml``, each ``codesets/`` table, and each ``environments/*.toml`` under
-# the config directory. The last is never loaded as config. The value file a serve start reads sits
+# config module (by ``config.snapshot._covered_name``, which gives the list a load digests and runs;
+# of the reads a load makes, only ADR 0036's trust check lists by ``config_py_files``, a separate
+# copy of the rule; ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble
+# ``._X.py`` skipped), ``connections.toml``, each ``codesets/`` table, and each
+# ``environments/*.toml`` under the config directory. The last is never loaded as config. The value
+# file a serve start reads sits
 # under ``[environments].base_dir``; where that is this folder, a reload parses the very bytes
 # hashed here (``ConfigSnapshot.environment_file``), so dropping them from the fold would let a
 # released reload apply values its digest does not cover. ``__pycache__`` is never read:
