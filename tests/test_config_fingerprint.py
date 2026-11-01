@@ -229,6 +229,21 @@ def test_strict_refuses_a_folder_it_cannot_list(
     assert config_fingerprint(d, strict=True) != readable  # the control: absent, not refused
 
 
+@pytest.mark.parametrize("name", ["codesets", "environments"])
+def test_a_file_named_like_a_folder_it_lists_is_a_missing_folder(tmp_path: Path, name: str) -> None:
+    """A sub-folder is judged as the directory itself is: a plain file in its place cannot be
+    listed, and it holds nothing a digest leaves out (vault BACKLOG #3535). So it refuses nothing,
+    is named as nothing left out, and does not move the digest."""
+    d = tmp_path / "cfg"
+    d.mkdir()
+    (d / "cfg.py").write_text("inbound = 1\n", encoding="utf-8")
+    without = config_fingerprint(d, strict=True)
+    (d / name).write_text("not a folder\n", encoding="utf-8")
+    assert config_fingerprint(d, strict=True) == without
+    detail = config_fingerprint_detail(d)
+    assert UNREADABLE_FILES_KEY not in detail and detail["fingerprint"] == without
+
+
 # --- vault BACKLOG #2944: the observational digest says when it left something out --------------
 
 
