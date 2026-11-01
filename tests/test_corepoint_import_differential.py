@@ -381,19 +381,22 @@ def _opened(steps: list[Step]) -> list[Step]:
     return out
 
 
-def _taken(previous: Step, branch: Control) -> Control | None:
-    # ``previous`` with ``branch`` adopted. A bare marker main adopted onto a construct it
-    # flattened out of a disabled wrapper goes to that construct still, inside the comment.
-    if isinstance(previous, Control) and previous.kind == _BRANCH_PARENT[branch.kind]:
-        return replace(previous, branches=(*previous.branches, branch))
-    if not (_bare(branch) and _wrapper(previous)):
-        return None
-    kept = [i for i, inner in enumerate(previous.body) if not _hollow_step(inner)]
-    if not kept or (inner := _taken(previous.body[kept[-1]], branch)) is None:
-        return None
-    body = list(previous.body)
-    body[kept[-1]] = inner
-    return replace(previous, body=tuple(body))
+def _closed(steps: list[Step], produced: list[Step]) -> list[Step]:
+    # A bare marker main adopted onto a construct it flattened out of a disabled wrapper has no
+    # construct now. A note leaves it holding a step, so it opens no branch of the construct
+    # around it, and it renders as an orphan.
+    if len(produced) != 1 or not _bare(marker := produced[0]):
+        return produced
+    at = _construct_at(steps, marker)
+    if at < 0 or not _wrapper(wrapper := steps[at]):
+        return produced
+    live = [s for s in _flat((wrapper,)) if not _label(s)]
+    if not (live and isinstance(live[-1], Control)):
+        return produced
+    if live[-1].kind != _BRANCH_PARENT[marker.kind]:
+        return produced
+    why = f"its {live[-1].source_verb} is in a @Disabled {wrapper.source_verb}, so it never runs"
+    return [replace(marker, body=(Control("block", "Comment", why), *marker.body))]
 
 
 def _grouped(step: Step, kind: str) -> bool:
@@ -418,18 +421,16 @@ def _left_open(step: Step) -> Control | None:
     return None
 
 
-def _settle(marker: Control, tag: str, run: list[Step], kind: str) -> list[Step]:
-    # A stray marker's run stays live, as main inlined it after the construct. So does a run
-    # that renders no code.
-    stray = kind not in ("if", "case") and (kind, marker.kind) != ("try", "except")
-    if stray or not [s for s in run if not _off(s) and getattr(s, "kind", "") != "disabled"]:
+def _settle(marker: Control, tag: str, run: list[Step]) -> list[Step]:
+    # A run that renders no code stays where it is.
+    if not [s for s in run if not _off(s) and getattr(s, "kind", "") != "disabled"]:
         return run
     why = "its marker is in a @Disabled " + tag
     detail = "; ".join(filter(None, (why, marker.detail)))
     return [replace(marker, detail=detail, body=tuple(run), branches=())]
 
 
-def _sealed(steps: list[Step], kind: str) -> list[Step]:
+def _sealed(steps: list[Step]) -> list[Step]:
     out: list[Step] = []
     held: tuple[Control, str, list[Step]] | None = None
     for step in steps:
@@ -438,13 +439,13 @@ def _sealed(steps: list[Step], kind: str) -> list[Step]:
             held[2].append(step)
             continue
         if held is not None:
-            out.extend(_settle(*held, kind))
+            out.extend(_settle(*held))
             held = None
         out.append(step)
         if (marker := _left_open(step)) is not None:
             held = (marker, step.source_verb, [])
     if held is not None:
-        out.extend(_settle(*held, kind))
+        out.extend(_settle(*held))
     return out
 
 
@@ -497,14 +498,19 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     (_PARSE_LIST_DEF, _LOOK_BACK + _PARSE_LIST_DEF),
     # A bare marker switched off in a wrapper leaves the steps after it dead, not live. And a
     # marker whose body main flattened bare opens its branch.
-    (_SPLIT_CALL, _SPLIT_CALL.replace("(body)", "(_opened(_sealed(body, kind)))")),
+    (_SPLIT_CALL, _SPLIT_CALL.replace("(body)", "(_opened(_sealed(body)))")),
     (
         _ADOPTED_FROM_LAST,
         "            and (at := _construct_at(steps, produced[0])) >= 0\n"
-        "            and (taken := _taken(steps[at], produced[0])) is not None\n"
+        "            and isinstance(steps[at], Control)\n"
+        "            and steps[at].kind == _BRANCH_PARENT[produced[0].kind]\n"
         "        ):\n"
-        "            steps[at] = taken\n",
+        "            previous = steps[at]\n"
+        "            steps[at] = replace(previous, branches=(*previous.branches, produced[0]))\n",
     ),
+    # A bare marker main adopted onto a construct it flattened out of a disabled wrapper opens
+    # nothing. Below the label amendment's lift, which it inserts just under the parse.
+    (_SIBLING_PARSE, _SIBLING_PARSE + "        produced = _closed(steps, produced)\n"),
     # Main flattened a disabled wrapper, so a wrapper holding the construct a branch-group
     # wrapper repeats made that a group. A disjunct ahead of main's test, so the label amendment
     # still finds that test's text once.

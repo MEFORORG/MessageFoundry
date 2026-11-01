@@ -11,7 +11,6 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.corepoint_import import (
-    _BRANCH_PARENT,
     Channel,
     Control,
     CorepointImportError,
@@ -108,16 +107,15 @@ def test_split_preserves_empty_branches_and_already_owned_bodies(kind: str) -> N
     first = Control(kind, "marker", "first")
     second = Control(kind, "marker", "second")
     last = Control(kind, "marker", "last")
-    parent = _BRANCH_PARENT[kind]
-    body, branches = _split_branches([lead, first, second, owned, last], parent)
+    body, branches = _split_branches([lead, first, second, owned, last])
     assert body == (lead,)
     assert branches == (
         first,
         Control(kind, "marker", "second", body=(owned,)),
         last,
     )
-    assert _split_branches([lead, owned], parent) == ((lead, owned), ())
-    assert _split_branches([], parent) == ((), ())
+    assert _split_branches([lead, owned]) == ((lead, owned), ())
+    assert _split_branches([]) == ((), ())
 
 
 @pytest.mark.parametrize("as_json", [False, True])

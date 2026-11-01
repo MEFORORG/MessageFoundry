@@ -3083,15 +3083,33 @@ _FOR = "    for _item in []:"
         pytest.param(_LOOP, _FOR, id="else-in-a-loop"),
     ],
 )
-def test_a_stray_switched_off_marker_seals_nothing(template: str, opener: str) -> None:
-    """A construct that cannot continue the marker made its branch a stray on main, inlined live
-    after the construct. Corepoint, its marker switched off, runs those steps in the construct's
-    body, so they stay there, live as far as the construct is. Code review of this change, round
-    5."""
+def test_a_stray_switched_off_marker_seals_its_run_too(template: str, opener: str) -> None:
+    """A construct that cannot continue the marker made its branch a stray on main, inlined after
+    the construct. Left in a ``try:`` body, a raise in those steps would send the message to the
+    ``Catch``, where on main it reached none, so the ``Catch`` would run more often. They fail
+    closed, as in a construct that renders the marker: under the orphan's dead placeholder,
+    inside the construct. In a loop its body was dead already. Code review of this change,
+    rounds 5 and 7."""
     off = '<List Disabled="1"><Line Data="Else"/></List>'
     handler = _handler_body(_handler_source(template.replace("{x}", off + _AFTER_THE_WRAPPER)))
-    assert _ORPHAN not in handler
-    assert _enclosing(handler, "OB_FLAT").startswith(opener)
+    dead = _enclosing(handler, "OB_FLAT")
+    assert dead.startswith(f"        if False:  # TODO: Corepoint Else {_ORPHAN}")
+    assert _enclosing(handler, "PID-19") == dead
+    assert any(line.startswith(opener) for line in handler.splitlines())
+
+
+def test_a_raise_after_a_switched_off_marker_never_reaches_the_catch(tmp_path: Path) -> None:
+    """The case behind the test above. The write after the switched-off ``Else`` raises on a
+    message with no OBX segment. On main it raised after the ``try``, so nothing was sent. In
+    the ``try:`` body the ``Catch`` would catch it and send. Code review of this change, round 7."""
+    body = (
+        '<Try><List><Line Data="ItemClear %ADT/PID-3"/><List Disabled="1"><Line Data="Else"/>'
+        '</List><Line Data="ItemClear %ADT/OBX-5"/><Line Data="Catch"/>'
+        '<Line Data="MsgSend %ADT [OB_C]"/></List></Try>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert f"Corepoint Else {_ORPHAN}" in _enclosing(handler, "OBX-5")
+    assert _run_handler(tmp_path, body) == []
 
 
 def test_a_switched_off_markers_own_branches_stay_commented_out() -> None:
@@ -3217,9 +3235,10 @@ def test_a_bare_marker_main_adopted_across_a_disabled_wrapper_leaves_no_stray(
     before: str, tmp_path: Path
 ) -> None:
     """Main adopted the bare ``Catch`` onto the ``Try`` before it, so the steps after it stayed in
-    the loop's body, dead. Left an orphan, the marker opened a branch of the loop instead, a stray
-    the render inlines live after the loop, for every message. It is adopted still: by the live
-    ``Try``, or by the switched-off one inside the wrapper's comment."""
+    the loop's body, dead. Left bare with no construct, the marker opened a branch of the loop
+    instead, a stray the render inlines live after the loop, for every message. A live ``Try``
+    adopts it still. A switched-off one cannot, so the marker fails closed and opens nothing: an
+    orphan, counted unmapped. Code review of this change, rounds 6 and 7."""
     body = _LOOP.replace("{x}", before + '<Line Data="Catch"/>' + _AFTER_THE_WRAPPER)
     src = _handler_source(body)
     handler = _handler_body(src)
@@ -3227,8 +3246,61 @@ def test_a_bare_marker_main_adopted_across_a_disabled_wrapper_leaves_no_stray(
     assert _enclosing(handler, "PID-19").startswith(_FOR)
     assert "cannot continue a Corepoint ForEach" not in handler
     assert not _send_lines(handler, 1)
+    closed = before.startswith("<List")
+    assert (f"Corepoint Catch {_ORPHAN}" in handler) is closed
+    assert ("Catch" in _count_steps(_handler_steps(body), in_loop=False)[1]) is closed
     assert _run_handler(tmp_path, body) == []
     ast.parse(src)
+
+
+def test_a_marker_closed_by_a_switched_off_construct_keeps_its_counted_todos() -> None:
+    """The orphan is a live element, so it and the statement on its label are counted unmapped,
+    not folded into the wrapper's one disabled count. Code review of this change, round 7."""
+    body = _LOOP.replace(
+        "{x}",
+        '<List Disabled="1"><Try><List/></Try></List><Line Data="Catch">'
+        '<List Data="MsgLog %ADT"/></Line>' + _CLEAR,
+    )
+    handler = _handler_body(_handler_source(body))
+    assert _count_steps(_handler_steps(body), in_loop=False) == (2, ["Catch", "MsgLog"], 1)
+    assert f"Corepoint Catch {_ORPHAN}" in _enclosing(handler, "TODO: Corepoint MsgLog")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param(_LOOP, id="in-a-loop"),
+        pytest.param("<Try><List>{x}</List></Try>", id="in-a-try"),
+        pytest.param('<Line Data="If (a)"><List>{x}</List></Line>', id="in-an-if"),
+    ],
+)
+def test_a_marker_switched_off_in_a_branch_markers_own_list_seals_its_run(template: str) -> None:
+    """In a branch marker's own list, main split the steps after a switched-off bare marker off
+    into a branch of that branch, which no render emits. Left in the marker's body, they would
+    run wherever the marker's branch runs: after a loop or a ``try``, as a stray, for every
+    message. They fail closed, under that marker's orphan. Code review of this change, round 7."""
+    branch = (
+        '<Line Data="Else"><List Disabled="1"><Line Data="ElseIf (b)"/></List>'
+        '<Line Data="ItemClear %ADT/PID-5"/></Line>'
+    )
+    body = template.replace("{x}", '<Line Data="ItemClear %ADT/PID-3"/>' + branch + _CLEAR)
+    src = _handler_source(body)
+    handler = _handler_body(src)
+    assert f"Corepoint ElseIf {_ORPHAN}" in _enclosing(handler, "PID-5")
+    ast.parse(src)
+
+
+def test_a_sibling_branchs_own_switched_off_marker_seals_its_run() -> None:
+    """The same in the list of a branch written beside its construct: the steps after the
+    switched-off marker no longer run in the ``except``. Code review of this change, round 7."""
+    body = (
+        '<Try><List><Line Data="ItemClear %ADT/PID-3"/></List></Try><Line Data="Catch"><List>'
+        '<Line Data="ItemClear %ADT/PID-4"/></List><List Disabled="1"><Line Data="Else"/></List>'
+        '<Line Data="ItemClear %ADT/PID-5"/></Line>'
+    )
+    handler = _handler_body(_handler_source(body))
+    assert _enclosing(handler, "PID-4").startswith("    except Exception:")
+    assert f"Corepoint Else {_ORPHAN}" in _enclosing(handler, "PID-5")
 
 
 @pytest.mark.parametrize(

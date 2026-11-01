@@ -1453,13 +1453,13 @@ def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
     )
 
 
-def _split_branches(steps: list[Step], kind: str) -> tuple[tuple[Step, ...], tuple[Control, ...]]:
-    """Split the body of a ``kind`` container at its branch markers into ``(body, branches)``.
+def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control, ...]]:
+    """Split a container body at its branch markers into ``(body, branches)``.
 
     The export writes ``Else``/``ElseIf``/``Catch``/``Matching`` as ordinary statements *inside* the
     construct's own ``<List>``, so everything after such a marker belongs to that branch. Walk once
     to keep successive branches siblings without consuming stack space for a wide list."""
-    steps = _seal_switched_off_branches(steps, kind)
+    steps = _seal_switched_off_branches(steps)
     body: tuple[Step, ...] = ()
     branches: list[Control] = []
     marker: Control | None = None
@@ -1478,21 +1478,22 @@ def _split_branches(steps: list[Step], kind: str) -> tuple[tuple[Step, ...], tup
     return body, tuple(branches)
 
 
-def _seal_switched_off_branches(steps: list[Step], kind: str) -> list[Step]:
+def _seal_switched_off_branches(steps: list[Step]) -> list[Step]:
     """``steps`` with each run main placed in a switched-off marker's branch made an orphan.
 
     A bare marker inside a ``@Disabled`` ``<List>``/``<Actions>`` wrapper opened its branch while
-    the wrapper was flattened, so the steps after the wrapper, up to the next marker, ran in it:
-    in an ``except``, or under a placeholder arm. With the wrapper commented out whole (BACKLOG
-    #2526) they would run in the construct's own body, for every message. They fail closed
-    instead: the marker's orphan holds them, which renders them under a dead placeholder and
-    counts the marker unmapped. The marker's own branches are switched-off content, and stay in
-    the wrapper's comment alone.
-
-    Only where a ``kind`` construct renders that marker as a branch (:func:`_renders_as_branch`).
-    A stray one, such as an ``Else`` in a ``Try`` or any marker in a loop, main inlined live after
-    the construct, and Corepoint, its marker switched off, runs those steps in the construct's
-    body. So they stay live there.
+    the wrapper was flattened, so the steps after the wrapper, up to the next marker, went in it.
+    Wherever that was, it ran no more often than the list it was cut from. In an ``If`` or a
+    ``ChooseFrom`` it is an arm under a dead condition, in a ``Try`` an ``except``. In a branch
+    marker's own list it is a branch of a branch, which no render emits. Where the construct
+    cannot continue the marker, as with an ``Else`` in a ``Try``, it is a stray inlined after the
+    construct, so a raise in it never reached a ``Catch``. With the wrapper commented out whole
+    (BACKLOG #2526) the steps would stay in the list they were cut from: run for every message,
+    or, in a ``try:`` body, run where a raise sends the message to its ``Catch``. They fail closed
+    instead, in every list that is split into branches: the marker's orphan holds them, which
+    renders them under a dead placeholder and counts the marker unmapped. In a loop the loop's
+    body was dead already, and they stay dead. The marker's own branches are switched-off
+    content, and stay in the wrapper's comment alone.
 
     A run ends at the next bare marker, or at the next such wrapper, whose own marker opened the
     next branch on main. So the runs are disjoint, and the walk stays linear in the list. A run
@@ -1505,7 +1506,7 @@ def _seal_switched_off_branches(steps: list[Step], kind: str) -> list[Step]:
         i += 1
         marker = _switched_off_marker(step)
         # ``isinstance`` holds wherever a marker does; it tells the type checker so.
-        if not (marker and isinstance(step, Control) and _renders_as_branch(kind, marker.kind)):
+        if not (marker and isinstance(step, Control)):
             continue
         end = next(
             (
@@ -1546,8 +1547,9 @@ def _unwrapped(steps: Iterable[Step]) -> Iterator[Step]:
 
     The tests of where a live step lands read a wrapper through this view, so a switched-off
     wrapper never moves one: not into a body that runs more often, and not out of a branch main
-    put it in. At least :func:`_opens_a_branch`, :func:`_switched_off_marker`,
-    :func:`_adopt_branch` and the branch-group test in :func:`_parse_statement` do.
+    put it in. At least :func:`_opens_a_branch`, :func:`_switched_off_marker`, :func:`_hollow`
+    (so :func:`_adopt_branch`), :func:`_close_switched_off_branch` and the branch-group test in
+    :func:`_parse_statement` do.
     :func:`_holds_a_chain` walks a wrapper's whole subtree, which reads the same. The wrapper's
     own contents stay commented out; only the placement is main's. Main also put a wrapper's
     own label marker where it stood, and a label marker decides no placement."""
@@ -1563,7 +1565,11 @@ def _switched_off_marker(step: Step) -> Control | None:
     the last one in its body, a nested disabled wrapper's included, as main flattened them all."""
     if not _is_wrapper(step):
         return None
-    return next((s for s in reversed([*_unwrapped(step.body)]) if _opens_a_branch(s)), None)
+    left: Control | None = None
+    for inner in _unwrapped(step.body):
+        if _opens_a_branch(inner):
+            left = inner
+    return left
 
 
 def _opens_a_branch(step: Step) -> TypeGuard[Control]:
@@ -1679,6 +1685,7 @@ def _parse_list(
             # statements live and a <Switch> — or a <Lines> typo — vanished with its body. Untrusted
             # input is still never a crash.
             produced = _parse_statement(child, subject, held, in_control, depth + 1)
+            produced = _close_switched_off_branch(steps, produced, waiting)
             if _adopt_branch(steps, produced, waiting):
                 continue
         for step in produced:
@@ -1709,11 +1716,7 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
       a branch's branches, so adopting it would drop them uncounted. An orphan renders them, dead.
 
     A disabled wrapper main flattened to label markers or to nothing is no more than they are
-    (:func:`_hollow`). And a bare marker main adopted onto a construct it flattened out of a
-    disabled wrapper is adopted onto that construct still, inside the wrapper's comment: the
-    construct is switched off, so its branch is too, and the steps after the marker stay where
-    main put them. Left an orphan, the marker would open a branch of the construct around it,
-    and in a loop that branch is a stray, inlined live after the loop (BACKLOG #2526)."""
+    (:func:`_hollow`), so it stands in the way of neither (BACKLOG #2526)."""
     if len(produced) != 1 or not steps:
         return False
     branch, previous = produced[0], steps[-1]
@@ -1721,39 +1724,42 @@ def _adopt_branch(steps: list[Step], produced: list[Step], between: list[Step]) 
         isinstance(branch, Control)
         and branch.kind in _BRANCH_PARENT
         and isinstance(previous, Control)
-        and (previous.kind == _BRANCH_PARENT[branch.kind] or _is_wrapper(previous))
+        and previous.kind == _BRANCH_PARENT[branch.kind]
     ):
         return False
-    bare = _opens_a_branch(branch)
-    if (bare or branch.branches) and not _hollow(between):
+    if (_opens_a_branch(branch) or branch.branches) and not _hollow(between):
         return False
-    if previous.kind == _BRANCH_PARENT[branch.kind]:
-        steps[-1] = replace(previous, branches=(*previous.branches, branch))
-        return True
-    taken = _adopted_in_wrapper(previous, branch) if bare else None
-    if taken is None:
-        return False
-    steps[-1] = taken
+    steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
 
 
-def _adopted_in_wrapper(wrapper: Control, branch: Control) -> Control | None:
-    """``wrapper`` with ``branch`` adopted by the construct main flattened out of it last, or
-    ``None`` when main's last step there is no construct that continues ``branch``."""
-    if not _is_wrapper(wrapper):
-        return None
-    body = wrapper.body
-    at = next((i for i in reversed(range(len(body))) if not _hollow(body[i : i + 1])), None)
-    if at is None:
-        return None
-    inner = body[at]
-    if isinstance(inner, Control) and inner.kind == _BRANCH_PARENT[branch.kind]:
-        taken: Control | None = replace(inner, branches=(*inner.branches, branch))
-    else:
-        taken = _adopted_in_wrapper(inner, branch) if isinstance(inner, Control) else None
-    if taken is None:
-        return None
-    return replace(wrapper, body=(*body[:at], taken, *body[at + 1 :]))
+def _close_switched_off_branch(
+    steps: list[Step], produced: list[Step], between: list[Step]
+) -> list[Step]:
+    """``produced``, with a bare marker that continues a switched-off construct made an orphan
+    that opens nothing.
+
+    Main flattened a ``@Disabled`` wrapper, so a bare marker written after it, past nothing but
+    label markers (:func:`_hollow`), was adopted by the construct main flattened out of it last.
+    The steps after the marker then stayed in the list around, where main ran them. That
+    construct is commented out now, so nothing adopts the marker. Left bare, it would open a
+    branch of the construct around it and take those steps: in a loop, a stray inlined live
+    after the loop, for every message. So it fails closed and opens nothing: a note says why,
+    which leaves the marker holding a step, and it renders as an orphan under a dead placeholder,
+    counted unmapped, its label markers counted with it (BACKLOG #2526)."""
+    if len(produced) != 1 or not steps or not _hollow(between):
+        return produced
+    branch, previous = produced[0], steps[-1]
+    if not (_opens_a_branch(branch) and _is_wrapper(previous)):
+        return produced
+    last = next(
+        (s for s in reversed([*_unwrapped(previous.body)]) if not isinstance(s, LabelMarker)),
+        None,
+    )
+    if not (isinstance(last, Control) and last.kind == _BRANCH_PARENT[branch.kind]):
+        return produced
+    why = f"its {last.source_verb} is in a @Disabled {previous.source_verb}, so it never runs"
+    return [replace(branch, body=(Control("block", "Comment", why), *branch.body))]
 
 
 def _runs_nothing(step: Step) -> bool:
@@ -1944,7 +1950,7 @@ def _parse_statement(
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
         return [Control(kind, source, statement or note or tag, body=(*marker, *body))]
 
-    inner, branches = _split_branches(body, kind)
+    inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
     return [*marker, Control(kind, source, detail, body=inner, branches=branches)]
 
