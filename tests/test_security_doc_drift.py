@@ -3950,6 +3950,7 @@ _RETIRED_RETENTION_CLAIMS: tuple[tuple[Path, str], ...] = (
     (_GUIDE_DOC, "loud, audited warnings"),
     (_LOOSENING_DOC, f"names that switch and an explicit `{_BODY_SWITCH} = 0`"),
     (_LOOSENING_DOC, "a loud, audited loosening"),
+    (_LOOSENING_DOC, "loud audited loosening"),
     (_LOOSENING_DOC, "refusals downgrade to loud audited warnings"),
     (_IDE_SECURITY_EDITOR, "0 = keep indefinitely (audited)"),
     (_IDE_SECURITY_EDITOR, "Audited escape: unbounded PHI retention"),
@@ -4058,6 +4059,9 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
         if retired in flat:
             findings.append(f"{where} says again: {retired!r}")
         findings += [f"{where} no longer says {c!r}" for c in corrected if c not in flat]
+    # Every link, since a row above is met by any one of them and nothing else reads a fragment.
+    links = re.findall(r"SECURITY-LOOSENING\.md#delete_message[^)\s]*", config + phi)
+    findings += [f"a link is not the entry's anchor: {link}" for link in links if link != anchor]
     return findings
 
 
@@ -4237,6 +4241,11 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "loosening",
             "at least `dead_letter_days`,",
             "`dead_letter_days`,",
+        ),
+        "a-table-link-goes-stale": (
+            "config",
+            "shows](SECURITY-LOOSENING.md#delete_message_bodies_after_days--0",
+            "shows](SECURITY-LOOSENING.md#delete_message_bodies_after_days--1",
         ),
         "entry-renamed-under-its-links": (
             "loosening",

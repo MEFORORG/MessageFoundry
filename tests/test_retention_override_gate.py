@@ -261,11 +261,13 @@ def test_the_two_readings_of_the_list_differ_as_the_retention_entry_says(
     assert security.delete_message_bodies_after_days == folded_days
     folded = dict(_pairs(sec=security))
     assert (_BODY_SWITCH in folded) is (folded_days == 0)
+    assert ("allow_keeping_phi_indefinitely" in folded) is switch_set
     if folded_days == 0:
         # True here too, where the gate neither bounded the window nor refused the start.
         assert "auto-bound" not in folded[_BODY_SWITCH]
     # Really unbounded under the switch, so the absence just below hides something.
-    assert (retention.dead_letter_days == 0) is switch_set
+    for field in ("dead_letter_days", "reference_snapshot_days", "processed_archive_days"):
+        assert (getattr(retention, field) == 0) is switch_set
     text = " ".join(f"{name} {risk}" for name, risk in folded.items())
     assert not [w.field for w in auto_bounded_windows() if w.field in text]
 

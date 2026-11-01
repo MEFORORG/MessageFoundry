@@ -10118,9 +10118,10 @@ def security_loosenings(
     output, rather than reporting a subset as if it were everything.
 
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
-    view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
-    a deliberate opt-out gives up; the posture GATES (which still refuse a production-PHI weakening) are
-    unchanged.
+    view (``GET /security/posture``, AC-5), so the two share one wording. They read at different points
+    of the start, so they can name different switches: docs/SECURITY-LOOSENING.md's retention entry
+    gives the case. This is advisory only — it names what a deliberate opt-out gives up; the posture
+    GATES (which still refuse a production-PHI weakening) are unchanged.
 
     ``audit_all_authorization_decisions`` CHANGED SIDES, and the old sentence is quoted here rather than
     deleted so nobody re-derives it. It read: *"``audit_all_authorization_decisions=false`` is the

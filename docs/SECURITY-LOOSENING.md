@@ -204,7 +204,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `allow_keeping_app_logs_indefinitely` | `false` |
 | | `allow_keeping_backup_archives_indefinitely` | `false` |
 | | `audit_all_authorization_decisions` | `true` (see note) |
-| Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
+| Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud loosening) |
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
@@ -522,6 +522,7 @@ false premise.
   window back into `[security]`, so at least `GET /security/posture` and the list the start's
   [best-effort](#the-switches) `config_loaded` audit row records read the effective value: with the switch set
   and that window unset, they name `delete_message_bodies_after_days` too, though nobody wrote `0`.
+  `messagefoundry security show` runs no gate and reads the file as written, so it does not.
   `security_loosenings()` does not read the other auto-bounded windows: at least `dead_letter_days`,
   `reference_snapshot_days` and `processed_archive_days` can stay at `0` with no entry in any of these records.
 - **Still refused:** a **PHI** instance whose PHI-body window is set **explicitly to `0`** refuses under
