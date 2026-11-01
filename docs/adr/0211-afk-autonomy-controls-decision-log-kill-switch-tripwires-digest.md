@@ -387,19 +387,32 @@ roster alias of the Lander.
 > Steward's minutes default is (60, 10, 5), though the gate reads only the first.
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
-> `usage-collect.ps1` writes a history row only on a rise, and `usage.ps1` needs two rows inside its
-> 90-minute rate window, the oldest at least 30 minutes old, so that one tick is not read as a burn. So
-> a slow or flat burn reads as no rate, and the 90 percent level decides. A timed row was tried and
-> refused: its rows read as a measured rate of zero while other sessions burn the pool, which lifted
-> the backstop.
+> `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its
+> 90-minute rate window. It also needs the oldest of them to be at least 30 minutes old, unless two
+> ticks or more moved, so that one tick is not read as a burn. So a slow or flat burn reads as no rate,
+> and the 90 percent level decides. A timed row was tried and refused: an idle session's rows measure
+> nothing, because they say only that a cached number has not changed.
 >
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
 > percentage, so no one session's reading is the truth; each is a valid floor. The collector therefore
-> refuses a lower reading in the same reset period, and any reading from an earlier one, so neither
-> reaches `latest.json` or the history. A later reset replaces the value in either direction. If usage
-> could ever fall inside a period, keeping the higher number errs toward a stop. **That does not close
-> the staleness gap:** an idle session reporting the same percentage as the published one still looks
-> freshly observed, and nothing here can tell it from a live one.
+> refuses a reading for the same reset that is not higher, and a reading whose reset has already passed,
+> so neither reaches `latest.json` or the history. Any other reset is a new window and replaces the
+> value in either direction. A reading that is not higher and has no readable reset is refused while the
+> published reset is ahead.
+>
+> **The age therefore counts from the last change.** The payload carries no time of its own, so an idle
+> session's cached number looks like a live flat one. Restamping an equal reading let one idle terminal
+> keep a frozen number fresh, and the rung read OK on it. The cost is deliberate: a flat account, live or
+> not, goes stale after 20 minutes and reads UNKNOWN, so the gate answers REVIEW, even above the level.
+>
+> The limits of that rule, all of them open:
+>
+> - It applies only against this root's own window. A window stamped with another root is no floor.
+> - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
+>   next live reading corrects it.
+> - If usage ever does fall inside a period, the kept reading stops being refreshed, goes stale in 20
+>   minutes, and the gate answers REVIEW until the reset. That errs away from clearing work, not toward
+>   a stop.
 >
 > **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
 > with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.

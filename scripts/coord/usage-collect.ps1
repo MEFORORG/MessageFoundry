@@ -228,23 +228,40 @@ try {
 
     # THE HIGHEST READING IN A RESET PERIOD BINDS. An idle session keeps reporting its cached number on
     # a timer, and every session publishes here, so without this rule a stale 60 replaces a live 99 and
-    # reads as freshly observed. The level only rises inside a window; if it ever fell, keeping the
-    # higher number errs toward a stop. A later reset is a new window, and it replaces in either
-    # direction. An EARLIER reset is a window already gone, so it replaces nothing: after a reset, an
-    # idle session still holds last week's number. A refused reading leaves the published window whole,
-    # its own age included, so the staleness guard keeps counting from the last real observation.
+    # reads as freshly observed. The level only rises inside a window. Any other reset is a new window
+    # and replaces in either direction, unless that reset has already passed: then it is a window that
+    # is gone, the number an idle session still holds after a reset, and it replaces nothing. A refused
+    # reading leaves the published window whole, its own age included, so the staleness guard keeps
+    # counting from the last real observation.
     #
-    # ONLY AGAINST THIS ROOT'S OWN WINDOW. A window stamped by another root is another pool, and as a
-    # floor it would shut this root's readings out until the reset. A reset time that cannot be read
-    # decides nothing, so the reading is taken.
+    # AN EQUAL READING IS REFUSED TOO, SO THE AGE COUNTS FROM THE LAST CHANGE. The payload carries no
+    # time of its own, so an idle session's cached number looks exactly like a live flat one. Restamping
+    # it let one idle terminal keep a frozen number fresh while sessions that never publish burned the
+    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale, and reads
+    # UNKNOWN, which sends the gate to REVIEW rather than clearing work.
+    #
+    # A READING WITH NO READABLE RESET CANNOT PROVE IT IS A NEW WINDOW. While the published reset is
+    # still ahead, one that is not higher is refused like any other. If it were taken, it would wipe
+    # the reset time this rule and the reader's gone-window check both need.
+    #
+    # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
+    # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
+    # or absent stamp counts as ours, because sessions on one root can differ in having the pin at all.
+    #
+    # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
+    # check and then land over a higher one written in between. The next live fire corrects it.
     $keepPublished = -not $seven
-    if ($seven -and $published -and [string]$published.config_root_env -ieq $stampEnv) {
+    $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
+    $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
+    if ($seven -and $published -and (-not $publishedRoot -or $publishedRoot -eq "unset" -or $publishedRoot -ieq $ownRoot)) {
+        $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $seenEpoch = $seven.resets_at_epoch -as [long]
         $publishedEpoch = $published.resets_at_epoch -as [long]
-        if ($seenEpoch -and $publishedEpoch) {
-            $keepPublished = $seenEpoch -lt $publishedEpoch -or
-                ($seenEpoch -eq $publishedEpoch -and $seven.used_percentage -lt ($published.used_percentage -as [double]))
+        $notHigher = $seven.used_percentage -le ($published.used_percentage -as [double])
+        $keepPublished = if ($seenEpoch -and $publishedEpoch) {
+            ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
+        else { $notHigher -and $publishedEpoch -gt $nowEpoch }
     }
 
     # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new
@@ -308,14 +325,13 @@ try {
     # over a dense flat series is noise.
     #
     # NO ROW ON A TIMER. A slow burn then has too few rows for a rate, and the rung falls back to the
-    # level, which is the safe side. A timed row would be worse: an idle session keeps reporting its
-    # cached percentage, so its rows would read as a measured rate of zero while other sessions burn the
-    # pool, and that would lift the level backstop.
+    # level, which is the safe side. A timed row would measure nothing: an idle session keeps reporting
+    # its cached percentage, so its rows would say only that the number had not changed.
     if ($ok -and $null -ne $freshSeven) {
         $histPath = Join-Path $StateDir "history.jsonl"
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
-        if (-not $prev -or $prev.seven_day -ne $freshSeven) {
+        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $rl.seven_day.resets_at) {
             $row = [ordered]@{
                 at          = $now
                 seven_day   = $freshSeven
@@ -330,6 +346,8 @@ try {
     if ($seven.resets_at_epoch) {
         $mins = [int](([System.DateTimeOffset]::FromUnixTimeSeconds([long]$seven.resets_at_epoch) - [System.DateTimeOffset]::UtcNow).TotalMinutes)
         if ($mins -ge 0) { $line += ("  (resets {0}h{1:00}m)" -f [math]::Floor($mins / 60), ($mins % 60)) }
+        # A window that is gone has no number worth showing. usage.ps1 applies the same rule.
+        else { $line = "7d reset passed, no current reading" }
     }
 }
 catch {

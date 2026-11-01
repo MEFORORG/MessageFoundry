@@ -22,11 +22,12 @@
     FOUR HONESTY RULES, because a usage tool that is confidently wrong is worse than no usage tool --
     it converts "I should check" into "I already know".
 
-      1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed.
+      1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed to
+         change. An unchanged reading does not refresh it; usage-collect.ps1 says why.
       2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the answer is UNKNOWN. Not an
          extrapolation, not a last-known value dressed up as current. Below two samples in the current
-         window, or under -MinRateSpanMinutes, there is no rate and no projection, and the percentage
-         bands still grade the reading.
+         window, or one tick under -MinRateSpanMinutes, there is no rate and no projection, and the
+         percentage bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -97,11 +98,12 @@ param(
     [int]$MaxAgeMinutes = 20,
     # Rate is measured over at most this much recent history.
     [int]$RateWindowMinutes = 90,
-    # And over at least this much. The weekly prints whole numbers, so over a few minutes one tick is
-    # quantisation, not a burn: over 4 minutes it reads as 15 percent an hour and would fire the rung
-    # on its own. watch.py's BURN_MIN_SPAN says the same, and its note says to retune its 4 minutes for
-    # the weekly before it is used. Under this, there is no rate and the level bands decide.
-    [int]$MinRateSpanMinutes = 30,
+    # And over at least this much, unless two ticks or more moved. The weekly prints whole numbers, so
+    # over a few minutes one tick is quantisation, not a burn: over 4 minutes it reads as 15 percent an
+    # hour and would fire the rung on its own. watch.py's BURN_MIN_SPAN says the same, and its note says
+    # to retune its 4 minutes for the weekly before it is used. Several ticks are a real burn however
+    # short the span, and the first half hour of one is when a stop matters most.
+    [ValidateRange(1, [int]::MaxValue)][int]$MinRateSpanMinutes = 30,
     # One line per config root on this box. A SURVEY, NEVER A MERGE: these are different accounts with
     # different 7d pools, so summing, averaging or taking a worst-of across them would rebuild
     # the exact lie the per-root publish path removes.
@@ -425,9 +427,10 @@ function Get-Rate($CurrentResetEpoch) {
     $newest = $rows | Sort-Object AgeMin | Select-Object -First 1
     # THE SPAN RUNS TO NOW, NOT TO THE NEWEST ROW. Rows land only on a move, so the flat time since the
     # last one is in no row, and ending the span there would keep a stopped burn reading as a live one.
-    if ($oldest.AgeMin -lt $MinRateSpanMinutes) { return $null }
     $spanH = $oldest.AgeMin / 60.0
+    if ($spanH -le 0) { return $null }
     $delta = $newest.Pct - $oldest.Pct
+    if ($oldest.AgeMin -lt $MinRateSpanMinutes -and $delta -lt 2) { return $null }
     return [pscustomobject]@{
         PctPerHour = [math]::Round($delta / $spanH, 2)
         Samples    = $rows.Count
@@ -525,7 +528,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         }
     }
     else {
-        $o.reason = "not enough samples in this window for a rate"
+        $o.reason = "not enough samples or span in this window for a rate"
     }
 
     # Bands. The question is not "is the number big" but "does it run out before it resets".
@@ -536,7 +539,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     }
     elseif ($pct -ge 85) {
         $o.state = "WARN"
-        $o.reason = if ($null -eq $rate) { "high, with no rate, so nothing is projected" } else { "high, but not projected to run out before reset" }
+        $o.reason = if ($null -eq $o.minutes_to_empty -or $null -eq $minsToReset) { "high, with no rising rate or no reset time, so nothing is projected" } else { "high, but not projected to run out before reset" }
     }
     elseif ($null -ne $o.projected_at_reset -and $o.projected_at_reset -ge 95) {
         $o.state = "WARN"; $o.reason = "projected to reach $($o.projected_at_reset)% by reset"
@@ -718,7 +721,7 @@ if ($dx.state -in $dxUntrusted) {
 # POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
 # reading on a box that does not use bash survives. Without this arm, a stale one fell through both
 # warnings and the operator saw no cause and no fix.
-elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN") {
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN" -and -not (Test-WindowResetPassed $doc.seven_day)) {
     Write-Host ""
     Write-Host "  WARNING -- nothing fresh has published here, and the wiring says why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
@@ -733,9 +736,10 @@ elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN")
 #
 # EVERY CLAUSE IS BACKED. "wired, and the collector it names exists" is what WIRED_HERE already tested
 # (ownership, an extracted -StateDir matching this directory, and Test-Path on the collector). "nothing
-# fresh" is the window's state. The two CAUSES are offered as alternatives, never asserted, because
+# fresh" is the window's state. The three CAUSES are offered as alternatives, never asserted, because
 # nothing here can tell them apart.
-elseif ($dx.state -eq "WIRED_HERE" -and $seven.state -eq "UNKNOWN") {
+# NOT FOR A GONE WINDOW: that reading can be seconds old, so neither cause below is in play.
+elseif ($dx.state -eq "WIRED_HERE" -and $seven.state -eq "UNKNOWN" -and -not (Test-WindowResetPassed $doc.seven_day)) {
     # THE COLLECTOR CLAUSE IS CONDITIONAL, because WIRED_HERE does not always mean one was checked: a
     # wired command carrying a -StateDir but no recognisable collector assignment yields a null
     # collector path, which skips the Test-Path guard entirely. Asserting it exists would be asserting
@@ -743,7 +747,8 @@ elseif ($dx.state -eq "WIRED_HERE" -and $seven.state -eq "UNKNOWN") {
     $collClause = if ($dx.wired_collector) { " and the collector it names exists" } else { "" }
     Write-Host ""
     Write-Host "  WARNING -- this root is wired correctly$collClause," -ForegroundColor Yellow
-    Write-Host "  yet nothing fresh has published here. Two causes, and this cannot tell them apart:" -ForegroundColor Yellow
+    Write-Host "  yet nothing fresh has published here. Three causes, and this cannot tell them apart:" -ForegroundColor Yellow
+    Write-Host "    - the percentage has not changed for that long; an unchanged reading keeps its old age, or" -ForegroundColor DarkGray
     Write-Host "    - no session has STARTED here since it was wired (settings are read at session start), or" -ForegroundColor DarkGray
     Write-Host "    - the statusLine is configured but never runs. It is part of the terminal UI's render" -ForegroundColor DarkGray
     Write-Host "      tree, so check whether your client shows a status bar at all; a line beginning" -ForegroundColor DarkGray

@@ -906,7 +906,8 @@ function Get-DecisionCostRung {
     $rate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
     $toEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
     $toReset = Get-DecisionJsonValue $week 'minutes_to_reset'
-    if ($null -ne $toReset -and [double]$toReset -le 0) {
+    # -lt, not -le: usage.ps1 rounds to whole minutes, so 0 can be a live window's last 30 seconds.
+    if ($null -ne $toReset -and [double]$toReset -lt 0) {
         return (New-DecisionRung 'UNKNOWN' "the weekly window's reset has passed, so this reading describes a window that is gone")
     }
     $at = "weekly at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"

@@ -1394,8 +1394,8 @@ whole shape:
 | [`config-roots.ps1`](../scripts/coord/config-roots.ps1) | definitions the others share: what a config root is, which one am I in, where does its state live, is it still spendable |
 
 **One publisher, N readers — per account.** The quota is **account-wide**: every session in every repo
-draws down the same 7-day pool, so any one session's reading is a valid floor for all sessions
-*on that account*, and inside one reset period the highest reading binds. Do not run a collector per session expecting to sum them; that double-counts a shared
+draws down the same 7-day pool, so any one session's reading speaks for all sessions *on that account*,
+as a floor; [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1)'s header states the rule. Do not run a collector per session expecting to sum them; that double-counts a shared
 pool.
 
 **It is not machine-wide, and an earlier version of this section said it was.** A box can run several
