@@ -833,9 +833,10 @@ def refuse_capture_conflicts(
     The resolved settings come through here once more when the connector is built. At least
     ``messagefoundry check`` and a reload refuse there, ``check`` for the one environment it runs
     under. At start the refusal fails that connection's lane (ADR 0031) rather than stopping the
-    engine, and a lane start skips, such as ``auto_start=False``, is judged when it is started.
-    ``check``'s ``build-check`` leg skips a config dir that declares no instance, and
-    ``messagefoundry dryrun`` builds no connector, so neither reaches this second pass."""
+    engine, and a lane that start skips, such as ``auto_start=False``, is judged when it is started.
+    At least these never reach this second pass: a ``deployed=False`` connection, a config dir that
+    declares no instance, which ``check``'s ``build-check`` leg skips, and ``messagefoundry dryrun``,
+    which builds no connector."""
 
     def on(key: str) -> bool:
         value = settings.get(key)

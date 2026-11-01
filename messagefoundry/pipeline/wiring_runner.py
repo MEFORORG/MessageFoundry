@@ -11679,7 +11679,7 @@ def build_check_registry(
     ``posture`` (#200, ADR 0092) is the instance's derived security posture (PHI? production?), stamped
     as the active hop posture for the whole connector-construction block so each cell keys its
     posture-keyed insecure-hop refusal on the LOADED config's posture rather than guessing — the ENFORCED
-    construction-time gate that fires at ``messagefoundry check`` / dry-run / reload. ``None`` (an
+    construction-time gate that fires at ``messagefoundry check`` and on a reload, dry run included. ``None`` (an
     embedding/test that doesn't derive a posture) leaves the posture unstamped: a cell then fail-closes
     (treats each hop as prod-PHI). Every ``serve``/``reload`` caller passes the config's real posture.
 
@@ -11884,8 +11884,8 @@ def _build_check_connectors(
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
         DatabaseLookupExecutor(resolved_lookups, egress=egress)  # checks each server first
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
-    # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
-    # than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
+    # posture, so weakened TLS that every sync would refuse fails check and a reload, dry run included,
+    # rather than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
     # read-only statement test runs here and again at sync (BACKLOG #2617). Builds no pool and opens
     # no socket. A source whose env() values do not resolve here is left to its sync, as before, so
     # one unprovisioned set does not refuse the whole graph.
@@ -12421,7 +12421,7 @@ def check_http_sync_reply(
 
     These are the facts one ``Http()`` call cannot know, because they are about the *other*
     connection. Runs with no store, so it fires at ``messagefoundry check`` and in a reload's dry run
-    exactly as at serve.
+    as well as at serve.
 
     The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
     warnings because together they make the feature's headline use case unserviceable.

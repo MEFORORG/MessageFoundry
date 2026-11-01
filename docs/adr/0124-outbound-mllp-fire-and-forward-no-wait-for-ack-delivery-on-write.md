@@ -48,7 +48,7 @@ The only fire-and-forget MessageFoundry ships today is `expect_reply=false` on t
 - **AC-5** — IF `no_ack=true` is combined with `capture_response=true` (or `reingress_to=…`), THEN wiring SHALL raise a `WiringError` at `check`/dry-run (no ACK is read, so there is nothing to capture).
   → `::test_no_ack_with_capture_response_rejected`, `::test_no_ack_with_reingress_rejected`
 
-  > **Update (2026-11-01, BACKLOG #3724):** AC-5 and the decision's "at `check`/dry-run time, before any store or socket" hold for literals, which are refused at load. A flag behind `env()` is judged once the connection's settings resolve. At least `check`'s `build-check` leg, for the one environment `check` runs under, and a reload refuse it. At start it fails that connection's lane (ADR 0031) rather than stopping the engine. The `build-check` leg skips a config dir that declares no instance, and `dryrun` builds no connector, so neither refuses a conflict behind `env()`. Tests: the `mllp-no_ack-env` cases in `tests/test_env_uncast_bool_setting.py`.
+  > **Update (2026-11-01, BACKLOG #3724):** AC-5, AC-6 and section 2's rejection at `check`/dry-run time hold for literals, which are refused at load. A flag behind `env()` is judged once the connection's settings resolve, so it is not refused at load, and a `no_ack` that resolves False is not refused at all. The docstring of `refuse_capture_conflicts` in `config/wiring.py` is the one statement of where that happens and what never reaches it. Tests: the `mllp-` cases in `tests/test_env_uncast_bool_setting.py`.
 
 - **AC-6** — IF a `no_ack` setting is placed on a non-MLLP outbound, THEN wiring SHALL raise a `WiringError` (the knob is MLLP-only; generic fire-and-forget is `expect_reply=false`).
   → `::test_no_ack_on_tcp_rejected`
