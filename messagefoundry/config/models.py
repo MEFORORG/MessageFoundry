@@ -354,6 +354,22 @@ def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
     )
 
 
+def check_attested_and_accepted(attested: bool, accepted: bool) -> None:
+    """Refuse a declaration that claims its hop is both secure and not secure.
+
+    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
+    record never fire, and the hop crosses silently while declaring an accepted risk. On the proxy
+    leg the acceptance still admits a proxy login, so a pair would carry that credential across with
+    the attestation's silence. The factories refuse the pair through ``config.wiring``; this is the
+    one rule they share with :class:`Destination` and the ``FhirLookup`` read executor, so neither
+    can be built directly into the state the factories refuse."""
+    if attested and accepted:
+        raise ValueError(
+            "tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
+            "secure) are opposite claims. Declare the one that is true"
+        )
+
+
 def _check_revocation_attestation(attested: bool, reason: str | None) -> None:
     """Load-validate the per-connection revocation-attestation pair (ADR 0173 §1.5 item 4).
 
@@ -860,6 +876,7 @@ class Destination(BaseModel):
     def _validate_hop_attestation(self) -> Destination:
         _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
         _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
+        check_attested_and_accepted(self.tls_hop_attested, self.cleartext_accepted)
         _check_revocation_attestation(
             self.tls_revocation_attested, self.tls_revocation_attested_reason
         )

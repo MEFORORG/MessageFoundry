@@ -65,6 +65,7 @@ from messagefoundry.config.models import (
     ConnectorType,
     Destination,
     bool_setting,
+    check_attested_and_accepted,
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
@@ -1919,6 +1920,10 @@ class FhirLookupExecutor:
             try:
                 attested = hop_attestation_from_settings(s)
                 lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
+                # The pair FhirLookup() and the runner's settings builder refuse, refused here too,
+                # so a directly built executor cannot admit a proxy login under both (decision
+                # d20261031T213402506-5d928c gives tls_hop_attested no proxy route).
+                check_attested_and_accepted(attested, lk_accepted)
             except ValueError as exc:
                 raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND

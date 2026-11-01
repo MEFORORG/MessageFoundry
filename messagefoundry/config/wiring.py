@@ -88,6 +88,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     bool_setting,
+    check_attested_and_accepted,
     check_db_connect_timeout,
     flag_from_settings,
     remote_file_protocol,
@@ -816,15 +817,12 @@ def refuse_resolved_verify_off(
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
-    """Refuse a declaration that claims its hop is both secure and not secure.
-
-    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
-    record never fire, and the hop crosses silently while declaring an accepted risk."""
-    if attested and accepted:
-        raise WiringError(
-            f"{where}: tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
-            "secure) are opposite claims. Declare the one that is true"
-        )
+    """:func:`~messagefoundry.config.models.check_attested_and_accepted`, raised as a
+    :class:`WiringError` that names the connection."""
+    try:
+        check_attested_and_accepted(attested, accepted)
+    except ValueError as exc:
+        raise WiringError(f"{where}: {exc}") from exc
 
 
 def refuse_raw_hop_attestation(settings: Mapping[str, Any], where: str) -> None:

@@ -66,6 +66,7 @@ from messagefoundry.transports.bounded_read import (
     _proxies_of,
     build_strict_opener,
 )
+from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
 from tests._wire_proxy import _WireProxy
@@ -268,6 +269,33 @@ def test_tls_hop_attested_does_not_admit_a_proxy_credential(
     ):
         _rest(_HTTPS_TARGET, posture=HopPosture(enforcing=enforcing), attested=True, **_PROXY_LOGIN)
     assert not [r for r in caplog.records if "ATTESTED secure" in r.getMessage()]
+
+
+def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None:
+    """``outbound()`` and ``_dest_config`` refuse the pair, and so does the model itself, so a
+    ``Destination`` built directly cannot reach the connector with both. With both set, the
+    acceptance would admit the proxy login while the attestation silenced the hop's WARN and audit
+    record (decision d20261031T213402506-5d928c keeps ``cleartext_accepted`` as the route and gives
+    ``tls_hop_attested`` none)."""
+    with pytest.raises(ValueError, match="opposite claims"):
+        _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
+
+
+def test_a_directly_built_fhir_lookup_refuses_attested_beside_accepted() -> None:
+    """``FhirLookup()`` and the runner's settings builder refuse the pair, and so does the executor,
+    so one built directly from a settings mapping cannot admit a proxy login under both."""
+    settings = {
+        "url": _HTTPS_TARGET,
+        **_PROXY_LOGIN,
+        "tls_hop_attested": True,
+        "tls_hop_attested_reason": "IPsec tunnel to the partner",
+        "cleartext_accepted": True,
+        "cleartext_reason": "legacy partner listener has no TLS",
+        "tls_revocation_attested": True,
+        "tls_revocation_attested_reason": "revocation-checking PKI at the partner edge",
+    }
+    with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*opposite claims"):
+        FhirLookupExecutor({"lk": settings}, egress=permitting(settings))
 
 
 def test_control_tls_hop_attested_still_carries_the_body_hop_past_a_credential_free_proxy() -> None:
