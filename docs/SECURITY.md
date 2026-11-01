@@ -2473,11 +2473,11 @@ would answer **503**, not the **409** a refused CA answers, and its `connection_
 carry `reason` `store_unavailable`. A restart would have stopped the listener before the check
 ran, so its 503 would say the connection is left stopped. The lane would read `failed`, and a lane
 with no earlier failure on record would show a line saying the CA could not be checked. An
-outbound start is not covered: the lane takes the fault, and the route does not answer it as one.
-A connection test would report `success: false` with one fixed line, and that line is what the
-route writes to `audit_log.detail`. The `connection_control` row of any refused start or restart
-is fail-soft, and so is that `connection_test` row: a store that also refuses the row would leave
-the answer standing, and the row's loss would be logged at ERROR.
+outbound start is not covered: the lane takes the fault. A connection test would report
+`success: false` with one fixed line, and that line is what the route writes to `audit_log.detail`.
+The `connection_control` row of any refused start or restart is fail-soft, and so is the
+`connection_test` row of a test the CA check stopped, refused or not: a store that also refuses
+the row would leave the answer standing, and the row's loss would be logged at ERROR.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,

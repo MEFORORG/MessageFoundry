@@ -2116,8 +2116,8 @@ async def _last_fingerprint(store: Store, label: str) -> _Baseline:
     (most-recent-first), a page at a time, and reads the first matching label's row. Each page
     starts below the ``id`` the one before ended on, the store's keyset cursor, so no row's ``ts``
     is read (vault BACKLOG #3746): a page all at one instant, or one ending in a malformed ``ts``,
-    cannot cost the baseline. Only :data:`_FINGERPRINT_PAGES` ends the look-back early, which still
-    reads as a first observation.
+    cannot cost the baseline. At least :data:`_FINGERPRINT_PAGES` and a newest row for the label
+    with no text fingerprint still end the look-back early, each read as a first observation.
 
     A row with no ``algorithm`` was written before BACKLOG #3425 and is :data:`UNMARKED_DIGEST`. A
     row naming a digest this release does not compile in is skipped, with one WARNING per call,

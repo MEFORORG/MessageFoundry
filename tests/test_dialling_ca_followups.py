@@ -755,16 +755,25 @@ async def test_a_connection_test_reports_a_stopped_check_as_a_store_fault(
 
 
 @pytest.mark.parametrize("row_lands", [True, False], ids=["row-written", "row-lost"])
-async def test_the_connection_test_route_keeps_the_store_line_when_its_row_fails(
+@pytest.mark.parametrize(
+    ("pin", "line"),
+    [(None, _STORE_START), (_WRONG_PIN, _ANCHOR_REFUSED_DETAIL)],
+    ids=["store-fault", "refused-ca"],
+)
+async def test_the_connection_test_route_keeps_its_line_when_its_row_fails(
     store: MessageStore,
     tmp_path: Path,
     judged: None,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pin: str | None,
+    line: str,
     row_lands: bool,
 ) -> None:
     """Vault BACKLOG #3746 item 2, through the route: the fixed line reaches the caller, and
     ``audit_log.detail`` when the row lands. A store that stopped the check is likely to refuse
-    this row too, and the line stands then as well. Red under: the route's write left bare, which
+    this row too, and the line stands then as well, with the loss logged at ERROR. So does a CA
+    refused while the store refuses its rows. Red under: the route's write left bare, which
     answers 500 for ``row-lost``."""
     faulty: Any = _FaultyAuditStore("list_audit")
     engine = Engine(
@@ -772,7 +781,7 @@ async def test_the_connection_test_route_keeps_the_store_line_when_its_row_fails
         lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    engine.add_registry(_poller_graph(_ca(tmp_path), None, auto_start=False))
+    engine.add_registry(_poller_graph(_ca(tmp_path), pin, auto_start=False))
     await engine.start()
     real = store.record_audit
 
@@ -784,11 +793,14 @@ async def test_the_connection_test_route_keeps_the_store_line_when_its_row_fails
     if not row_lands:
         monkeypatch.setattr(store, "record_audit", refuse_test_row)
     try:
-        r = await _control(engine, "test")
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            r = await _control(engine, "test")
         assert r.status_code == 200, r.text
-        assert (r.json()["success"], r.json()["detail"]) == (False, _STORE_START)
+        assert (r.json()["success"], r.json()["detail"]) == (False, line)
         rows = await _rows(store, "connection_test")
-        assert [row["detail"] for row in rows] == ([_STORE_START] if row_lands else [])
+        assert [row["detail"] for row in rows] == ([line] if row_lands else [])
+        lost = [rec for rec in caplog.records if "connection_test row" in rec.getMessage()]
+        assert [rec.levelno for rec in lost] == ([] if row_lands else [logging.ERROR])
     finally:
         await engine.stop()
 

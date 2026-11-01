@@ -3744,6 +3744,7 @@ async def _record_refused_control_audit(
     refuse this row too, which would turn that answer into a 500 (vault BACKLOG #3746). A failed
     write is logged at ERROR, and a cancel waits a bounded time for the row."""
     actor = identity.username
+    reason = "store_unavailable" if store_fault else None
     await write_audit_soft(
         lambda: _write_through_cancel(
             _record_control_audit(
@@ -3754,18 +3755,23 @@ async def _record_refused_control_audit(
                 role="source",
                 running=False,
                 client=client,
-                reason="store_unavailable" if store_fault else None,
+                reason=reason,
             ),
-            lambda: _lost_row("connection_control", actor, f"refused {action} of {name}"),
+            lambda: _lost_row(
+                "connection_control",
+                actor,
+                f"refused {action} of {name} at {client or '-'}, reason {reason or '-'}",
+            ),
         ),
         log=_log,
-        message="a refused %s of inbound connection %s by %s at %s: its connection_control row "
-        "failed",
+        message="a refused %s of inbound connection %s by %s at %s, reason %s: its "
+        "connection_control row failed",
         args=lambda: (
             action,
             scrub_log_argument(name),
             scrub_log_argument(actor),
             scrub_log_argument(client or "-"),
+            reason or "-",
         ),
         # (), as write_audit_soft's docstring asks where a raise would replace the answer owed.
         defects=(),
@@ -3847,6 +3853,9 @@ _ANCHOR_STORE_RESTART_DETAIL = (
     "the engine could not reach its store to check a trust anchor, so this restart left the "
     "connection stopped; start it once the store is back, and see the engine log"
 )
+
+#: The two lines of a connection test the CA check stopped before it dialled anything.
+_ANCHOR_CHECK_STOPPED_DETAILS: Final = frozenset({_ANCHOR_REFUSED_DETAIL, _ANCHOR_STORE_DETAIL})
 
 
 async def _run_connection_test(
@@ -5381,6 +5390,7 @@ def create_app(
         rr, side = await _resolve_connection(engine, identity, name, client, role=role)
         if rr is not None and side == "in":
             refused: HTTPException | None = None
+            store_fault = False
             try:
                 # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
@@ -5400,7 +5410,8 @@ def create_app(
                 # the CA's path and SHA-256, is not left on the 409's __context__.
                 # Vault BACKLOG #3746: the lane's fixed line is a TrustAnchorError for a store fault
                 # too, raised from it. Nothing is known against the CA, so that is a 503.
-                if explicit_cause(exc, AnchorStoreUnavailable) is None:
+                store_fault = explicit_cause(exc, AnchorStoreUnavailable) is not None
+                if not store_fault:
                     refused = HTTPException(409, _ANCHOR_REFUSED_DETAIL)
                 elif action == "restart":
                     refused = HTTPException(503, _ANCHOR_STORE_RESTART_DETAIL)
@@ -5428,7 +5439,7 @@ def create_app(
                     identity,
                     name,
                     action,
-                    store_fault=refused.status_code == 503,
+                    store_fault=store_fault,
                     client=client,
                 )
                 raise refused
@@ -5639,34 +5650,40 @@ def create_app(
         # Scope before existence, so a scoped caller cannot probe for names (BACKLOG #2551).
         rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         result = await _run_connection_test(rr, name, direction)
+        actor, client = identity.username, client_ip(request)
+        row = json.dumps(
+            {
+                "connection": name,
+                "direction": direction,
+                "supported": result.supported,
+                "success": result.success,
+                "detail": result.detail,
+            }
+        )
 
-        async def write_row() -> None:
-            await engine.store.record_audit(
-                "connection_test",
-                actor=identity.username,
-                channel_id=name if direction == "in" else None,
-                detail=json.dumps(
-                    {
-                        "connection": name,
-                        "direction": direction,
-                        "supported": result.supported,
-                        "success": result.success,
-                        "detail": result.detail,
-                    }
-                ),
-                client=client_ip(request),
+        def write_row() -> Coroutine[Any, Any, None]:
+            channel_id = name if direction == "in" else None
+            return engine.store.record_audit(
+                "connection_test", actor=actor, channel_id=channel_id, detail=row, client=client
             )
 
-        if result.detail != _ANCHOR_STORE_DETAIL:
+        if result.detail not in _ANCHOR_CHECK_STOPPED_DETAILS:
             await write_row()
             return result
-        # Vault BACKLOG #3746: the store that stopped the check is likely to refuse this row too.
-        # Nothing was dialled, and a raise would replace the store line with a 500, so () defects.
+        # Vault BACKLOG #3746: a test the CA check stopped dialled nothing, and a store that
+        # refused the check's rows is likely to refuse this one too. A raise would replace the
+        # fixed line with a 500, so () defects.
         await write_audit_soft(
-            write_row,
+            lambda: _write_through_cancel(
+                write_row(), lambda: _lost_row("connection_test", actor, row)
+            ),
             log=_log,
-            message="a connection test of %s by %s: its connection_test row failed",
-            args=lambda: (scrub_log_argument(name), scrub_log_argument(identity.username)),
+            message="a connection test by %s at %s: its connection_test row failed. Lost row: %s",
+            args=lambda: (
+                scrub_log_argument(actor),
+                scrub_log_argument(client or "-"),
+                scrub_log_argument(row),
+            ),
             defects=(),
         )
         return result
