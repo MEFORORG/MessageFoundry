@@ -6971,8 +6971,8 @@ def _url_scheme(value: str) -> bool:
     It answers yes or no, and hands back no text, because a refusal quotes no part of the value
     (vault BACKLOG #2850). A URL can carry a credential (``https://user:pw@``, a signed query), the
     matched scheme is whatever text sits in front of ``://``, and :func:`settings_error_detail`
-    prints a validator's message as written: to stderr, a service log, and since vault BACKLOG
-    #2600 ``security show``'s JSON."""
+    prints a validator's message as written, to at least stderr, a service log, and since vault
+    BACKLOG #2600 ``security show``'s JSON."""
     return _URL_SCHEME.match(value.strip().lower()) is not None
 
 
@@ -10747,9 +10747,10 @@ def settings_error_detail(exc: Exception) -> str:
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
     refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
-    message must name the setting and never quote a secret value. The OIDC URL refusals quote no
-    part of the URL for that reason, and since vault BACKLOG #2850 neither do the ``[backup]`` and
-    ``[dr]`` URL refusals (:func:`_url_scheme`).
+    message must name the setting and never quote a secret value. The ``[backup]`` and ``[dr]`` URL
+    refusals quote no part of the URL for that reason (vault BACKLOG #2850, :func:`_url_scheme`).
+    The OIDC endpoint refusal of a user name or password does not either, but the
+    ``oidc_allowed_endpoints`` refusal quotes the host it refused.
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is

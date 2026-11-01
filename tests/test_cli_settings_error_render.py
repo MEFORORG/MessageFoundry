@@ -296,7 +296,7 @@ def test_a_json_caller_still_gets_a_json_error(
     assert _CANARY not in error and _MESSAGE in error
 
 
-#: The four path settings that refuse a URL: (model, field). Vault BACKLOG #2850.
+#: The path settings held to a refusal that quotes nothing: (model, field). Vault BACKLOG #2850.
 _PATH_FIELDS: list[tuple[type[BaseModel], str]] = [
     (BackupSettings, "destination"),
     (DrSettings, "seed_archive"),

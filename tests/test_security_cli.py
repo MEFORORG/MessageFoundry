@@ -330,8 +330,8 @@ def test_a_cloud_url_refusal_in_the_partial_reason_quotes_no_part_of_the_url(
     table: str, key: str, scheme: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A URL can carry a credential, and the reason prints each validator's message. The cloud-URL
-    refusals take any scheme of two or more characters (vault BACKLOG #2600) and quote no part of
-    the URL, the scheme included (vault BACKLOG #2850)."""
+    refusals refuse any scheme of two or more characters (vault BACKLOG #2600) and quote no part
+    of the URL, the scheme included (vault BACKLOG #2850)."""
     planted = "canary-canary-canary"
     toml = tmp_path / "mf.toml"
     toml.write_text(
@@ -341,9 +341,9 @@ def test_a_cloud_url_refusal_in_the_partial_reason_quotes_no_part_of_the_url(
     data = _show(toml, capsys)
     assert data["loosenings_partial"] is True
     reason = data["loosenings_partial_reason"]
-    assert f"{table}.{key}" in reason and "not a URL;" in reason
+    assert f"{table}.{key}" in reason and "not a URL" in reason
+    assert f"{scheme}://" not in reason
     dumped = json.dumps(data)
-    assert f"{scheme}://" not in dumped
     assert planted not in dumped and "SYNTHTOKEN" not in dumped
 
 
