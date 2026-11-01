@@ -2272,8 +2272,10 @@ the same permission set on the same method reds CI until it is listed here.
 > IDE promote pre-flight would stall on a second person. So under dual control, a `config:deploy`
 > holder who can also write the config directory can have a module run with no second approver,
 > though nothing is applied. That stays true until a dry run can run in a throwaway worker. A restart
-> also executes what the directory holds. `tests/test_connection_flag.py` pins
-> this behaviour, so a change to it fails there and this note gets read again. A connection flag
+> also executes what the directory holds. `tests/test_connection_flag.py` pins that a dry run runs
+> the modules and applies nothing, and `test_dry_run_reload_is_never_held` in
+> `tests/test_dual_control_reload.py` pins, through the route, that `[approvals]` does not hold it.
+> A change to either fails there and this note gets read again. A connection flag
 > toggle is not such a route: the store holds the flag, so a toggle runs no config module and writes
 > no file in the config directory.
 >

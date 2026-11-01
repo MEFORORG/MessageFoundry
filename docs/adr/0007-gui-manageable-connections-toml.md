@@ -198,7 +198,7 @@ touch this feature adds.
 
 **What was wrong with the flag in `connections.toml`.** A toggle's validate step called `load_config`
 on the live directory, so one toggle ran every config module in the engine's process. That is a
-trigger for code execution from a route with no second approver, for a field that decides nothing.
+trigger for code execution from a route with no second approver, for a field no engine path reads.
 The write also needed the service account to hold write access to the directory it executes code
 from, which `install-service.ps1` does not grant, and a cluster node had to refuse the toggle because
 it could reach only its own copy.
@@ -208,15 +208,19 @@ it could reach only its own copy.
 1. **`flagged`, and only `flagged`, moves to a new `connection_flag` table on all three store
    backends.** `auto_start` and `deployed` share the old tables, and both act: the runner skips and
    starts listeners on them. They stay in `connections.toml`, inside the ADR 0041 fingerprint.
-2. **No seal.** The flag decides nothing, so nothing a seal would protect rests on it. What a database
-   writer with no key can do is move a marker on the console, which is attention, not access.
+2. **No seal.** The flag drives no engine path: no start, reload, routing or delivery path reads
+   it. It does feed the console's Flagged-only filter, and select-all honours that filter, so a
+   database writer with no key can move a marker and could shape a bulk action's target set. The
+   owner accepted that reach on 2026-11-01; *Accepted residual* below records what bounds it.
    `tests/test_connection_flag_readers.py` fails when a new reader appears. That test is what brings
-   the seal question back if the flag ever comes to act.
+   the seal question back if the flag ever comes to drive an engine path.
 3. **A row is the flag.** A flagged connection has a row, keyed by name and direction, and an
    unflagged one has none. No value is parsed or validated. Nothing in a start or a reload
    reads the table, and the flag is off the `Registry`, so no stored row can refuse either. The
    dashboard read fails soft: a row the driver cannot decode costs every marker, logged once per run
-   of failures at WARNING, and never the page.
+   of failures at WARNING, and never the page. Until the read recovers, each row's flag is unknown
+   rather than unset: `ConnectionRow.flagged` is `null`, the row offers no toggle, Flagged only hides
+   no row, and a notice above the table says why.
 4. **The store is the only source.** The `flagged` TOML key and the `flagged=` declaration argument
    are removed, and the loader refuses both. Ignoring the key would leave a hand edit that reads as
    flagging a connection and flags nothing. There are no deployments, so there is nothing to migrate
@@ -243,6 +247,15 @@ and nothing compares them. An unusable row never refuses anything. A row also ou
 connection removed or renamed leaves a row that matches nothing, which no route clears, and a later
 connection of that name takes the flag.
 
+**Accepted residual: the flag reaches a bulk action (owner ruling 2026-11-01).** Flagged only hides
+rows, select-all takes only the rows left on screen, and that selection then goes into a bulk action
+such as Stop, Restart, Reset or Purge. So a database writer who sets or clears rows could add a
+connection to that target set or keep one out of it. Asked whether to accept this, the owner chose
+*"Accept, record the reach"*, so the filter and select-all stay as they are. What bounds it: a row
+select-all takes is on screen as it is taken, the toolbar counts the selection beside Go, and an
+operator must press Go. Purge then adds a confirm page naming each outbound. Stop, Restart and Reset
+have no such page, and a selected row a later refresh hides stays selected, so it is still acted on.
+
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.
 [SECURITY.md](../SECURITY.md) records it, until a dry run can run in a throwaway worker.
@@ -255,8 +268,13 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
 - **AC-3** — WHEN the store holds a row no toggle could write, THE SYSTEM SHALL start and reload as
   though it were absent.
   → `tests/test_connection_flag.py::test_a_stored_row_refuses_neither_a_start_nor_a_reload`
-- **AC-4** — WHEN a module other than the listed display code reads the flag, THE build SHALL fail.
+- **AC-4** — WHEN a module other than the listed dashboard and console code reads the flag, THE build
+  SHALL fail.
   → `tests/test_connection_flag_readers.py`
+- **AC-5** — WHEN the flag read fails, THE SYSTEM SHALL answer the dashboard with each row's flag
+  unknown, offer no toggle, hide no row under Flagged only, and say why on the page.
+  → `tests/test_connection_audit_writes.py::test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page`,
+  `packaging/messagefoundry-webconsole/tests/test_ui_flag_read_failed.py`
 
 ---
 
@@ -300,10 +318,13 @@ left for a future, owner-chosen, store-serialized effort.
   connection, THE SYSTEM SHALL persist `flagged` via the comment-preserving validate-before-persist
   writer AND reflect it on the live `ConnectionRow.flagged`, constructing no channel/route object and
   making no store schema change.
-  → `tests/test_connection_flag.py::test_flag_toggle_persists_and_reflects`
+  → Withdrawn with the behaviour. The 2026-10-31 amendment deleted its test; its own AC-1 to AC-3
+  replace this criterion.
 - **AC-2 (amend)** — WHEN the flag toggle targets a code-first connection (not in `connections.toml`),
   THE SYSTEM SHALL refuse it (409) and leave `connections.toml` untouched.
-  → `tests/test_connection_flag.py::test_flag_toggle_refuses_code_first`
+  → Withdrawn with the behaviour. The 2026-10-31 amendment deleted its test, and a code-first
+  connection now takes the flag: `tests/test_connection_flag.py::test_a_code_first_connection_takes_the_flag`.
 - **AC-3 (amend)** — THE `connections_edit` write schema SHALL stay set-equal to the loader's read
   schema per direction (the `flagged` key is in both), so the #234 key-parity test stays green.
-  → `tests/test_connections_file.py::test_write_schema_matches_read_schema_per_direction`
+  → Set-equal still holds, and `flagged` is now in neither schema:
+  `tests/test_connections_file.py::test_write_schema_matches_read_schema_per_direction`.
