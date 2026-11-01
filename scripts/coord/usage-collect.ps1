@@ -235,17 +235,19 @@ try {
     # direction. A refused reading leaves the published window whole, its own age included, so the
     # staleness guard keeps counting from the last real observation.
     #
-    # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. A gone reading on an empty directory, over a
-    # window stamped with another root, or over one with no reset, is published and reaches the history.
-    # Nothing here reads the clock against a lone reading. The reader is what stops its number being
-    # used: it reports any window past its reset as UNKNOWN.
+    # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. At least these gone readings are published and
+    # reach the history: one on an empty directory, one over a window stamped with another root or with
+    # no reset, one higher than the published window for the same gone reset, and one with a later reset
+    # than the published window. Nothing here reads the clock against a lone reading. The reader reports
+    # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
+    # row can still be read: with no current reset, usage.ps1's rate skips its reset filter.
     #
     # AN EQUAL READING IS REFUSED TOO, SO THE AGE COUNTS FROM THE LAST CHANGE. The payload carries no
     # time of its own, so an idle session's cached number looks exactly like a live flat one. Restamping
     # it let one idle terminal keep a frozen number fresh while sessions that never publish burned the
-    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. While
-    # its reset is ahead the number still stands as a floor: usage.ps1 publishes it as level_floor, and
-    # the gate's rung reads a stale reading at the rung as a HIT.
+    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. On the
+    # conditions at level_floor in usage.ps1, the number still stands as a floor, and the gate's rung
+    # reads it as a HIT at the level or the ceiling.
     #
     # A READING WITH NO READABLE RESET CANNOT PROVE WHICH WINDOW IT BELONGS TO. So while the published
     # reset is still ahead it is refused, higher or not. Taken bare, it would wipe the reset this rule

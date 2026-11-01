@@ -365,13 +365,6 @@ def test_with_no_published_reset_there_is_no_floor(tmp_path: Path) -> None:
     assert captured_at(tmp_path) > first
 
 
-def test_a_bare_reading_replaces_a_window_whose_reset_has_passed(tmp_path: Path) -> None:
-    """The floor ends with its window. Nothing is ahead to protect, so the reading is taken."""
-    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(95.0, -300)}})
-    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": {"used_percentage": 2.0}}})
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
-
-
 def test_a_gone_reading_on_an_empty_directory_is_published_and_read_as_unknown(
     tmp_path: Path,
 ) -> None:
@@ -533,6 +526,22 @@ def publish(
     (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
+def _stamp(state: Path, root: Path) -> None:
+    """Stamp a published document and its window with ``root``, as a pinned collector would."""
+    doc = latest(state)
+    doc["published_by"]["config_root_env"] = str(root)
+    doc["seven_day"]["config_root_env"] = str(root)
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _floor(state: Path, **published: Any) -> float | None:
+    """The level_floor of a reading of this root's, read with -StateDir so wiring does not apply."""
+    publish(state, **published)
+    _stamp(state, state.parent)
+    floor: float | None = read(state)[1]["seven_day"]["level_floor"]
+    return floor
+
+
 def write_history(state: Path, points: list[tuple[float, float]], seven_epoch: int) -> None:
     """points = [(minutes_ago, seven_day_pct)] within one window epoch."""
     state.mkdir(parents=True, exist_ok=True)
@@ -578,20 +587,70 @@ def test_a_stale_reading_with_its_reset_ahead_is_a_floor_and_nothing_else_is(
 ) -> None:
     """The gate may HALT on level_floor, so only a reading that was once true and whose window is
     still running may carry it. A future date, or no reset to prove the window, proves nothing."""
-    publish(tmp_path, seven=95.0, age_min=75)
-    assert read(tmp_path)[1]["seven_day"]["level_floor"] == pytest.approx(95.0)
-
-    publish(tmp_path, seven=95.0)
-    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "a fresh reading is no floor"
-
-    publish(tmp_path, seven=95.0, age_min=-120)
-    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "a future date proves nothing"
+    assert _floor(tmp_path, seven=95.0, age_min=75) == pytest.approx(95.0)
+    assert _floor(tmp_path, seven=95.0) is None, "a fresh reading is no floor"
+    assert _floor(tmp_path, seven=95.0, age_min=-120) is None, "a future date proves nothing"
 
     publish(tmp_path, seven=95.0, age_min=75)
+    _stamp(tmp_path, tmp_path.parent)
     doc = latest(tmp_path)
     del doc["seven_day"]["resets_at_epoch"]
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
     assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "no reset proves no window"
+
+
+@pytest.mark.parametrize(
+    ("doc_root", "window_root"),
+    [
+        pytest.param(None, None, id="no-stamp"),
+        pytest.param("unset", "unset", id="unset"),
+        pytest.param("own", "unset", id="window-unset"),
+        pytest.param("unset", "own", id="document-unset"),
+    ],
+)
+def test_a_stale_reading_with_unverified_provenance_is_no_floor(
+    tmp_path: Path, doc_root: str | None, window_root: str | None
+) -> None:
+    """Halting until the reset on a number this reader cannot tie to this account is too long a
+    deferral. Such a reading answers REVIEW, as it did before the floor."""
+    publish(tmp_path, seven=95.0, age_min=75)
+    own = str(tmp_path.parent)
+    doc = latest(tmp_path)
+    if doc_root:
+        doc["published_by"]["config_root_env"] = own if doc_root == "own" else doc_root
+    if window_root:
+        doc["seven_day"]["config_root_env"] = own if window_root == "own" else window_root
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None
+
+
+def test_a_root_wired_elsewhere_gets_no_floor_and_a_wired_one_does(fake_home: Path) -> None:
+    pin = fake_home / ".claude-account-1"
+    publish(pin / "mefor-usage", seven=95.0, age_min=75)
+    _stamp(pin / "mefor-usage", pin)
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["seven_day"]["level_floor"] is None, "an unwired root's reading is no floor"
+
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["seven_day"]["level_floor"] == pytest.approx(95.0), "control: wired, it is one"
+
+
+@pytest.mark.parametrize(
+    ("resets_in_min", "expected"),
+    [
+        pytest.param(9000, 95.0, id="fits-a-week"),
+        pytest.param(10050, None, id="age-plus-reset-past-a-week"),
+        pytest.param(43200, None, id="reset-a-month-ahead"),
+    ],
+)
+def test_no_floor_outlasts_the_seven_day_window(
+    tmp_path: Path, resets_in_min: int, expected: float | None
+) -> None:
+    """A reading 75 minutes old cannot belong to a 7-day window that ends more than 6 days and 22
+    hours away. Without this bound a wrong floor could hold for as long as its reset says."""
+    epoch = int(time.time()) + resets_in_min * 60
+    assert _floor(tmp_path, seven=95.0, age_min=75, seven_epoch=epoch) == expected
 
 
 def test_a_never_published_window_is_unknown_not_zero(tmp_path: Path) -> None:

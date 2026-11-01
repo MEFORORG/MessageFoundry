@@ -401,28 +401,41 @@ roster alias of the Lander.
 > the value in either direction. A reading with no readable reset is refused while the published reset
 > is ahead, higher or not, because it cannot prove which window it belongs to.
 >
-> **The age therefore counts from the last change, and age alone does not block a hit while the reset is
-> known and ahead.** The payload carries no time of its own, so an idle session's cached number looks
-> like a live flat one. Restamping an equal reading let one idle terminal keep a frozen number fresh,
-> and the rung read OK on it. So a flat account, live or not, goes stale after 20 minutes and reads
-> UNKNOWN. That reading still proves at least its level while its reset is ahead, so `usage.ps1`
-> publishes it as `level_floor`, and the rung is hit at the 90 percent level or the 98 percent ceiling.
-> Below them the gate answers REVIEW, because a stale number cannot clear work. At least a future-dated
-> reading, an undateable one and one with no reset set no floor, so those answer REVIEW at any level.
-> A Desktop session on a root holding such a floor gets HALT, which narrows the gap this section names.
+> **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot
+> prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
+> missing reset must not loosen the rung.
 >
-> **A stale reading has no rate, so the level decides it.** Nothing is projected from a stale reading.
-> So from 90 to 97 percent the rung is hit even where the rate a fresher reading had would have cleared
-> it, because the window resets first. That departs from the rate-governs rule for stale readings only.
+> **The age therefore counts from the last change, and only a level or ceiling hit survives age.** The
+> payload carries no time of its own, so an idle session's cached number looks like a live flat one.
+> Restamping an equal reading let one idle terminal keep a frozen number fresh, and the rung read OK on
+> it. So a flat account, live or not, goes stale after 20 minutes and reads UNKNOWN. `usage.ps1`
+> publishes such a reading as `level_floor` when its reset is ahead, its age plus the time to its reset
+> fits one 7-day window, and its provenance is trusted: the document and the window carry a verified
+> root stamp, and the root is wired here. The rung is then hit at the 90 percent level or the 98 percent
+> ceiling. Every other stale reading answers REVIEW at any level, including at least a future-dated one,
+> an undateable one, a stale one with no reset, and one with no verified stamp. A Desktop session on a
+> root holding such a floor gets HALT, which narrows the gap this section names.
+>
+> **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale
+> reading. A fresh 70 percent with 45 minutes to empty hits; the same reading once stale answers REVIEW.
+> From 90 to 97 percent the opposite applies: the rung is hit even where the rate a fresher reading had
+> would have cleared it, because the window resets first. That departs from the rate-governs rule for
+> stale readings only.
 >
 > The rule has at least these limits, all of them open:
 >
-> - It needs a published window to compare with. A gone reading on an empty directory, over a window
->   stamped with another root, or over one with no reset, is published and reaches the history. A higher
->   reading for the same gone reset replaces too. `usage.ps1` is what stops the number being used, by
->   reporting any window past its reset as UNKNOWN.
+> - It needs a published window to compare with. At least these gone readings are published and reach
+>   the history: one on an empty directory, one over a window stamped with another root or with no reset,
+>   one higher than the published window for the same gone reset, and one with a later reset than the
+>   published window. `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its
+>   level is not graded. Its history row can still feed a rate, because with no current reset the rate
+>   skips its reset filter.
 > - With no published reset ahead, there is no floor at all: a reading with no reset is taken whatever
->   its value, and an equal one refreshes the age, until a reading brings a reset.
+>   its value, and an equal one refreshes the age, until a reading brings a reset. Below the rung the gate
+>   answers REVIEW for it.
+> - Refusing a reading with no reset while the published reset is ahead drops true evidence too. A real
+>   99 over a published 89 cannot raise the number, so the rung does not hit on it until a reading that
+>   carries a reset arrives.
 > - A `level_floor` holds only while the published reset is right. After a re-login or a moved reset, a
 >   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. Only a
 >   new reading clears it, and only an interactive terminal session on that root publishes one.

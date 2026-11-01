@@ -852,16 +852,18 @@ function Get-DecisionCostRung {
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
 
-      AGE ALONE DOES NOT BLOCK A HIT WHILE THE RESET IS KNOWN AND AHEAD. An equal reading does not
-      refresh its age, so a flat pool goes stale, and a spent one cannot rise. A stale reading whose
-      reset is ahead still proves at least its level, which usage.ps1 publishes as level_floor, so at
-      the level or the ceiling it is HIT. It has no rate, since nothing is projected from a stale
-      reading, so the level decides even where a fresher reading's rate would have cleared it. Below
-      them it is UNKNOWN, because a stale number cannot clear work. At least a reading with no reset, a
-      future-dated one and an undateable one carry no floor, whatever their number.
+      ONLY A LEVEL OR CEILING HIT SURVIVES AGE, AND ONLY ON A level_floor. An equal reading does not
+      refresh its age, so a flat pool goes stale, and a spent one cannot rise. usage.ps1 publishes
+      level_floor on a stale reading with its reset ahead and inside one 7-day window, and with trusted
+      provenance. Such a reading has reached at least that level, unless the reset has moved or usage
+      did fall, so at the level or the ceiling it is HIT. A rate hit does not survive: nothing is
+      projected from a stale reading, so it has no rate. The level then decides, even where a fresher
+      reading's rate would have cleared it, and a reading the rate would have hit below the level goes
+      to UNKNOWN. Every other stale reading is UNKNOWN, because a stale number cannot clear work.
 
-      UNKNOWN when the reading is missing, stale with no floor at the rung, refused, past its reset (it
-      describes a window that is gone, so it neither clears nor halts), or usage.ps1 calls it UNKNOWN overall (its
+      UNKNOWN when the reading is missing, stale and not a floor at the rung, refused, past its reset (it
+      describes a window that is gone, so it neither clears nor halts), below the rung with no reset
+      time (it cannot prove which window it belongs to), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
       window's own state does not), unless the window grades HIT: a hit is never downgraded, since
       that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
@@ -906,6 +908,12 @@ function Get-DecisionCostRung {
     $week = Get-DecisionJsonValue $j 'seven_day'
     $pct = Get-DecisionJsonValue $week 'used_percentage'
     $weekState = [string](Get-DecisionJsonValue $week 'state')
+    $toReset = Get-DecisionJsonValue $week 'minutes_to_reset'
+    # BEFORE THE FLOOR, so a gone window cannot HIT by any route.
+    # -lt, not -le: usage.ps1 rounds to whole minutes, so 0 can be a live window's last 30 seconds.
+    if ($null -ne $toReset -and [double]$toReset -lt 0) {
+        return (New-DecisionRung 'UNKNOWN' "the weekly window's reset has passed, so this reading describes a window that is gone")
+    }
     $floor = Get-DecisionJsonValue $week 'level_floor'
     if ($null -ne $floor -and ([double]$floor -ge 98 -or [double]$floor -ge $lv.HoldAt)) {
         return (New-DecisionRung 'HIT' "weekly at least $floor%, a stale reading whose reset is still ahead, so that level stands; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
@@ -918,11 +926,6 @@ function Get-DecisionCostRung {
     $pct = [double]$pct
     $rate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
     $toEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
-    $toReset = Get-DecisionJsonValue $week 'minutes_to_reset'
-    # -lt, not -le: usage.ps1 rounds to whole minutes, so 0 can be a live window's last 30 seconds.
-    if ($null -ne $toReset -and [double]$toReset -lt 0) {
-        return (New-DecisionRung 'UNKNOWN' "the weekly window's reset has passed, so this reading describes a window that is gone")
-    }
     $at = "weekly at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
     $rung = if ($pct -ge 98) {
         New-DecisionRung 'HIT' "$at. At the ceiling (98 percent, usage.ps1's own CRITICAL band), whatever the rate"
@@ -941,6 +944,11 @@ function Get-DecisionCostRung {
     # A HIT stands whatever the overall state: halting on a reading that may be another root's
     # costs a deferral, while dropping it to UNKNOWN would let a session at the ceiling act.
     if ($rung.State -eq 'HIT') { return $rung }
+    # A reading with no reset cannot prove which window it belongs to, so it may be last week's. A
+    # missing reset must not loosen the rung, which is why this comes after the HIT above.
+    if ($null -eq $toReset) {
+        return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but this reading carries no reset time, so it cannot prove which window it belongs to")
+    }
     if ($overall -notin @('OK', 'WARN', 'CRITICAL')) {
         return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 reads '$overall' overall: $(Get-DecisionJsonValue $j 'statusline_state')")
     }

@@ -327,6 +327,39 @@ def test_a_reading_whose_reset_has_passed_neither_clears_nor_halts(sb: Sandbox, 
     assert code == REVIEW and "reset has passed" in why(doc), why(doc)
 
 
+def test_a_floor_past_its_reset_neither_clears_nor_halts(sb: Sandbox) -> None:
+    """The guard runs before the floor, so the rung holds this limb on its own too."""
+    seed_vault(sb, calibrated("manager"))
+    stale = usage(99.0, state="UNKNOWN", level_floor=99.0, minutes_to_reset=-5, reason="old")
+    write_fake_usage(_usage_path(sb), stale, code=20)
+    code, doc = gate(sb)
+    assert code == REVIEW and "reset has passed" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({}, id="no-rate"),
+        pytest.param({"rate_pct_per_hr": 2.0, "minutes_to_empty": 1500}, id="rate-off-the-rung"),
+    ],
+)
+def test_a_reading_below_the_rung_with_no_reset_cannot_clear(
+    sb: Sandbox, fields: dict[str, Any]
+) -> None:
+    """It cannot prove which window it belongs to, so it may be last week's number."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(40.0, minutes_to_reset=None, **fields))
+    code, doc = gate(sb)
+    assert code == REVIEW and "no reset time" in why(doc), why(doc)
+
+
+def test_a_reading_at_the_rung_with_no_reset_still_halts(sb: Sandbox) -> None:
+    """The control: a missing reset must not loosen the rung in either direction."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(95.0, state="WARN", minutes_to_reset=None))
+    assert gate(sb)[0] == HALT
+
+
 def test_an_unknown_cost_reading_reviews_rather_than_halts(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), {"state": "UNKNOWN", "reason": "no statusLine"}, code=20)
@@ -443,6 +476,34 @@ def test_the_real_usage_reader_feeds_the_rung(
     assert code == expected, why(doc)
 
 
+def _fire(
+    sb: Sandbox, state: Path, seven: dict[str, Any], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """One statusLine fire through the real collector."""
+    payload = json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}})
+    return sb.run(COORD / "usage-collect.ps1", "-StateDir", str(state), stdin=payload, **env)
+
+
+def _wire(sb: Sandbox, root: Path, home: Path, env: dict[str, str]) -> None:
+    """Wire ``root``'s statusLine with the real installer, so the reader trusts it."""
+    proc = sb.run(
+        COORD / "install-usage-statusline.ps1",
+        "-ConfigDir",
+        str(root),
+        "-HomeDir",
+        str(home),
+        "-CollectorPath",
+        str(COORD / "usage-collect.ps1"),
+        **env,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+
+
+def _real_gate(sb: Sandbox, env: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    real = sb.repo / "scripts" / "coord" / "usage.ps1"
+    return gate(sb, "-UsageScript", str(real), item="1", **env)
+
+
 def _stale(pct: float, **over: Any) -> dict[str, Any]:
     """usage.ps1 -Json's shape for a reading past the age limit, with its reset still ahead."""
     fields: dict[str, Any] = {
@@ -503,28 +564,48 @@ def test_a_flat_full_pool_held_past_the_age_limit_halts_through_the_real_scripts
     sb: Sandbox, tmp_path: Path
 ) -> None:
     """A spent pool cannot rise, so an equal reading never refreshes its age, and this state is
-    certain. It used to fall to REVIEW until the reset."""
+    certain. It used to fall to REVIEW until the reset. On a root wired elsewhere the same reading
+    has no trusted provenance, so it stays at REVIEW."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
     env = {"CLAUDE_CONFIG_DIR": str(root)}
     seven = {"used_percentage": 100, "resets_at": int(ago().timestamp()) + 200000}
-    payload = json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}})
 
-    def fire() -> subprocess.CompletedProcess[str]:
-        return sb.run(COORD / "usage-collect.ps1", "-StateDir", str(state), stdin=payload, **env)
+    def fire() -> None:
+        assert _fire(sb, state, seven, env).returncode == 0
 
-    assert fire().returncode == 0
+    fire()
     published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
     published["seven_day"]["captured_at"] = ago(minutes=25).isoformat().replace("+00:00", "Z")
     (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
-    assert fire().returncode == 0, "the idle fire"
+    fire()  # the idle session
 
     seed_vault(sb, calibrated("manager"))
-    real = sb.repo / "scripts" / "coord" / "usage.ps1"
-    code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
+    assert _real_gate(sb, env)[0] == REVIEW, "control: unwired, the floor does not apply"
+
+    _wire(sb, root, tmp_path, env)
+    code, doc = _real_gate(sb, env)
     # "at least" is the stale floor's own reason. A fresh 100 would also HALT, on the ceiling.
     assert code == HALT and "at least" in why(doc), why(doc)
+
+
+def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """The collector takes it, because no reset is ahead to protect. It used to clear the rung: a
+    40 that cannot say which window it belongs to, on a pool that may be spent."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    gone = {"used_percentage": 95, "resets_at": int(ago().timestamp()) - 300}
+    assert _fire(sb, state, gone, env).returncode == 0
+    assert _fire(sb, state, {"used_percentage": 40}, env).returncode == 0
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW and "no reset time" in why(doc), why(doc)
 
 
 def test_the_real_reader_sends_a_passed_reset_to_review_not_halt(

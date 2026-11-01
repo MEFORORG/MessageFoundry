@@ -495,10 +495,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         rate_pct_per_hr  = $null
         projected_at_reset = $null
         minutes_to_empty = $null
-        # Set only on a reading past -MaxAgeMinutes whose reset is known and still ahead. It says the
-        # window now running has reached at least this level: usage does not fall inside a reset
-        # period, so age takes away what the number says about now, not what it proves. Get-DecisionCostRung
-        # halts on it. A future date or an undateable reading sets nothing, because it proves nothing.
+        # Set only on a reading past -MaxAgeMinutes with its reset ahead and inside one 7-day window, and
+        # with trusted provenance. Usage does not fall inside a reset period, so such a reading says the
+        # window has reached at least this level, unless the reset has moved or usage did fall.
+        # Get-DecisionCostRung halts on it at the level or the ceiling, and nothing else reads it.
+        # At least a future date, an undateable reading and one with no reset set nothing.
         level_floor      = $null
         state            = "OK"
         reason           = ""
@@ -519,7 +520,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # root. The mis-wire warning printed above the numbers names that case; this line states the
         # age and stops.
         else { "reading is $age min old (max $MaxAgeMinutes)" }
-        if ($age -gt $MaxAgeMinutes -and $null -ne $minsToReset) { $o.level_floor = $pct }
+        # A window lasts 10080 minutes, so a reading older than that before its reset cannot belong to
+        # that reset. The one minute is the rounding of the two values added here. An unstamped window
+        # cannot be tied to this account; the document's stamp and the wiring are tested below.
+        $fitsAWeek = $null -ne $minsToReset -and ($age + $minsToReset) -le 10081
+        if ($age -gt $MaxAgeMinutes -and $fitsAWeek -and $wEnv -and $wEnv -ne "unset") { $o.level_floor = $pct }
         return $o
     }
 
@@ -569,6 +574,14 @@ $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "
     "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
 
 $overall = $seven.state
+
+# A FLOOR NEEDS TRUSTED PROVENANCE. It can hold a seat at HALT until the reset, which is too long a
+# deferral on a number this reader cannot tie to this account. So a document with no verified stamp, or
+# a root it does not trust, gets no floor and stays UNKNOWN. An explicit -StateDir is exempt from the
+# wiring half, as it is from the verdict below: the operator named the directory.
+if ($seven.Contains('level_floor') -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
+    $seven.level_floor = $null
+}
 
 # A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The
 # diagnosis used to reach the prose only, so a root the script itself called mis-wired still exited 0
