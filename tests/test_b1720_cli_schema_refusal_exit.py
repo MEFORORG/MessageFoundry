@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1720: a server store whose live schema falls short refuses its open with
-``ServerSchemaMismatchError``, and every CLI command that opens the store reports that as could not
-start, exit 2.
+``ServerSchemaMismatchError``, and at least the CLI commands in :data:`_COMMANDS` report that as
+could not start, exit 2.
 
 The error is a ``RuntimeError``, not SQLite's ``sqlite3.DatabaseError``, so no command's SQLite arm
 caught it. Through ``_open_store_or_refuse`` it reached the dispatch floor's exit 1, which

@@ -8895,16 +8895,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except key_unresolved as exc:
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
-    except InsecureHopRefused as exc:
+    except (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # The store hop, refused at the open as `serve` refuses it now that the posture is passed:
         # a server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`.
-        # Its text names the hop and the setting that clears it. Exit 2: could not start.
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
-        return 2
-    except ServerSchemaMismatchError as exc:
-        # BACKLOG #1720: a server store's live schema falls short of this build's DDL batch. The
-        # open rolled the batch back and wrote no marker. Its text lists the differences and the
-        # remedy. Exit 2: could not start, never the dispatch floor's 1, this command's refusal.
+        # Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
+        # store's live schema falls short of this build's DDL batch: the open rolled the batch back
+        # and wrote no marker, and the text lists the differences and the remedy. Exit 2: could not
+        # start, never the dispatch floor's 1, this command's refusal.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
     except TrustAnchorError as exc:
@@ -12298,7 +12295,7 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     code, for ``admin-unlock``, ``admin-set-notify-email`` (vault BACKLOG #3054, item 11),
     ``admin-reset-totp`` and ``backup``, and for ``rotate-key``, where it is an aborted rotation's
     (BACKLOG #2109). The schema refusal rolls the open's DDL batch back and writes no schema marker,
-    and the command has read and written no store row, so it could not start, exit 2. Not "changed
+    and the command has written no store row, so it could not start, exit 2. Not "changed
     nothing": a SQL Server open under ``auto`` may already have switched the database's RCSI
     option on, before the batch. Its text lists the tables, columns and indexes that differ and
     the remedy, and names no row's content. ``audit-verify`` and ``audit-anchor`` open read-only,
