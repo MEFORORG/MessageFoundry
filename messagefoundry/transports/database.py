@@ -105,6 +105,7 @@ from messagefoundry.transports.base import (
     float_setting,
     intake_open,
     poll_interval,
+    port_setting,
     positive_cap,
     register_destination,
     register_source,
@@ -249,9 +250,10 @@ def _build_dsn(
         raise ValueError(
             "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
         )
+    port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
     parts = [
         f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
-        f"SERVER={server},{int(s.get('port', SQLSERVER_DEFAULT_PORT))}",
+        f"SERVER={server},{port}",
         f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
         f"APP={odbc_brace(str(s.get('app_name', 'messagefoundry')))}",

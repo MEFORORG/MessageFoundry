@@ -275,7 +275,7 @@ def test_generic_with_a_driver_known_to_read_port_is_admitted(check: Check, driv
 
 
 def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: Check) -> None:
-    # The preset's connection string sends int(port), so an env()-shaped " 5432" sends 5432.
+    # The preset's connection string sends port_setting's number: an env()-shaped " 5432" sends 5432.
     check({"server": HOST, "database": "d", "port": " 5432"}, PINNED)
 
 
@@ -283,7 +283,7 @@ def test_sqlserver_preset_port_is_read_as_the_connection_string_reads_it(check: 
 def test_sqlserver_preset_port_is_read_with_the_int_the_connection_string_uses(
     check: Check, port: object
 ) -> None:
-    # The preset's connection string sends int(port); a value int() reads as 5432 sends 5432.
+    # The preset's connection string sends port_setting's number, which is 5432 for each of these.
     check({"server": HOST, "database": "d", "port": port}, PINNED)
 
 

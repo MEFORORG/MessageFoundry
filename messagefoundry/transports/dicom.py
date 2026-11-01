@@ -125,6 +125,7 @@ from messagefoundry.transports.base import (
     count_setting,
     float_setting,
     peer_ip_allowed,
+    port_setting,
     positive_cap,
     register_destination,
     register_source,
@@ -1409,7 +1410,7 @@ class DicomScpSource(SourceConnector):
         # inbound); fall back to loopback — never bind all interfaces by accident (DIMSE has no
         # transport auth without the AE/IP allowlists + TLS).
         self._host = str(s.get("host") or "127.0.0.1")
-        self._port = int(s.get("port", 104))
+        self._port = port_setting(s.get("port", 104), transport="DICOM-SCP source")
         contexts = s.get("presentation_contexts")
         self._presentation_contexts: list[str] | None = (
             [str(c) for c in contexts] if contexts else None
@@ -2257,7 +2258,7 @@ class DicomScuDestination(DestinationConnector):
                 "declare it as DICOM(host=..., called_ae_title=...)"
             )
         self._host = str(host)
-        self._port = int(s.get("port", 104))
+        self._port = port_setting(s.get("port", 104), transport="DICOM-SCU destination")
         self._calling_ae_title = str(s["ae_title"])
         called = s.get("called_ae_title")
         # pynetdicom's accept-any token when the peer AE title is left unset.

@@ -126,6 +126,7 @@ from messagefoundry.transports.base import (
     intake_open,
     ledger_holds,
     poll_interval,
+    port_setting,
     positive_cap,
     register_destination,
     register_source,
@@ -967,7 +968,7 @@ class _FtpClient(_RemoteClient):
         name: str = "",
     ) -> None:
         self._host = str(settings["host"])
-        self._port = int(settings.get("port", 21))
+        self._port = port_setting(settings.get("port", 21), transport="REMOTEFILE ftp")
         self._user = settings.get("username")
         self._password = settings.get("password")
         self._tls = tls
@@ -1682,7 +1683,7 @@ class _SftpClient(_RemoteClient):
     def __init__(self, settings: dict[str, Any], *, name: str = "") -> None:
         self._name = name
         self._host = str(settings["host"])
-        self._port = int(settings.get("port", 22))
+        self._port = port_setting(settings.get("port", 22), transport="REMOTEFILE sftp")
         self._user = settings.get("username")
         self._password = settings.get("password")
         self._private_key = settings.get("private_key")
@@ -2171,7 +2172,7 @@ def _anon_ftp_guard(
         raise ValueError(f"{hop_name_prefix(connection)}{exc}") from exc
     return InsecureHopGuard.capture(
         host=str(s["host"]),
-        port=int(s.get("port", 21)),
+        port=port_setting(s.get("port", 21), transport="REMOTEFILE ftp"),
         cell="REMOTEFILE ftp",
         description="cleartext anonymous FTP egress",
         attested=attested,

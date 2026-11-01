@@ -102,6 +102,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     float_setting,
     intake_open,
+    port_setting,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -789,7 +790,7 @@ class MLLPDestination(DestinationConnector):
         if not isinstance(host, str) or not host:
             raise ValueError("MLLP destination requires a 'host' setting (the downstream peer)")
         self.host: str = host
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="MLLP destination")
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="MLLP destination"
         )
@@ -1833,7 +1834,7 @@ class MLLPSource(SourceConnector):
         # host on an inbound). Fall back to loopback for a missing/None value — never bind all
         # interfaces (0.0.0.0) by accident, since MLLP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="MLLP")
         self.encoding: str = s.get("encoding", "utf-8")
         # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
         # The runner builds every other ACK itself.

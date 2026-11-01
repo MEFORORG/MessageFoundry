@@ -815,6 +815,111 @@ def refuse_resolved_verify_off(
         )
 
 
+def refuse_capture_conflicts(
+    type_: ConnectorType, settings: Mapping[str, Any], where: str, *, batched: bool
+) -> None:
+    """Refuse a capture or ``no_ack`` declaration that can never do what it asks (ADR 0013, ADR 0124),
+    before its connector is built.
+
+    It runs twice. ``build_outbound_connection``, the choke point for BOTH the code-first factories
+    and the ``connections.toml`` desugar, passes the spec's literals, and an :func:`env` flag is
+    undecided there: a reference is truthy whatever it resolves to, so reading one as on would refuse
+    a graph whose flag resolves False, and reading one as satisfying ``expect_reply`` would pass a
+    capture with no reply to capture (BACKLOG #3724). A ``statement`` behind ``env()`` is different:
+    this pass judges its repr, which holds the key and any default and never the resolved value. So
+    ``capture_response=True`` is refused beside ``env("sql")`` and passes beside
+    ``env("output_sql")``, and ``capture_out_params=True`` is refused beside ``env("proc")``.
+
+    The resolved settings come through here once more when the connector is built. At least
+    ``messagefoundry check`` and a reload refuse there, ``check`` for the one environment it runs
+    under. At start the refusal fails that connection's lane (ADR 0031) rather than stopping the
+    engine, and a lane that start skips, such as ``auto_start=False``, is judged when it is started.
+    At least these never reach this second pass: a ``deployed=False`` connection, a config dir that
+    declares no instance, which ``check``'s ``build-check`` leg skips, and ``messagefoundry dryrun``,
+    which builds no connector."""
+
+    def on(key: str) -> bool:
+        value = settings.get(key)
+        return bool(value) and not isinstance(value, EnvRef)
+
+    def off(key: str) -> bool:
+        return not settings.get(key)
+
+    # A resolved out-params flag never forced capture_response on, and the connector reads either
+    # flag as capture, so this does too.
+    capturing = on("capture_response") or on("capture_out_params")
+    # BACKLOG #117 (ADR 0124): fire-and-forward MLLP outbound. no_ack skips the ACK read entirely, so
+    # there is nothing to capture, and it is MLLP-only (the generic Tcp()/X12() fire-and-forget is
+    # expect_reply=false). Runs AFTER the reingress→capture desugar, so no_ack+reingress_to is
+    # rejected via the capture_response check too.
+    if on("no_ack"):
+        if type_ is not ConnectorType.MLLP:
+            raise WiringError(
+                f"{where}: no_ack is an MLLP-only fire-and-forward knob "
+                f"(got {type_.value.upper()}) — the generic Tcp()/X12() fire-and-forget is "
+                "expect_reply=false (BACKLOG #117)."
+            )
+        if capturing:
+            raise WiringError(
+                f"{where}: MLLP no_ack=True skips the ACK read, so there is no "
+                "ACK to capture — capture_response/reingress_to is incompatible with no_ack "
+                "(ADR 0124 / BACKLOG #117)."
+            )
+        if on("verify_ack_control_id"):
+            raise WiringError(
+                f"{where}: MLLP no_ack=True skips the ACK read, so there is no "
+                "MSA-2 to match against the sent MSH-10 — verify_ack_control_id is incompatible with "
+                "no_ack (BACKLOG #117 + #82)."
+            )
+    # ADR 0013: response capture must be wiring-valid with no store needed.
+    if capturing:
+        if type_ in (ConnectorType.FILE, ConnectorType.REMOTEFILE):
+            raise WiringError(
+                f"{where}: {type_.value.upper()} has no synchronous response, "
+                "so capture_response=True is invalid (ADR 0013)."
+            )
+        if type_ is ConnectorType.TCP and off("expect_reply"):
+            raise WiringError(
+                f"{where}: TCP capture_response=True requires expect_reply=True "
+                "(there is no reply to capture otherwise) (ADR 0013)."
+            )
+        if type_ is ConnectorType.X12 and off("expect_reply"):
+            raise WiringError(
+                f"{where}: X12 capture_response=True requires expect_reply=True "
+                "(there is no returned interchange to capture otherwise) (ADR 0016)."
+            )
+        if batched:
+            # One batch-level ACK covers the whole envelope; there is no per-row reply to capture or
+            # re-ingress (ADR 0013). Reject the combination rather than silently drop N-1 captures.
+            reason = "reingress_to" if settings.get("reingress_to") else "capture_response"
+            raise WiringError(
+                f"{where}: batch aggregation is incompatible with {reason} "
+                "— one batch ACK cannot fan out to N per-message captured replies (ADR 0082/0013)."
+            )
+        if type_ is ConnectorType.DATABASE:
+            stmt = str(settings.get("statement") or "").lower()
+            if settings.get("capture_out_params"):
+                # #67 (ADR 0013 amendment): a stored-proc CALL captures its OUT params / scalar RETURN
+                # value via a pre-commit readback SELECT in the SAME batch, which may carry NEITHER a
+                # RETURNING nor an OUTPUT token (a scalar `EXEC @rv = proc; SELECT @rv` batch). The
+                # EXPLICIT opt-in flag — NOT a loosening of the substring test — authorizes capture, but
+                # only for an actual stored-proc call, so the flag can't silently mask a plain
+                # INSERT/UPDATE whose result-set would re-run non-idempotently. An undecided flag
+                # takes this arm too: the other one would refuse a proc call it may yet authorize.
+                if on("capture_out_params") and not _is_db_proc_call(stmt):
+                    raise WiringError(
+                        f"{where}: DATABASE capture_out_params=True requires the "
+                        "statement to be a stored-procedure call (an ODBC '{ ... CALL ... }' escape or a "
+                        "leading EXEC/EXECUTE), not a plain write (ADR 0013 amendment, #67)."
+                    )
+            elif "returning" not in stmt and "output" not in stmt:
+                raise WiringError(
+                    f"{where}: DATABASE capture_response=True requires a "
+                    "RETURNING/OUTPUT clause in the statement (it is fetched from the same cursor "
+                    "before commit), not a separate SELECT (ADR 0013)."
+                )
+
+
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
     """Refuse a declaration that claims its hop is both secure and not secure.
 
@@ -1372,11 +1477,14 @@ class _BoolSettings(NamedTuple):
     """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
     factories give it, or ``None`` where they disagree; ``dropped`` names any setting that is ``bool``
     on one factory and anything else on another, and ``split_defaults`` any whose factories give it
-    different defaults. ``tests/test_env_uncast_bool_setting.py`` pins both sets empty."""
+    different defaults. ``factories`` names each factory the scan read: one it misses reads its flags
+    as text again and reports nothing (BACKLOG #3724). ``tests/test_env_uncast_bool_setting.py`` pins
+    ``dropped`` and ``split_defaults`` empty, and ``factories`` against the source."""
 
     defaults: Mapping[str, bool | None]
     dropped: frozenset[str]
     split_defaults: frozenset[str]
+    factories: frozenset[str]
 
 
 @cache
@@ -1401,6 +1509,7 @@ def _bool_settings() -> _BoolSettings:
 
     defaults: dict[str, set[object]] = {}
     other_names: set[str] = set()
+    factories: set[str] = set()
     for obj in globals().values():
         if not inspect.isfunction(obj) or obj.__module__ != __name__:
             continue
@@ -1414,6 +1523,7 @@ def _bool_settings() -> _BoolSettings:
             # Raised, not skipped: a skip would quietly read one factory's flags as text again.
             # A WiringError, so every caller's existing handling of a bad config applies.
             raise WiringError(f"factory {obj.__name__} has annotations that do not resolve")
+        factories.add(obj.__name__)
         for param in signature.parameters.values():
             if param.kind is not inspect.Parameter.KEYWORD_ONLY:
                 continue
@@ -1439,6 +1549,7 @@ def _bool_settings() -> _BoolSettings:
         defaults=MappingProxyType(strict),
         dropped=frozenset(defaults) & frozenset(other_names),
         split_defaults=frozenset(name for name, seen in defaults.items() if len(seen) != 1),
+        factories=frozenset(factories),
     )
 
 
@@ -2425,7 +2536,8 @@ def MLLP(
     (*at-most-once-confirmation*; a connect/drain failure is still charged + retried, so receivers must
     stay idempotent). ``False`` (the default) is **byte-identical** (read + validate one ACK). It
     composes with ``persistent=True`` (no handshake *and* no ACK wait) and is **incompatible** with
-    ``capture_response``/``reingress_to`` (there is no ACK to capture) — both rejected at ``check``.
+    ``capture_response``/``reingress_to`` (there is no ACK to capture) — both rejected at ``check``,
+    a flag behind ``env()`` only once it resolves (:func:`refuse_capture_conflicts`).
 
     ``encoding_characters`` (**outbound only**, Corepoint ``MsgSend -override component`` parity) makes
     this destination re-encode each outgoing message with a different set of HL7 delimiters before
@@ -5371,9 +5483,13 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
     """Resolve a connector ``port`` setting to an ``int`` when possible, else ``None`` (uncheckable).
 
     Handles a literal ``int``, a string literal (``"2575"`` from ``connections.toml``), and an
-    :func:`env` ref (resolved against ``env_values``, applying its cast). A ``bool`` (an ``int``
-    subclass) or an unresolved/unparseable value yields ``None`` so the caller simply skips it — a
-    missing ``env()`` value is reported loud elsewhere (when the connector is built), not doubled here."""
+    :func:`env` ref (resolved against ``env_values``, applying its cast), and reads the number by the
+    connectors' own rule (``transports.base.port_setting``). A value that rule refuses, or an
+    unresolved one, yields ``None`` so the caller simply skips it — a missing ``env()`` value is
+    reported loud elsewhere (when the connector is built), not doubled here. Imported here:
+    ``messagefoundry.transports`` imports this module."""
+    from messagefoundry.transports.base import port_setting
+
     if isinstance(raw, EnvRef):
         if raw.key not in env_values:
             return None
@@ -5384,16 +5500,10 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
             except (ValueError, TypeError):
                 return None
         raw = value
-    if isinstance(raw, bool):
+    try:
+        return port_setting(raw, transport="listener")
+    except ValueError:
         return None
-    if isinstance(raw, int):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return int(raw.strip())
-        except ValueError:
-            return None
-    return None
 
 
 def resolve_listener_binding(
@@ -7524,72 +7634,24 @@ def build_outbound_connection(
             )
         spec.settings["capture_response"] = True
     # #67 (ADR 0013 amendment): capturing a stored-proc's OUT params + scalar return value IMPLIES
-    # capture, so the capture-validity guards below (and the connector) treat it as a capturing outbound.
-    if spec.settings.get("capture_out_params"):
+    # capture, so the capture-validity guards (and the connector) treat it as a capturing outbound.
+    # BACKLOG #3724: an env() ref does not force it, or capture would stay on after the ref resolves
+    # False. Each reader of the flags ORs the two once resolved.
+    out_params = spec.settings.get("capture_out_params")
+    if out_params and not isinstance(out_params, EnvRef):
         spec.settings["capture_response"] = True
-    # BACKLOG #117 (ADR 0124): fire-and-forward MLLP outbound. no_ack skips the ACK read entirely, so
-    # there is nothing to capture, and it is MLLP-only (the generic Tcp()/X12() fire-and-forget is
-    # expect_reply=false). Validate at check/dry-run — a config that can never do what it asks fails
-    # before any store or socket. Runs AFTER the reingress→capture desugar above, so no_ack+reingress_to
-    # is rejected via the capture_response check below too.
-    if spec.settings.get("no_ack"):
-        if spec.type is not ConnectorType.MLLP:
-            raise WiringError(
-                f"outbound connection {name!r}: no_ack is an MLLP-only fire-and-forward knob "
-                f"(got {spec.type.value.upper()}) — the generic Tcp()/X12() fire-and-forget is "
-                "expect_reply=false (BACKLOG #117)."
-            )
-        if spec.settings.get("capture_response"):
-            raise WiringError(
-                f"outbound connection {name!r}: MLLP no_ack=True skips the ACK read, so there is no "
-                "ACK to capture — capture_response/reingress_to is incompatible with no_ack "
-                "(ADR 0124 / BACKLOG #117)."
-            )
-        if spec.settings.get("verify_ack_control_id"):
-            raise WiringError(
-                f"outbound connection {name!r}: MLLP no_ack=True skips the ACK read, so there is no "
-                "MSA-2 to match against the sent MSH-10 — verify_ack_control_id is incompatible with "
-                "no_ack (BACKLOG #117 + #82)."
-            )
-    # ADR 0013: response capture must be wiring-valid at `check`/dry-run time (no store needed), and
-    # this is the choke point for BOTH the code-first factories and the connections.toml desugar.
-    if spec.settings.get("capture_response"):
-        if spec.type in (ConnectorType.FILE, ConnectorType.REMOTEFILE):
-            raise WiringError(
-                f"outbound connection {name!r}: {spec.type.value.upper()} has no synchronous response, "
-                "so capture_response=True is invalid (ADR 0013)."
-            )
-        if spec.type is ConnectorType.TCP and not spec.settings.get("expect_reply"):
-            raise WiringError(
-                f"outbound connection {name!r}: TCP capture_response=True requires expect_reply=True "
-                "(there is no reply to capture otherwise) (ADR 0013)."
-            )
-        if spec.type is ConnectorType.X12 and not spec.settings.get("expect_reply"):
-            raise WiringError(
-                f"outbound connection {name!r}: X12 capture_response=True requires expect_reply=True "
-                "(there is no returned interchange to capture otherwise) (ADR 0016)."
-            )
-        if spec.type is ConnectorType.DATABASE:
-            stmt = str(spec.settings.get("statement") or "").lower()
-            if spec.settings.get("capture_out_params"):
-                # #67 (ADR 0013 amendment): a stored-proc CALL captures its OUT params / scalar RETURN
-                # value via a pre-commit readback SELECT in the SAME batch, which may carry NEITHER a
-                # RETURNING nor an OUTPUT token (a scalar `EXEC @rv = proc; SELECT @rv` batch). The
-                # EXPLICIT opt-in flag — NOT a loosening of the substring test — authorizes capture, but
-                # only for an actual stored-proc call, so the flag can't silently mask a plain
-                # INSERT/UPDATE whose result-set would re-run non-idempotently.
-                if not _is_db_proc_call(stmt):
-                    raise WiringError(
-                        f"outbound connection {name!r}: DATABASE capture_out_params=True requires the "
-                        "statement to be a stored-procedure call (an ODBC '{ ... CALL ... }' escape or a "
-                        "leading EXEC/EXECUTE), not a plain write (ADR 0013 amendment, #67)."
-                    )
-            elif "returning" not in stmt and "output" not in stmt:
-                raise WiringError(
-                    f"outbound connection {name!r}: DATABASE capture_response=True requires a "
-                    "RETURNING/OUTPUT clause in the statement (it is fetched from the same cursor "
-                    "before commit), not a separate SELECT (ADR 0013)."
-                )
+    # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
+    # rejects an unsupportable config before any store is opened.
+    if batch is not None and spec.type is not ConnectorType.MLLP:
+        # BHS/BTS framing is HL7v2-specific; other transports have no batch-envelope analogue. The
+        # outbound has no content_type (inbound-only), so gate on the MLLP connector type itself.
+        raise WiringError(
+            f"outbound connection {name!r}: batch aggregation is MLLP (HL7v2) only, "
+            f"not {spec.type.value.upper()} (ADR 0082)."
+        )
+    refuse_capture_conflicts(
+        spec.type, spec.settings, f"outbound connection {name!r}", batched=batch is not None
+    )
     # ADR 0015: WS-* / mutual-TLS validity for SOAP, at `check`/dry-run time (no store). The url-scheme
     # checks (https required for a client cert, cleartext-credential refusal) need the resolved url and
     # run in SoapDestination.__init__; the structural ones below work on the unresolved spec (an EnvRef
@@ -7639,24 +7701,6 @@ def build_outbound_connection(
                 f"outbound connection {name!r}: SOAP body_secrets is incompatible with reingress_to "
                 "(re-ingress would persist a best-effort-scrubbed partner reply as a new message; "
                 "use capture_response for reconciliation instead) (ADR 0015 amendment, #236)."
-            )
-    # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
-    # rejects an unsupportable config before any store is opened.
-    if batch is not None:
-        if spec.type is not ConnectorType.MLLP:
-            # BHS/BTS framing is HL7v2-specific; other transports have no batch-envelope analogue. The
-            # outbound has no content_type (inbound-only), so gate on the MLLP connector type itself.
-            raise WiringError(
-                f"outbound connection {name!r}: batch aggregation is MLLP (HL7v2) only, "
-                f"not {spec.type.value.upper()} (ADR 0082)."
-            )
-        if spec.settings.get("capture_response"):
-            # One batch-level ACK covers the whole envelope; there is no per-row reply to capture or
-            # re-ingress (ADR 0013). Reject the combination rather than silently drop N-1 captures.
-            reason = "reingress_to" if spec.settings.get("reingress_to") else "capture_response"
-            raise WiringError(
-                f"outbound connection {name!r}: batch aggregation is incompatible with {reason} "
-                "— one batch ACK cannot fan out to N per-message captured replies (ADR 0082/0013)."
             )
     return OutboundConnection(
         name=name,

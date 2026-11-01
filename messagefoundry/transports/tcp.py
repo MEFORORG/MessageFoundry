@@ -40,7 +40,9 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     InboundHandler,
     SourceConnector,
+    count_setting,
     float_setting,
+    port_setting,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -105,22 +107,26 @@ def _codec_from_settings(settings: dict[str, object]) -> FrameCodec:
     try:
         return codec_for(
             None if framing is None else str(framing),
-            start=_opt_byte(settings.get("start")),
-            end=_opt_byte(settings.get("end")),
-            trailer=_opt_byte(settings.get("trailer")),
+            start=_opt_byte(settings, "start"),
+            end=_opt_byte(settings, "end"),
+            trailer=_opt_byte(settings, "trailer"),
         )
     except ValueError as exc:
         raise ValueError(f"TCP framing misconfigured: {exc}") from exc
 
 
-def _opt_byte(value: object) -> int | None:
-    """Coerce an optional delimiter setting to an int (``None`` passes through). A non-int value
-    raises ``ValueError`` so a mistyped delimiter fails loud at construction."""
+def _opt_byte(settings: dict[str, object], knob: str) -> int | None:
+    """Read an optional delimiter setting (``None`` passes through) by the rule in
+    :func:`~messagefoundry.transports.base.count_setting`, so a mistyped delimiter fails loud at
+    construction with the value withheld. The range is checked here too, because the codec's own
+    range refusal quotes the number, and this one may have come from the environment."""
+    value = settings.get(knob)
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError(f"delimiter byte must be an int in 0..255, got {value!r}")
-    return int(value)
+    byte = count_setting(value, knob=knob, transport="TCP")
+    if not 0 <= byte <= 255:
+        raise ValueError(f"TCP {knob} must be a byte value in 0..255 (value withheld)")
+    return byte
 
 
 # --- destination -------------------------------------------------------------
@@ -153,7 +159,7 @@ class TcpDestination(DestinationConnector):
         if not isinstance(host, str) or not host:
             raise ValueError("TCP destination requires a 'host' setting (the downstream peer)")
         self.host: str = host
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="TCP destination")
         self.codec = _codec_from_settings(s)
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="TCP destination"
@@ -473,7 +479,7 @@ class TcpSource(SourceConnector):
         # host on an inbound). Fall back to loopback for a missing/None value — never bind all
         # interfaces (0.0.0.0) by accident, since raw TCP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="TCP source")
         self.codec = _codec_from_settings(s)
         self.encoding: str = s.get("encoding", "utf-8")
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
