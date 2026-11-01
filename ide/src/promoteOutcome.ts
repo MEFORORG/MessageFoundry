@@ -99,9 +99,10 @@ const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
 /**
  * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
  * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, not reported here yet) can sit
- * beside the restart sentence. This reads applied replies only, so null or no value is unreadable,
- * as any other shape is. An unreadable list keeps the counts and says so: the swap did happen, and
- * it must not read as a clean promote.
+ * beside the restart sentence. The first entry leads the notification, so it reads on from the
+ * message's prefix. This reads applied replies only, so null or no value is unreadable, as any other
+ * shape is. An unreadable list keeps the counts and says so: the swap did happen, and it must not
+ * read as a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
   const names = r.restart_required;
@@ -110,28 +111,32 @@ function reloadShortfall(r: ReloadResult): string[] {
     !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
   ) {
     return [
-      "The engine's list of trust anchors that take a restart could not be read, so check the " +
-        "engine's log for them.",
+      "check the engine's log for trust anchors that take a restart: the engine's list of them " +
+        "could not be read.",
     ];
   }
   if (names.length === 0) {
     return [];
   }
   return [
-    "Restart the engine to apply a changed trust anchor: this reload checked the new file but " +
-      `does not load it, so the engine still trusts the old CA for: ${names.join(", ")}. This ` +
-      "list is not complete, for at least these reasons: it covers only the engine that " +
-      "answered; another engine shard reports only once a reload reaches its own API; a cluster " +
-      "node reports only if it converges on the reload; and the dialling CAs are never listed, " +
-      "so see docs/SECURITY.md for which need a restart.",
+    `restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
+      "does not load it, so the engine still trusts the old CA.",
+    "The settings list above is not complete, for at least these reasons: it covers only the " +
+      "engine that answered; another engine shard reports only once a reload reaches its own " +
+      "API; a cluster node reports only in its own log, and only if it converges on the reload; " +
+      'and the dialling CAs are never listed. See the section "Outbound TLS trust anchor — ' +
+      'pinned internal CA" of docs/SECURITY.md in the MessageFoundry repository for which of ' +
+      "those need a restart.",
   ];
 }
 
 /**
  * The message for the apply step's outcome. A held reload is a warning that names the approval and
  * says the config is not live; it never prints graph counts, because no graph was swapped. A live
- * swap with a shortfall is a warning too, after the counts. Held, invalid and live exclude each
- * other, so each is its own branch.
+ * swap with a shortfall is a warning too, and it leads with the shortfall: VS Code starts a
+ * notification with no button collapsed to one clipped line, so the words to act on come first, in
+ * as few characters as they can. Held, invalid and live exclude each other, so each is its own
+ * branch.
  */
 export function promoteOutcomeMessage(
   targetName: string,
@@ -158,13 +163,15 @@ export function promoteOutcomeMessage(
         "result, so it is unknown whether the new config is live. Check the engine before retrying.",
     };
   }
-  const promoted =
-    `MessageFoundry: promoted to ${targetName} — live graph: ${r.inbound} inbound, ` +
-    `${r.outbound} outbound, ${r.routers} routers, ${r.handlers} handlers` +
-    `${r.running ? ", running" : ""}.`;
-  const shortfall = reloadShortfall(r);
+  const graph =
+    `to ${targetName} — live graph: ${r.inbound} inbound, ${r.outbound} outbound, ` +
+    `${r.routers} routers, ${r.handlers} handlers${r.running ? ", running" : ""}.`;
+  const [lead, ...rest] = reloadShortfall(r);
+  if (lead === undefined) {
+    return { level: "info", text: `MessageFoundry: promoted ${graph}` };
+  }
   return {
-    level: shortfall.length > 0 ? "warning" : "info",
-    text: [promoted, ...shortfall].join(" "),
+    level: "warning",
+    text: [`MessageFoundry: ${lead}`, `Promoted ${graph}`, ...rest].join(" "),
   };
 }

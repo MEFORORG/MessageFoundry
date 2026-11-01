@@ -39,10 +39,8 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     dry_run: false,
     restart_required: [],
   };
-  // The success sentence for `live`, which every outcome of a live swap starts with.
-  const promoted =
-    "MessageFoundry: promoted to PROD — live graph: 2 inbound, 3 outbound, 1 routers, " +
-    "4 handlers, running.";
+  // The swap's report for `live`, which follows "promoted" on every outcome of a live swap.
+  const graph = "to PROD — live graph: 2 inbound, 3 outbound, 1 routers, 4 handlers, running.";
 
   setup(async () => {
     replyStatus = 200;
@@ -92,7 +90,7 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     const msg = promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
     assert.deepStrictEqual(sent, { config_dir: null, dry_run: false });
     assert.strictEqual(msg.level, "info");
-    assert.strictEqual(msg.text, promoted);
+    assert.strictEqual(msg.text, `MessageFoundry: promoted ${graph}`);
   });
 
   const promoteReplying = async (restart: unknown): Promise<PromoteMessage> => {
@@ -100,24 +98,31 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     return promoteOutcomeMessage("PROD", await reloadConfig(url, null, false, "tok"));
   };
 
-  test("a changed trust anchor is a WARNING that names each anchor and still reports the swap", async () => {
-    const msg = await promoteReplying(["[auth].ad_tls_ca_cert_file", "[api].tls_client_ca_file"]);
+  // The anchors the engine can report: the ones whose consumer loaded its bytes at start.
+  test("a changed trust anchor is a WARNING that leads with the restart and still reports the swap", async () => {
+    const msg = await promoteReplying([
+      "[auth].oidc_tls_ca_cert_file",
+      "[auth].ad_tls_ca_cert_file",
+      "[api].tls_client_ca_file",
+    ]);
     assert.strictEqual(msg.level, "warning");
     assert.strictEqual(
       msg.text,
-      `${promoted} Restart the engine to apply a changed trust anchor: this reload checked the ` +
-        "new file but does not load it, so the engine still trusts the old CA for: " +
-        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file. This list is not complete, for at " +
-        "least these reasons: it covers only the engine that answered; another engine shard " +
-        "reports only once a reload reaches its own API; a cluster node reports only if it " +
-        "converges on the reload; and the dialling CAs are never listed, so see " +
-        "docs/SECURITY.md for which need a restart.",
+      "MessageFoundry: restart the engine for [auth].oidc_tls_ca_cert_file, " +
+        "[auth].ad_tls_ca_cert_file, [api].tls_client_ca_file: this reload checked each changed " +
+        `CA file but does not load it, so the engine still trusts the old CA. Promoted ${graph} ` +
+        "The settings list above is not complete, for at least these reasons: it covers only " +
+        "the engine that answered; another engine shard reports only once a reload reaches its " +
+        "own API; a cluster node reports only in its own log, and only if it converges on the " +
+        'reload; and the dialling CAs are never listed. See the section "Outbound TLS trust ' +
+        'anchor — pinned internal CA" of docs/SECURITY.md in the MessageFoundry repository for ' +
+        "which of those need a restart.",
     );
   });
 
   for (const [name, names] of [
     [
-      "the seven settings anchor names, as a check of the name shape",
+      "the settings anchor names, as a check of the name shape",
       [
         "[auth].oidc_tls_ca_cert_file",
         "[auth].ad_tls_ca_cert_file",
@@ -134,7 +139,10 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
     test(`a restart_required of ${name} is printed`, async () => {
       const msg = await promoteReplying(names);
       assert.strictEqual(msg.level, "warning");
-      assert.ok(msg.text.includes(`old CA for: ${names.join(", ")}. This list`), msg.text);
+      assert.ok(
+        msg.text.startsWith(`MessageFoundry: restart the engine for ${names.join(", ")}: `),
+        msg.text,
+      );
     });
   }
 
@@ -166,8 +174,8 @@ suite("promote outcome — a held reload is reported as held (BACKLOG #1981)", (
       assert.strictEqual(msg.level, "warning");
       assert.strictEqual(
         msg.text,
-        `${promoted} The engine's list of trust anchors that take a restart could not be read, ` +
-          "so check the engine's log for them.",
+        "MessageFoundry: check the engine's log for trust anchors that take a restart: the " +
+          `engine's list of them could not be read. Promoted ${graph}`,
       );
       // The pre-flight prints no restart list, so the same reply must not stop it.
       assert.ok(preflightOutcome(await reloadConfig(url, "/cfg", true, "tok")).ok);
