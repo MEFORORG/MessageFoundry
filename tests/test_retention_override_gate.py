@@ -28,7 +28,12 @@ from messagefoundry.config.retention_classification import (
     judge_keep_forever_overrides,
     keep_forever_overrides,
 )
-from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.settings import (
+    EgressSettings,
+    RetentionSettings,
+    SecuritySettings,
+    StoreBackend,
+)
 from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.engine import Engine
@@ -40,9 +45,11 @@ from tests._phi_gate_provisions import (
 from tests._retention_override_graph import override_graph as _graph
 from tests._retention_override_graph import override_guard
 from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
+from tests.test_security_posture_defaults import _pairs
 
 _LOG = logging.getLogger("tests.retention_override_gate")
 _ACK = "[security].allow_keeping_phi_indefinitely"
+_BODY_SWITCH = "delete_message_bodies_after_days"
 
 
 def _guard(*, acknowledged: bool, enforcing: bool) -> Callable[[Registry], None]:
@@ -196,7 +203,77 @@ def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
     assert "an engine writes an AUDIT line naming these connections" in remedy
     # The imperative carries its own reason, or a reader on enforce has none to bound a window.
     assert "Set each of them to an explicit number of days first, or" in remedy
-    assert "The start gate writes an AUDIT line for such a window at 0 only" in remedy
+    assert "AUDIT line for such a window at 0 only under enforcement = enforce" in remedy
+
+
+@pytest.mark.parametrize(
+    ("authored", "early_names_body", "folded_days"),
+    [
+        # What the entry exists to say: the gate leaves the window unbounded, nobody typed 0.
+        ("security.allow_keeping_phi_indefinitely = true\n", False, 0),
+        (f"security.{_BODY_SWITCH} = 0\n", True, 0),
+        # Controls: the switch alone does not name the window, and neither does the dial.
+        (
+            f"security.allow_keeping_phi_indefinitely = true\nsecurity.{_BODY_SWITCH} = 30\n",
+            False,
+            30,
+        ),
+        ("", False, 30),
+    ],
+    ids=["switch-window-unset", "explicit-zero", "switch-window-bounded", "neither"],
+)
+def test_the_two_readings_of_the_list_differ_as_the_retention_entry_says(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    authored: str,
+    early_names_body: bool,
+    folded_days: int,
+) -> None:
+    """The real ``serve`` runs, so its own order is what is read: warning, gate, then the fold.
+
+    The ``SECURITY-LOOSENING.md`` retention entry states the result, and
+    ``tests/test_security_doc_drift.py`` reads that prose. A ``SecuritySettings`` built by hand
+    cannot show it: it never passes the fold, where an unset window under the switch becomes a 0
+    nobody wrote. Only the app and uvicorn are replaced. The later reading is the registry on the
+    ``[security]`` view ``serve`` hands the app, every other section at its default, and not the
+    posture route itself. Only ``warn`` is run, because the fold reads no dial."""
+    rc, handed = _run_secure_serve(
+        tmp_path, monkeypatch, f'security.enforcement = "warn"\n{authored}'
+    )
+    assert rc == 0
+
+    # `serve` configures logging itself, so the line is read off stdout rather than from caplog.
+    (early,) = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "posture loosened from the secure defaults" in line
+    ]
+    # Each entry prints as `name (risk)`, so a name inside another entry's risk does not count.
+    assert (f"{_BODY_SWITCH} (" in early) is early_names_body
+    switch_set = "allow_keeping_phi_indefinitely" in authored
+    assert ("allow_keeping_phi_indefinitely (" in early) is switch_set
+
+    security = handed["security_settings"]
+    retention = handed["retention_settings"]
+    assert isinstance(security, SecuritySettings)
+    assert isinstance(retention, RetentionSettings)
+    assert security.delete_message_bodies_after_days == folded_days
+    folded = dict(_pairs(sec=security))
+    assert (_BODY_SWITCH in folded) is (folded_days == 0)
+    if folded_days == 0:
+        # True here too, where the gate neither bounded the window nor refused the start.
+        assert "auto-bound" not in folded[_BODY_SWITCH]
+    # Really unbounded under the switch, so the absence just below hides something.
+    assert (retention.dead_letter_days == 0) is switch_set
+    text = " ".join(f"{name} {risk}" for name, risk in folded.items())
+    assert not [w.field for w in auto_bounded_windows() if w.field in text]
+
+
+def test_a_warn_only_tier_switch_does_name_its_window() -> None:
+    # Why the docs say "auto-bounded" where they say the list names no other window.
+    tier = _pairs(sec=SecuritySettings(allow_keeping_app_logs_indefinitely=True))
+    assert "app_log_days" in " ".join(risk for _name, risk in tier)
 
 
 def test_chained_guards_run_in_order_and_the_first_refusal_wins() -> None:

@@ -45,23 +45,15 @@ from messagefoundry.auth.permissions import (
 from messagefoundry.config.retention_classification import (
     BODY_ACKNOWLEDGEMENT_SETTING,
     RetentionGateLine,
-    auto_bounded_windows,
     evaluate_retention_gate,
 )
-from messagefoundry.config.settings import (
-    AuthSettings,
-    RetentionSettings,
-    SecuritySettings,
-    ServiceSettings,
-)
+from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.config.wiring import WiringError
 from scripts.security.route_gates import gate_of, route_rows
 from tests._ast_sites import call_sites, callee_name, calls_to, find_funcs, named_func
 from tests._doc_blockquote import blockquote_lines, plant_in_blockquote
 from tests._retention_override_graph import override_graph, override_guard
-from tests.test_cli import _run_secure_serve
 from tests.test_docs_security_pathways import _github_anchor
-from tests.test_security_posture_defaults import _pairs
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -3954,8 +3946,11 @@ _RETIRED_RETENTION_CLAIMS: tuple[tuple[Path, str], ...] = (
     (_CONFIG_DOC, "`0` = keep indefinitely (audited)"),
     (_CONFIG_DOC, "audited escape: unbounded PHI retention"),
     (_CONFIG_DOC, "the audited keep-forever opt-out"),
+    (_CONFIG_DOC, "a loud, audited loosening"),
     (_GUIDE_DOC, "loud, audited warnings"),
     (_LOOSENING_DOC, f"names that switch and an explicit `{_BODY_SWITCH} = 0`"),
+    (_LOOSENING_DOC, "a loud, audited loosening"),
+    (_LOOSENING_DOC, "refusals downgrade to loud audited warnings"),
     (_IDE_SECURITY_EDITOR, "0 = keep indefinitely (audited)"),
     (_IDE_SECURITY_EDITOR, "Audited escape: unbounded PHI retention"),
     (_SETTINGS_SOURCE, "0 = keep indefinitely (audited)"),
@@ -4049,7 +4044,8 @@ def _gate_audit_prose_findings(config: str, loosening: str, phi: str) -> list[st
             "the CONFIGURATION.md auto-bound paragraph",
             config,
             "The audited opt-out is `[security].allow_keeping_phi_indefinitely",
-            (anchor,),
+            # The opening words too: the anchor alone is met by this document's table rows.
+            (f"as well as the refusal. [SECURITY-LOOSENING.md]({anchor})",),
         ),
         (
             "the SECURITY-LOOSENING.md `enforcement = warn` entry",
@@ -4073,7 +4069,8 @@ def _retention_claim_sources() -> dict[Path, str]:
 
 
 def _retired_retention_claims(sources: Mapping[Path, str]) -> list[str]:
-    """Each retired claim still in its source, wrapped across lines or not."""
+    """Each retired claim still in its source. Flattening unwraps prose only: a claim split across
+    two code comments or string literals keeps the ``#`` or the quotes between, and reads clean."""
     flat = {path: " ".join(text.split()) for path, text in sources.items()}
     return [
         f"{path.name} says again: {claim!r}"
@@ -4134,74 +4131,10 @@ def test_the_docs_say_the_body_window_gate_audits_only_under_enforce() -> None:
     assert not any(line.audit for line in unacknowledged)
     (plain,) = [line for line in unacknowledged if _BODY_WINDOW in line.text]
     assert plain.text.startswith("warning:")
-    # A warn-only tier's switch does name a window: the docs' "auto-bounded" scopes that sentence.
-    tier = _pairs(sec=SecuritySettings(allow_keeping_app_logs_indefinitely=True))
-    assert "app_log_days" in " ".join(risk for _name, risk in tier)
 
 
-@pytest.mark.parametrize(
-    ("authored", "early_names_body", "folded_days"),
-    [
-        # What the entry exists to say: the gate leaves the window unbounded, nobody typed 0.
-        ("security.allow_keeping_phi_indefinitely = true\n", False, 0),
-        (f"security.{_BODY_SWITCH} = 0\n", True, 0),
-        # Controls: the switch alone does not name the window, and neither does the dial.
-        (
-            f"security.allow_keeping_phi_indefinitely = true\nsecurity.{_BODY_SWITCH} = 30\n",
-            False,
-            30,
-        ),
-        ("", False, 30),
-    ],
-    ids=["switch-window-unset", "explicit-zero", "switch-window-bounded", "neither"],
-)
-def test_the_two_readings_of_the_list_differ_as_the_retention_entry_says(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    authored: str,
-    early_names_body: bool,
-    folded_days: int,
-) -> None:
-    """The real ``serve`` runs, so its own order is what is read: warning, gate, then the fold.
-
-    A ``SecuritySettings`` built by hand cannot show this. It never passes the fold, which is where
-    an unset window under the switch becomes a 0 nobody wrote. Only the app and uvicorn are
-    replaced, and the captured ``security_settings`` is the view the posture route reads.
-    `tests/test_start_config_loaded_row.py` pins the ``config_loaded`` row to that route's list."""
-    rc, handed = _run_secure_serve(
-        tmp_path, monkeypatch, f'security.enforcement = "warn"\n{authored}'
-    )
-    assert rc == 0
-
-    # `serve` configures logging itself, so the line is read off stdout rather than from caplog.
-    (early,) = [
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if "posture loosened from the secure defaults" in line
-    ]
-    # Each entry prints as `name (risk)`, so a name inside another entry's risk does not count.
-    assert (f"{_BODY_SWITCH} (" in early) is early_names_body
-    switch_set = "allow_keeping_phi_indefinitely" in authored
-    assert ("allow_keeping_phi_indefinitely (" in early) is switch_set
-
-    security = handed["security_settings"]
-    retention = handed["retention_settings"]
-    assert isinstance(security, SecuritySettings)
-    assert isinstance(retention, RetentionSettings)
-    assert security.delete_message_bodies_after_days == folded_days
-    folded = dict(_pairs(sec=security))
-    assert (_BODY_SWITCH in folded) is (folded_days == 0)
-    # True here too, where the gate neither bounded the window nor refused the start.
-    assert "auto-bound" not in folded.get(_BODY_SWITCH, "")
-    # Really unbounded under the switch, so the absence just below hides something.
-    assert (retention.dead_letter_days == 0) is switch_set
-    text = " ".join(f"{name} {risk}" for name, risk in folded.items())
-    assert not [w.field for w in auto_bounded_windows() if w.field in text]
-
-
-def test_no_site_still_calls_the_opt_out_audited_on_either_dial() -> None:
-    """The entry's sibling sites, each of which now scopes the word or links to the entry."""
+def test_the_retired_retention_claims_stay_gone() -> None:
+    """At least the listed sentences. It is no census of the word "audited"."""
     assert not (found := _retired_retention_claims(_retention_claim_sources())), found
 
 
@@ -4314,6 +4247,26 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "loosening",
             "too, though nobody wrote `0`",
             "too",
+        ),
+        "auto-bound-paragraph-opt-out": (
+            "config",
+            "The opt-out is `[security].allow_keeping_phi_indefinitely",
+            "The audited opt-out is `[security].allow_keeping_phi_indefinitely",
+        ),
+        "auto-bound-paragraph-link-dropped": (
+            "config",
+            "as well as the refusal.\n[SECURITY-LOOSENING.md]",
+            "as well as the refusal.\n[the entry]",
+        ),
+        "warn-entry-retired": (
+            "loosening",
+            "the warnings, the\n  posture view",
+            "the warnings + startup **AUDIT** line + posture view",
+        ),
+        "warn-entry-record-gone": (
+            "loosening",
+            "keep the deviation visible.",
+            "stay.",
         ),
         "phi-link-dropped": (
             "phi",

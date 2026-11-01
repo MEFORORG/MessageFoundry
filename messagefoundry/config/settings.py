@@ -3248,8 +3248,8 @@ class RetentionSettings(_Section):
     # File source's `.processed` copies) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
     # days, so only an explicit 0 trips the gate. Setting this true is the explicit override that
-    # lets an instance run with unbounded (keep-forever) retention; the start gate writes an AUDIT
-    # line for it only under enforce. Operators write it as
+    # lets an instance run with unbounded (keep-forever) retention; docs/SECURITY-LOOSENING.md says
+    # what each dial records. Operators write it as
     # [security].allow_keeping_phi_indefinitely; the [retention] spelling is refused at load. Off by
     # default. No instance is exempt: every instance carries patient data since BACKLOG #1279
     # (ADR 0186). See messagefoundry/__main__.py.
@@ -7475,7 +7475,7 @@ class SecuritySettings(_Section):
     block_unlisted_outbound: bool = (
         True  # deny-by-default egress; only allow-listed destinations send
     )
-    delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely (AUDIT line under enforce)
+    delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely; see SECURITY-LOOSENING.md
     allow_keeping_phi_indefinitely: bool = False
     # Per-tier acknowledgements for the retention windows the engine never auto-bounds (owner ruling
     # R4 (b), 2026-09-24; ASVS 14.2.7; BACKLOG #1967). On an enforcing instance `serve` refuses to start

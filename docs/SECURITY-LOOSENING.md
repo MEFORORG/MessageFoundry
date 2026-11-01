@@ -16,7 +16,7 @@
    unconditionally. At the default this is **byte-identical to the former production-PHI refusal** — [ADR
    0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 2) re-keyed the
    refuse/warn dial off the *derived* `production` tier and onto the *explicit* `enforcement` level;
-   `enforcement = warn` reproduces the historical non-production warn-and-start (a loud, audited loosening —
+   `enforcement = warn` reproduces the historical non-production warn-and-start (a loud loosening —
    see the `enforcement = warn` deviation below). **Two of these controls may be lifted while staying at
    `enforce`, but only behind a dedicated acknowledgment switch that does nothing else** (the No-loosen
    carve-out, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5 as amended, [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)):
@@ -516,8 +516,8 @@ false premise.
 - **Compensating controls:** a bounded window (e.g. 30 days). Under `enforcement = enforce`, a startup
   **AUDIT** line records the override. Under `enforcement = warn` the gate writes no **AUDIT** line for it:
   with no opt-out it prints a plain `warning:` line to stderr, and with `allow_keeping_phi_indefinitely = true`
-  it prints nothing about the window. What is left is `security_loosenings()`, and what it names depends on
-  when it is read. The start's posture warning runs before the gate, on the settings as written: it names the
+  it prints nothing about the window. At least `security_loosenings()` still carries it, and what that names
+  depends on when it is read. The start's posture warning runs before the gate, on the settings as written: it names the
   switch, and `delete_message_bodies_after_days` only on an explicit `0`. `serve` then folds the effective
   window back into `[security]`, so at least `GET /security/posture` and the list the start's
   [best-effort](#the-switches) `config_loaded` audit row records read the effective value: with the switch set
@@ -679,7 +679,7 @@ is refused, so an opt-out does nothing and is not reported.
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
-  off-box bind, open-egress, and single-factor-at-exposure refusals downgrade to loud audited warnings,
+  off-box bind, open-egress, and single-factor-at-exposure refusals downgrade to loud warnings,
   and an explicitly-zeroed PHI retention window warns rather than refusing. (The 30-day auto-bound of an
   **unset** window is not part of this dial — it applies under `enforce` too.) Named once by
   `security_loosenings()` and in `GET /security/posture`.

@@ -64,10 +64,10 @@ export const FIELDS: Field[] = [
     desc: "Deny-by-default egress — only allow-listed destinations send.",
     insecure: false, risk: "outbound egress is allow-any — a transform may send PHI to any destination" },
   { key: "delete_message_bodies_after_days", label: "Delete message bodies after (days)", type: "int", group: "Data handling",
-    desc: "Bounded PHI-body retention; 0 = keep indefinitely. The start gate writes an AUDIT line for it only under enforce.",
+    desc: "Bounded PHI-body retention; 0 = keep indefinitely. docs/SECURITY-LOOSENING.md says what the start gate refuses and records.",
     insecure: 0, risk: "message bodies are kept indefinitely (enforcement = enforce refuses an explicit 0 unless allow_keeping_phi_indefinitely is set)" },
   { key: "allow_keeping_phi_indefinitely", label: "Allow keeping PHI indefinitely", type: "bool", group: "Data handling",
-    desc: "Escape: unbounded PHI retention. The start gate writes an AUDIT line for it only under enforce.",
+    desc: "Escape: unbounded PHI retention. docs/SECURITY-LOOSENING.md says what each dial records.",
     insecure: true, risk: "unbounded PHI retention is permitted" },
   // The per-tier retention acknowledgements (BACKLOG #1967, #2280). 'Allow keeping PHI indefinitely'
   // above covers the auto-bounded tiers only and does NOT satisfy these. Each `risk` mirrors
