@@ -198,7 +198,9 @@ class _RecordingAlertSink:
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
         self.stalls.append((name, oldest_age_seconds))
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
         self.errors.append((name, kind))
 
     def connection_restored(self, name: str) -> None: ...

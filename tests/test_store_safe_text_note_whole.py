@@ -3,13 +3,15 @@
 """The store keeps :func:`safe_text`'s bounded output whole, note and all (BACKLOG #1797).
 
 Three SQLite writers stored ``safe_text(x)[:200]``: ``response.detail`` (``record_ack_sent``),
-``connection_event.reason`` and ``alert_instance.reason``. While :func:`safe_text` cut at exactly its
-limit, the outer slice dropped the ``(+N chars)`` note whole. Since #1797 the cut goes back to a
-whole token, so the head can be shorter than the limit and the outer slice kept part of the note.
-On the fixture below it kept ``…(+`` and no digits at all, for a true count of 132; at other head
-lengths it keeps a truncated number. Each writer now passes the bound to :func:`safe_text` instead.
-Postgres and SQL Server carry the same three call sites in the same shape. Their suites skip without
-a server, so they are held here by reading their source, and only SQLite is exercised.
+``connection_event.reason`` and ``alert_instance.reason``. A fourth, ``complete_with_response``'s
+``response.detail``, joined them under BACKLOG #2984 with the bound passed in from the start.
+While :func:`safe_text` cut at exactly its limit, the outer slice dropped the ``(+N chars)`` note
+whole. Since #1797 the cut goes back to a whole token, so the head can be shorter than the limit
+and the outer slice kept part of the note. On the fixture below it kept ``…(+`` and no digits at
+all, for a true count of 132; at other head lengths it keeps a truncated number. Each writer now
+passes the bound to :func:`safe_text` instead. Postgres and SQL Server carry the same four call
+sites in the same shape. Their suites skip without a server, so they are held here by reading their
+source, and only SQLite is exercised.
 
 The columns are ``TEXT`` on SQLite and Postgres and ``NVARCHAR(MAX)`` on SQL Server, so the note
 cannot overflow a declared width. The bound pinned here is the one :func:`safe_text` itself gives
@@ -32,7 +34,7 @@ import pytest
 
 from messagefoundry import store as store_package
 from messagefoundry.redaction import safe_text
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, Stage
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 LIMIT = 200
@@ -86,8 +88,18 @@ async def _alert_reason(store: MessageStore, db: Path, text: str) -> str:
     return _stored(db, "SELECT reason FROM alert_instance")
 
 
+async def _reply_detail(store: MessageStore, db: Path, text: str) -> str:
+    await store.enqueue_message(channel_id="IB_X", raw=ADT, deliveries=[("OB_X", ADT)], now=1.0)
+    item = await store.claim_next_fifo("OB_X", stage=Stage.OUTBOUND.value, now=1.0)
+    assert item is not None
+    await store.complete_with_response(
+        item.id, body="MSA|AA", outcome="accepted", detail=text, now=2.0
+    )
+    return _stored(db, "SELECT detail FROM response")
+
+
 Writer = Callable[[MessageStore, Path, str], Awaitable[str]]
-WRITERS: list[Writer] = [_ack_detail, _event_reason, _alert_reason]
+WRITERS: list[Writer] = [_ack_detail, _event_reason, _alert_reason, _reply_detail]
 
 
 @pytest.mark.parametrize("write", WRITERS, ids=lambda w: w.__name__.lstrip("_"))
@@ -128,13 +140,13 @@ async def test_a_short_value_is_stored_unchanged(tmp_path: Path, write: Writer) 
 #: A slice on the same line as a ``safe_text`` call, the shape #1797 removed. At least the spellings
 #: the control below names; a slice taken on a later line is not seen.
 _SLICED = re.compile(r"safe_text\(.*\)\)?\s*\[[^\]\n]*:")
-#: The shape each of the three writers uses now.
+#: The shape each of the four writers uses now.
 _BOUNDED = re.compile(r"safe_text\((?:detail|reason), limit=200\)")
 
 
 @pytest.mark.parametrize("module", ["store.py", "postgres.py", "sqlserver.py"])
 def test_every_backend_passes_the_bound_instead_of_slicing(module: str) -> None:
-    """Postgres and SQL Server have no server here, so their three writers are held by source. THE
+    """Postgres and SQL Server have no server here, so their four writers are held by source. THE
     CONTROL: the slice pattern does match the old spelling and its near variants."""
     for old in (
         "safe_text(reason)[:200]",
@@ -145,4 +157,4 @@ def test_every_backend_passes_the_bound_instead_of_slicing(module: str) -> None:
         assert _SLICED.search(old), f"the control does not hold: {old}"
     source = (Path(store_package.__file__).parent / module).read_text(encoding="utf-8")
     assert _SLICED.search(source) is None
-    assert len(_BOUNDED.findall(source)) == 3
+    assert len(_BOUNDED.findall(source)) == 4

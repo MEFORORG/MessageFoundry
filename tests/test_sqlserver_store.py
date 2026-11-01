@@ -2513,6 +2513,21 @@ async def test_complete_with_response_captures_and_finalizes(store) -> None:
     assert r.body == "ACK^AA" and r.detail == "all good"  # both decrypted (both ciphertext at rest)
 
 
+async def test_complete_with_response_scrubs_detail_ss(store) -> None:
+    # BACKLOG #2984: a reply's detail is stored through safe_text(detail, limit=200), as an ack_sent
+    # row's is, whatever the connector put in it. Synthetic PID fragment, invented for this test.
+    detail = "partner note PID|1||MRN7731^^^H^MR||ZEPHYRTEST^QUINN||19700101"
+    mid, item = await _delivered_outbound(store)
+    await store.complete_with_response(
+        item.id, body="ACK^AA", outcome="accepted", detail=detail, now=110.0
+    )
+    (reply,) = await store.correlate_response(mid)
+    # The exact value is pinned against safe_text on SQLite (tests/test_b2984_reply_detail_scrub.py);
+    # importing redaction here would widen this suite's serverdb path gate.
+    assert reply.detail is not None and reply.detail.startswith("partner note ")
+    assert "ZEPHYRTEST" not in reply.detail and "MRN7731" not in reply.detail
+
+
 async def test_correlate_orders_by_seq_and_decrypts(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB", "a"), ("OB", "b")], now=100.0
