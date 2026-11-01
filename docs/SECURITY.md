@@ -2112,7 +2112,7 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name with no `connections.toml` entry.
+> reaches the engine, which answers 409 for a name the running graph does not have.
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
@@ -2265,6 +2265,20 @@ the same permission set on the same method reds CI until it is listed here.
 > queue's prediction for a held reload and purge, `reload_refused`, and the bound on a malformed
 > name in a denial row.
 
+> **A dry-run reload executes config code too, and no approver holds it (BACKLOG #2623).**
+> `POST /config/reload` with `dry_run` runs every config module's top-level code in the engine's
+> own process, because the load happens before the dry-run branch. It takes the same `config:deploy`
+> and step-up as a reload, but `[approvals]` never holds it. A dry run is not held on purpose: the
+> IDE promote pre-flight would stall on a second person. So under dual control, a `config:deploy`
+> holder who can also write the config directory can have a module run with no second approver,
+> though nothing is applied. That stays true until a dry run can run in a throwaway worker. A restart
+> also executes what the directory holds. `tests/test_connection_flag.py` pins that a dry run runs
+> the modules and applies nothing, and `test_dry_run_reload_is_never_held` in
+> `tests/test_dual_control_reload.py` pins, through the route, that `[approvals]` does not hold it.
+> A change to either fails there and this note gets read again. A connection flag
+> toggle is not such a route: the store holds the flag, so a toggle runs no config module and writes
+> no file in the config directory.
+>
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
 > the server's startup `--config` dir or an entry in `[api].config_reload_roots` — otherwise it is
@@ -2470,9 +2484,9 @@ every refused release does. The engine log carries the store's error.
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
 connection counts and the digest it took before the swap. The row is written after the swap, so a
-second reload or a connection flag toggle can move the engine on first. The row then still names
+second reload can move the engine on first. The row then still names
 its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
-it and does not compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+it and does not compare against it. Only a committed reload that moves the engine's loaded
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
 runs just before the write, so a change after it is not caught.
 
@@ -2562,8 +2576,6 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   move lands while a digest is reading it;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
-- a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
-  before a toggle is refused at release and must be asked for again;
 - a repeat after an edit files a second hold and leaves the first pending. The first is refused
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
@@ -4243,7 +4255,7 @@ slack.
 BACKLOG #2622 item 1).** The MLLP, DICOM, raw TCP and HTTP listener exposure gates run in two places. At
 listener start, a refusal isolates that one listener and the rest of the graph comes up (ADR 0031).
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
-reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
+reload or dry-run reload, promote, a connection edit, a DR activation
 and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
 keep its old graph, log the refusal and retry each interval. It would also write a
 `config_reload_failed` audit row under `system:cluster-convergence` (vault BACKLOG #3109).

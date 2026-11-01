@@ -159,11 +159,11 @@ id = "connection-flag-audit-renamed"
 item = 1643
 file = "messagefoundry/pipeline/engine.py"
 find = '''
-        return await self.write_baseline_config(
+        audit = AuditAppend(
             "connection_flag_set",
 '''
 replace = '''
-        return await self.write_baseline_config(
+        audit = AuditAppend(
             "connection_flag_set_mutated",
 '''
 tests = [

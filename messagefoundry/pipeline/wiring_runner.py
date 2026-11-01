@@ -2967,9 +2967,9 @@ class RegistryRunner:
         self, *, now: datetime | None = None
     ) -> Callable[[InboundConnection], bool]:
         """Which inbound listeners this runner would bind, as a predicate over a snapshot of what is
-        listening now (vault BACKLOG #2622 item 1). :meth:`build_check` and an engine's flag toggle
-        run the inbound exposure gates only where it holds, so neither refuses a config for a
-        listener the engine leaves unbound.
+        listening now (vault BACKLOG #2622 item 1). :meth:`build_check` runs the inbound exposure
+        gates only where it holds, so it does not refuse a config for a listener the engine leaves
+        unbound.
 
         It reads :meth:`_listener_skip`, the one copy of the skips :meth:`start` and
         :meth:`reload` apply, without their side effects (vault BACKLOG #3063 item 12). It holds for
@@ -2985,22 +2985,19 @@ class RegistryRunner:
         is refused before the disaster rather than during it (vault BACKLOG #3140).
 
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
-        worker thread (the flag toggle validates off the event loop). The DR threshold, default
+        worker thread. The DR threshold, default
         tier and schedule clock are read through ``self`` when it runs. The tier is set only at
         construction; the threshold is set there and by :meth:`set_dr_threshold`. ``now`` pins
         the schedule clock instead: :meth:`reload` passes the time its listener loop also reads,
         so a window that opens during the quiesce cannot make the two disagree.
 
-        **At least two callers take the snapshot outside the reload lock, and that window is accepted**
-        (vault BACKLOG #3063 item 5): a dry-run reload, through :meth:`build_check`, and an
-        engine's flag toggle. The lock is an ``asyncio.Lock``, which the worker thread cannot take,
-        and holding it on the loop across the toggle's file write would stall every reload behind
-        it. A snapshot taken during a reload's quiesce can miss a listener an operator started, so
-        the dry run or toggle passes a config the reload then refuses. Or it can keep one an
-        operator has just stopped, so it refuses one the reload would pass. Neither path binds
-        anything: a dry run applies nothing, and a toggle writes only the cosmetic ``flagged``
-        field. A reload takes its own snapshot under the lock and runs the gates on it, and a
-        start runs them on the listener itself, so the window never admits a bind."""
+        **A dry-run reload takes the snapshot outside the reload lock, through :meth:`build_check`,
+        and that window is accepted** (vault BACKLOG #3063 item 5). A snapshot taken during a
+        reload's quiesce can miss a listener an operator started, so the dry run passes a config
+        the reload then refuses. Or it can keep one an operator has just stopped, so it refuses one
+        the reload would pass. A dry run binds nothing and applies nothing. A reload takes its own
+        snapshot under the lock and runs the gates on it, and a start runs them on the listener
+        itself, so the window never admits a bind."""
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
@@ -11819,14 +11816,14 @@ def build_check_registry(
     ``allow_insecure_bind`` is the cleartext-listener escape the four inbound exposure gates read
     (vault BACKLOG #2622 item 1): ``serve --allow-insecure-bind`` folded with
     ``[security].require_encryption_for_remote = false``, exactly as ``serve`` folds them. Pass the
-    value the caller really has. A running engine passes its own, so a reload or flag toggle accepts
-    the listener the engine already accepted; ``messagefoundry check`` has no such flag and passes the
+    value the caller really has. A running engine passes its own, so a reload accepts the listener
+    the engine already accepted; ``messagefoundry check`` has no such flag and passes the
     setting half alone. The default ``False`` is the strict side: it refuses, never admits.
 
     ``exposure_gated`` picks the inbound listeners those four gates run on. ``None`` means
     :func:`inbound_listener_starts`, the deployed-and-auto-start test engine start applies, which is
-    all an offline caller (``check``, ``connection``) can know. A live runner, and an engine's flag
-    toggle, pass :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip meets
+    all an offline caller (``check``, ``connection``) can know. A live runner passes
+    :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip meets
     them when it would be bound. An operator start of an ``auto_start = false`` listener runs the
     same gates. A ``deployed = false`` listener cannot be started (the start raises
     :class:`NotDeployedError`); the reload that deploys it meets the gates if the engine would then

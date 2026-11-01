@@ -169,18 +169,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.post("/ui/connections/{name}/flag")
     async def ui_set_connection_flag(
         # Annotated like the other per-name routes (BACKLOG #1740). This one is the reason not to
-        # leave it for later: it is the only one of the five that WRITES, reaching the
-        # comment-preserving connections.toml writer through core.set_connection_flag.
+        # leave it for later: it is the only one of the five that WRITES, reaching the store through
+        # core.set_connection_flag.
         name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.CONFIG_DEPLOY)),
     ) -> Response:
-        # #131 (ADR 0007 amendment): the FIRST console→connections.toml write path — the object-flag
-        # toggle. config:deploy + same-origin (like bulk-control); NO step-up (a cosmetic annotation), so
-        # it registers no write-action. The reused JSON handler persists via connections_edit
-        # (validate-before-persist, comment-preserving) + reflects it on the live registry, and REFUSES a
-        # code-first connection (no TOML home) with 409 — which we render as a friendly notice.
+        # #131, BACKLOG #2623: the object-flag toggle. config:deploy + same-origin (like bulk-control);
+        # NO step-up (no engine path reads it), so it registers no write-action. The reused JSON handler
+        # writes the store, and REFUSES a name the running graph does not have with 409, which we
+        # render as a friendly notice.
         assert_same_origin(request)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         direction = form.get("direction", "")
@@ -195,13 +194,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 name, req, engine=engine, identity=identity, request=request
             )
         except HTTPException as exc:
-            # At least: the scope fork (code-first), a validate-before-persist failure, or a
-            # connections.toml the engine's account cannot write (vault BACKLOG #3106).
+            # The running graph has no such connection.
             if exc.status_code == 409:
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
             if exc.status_code == 503:
-                # The route's only 503: the audit log did not record the toggle (vault BACKLOG
-                # #2945), whose fix is neither of flag_rejected's.
+                # The route's only 503: the store did not confirm the toggle and its audit row
+                # (BACKLOG #2623), whose fix is not flag_rejected's.
                 return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
             raise
         return RedirectResponse("/ui", status_code=303)

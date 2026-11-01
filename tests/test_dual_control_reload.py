@@ -512,8 +512,8 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
     """Lander hold on PR 2135. Reload A sits between its swap and its row while reload B swaps and
     then fails and rolls back to A's graph. A's row is written while B's graph is briefly live. A
     graph-identity test then marked A's row superseded, so the next start compared against an
-    older row and raised a false config_changed. Only a committed reload or a flag toggle moves the
-    loaded fingerprint, so A's row must stay a baseline."""
+    older row and raised a false config_changed. Only a committed reload moves the loaded
+    fingerprint, so A's row must stay a baseline."""
     cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
     _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
     _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
@@ -599,16 +599,18 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         await engine.stop()
 
 
-async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: Engine) -> None:
-    """vault BACKLOG #2257: a connection flag toggle moves the loaded fingerprint without swapping
-    the graph. A reload row written after one names a digest the engine no longer reports, so it
-    marks itself superseded too. The toggle is stood in for by the rebind it performs."""
+async def test_a_reload_row_written_after_the_fingerprint_moved_is_no_baseline(
+    engine: Engine,
+) -> None:
+    """vault BACKLOG #2257: a reload row written after the loaded fingerprint moved on names a digest
+    the engine no longer reports, so it marks itself superseded. The move is stood in for by the
+    rebind a later reload performs."""
     outcome = await engine.reload_detail(propagate=False)
     assert outcome.fingerprint is not None
     assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
-    engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
+    engine.loaded_config_fingerprint = dict(loaded)  # what a later committed reload does
     assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]

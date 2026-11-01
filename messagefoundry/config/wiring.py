@@ -5277,12 +5277,6 @@ class InboundConnection:
     # shared across shards. Purely an intake-partition tag — never used for routing. See
     # messagefoundry/pipeline/sharding.py.
     shard: str | None = None
-    # Operator "object of interest" flag (#131, ADR 0007 amendment). Purely a console/CLI display marker
-    # — NO runtime path reads it — for the Flagged Objects filter. Console-settable ONLY on a
-    # connections.toml-managed connection (the write seam persists it there); a code-first connection can
-    # still declare flagged=True in Python, but the console flag-toggle refuses it (no TOML home). Default
-    # False → byte-identical. Code-first AND connections.toml.
-    flagged: bool = False
     # ADR 0092, owner ruling 2026-09-24: the operator attests this listener's hop is secure by means the
     # engine cannot see (a TLS-terminating proxy, an isolated segment), so an enforcing insecure-bind
     # refusal ALLOWs it. Needs a written reason. Top-level, like cleartext_accepted: a hop-policy
@@ -5352,9 +5346,6 @@ class OutboundConnection:
     metadata: Mapping[str, Any] | None = (
         None  # operability labels (Tier 4); API-surfaced, not routing
     )
-    # Operator "object of interest" flag (#131, ADR 0007 amendment) — see the InboundConnection note.
-    # Display-only (no runtime path reads it); console-settable on a connections.toml-managed outbound.
-    flagged: bool = False
     # Cosmetic per-message "Waiting for Reply" display delay (#136, ADR 0065 amendment): seconds after a
     # send before the connection is SHOWN awaiting a reply (the MLLP connector stamps a side-band marker
     # around its ACK read). DISPLAY ONLY — no delivery effect, independent of `timeout_seconds`/pacing.
@@ -7137,7 +7128,6 @@ def build_inbound_connection(
     max_message_bytes: int | None = None,
     priority: Priority | None = None,
     shard: str | None = None,
-    flagged: bool = False,
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
     tls_revocation_attested: bool = False,
@@ -7358,7 +7348,6 @@ def build_inbound_connection(
         max_message_bytes=max_message_bytes,
         priority=priority,
         shard=shard,
-        flagged=flagged,
         tls_hop_attested=tls_hop_attested,
         tls_hop_attested_reason=tls_hop_attested_reason,
         tls_revocation_attested=tls_revocation_attested,
@@ -7395,7 +7384,6 @@ def inbound(
     max_message_bytes: int | None = None,
     priority: Priority | None = None,
     shard: str | None = None,
-    flagged: bool = False,
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
     tls_revocation_attested: bool = False,
@@ -7496,7 +7484,6 @@ def inbound(
             max_message_bytes=max_message_bytes,
             priority=priority,
             shard=shard,
-            flagged=flagged,
             tls_hop_attested=tls_hop_attested,
             tls_hop_attested_reason=tls_hop_attested_reason,
             tls_revocation_attested=tls_revocation_attested,
@@ -7524,7 +7511,6 @@ def build_outbound_connection(
     dead_letter_days: int | None = None,
     priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
-    flagged: bool = False,
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
@@ -7718,7 +7704,6 @@ def build_outbound_connection(
         dead_letter_days=dead_letter_days,
         priority=priority,
         metadata=metadata,
-        flagged=flagged,
         waiting_display_delay=waiting_display_delay,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
@@ -7748,7 +7733,6 @@ def outbound(
     dead_letter_days: int | None = None,
     priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
-    flagged: bool = False,
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
@@ -7824,7 +7808,6 @@ def outbound(
             dead_letter_days=dead_letter_days,
             priority=priority,
             metadata=metadata,
-            flagged=flagged,
             waiting_display_delay=waiting_display_delay,
             cleartext_accepted=cleartext_accepted,
             cleartext_reason=cleartext_reason,

@@ -530,13 +530,18 @@ _CIPHER_MERGE_BACKOFF = 0.05
 
 
 async def _retry_idempotent_merge[T](
-    op: Callable[[], Awaitable[T]], *, on_retry: Callable[[], Awaitable[None]] | None = None
+    op: Callable[[], Awaitable[T]],
+    *,
+    on_retry: Callable[[], Awaitable[None]] | None = None,
+    statement: str = "insert-if-absent MERGE",
 ) -> T:
-    """Run an IDEMPOTENT insert-if-absent MERGE, retrying a transient write conflict with backoff.
+    """Run an IDEMPOTENT write, by default an insert-if-absent MERGE, retrying a transient write
+    conflict with backoff.
 
     Only for a statement a re-run cannot double-apply; an increment such as
     :meth:`SqlServerStore.add_cipher_invocations` needs its own no-double-count guard instead.
-    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back."""
+    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back.
+    ``statement`` is what the retry's log line calls it."""
     for attempt in range(1, _CIPHER_MERGE_ATTEMPTS + 1):
         try:
             return await op()
@@ -544,7 +549,8 @@ async def _retry_idempotent_merge[T](
             if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS:
                 raise
             log.debug(
-                "insert-if-absent MERGE hit a %s, attempt %d of %d; retrying",
+                "%s hit a %s, attempt %d of %d; retrying",
+                statement,
                 "lock timeout (HYT00)" if "HYT00" in str(exc) else "deadlock (1205)",
                 attempt,
                 _CIPHER_MERGE_ATTEMPTS,
@@ -2543,6 +2549,15 @@ _SCHEMA: list[str] = [
         CONSTRAINT pk_known_login_addresses PRIMARY KEY (user_id, address),
         CONSTRAINT fk_known_login_addresses_user FOREIGN KEY (user_id)
             REFERENCES users(id) ON DELETE CASCADE)""",
+    # The object-of-interest flag (BACKLOG #2623) -- mirrors the SQLite `connection_flag` table
+    # (store/store.py), whose comment gives the reasons: a row IS the flag. BIN2 so key equality is
+    # a byte comparison, as on SQLite and Postgres: a case-insensitive default collation would give
+    # two connections whose names differ by case one flag. Adding this DDL moves _schema_hash() --
+    # the ADR 0064 bump.
+    """IF OBJECT_ID('connection_flag','U') IS NULL CREATE TABLE connection_flag (
+        connection NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        direction NVARCHAR(16) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        CONSTRAINT pk_connection_flag PRIMARY KEY (connection, direction))""",
     # Captured request/response replies (ADR 0013) — an IMMUTABLE ARTIFACT table (composite PK), NOT a
     # queue stage, so it is invisible to _maybe_finalize's `FROM queue` scan. response_seq is replay-
     # stable (1+MAX per (message_id,destination_name)). body + detail are BOTH ciphertext at rest for
@@ -7906,6 +7921,55 @@ class SqlServerStore:
             suspended_until=(None if r["suspended_until"] is None else float(r["suspended_until"])),
             escalation_tier=int(r["escalation_tier"]),
         )
+
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`. ``HOLDLOCK`` makes
+        the MERGE's match-then-insert one decision, so two toggles cannot both take the insert
+        branch and collide on the key. The set or clear is the transaction's first statement and
+        safe to re-run, so it is retried as :meth:`_claim_keyed_surface` is. The append takes the audit applock at the tail, as
+        :meth:`_alert_write`'s does."""
+        now = time.time() if now is None else now
+        if flagged:
+            statement = "connection flag MERGE"
+            sql = (
+                "MERGE connection_flag WITH (HOLDLOCK) AS t"
+                " USING (SELECT ? AS connection, ? AS direction) AS s"
+                " ON t.connection = s.connection AND t.direction = s.direction"
+                " WHEN NOT MATCHED THEN INSERT (connection, direction)"
+                " VALUES (s.connection, s.direction);"
+            )
+        else:
+            statement = "connection flag DELETE"
+            sql = "DELETE FROM connection_flag WHERE connection=? AND direction=?"
+        async with AuditedWrite(now) as written, self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+
+                    async def write_flag() -> None:
+                        await cur.execute(sql, (connection, direction))
+
+                    await _retry_idempotent_merge(
+                        write_flag, on_retry=conn.rollback, statement=statement
+                    )
+                    await self._append_operator_audit(cur, written, if_applied(audit), True)
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
+                await self._rollback_or_discard(conn)
+                raise
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
+        rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
+        return {(str(d["connection"]), str(d["direction"])) for d in rows}
 
     async def _alert_write(
         self, sql: str, params: tuple[Any, ...], audit: AuditAppend, now: float

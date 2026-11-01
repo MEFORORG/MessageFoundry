@@ -128,6 +128,10 @@ behaviour with an unchanged fingerprint. **Implementation:**
 [`config/fingerprint.py`](../../messagefoundry/config/fingerprint.py) + a splat into the existing
 reload-audit detail; a fingerprint failure is logged and never blocks the audit.
 
+*Note 2026-10-31 (BACKLOG #2623): the connection flag left `connections.toml` (ADR 0007, amendment
+of 2026-10-31). `connection_flag_set` is no longer a baseline and carries no digest, so the note
+below holds for it only as history.*
+
 *Note 2026-10-04 (vault BACKLOG #2597, step 4): a start now compares its fingerprint with the
 store's baseline and alerts on a change.* The baseline is the newest usable `config_loaded`,
 `config_reload` or `connection_flag_set` row from any node or engine shard, since all of them share

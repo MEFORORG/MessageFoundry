@@ -326,7 +326,6 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     resolve_effective_policy,
 )
-from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.fingerprint import (
     ConfigDirMissing,
     DigestCoverage,
@@ -460,9 +459,8 @@ from messagefoundry.pipeline.cluster import (
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.engine import (
-    CONFIG_WRITE_ACTIONS,
     ConfigRefusedBeforeApprovalCheck,
-    ConfigWriteAuditFailed,
+    ConnectionFlagNotRecorded,
 )
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.refused_body import RefusedBodyPolicy, head_only_resubmit_refusal
@@ -672,11 +670,31 @@ def _method_label(type_value: str) -> str:
     return _METHOD_LABELS.get(type_value, type_value.upper())
 
 
-def _is_toml_managed(source_file: str | None) -> bool:
-    """Whether a connection was authored in ``connections.toml`` (vs a code-first ``.py``), from its
-    registry ``source_file`` (#131). The console shows the flag TOGGLE only on a TOML-managed row; the
-    API's flag write refuses a non-TOML connection regardless (the guard of record)."""
-    return source_file is not None and source_file.endswith(CONNECTIONS_FILE_NAME)
+async def _connection_flags(engine: Engine, state: Any) -> set[tuple[str, str]] | None:
+    """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows, or
+    ``None`` when the read failed.
+
+    The flag's one reader (BACKLOG #2623), and ``tests/test_connection_flag_readers.py`` fails on a
+    second. No engine path reads the flag, so a read that fails costs the markers and never the
+    page: a row a database writer planted that the driver cannot decode reads as flags unknown. It
+    is ``None`` and not an empty set so that the console cannot take a failed read for an answer:
+    an empty set would hide every row under Flagged only, and every toggle would post a value
+    derived from it. Logged at WARNING once per failure run, because the stats socket reads this
+    every second per console. ``state`` is the app's, so a run belongs to one app."""
+    try:
+        flags = await engine.store.list_connection_flags()
+    except Exception as exc:  # noqa: BLE001 - the page outlives this read; see the docstring
+        if not state.connection_flags_failing:
+            _log.warning("the connection flags could not be read: %s", safe_exc(exc))
+        state.connection_flags_failing = True
+        return None
+    state.connection_flags_failing = False
+    return flags
+
+
+def _row_flag(flags: set[tuple[str, str]] | None, name: str, direction: str) -> bool | None:
+    """One dashboard row's ``flagged``, ``None`` when :func:`_connection_flags` read nothing."""
+    return None if flags is None else (name, direction) in flags
 
 
 def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
@@ -1552,21 +1570,6 @@ def _managed_teardown_steps(
         )
     )
     steps += _app_drain_steps(app, store, auth, owns_auth=True)
-    # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit row.
-    # Drained here, under the budget, rather than by the 5 s wait engine.stop() runs when no drain
-    # ran first. Draining closes the engine's gate, and engine.stop() then gives a write still
-    # running only a 1 s late wait, inside its reserve. Handed _INNER_SHARE of its bound, so its
-    # wait ends before the step is cut; the wait never cancels a write. A small floor, since the
-    # gate closes at once and most shutdowns have no write running. The embedded lifespan
-    # (create_app(engine=...)) has no such step, so its caller's engine.stop() runs the 5 s wait,
-    # outside the reserve that lifespan's budget assumes.
-    steps.append(
-        _TeardownStep(
-            "the config-write drain",
-            0.25,
-            lambda b: engine.drain_config_writes(b * _INNER_SHARE),
-        )
-    )
     if security_notifier is not None:
         # It drains queued user emails, and records a notice it could not send in the audit log,
         # so it closes while the store is open, after the lock notices that hand it mail (BACKLOG
@@ -2357,14 +2360,14 @@ async def _record_reload_audit(
     that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
     when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. The
     row is written after the swap, and nothing holds the graph still until
-    then, so a second reload or a connection flag toggle can move the engine on first. The row then
+    then, so a second reload can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
     :data:`_BASELINE_UNCHECKED`, as a superseded start row does: it is no baseline, and the next
     start compares against an older row instead. The test is whether
     :attr:`~Engine.loaded_config_fingerprint` is still this reload's digest object, which only a
-    committed reload or a flag toggle rebinds; a reload that swaps and then rolls back leaves it
-    alone. The check runs just before the write, so a change after it is not caught. The snapshot
-    and the check are inside the guard below, so a fault in either is caught like a failed write.
+    committed reload rebinds; a reload that swaps and then rolls back leaves it alone. The check
+    runs just before the write, so a change after it is not caught. The snapshot and the check are
+    inside the guard below, so a fault in either is caught like a failed write.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -2401,7 +2404,7 @@ async def _record_reload_audit(
         if isinstance(loaded, ReloadOutcome):
             state = _LoadedConfig.of(loaded)
             config_version = loaded.config_version
-            # Only a COMMITTED reload or a flag toggle rebinds the loaded fingerprint. The graph
+            # Only a COMMITTED reload rebinds the loaded fingerprint. The graph
             # object is no test: a reload part way through its swap, which then fails and rolls back
             # to this graph, would mark a row that still names the running config.
             superseded = engine.loaded_config_fingerprint is not loaded.fingerprint
@@ -2813,16 +2816,13 @@ async def _audit_reload_attempt(
         ) from exc
 
 
-#: The audit actions that record which config bytes a process ran from: a start, an applied reload,
-#: and every engine write of a file the config digest covers, such as a flag toggle that rewrote
-#: ``connections.toml`` (vault BACKLOG #2597). The writes come from ``CONFIG_WRITE_ACTIONS``, the
-#: names ``Engine.write_baseline_config`` records under, so a new engine config write needs no edit
-#: here (vault BACKLOG #2945). A dry run's ``config_reload_check`` is not one: it applied nothing.
-_CONFIG_BASELINE_ACTIONS: tuple[str, ...] = (
-    "config_loaded",
-    "config_reload",
-    *CONFIG_WRITE_ACTIONS,
-)
+#: The audit actions that record which config bytes a process ran from: a start and an applied
+#: reload (vault BACKLOG #2597). The engine has no write of a file the config digest covers, and
+#: ``tests/test_config_write_census.py`` fails on at least the writers it names.
+#: A dry run's ``config_reload_check`` is not one: it applied nothing. Nor is a flag toggle's
+#: ``connection_flag_set``: the store holds the flag, so the row carries no digest, and as a baseline
+#: it would read as degraded and leave the next start comparing nothing (BACKLOG #2623).
+_CONFIG_BASELINE_ACTIONS: tuple[str, ...] = ("config_loaded", "config_reload")
 
 #: How long the start waits for its baseline read. A slow store costs the comparison, never the start.
 _CONFIG_BASELINE_TIMEOUT_SECONDS = 5.0
@@ -2834,11 +2834,11 @@ _CONFIG_BASELINE_TIMEOUT_SECONDS = 5.0
 _CONFIG_BASELINE_WINDOW = 50
 
 #: The detail key that marks a config row whose digest this process never checked against the
-#: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest,
-#: and any flag toggle that process writes. A later start passes over such a row to the last checked
+#: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest.
+#: A later start passes over such a row to the last checked
 #: one, so the change the unchecked start could not see is still reported. A start row that a reload
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
-#: So does an inline or released reload's row written after a later reload or a flag toggle moved
+#: So does an inline or released reload's row written after a later reload moved
 #: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
@@ -2969,7 +2969,7 @@ async def _compare_start_config(
 
     Keyed on the store, not on a node: every engine shard and cluster node shares one config
     directory by contract, and a node id changes on every restart. The baseline is the newest
-    ``config_loaded``, ``config_reload`` or ``connection_flag_set`` row the start can use: it passes
+    ``config_loaded`` or ``config_reload`` row the start can use: it passes
     over a row whose detail is not a JSON object (at WARNING, since only the engine writes these
     rows) and a row marked :data:`_BASELINE_UNCHECKED`, and falls back to the next older one.
 
@@ -4202,6 +4202,7 @@ def create_app(
     # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
     app.state.configured_log_level = configured_log_level
     app.state.ws_count = 0  # live /ws/stats connection count (API-WS cap)
+    app.state.connection_flags_failing = False  # see _connection_flags
     # BACKLOG #76 (ADR 0065 amendment): the in-memory metrics-history ring the console trend charts read
     # from GET /metrics/history. Fed by the ~1s /ws/stats sampler below (no new task, no extra store I/O);
     # bounded + process-local (a durable table would flip store_schema — out of scope for this first slice).
@@ -5001,6 +5002,8 @@ def create_app(
         # edge that has carried traffic (the outbox metrics are keyed that way).
         rr = engine.registry_runner
         if rr is not None:
+            # See _connection_flags for why its own failure stays out of the page.
+            flags = await _connection_flags(engine, app.state)
             reg = rr.registry
             for iname, ic in reg.inbound.items():
                 if not identity.can_access_channel(iname):
@@ -5049,8 +5052,7 @@ def create_app(
                         # the status; ifail takes precedence. One connection can hold both: a passive DR
                         # standby records a refused CA on a feed it parks (vault BACKLOG #3263).
                         error=ifail or ifiltered,
-                        flagged=ic.flagged,  # #131: object-of-interest marker (display-only)
-                        toml_managed=_is_toml_managed(ic.source_file),
+                        flagged=_row_flag(flags, iname, "inbound"),  # object-of-interest marker
                     )
                 )
             emitted_dests: set[str] = set()
@@ -5125,9 +5127,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=(dfail or dfiltered) if oc is not None else None,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        # #131: object-of-interest marker; a draining (removed) outbound has no oc → False.
-                        flagged=oc.flagged if oc is not None else False,
-                        toml_managed=_is_toml_managed(oc.source_file) if oc is not None else False,
+                        flagged=_row_flag(flags, dname, "outbound"),  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector, past its
                         # display delay). Duck-typed → False for non-ACK-waiting / draining outbounds.
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
@@ -5234,8 +5234,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        flagged=oc.flagged,  # #131: object-of-interest marker (display-only)
-                        toml_managed=_is_toml_managed(oc.source_file),
+                        flagged=_row_flag(flags, dname, "outbound"),  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector).
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
                     )
@@ -5449,29 +5448,29 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONFIG_DEPLOY)),
     ) -> dict[str, object]:
-        """Set the object-of-interest flag (#131, ADR 0007 amendment) on a ``connections.toml``-managed
-        connection — the FIRST console→connections.toml write seam. Persists ``flagged`` through the
-        comment-preserving, validate-before-persist writer (``connections_edit``) and reflects it on the
-        live registry **without a reload** (a cosmetic-field replace — no connector rebuild, no delivery
-        change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
-        A toggle whose audit row fails is refused **503** (vault BACKLOG #2945). Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path.
+        """Set the object-of-interest flag on a connection in the running graph (#131, BACKLOG
+        #2623). The store holds the flag, so a toggle runs no config module and writes no file, and
+        the flag and its ``connection_flag_set`` row commit together. A name the graph does not have
+        is refused **409**, and a toggle the store did not confirm **503**: a commit whose answer
+        was lost has landed, so a 503 does not say the flag is unchanged. Paced and audited.
+
+        Gated by ``config:deploy``, which the flag's old home justified and which stays by decision:
+        the flag marks what an operator should look at, and a change of gate is its own decision
+        (ADR 0007, amendment of 2026-10-31).
 
         A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
         other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
-        engine looks the name up, so a 200 against a 409 cannot tell it which names are
-        TOML-managed. Unlike :func:`_guarded_direction` it needs no runner: with none, an in-scope
-        name reaches the engine, which answers for the connections file alone."""
+        engine looks the name up, so a 200 against a 409 cannot tell it which names exist."""
         rr = engine.registry_runner
         if identity.allowed_channels is not None and (
             req.direction != "inbound"
             or not identity.can_access_channel(name)
-            or (rr is not None and name not in rr.registry.inbound)
+            # inbound_names(), as the engine's own guard reads it: an engine shard's view holds only
+            # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
+            or (rr is not None and name not in rr.registry.inbound_names())
         ):
             await _deny_connection(engine, identity, name, client_ip(request))
         try:
-            # The engine writes the connection_flag_set row itself, with the config digest it
-            # vouches for after this write (vault BACKLOG #2597, #2945). The next start reads that
-            # row as its baseline.
             await engine.set_connection_flag(
                 name,
                 direction=req.direction,
@@ -5479,15 +5478,12 @@ def create_app(
                 actor=identity.username,
                 client=client_ip(request),
             )
-        except ConfigWriteAuditFailed as exc:
-            # The audit log did not record the row, so the engine refused the toggle and undid it,
-            # or says it could not (vault BACKLOG #2945). The audit log, not the request, is at
-            # fault, so 503 as for any refused audit write. The route's only 503, which the console
-            # relies on to name this fix.
+        except ConnectionFlagNotRecorded as exc:
+            # The store, not the request, is at fault, so 503 as for any refused audit write. The
+            # route's only 503, which the console relies on to name this fix.
             raise HTTPException(503, str(exc)) from exc
         except WiringError as exc:
-            # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
-            # which writes no config file (vault BACKLOG #2933): the edit never landed.
+            # The one 409: the running graph has no such connection.
             raise HTTPException(409, str(exc)) from exc
         return {"name": name, "direction": req.direction, "flagged": req.flagged}
 
@@ -11904,7 +11900,7 @@ def create_managed_app(
                 "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
             )
             # The row names the digest judged above, not the engine's at the write: a later
-            # reload or flag toggle marks it superseded instead (vault BACKLOG #3765, item 19).
+            # reload marks it superseded instead (vault BACKLOG #3765, item 19).
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,
@@ -11991,8 +11987,8 @@ def create_managed_app(
                 # not later: engine.start() has not run, so no reload can have moved it yet, and a
                 # start on changed bytes still pages through a crash loop (vault BACKLOG #3076).
                 # Its row stays no baseline, since nothing can rule out a swap before the row is
-                # written. So the next start pages again for the same change, unless a flag toggle
-                # or reload row lands in between and becomes the baseline. A repeat page on a
+                # written. So the next start pages again for the same change, unless a reload row
+                # lands in between and becomes the baseline. A repeat page on a
                 # degraded start is the safe side of that trade.
                 compared = (
                     start_loaded.fingerprint
@@ -12002,11 +11998,6 @@ def create_managed_app(
                 start_outcome, start_config = await _compare_start_config(
                     engine, compared, on_disk=on_disk
                 )
-                # This process cannot vouch for a config it never checked: its flag rows say so.
-                # The outcome alone decides it, by design (vault BACKLOG #3076 item 6): a start
-                # row that names no snapshot, or that a reload superseded, is no baseline itself,
-                # but its comparison still ran, and a flag row vouches for no more than that.
-                engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 if compared and _may_have_moved(
                     digest_coverage(compared), digest_coverage(on_disk)
                 ):

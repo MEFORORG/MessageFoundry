@@ -325,7 +325,6 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
             "role",
             "simulated",
             "status",
-            "toml_managed",
             "waiting_for_reply",
             "written",
         }

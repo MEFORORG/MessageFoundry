@@ -420,8 +420,8 @@ async def test_the_event_refusal_renders_no_results_table_at_all(admin: httpx.As
 
 
 async def test_the_flag_route_refuses_a_bad_connection_name(admin: httpx.AsyncClient) -> None:
-    """The fifth per-name route, and the only one that WRITES -- it reaches the comment-preserving
-    connections.toml writer, so it is the last one that should have been left unruled."""
+    """The fifth per-name route, and the only one that WRITES -- it reaches the store, so it is the
+    last one that should have been left unruled."""
     r = await admin.post(
         f"/ui/connections/{BAD_NAME}/flag",
         data={"direction": "inbound", "flagged": "true"},

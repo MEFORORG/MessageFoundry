@@ -3,8 +3,8 @@
 """A start compares its config fingerprint with the store's baseline and alerts on a change (vault
 BACKLOG #2597, step 4).
 
-The baseline is the newest ``config_loaded``, ``config_reload`` or ``connection_flag_set`` row from
-any node, since every engine shard and node shares one config directory. These tests drive the
+The baseline is the newest ``config_loaded`` or ``config_reload`` row from any node, since every
+engine shard and node shares one config directory. These tests drive the
 managed app's real lifespan twice over one store, which is what a restart is. No ``[alerts]``
 transport is configured, so the start falls back to ``LoggingAlertSink``; its ``config_changed`` is
 wrapped to record each call, and the real method still runs.
@@ -56,7 +56,7 @@ from tests.test_alert_state import _RecordingStore
 from tests.test_config_fingerprint import _unlistable, _unreadable
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
 
-_ACTIONS = ("config_loaded", "config_reload", "connection_flag_set")
+_ACTIONS = ("config_loaded", "config_reload")
 
 
 @pytest.fixture
@@ -380,11 +380,11 @@ async def test_a_start_that_took_no_digest_is_passed_over_too(
     assert rows[-1]["comparison"] == "compared"
 
 
-async def test_a_flag_toggle_in_an_unchecked_process_vouches_for_nothing(
+async def test_a_flag_toggle_in_an_unchecked_process_leaves_the_last_checked_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
-    """Review round 3: the toggle would vouch for the digest the unchecked start loaded, and the
-    next start would take the toggle's row as its baseline. The process marks it unchecked."""
+    """A toggle's row is no baseline at all (BACKLOG #2623), so an unchecked process has nothing to
+    mark on it, and the next start compares with the last checked row and pages."""
     cfg = _toml_config(tmp_path)
     before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)
@@ -398,12 +398,10 @@ async def test_a_flag_toggle_in_an_unchecked_process_vouches_for_nothing(
                 "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
             )
             assert r.status_code == 200, r.text
-            engine: Engine = app.state.engine
-            flag_rows = await engine.store.list_audit(action="connection_flag_set")
-    assert json.loads(flag_rows[0]["detail"])["baseline_unchecked"] is True
     rows = await _start(tmp_path, cfg)
     assert len(alerts) == 1
     assert alerts[0]["previous_fingerprint"] == before
+    assert rows[-1]["changed"] is True
     assert rows[-1]["comparison"] == "compared"
 
 
@@ -705,7 +703,7 @@ async def test_a_convergence_row_names_its_own_reload_when_the_engine_moves_on_f
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
     """vault BACKLOG #3076 item 3, #3109 item 4: a convergence reload's row is built from that
-    reload's outcome, as an operator reload's is. A flag toggle or an operator reload can move the
+    reload's outcome, as an operator reload's is. An operator reload can move the
     engine on between the swap and the row. The row then still names the bytes this node converged
     on, under the convergence actor, and marks itself superseded, so it is no baseline. It was read
     off the live engine before, and named the other change's digest as the convergence's."""
@@ -714,7 +712,7 @@ async def test_a_convergence_row_names_its_own_reload_when_the_engine_moves_on_f
 
     async def _reload_then_move_on(self: Engine, *a: Any, **kw: Any) -> Any:
         outcome = await real(self, *a, **kw)
-        self.loaded_config_fingerprint = dict(other)  # what a flag toggle does, before the row
+        self.loaded_config_fingerprint = dict(other)  # what a reload does, before the row
         return outcome
 
     app = _app(tmp_path, cfg)
@@ -929,6 +927,8 @@ def _toml_config(tmp_path: Path) -> Path:
 async def test_a_flag_toggle_then_a_restart_raises_no_alert(
     tmp_path: Path, alerts: list[dict[str, Any]]
 ) -> None:
+    """The flag is not config (BACKLOG #2623): the toggle leaves the digest where it was, and the
+    start after it compares with the last start, not with the toggle."""
     cfg = _toml_config(tmp_path)
     before = config_fingerprint(cfg)
     app = _app(tmp_path, cfg)
@@ -938,24 +938,22 @@ async def test_a_flag_toggle_then_a_restart_raises_no_alert(
             "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
         )
         assert r.status_code == 200, r.text
-        flag_rows = await engine.store.list_audit(action="connection_flag_set")
-    after = config_fingerprint(cfg)
-    assert after != before, "control: the toggle rewrote connections.toml"
-    flag = json.loads(flag_rows[0]["detail"])
-    assert flag["fingerprint"] == after and flag["scheme"] == FINGERPRINT_SCHEME
+        [flag_row] = await engine.store.list_audit(action="connection_flag_set")
+    assert config_fingerprint(cfg) == before
+    assert "fingerprint" not in json.loads(flag_row["detail"])
     rows = await _start(tmp_path, cfg)
     assert alerts == []
-    assert rows[-1]["changed"] is False and rows[-1]["previous_fingerprint"] == after
+    assert rows[-1]["comparison"] == "compared"
+    assert rows[-1]["changed"] is False and rows[-1]["previous_fingerprint"] == before
 
 
-async def test_two_flag_toggles_move_the_provenance_baseline(
+async def test_flag_toggles_leave_provenance_alone(
     tmp_path: Path, alerts: list[dict[str, Any]]
 ) -> None:
-    """The flag is reflected live, so the loaded digest moves with each toggle: the second toggle
-    still counts as the one change since the load, and provenance reports no drift."""
     cfg = _toml_config(tmp_path)
     app = _app(tmp_path, cfg)
     async with app.router.lifespan_context(app), _client(app) as c:
+        before = (await c.get("/config/provenance")).json()
         for flagged in (True, False):
             r = await c.post(
                 "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": flagged}
@@ -963,17 +961,15 @@ async def test_two_flag_toggles_move_the_provenance_baseline(
             assert r.status_code == 200, r.text
         prov = (await c.get("/config/provenance")).json()
     assert prov["drift"] is False
-    assert prov["fingerprint"] == config_fingerprint(cfg)
-    rows = await _start(tmp_path, cfg)
-    assert alerts == []
-    assert rows[-1]["changed"] is False
+    assert prov["fingerprint"] == before["fingerprint"] == config_fingerprint(cfg)
 
 
-async def test_a_flag_toggle_does_not_vouch_for_an_unloaded_edit(
+async def test_a_flag_toggle_does_not_hide_an_unloaded_edit(
     tmp_path: Path, alerts: list[dict[str, Any]]
 ) -> None:
-    """An edit made on disk and never loaded, then a toggle, then a restart: the toggle's row
-    must not carry a digest that covers the edit, or the restart would raise nothing."""
+    """An edit made on disk and never loaded, then a toggle, then a restart still pages. The toggle's
+    row has no digest, so as a baseline it would read as degraded and this start would compare
+    nothing: RED if ``connection_flag_set`` is ever put back on the baseline list."""
     cfg = _toml_config(tmp_path)
     loaded = config_fingerprint(cfg)
     app = _app(tmp_path, cfg)
@@ -984,52 +980,12 @@ async def test_a_flag_toggle_does_not_vouch_for_an_unloaded_edit(
             "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
         )
         assert r.status_code == 200, r.text
-        engine: Engine = app.state.engine
-        flag = json.loads(
-            (await engine.store.list_audit(action="connection_flag_set"))[0]["detail"]
-        )
-    assert flag["fingerprint"] == loaded, "the row keeps the digest the running graph loaded"
     rows = await _start(tmp_path, cfg)
     assert len(alerts) == 1
     assert alerts[0]["previous_fingerprint"] == loaded
     assert alerts[0]["fingerprint"] == config_fingerprint(cfg)
-    assert alerts[0]["baseline_action"] == "connection_flag_set"
+    assert alerts[0]["baseline_action"] == "config_loaded"
     assert rows[-1]["changed"] is True
-
-
-async def test_a_failed_digest_after_the_toggle_vouches_for_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
-) -> None:
-    """The toggle was the one change, but its after-digest could not be taken. The row carries no
-    digest rather than the loaded one, which the next start would read as a change."""
-    cfg = _toml_config(tmp_path)
-    app = _app(tmp_path, cfg)
-    async with app.router.lifespan_context(app), _client(app) as c:
-        # The toggle takes both digests on its worker thread, under the config edit lock (vault
-        # BACKLOG #2782), so it calls the blocking twin of fingerprint_bundle.
-        real = Engine.fingerprint_bundle_blocking
-        calls = 0
-
-        def _second_fails(self: Engine, path: Path) -> Any:
-            nonlocal calls
-            calls += 1
-            return (None, "unreadable") if calls == 2 else real(self, path)
-
-        monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", _second_fails)
-        r = await c.post(
-            "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
-        )
-        assert r.status_code == 200, r.text
-        monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", real)
-        engine: Engine = app.state.engine
-        flag = json.loads(
-            (await engine.store.list_audit(action="connection_flag_set"))[0]["detail"]
-        )
-    assert calls == 2, "control: the before and after digests were both asked for"
-    assert "fingerprint" not in flag
-    rows = await _start(tmp_path, cfg)
-    assert alerts == []
-    assert rows[-1]["changed"] is None
 
 
 # --- the alert timing ----------------------------------------------------------------------------
@@ -1370,7 +1326,6 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
         async with app.router.lifespan_context(app):
             engine: Engine = app.state.engine
             provenance_after = engine.loaded_config_fingerprint
-            unchecked_after = engine.config_baseline_unchecked
             rows = await _start_rows(engine)
     assert config_fingerprint(cfg) == before, "control: the digest after the load matches"
     assert [(a["fingerprint"], a["previous_fingerprint"]) for a in alerts] == [(ran, before)]
@@ -1378,7 +1333,6 @@ async def test_an_edit_reverted_during_the_start_load_pages_on_the_bytes_it_load
     assert rows[-1]["comparison"] == "changed_during_load" and rows[-1]["changed"] is True
     assert rows[-1]["fingerprint"] == ran and "baseline_unchecked" not in rows[-1]
     assert provenance_after is not None and provenance_after["fingerprint"] == ran
-    assert unchecked_after is False, "the start compared, and its digest is the bytes it ran"
     # The directory went back, so the next start differs from what this one ran, and says so.
     rows = await _start(tmp_path, cfg)
     assert [a["fingerprint"] for a in alerts] == [ran, before]
@@ -1393,7 +1347,7 @@ def _long_node_detail(comparison: str = "compared") -> str:
     return config_changed_detail(
         fingerprint="a" * 64,
         previous_fingerprint="b" * 64,
-        baseline_action="connection_flag_set",
+        baseline_action="config_reload",
         baseline_node=_LONG_NODE,
         baseline_at="2026-10-04T00:00:00+00:00",
         comparison=comparison,
@@ -1406,7 +1360,7 @@ def test_the_detail_leads_with_the_baseline_time_and_node_and_fits_the_reason_co
     detail = _long_node_detail()
     assert len(detail) <= 200
     assert detail.startswith("baseline 2026-10-04T00:00:00+00:00 on node hhh")
-    assert ":4194304:abcdef12 (connection_flag_set)" in detail
+    assert ":4194304:abcdef12 (config_reload)" in detail
     assert detail.endswith("baseline config bbbbbbbbbbbb")
 
 
@@ -1650,10 +1604,8 @@ async def test_a_start_with_no_snapshot_still_marks_a_directory_that_moved(
         async with app.router.lifespan_context(app):
             engine: Engine = app.state.engine
             provenance_after = engine.loaded_config_fingerprint
-            unchecked_after = engine.config_baseline_unchecked
     assert [a["comparison"] for a in alerts] == ["changed_during_load"], "control: it paged"
     assert provenance_after is not None and provenance_after["fingerprint"] == before
-    assert unchecked_after is False
 
 
 async def test_a_partial_digest_whose_fold_equals_the_baseline_still_pages(
@@ -1676,7 +1628,7 @@ async def test_the_convergence_row_writes_the_fingerprint_it_judged(
     tmp_path: Path, cfg: Path
 ) -> None:
     """Item 19: the row judged ``outcome.fingerprint`` but wrote whatever the engine held at the
-    write, so a later reload or flag toggle could put a digest it never judged on the row."""
+    write, so a later reload could put a digest it never judged on the row."""
     app = _app(tmp_path, cfg)
     async with app.router.lifespan_context(app):
         engine: Engine = app.state.engine

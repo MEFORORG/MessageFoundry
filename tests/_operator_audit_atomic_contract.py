@@ -7,7 +7,7 @@ the upload inject each take an :data:`~messagefoundry.store.store.OperatorAudit`
 the row it builds inside the mutation's own transaction. Before #2624 the API wrote the row in a
 second transaction, so a crash between the two kept the change and lost who made it. The four
 operator alert mutations (ack, resolve, suspend, resume) take one ``AuditAppend`` the same way
-(vault BACKLOG #3217).
+(vault BACKLOG #3217), and so does the connection flag (BACKLOG #2623).
 
 Each case runs twice. First the audit append is made to fail, and the case asserts the store change
 rolled back with it: neither committed. Then it runs clean and asserts both committed, the row
@@ -196,6 +196,71 @@ async def _check(
     assert len(rows) == 1, f"{label}: the clean run committed {len(rows)} audit rows"
     row = rows[0]
     assert (row["actor"], row["channel_id"], row["client"]) == ("contract-op", channel, _CLIENT)
+
+
+async def _assert_connection_flag_atomic(store: Any, tag: str) -> None:
+    """The object-of-interest flag commits with its row, and a row IS the flag (BACKLOG #2623): a
+    set, a repeat that adds no second row, a clear, and a clear of nothing, which still audits."""
+    conn = f"OB_F{tag}"
+
+    async def is_clear() -> None:
+        assert (conn, "outbound") not in await store.list_connection_flags()
+
+    async def is_flagged() -> None:
+        assert (conn, "outbound") in await store.list_connection_flags()
+
+    async def was_flagged(_result: Any) -> None:
+        await is_flagged()
+
+    async def was_cleared(_result: Any) -> None:
+        await is_clear()
+
+    def setter(flagged: bool) -> Callable[[Callable[[Any], AuditAppend | None]], Awaitable[Any]]:
+        async def run(audit: Callable[[Any], AuditAppend | None]) -> None:
+            built = audit(flagged)
+            assert built is not None
+            await store.set_connection_flag(conn, "outbound", flagged=flagged, audit=built)
+
+        return run
+
+    await _check(
+        store,
+        label="flag-set",
+        channel=None,
+        run=setter(True),
+        unchanged=is_clear,
+        changed=was_flagged,
+    )
+    await _check(
+        store,
+        label="flag-repeat",
+        channel=None,
+        run=setter(True),
+        unchanged=is_flagged,
+        changed=was_flagged,
+    )
+    await _check(
+        store,
+        label="flag-clear",
+        channel=None,
+        run=setter(False),
+        unchanged=is_flagged,
+        changed=was_cleared,
+    )
+    await _check(
+        store,
+        label="flag-clear-none",
+        channel=None,
+        run=setter(False),
+        unchanged=is_clear,
+        changed=was_cleared,
+    )
+    # The direction is part of the key, so the same name on the other side stays unflagged.
+    built = AuditAppend("contract.flag-in", actor="contract-op")
+    await store.set_connection_flag(conn, "inbound", flagged=True, audit=built)
+    await is_clear()
+    assert (conn, "inbound") in await store.list_connection_flags()
+    await store.set_connection_flag(conn, "inbound", flagged=False, audit=built)
 
 
 async def _assert_alert_mutations_atomic(store: Any, tag: str) -> None:
@@ -479,6 +544,7 @@ async def assert_operator_audit_atomic(store: Any) -> None:
     )
 
     await _assert_alert_mutations_atomic(store, tag)
+    await _assert_connection_flag_atomic(store, tag)
 
     # The rows joined the hash chain the way record_audit's do: the chain still verifies.
     ok, message = await store.verify_audit_chain()

@@ -404,9 +404,9 @@ def _codesets_dir(config_dir: str | Path) -> Path:
 def _directory_lock(codesets_dir: Path) -> AbstractContextManager[None]:
     """The cross-process edit lock for every code set in ``codesets_dir`` (vault BACKLOG #2782).
 
-    It is the CONFIG directory's lock, the one ``connections_edit`` takes, because the engine's
-    flag toggle holds it across two digests of the whole bundle, code sets included. Keyed on
-    the directory, never on an operator-supplied name, so no name can steer the lock file."""
+    It is the CONFIG directory's lock, the one ``connections_edit`` takes, so the CLI's edits of
+    one directory run one at a time. Keyed on the directory, never on an operator-supplied name,
+    so no name can steer the lock file."""
     return atomic_edit.edit_lock(codesets_dir, busy_error=WiringError, refused_error=WiringError)
 
 

@@ -133,6 +133,7 @@ def _selection_checkbox(r: ConnectionRow) -> Markup:
     ``app.js`` can partition a mixed selection per the role/state matrix (UX-only — the engine is the
     authority). ``data-paused`` (paused AND quiesced) gates purge eligibility INDEPENDENT of the collapsed
     display ``status`` so a failed/filtered-but-paused outbound stays purgeable."""
+    flagged = "unknown" if r.flagged is None else ("1" if r.flagged else "0")
     return el(
         "input",
         type="checkbox",
@@ -144,7 +145,8 @@ def _selection_checkbox(r: ConnectionRow) -> Markup:
         data_paused=("1" if r.paused else "0"),
         data_dest=(r.destination or ""),
         # #131: the object-of-interest flag, read by the "Flagged only" client-side filter (app.js).
-        data_flagged=("1" if r.flagged else "0"),
+        # "unknown" is a failed read, which that filter must not take for "not flagged" (#2623).
+        data_flagged=flagged,
     )
 
 
@@ -173,19 +175,19 @@ def _flag_name(r: ConnectionRow) -> tuple[str, str]:
 
 
 def _flag_cell(r: ConnectionRow) -> Markup:
-    """The Flag cell (#131, ADR 0007 amendment): a same-origin POST toggle form on a
-    ``connections.toml``-managed row (the write seam persists there), or a read-only indicator on a
-    code-first row (no TOML home for the flag). The glyph is filled (⚑) when flagged, outline (⚐)
-    otherwise; the button posts the DESIRED new value so a submit flips it (like the Alerts ack/resolve
-    POST forms). Every value is placed through the escaping builder."""
+    """The Flag cell (#131, BACKLOG #2623): a same-origin POST toggle form on a row in the running
+    graph, or the marker alone on a draining outbound, whose name the graph no longer holds, so the
+    toggle would only be refused. A row whose flag could not be read gets neither: the form posts
+    the opposite of what the row shows, and a failed read shows nothing to take the opposite of. The
+    glyph is filled when flagged and outline otherwise; the button posts the DESIRED new value so a
+    submit flips it (like the Alerts ack/resolve POST forms). Every value is placed through the
+    escaping builder."""
     glyph = "⚑" if r.flagged else "⚐"
-    if not r.toml_managed:
-        # Code-first / draining: show the state but no toggle (it can't be persisted to connections.toml).
+    if r.flagged is None or r.status == "draining":
         return el(
             "span",
             glyph if r.flagged else "",
             class_="flag" + (" flagged" if r.flagged else ""),
-            title="Flagged (code-first — edit the .py module to change)" if r.flagged else "",
         )
     name, direction = _flag_name(r)
     return el(
@@ -204,6 +206,16 @@ def _flag_cell(r: ConnectionRow) -> Markup:
         action=f"/ui/connections/{_seg(name)}/flag",
         class_="ctl flagform",
     )
+
+
+#: Above the table while the store's flag read fails (BACKLOG #2623). Without it an operator would see
+#: every marker and toggle gone and Flagged only showing rows that may not be flagged, with no reason.
+FLAGS_UNREAD_NOTICE = (
+    "The connection flags could not be read, so no row shows a flag or offers the toggle. Flagged "
+    "only shows every connection, and while Flagged only is ticked select-all takes none of them. "
+    "This clears when the read recovers. If it does not, see the engine log: a stored flag row "
+    "that cannot be decoded stops every read until it is deleted from the database by hand."
+)
 
 
 def purge_pending(pending: object) -> Markup:
@@ -227,7 +239,10 @@ def connections_fragment(rows: list[ConnectionRow]) -> Markup:
     A leading selection column replaces the old per-row control cell: a header select-all checkbox and a
     per-row checkbox whose ``value`` = :func:`_row_key`. These are the ONLY per-row controls now — the
     Start/Stop/Restart/Reset/Purge actions moved to the un-polled dashboard toolbar, driven over this
-    selection by ``app.js`` (the checkboxes are wiped on each poll/ws swap and re-hydrated from a JS Set)."""
+    selection by ``app.js`` (the checkboxes are wiped on each poll/ws swap and re-hydrated from a JS Set).
+
+    :data:`FLAGS_UNREAD_NOTICE` sits above the table while the flag read is failing. It is inside the
+    fragment so that the next swap after the read recovers clears it."""
     headers: list[str] = [
         el("input", type="checkbox", data_mf_conns_all=True),
         "Flag",
@@ -257,7 +272,14 @@ def connections_fragment(rows: list[ConnectionRow]) -> Markup:
         ]
         for r in rows
     ]
-    return el("div", rows_table(headers, body), id="conns")
+    notice = any(r.flagged is None for r in rows)
+    return el(
+        "div",
+        # No role: this swaps about once a second, and a live region would be read out every time.
+        el("p", FLAGS_UNREAD_NOTICE, class_="banner") if notice else Markup(""),
+        rows_table(headers, body),
+        id="conns",
+    )
 
 
 def _controls_toolbar() -> Markup:
@@ -286,8 +308,9 @@ def _controls_toolbar() -> Markup:
 def _filter_box() -> Markup:
     """A filter-as-you-type box over the connections table (client-side, ``app.js``). It lives OUTSIDE the
     ``[data-poll]`` container so its typed value survives the live swap; ``app.js`` hides rows whose text
-    doesn't match and re-applies the filter after each poll/ws swap. Purely presentational — the server
-    still sends every row, and a hidden row's checkbox value stays in the selection (filter is view-only)."""
+    doesn't match and re-applies the filter after each poll/ws swap. The server still sends every row,
+    and a hidden row's checkbox value stays in the selection. Select-all skips a hidden row, so what is
+    typed here shapes a bulk action's target set."""
     return el(
         "input",
         type="search",
@@ -300,10 +323,12 @@ def _filter_box() -> Markup:
 
 
 def _flagged_only_toggle() -> Markup:
-    """The Flagged Objects filter (#131): a checkbox that hides every non-flagged row (client-side,
-    ``app.js``). Lives OUTSIDE ``[data-poll]`` (like the filter box) so its state survives the live swap;
-    ``app.js`` re-applies it after each poll/ws swap. Purely presentational — the server still sends every
-    row, and a hidden row's checkbox stays in the selection Set."""
+    """The Flagged Objects filter (#131): a checkbox that hides every row known to be unflagged
+    (client-side, ``app.js``), so a failed flag read hides nothing. Lives OUTSIDE ``[data-poll]`` (like
+    the filter box) so its state survives the live swap; ``app.js`` re-applies it after each poll/ws
+    swap. The server still sends every row, and a hidden row's checkbox stays in the selection Set.
+    It is not only presentation: select-all skips a hidden row, so this filter shapes a bulk action's
+    target set (the reach ADR 0007's 2026-10-31 amendment records as accepted)."""
     return el(
         "label",
         el("input", type="checkbox", data_mf_conns_flagged=True),
@@ -512,12 +537,9 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
 
 
 def flag_rejected(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused (#131): the SCOPE FORK, where the connection is
-    code-first (no ``connections.toml`` home for the flag); a ``connections.toml`` the engine's
-    account cannot write (vault BACKLOG #3106); or a cluster node, which writes no config file
-    (vault BACKLOG #2933). ``detail`` says which; the two hints below each name the case they are
-    for, since nothing here should guess from the detail's wording. Both ``name`` and ``detail``
-    are escaped."""
+    """Shown when a flag toggle is refused (#131): the running graph has no such connection, as for
+    a page drawn before a reload removed it (BACKLOG #2623). Both ``name`` and ``detail`` are
+    escaped."""
     body = el(
         "div",
         el("h1", "Flag not changed"),
@@ -525,17 +547,8 @@ def flag_rejected(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The object flag is settable here only on a connections.toml-managed connection, in a "
-            "config directory the engine can write. A code-first connection has no TOML home for "
-            "it, so edit its .py module to change the flag. A read-only or root-owned config "
-            "directory: change the flag in the config source itself.",
-            class_="muted",
-        ),
-        el(
-            "p",
-            "A cluster node refuses the toggle, because each node loads its own config directory. "
-            "Set flagged on the connection's entry in connections.toml on every node, then apply "
-            "it with a coordinated restart.",
+            "Only a connection in the running graph can be flagged. A connection removed from the "
+            "config stops being one when the reload that removed it applies.",
             class_="muted",
         ),
         el("p", el("a", "← Connections", href="/ui")),
@@ -545,26 +558,27 @@ def flag_rejected(name: str, detail: str) -> Markup:
 
 
 def flag_not_recorded(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused because the audit log did not record it (vault BACKLOG
-    #2945). The engine undoes such a toggle, and ``detail`` says when it could not. Its own page,
-    because :func:`flag_rejected`'s hints name fixes for other refusals. Both ``name`` and
+    """Shown when the store did not confirm a flag toggle (BACKLOG #2623). The flag and its audit row
+    land together or not at all, and a lost commit answer may have landed both. Its own page,
+    because :func:`flag_rejected`'s hint names a fix for another refusal. Both ``name`` and
     ``detail`` are escaped."""
     body = el(
         "div",
-        el("h1", "Flag not changed"),
+        el("h1", "Flag change not confirmed"),
         el("p", text(f"Connection: {name}"), class_="muted"),
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The audit log did not record the change, so the engine undid it, unless the "
-            "message above says it could not be fully undone. Then the next engine start "
-            "reports a config change, and the engine log names the file. Try again.",
+            "The store did not confirm the change, and a commit whose answer was lost still "
+            "lands. So read the flag on Connections first. If it shows what you asked for, the "
+            "change landed, and clicking it again would undo that. If it does not, click it once. "
+            "If Connections says the flags could not be read, wait until it can.",
             class_="muted",
         ),
         el("p", el("a", "Back to Connections", href="/ui")),
         class_="card",
     )
-    return page("Flag not changed", body, active="dashboard")
+    return page("Flag change not confirmed", body, active="dashboard")
 
 
 def purge_confirm(dests: list[str], scope: str) -> Markup:

@@ -15,10 +15,34 @@ import json
 import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
 
+from messagefoundry.api.models import ConnectionRow
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertRule, AlertsSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.pages import connections as connection_pages
+
+
+def _row(status: str, *, flagged: bool) -> ConnectionRow:
+    return ConnectionRow.model_construct(
+        role="destination",
+        channel_id="IB_A",
+        channel_name="IB_A",
+        destination="OB_A",
+        name="OB_A",
+        status=status,
+        flagged=flagged,
+    )
+
+
+def test_a_running_row_offers_the_toggle_and_a_draining_row_only_the_marker() -> None:
+    """BACKLOG #2623: any row in the running graph takes the flag, code-first included. A draining
+    outbound is no longer in it, so a toggle there could only be refused."""
+    assert 'action="/ui/connections/OB_A/flag"' in str(
+        connection_pages._flag_cell(_row("running", flagged=False))
+    )
+    draining = str(connection_pages._flag_cell(_row("draining", flagged=True)))
+    assert "<form" not in draining and "flagged" in draining
 
 
 async def _scoped(service: AuthService, username: str, role: Role, scope: list[str]) -> None:
@@ -82,16 +106,16 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
     assert "data-poll" not in scoped_page and "data-mf-fragment" not in scoped_page
 
 
-async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
+async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """vault BACKLOG #2945: a toggle whose audit row failed is refused 503 and undone. The console
-    names that fix, not ``flag_rejected``'s code-first and cluster-node hints, which do not apply.
-    A 503 used to escape the route as an error page."""
-    from messagefoundry.pipeline.engine import ConfigWriteAuditTimeout
+    """BACKLOG #2623: a toggle the store did not confirm is refused 503. The console names that fix,
+    not ``flag_rejected``'s hint, which does not apply. A 503 used to escape the route as an error
+    page."""
+    from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
 
     async def _not_recorded(*_args: object, **_kwargs: object) -> None:
-        raise ConfigWriteAuditTimeout(10.0, undone=True)
+        raise ConnectionFlagNotRecorded("the store did not confirm this toggle")
 
     monkeypatch.setattr(engine, "set_connection_flag", _not_recorded)
     service = await auth_service(engine)
@@ -104,6 +128,11 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
             headers=SAME_ORIGIN,
         )
     assert r.status_code == 200, r.text[:300]
-    assert "The audit log did not record the change, so the engine undid it" in r.text
-    assert "was not recorded within 10 s" in r.text
-    assert "code-first connection" not in r.text and "cluster node" not in r.text
+    assert "The store did not confirm the change" in r.text
+    assert "the store did not confirm this toggle" in r.text
+    assert "running graph" not in r.text
+    # A lost commit answer lands, and the toggle posts the opposite of what the row then shows, so a
+    # bare retry would flip it back. The page sends the operator to read the flag first.
+    assert "clicking it again would undo that" in r.text
+    assert "Flag not changed" not in r.text
+    assert "try again" not in r.text.lower()

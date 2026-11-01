@@ -764,6 +764,12 @@ from typing import Any
 #: 9ad245683e8594e1; this branch at 75c4b3550c195a62). Neither parent's value covered both, so
 #: the value below was re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #2623: the connection flag moved to the store, so ``ConnectionRow.toml_managed`` is gone
+#: and the console offers the toggle on every row. Re-derived with ``--write`` (from
+#: b634db50214474e2). ``ConnectionRow.flagged`` also became ``bool | None``, null on a failed read.
+#: The digest reads field names only, so that part did not move it: a console from before it would
+#: take null for unflagged, hide every row under Flagged only and post ``flagged=true``.
+#:
 #: Vault BACKLOG #3747: ``list_approvals`` now takes ``request``, for the caller's address on the
 #: ``approval.standing_shown`` row it writes, and ``GET /ui/approvals`` passes it. Same blind spot
 #: as #2346, so the digest did not move. A skew in either direction raises TypeError on that page,
@@ -775,12 +781,16 @@ from typing import Any
 #: console would render as clean, and the digest records field names only, so that alone would not
 #: have moved it.
 #:
+#: BACKLOG #2623 and #3765 merged in one batch branch (digests f3c064fe186b81d4 and
+#: 0341bb4cd2670000). Neither parent's value covered both, so the value below was re-derived with
+#: ``--write`` on the merged tree.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "0341bb4cd2670000"
+ENGINE_UI_SEAM: str = "86ccf1e26578f65a"
 
 
 @dataclass(frozen=True, slots=True)
@@ -871,8 +881,8 @@ class CoreHandlers:
     # + the status-colored by-name data-flow graph, both read-only + monitoring:read.
     metrics_history: Callable[..., Awaitable[Any]]
     graph_edges: Callable[..., Awaitable[Any]]
-    # First console→connections.toml write seam (BACKLOG #131, ADR 0007 amendment; seam v9): the
-    # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
+    # The object-flag toggle (BACKLOG #131, #2623; seam v9), config:deploy. Any connection in the
+    # running graph; the store holds the flag. An unknown name is refused 409.
     set_connection_flag: Callable[..., Awaitable[Any]]
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on

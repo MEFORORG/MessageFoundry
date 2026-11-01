@@ -1403,6 +1403,29 @@ class QueueStore(StoreLifecycle, Protocol):
         """
         ...
 
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """Set or clear the operator's object-of-interest flag on ``connection`` in ``direction``
+        (BACKLOG #2623), with ``audit`` appended in the same transaction, so a failed append changes
+        nothing. Setting a flag already set, or clearing one that is not, still appends the row: the
+        audit log records what the operator asked for."""
+        ...
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """Every ``(connection, direction)`` holding the flag (BACKLOG #2623).
+
+        The dashboard rows are the one reader, and ``tests/test_connection_flag_readers.py`` fails on
+        a second. No engine path acts on a row, so nothing here checks one against the graph: a row
+        that names no connection matches no dashboard row."""
+        ...
+
     # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The
     # row is appended in the mutation's own transaction, and only when the change applied, so a
     # failed append changes nothing and an unknown or resolved id writes no row.

@@ -101,7 +101,6 @@ _INBOUND_CASES: dict[str, Any] = {
     "schedule": _SCHEDULE,
     "auto_start": False,
     "deployed": False,
-    "flagged": True,  # #131 (ADR 0007 amendment): the object-of-interest flag round-trips too.
     # Owner ruling 2026-09-24: the hop attestation pair. Dropping it on a save would turn an attested
     # listener into a REFUSED one at the next reload.
     "tls_hop_attested": True,
@@ -126,7 +125,6 @@ _OUTBOUND_CASES: dict[str, Any] = {
     "schedule": _SCHEDULE,
     "auto_start": False,
     "deployed": False,
-    "flagged": True,  # #131 (ADR 0007 amendment): the object-of-interest flag round-trips too.
     "waiting_display_delay": 2.5,  # #136 (ADR 0065 amendment): the cosmetic waiting-for-reply delay.
     # ADR 0153: the per-outbound cleartext-hop acceptance. It MUST round-trip — dropping it on a GUI
     # save would silently turn a declared, reviewed hop into a refused one at the next reload.

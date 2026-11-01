@@ -272,7 +272,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 | Operation | Route | Permission | Extra gate |
 |---|---|---|---|
 | Start / stop / restart a connection, singly or over a selection | `/ui/connections/{name}/start`, `/stop`, `/restart`, `/ui/connections/bulk-control` | `connections:control` | — |
-| Toggle a connection's flag annotation — the one console write that persists to `connections.toml` | `/ui/connections/{name}/flag` | `config:deploy` | — |
+| Toggle a connection's flag annotation, which the store holds | `/ui/connections/{name}/flag` | `config:deploy` | — |
 | Reload the graph from the engine's own startup config dir (executes your config Python) | `/ui/config/reload` | `config:deploy` | step-up bound to the action `config_reload` (vault BACKLOG #2625), unless `[auth].require_action_step_up = false`; dual control **only if you add `config_reload` to `[approvals].operations`** — see the note above |
 | Replay one message | `/ui/messages/{message_id}/replay` | `messages:replay` | step-up |
 | Replay dead deliveries — for one channel, for one (channel, destination), or all of them | `/ui/dead-letters/{channel_id}/replay`, `/ui/dead-letters/{channel_id}/{destination_name}/replay`, `/ui/dead-letters/replay-all` | `messages:replay` | step-up + dual control |
@@ -296,8 +296,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 Two things the console deliberately **cannot** do. It has no editor for Connection/Router/Handler
 Python — the reload above always runs the engine's own startup config dir, never a browser-supplied
 path — and it cannot write service settings: `[security]` and the rest of `messagefoundry.toml` are
-read-only to it (`GET /security/posture`), so changing posture is a file/IDE operation. The
-connection-flag row is the single exception to "no config writes".
+read-only to it (`GET /security/posture`), so changing posture is a file/IDE operation.
 
 The exhaustive per-route table — reads as well as writes, the exact gate on each, and the places a
 `/ui` route is deliberately weaker than its JSON counterpart — lives in

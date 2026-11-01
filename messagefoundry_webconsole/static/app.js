@@ -363,15 +363,24 @@
         refresh();
       } else if (t.hasAttribute("data-mf-conns-all")) {
         var cbs = rowCheckboxes();
+        var flaggedOnly = document.querySelector("[data-mf-conns-flagged]");
+        var onlyFlagged = !!(flaggedOnly && flaggedOnly.checked);
         for (var i = 0; i < cbs.length; i++) {
           // Select-all applies to the VISIBLE rows only: when checking, skip a row the filter has hidden
           // (offsetParent is null for a display:none row) so the operator never sweeps in — and then
           // Stop/Restart/Reset — connections they can't see. Unchecking still clears every row.
           if (t.checked && cbs[i].offsetParent === null) continue;
+          // A failed flag read leaves every row on screen under Flagged only, and none of them is
+          // known to be flagged, so one transient error must not widen a selection scoped to flagged
+          // rows to every connection. The operator can still tick such a row by hand.
+          if (t.checked && onlyFlagged && cbs[i].getAttribute("data-flagged") !== "1") continue;
           cbs[i].checked = t.checked;
           if (t.checked) selected.add(cbs[i].value);
           else selected.delete(cbs[i].value);
         }
+        // At once, so a click that took nothing leaves the box clear: a ticked box's next click
+        // would be the uncheck that clears every row, those ticked by hand included.
+        syncSelectAll();
         refresh();
       }
     });
@@ -1030,9 +1039,12 @@
   // --- Connections filter box: hide rows that don't match the typed query + the Flagged-only toggle ---
   // Both controls live in the un-polled shell, so their state survives the ~1s live swap; app.js filters
   // the table's rows and re-applies after each poll/ws swap (MutationObserver on [data-poll]). A row is
-  // visible iff (text query matches) AND (Flagged-only off OR the row's selection checkbox is
-  // data-flagged="1", #131). display:none only — the server still sends every row and a hidden row's
-  // checkbox stays in the selection Set (the filter is view-only). Coexists with sort + column resize.
+  // visible iff (text query matches) AND (Flagged-only off OR the row's selection checkbox is not
+  // data-flagged="0", #131: "unknown" is a failed read, and hiding on it would empty the page). A
+  // row with no checkbox stays hidden under Flagged-only. display:none only — the server still sends
+  // every row and a hidden row's checkbox stays in the selection Set. Select-all skips a hidden row,
+  // so this filter does shape a bulk action's target set (ADR 0007, 2026-10-31 amendment). Coexists
+  // with sort + column resize.
   feature("[data-mf-conns-filter]", function (input) {
     var poll = document.querySelector("[data-poll]");
     if (!poll) return; // no live table on this page
@@ -1044,7 +1056,7 @@
       for (var i = 0; i < rows.length; i++) {
         var textHit = !q || rows[i].textContent.toLowerCase().indexOf(q) !== -1;
         var cb = rows[i].querySelector("[data-mf-conns-cb]");
-        var flagHit = !onlyFlagged || (cb && cb.getAttribute("data-flagged") === "1");
+        var flagHit = !onlyFlagged || (cb && cb.getAttribute("data-flagged") !== "0");
         rows[i].style.display = textHit && flagHit ? "" : "none";
       }
     }

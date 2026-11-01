@@ -346,8 +346,8 @@ def test_a_held_lock_times_out_in_the_editors_own_error_type(tmp_path: Path) -> 
 
 
 def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
-    """The engine's flag toggle holds the lock across its list and its upsert, and the upsert takes it
-    again. A second ``flock`` on a new handle in one process would wait on the first forever."""
+    """A caller may hold the lock across a list and an upsert, and the upsert takes it again. A
+    second ``flock`` on a new handle in one process would wait on the first forever."""
     path = tmp_path / "connections.toml"
     path.write_text(CONNECTIONS_TOML, encoding="utf-8")
     finished = threading.Event()
@@ -357,7 +357,7 @@ def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
             entry = next(
                 e for e in connections_edit.list_connections(tmp_path) if e["name"] == "OB_TOML"
             )
-            entry["flagged"] = True
+            entry["deployed"] = False
             connections_edit.upsert_connection(tmp_path, entry, validate=_noop)
         finished.set()
 
@@ -365,7 +365,7 @@ def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
     thread.start()
     thread.join(_JOIN_S)
     assert finished.is_set()
-    assert "flagged = true" in path.read_text(encoding="utf-8")
+    assert "deployed = false" in path.read_text(encoding="utf-8")
 
 
 def test_one_hidden_lock_file_per_directory(tmp_path: Path) -> None:
@@ -386,7 +386,7 @@ def test_codeset_remove_waits_for_the_directory_lock(tmp_path: Path) -> None:
     codeset_edit.upsert_code_set(tmp_path, "diets", ["code", "value"], [["A", "B"]], validate=_noop)
     path = tmp_path / "codesets" / "diets.csv"
     held, release, done = threading.Event(), threading.Event(), threading.Event()
-    # The config directory's lock, the one a connection edit (and the engine toggle) holds.
+    # The config directory's lock, the one a connection edit holds.
     holder = _hold_lock(tmp_path / "connections.toml", held, release)
 
     def remover() -> None:
