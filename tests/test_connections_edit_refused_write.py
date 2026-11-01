@@ -281,7 +281,7 @@ def _refuse_stat(monkeypatch: pytest.MonkeyPatch, refusal: OSError, name: str) -
     [
         lambda d: connections_edit.upsert_connection(d, ENTRY, validate=_noop),
         lambda d: connections_edit.remove_connection(d, "OB_TOML", validate=_noop),
-        # A read-modify-write lists before it writes, so this read comes first.
+        # A listing refuses the same way.
         connections_edit.list_connections,
     ],
     ids=["upsert", "remove", "list"],
@@ -1129,7 +1129,7 @@ def test_a_policy_sidecar_it_cannot_copy_is_a_wiring_error(
 def test_a_caller_that_names_no_refusal_type_gets_the_os_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The engine's undo of a failed audit row replaces with no refused_error and catches OSError.
+    # All four editors name a type, so no shipped caller reaches this default.
     path = _live(tmp_path)
     refusal = OSError(errno.EROFS, "Read-only file system")
     monkeypatch.setattr(os, "replace", _raising(refusal))

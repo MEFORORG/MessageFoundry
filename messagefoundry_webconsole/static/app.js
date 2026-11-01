@@ -327,8 +327,8 @@
         }
       }
       box.checked = takeable > 0 && taken === takeable;
-      // A selection that holds a row select-all could not take keeps its mark, ticked or not: that
-      // row is hidden, it is still acted on, and the next click clears it too.
+      // A selection that holds a row select-all could not take keeps its mark, ticked or not, since
+      // that row is still acted on. Ticked, the next click clears it too; unticked, it stays.
       box.indeterminate = box.checked ? checked > taken : checked > 0;
     }
 

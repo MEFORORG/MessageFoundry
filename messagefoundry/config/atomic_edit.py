@@ -21,8 +21,9 @@ The candidate keeps the live file's NAME because the loaders read meaning from i
 its file stem and its format is its suffix, and ``connections.toml`` is found by name. ``companions``
 copies sibling files the loader reads beside the candidate, such as a code set's policy sidecar.
 
-:func:`edit_lock` is the cross-process half. Each ``connection`` CLI run is its own process, so two
-edits could each read the same original and the second replace would drop the first. The lock
+:func:`edit_lock` keeps edits of one config directory apart. Each CLI run of an editor is its own
+process, so two edits could each read the same original and the second replace would drop the
+first. The lock
 is an OS lock on one hidden file per DIRECTORY, ``.mefor-edit.lock`` beside the edited file, held from
 the read through the replace. One per directory rather than one per file, so a code-set rename or
 remove covers both of its names with one lock and a renamed table leaves no lock file behind. It

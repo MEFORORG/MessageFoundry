@@ -322,3 +322,10 @@ def test_a_ticked_box_keeps_its_mark_for_a_selected_row_it_hides(tmp_path: Path)
     run = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=steps)
     assert run["selected"] == ["1", "0"] and run["visible"] == ["1"]
     assert run["header"] is True and run["indeterminate"] is True
+    cleared = _run_app_js(tmp_path, flagged_only=False, values=("1", "0"), steps=(*steps, "click"))
+    assert cleared["selected"] == [] and cleared["header"] is False, "the hidden row goes too"
+    # Unticked, the same mark takes the rows it can and leaves the hidden one.
+    run = _run_app_js(
+        tmp_path, flagged_only=False, values=("1", "0"), steps=({"tick": "0"}, {"query": "row 1"})
+    )
+    assert run["header"] is False and run["indeterminate"] is True

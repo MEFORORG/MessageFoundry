@@ -72,8 +72,8 @@ FIELD_READERS: dict[tuple[str, str], str] = {
         "POST /connections/{name}/flag hands req.flagged to the engine and echoes it"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_selection_checkbox"): (
-        "the row's data-flagged attribute, which the client-side filter reads. That filter is the "
-        "flag's one reach past a marker: select-all honours it (the accepted residual)"
+        "the row's data-flagged attribute, which the client-side filter and select-all read. That "
+        "is the flag's one reach past a marker (the accepted residual)"
     ),
     ("messagefoundry_webconsole/pages/connections.py", "_flag_cell"): (
         "the flag cell's glyph, and whether the toggle is offered"

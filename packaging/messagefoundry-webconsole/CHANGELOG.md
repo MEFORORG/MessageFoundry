@@ -52,8 +52,9 @@ this line.**
   store, the owner accepted that on 2026-11-01 (ADR 0007). (`BACKLOG #2623`)
 - **Select-all's box reads the rows a click can take.** Under a filter it stays ticked once every
   such row is taken, so the next click clears the selection, hidden rows included, rather than
-  selecting again. A selection that also holds a hidden row shows the part-selected mark. Typing a
-  filter judges the box again at once. (`BACKLOG #2623`)
+  selecting again. A selection that also holds a row select-all could not take shows the
+  part-selected mark, so a ticked box and an unticked one can look alike. Typing a filter judges the
+  box again at once. (`BACKLOG #2623`)
 
 ### Security
 

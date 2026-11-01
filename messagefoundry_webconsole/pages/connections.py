@@ -144,8 +144,8 @@ def _selection_checkbox(r: ConnectionRow) -> Markup:
         data_status=r.status,
         data_paused=("1" if r.paused else "0"),
         data_dest=(r.destination or ""),
-        # #131: the object-of-interest flag, read by the "Flagged only" client-side filter (app.js).
-        # "unknown" is a failed read, which that filter must not take for "not flagged" (#2623).
+        # #131: the object-of-interest flag, read by the "Flagged only" client-side filter and by
+        # select-all (app.js). "unknown" is a failed read, which neither takes for an answer (#2623).
         data_flagged=flagged,
     )
 
