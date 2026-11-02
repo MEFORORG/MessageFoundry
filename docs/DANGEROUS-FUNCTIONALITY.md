@@ -472,7 +472,9 @@ pure-Python equivalent:
   creates the file with `O_CREAT | O_EXCL` and mode `0o600`
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
-  and again before View Log opens the file, so it can refuse one before touching it
+  and again before View Log opens the file, so it can refuse one before touching it. And
+  `transports/database.py`, which calls `GetDriveTypeW` and `QueryDosDeviceW` as inputs to the
+  best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts

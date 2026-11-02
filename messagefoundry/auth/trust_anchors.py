@@ -196,12 +196,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     keeps running. ``warn`` warns instead for the ACL and path. A file swapped since the last
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
-    build leaves to the driver, or a value that can name another host, which the build refuses.
+    build leaves to the driver. A value the build's remote-path check refuses is refused here as a
+    setting, in every ``sslmode`` (BACKLOG #2705); ``docs/CONNECTIONS.md``, Generic ODBC, states
+    that check's limits.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
-    (:func:`read_if_regular`). Only a driver file's spellings are screened for another host before
-    that stat; a ``tls_ca_file`` is not.
+    (:func:`read_if_regular`). Only a driver file's value goes through the remote-path check before
+    that stat; a ``tls_ca_file`` does not.
 
     **Not covered**, at least, as in item 9: the driver reads the file by path, at every connect
     its pool opens. A running lane is not stopped when its file fails a later check: its pool goes on
@@ -1716,18 +1718,35 @@ def database_ca_anchor_spec(
     ``None`` (module item 12, vault BACKLOG #3090 step 7).
 
     ``None`` when the connection names no ``sslca``, when its driver never reads it
-    (:func:`unread_ca_reason`), and when no spelling the build checks names an existing path other
-    than a directory: a missing file or a directory is left to the driver, as the build leaves it,
-    and a value that can name another host is never opened here, since the build refuses it. The
-    first spelling that names one is checked. A pipe or device is a spec, and
+    (:func:`unread_ca_reason`) and the value is not refused below, and when no spelling the build
+    checks names an existing path other than a directory: a missing file or a directory is left to
+    the driver, as the build leaves it. The first spelling that names one is checked. A pipe or device is a spec, and
     :func:`evaluate_anchor` refuses it unread. ``kind`` and ``label`` are
-    :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers."""
-    value = _generic_odbc_param(settings, "sslca")
-    if value is None or unread_ca_reason(settings) is not None:
-        return None
-    from messagefoundry.transports.database import driver_file_spellings
+    :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers.
 
-    spellings = driver_file_spellings(value)
+    Raises ``ValueError`` when ``names_another_host`` refuses the value (BACKLOG #2705), in every
+    ``sslmode``. The value is judged here again, not taken from the build's judgement, and the
+    spellings checked come from this one judgement. The lane check turns the ``ValueError`` into a
+    refused setting, as it does a bad pin. ``docs/CONNECTIONS.md``, Generic ODBC, states that
+    check's limits."""
+    value = _generic_odbc_param(settings, "sslca")
+    if value is None:
+        return None
+    from messagefoundry.transports.database import (
+        driver_file_spellings,
+        file_keyword_verdicts,
+        names_another_host,
+    )
+
+    verdicts = file_keyword_verdicts(value)
+    if names_another_host(value, verdicts):
+        raise ValueError(
+            f"{kind} '{name}' odbc_params sslca must be a plain local path on this host: not a "
+            "share, a network drive, a link to one, or a path the check cannot read"
+        )
+    if unread_ca_reason(settings) is not None:
+        return None
+    spellings = driver_file_spellings(value, verdicts)
     path = next((p for p in spellings if os.path.exists(p) and not os.path.isdir(p)), None)
     if path is None:
         return None
@@ -2609,7 +2628,7 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             else:
                 spec = lane_anchor_spec(direction, name, settings)
         except ValueError as exc:
-            # No file was read, so this is a refused setting, and the class says so.
+            # The spec refused the setting before any anchor was evaluated, and the class says so.
             raise AnchorSettingRefused(str(exc)) from exc
         if spec is None:
             refused.pop(f"{direction}:{name}", None)

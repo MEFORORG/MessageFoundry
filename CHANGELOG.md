@@ -14,6 +14,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   proxy or a credential of its own needs that name listed. The `pass_environment` row of the
   `[dr]` section of [CONFIGURATION.md](docs/CONFIGURATION.md) says what crosses and what the
   setting refuses. (`BACKLOG #2587`)
+- On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
+  its path leads to another host; see the Generic ODBC section of
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
