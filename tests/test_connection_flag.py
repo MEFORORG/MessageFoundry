@@ -597,24 +597,18 @@ async def test_the_bound_holds_for_a_write_whose_caller_went(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The bound sits inside the write, so a hung store ends a write nobody is waiting on, and the
-    drain has nothing left to wait for. Its failure is logged once, through ``safe_exc``, and not
-    also reported by asyncio as an exception nobody retrieved."""
-    entered = asyncio.Event()
-
-    async def _hung(*_args: object, **_kwargs: object) -> None:
-        entered.set()
-        await asyncio.Event().wait()
-
+    drain has nothing left to wait for. Its failure is logged through ``safe_exc``, and the line
+    says its caller had gone; asyncio does not also report an exception nobody retrieved."""
+    # Never released, so the store does not answer.
+    slow = _SlowWrite(engine, monkeypatch)
     monkeypatch.setattr(BOUND, 0.2)
-    monkeypatch.setattr(engine.store, "set_connection_flag", _hung)
     caller = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound"))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(slow.entered.wait(), 5)
         caller.cancel()
         with pytest.raises(asyncio.CancelledError):
             await caller
         await asyncio.wait_for(asyncio.wait(set(engine._config_writes)), 5)
-        await asyncio.sleep(0.05)
     messages = [record.getMessage() for record in caplog.records]
     abandoned = [m for m in messages if m.startswith("config write failed after its caller")]
     assert len(abandoned) == 1, messages

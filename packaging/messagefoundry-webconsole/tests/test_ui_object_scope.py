@@ -142,15 +142,20 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     assert "try again" not in r.text.lower()
 
 
-async def test_ui_flag_tells_the_operator_a_stopping_engine_took_no_toggle(engine: Engine) -> None:
-    """BACKLOG #2623: once the shutdown's drain has begun, a toggle gets the 409's page, whose hint
-    has to fit this refusal as well as an unknown name."""
+def _add_flaggable_inbound(engine: Engine) -> None:
+    """``IB_A`` in the running graph, the real flag path's precondition."""
     graph = Registry()
     graph.add_inbound(
         InboundConnection("IB_A", ConnectionSpec(ConnectorType.MLLP, {"port": 2579}), router="r")
     )
     graph.add_router("r", lambda m: [])
     engine.add_registry(graph)
+
+
+async def test_ui_flag_tells_the_operator_a_stopping_engine_took_no_toggle(engine: Engine) -> None:
+    """BACKLOG #2623: once the shutdown's drain has begun, a toggle gets the 409's page, whose hint
+    has to fit this refusal as well as an unknown name."""
+    _add_flaggable_inbound(engine)
     service = await auth_service(engine)
     await provision(service, "dep", [Role.DEPLOYMENT.value])
     async with ui_client(engine, service) as c:
@@ -182,12 +187,7 @@ async def test_ui_flag_shows_the_not_confirmed_page_for_a_store_that_never_answe
         "messagefoundry.pipeline.engine.CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS", 0.05
     )
     monkeypatch.setattr(engine.store, "set_connection_flag", _hung)
-    graph = Registry()
-    graph.add_inbound(
-        InboundConnection("IB_A", ConnectionSpec(ConnectorType.MLLP, {"port": 2579}), router="r")
-    )
-    graph.add_router("r", lambda m: [])
-    engine.add_registry(graph)
+    _add_flaggable_inbound(engine)
     service = await auth_service(engine)
     await provision(service, "dep", [Role.DEPLOYMENT.value])
     async with ui_client(engine, service) as c:

@@ -2618,7 +2618,7 @@ class Engine:
 
         # asyncio.wait rather than asyncio.shield, as approvals._outlive_caller does: a shield
         # reports a failure after its caller has gone to the loop's handler with a raw traceback,
-        # where this logs it once, rendered by safe_exc.
+        # where this retrieves it and logs it rendered by safe_exc.
         task = asyncio.ensure_future(_write())
         self._config_writes.add(task)
         task.add_done_callback(self._config_writes.discard)
