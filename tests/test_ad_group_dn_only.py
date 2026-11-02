@@ -339,10 +339,11 @@ def _scaling_ratio(
     Noise moves a ratio both ways, so each side takes up to three attempts, keeps its best and
     stops at the first that clears the line. A linear check keeps the lowest, so contention that
     slows the large input cannot fake a curve. The quadratic control, ``expect_quadratic``, keeps
-    the highest, so contention that slows the small input cannot hide one. The earlier form timed
-    3 large runs and then 7 small ones of about 1.6 ms, a window of about 11 ms that one stretch of
-    contention could cover whole, and CI read the control at 6.2 to 8.0 while it kept the lowest
-    of three (BACKLOG #3452).
+    the highest, so contention that slows the small input cannot hide one. CI read the control at
+    6.2 to 8.0 while it kept the lowest of three (BACKLOG #3452). The earlier form timed 3 large
+    runs and then 7 small ones of about 1.6 ms at ``k`` = 1,000, a window of about 11 ms that one
+    stretch of contention could cover whole. That cause is inferred from the code and local
+    timings, not measured on a hosted runner.
 
     What that buys and costs: the control shows this instrument reads a quadratic parser as
     quadratic. It does not show that the linear check, which stops at its first attempt under the
@@ -374,9 +375,9 @@ def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
     """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
 
     This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
-    start at each separator. Its work grows with the square of the length. At ``k`` = 4,000 one
-    small call takes tens of milliseconds; at 1,000 it took under 2 ms, and all seven small runs
-    fit inside one stretch of contention (BACKLOG #3452)."""
+    start at each separator. Its work grows with the square of the length. It runs at ``k`` =
+    4,000, where one small call takes tens of milliseconds; :func:`_scaling_ratio` says why the
+    size went up (BACKLOG #3452)."""
 
     def quadratic(text: str) -> None:
         for end in range(100, len(text) + 1, 100):
@@ -426,19 +427,23 @@ def test_the_quadratic_control_keeps_its_highest_attempt(monkeypatch: pytest.Mon
 
 
 @pytest.mark.parametrize(
-    ("attempts", "kept", "spent"),
-    [((9.0, 3.9, 20.0), 3.9, 2), ((9.0, 12.0, 10.0), 9.0, 3)],
+    ("attempts", "spent", "passes"),
+    [((9.0, 3.9, 20.0), 2, True), ((9.0, 12.0, 10.0), 3, False)],
     ids=["clears", "never-clears"],
 )
 def test_the_linear_check_keeps_its_lowest_attempt(
-    monkeypatch: pytest.MonkeyPatch, attempts: tuple[float, ...], kept: float, spent: int
+    monkeypatch: pytest.MonkeyPatch, attempts: tuple[float, ...], spent: int, passes: bool
 ) -> None:
-    """The branch the control no longer runs (BACKLOG #3452): the linear check keeps the lowest
-    attempt and stops at the first under the line, and one that never gets under it reads over
-    the line, so the linear test fails it."""
+    """The branch the control no longer runs (BACKLOG #3452), driven through the linear test
+    itself: it keeps the lowest attempt and stops at the first under the line, and it fails a
+    parser whose every attempt reads over the line."""
     taken = _stub_attempts(monkeypatch, attempts)
-    ratio = _scaling_ratio(canonical_group_dn, _PATHOLOGICAL_DNS["many-rdns"][0], 4_000)
-    assert (ratio, taken) == (kept, list(attempts[:spent]))
+    if passes:
+        test_a_pathological_dn_is_judged_in_linear_time(*_PATHOLOGICAL_DNS["many-rdns"])
+    else:
+        with pytest.raises(AssertionError, match=r"4x the input took 9\.0x the time"):
+            test_a_pathological_dn_is_judged_in_linear_time(*_PATHOLOGICAL_DNS["many-rdns"])
+    assert taken == list(attempts[:spent])
 
 
 def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFixture) -> None:
