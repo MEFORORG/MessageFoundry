@@ -771,7 +771,9 @@ jobs:
       #   windows-2022     29:23              399   36:00     1.225x       55:00     1.872x
       #   windows-2025     35:47  CENSORED    360   36:00     1.006x       55:00     1.537x
       #
-      # ONLY THE WINDOWS-2025 ROW IS CENSORED, AND THAT IS MEASURED, NOT ASSUMED. Largest ubuntu step
+      # IN THIS 2026-08 POOL ONLY THE WINDOWS-2025 ROW WAS CENSORED, AND THAT WAS MEASURED, NOT ASSUMED.
+      # Since 2026-11-02 the censored engine row is windows-2022's instead; the "RE-DERIVED 2026-11-02"
+      # note below and that leg's baseline row say why. Largest ubuntu step
       # FAILURE in 535 leg-executions is 14:21; largest windows-2022 failure in 542 is 25:48. Neither leg
       # has ever touched its cap, so 16:08 and 29:23 are true maxima. windows-2025 was killed at the cap
       # SEVEN times in this window -- 36:08 (31189317409, main b78214f5), 36:08 (31199321840, main
@@ -1220,7 +1222,8 @@ jobs:
       # tests/test_ci_step_margin.py runs the real script at it. 1.10 is not available as a floor: the
       # self-check's negative control is 1.111x, so it exits 2. The warning is raised here rather than
       # left to the script's RE-SIZE escalation, because a censored row never escalates, and the
-      # windows-2025 row is censored. On an uncensored row a run over its record gets a RE-SIZE
+      # windows-2022 row is censored (since 2026-11-02; it was windows-2025's before). On an
+      # uncensored row a run over its record gets a RE-SIZE
       # annotation from EACH call, each naming its own floor's red line, beside this warning.
       # ONLY THE VERDICT IS ADVISORY, NOT THE INSTRUMENT. In merge_group the run body below turns exit
       # 1 (LOW margin) into a warning annotation plus a summary line and exits 0, and on pull_request
@@ -1233,6 +1236,8 @@ jobs:
       # that case: it exits 1, so this step reads it as LOW, and that is a limit of this branch. Not
       # `continue-on-error`, which would have let exit 2 through as well. `ci-gate` does not need
       # `test` at all: each `test` leg is its own required context, judged by its job conclusion.
+      # The Windows caps were re-measured 2026-11-02, but the revert also waits on a re-measure of the
+      # ubuntu row, which this softening covers too (Manager ruling of 2026-11-02).
       # REVERT THIS when #3515's re-measure of the cap lands: drop both event branches, `pr_floor`,
       # and the `warn` and `margin` functions, restore the single call, and take the matching tests
       # and the exception in docs/CI.md with them.
