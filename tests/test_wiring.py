@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import textwrap
@@ -536,6 +537,48 @@ def test_check_validate_fails_on_invalid_encoding(tmp_path: Path) -> None:
     assert "not a Python text codec" in result.detail
 
 
+@pytest.mark.parametrize("literal", ["8", "True", "1252"])
+def test_check_validate_fails_on_a_non_str_encoding_naming_the_connection(
+    tmp_path: Path, literal: str
+) -> None:
+    # BACKLOG #2431: an encoding must be a codec NAME string. A number is ambiguous: the run-time rule
+    # stringifies it, and 1252 then names cp1252 while 8 names nothing. Refused at load either way.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(tmp_path, f"inbound('i', MLLP(port=2575, encoding={literal}), router='r')")
+    result = _check_validate(tmp_path)
+    assert result.ok is False and result.required is True
+    assert "inbound connection 'i'" in result.detail
+    assert "not a codec name" in result.detail
+
+
+def test_a_null_literal_inbound_encoding_is_not_refused(tmp_path: Path) -> None:
+    # None on an inbound is the declared "not declared", which its decode reads as utf-8; refusing it
+    # would fail a config that runs correctly.
+    _encoding_cfg(tmp_path, "inbound('i', MLLP(port=2575, encoding=None), router='r')")
+    reg = load_config(tmp_path)
+    assert reg.encoding_problems() == []
+    assert reg.encoding_census() == (1, 0, 0)
+
+
+def test_a_null_literal_outbound_encoding_is_refused_at_load(tmp_path: Path) -> None:
+    # BACKLOG #2431: an outbound reads the value as the codec name (`s.get("encoding", "utf-8")`), so
+    # None would raise TypeError on every send. Counting it "checked" beside a comment that it falls
+    # back to utf-8 was a false green; it is refused instead.
+    from messagefoundry.checks import _check_validate
+
+    _encoding_cfg(
+        tmp_path,
+        "inbound('i', MLLP(port=2575), router='r')\n"
+        "outbound('o', File(directory='.', encoding=None))",
+    )
+    with pytest.raises(WiringError, match="outbound connection 'o': encoding is None"):
+        load_config(tmp_path)
+    result = _check_validate(tmp_path)
+    assert result.ok is False
+    assert "outside an inbound connection it must be a codec name" in result.detail
+
+
 # "UTF_8" is the load-bearing row: Python normalizes case and underscores, so a probe stricter than
 # str.encode would false-positive on it. The other two are the ordinary spellings.
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "UTF_8"])
@@ -550,23 +593,55 @@ def test_real_encodings_validate_cleanly(tmp_path: Path, encoding: str) -> None:
     assert validate_config(tmp_path) == []
 
 
-def test_env_supplied_encoding_is_deferred_by_the_literal_pass_without_masking_a_literal_typo(
+def test_env_supplied_outbound_encoding_is_deferred_by_the_literal_pass_without_masking_a_typo(
     tmp_path: Path,
 ) -> None:
     # An env() ref carries no value at load time (resolve_env_settings needs the instance's
-    # environment values), so THIS pass skips it deliberately — and probing the EnvRef object itself
-    # would raise TypeError, not LookupError, so this also pins that the skip happens before any probe.
-    # "Deferred", not "unchecked": since #1767 the resolved pass in build_check_registry probes it.
-    # The bad literal beside it is the positive control: without it this test would pass just as well
-    # if the check never ran at all.
+    # environment values), so THIS pass skips one on an outbound deliberately — and probing the EnvRef
+    # object itself would raise TypeError, not LookupError, so this also pins that the skip happens
+    # before any probe. "Deferred", not "unchecked": since #1767 the resolved pass in
+    # build_check_registry probes it. The bad literal beside it is the positive control: without it
+    # this test would pass just as well if the check never ran at all.
     _encoding_cfg(
         tmp_path,
-        "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
+        "inbound('i', MLLP(port=2575), router='r')\n"
+        "outbound('o', File(directory='.', encoding=env('charset')))\n"
+        "outbound('p', File(directory='.', encoding='not-a-real-codec'))",
+    )
+    text = "; ".join(d.message for d in validate_config(tmp_path) if d.severity == "error")
+    assert "outbound connection 'p'" in text  # the literal typo was reported
+    assert "outbound connection 'o'" not in text  # the env()-supplied outbound encoding was not
+
+
+@pytest.mark.parametrize("deployed", [True, False])
+def test_an_env_inbound_encoding_is_refused_at_load_without_masking_a_literal_typo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deployed: bool
+) -> None:
+    # BACKLOG #2431: the ingress decode reads the inbound's own settings, where an env() reference is
+    # never resolved, so the literal pass refuses one on an inbound outright, deployed or not. It
+    # resolves nothing to do so (ADR 0111 holds), so a value set in the environment is never rendered.
+    # The bad literal beside it is the positive control that the pass walks on past the refusal.
+    from messagefoundry.checks import _check_validate
+
+    secret = "pw-C4st_Val-66"  # allowlisted in .gitleaks.toml
+    monkeypatch.setenv("MEFOR_VALUE_charset", secret)
+    _encoding_cfg(
+        tmp_path,
+        f"inbound('i', MLLP(port=2575, encoding=env('charset')), router='r', deployed={deployed})\n"
         "outbound('o', File(directory='.', encoding='not-a-real-codec'))",
     )
-    flagged = [d.message for d in validate_config(tmp_path) if "text codec" in d.message]
-    assert len(flagged) == 1  # the env()-supplied inbound encoding produced nothing
-    assert "outbound connection 'o'" in flagged[0]  # the literal typo still did
+    text = "; ".join(d.message for d in validate_config(tmp_path) if d.severity == "error")
+    assert "inbound connection 'i': encoding is the environment reference 'charset'" in text
+    assert "an inbound encoding must be a literal codec name" in text
+    assert "editing the connection" in text
+    assert "outbound connection 'o'" in text  # the literal typo still reported
+    assert secret not in text
+    with pytest.raises(WiringError, match="must be a literal codec name"):
+        load_config(tmp_path)
+    result = _check_validate(tmp_path)
+    assert result.ok is False and result.required is True
+    assert "inbound connection 'i'" in result.detail
+    assert secret not in result.detail
 
 
 def test_encoding_census_counts_what_was_probed(tmp_path: Path) -> None:
@@ -587,13 +662,15 @@ def test_an_all_env_config_is_counted_as_deferred_not_reported_as_clean(tmp_path
     # no problems — indistinguishable from a pass that checked everything. The census is what
     # separates them, so pin the zero in the `checked` column. Both entries are deployed, so both are
     # deferred and the `unchecked` column is zero too: nothing here is beyond every pass's reach.
+    # Outbound only: an env() inbound encoding is refused at load (BACKLOG #2431), and an inbound with
+    # no `encoding` argument still declares its factory's literal utf-8 default.
     _encoding_cfg(
         tmp_path,
-        "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
-        "outbound('o', File(directory='.', encoding=env('charset', default='utf-8')))",
+        "outbound('o', File(directory='.', encoding=env('charset')))\n"
+        "outbound('p', File(directory='.', encoding=env('charset', default='utf-8')))",
     )
     reg = load_config(tmp_path)  # no WiringError, no TypeError
-    assert validate_config(tmp_path) == []
+    assert reg.encoding_problems() == []
     assert reg.encoding_census() == (0, 2, 0)
 
 
@@ -603,14 +680,31 @@ def test_check_validate_detail_reports_the_encoding_census(tmp_path: Path) -> No
 
     _encoding_cfg(
         tmp_path,
-        "inbound('i', MLLP(port=2575, encoding=env('charset')), router='r')\n"
-        "outbound('o', File(directory='.', encoding='utf-8'))",
+        "inbound('i', MLLP(port=2575, encoding='utf-8'), router='r')\n"
+        "outbound('o', File(directory='.', encoding=env('charset')))",
     )
     result = _check_validate(tmp_path)
     assert result.ok is True
     assert (
         "encodings checked: 1, env() refs deferred to build-check: 1, unchecked: 0" in result.detail
     )
+
+
+def test_an_env_inbound_encoding_is_counted_checked_not_deferred() -> None:
+    # The literal pass refuses it (BACKLOG #2431), so it is judged here and nothing is deferred to the
+    # resolved pass, which skips an inbound. Built by hand, since load_config refuses this graph.
+    from messagefoundry.config.wiring import EnvRef
+
+    reg = Registry()
+    for name, deployed in (("live", True), ("parked", False)):
+        reg.inbound[name] = InboundConnection(
+            name,
+            ConnectionSpec(ConnectorType.MLLP, {"port": 2575, "encoding": EnvRef("charset")}),
+            router="r",
+            deployed=deployed,
+        )
+    assert reg.encoding_census() == (2, 0, 0)
+    assert len(reg.encoding_problems()) == 2
 
 
 # --- the RESOLVED env() encoding pass (BACKLOG #1767) ------------------------
@@ -649,6 +743,20 @@ def test_env_supplied_encoding_naming_no_codec_is_refused_at_build_check(tmp_pat
     assert "not a Python text codec" in str(exc.value)
 
 
+@pytest.mark.parametrize("value", [87654, True])
+def test_a_non_str_encoding_from_the_environment_is_refused_without_its_value(
+    tmp_path: Path, value: object
+) -> None:
+    # The message names the connection and the key, and never the value.
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding=env('charset')))")
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {"charset": value})
+    assert "outbound connection 'o'" in str(ei.value)
+    assert "'charset'" in str(ei.value)
+    assert f"type {type(value).__name__}, value withheld" in str(ei.value)
+    assert repr(value) not in str(ei.value)
+
+
 def test_a_non_text_codec_from_the_environment_is_refused_too(tmp_path: Path) -> None:
     # `base64` IS a registered codec, so codecs.lookup() accepts it — str.encode/bytes.decode do not,
     # and those are what the transports call. Same probe as the literal pass, same verdict.
@@ -680,18 +788,45 @@ def test_the_undefined_codec_from_the_environment_is_a_wiringerror_not_a_unicode
 
 
 @pytest.mark.parametrize("declared", ["None", "''"])
-def test_an_env_encoding_that_declines_to_set_a_value_is_not_a_bad_codec(
+def test_an_env_outbound_encoding_resolving_to_none_or_empty_is_refused(
     tmp_path: Path, declared: str
 ) -> None:
-    # `env("charset", default=None)` is an opt-out, not a typo: ingress_guards.ingress_encoding
-    # documents an explicit None as "not declared" and falls back to utf-8. Refusing it would
-    # hard-fail `check`, every reload and every unrelated `connection upsert` on a config that runs
-    # correctly. Measured: the first cut of this pass did exactly that.
+    # BACKLOG #2431: only the inbound decode reads a falsy name as utf-8, and an inbound never reaches
+    # this pass. The File destination reads the value as the codec name, so None would raise TypeError
+    # on every send and "" would name no codec: both are refused here, before any connector is built.
     _encoding_cfg(
         tmp_path,
         f"outbound('o', File(directory='.', encoding=env('charset', default={declared})))",
     )
-    _build_check(load_config(tmp_path), {})  # no WiringError
+    with pytest.raises(WiringError) as ei:
+        _build_check(load_config(tmp_path), {})
+    assert "outbound connection 'o'" in str(ei.value)
+    assert "'charset' resolves to no codec name (empty or None)" in str(ei.value)
+
+
+def test_a_cast_raising_any_error_does_not_escape_the_resolved_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #1656: a cast is an arbitrary callable, and a lookup-table cast raises KeyError carrying
+    # the value. The resolved pass runs before the connector build, so it must skip such a ref and
+    # leave it to resolve_env_settings, which reports it redacted, rather than let the KeyError out.
+    secret = "pw-C4st_Val-66"  # allowlisted in .gitleaks.toml
+    _encoding_cfg(
+        tmp_path,
+        "TABLE = {}\n"
+        "outbound('o', File(directory='.', encoding=env('charset', cast=TABLE.__getitem__)))",
+    )
+    with (
+        caplog.at_level(logging.DEBUG, logger="messagefoundry.config.wiring"),
+        pytest.raises(WiringError) as ei,
+    ):
+        _build_check(load_config(tmp_path), {"charset": secret})
+    assert secret not in str(ei.value)
+    assert "charset" in str(ei.value)  # positive control: the ref is still the diagnostic
+    # Not dropped silently (CLAUDE.md section 6): the probe logs the cast error's CLASS only.
+    probed = [r for r in caplog.records if "skipped by this probe" in r.getMessage()]
+    assert probed and all("KeyError" in r.getMessage() for r in probed)
+    assert secret not in caplog.text
 
 
 def test_a_non_string_environment_value_names_its_type(tmp_path: Path) -> None:
@@ -736,21 +871,20 @@ def test_the_resolved_pass_never_echoes_the_environment_value(tmp_path: Path) ->
 
 def test_every_bad_env_encoding_is_reported_not_just_the_first(tmp_path: Path) -> None:
     # build_check_registry joins the whole list, and the comment there promises "all of them at once,
-    # not the first" — the caller is usually rendering a 422 an operator reads once. Two entries in
-    # two different tables, so this also pins that the pass walks past the outbound table.
+    # not the first" — the caller is usually rendering a 422 an operator reads once.
     _encoding_cfg(
         tmp_path,
-        "inbound('i', MLLP(port=2575, encoding=env('in_charset')), router='r')\n"
-        "outbound('o', File(directory='.', encoding=env('out_charset')))",
+        "outbound('o', File(directory='.', encoding=env('out_charset')))\n"
+        "outbound('p', File(directory='.', encoding=env('other_charset')))",
     )
     with pytest.raises(WiringError) as ei:
         _build_check(
             load_config(tmp_path),
-            {"in_charset": "not-a-real-codec", "out_charset": "also-not-a-codec"},
+            {"out_charset": "not-a-real-codec", "other_charset": "also-not-a-codec"},
         )
     msg = str(ei.value)
-    assert "inbound connection 'i'" in msg
     assert "outbound connection 'o'" in msg
+    assert "outbound connection 'p'" in msg
 
 
 def test_env_supplied_encoding_on_a_not_deployed_connection_is_skipped(tmp_path: Path) -> None:

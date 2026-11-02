@@ -146,8 +146,9 @@ with its gate, in [Route → permission map](#route--permission-map-engine-api) 
 implicit.
 
 Both app factories are **fail-closed**. With no `AuthService` attached, `create_app(engine)`
-and `create_managed_app(...)` deny every protected route (503) unless the caller explicitly opts out
-with `allow_no_auth=True`, the escape hatch for embedders and tests. Neither factory reaches
+and `create_managed_app(...)` deny every protected route. Only `allow_no_auth=True`, the escape
+hatch for embedders and tests, opens the bearer-token gates, which is the open mode. Neither
+factory reaches
 that mode by omission, both refuse the opt-in beside an auth service or auth settings, and `serve`
 never passes it. `serve` always requires sign-in, on every bind, loopback included (vault BACKLOG
 #2719), and no setting turns an attached service off (vault BACKLOG #2825). It used to allow a loopback
@@ -958,8 +959,7 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   per hop. `supervise` checks the service-settings hops too, before it starts any engine shard
   (BACKLOG #2356); the connection graph's hops stay with each engine shard. Each honoured opt-out is logged at start by hop name, never by secret, and is named by
   `security_loosenings()`. The refuse/warn split is `[security].enforcement`. What it counts as a
-  hop, and what it leaves out (listeners, plugin connector types, and a generic-ODBC credential
-  hidden in a driver keyword), is stated in `messagefoundry/config/static_credentials.py`.
+  hop, and what it leaves out, is stated in `messagefoundry/config/static_credentials.py`.
   **Several hops have no compliant credential kind in the product today.** The table in
   [`docs/CONNECTIONS.md`](CONNECTIONS.md#static-credentials-on-every-backend-hop) is the one list
   of them, and each listed hop's `compliant_kind` flag is the source of record. With the refusal on,
@@ -1164,7 +1164,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 | Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532), and `_admin_revoke_sessions` (BACKLOG #2614), which came later and does the same, so the cells to its right count it with the BACKLOG #2532 commands; at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice and logs it twice), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
-| `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
+| `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS mode (a key or certificate keyword alone does not count) or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS mode) is refused |
 | `db_lookup` | `transports/database.py` `DatabaseLookupExecutor` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` | `_build_dsn`, posture stamped by `RegistryRunner._build_lookup_executor` | refuses | No |
 | `DatabaseRef` reference sync | `pipeline/reference_sync.py` `database_source_dsn`, from `_load_database_source` and from `build_check` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` (BACKLOG #2617) | `_build_dsn`, with the engine's posture at sync time | refuses at `messagefoundry check`, dry-run, reload and every sync. `serve` start does not stop: its first sync fails and the set stays unloaded. CORRECTED: at `bca583f2a7` a sync read no posture and the escape was unclamped | No |
 | Vault KV secrets | `config/secretprovider_vault.py` `_build_client` | hvac over the scheme the address names | a scheme gate, `transports/strict_requests.py` `_refuse_a_cleartext_vault_hop`, through the shared `insecure_hop_disposition`; run by `mount_strict_reply_adapter` at build and again before each send | refuses an `http://` address unless it is loopback and reached with no proxy. The hop holds no posture and has no escape, so it refuses the same way under `warn`. CORRECTED: at `bca583f2a7` this row read *"none on the scheme"* and *"an `http://` address is used as given"*; engine PR 1880 (vault BACKLOG #2317) added the gate | Off by default; once on, only a loopback `http://` address with no proxy crosses unencrypted |
@@ -1214,7 +1214,7 @@ named it as still open, waiting on engine PR 1877.
   `enforce`. #2532 left this open: the fix is a guard that fails closed with no posture, in the
   store files, rather than another call site.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
-  one. `generic_odbc_no_tls_params` records that residual.
+  one. The comment above `_ODBC_NO_TLS_VALUES` records that residual.
 
 Backups and the support bundle write to a path. If that path is a network share, the operating
 system makes the connection, and the engine opens no socket of its own for it.
@@ -2451,8 +2451,9 @@ written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mi
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
-raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`, which only a
-missing config directory writes. The row does not claim the old graph is still serving: at least a
+raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
+for the config directory itself: at least one that is missing, and a share lost between the
+reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
@@ -2467,6 +2468,32 @@ reason is written only for an anchor that passed them. An anchor they refuse is 
 Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error.
+
+**The same store fault would not read as a refused anchor on an operator start or on a connection
+test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
+**503**, not the **409** a refused CA answers on an inbound, and its `connection_control` row would
+carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
+its 503 would say the connection is left stopped until the next start. The lane would read
+`failed`, and a lane with no earlier failure on record would show a line saying the CA could not be
+checked. An outbound checks its CA at a start only when it has no connector. An operator start of
+such a lane that was paused would leave it paused with its rows pending, because a resumed lane
+with no connector charges each row it claims an attempt, and a finite `max_attempts` would
+dead-letter it with nothing known against the CA.
+
+**That hold covers the operator control route only, and it ends at the lane's next start**, which
+at least an operator, a schedule or a rule can make. While a lane is held it sits in the paused
+set, which suppresses its buildup and stall pages. A lane that was not paused, such as one that failed at boot
+on the same fault, is not held: it would keep claiming with no connector, unless a restart paused
+it.
+
+A connection test the store stopped would report `success: false` with one fixed line, and the row
+the route writes to `audit_log.detail` would carry that line and the same `reason`. The
+`connection_control` row of a start or restart answered this way is fail-soft, as is that row for
+any refused inbound start or restart, and so is the `connection_test` row of a test stopped in its
+CA check step, before its connector is built. A store that also refuses the row would leave the answer
+standing, and the row's loss would be logged at ERROR. Any other test's row stays required. A
+refused start's or restart's row carries `refused` true beside the lane's `running`, so it cannot
+read as a completed action.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
@@ -2561,6 +2588,13 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
+- a network share the engine cannot reach can read as absent, not as a fault. At least a share lost
+  between the target check and the reload's read of the directory would answer `not_found`, and
+  `validate_config`, which `messagefoundry check` runs, would report a config directory on such a
+  share as absent. A value file read from disk would read as absent there too, so an `env()`
+  reference with a default would take that default, with no refusal;
+- a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
+  out what it cannot read and does not tell its caller, so it can be partial;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
@@ -4087,9 +4121,11 @@ dict. Each model now gets a serializer over its own gated properties only
 ([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
 closed. The published schema of every other gated model is unchanged.
 
-**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves every route to
-the built-in system identity, which holds every role and therefore every permission, so the
-per-property gate withholds nothing there. `serve` never builds that app (vault BACKLOG #2719).
+**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves a caller
+reaching a bearer-token gate to the built-in system identity, which holds every role and therefore
+every permission, so the per-property gate withholds nothing there. A route that needs a service
+still answers 503, at least `/users` and `/audit`. `serve` never builds that app (vault BACKLOG
+#2719).
 
 **Assurance — what CI actually asserts.** Three guards, deliberately covering the three distinct ways
 this gate can be forgotten (the previous claim here was overstated: the old pinning tests iterate the
@@ -6963,9 +6999,22 @@ reads the file again by path, on its own schedule. The SMTP hop reads it at ever
 swapped between reloads would be trusted by the next send. A connection that falls back to the
 internal CA reads it when the connection is built, and the syslog forwarder reads it once, at start.
 Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
-`restart_required` row for them. A changed syslog CA takes effect only at a restart. The reload
-response's `restart_required` field lists none of these dialling CAs, so an empty list there does
-not mean a changed one is applied (BACKLOG #3015).
+`restart_required` row for them. A changed syslog CA takes effect only at a restart.
+
+**What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
+response says that no settings anchor with a recorded load changed in the engine process that
+answered, including when none is configured. It does not say that no restart is needed. At least
+these sit outside the list:
+
+- the dialling settings CAs named above. Their hops load the file by path and record no fingerprint
+  to compare with, so a changed one is never listed, and it can still need a restart or a rebuild
+  of the connections that use it;
+- another engine shard. A reload is per process with no fleet coordination (ADR 0073). An engine
+  shard logs a changed anchor with a recorded load at least when a reload or a DR activation on it
+  runs the settings check and every anchor passes. Only a reload's response carries the list;
+- another cluster node, converging on the reload. It has no response to carry a list, and the
+  `auth.trust_anchor` row names no node, so it says so only in its own log, and only once its
+  convergence reload reaches this check.
 
 **The hops built before that check take the same checks first (BACKLOG #3470).** At least four
 are covered:

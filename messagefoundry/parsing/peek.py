@@ -52,6 +52,12 @@ DEFAULT_MAX_SEGMENTS = 10_000  # generous for big batches/ORUs, bounds segment-c
 class HL7PeekError(ValueError):
     """Raised when bytes are not a parseable HL7 message, or a field path is malformed."""
 
+    #: ``True`` on the :func:`parse_or_refuse` refusal for a fault in the parser itself, not a
+    #: property of the message (ADR 0054 amendment). A flag rather than a subclass, so the class name
+    #: an operator reads in a stored reason does not change. A caller that must tell an engine fault
+    #: from a bad message (the delivery re-attach, vault BACKLOG #2809) reads it.
+    parser_fault: bool = False
+
 
 class HL7MessageTooLarge(HL7PeekError):
     """The message is over the ``max_bytes`` cap. A subclass, so every ``except HL7PeekError`` still
@@ -225,11 +231,13 @@ def parse_or_refuse(text: str) -> _builtin_hl7.ParsedMessage:
     raise comes after the handler so the parser's error is not on the chain (BACKLOG #2085; the same
     policy as ``wiring_runner._peek_read_fault``).
     """
+    fault = False
     try:
         return _builtin_hl7.parse(text)
     except _builtin_hl7.HL7ParseError as exc:
         refused = str(exc)  # fixed text, quotes nothing from the body
     except Exception as exc:  # noqa: BLE001 — any other error here is a parser fault
+        fault = True
         refused = f"could not parse HL7 message ({type(exc).__name__})"
         # Where it failed, as file:line of each frame, and never the error's own text: a location
         # locates the bug and carries no body.
@@ -238,7 +246,9 @@ def parse_or_refuse(text: str) -> _builtin_hl7.ParsedMessage:
         logger.error(
             "built-in HL7 parse faulted with %s at %s; message refused", type(exc).__name__, where
         )
-    raise HL7PeekError(refused)
+    refusal = HL7PeekError(refused)
+    refusal.parser_fault = fault
+    raise refusal
 
 
 def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "replace") -> str:

@@ -37,9 +37,31 @@ this line.**
   that ships that module, which no published engine does yet, so the release that carries this
   raises the `messagefoundry` floor to the engine release that adds it. The seam digest does not
   cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
+- **A refused start, stop or restart on the dashboard redirects back with a notice.** A 409 or a
+  503 from the per-name control routes used to show as raw JSON. (BACKLOG #3746)
+- **A released config reload shows each thing it left undone in its own banner.** The approvals
+  page now matches the configuration page there. It drops the raw `restart_required` row when a
+  banner says the names or the list is empty, and any other value stays in the facts. Its facts
+  gain `routers`, `handlers`, `running` and `dry_run`. The restart banner on both pages says the
+  list is not complete, and points at the section "Outbound TLS trust anchor" of docs/SECURITY.md
+  in the MessageFoundry repository, at the paragraph "What a reload's restart_required list
+  covers". (vault BACKLOG #3746)
 
 ### Security
 
+- **An IPv4 entry that is not one host's address covers nothing.** Engine settings refuse such an
+  entry at load: at least all of `0.0.0.0/8`, a multicast address and the reserved class E range.
+  The console matched one that reached it another way, so a URL to that address skipped the
+  interstitial. It now shows the interstitial, as it does for a dot-led entry. A host a browser
+  reads as an address now matches only a canonical IPv4 entry that is one host's, exactly, so a
+  partial entry such as `0.0` covers no address, and neither does an octal, hexadecimal or integer
+  spelling or an IPv6 literal. (BACKLOG #3765)
+- **A non-ASCII entry that reaches the console other than through engine settings covers no host.**
+  The console lower-cased an entry with `str.lower()`, which turns the Kelvin sign into an ASCII
+  `k`, and removed non-ASCII white space, so such an entry covered an ASCII host. Hosts are compared
+  in ASCII, so it now shows the interstitial. An ASCII entry still loses its capitals and any
+  spaces, tabs or line breaks around it, and settings still strip a pasted entry at load.
+  (BACKLOG #3765)
 - **The Approvals page lists a request that failed its integrity check, flagged, and offers its
   Reject.** The engine marks such a row `release_blocked = "seal_failed"` and sends no parameters
   for it; the page shows "withheld" where the parameters go, a FLAGGED note saying the request was
@@ -141,6 +163,15 @@ this line.**
   listing, not every route to the fact; [`docs/SECURITY.md`](../../docs/SECURITY.md) says what it
   leaves out. Seam change: `list_approvals` takes `request`, which the handshake does not check, so
   this console and an engine without that change raise TypeError on the page. (BACKLOG #3747)
+
+### Fixed
+
+- **The flag toggle's "audit log did not record the change" page keys on the refusal's type.**
+  The console gave that page for any 503 the engine's flag handler raised, relying on a comment
+  that the handler had no other. No other 503 reaches it today, so nothing an operator sees
+  changes; a 503 a later handler change adds is no longer named as the audit refusal. The console
+  now catches the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine
+  seam that carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

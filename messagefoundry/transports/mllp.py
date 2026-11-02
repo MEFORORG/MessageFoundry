@@ -112,6 +112,7 @@ from messagefoundry.transports.base import cap_setting as _cap_setting
 from messagefoundry.transports.framing import (
     MLLP_CODEC,
     check_frame_bytes,
+    declared_encoding,
     frame_for_delivery,
     frame_reply,
 )
@@ -1834,7 +1835,12 @@ class MLLPSource(SourceConnector):
         # interfaces (0.0.0.0) by accident, since MLLP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
-        self.encoding: str = s.get("encoding", "utf-8")
+        # The rule ingress_guards.ingress_encoding reads too, so the reply is encoded in the charset
+        # the runner decoded the body with. Config load refuses an env() inbound encoding, which the
+        # runner's decode would not resolve, and a non-str or unusable name (BACKLOG #2431); the str()
+        # rule is the backstop that hands one that got past it to frame_reply's fallback, rather than
+        # raising a TypeError that leaves the reply unsent.
+        self.encoding: str = declared_encoding(s.get("encoding"))
         # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
         # The runner builds every other ACK itself.
         self.ack_mode: AckMode = config.ack_mode
@@ -2306,7 +2312,7 @@ class MLLPSource(SourceConnector):
                 nak = build_ack(
                     inbound, code="AE", text=_HANDLER_FAILURE_NAK_TEXT, ack_mode=self.ack_mode
                 )
-                return frame_reply(MLLP_CODEC, nak, self.encoding)
+                return frame_reply(MLLP_CODEC, nak, self.encoding, connection=self._pacing_name)
             except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
                 logger.warning(
                     "MLLP-level NAK for a handler fault could not be built: %s", safe_exc(exc)
@@ -2471,7 +2477,14 @@ class MLLPSource(SourceConnector):
                                 break
                             if reply is not None:
                                 # ADR 0205: a reply never carries a second frame boundary.
-                                writer.write(frame_reply(MLLP_CODEC, reply, self.encoding))
+                                writer.write(
+                                    frame_reply(
+                                        MLLP_CODEC,
+                                        reply,
+                                        self.encoding,
+                                        connection=self._pacing_name,
+                                    )
+                                )
                                 await self._drain_ack(writer)
                         if handler_dropped:
                             failed = True  # handler_error already names why this closes

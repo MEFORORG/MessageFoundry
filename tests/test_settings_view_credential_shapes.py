@@ -139,15 +139,16 @@ def test_a_headers_list_of_pairs_gets_the_header_rule() -> None:
     ],
 )
 def test_a_reference_inside_a_default_is_named_by_its_key_only(name: str, inner: str) -> None:
-    """``env("a", default=env("b", default=...))`` showed the inner default, and the raw ``EnvRef``
-    it left in the view made ``json.dumps`` refuse the whole map. #2519 (refuse the shape at load)
-    has not landed, so the view still has to handle it."""
-    view = _shown({name: env("a", default=env("b", default=inner))})
+    """The view used to show the inner default, and the raw ``EnvRef`` it left behind made
+    ``json.dumps`` refuse the whole map. ``env()`` refuses this shape since vault BACKLOG #2519, but
+    a raw top-level marker from a hand-built spec or a stored graph never passes ``EnvRef``, so the
+    view still handles it, and that is the shape built here."""
+    view = _shown({name: {"env": "a", "default": env("b", default=inner)}})
     assert view[name] == {"env": "a", "default": {"env": "b"}}
 
 
 def test_a_raw_marker_inside_a_default_is_named_by_its_key_only() -> None:
-    view = _shown({"host": env("a", default={"env": "b", "default": MARK})})
+    view = _shown({"host": {"env": "a", "default": {"env": "b", "default": MARK}}})
     assert view["host"] == {"env": "a", "default": {"env": "b"}}
 
 

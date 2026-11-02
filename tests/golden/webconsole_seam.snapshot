@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-b634db50214474e2
+8774e324f0b1b7cf
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -114,6 +114,7 @@ current_user
 federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
+ConfigWriteNotRecorded: (detail: 'str') -> 'None'
 RepeatedCredentialError: (credential: 'str', detail: 'str') -> 'None'
 alert_directory_administrator_granted: (state: 'Any', outcome: 'LoginOutcome', *, via: 'str') -> 'None'
 authorization_header: (request: 'Request') -> 'str'

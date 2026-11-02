@@ -17,6 +17,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, NoReturn
 
 import pytest
@@ -31,6 +32,9 @@ from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import (
+    _ODBC_NO_TLS_VALUES,
+    _ODBC_PARAM_ALLOWLIST,
+    _ODBC_TLS_MODE_KEYWORDS,
     DatabaseDestination,
     DatabaseSource,
     _bind_params,
@@ -39,6 +43,7 @@ from messagefoundry.transports.database import (
     _build_odbc_dsn,
     _classify_db_error,
     _driver_code,
+    _is_tls_keyword,
     _is_transient,
     _lookup_connect_failure,
     _parse_named_params,
@@ -299,8 +304,10 @@ def test_generic_dsn_warns_when_no_tls_keyword(caplog: pytest.LogCaptureFixture)
     assert any("TLS verification is NOT enforced" in r.getMessage() for r in caplog.records)
 
 
-def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureFixture) -> None:
-    # An operator who set a TLS keyword AT A VERIFYING VALUE has taken ownership → no WARNING (DEBUG).
+def test_generic_dsn_no_warn_when_a_mode_is_outside_the_deny_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A mode keyword at a value the deny-list does not name is delegated → no WARNING (DEBUG).
     # The other half of the pair is below: a TLS keyword at a NO-TLS value must still WARN. Before #333
     # the detector matched the regex against KEYS ONLY, so this test passed for `disable` too — which is
     # why the pair, not this test alone, is the control.
@@ -324,6 +331,7 @@ def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureF
         ("SSLMODE", "DISABLED"),  # MySQL Connector/ODBC
         ("SSLMODE", "PREFERRED"),  # MySQL Connector/ODBC: opportunistic
         ("Encrypt", "no"),
+        ("Encrypt", "Optional"),  # Microsoft ODBC 18 documents this as a synonym for `no`
         ("Encrypt", "0"),
         ("Encrypt", "false"),
         ("Encrypt", "OFF"),  # value classification tolerates case
@@ -450,7 +458,24 @@ def test_generic_destination_warning_names_the_connection(
     assert any("'OB_DB_GEN'" in m and "SSLmode=disable" in m for m in warned), warned
 
 
-_NO_TLS_WORDS = ("disable", "disabled", "allow", "prefer", "preferred", "no", "off", "false", "0")
+_NO_TLS_WORDS = (
+    "disable",
+    "disabled",
+    "allow",
+    "prefer",
+    "preferred",
+    "no",
+    "optional",
+    "off",
+    "false",
+    "0",
+)
+
+
+def test_the_no_tls_word_copy_matches_the_deny_list() -> None:
+    # The copy above pins the deny-list's content, and the sslpassword test below runs over it, so a
+    # word added to or dropped from either one must fail here rather than leave a word untested.
+    assert set(_NO_TLS_WORDS) == set(_ODBC_NO_TLS_VALUES)
 
 
 def _generic_dsn_logs(params: dict[str, str], caplog: pytest.LogCaptureFixture) -> str:
@@ -508,6 +533,114 @@ def test_a_lone_sslpassword_is_not_tls_ownership(password: str) -> None:
         "no TLS keyword is set in odbc_params"
     )
     assert generic_odbc_tls_unenforced({"sslpassword": password, "SSLmode": "verify-full"}) is None
+
+
+#: Every accepted keyword named like TLS that can set no mode. Read from the allowlist, so a TLS
+#: keyword added there later is held to this rule without anyone listing it here.
+_TLS_KEYWORDS_WITH_NO_MODE = sorted(
+    keyword
+    for keyword in _ODBC_PARAM_ALLOWLIST - _ODBC_TLS_MODE_KEYWORDS
+    if _is_tls_keyword(keyword)
+)
+_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
+
+
+def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
+    # Positive control: an empty table would pass every test below. A mode keyword the build refuses
+    # would leave no accepted way to clear a hop.
+    assert {"sslca", "sslcapath", "sslcert", "sslcipher", "sslkey"} <= set(
+        _TLS_KEYWORDS_WITH_NO_MODE
+    )
+    assert _ODBC_TLS_MODE_KEYWORDS <= _ODBC_PARAM_ALLOWLIST
+
+
+@pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
+def test_a_lone_tls_keyword_that_sets_no_mode_is_not_tls_ownership(keyword: str) -> None:
+    """BACKLOG #2483. A key or certificate path with no mode beside it does not count as a mode. A
+    real mode beside it is the control."""
+    for spelling in (keyword, keyword.upper()):
+        assert generic_odbc_tls_unenforced({spelling: "fixture"}) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "require"}) is None
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "SSLmode": "verify-full"}) is None
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "prefer"}) == (
+        "TLS is explicitly not required: sslmode=prefer"
+    )
+
+
+def test_a_lone_sslrootcert_is_not_ownership() -> None:
+    # The ledger row names this keyword. The build refuses it (it is not on the allowlist), so the
+    # table above never reads it and only the classifier can be handed it.
+    assert generic_odbc_tls_unenforced({"sslrootcert": "ca.pem"}) == _NO_MODE_REASON
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"sslmode": ""},
+        {"sslmode": "   "},
+        {"Encrypt": ""},
+        {"sslmode": None},
+        {"SSLmode": "", "sslcert": "c.pem"},
+        {"sslmode": "", "Encrypt": "  "},
+        {"sslmode": ["disable"]},
+        {"Encrypt": ["yes"]},
+        {"sslmode": {"mode": "require"}},
+        {"Encrypt": True},
+        {"sslmode": 1},
+    ],
+)
+def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(params: dict[str, object]) -> None:
+    # connections.toml refuses a non-string value, so only a code-first table can hand one in.
+    assert generic_odbc_tls_unenforced(params) == _NO_MODE_REASON
+
+
+@pytest.mark.parametrize("value", [" require", "require ", "\tverify-full", "yes\n"])
+def test_a_padded_mode_value_sets_no_mode(value: str) -> None:
+    # psqlODBC switches on a value's first character, so a leading blank would select the driver's
+    # default. The build refuses a padded value outright since BACKLOG #2705; this pins the
+    # classifier the posture readers use on specs that were never built. The unpadded spelling is
+    # the control.
+    for keyword in ("sslmode", "Encrypt"):
+        assert generic_odbc_tls_unenforced({keyword: value}) == _NO_MODE_REASON
+        assert generic_odbc_tls_unenforced({keyword: value.strip()}) is None
+
+
+def test_a_padded_no_tls_value_is_still_named() -> None:
+    # Padding never hides the deny-list: that check reads the value trimmed.
+    assert generic_odbc_tls_unenforced({"sslmode": " disable"}) == (
+        "TLS is explicitly not required: sslmode=disable"
+    )
+
+
+def test_a_mode_keyword_named_twice_reads_the_same_in_either_order() -> None:
+    # The build refuses the duplicate, but the posture readers classify specs never built.
+    first: dict[str, object] = {"sslmode": "verify-full", "SSLMODE": ""}
+    second: dict[str, object] = {"SSLMODE": "", "sslmode": "verify-full"}
+    assert generic_odbc_tls_unenforced(first) is None
+    assert generic_odbc_tls_unenforced(second) is None
+
+
+def test_one_blank_mode_keyword_does_not_void_the_other() -> None:
+    assert generic_odbc_tls_unenforced({"sslmode": "", "Encrypt": "yes"}) is None
+    assert generic_odbc_tls_unenforced({"sslmode": "verify-full", "Encrypt": ""}) is None
+
+
+@pytest.mark.parametrize("value", ["bogus", "1", "VERIFY_IDENTITY"])
+def test_a_mode_value_the_deny_list_does_not_name_stays_delegated(value: str) -> None:
+    # A deny-list on purpose (see the comment above _ODBC_NO_TLS_VALUES). This pins the classifier
+    # only: since BACKLOG #2705 the build refuses an sslmode outside libpq's spellings on every
+    # driver but MySQL Connector/ODBC.
+    assert generic_odbc_tls_unenforced({"sslmode": value}) is None
+
+
+def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A relative name in an empty directory: no file can change the outcome, and it stays ASCII.
+    monkeypatch.chdir(tmp_path)
+    logged = _generic_dsn_logs({"sslcert": "absent.pem"}, caplog)
+    assert "TLS verification is NOT enforced" in logged and _NO_MODE_REASON in logged
+    assert "SSLmode=verify-full" in logged
 
 
 @pytest.mark.parametrize(
@@ -1876,6 +2009,25 @@ def test_source_requires_core_settings(missing: str) -> None:
             Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings),
             egress=EgressSettings(deny_by_default=False),
         )
+
+
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "base64", "undefined", 8, True])
+def test_source_refuses_an_unusable_encoding_when_built(encoding: object) -> None:
+    # BACKLOG #2431: each polled row is encoded with this name, so an unusable one is refused when
+    # the source is built rather than surfacing per row. The message never renders the name.
+    settings = {**DatabasePoll(server="s", database="d", poll_statement=POLL).settings}
+    settings["encoding"] = encoding
+    with pytest.raises(ValueError, match="names no usable text codec") as ei:
+        build_source(
+            Source(type=ConnectorType.DATABASE, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert str(encoding) not in str(ei.value)
+
+
+@pytest.mark.parametrize("encoding", [None, "", "latin-1", "UTF_8"])
+def test_source_builds_with_a_usable_or_undeclared_encoding(encoding: object) -> None:
+    _src(encoding=encoding)
 
 
 # --- source connect-allowlist ([egress].allowed_db) --------------------------

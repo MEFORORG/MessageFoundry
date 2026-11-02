@@ -728,14 +728,17 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 `ERROR`, so it is counted and never silently dropped, and the answer's body names that row:
 `{"error": "message was not accepted", "refused_message_id": "<id>"}`. The status says whether to re-send:
 
-- **`503`** with `Retry-After` when the refusal is temporary, the engine's own and expected to clear.
-  Only the streaming detach's in-flight budget, while other detaches hold it, is classed so; re-send
-  the same body later. A body larger than that whole budget is over-size instead.
+- **`503`** with `Retry-After` when the refusal is temporary: the engine's own, not the body's.
+  At least two refusals are classed so: the streaming detach's in-flight budget, while other
+  detaches hold it, and an inbound `encoding` naming no text codec, which refuses every body until
+  an operator fixes the name (BACKLOG #2431), so a sender re-sending every few seconds meanwhile
+  leaves one `ERROR` row per attempt. Re-send the same body later. A body larger than that whole
+  budget is over-size instead.
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
   with `max_message_bytes`.
 - **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
-  body the engine cannot decode, one that does not match the declared `content_type`, or an HL7 parse
+  body the engine cannot decode in a usable charset, one that does not match the declared `content_type`, or an HL7 parse
   or strict-validation failure. A strict-validation timeout is one too, deliberately: even one caused
   by load answers `422` and is final. BACKLOG #2105's filing listed that timeout as temporary; it is
   reclassified as permanent.
@@ -746,6 +749,8 @@ the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-
 The owner ruling of 2026-09-26 answered a refused body `422`. The owner ruling of 2026-09-30 set a
 temporary refusal at `503` with `Retry-After` and kept a permanent one at `422`; which refusals are
 temporary, and the one `413` for over-size, are Manager decision d20261030T155119571-255c98. The
+unusable codec name joined the temporary class later, under BACKLOG #2431, and was not part of that
+decision. The
 `ERROR` row's error text opens with `[refusal kind: <kind>]`, ahead of any refused-body allowance note.
 A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
@@ -1795,9 +1800,12 @@ port compared.
 
 ##### Accepted `odbc_params` keywords
 
-`[egress].allowed_db` checks the host in `server`. **No `odbc_params` keyword can give the
-driver another host** (vault BACKLOG #2577): `odbc_params` takes a fixed list of keywords, and
-each one sets a port, a TLS mode, a local file or a session option:
+`[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords:
+the list is hand-chosen, no keyword is on it in order to name a host, and a file
+keyword's value is screened separately by spelling (vault BACKLOG #2577). **The list covers
+keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
+in a braced password (*The password*, below), and the driver reading `SERVER` as its target
+(*This is a rule about keywords*, below).** The keywords set at least a port, a TLS mode, a local file or a session option:
 
 <!-- odbc-params-allowlist:start -->
 | Group | Keywords |
@@ -1877,8 +1885,8 @@ these kinds:
 
 Two limits follow from this:
 
-- **A driver that takes its target under another keyword cannot be configured here.** The engine
-  sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
+- **A driver may take its target under another keyword, and the engine does not detect that.** The
+  engine sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
   target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
@@ -1962,18 +1970,45 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > `Encrypt`/`TrustServerCertificate` to *refuse* a weakened DB hop, but it cannot introspect an arbitrary
 > driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
-> `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. So the
-> delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
-> when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
-> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
-> dropped to DEBUG only once a keyword is set to something outside that deny-list. A passphrase keyword
+> `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. A generic
+> connection logs a **WARNING** at construction, naming itself,
+> when `odbc_params` set **no** TLS mode **or** set one to a no-TLS value
+> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`optional`/`0`/`false`/`off`) —
+> dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **The engine
+> counts only those two as a mode** (BACKLOG #2483). No other TLS keyword counts, at least
+> `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and `SSLCIPHER`, so one of them alone reads as no mode.
+> So does a blank mode, or one with a blank at either end; since BACKLOG #2705 the build refuses
+> such a value outright, on any posture (see *Values on the generic dialect*). Name the mode as
+> well as the files. libpq's default is `sslmode=prefer`, which can fall back to plaintext.
+> psqlODBC's own source sets `disable`, so no TLS would be attempted at all.
+>
+> **On MySQL Connector/ODBC, set `SSLMODE`.** Its
+> [parameter page](https://dev.mysql.com/doc/connector-odbc/en/connector-odbc-configuration-connection-parameters.html)
+> (read 2026-10-30) says that with `SSLMODE` unset, `SSLCA` or its CA path option implies
+> `SSLMODE=VERIFY_CA`. The engine does not read that, so the gate stays fail-closed: such a hop reads
+> as no mode until `SSLMODE=...` is set beside it. That page lists no `Encrypt` keyword.
+>
+> **Spell a psqlODBC mode exactly, in lower case.** Its keyword parser has no `Encrypt`, so
+> `Encrypt=yes` would clear this check with no TLS attempted. It also reads `SSLmode` by a
+> case-sensitive first letter and sends anything it does not recognize to `disable`. Since BACKLOG
+> #2705 the build refuses an `sslmode` outside libpq's six lower-case spellings for every driver but
+> MySQL Connector/ODBC, so `SSLmode=REQUIRE` is refused at build rather than cleared here. These
+> psqlODBC facts come from its source at commit `0395bf4cc33a`, and were not measured against a
+> driver.
+>
+> A passphrase keyword
 > such as `sslpassword` is not a TLS keyword here: it sets no TLS mode, and its value is never read or
-> reported (BACKLOG #1352). It is also reported
+> reported (BACKLOG #1352). A hop that warns is also reported
 > by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
-> line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
+> line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). A `dialect` given as
+> `env()` is resolved when the connection is built. `GET /security/posture` resolves it against the
+> running engine's values the same way and lists the hop only when it resolves to `generic`; when
+> those values do not resolve it, the posture lists the name marked *possibly generic*.
+> `messagefoundry check` reads the graph without the values, so its `generic-db-tls` line lists such a
+> hop as possibly generic and names the reference's key, never its value. This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
-> **A generic hop that says TLS is not required is REFUSED, not merely warned about** (BACKLOG #1178).
+> **A generic hop that says TLS is not required, or sets no TLS mode, is REFUSED, not merely warned about** (BACKLOG #1178).
 > The warning above used to be the whole control, so a generic connection with no TLS keyword would
 > cross in plaintext with nothing stopping it. That arm now goes through the same cleartext-hop
 > authority every other cleartext transport uses, with the same owner-ratified precedence: an on-box
@@ -1984,12 +2019,12 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > build when `serve` starts it fails that connection, which is recorded failed while the rest of the
 > graph starts (ADR 0031).
 >
-> What is gated is the case the classifier can judge: **no** ssl/tls/encrypt keyword, or one pinned to
-> a no-TLS value. A keyword set to anything outside that deny-list is still delegated, because the
+> What is gated is the case the classifier can judge: **no** TLS mode, or one pinned to
+> a no-TLS value. A mode set to anything outside that deny-list is still delegated, because the
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
 > unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
 > per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by
-> other means. Otherwise set a verifying keyword, or run at `[security].enforcement = warn`.
+> other means. Otherwise set a verifying TLS mode, or run at `[security].enforcement = warn`.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
@@ -2130,7 +2165,7 @@ opt-out. That is expected, and the table says which they are.
 | `Sftp(...)` | `<name>` or `inbound:<name>` | yes: SSH private key |
 | `Ftp(...)` | `<name>` or `inbound:<name>` | **no** |
 | `File(...)` alternate-share credential | `<name>` or `inbound:<name>` | **no** (drop it to run as the service identity) |
-| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` |
+| the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` on the SQL Server preset; on `dialect="generic"`, which only `Database` and `DatabasePoll` take, a client certificate (`SSLCERT` and `SSLKEY`, on a driver that reads them) or the service's own account |
 | `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
 | Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
 | `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
@@ -2182,7 +2217,7 @@ It covers **four** factories, because four of them dial a database with a creden
 > [`docs/SECURITY.md`](SECURITY.md) for the delegation boundary.
 
 One case is deliberately **not** reported: a `dialect="generic"` hop that sets no top-level
-`username`/`password`. `odbc_params` accepts no login-name or password keyword (see
+`username`/`password`. `odbc_params` accepts no login-name or login-password keyword (see
 [*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords)), so such a hop carries
 neither in its connection string. It may still sign in with a client certificate (`SSLCERT` and
 `SSLKEY`, on a driver that reads them) or as the service's own account, and this report
@@ -4069,7 +4104,7 @@ security-event notifier has a second one of its own).
 work on at least **four** distinct thread pools, plus `aiosqlite`'s per-connection worker thread on the SQLite
 store, and only one of the pools carries a knob.
 
-1. **The event loop's default `ThreadPoolExecutor`**, bound to CPython's `min(32, os.cpu_count() + 4)`
+1. **The event loop's default `ThreadPoolExecutor`**, bound to CPython's `min(32, (os.process_cpu_count() or 1) + 4)`
    with **no setting for it** (the engine never calls `loop.set_default_executor` outside a bench-only,
    env-gated shim, `pipeline/connscale_shim.py`). It carries **five** classes of work:
    - **Router and Handler execution** — `route_only` and `transform_one` go through `asyncio.to_thread`
