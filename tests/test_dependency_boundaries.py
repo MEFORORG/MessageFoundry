@@ -1202,8 +1202,9 @@ _TRAY_START_LOADS = frozenset({"messagefoundry", "messagefoundry.childenv", "mes
 # imports one of them, `_missing_stdlib_info`, so the probe charged it to the tray and went red on the
 # 3.15 canary's Linux leg (run 40504909930). The Windows build measured here ships no such file. Only
 # a top-level module whose file's directory resolves EXACTLY to the directory `os.py` was loaded from
-# counts. Installers put packages in site-packages below it or in a venv's own `Lib`, so an installed
-# third-party module does not qualify; a file someone writes straight into that directory would.
+# counts. Installers put packages in other directories, at least a site-packages below it, a venv's
+# `Lib/site-packages`, the user site, dist-packages and PYTHONPATH entries, so an installed third-party
+# module does not qualify; a file someone writes straight into that directory would.
 # `os` is read in the child, where it is already loaded before the snapshot, so the filter adds no
 # import to the count, and it names the directory the running interpreter really uses, which on a
 # source-tree build is not sysconfig's install path.

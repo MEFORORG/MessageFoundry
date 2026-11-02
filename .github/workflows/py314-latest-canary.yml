@@ -64,8 +64,8 @@ jobs:
         # Windows is the deployment target; Linux is the cheap breadth.
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Setup and install plus the suite step's 90-minute cap.
-    timeout-minutes: 120
+    # Setup and install, plus the suite step's 90-minute cap and the quarantine step's 20.
+    timeout-minutes: 130
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONFAULTHANDLER: "1"
@@ -166,13 +166,14 @@ jobs:
       #   * The xdist worker-restart hang. ci.yml's note beside its own `--max-worker-restart=0` is the
       #     source of record for it; the flag is copied here. Its cost, as there: one test past the
       #     120s per-test cap kills its worker and ends the whole smoke with a partial count.
-      # The selection now matches the required legs, `timing_quarantine` excluded. That leaves the
-      # quarantined tests unmeasured on the canary interpreters: ci.yml's timing-quarantine job runs
-      # them on the pinned patch only.
+      # The selection matches the required legs, `timing_quarantine` excluded; the next step runs the
+      # quarantined tests on this interpreter, outside the verdict, as ci.yml's timing-quarantine job
+      # does on the pin.
       # The output goes through tee so a run killed at the cap still shows how far it got. pipefail is
       # set in the step as well as by the shell default, so a `shell:` change here cannot let tee's
       # exit status stand in for pytest's. stop-commands keeps a `::error` line printed by a test from
-      # becoming an annotation on this run.
+      # becoming an annotation on this run; the token is a uuid4, as in scripts/ci/, so test output
+      # cannot guess it and resume commands early.
       - name: Engine suite smoke
         id: suite
         if: steps.install.outcome == 'success'
@@ -181,7 +182,7 @@ jobs:
         run: |
           set -o pipefail
           STATUS=0
-          STOP="suite-$RANDOM$RANDOM"
+          STOP="$(python -c 'import uuid; print(uuid.uuid4().hex)')"
           echo "::stop-commands::$STOP"
           python -m pytest -q -n auto --dist loadfile --max-worker-restart=0 -p no:cacheprovider \
             -m 'not tooling and not timing_quarantine' \
@@ -189,6 +190,36 @@ jobs:
             --timeout=120 2>&1 | tee -i suite.txt || STATUS=$?
           echo "::$STOP::"
           echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
+          exit $STATUS
+
+      # The tests tests/timing_quarantine.txt lists, which the smoke above deselects, run here on the
+      # canary interpreter. ADVISORY TWICE OVER: the step is continue-on-error and the verdict below
+      # never fails on it. Its outcome is a summary row and a warning, the way ci.yml's
+      # timing-quarantine job reports (owner condition on this change: the canaries keep running the
+      # set). The file list is read the way that job reads it. The listed harness tests may skip or
+      # fail to collect here, because this job installs no `harness` extra or Qt libraries.
+      - name: Quarantined timing tests (advisory)
+        id: quarantine
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          grc=0
+          entries="$(grep -vE '^[[:space:]]*(#|$)' tests/timing_quarantine.txt)" || grc=$?
+          if [ "$grc" -gt 1 ] || [ -z "$entries" ]; then
+            echo "summary=could not read a test list from tests/timing_quarantine.txt (grep exit $grc)" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          files="$(printf '%s\n' "$entries" | cut -d: -f1 | sort -u)"
+          STATUS=0
+          STOP="$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+          echo "::stop-commands::$STOP"
+          # shellcheck disable=SC2086
+          python -m pytest -q -p no:cacheprovider -m timing_quarantine --continue-on-collection-errors \
+            --timeout=120 --durations=20 $files 2>&1 | tee -i quarantine.txt || STATUS=$?
+          echo "::$STOP::"
+          echo "summary=$(tail -1 quarantine.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 
       - name: Verdict -- did the canary fly, and what did it find?
@@ -203,6 +234,8 @@ jobs:
           NEWEST: ${{ steps.probe.outputs.newest }}
           NEWER: ${{ steps.probe.outputs.newer }}
           SUITE_SUMMARY: ${{ steps.suite.outputs.summary }}
+          QUARANTINE: ${{ steps.quarantine.outcome }}
+          QUARANTINE_SUMMARY: ${{ steps.quarantine.outputs.summary }}
         run: |
           # Each finding prints its own ::error line; FAILED only records that one fired.
           FAILED=""
@@ -224,6 +257,10 @@ jobs:
               FAILED=1
             fi
           fi
+          # Reported, never counted: the quarantined tests do not set FAILED.
+          if [ -n "$QUARANTINE" ] && [ "$QUARANTINE" != "success" ] && [ "$QUARANTINE" != "skipped" ]; then
+            echo "::warning title=Timing quarantine (advisory)::quarantined timing tests outcome=$QUARANTINE on Python $VERSION; this does not fail the canary"
+          fi
           if [ "$NEWER" = "True" ]; then
             echo "::warning title=Newer Python 3.14 patch::$VERSION is out and ci/python-version pins $PIN. Bump the pin in its own pull request; this run's suite result is the evidence for that bump."
           fi
@@ -238,6 +275,7 @@ jobs:
             echo "| newer than the pin | ${NEWER:-n/a} |"
             echo "| install | $INSTALL |"
             echo "| engine suite smoke | $SUITE: ${SUITE_SUMMARY:-n/a} |"
+            echo "| quarantined timing tests (advisory, not in the verdict) | ${QUARANTINE:-n/a}: ${QUARANTINE_SUMMARY:-n/a} |"
             echo ""
             if [ -z "$FAILED" ]; then
               echo "The canary flew clean on Python $VERSION."
