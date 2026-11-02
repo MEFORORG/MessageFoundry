@@ -1514,10 +1514,11 @@ def _build_connection(
 
 
 # One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
-# `#delete` reads as one identifier rather than as the `DELETE` keyword. After a sigil a digit may come
-# first (`#1tmp`, `@1x`), as T-SQL's identifier rules allow, so such a name is one word too and its
-# digit never reaches the number scan below.
-_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*|[@#]{1,2}[0-9][A-Za-z0-9_$#@]*")
+# `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil followed by a digit
+# (`#1tmp`, `@1x`) is NOT taken as one name, though T-SQL allows it: on the generic dialect `#` and `@`
+# can be operators, and there `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose
+# glue refusal refuses the statement on every dialect.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
@@ -1545,8 +1546,9 @@ _SQL_WRITE_KEYWORDS = frozenset(
 # Keywords that are also ordinary scalar FUNCTIONS in a dialect the generic ODBC path can reach, so a
 # `(` IMMEDIATELY after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)`
 # and `TRUNCATE(n,d)`, and by default MySQL wants no space between a built-in's name and its `(`.
-# Only `dialect='generic'` gets the exemption; the SQL Server preset, which has neither function,
-# never does. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
+# Only `dialect='generic'` gets the exemption. The SQL Server preset never does: SQL Server has no
+# native function of either name, and an ODBC scalar escape (`{fn TRUNCATE(x, 2)}`), which its
+# driver does translate, is refused with the rest, failing closed. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
 # Server driver), so the exemption there rests on this premise, read from the documented T-SQL
 # grammar and not run against a server: no T-SQL statement puts a `(` straight after `INSERT` or
 # `TRUNCATE`. `INSERT` takes `TOP (n)`, `INTO` or a target name first, and `TRUNCATE` takes `TABLE`.
@@ -1563,7 +1565,7 @@ _SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
 # `SELECT 1e1INTO copy` is `1e1` then `INTO`. :func:`_scan_sql_tokens` refuses any literal glued to a
 # word character, wherever this pattern's boundary falls, so the gate does not rest on matching a
 # lexer it cannot run. "A word character" there is any Unicode letter or digit or one of `_$#@`, a
-# superset of what `_SQL_WORD_RE` continues a word with, so widening that pattern cannot open a gap.
+# superset of what `_SQL_WORD_RE` continues a word with.
 _SQL_NUMBER_RE = re.compile(r"0[xX][0-9A-Fa-f]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
 
 
@@ -1597,7 +1599,8 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
     literal with a word character glued to its end (:data:`_SQL_NUMBER_RE`): SQL Server reads
     ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``. That refusal
     also catches valid reads, at least an Oracle ``1.5f``, a MySQL name that starts with a digit
-    (``2024_orders``), a MySQL ``0b101`` and a ``:1st`` placeholder; it fails closed on purpose.
+    (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp`` or ``@1x`` and a ``:1st`` placeholder;
+    it fails closed on purpose.
     ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
     tokens: list[_SqlToken] = []
@@ -1637,8 +1640,8 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
                     break
                 i += 1
             continue
-        num = _SQL_NUMBER_RE.match(statement, i) if "0" <= ch <= "9" else None
-        if num:
+        # `[0-9]+` always matches at a digit, so a digit never reaches the word scan below.
+        if "0" <= ch <= "9" and (num := _SQL_NUMBER_RE.match(statement, i)):
             end = num.end()
             if end < n and (statement[end].isalnum() or statement[end] in "_$#@"):
                 raise DbLookupError(f"{refusal}; a number runs into a word")

@@ -163,3 +163,20 @@ def test_the_poll_test_admits_mysql_scalar_insert_on_the_generic_dialect_only() 
     )
     assert isinstance(generic, DatabaseSource)
     assert database._read_only_poll_refusal(poll, dialect="generic") is None
+
+
+def test_an_env_dialect_defers_the_poll_test_to_the_build() -> None:
+    """A dialect that is not a literal is not guessed at declaration; the build tests the statement
+    with the resolved dialect.
+
+    Red mutation: test an unresolved dialect as sqlserver at declaration and this raises."""
+    from messagefoundry.config.wiring import env
+
+    poll = "SELECT id, INSERT(payload, 1, 0, 'x') AS payload FROM mf_inbox"
+    spec = DatabasePoll(
+        server="sql.example.com",
+        poll_statement=poll,
+        dialect=env("DB_DIALECT"),  # type: ignore[arg-type]
+        mark_statement=_MARK,
+    )
+    assert spec.settings["poll_statement"] == poll

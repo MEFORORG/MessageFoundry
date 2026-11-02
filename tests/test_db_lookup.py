@@ -481,8 +481,6 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
         # Numeric literals of every T-SQL shape, none of them glued to a word.
         "SELECT 0x1F AS b, 0x AS e, 1e5 AS f, 1.5E-3 AS g, 12. AS h, $12.50 AS m FROM t",
         "SELECT TOP 10 x$1 FROM t WHERE n IN (1,2,3)",
-        # A T-SQL name may put a digit straight after its sigil; it is one name, not a glued number.
-        "SELECT * FROM #1tmp JOIN ##2g ON 1=1 WHERE @1x = 1",
         # Comments are skipped wherever they sit, and T-SQL block comments nest.
         "SELECT 1; -- trailing note",
         "SELECT /* nested /* deep */ still */ 1",
@@ -494,11 +492,12 @@ def test_read_only_statements_still_admitted(stmt: str) -> None:
 
 # --- two bypasses of the keyword scan ------------------------------------------------------------
 #
-# Both passed the scan before this change, measured by calling _require_read_only on these exact
-# statements at origin/main f0101de6ef. (1) The INSERT()/TRUNCATE() function-form exemption looked at
-# the next SURVIVING token, and the scan drops a quoted identifier or a comment, so `INSERT [t](c)`
-# read as a call. (2) A number with a word glued to its end tokenized as one non-keyword word
-# (`0xUPDATE` became `0` and `XUPDATE`), while SQL Server reads `0x` then `UPDATE`.
+# Measured by calling _require_read_only at origin/main f0101de6ef. (1) The INSERT()/TRUNCATE()
+# function-form exemption looked at the next SURVIVING token, and the scan drops a quoted identifier
+# or a comment, so `INSERT [t](c)` read as a call: every _FUNCTION_FORM_BYPASSES row passed. (2) A number with a word glued to its end could tokenize as one non-keyword word (`0xUPDATE`
+# became `0` and `XUPDATE`), while SQL Server reads `0x` then `UPDATE`. Of _GLUED_LITERAL_BYPASSES,
+# `1e1INTO`, both `0xUPDATE` rows, `0x1FDELETE` and `1eINTO` passed; the rest were refused already,
+# as a keyword, and stay as controls that the new refusal covers them too.
 
 _FUNCTION_FORM_BYPASSES = [
     "SELECT 1 INSERT [patients](mrn) VALUES (1)",
@@ -522,6 +521,10 @@ _GLUED_LITERAL_BYPASSES = [
     # Refused even where the hex digits swallow the keyword's head (`0xDE` then `LETE`): the glue is
     # the refusal, so the gate never rests on matching where SQL Server ends the literal.
     "SELECT 0x1FDELETE FROM patients",
+    # A sigil then a digit is not taken as one name, so a keyword glued behind it is still refused
+    # (on the generic dialect `@` and `#` can be operators, and `@1INTO` is `@`, `1`, `INTO`).
+    "SELECT @1INTO copy FROM patients",
+    "SELECT 1 #1INTO copy FROM patients",
 ]
 
 
