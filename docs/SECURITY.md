@@ -6538,7 +6538,7 @@ listener held full by ordinary load raises it as well.
 a detector count of `0` or above its default, or a window shorter than its default while any
 count is above `0`, is named in `GET /security/posture` and in the start's `config_loaded` row.
 With the layer off, every detector stops but the posture one, so that start still raises
-`posture_loosened` naming the switch. A later start that records no loosening raises the
+`posture_loosened`. A later start that records no loosening raises the
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
 process and pages nobody. A row marked `superseded` or `baseline_unchecked` raises no inverse,
 even with an empty list: the list is read off the graph the start's snapshot took, and a reload
@@ -6553,6 +6553,24 @@ under its identity, at least after an engine shard is removed from the config or
 `POST /alerts/{alert_id}/resolve` or in the web console's alert list, which goes through the same
 scope check, so both need an account that is not channel-scoped and holds `monitoring:diagnose`. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
 records its loosenings as unknown, such as one whose config snapshot could not be taken.
+
+**A resolved `posture_loosened` does not prove the engine runs clean.** The detector reads
+`config_loaded` rows and no `config_reload` row, so at least these two reloads go unseen. One lands
+after the start's swap check and before its row is written, which leaves a clean, unmarked row. The
+other lands after a clean start. In the first case the row resolves the alert while the reloaded,
+loosened graph runs. In the second the alert was resolved already, and nothing raises it again until
+a later start. `GET /security/posture` reads the live graph, so read that for the current posture.
+
+**`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
+count of every loosening, then their names, cut at 200 characters and ending in `...`. The
+`alert_instance` reason then cuts the whole sentence at 200 characters. A name late in a long list
+is therefore missing, and `[security]` switches come ahead of `alerts.security_signals`. Measured
+with every false-by-default `[security]` boolean set: 309 characters of names came ahead of it, and
+the alert read 19 loosenings, ending in `...`, without it. With 116 characters of names ahead of it
+the stored reason still named it, and with 145 it did not. The count always includes it. The start's
+`config_loaded` row holds the whole list, and so does `GET /security/posture`, which narrows only
+the per-connection entries for a channel-scoped reader. Read one of those when the alert's list is
+cut.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

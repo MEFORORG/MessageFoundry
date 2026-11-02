@@ -840,7 +840,8 @@ count is above `0` (vault BACKLOG #2613).
   With the layer off a DEBUG log level raises no alert either. The `[alerts]` table of
   [CONFIGURATION.md](CONFIGURATION.md) says what each detector counts.
 - **What stays:** the posture detector. With the layer off it still runs, so a start that records
-  its loosenings raises `posture_loosened` naming this one.
+  its loosenings raises `posture_loosened`. Its list of names can be cut before this one, as
+  [SECURITY.md](SECURITY.md#audit-1) states, and the start's `config_loaded` row holds them all.
 - **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns. It
   does not see refused connections, and with the layer off nothing counts them, so a site that
   turns the layer off accepts losing that alert. With the layer on, a SIEM on the audit stream is
