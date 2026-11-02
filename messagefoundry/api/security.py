@@ -49,8 +49,8 @@ from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.controlchars import scrub_log_argument
 
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
-# the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. This plane keys by issuer first
-# (BACKLOG #2237); the intake plane does not yet.
+# the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. Both planes key by issuer first
+# (BACKLOG #2237 here, #2287 for the intake plane's intake_client_subjects).
 from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
@@ -358,7 +358,7 @@ def open_mode(app_state: object) -> bool:
 
     The one spelling of the check (vault BACKLOG #3216). The request gates and the posture all ask
     here, so they cannot drift apart. Both halves are read every time: a service beside the flag
-    still requires sign-in, and no service without the flag fails closed (503). A gate that has
+    still requires sign-in, and no service without the flag fails closed. A gate that has
     already found no service reads it once more here; that is the price of one spelling."""
     return getattr(app_state, "auth", None) is None and bool(
         getattr(app_state, "allow_no_auth", False)
@@ -418,6 +418,23 @@ class RepeatedCredentialError(HTTPException):
     def __init__(self, credential: str, detail: str) -> None:
         super().__init__(status.HTTP_400_BAD_REQUEST, detail)
         self.credential = credential
+
+
+class ConfigWriteNotRecorded(HTTPException):
+    """A 503 for a config write the engine refused because its audit row was not recorded (vault
+    BACKLOG #2945).
+
+    The connection flag handler raises it in place of a plain 503, so the console's flag route can
+    name this refusal's fix by its TYPE rather than by its status (BACKLOG #3811). The JSON route
+    answers other 503s, at least ``_get_engine``'s "engine not started" and
+    ``RequestTimeoutMiddleware``'s deadline. Neither reaches the console, which calls the handler
+    in-process with its engine supplied, so keying on the status held only because nothing in the
+    handler itself raised another 503; a later change to the handler could. The HTTP answer is the
+    ordinary 503 with ``detail``. Defined here because this is the leaf module the console imports,
+    and the seam snapshot records what it imports from it."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
 
 
 #: How much of the request path the repeated-credential line and row keep.

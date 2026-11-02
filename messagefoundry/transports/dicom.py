@@ -38,9 +38,10 @@ anything is read from it; see :func:`_admitting_server_class`) + ``require_calle
 a ``max_object_bytes`` cap (charged against the **raw received Data Set, before it is decoded**, so an
 over-cap object is refused before any decode, re-encode or commit) + an **opt-in association-rate
 bound** (``max_associations_per_second``, ASVS 2.4.1 / BACKLOG #1114 — off by default, waits before the
-association request is read, and never drops or refuses; see :meth:`DicomScpSource._pace_association`
+association request is read, and the wait itself never drops or refuses; see :meth:`DicomScpSource._pace_association`
 for why the unit is an association and not a message) + DICOM-over-TLS, whose inbound handshake is
-bounded and runs off the accept loop. A non-loopback
+bounded and runs off the accept loop + a cap and a deadline on connections with no association yet
+(see :func:`_admitting_server_class`). A non-loopback
 cleartext SCP is refused at startup by the generalized bind-guard (see
 :func:`messagefoundry.pipeline.wiring_runner.check_dimse_tls_exposure`). All log lines carry only
 **routing-safe identifiers** (SOP class/instance UID, calling AE, peer IP) — **never** the dataset or
@@ -76,6 +77,7 @@ from typing import Any, ClassVar, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
     RevocationHopGuard,
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
@@ -87,6 +89,7 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
     relax_verify_expiry,
     resolve_trust_anchor,
+    skips_validity_period,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.netaddr import (
@@ -133,6 +136,12 @@ from messagefoundry.transports.mllp import (
     InsecureHopGuard,
     _MessagePacer,
 )
+from messagefoundry.transports.receipt import (
+    IngressReceipt,
+    ReceiptHandler,
+    RefusalKind,
+    require_receipt,
+)
 
 __all__ = [
     "DicomScpSource",
@@ -143,10 +152,14 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Per-object size cap default: it bounds what is persisted, and — charged against the raw received Data
-#: Set before decode (see DicomScpSource._raw_over_cap) — what one received object costs in memory.
-#: max_pdu_size bounds a fragment, NOT the object: pynetdicom accumulates every fragment of an incoming
-#: object with no ceiling of its own. Overridable via DICOM(max_object_bytes=...).
+#: Per-object size cap default: it bounds what is persisted, and what is decoded, because it is charged
+#: against the raw received Data Set before decode (see DicomScpSource._raw_over_cap). It does not
+#: bound what one received object costs in memory on its own: pynetdicom holds every fragment of an
+#: object until its last one arrives, and only then does the cap refuse it. What bounds that memory on
+#: the SCP is ``_ReceiptTally``, which ends the association once an object passes twice the SCP's
+#: effective cap (owner ruling B462-R3, vault BACKLOG #2712). max_pdu_size is the fragment size the
+#: SCP offers, NOT a bound on the object; the SCP refuses a PDU longer than it.
+#: Overridable via DICOM(max_object_bytes=...).
 #:
 #: **The SCP never honours more than** :data:`_ENGINE_INGRESS_CEILING_BYTES`, whatever is configured
 #: here (BACKLOG #1910). This default still reaches the outbound SCU unchanged.
@@ -205,21 +218,117 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"
 #: The throttle is the one the socket listeners share (vault BACKLOG #2606), at its defaults.
 _REFUSAL_LOG_WINDOW_SECONDS = REFUSAL_LOG_WINDOW_SECONDS
 
-#: How often a pending inbound TLS handshake looks at whether the listener is stopping. It is a poll
-#: interval, not a bound: the bound is ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant,
-#: imported so the two listeners cannot drift apart. pynetdicom polls its own sockets at 0.5 s too.
-_HANDSHAKE_POLL_SECONDS = 0.5
+#: How often a pending inbound TLS handshake, and a read of a PDU, look at whether the listener is
+#: stopping. It is a poll interval, not a bound. The handshake's bound is
+#: ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant, imported so the two listeners cannot drift
+#: apart. A PDU's is ``timeout_seconds``. pynetdicom polls its own sockets at 0.5 s too.
+_STOP_POLL_SECONDS = 0.5
 
-#: Connections that may be inside their inbound TLS handshake at once: on one SCP, and from one peer
-#: address. The handshake runs on the connection's own thread, so these are what bound how many such
-#: threads exist. A connection over either is closed before a thread is started. They are the MLLP
-#: listener's two shipped connection caps, read from it so the numbers cannot drift apart; its
-#: constants say why 256 and why an eighth of it. Here they count a connection only while it is in
-#: its handshake. Constants, not settings, for the reason ``_TLS_HANDSHAKE_TIMEOUT`` gives. A
-#: handshake takes milliseconds, so senders that share one address behind a NAT do not meet the
-#: per-address number in normal use.
-_MAX_PENDING_HANDSHAKES = DEFAULT_MAX_CONNECTIONS
-_MAX_PENDING_HANDSHAKES_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
+#: Connections that may have no association yet, at once: on one SCP, and from one peer address. A
+#: connection counts from accept until its association has started: through the TLS handshake, any
+#: association-rate wait, and the read of its association request. All of that runs on the
+#: connection's own thread, so these are what bound how many such threads exist. A connection over
+#: either is closed before a thread is started. They are the MLLP listener's two shipped connection
+#: caps, read from it so the numbers cannot drift apart; its constants say why 256 and why an eighth
+#: of it. Here they count a connection only until its association starts, and from then on
+#: ``max_associations`` counts it. Constants, not settings, for the reason
+#: ``_TLS_HANDSHAKE_TIMEOUT`` gives. An SCU sends its request as soon as it connects, so senders that
+#: share one address behind a NAT do not meet the per-address number in normal use.
+_MAX_PENDING_CONNECTIONS = DEFAULT_MAX_CONNECTIONS
+_MAX_PENDING_CONNECTIONS_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
+
+#: The fixed head of every DICOM PDU (PS3.8 section 9.3): type, a reserved byte, a 4-byte length.
+_PDU_HEADER_BYTES = 6
+#: The PDU type of an A-ASSOCIATE-RQ, the only PDU a peer may open with (PS3.8 section 9.2).
+_PDU_TYPE_ASSOCIATE_RQ = 0x01
+#: The protocol version bit an A-ASSOCIATE-RQ must set (PS3.8 section 9.3.2). Each bit of the field
+#: names one version, and a receiver that implements only version 1 tests only bit 0, so a request
+#: that also sets other bits is a version-1 request.
+_PROTOCOL_VERSION = 0x0001
+#: Where that two-byte field sits in an A-ASSOCIATE-RQ, header included (PS3.8 Table 9-11).
+_PROTOCOL_VERSION_OFFSET = 6
+#: The PDU type of a P-DATA-TF, the PDU that carries the fragments of a DIMSE message (PS3.8 section
+#: 9.3.5). Its declared length is the length of its variable field, which is what ``max_pdu_size``
+#: bounds (PS3.8 Annex D.1).
+_PDU_TYPE_P_DATA_TF = 0x04
+#: The PDU types PS3.8 defines. pynetdicom reads the body of each of these. A PDU of any other type
+#: it answers as an invalid PDU without reading its body.
+_PDU_TYPES = frozenset(range(0x01, 0x08))
+
+#: The most the SCP reads for one association request. PS3.8 sets no limit, and the PDU's length field
+#: can announce 4 GiB. A request names at most 128 presentation contexts, since their IDs are odd
+#: numbers in one byte. At 64-byte UIDs and 20 transfer syntaxes each, which is a choice here and not
+#: a limit in the standard, that is about 190 KiB, so this leaves room for the user information
+#: items. A larger request is legal in the format and is closed. Each connection this reads for is
+#: capped, so the memory it can hold is bounded too. This also bounds the decode, which is not cheap:
+#: pynetdicom's decoder runs twice on a request that passes, and it logs for each UID it dislikes.
+_MAX_ASSOCIATE_RQ_BYTES = 256 * 1024
+
+#: The A-ASSOCIATE-RJ (result, source, diagnostic) the SCP answers a whole request it decoded and
+#: refuses before the association starts (PS3.8 section 9.3.4). Both are rejected-permanent, because
+#: the same request is refused again. One with the wrong protocol version is the ACSE's "protocol
+#: version not supported", the answer pynetdicom's DUL gives it. One the association could not
+#: negotiate is the service user's, with no reason given, the answer pynetdicom gives a rejection of
+#: its own. A request that does not decode is an invalid PDU, so it gets the A-ABORT the DUL's state
+#: table gives one in Sta2 (Evt19, AA-1), with source and reason 0, as pynetdicom sends it.
+_RJ_WRONG_PROTOCOL = (0x01, 0x02, 0x02)
+_RJ_DOES_NOT_NEGOTIATE = (0x01, 0x01, 0x01)
+
+#: The A-ABORT (source, reason) the SCP sends when it ends a started association itself (PS3.8
+#: section 9.3.8). A PDU longer than the SCP takes is the service provider's invalid PDU parameter
+#: value. A P-DATA-TF whose items or message pynetdicom would fail on gets what pynetdicom's own
+#: AA-8 sends an invalid PDU: the service provider, no reason. An object past twice the object cap,
+#: and a command set past its bound, are the SCP's own limits, so the source is the service user,
+#: with no reason, as pynetdicom's own ``Association.abort()`` sends.
+_ABORT_PDU_TOO_LONG = (0x02, 0x06)
+_ABORT_INVALID_MESSAGE = (0x02, 0x00)
+_ABORT_OVER_LIMIT = (0x00, 0x00)
+
+#: The most of one DIMSE message's command set the SCP takes. pynetdicom holds a command set's
+#: fragments until the message is complete, as it holds a data set's. A real one is a few hundred
+#: bytes: it names a SOP class and instance and a few small fields. Past this the association is
+#: ended, as an object past twice its cap is.
+_MAX_COMMAND_SET_BYTES = 64 * 1024
+
+#: The longest a send of an answer the SCP writes itself may take: an A-ASSOCIATE-RJ or A-ABORT from
+#: the connection's thread before an association starts, and an A-ABORT that ends one. Each is under
+#: a hundred bytes, which any socket send buffer takes at once, so only a peer that has stopped
+#: reading meets this. ``timeout_seconds`` bounds the association's own sends instead, and once one
+#: of those notices a stop, it has this long more. A send looks for a stop at least every
+#: :data:`_STOP_POLL_SECONDS`, so a stop waits on a send for this plus that, 1.5 seconds, at most.
+_ANSWER_SEND_SECONDS = 1.0
+
+#: The least and the most ``max_pdu_size`` the SCP takes. pynetdicom fragments an object into PDVs
+#: of six bytes less than the size a peer offers, so a size of six or less breaks its senders, and
+#: 4096 is DCMTK's own least. The most bounds what one read holds before the SCP has counted any of
+#: it, since a PDU's body is read whole: a 4 GiB size would let a single PDU carry far past twice the
+#: object cap. 1 MiB is 64 times the shipped 16 KiB.
+_MIN_PDU_SIZE = 4096
+_MAX_PDU_SIZE = 1024 * 1024
+
+#: Why the SCP refuses to run, and refuses each connection, while pynetdicom's process-wide
+#: ``STORE_RECV_CHUNKED_DATASET`` is set. With it set, pynetdicom writes each object it receives to
+#: a temporary file, in plaintext and outside the store and its encryption, and that file is not on
+#: any list of where PHI rests (docs/PHI.md).
+_CHUNKED_RECEIPT_REFUSAL = (
+    "pynetdicom's STORE_RECV_CHUNKED_DATASET is set, which would write each received object to a "
+    "plaintext temporary file"
+)
+
+#: The least ``timeout_seconds`` the SCP takes. It is a fixed deadline on every read and send, so a
+#: tiny one, such as a typo of 0.001, would end nearly every peer while looking like a working value.
+#: One second is a floor against that, not a recommendation: the shipped 30 is what a real sender is
+#: sized for.
+_MIN_TIMEOUT_SECONDS = 1.0
+
+#: The most a closing connection reads and throws away, so that its close is not over unread data.
+#: See :func:`_drain_readable`. A peer that has sent more than this gets a reset, as it did before.
+_DRAIN_BYTES = 64 * 1024
+
+#: The DUL states (PS3.8 section 9.2) in which ``_AdmittedSocket.ready`` does not read: awaiting the
+#: request and awaiting the local answer to it, and closing.
+_STATES_BEFORE_THE_ANSWER = frozenset({"Sta2", "Sta3"})
+_STATE_CLOSING = "Sta13"
 
 #: The most refusal lines one SCP writes per window over every address together. The per-address
 #: bound alone would still let many addresses earn a line each.
@@ -241,11 +350,224 @@ _NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
 _HUNG_UP = (*HUNG_UP, ssl.SSLEOFError, ConnectionAbortedError)
 
 
+class _RefusedPeer(Exception):
+    """A peer did not deliver an association request the SCP will read. The message is the reason
+    the refusal line gives, so it never holds a byte the peer sent."""
+
+
 def _address_host(client_address: Any) -> str:
     """The host part of a socket peer address, as ``accept()`` returns it. ``"?"`` when there is none."""
     if isinstance(client_address, tuple) and client_address:
         return str(client_address[0])
     return "?"
+
+
+def _drain_readable(sock: socket.socket) -> None:
+    """Read and throw away what the peer has already sent, without waiting for more, before the SCP
+    closes the connection.
+
+    A close over unread data resets the connection, and the peer's stack can then drop an answer
+    the SCP has just sent, before the peer reads it. Measured on Windows loopback: a request with
+    one stray byte behind it got a reset and no A-ASSOCIATE-RJ, 25 times in 25. This stops at the
+    end of what has arrived, at the peer's close, at an error, or at :data:`_DRAIN_BYTES`. It never
+    waits, so a peer that stalls part way through a PDU cannot hold the closing thread. The socket
+    is left non-blocking, which is fine for one that is about to be closed."""
+    left = _DRAIN_BYTES
+    try:
+        sock.settimeout(0.0)
+        while left > 0:
+            chunk = sock.recv(left)
+            if not chunk:
+                return
+            left -= len(chunk)
+    except (BlockingIOError, ssl.SSLWantReadError):  # nothing more has arrived
+        return
+    except OSError as exc:  # a reset or a TLS error: the close goes ahead regardless
+        logger.debug("Draining a closing DICOM connection ended: %s", safe_exc(exc))
+
+
+#: The DIMSE commands the SCP serves (PS3.7 Annex E): C-STORE-RQ and C-ECHO-RQ. pynetdicom queues
+#: each of these for the Association thread, which serves one at a time. It serves some others on a
+#: thread of their own, an N-EVENT-REPORT-RQ for one, and so outside the hold ``ready`` puts on a
+#: waiting message; and it logs each response it was not waiting for. So any other command ends the
+#: association.
+_SERVED_COMMANDS = frozenset({0x0001, 0x0030})
+
+
+def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
+    """A whole command set read as pynetdicom reads it: its ``CommandField``, whether the message is
+    complete without a data set, and whether pynetdicom would serve it as a request. ``None`` when
+    pynetdicom would fail on it.
+
+    ``DIMSEMessage.decode_msg`` decodes the command set with ``dsutils.decode``, implicit VR little
+    endian, looks its ``CommandField`` up in ``_MESSAGE_TYPES``, and compares its
+    ``CommandDataSetType`` to 0x0101. Once the message is whole, ``message_to_primitive`` sets each
+    element on the command's primitive, whose setters refuse some values, and
+    ``Association._serve_request`` serves it only if ``is_valid_request`` holds. These are the same
+    steps, on a message built the same way. A raise in the first three happens on the DUL thread
+    there and kills it with a traceback, and one in ``message_to_primitive`` is logged at ERROR with
+    a traceback, so here either is a reason to end the association instead. A request that is not
+    valid gets no response there, only a WARNING, and the association goes on, so a peer could
+    stream such requests; the caller ends the association on one.
+
+    Running ``message_to_primitive`` here means pynetdicom's own log lines from it are written here
+    first, and then again when pynetdicom runs it on the whole message. At least these: a setter that
+    refuses a UID logs it at ERROR before it raises; one that finds a UID non-conformant logs a
+    WARNING and does not raise; the Move Originator AE title setter logs an ERROR and does not raise;
+    and ``message_to_primitive`` itself logs a WARNING for an element with more than one value. Some
+    of those lines name the peer's UID value. They are left as they are."""
+    from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
+    from pynetdicom.dsutils import decode
+
+    try:
+        command = decode(BytesIO(command_set), True, True)
+        message = DIMSEMessage()
+        message.command_set = command
+        field = int(command.CommandField)
+        message.__class__ = _MESSAGE_TYPES[field][1]
+        completes = bool(command.CommandDataSetType == 0x0101)
+        # C_CANCEL has no is_valid_request; it is not a served command, so the caller ends it as one.
+        valid = bool(getattr(message.message_to_primitive(), "is_valid_request", False))
+    except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
+        logger.debug("A DICOM command set did not decode: %s", safe_exc(exc))
+        return None
+    return field, completes, valid
+
+
+def _chunked_receipt_on() -> bool:
+    """Whether pynetdicom's process-wide ``STORE_RECV_CHUNKED_DATASET`` is set; see
+    :data:`_CHUNKED_RECEIPT_REFUSAL`. It is read again at each command, since anything in the
+    process could set it while an association is open."""
+    from pynetdicom import _config
+
+    return bool(_config.STORE_RECV_CHUNKED_DATASET)
+
+
+class _ReceiptTally:
+    """What one association has received of the DIMSE message in progress, counted as the P-DATA-TF
+    PDUs are read and before pynetdicom sees them (owner ruling B462-R3, vault BACKLOG #2712).
+
+    pynetdicom holds every fragment of a message until the message is complete, with no ceiling of
+    its own. Its ``max_object_bytes`` check runs only then, so without this a peer could send an
+    object of any size, and the SCP would hold it all before refusing it. This counts from the same
+    PDUs, in the same order, so it sees what pynetdicom will hold.
+
+    A message is its command set's fragments, then, when the command says one follows, its data
+    set's fragments (PS3.8 Annex E.2). The count starts again where pynetdicom starts a new message:
+    at a data set's last fragment, and at a command set's last fragment when the command says no
+    data set follows. So a run of objects under the cap is never counted together, however long the
+    association.
+
+    Each item is split where ``pdu.P_DATA_TF._generate_items`` splits it, and each fragment counts
+    what ``DIMSEMessage.decode_msg`` holds of it, all but its control byte. A shape pynetdicom would
+    fail on, take out of that order, or serve outside the hold ``ready`` puts on a waiting message,
+    ends the association instead of reaching it. At least these: an item too short for its length,
+    context and control byte, or longer than the PDU holds; a command set that does not decode, or
+    whose values pynetdicom refuses; a command the SCP does not serve; a request that lacks a field
+    pynetdicom needs to serve it, which it would answer with nothing; a second command set in one
+    message; a data set fragment before its command set is whole; and anything in a PDU after the
+    item that completes a message, which pynetdicom drops unread. pynetdicom would log each at ERROR
+    with a traceback, or lose its DUL thread to it, or count it apart from what is counted here. The
+    fragments are read through a ``memoryview``, so counting one copies nothing."""
+
+    def __init__(self, *, max_data_set_bytes: int) -> None:
+        #: Past this the association is ended: twice the SCP's effective ``max_object_bytes``.
+        self.max_data_set_bytes = max_data_set_bytes
+        #: The data set bytes of the message in progress.
+        self.data_set_bytes = 0
+        #: The command set of the message in progress, kept whole so that its last fragment can be
+        #: read. It is bounded by :data:`_MAX_COMMAND_SET_BYTES`.
+        self.command_set = bytearray()
+        #: Whether the command set's last fragment has arrived, saying a data set follows.
+        self.command_whole = False
+        #: Whether an item of the PDU being counted completed a message.
+        self.completed = False
+
+    def take(self, body: bytes | bytearray) -> tuple[tuple[int, int], str] | None:
+        """Count one P-DATA-TF's variable field. Returns the A-ABORT (source, reason) to end the
+        association with, and why, or ``None`` when the PDU may go to pynetdicom."""
+        view = memoryview(body)
+        offset, size = 0, len(view)
+        self.completed = False
+        while offset < size:
+            if self.completed:
+                return _ABORT_INVALID_MESSAGE, "a P-DATA-TF goes on past a message's last fragment"
+            start = offset + 5  # the item length and the context ID come first
+            end = offset + 4 + int.from_bytes(view[offset : offset + 4], "big")
+            if start >= end or end > size:
+                return _ABORT_INVALID_MESSAGE, "a P-DATA-TF item does not decode"
+            control, fragment = view[start], view[start + 1 : end]
+            offset = end
+            if control & 0x01:
+                ended = self._take_command(fragment, last=bool(control & 0x02))
+            else:
+                ended = self._take_data(fragment, last=bool(control & 0x02))
+            if ended is not None:
+                return ended
+        return None
+
+    def _take_command(
+        self, fragment: memoryview, *, last: bool
+    ) -> tuple[tuple[int, int], str] | None:
+        if self.command_whole:
+            return _ABORT_INVALID_MESSAGE, "a second command set in one message"
+        self.command_set += fragment
+        if len(self.command_set) > _MAX_COMMAND_SET_BYTES:
+            return _ABORT_OVER_LIMIT, f"a command set passed {_MAX_COMMAND_SET_BYTES} bytes"
+        if not last:
+            return None
+        if _chunked_receipt_on():
+            return _ABORT_OVER_LIMIT, _CHUNKED_RECEIPT_REFUSAL
+        read = _read_command_set(bytes(self.command_set))
+        if read is None:
+            return _ABORT_INVALID_MESSAGE, "a command set does not decode"
+        field, completes, valid = read
+        if field not in _SERVED_COMMANDS:
+            return _ABORT_INVALID_MESSAGE, "a command the SCP does not serve"
+        if not valid:
+            return _ABORT_INVALID_MESSAGE, "a request that lacks a field it must carry"
+        if completes:
+            self._next_message()
+        else:
+            self.command_whole = True
+        return None
+
+    def _take_data(self, fragment: memoryview, *, last: bool) -> tuple[tuple[int, int], str] | None:
+        if not self.command_whole:
+            return _ABORT_INVALID_MESSAGE, "a data set fragment came before its command set"
+        self.data_set_bytes += len(fragment)
+        if self.data_set_bytes > self.max_data_set_bytes:
+            return _ABORT_OVER_LIMIT, (
+                f"an object passed {self.max_data_set_bytes} bytes, twice the SCP's effective "
+                "max_object_bytes"
+            )
+        if last:
+            self._next_message()
+        return None
+
+    def _next_message(self) -> None:
+        self.data_set_bytes = 0
+        self.command_set.clear()
+        self.command_whole = False
+        self.completed = True
+
+
+def _require_association_seams(handler: type[Any], association_socket: type[Any]) -> None:
+    """Refuse a pynetdicom without the private names :func:`_admitting_server_class` builds on.
+
+    An install that got round the pin could bring another release. With these gone the SCP would
+    start and then fail every connection, with nothing above stderr to say why, so it does not."""
+    own = vars(association_socket)
+    present = (
+        callable(getattr(handler, "_create_association", None))
+        and isinstance(own.get("ready"), property)
+        and all(callable(own.get(name)) for name in ("recv", "send", "close", "_shutdown_socket"))
+    )
+    if not present:
+        raise RuntimeError(
+            "the installed pynetdicom does not have the association hooks the DICOM server (SCP) "
+            "reads a connection's first request through; refusing to start the SCP with it"
+        )
 
 
 def _require_socketserver_routing(stock: type[Any]) -> None:
@@ -281,12 +603,11 @@ def _admitting_server_class() -> type[Any]:
     moved ahead of the first read (vault BACKLOG #2583). Built on first use, because pynetdicom is the
     optional ``[dicom]`` extra and is never imported at module top.
 
-    **Read against pynetdicom 3.0.4 and CPython's ``socketserver``; re-read both before raising the
-    pynetdicom cap in the ``[dicom]`` extra.** ``pyproject.toml`` holds that cap at the release line
-    this was read against, so a later line is stopped at install time. A patch release of the same
-    line can still arrive unread. The comment above the extra there gives the bound and the steps to
-    raise it. :func:`_require_socketserver_routing` refuses a pynetdicom that left this routing, and
-    ``tests/test_dicom_scp_admission.py`` pins the rest.
+    **Read against pynetdicom 3.0.4 and CPython's ``socketserver``; re-read both before moving the
+    pynetdicom pin in the ``[dicom]`` extra.** ``pyproject.toml`` pins the release this was read
+    against, so any other is stopped at install time. The comment above the extra there gives the
+    steps to move it. :func:`_require_socketserver_routing` refuses a pynetdicom that left this
+    routing, and ``tests/test_dicom_scp_admission.py`` pins the rest.
 
     * ``AssociationServer.get_request`` accepts a connection and, on a TLS listener, runs the TLS
       handshake in the same call. That call is on the accept loop, and the accepted socket has no
@@ -297,21 +618,47 @@ def _admitting_server_class() -> type[Any]:
       where the peer address is checked, so a peer outside ``source_ip_allowlist`` is closed before
       an association thread exists for it and before a byte is read from it.
     * ``ThreadingMixIn.process_request`` starts the connection's thread, still on the accept loop.
-      On a TLS listener the connection takes a handshake slot first, counted per listener and per
-      peer address against :data:`_MAX_PENDING_HANDSHAKES` and
-      :data:`_MAX_PENDING_HANDSHAKES_PER_HOST`. One over either is closed with no thread started.
+      The connection takes a slot first, on a cleartext listener as on a TLS one, counted per
+      listener and per peer address against :data:`_MAX_PENDING_CONNECTIONS` and
+      :data:`_MAX_PENDING_CONNECTIONS_PER_HOST`. One over either is closed with no thread started.
     * ``ThreadedAssociationServer.process_request_thread`` runs on the connection's own thread. The
       handshake runs there, against a deadline of ``_TLS_HANDSHAKE_TIMEOUT`` for the whole handshake.
       A peer that sends nothing, and one that sends its handshake slowly, are both dropped at it.
-      The slot is given back in a ``finally`` there, however the handshake ends.
+      The slot is given back in a ``finally`` there, because that thread's work ends when the
+      association has started: ``RequestHandler.handle`` returns right after ``assoc.start()``.
+    * ``RequestHandler.handle`` is replaced so that the association request is read BEFORE the
+      ``Association`` thread starts. pynetdicom reads a connection on the association's DUL thread,
+      in a loop of blocking ``recv`` calls on a socket with no timeout. That thread cannot reach
+      its own timers while it is blocked, and ``Association.kill()`` then waits on it for good, so
+      a peer that sent one byte and stopped would never be ended. Every started ``Association``
+      also counts at pynetdicom's ``maximum_associations`` check, so stalled peers could fill it
+      and turn a real sender away. Here the connection's own thread reads the first PDU under a
+      fixed deadline of ``timeout_seconds``, so a peer that stalls never starts an ``Association``.
+      It cannot use up ``max_associations``, and it costs one thread rather than two.
+    * That read consumes the PDU, and pynetdicom must still see it. ``_create_association`` names
+      ``AssociationSocket`` itself and ``Association.set_socket`` refuses a second socket, so the
+      socket it made is turned into an ``_AdmittedSocket``. A wrapper around the ``socket`` would
+      lose the ``ssl.SSLSocket`` check in ``AssociationSocket.ready``, and with it ``pending()``.
+    * The same socket bounds the DUL thread from there on, so it cannot block for good after the
+      association has started either. A later read, and a whole send, each have a fixed deadline.
+      It also reads each PDU's body with its header, so that a PDU longer than the SCP offered, and
+      an object past twice the object cap, end the association before pynetdicom holds them, and it
+      reads nothing while a whole message waits on pynetdicom's queue.
+      It also holds off reading while the request is unanswered, so a stray byte behind a whole
+      request cannot delay the ``maximum_associations`` check.
     * ``AE.start_server`` cannot start this class: its non-blocking branch names
       ``ThreadedAssociationServer`` itself. ``AE.make_server`` takes ``server_class`` and passes extra
       keywords to its constructor, and ``start_serving`` here does the rest of what that branch does.
     """
-    from pynetdicom.transport import ThreadedAssociationServer
+    from pynetdicom import _config, evt
+    from pynetdicom.pdu import A_ABORT_RQ, A_ASSOCIATE_RJ, A_ASSOCIATE_RQ
+    from pynetdicom.pdu_primitives import A_ASSOCIATE, SCP_SCU_RoleSelectionNegotiation
+    from pynetdicom.presentation import negotiate_as_acceptor, negotiate_unrestricted
+    from pynetdicom.transport import AssociationSocket, RequestHandler, ThreadedAssociationServer
     from pynetdicom.utils import make_target
 
     _require_socketserver_routing(ThreadedAssociationServer)
+    _require_association_seams(RequestHandler, AssociationSocket)
 
     class _AdmittingAssociationServer(ThreadedAssociationServer):
         def __init__(
@@ -319,23 +666,37 @@ def _admitting_server_class() -> type[Any]:
             *args: Any,
             admit: Callable[[Any], bool],
             refused: Callable[[str, str, str], None],
+            ended: Callable[[str, str], None],
             handshake_failed: Callable[[str, str], None],
             stopping: threading.Event,
+            max_pdu_size: int,
+            max_object_bytes: int,
             **kwargs: Any,
         ) -> None:
+            #: The longest P-DATA-TF variable field the SCP offers to take, and so takes.
+            self.max_pdu_size = max_pdu_size
+            #: The SCP's effective object cap. An association whose object passes twice this is
+            #: ended (owner ruling B462-R3).
+            self.max_object_bytes = max_object_bytes
             self._admit = admit
             self._refused = refused
+            #: Called on the DUL thread with the peer address and the reason, when a read of an
+            #: association that has started runs out its deadline. It is not a refusal: the SCP
+            #: accepted that association and may have taken objects on it.
+            self._ended = ended
             #: Called on the connection's thread with the peer address and the cause, for each
             #: handshake :meth:`_handshake` counts as failed (vault BACKLOG #3784).
             self._handshake_failed = handshake_failed
             #: The SCP's own stop signal, set before it calls shutdown(). shutdown() joins every
             #: connection thread, so a thread inside a handshake has to see this to end early.
             self._stopping = stopping
-            #: Handshakes in flight per peer address. Its values sum to the listener's total.
+            #: Connections with no association yet, per peer address. Its values sum to the
+            #: listener's total.
             self._pending: dict[str, int] = {}
             self._pending_lock = threading.Lock()
             #: When the next admission-check fault may be logged (monotonic). See verify_request.
             self._gate_fault_log_after = 0.0
+            kwargs["request_handler"] = _AdmittingRequestHandler
             super().__init__(*args, **kwargs)
 
         def start_serving(self) -> None:
@@ -375,13 +736,10 @@ def _admitting_server_class() -> type[Any]:
                 return False
 
         def process_request(self, request: Any, client_address: Any) -> None:
-            # On the accept loop, for a connection verify_request admitted. A TLS connection takes
-            # its handshake slot here, so one over a cap is closed before a thread exists for it.
-            if self.ssl_context is None:
-                super().process_request(request, client_address)
-                return
+            # On the accept loop, for a connection verify_request admitted. It takes its slot here,
+            # so one over a cap is closed before a thread exists for it.
             host = _address_host(client_address)
-            full = self._take_handshake_slot(host)
+            full = self._take_slot(host)
             if full is not None:
                 try:
                     self._refused(host, "a connection", full)
@@ -391,43 +749,355 @@ def _admitting_server_class() -> type[Any]:
             try:
                 super().process_request(request, client_address)
             except BaseException:
-                self._release_handshake_slot(host)  # no thread was started to give it back
+                self._release_slot(host)  # no thread was started to give it back
                 raise
 
         def process_request_thread(self, request: Any, client_address: Any) -> None:
-            context = self.ssl_context
-            if context is not None:
-                host = _address_host(client_address)
-                try:
+            host = _address_host(client_address)
+            try:
+                context = self.ssl_context
+                if context is not None:
                     request = self._handshake(context, request, host)
-                finally:
-                    self._release_handshake_slot(host)
-                if request is None:
-                    return
-            super().process_request_thread(request, client_address)
+                    if request is None:
+                        return
+                # Returns once the association's own thread has started, or the connection has
+                # ended. From there pynetdicom's maximum_associations counts it.
+                super().process_request_thread(request, client_address)
+            finally:
+                self._release_slot(host)
 
-        def _take_handshake_slot(self, host: str) -> str | None:
-            """Count one more handshake in flight for ``host``. Returns ``None`` when the slot is
-            taken, else the reason there is none, and then nothing was counted."""
+        def _take_slot(self, host: str) -> str | None:
+            """Count one more connection with no association yet for ``host``. Returns ``None`` when
+            the slot is taken, else the reason there is none, and then nothing was counted."""
             with self._pending_lock:
-                if sum(self._pending.values()) >= _MAX_PENDING_HANDSHAKES:
-                    return f"{_MAX_PENDING_HANDSHAKES} TLS handshakes are already in progress"
-                held = self._pending.get(host, 0)
-                if held >= _MAX_PENDING_HANDSHAKES_PER_HOST:
+                if sum(self._pending.values()) >= _MAX_PENDING_CONNECTIONS:
                     return (
-                        f"{_MAX_PENDING_HANDSHAKES_PER_HOST} TLS handshakes from this address "
-                        "are already in progress"
+                        f"{_MAX_PENDING_CONNECTIONS} connections with no association yet are "
+                        "already in progress"
+                    )
+                held = self._pending.get(host, 0)
+                if held >= _MAX_PENDING_CONNECTIONS_PER_HOST:
+                    return (
+                        f"{_MAX_PENDING_CONNECTIONS_PER_HOST} connections from this address with "
+                        "no association yet are already in progress"
                     )
                 self._pending[host] = held + 1
                 return None
 
-        def _release_handshake_slot(self, host: str) -> None:
+        def _release_slot(self, host: str) -> None:
             with self._pending_lock:
                 held = self._pending[host] - 1
                 if held:
                     self._pending[host] = held
                 else:
-                    del self._pending[host]  # so the table holds only addresses in a handshake
+                    del self._pending[host]  # so the table holds only addresses still pending
+
+        def read_association_request(self, sock: socket.socket, host: str) -> bytes | None:
+            """Read the connection's first PDU, on the connection's own thread. Returns it, with the
+            socket's own timeout restored, or ``None`` when no association should start.
+
+            A peer that closes, and a stop, are ordinary ends and leave a DEBUG line. A peer that
+            runs out the deadline, or opens with anything but an association request the SCP will
+            read, is logged as a refusal, throttled per address."""
+            try:
+                first_pdu = self._read_first_pdu(sock)
+                self._check_association_request(sock, first_pdu)
+                # A request that sets bit 0 and other version bits as well is a version-1 request,
+                # but pynetdicom's AE-6 compares the whole field to 1 and would reject it. So the
+                # copy pynetdicom reads names version 1 alone. Nothing else in it changes.
+                at = _PROTOCOL_VERSION_OFFSET
+                return first_pdu[:at] + _PROTOCOL_VERSION.to_bytes(2, "big") + first_pdu[at + 2 :]
+            except _RefusedPeer as exc:
+                self._refused(host, "a connection", str(exc))
+            except OSError as exc:  # a timeout errno, a reset and an ssl.SSLError are all OSError
+                logger.debug("DICOM peer %s sent no association request: %s", host, safe_exc(exc))
+            return None
+
+        def _read_first_pdu(self, sock: socket.socket) -> bytes:
+            """Read one whole PDU within the deadline, however slowly the peer sends it.
+
+            The bound is a fixed monotonic deadline for the whole PDU, not an idle timer, because a
+            byte would restart an idle timer. The first byte is read alone, so a peer that is not
+            speaking DICOM is closed at once. It asks for no more than the PDU needs, so nothing
+            the association will read next is taken here."""
+            restore = sock.gettimeout()  # None: accept() returns a blocking socket
+            seconds = cast(float, self.ae.acse_timeout)
+            deadline = time.monotonic() + seconds
+            expired = _RefusedPeer(f"no complete association request within {seconds:g}s")
+
+            pdu = self._read_exactly(sock, 1, deadline, expired)
+            if pdu[0] != _PDU_TYPE_ASSOCIATE_RQ:
+                raise _RefusedPeer("its first PDU is not an association request")
+            pdu += self._read_exactly(sock, _PDU_HEADER_BYTES - 1, deadline, expired)
+            body = int.from_bytes(pdu[2:], "big")
+            if _PDU_HEADER_BYTES + body > _MAX_ASSOCIATE_RQ_BYTES:
+                raise _RefusedPeer(
+                    f"its association request is over {_MAX_ASSOCIATE_RQ_BYTES} bytes"
+                )
+            pdu += self._read_exactly(sock, body, deadline, expired)
+            if self._stopping.is_set():  # finished after the stop began: start no association
+                raise OSError("the listener is stopping")
+            sock.settimeout(restore)
+            return bytes(pdu)
+
+        def read_for_association(self, sock: socket.socket, count: int, host: str) -> bytearray:
+            """One read of a started association, within ``timeout_seconds`` however slowly the
+            peer sends it. Short where the peer closed, as ``AssociationSocket.recv`` is, and empty
+            where the deadline passed, the read failed or the listener is stopping.
+
+            ``_AdmittedSocket._read_pdu`` reads a PDU's header and then its body, so each of those
+            has the deadline. The DUL takes a short read as a closed connection, and that ends the
+            connection the normal way. A raise would too, but pynetdicom logs each one at ERROR
+            with a traceback, and a peer could repeat that as often as it could connect. So the end
+            goes through a throttled line of its own instead, apart from the refusals: the SCP
+            accepted this association, so it is not a refused connection, and it must not use up an
+            address's refusal line. ``_read_pdu`` hands the DUL an empty header for a short body,
+            so either short read is silent in the DUL. It is a deadline per read and not per
+            object. **A peer that keeps a message incomplete, finishing a small fragment's PDU
+            inside each deadline, is not bounded by this, by :class:`_ReceiptTally`, or by
+            pynetdicom's timers**: each PDU restarts pynetdicom's idle timer, and the tally ends
+            only on size. Such a peer holds a ``max_associations`` slot for as long as it keeps
+            sending, and enough of them fill it. No per-message deadline is built here."""
+            seconds = cast(float, self.ae.network_timeout)
+            expired = _RefusedPeer(f"no complete PDU within {seconds:g}s")
+            restore = sock.gettimeout()  # None: pynetdicom reads a blocking socket
+            try:
+                return self._read_up_to(sock, count, time.monotonic() + seconds, expired)
+            except _RefusedPeer as exc:
+                self._ended(host, str(exc))
+            except OSError as exc:  # a timeout errno, a reset and an ssl.SSLError are all OSError
+                logger.debug("A read from DICOM peer %s ended: %s", host, safe_exc(exc))
+            finally:
+                with contextlib.suppress(OSError):  # the association may have closed it
+                    sock.settimeout(restore)
+            return bytearray()
+
+        def _read_exactly(
+            self, sock: socket.socket, count: int, deadline: float, expired: Exception
+        ) -> bytearray:
+            """Read ``count`` bytes before ``deadline``, or raise."""
+            received = self._read_up_to(sock, count, deadline, expired)
+            if len(received) < count:
+                raise ConnectionResetError("the peer closed the connection")
+            return received
+
+        def _read_up_to(
+            self, sock: socket.socket, count: int, deadline: float, expired: Exception
+        ) -> bytearray:
+            """Read ``count`` bytes before ``deadline``, or fewer if the peer closes first. Raises
+            ``expired`` when the deadline passes. A read asks for 4096 bytes at most, as pynetdicom's
+            own does."""
+            received = bytearray()
+            while len(received) < count:
+                recv = functools.partial(sock.recv, min(count - len(received), 4096))
+                chunk: bytes = self._in_slices(sock, recv, deadline, expired)
+                if not chunk:
+                    break
+                received += chunk
+            return received
+
+        def _in_slices(
+            self,
+            sock: socket.socket,
+            step: Callable[[], Any],
+            deadline: float,
+            expired: Exception,
+            *,
+            on_stop: Callable[[], float] | None = None,
+        ) -> Any:
+            """Run one socket ``step`` against ``deadline`` and return what it returns, or raise
+            ``expired`` when the deadline passes.
+
+            The step runs in slices of :data:`_STOP_POLL_SECONDS`, so that a stop is noticed without
+            closing a socket under the thread that is reading it. A slice that ends with nothing to
+            read raises a ``TimeoutError`` that carries no ``errno`` and leaves the socket, and any
+            TLS state on it, as it was, so the next slice takes the step up again. A ``TimeoutError``
+            that does carry one is the connection itself timing out, and ends the step.
+
+            A stop ends the step at once, or, given ``on_stop``, at the time it returns, if that is
+            sooner than ``deadline``.
+
+            The timeout is set only when it changes: at most once per read, and then on each slice
+            within the last slice's length of the deadline. Setting it is a system call."""
+            while True:
+                if self._stopping.is_set():
+                    stop_end = time.monotonic() if on_stop is None else on_stop()
+                    if time.monotonic() >= stop_end:
+                        raise OSError("the listener is stopping")
+                    deadline = min(deadline, stop_end)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise expired
+                slice_seconds = min(remaining, _STOP_POLL_SECONDS)
+                if sock.gettimeout() != slice_seconds:
+                    sock.settimeout(slice_seconds)
+                try:
+                    return step()
+                except TimeoutError as exc:
+                    if exc.errno is not None:
+                        raise
+
+        def _check_association_request(self, sock: socket.socket, first_pdu: bytes) -> None:
+            """Refuse a request the association would not be given, or could not negotiate.
+
+            The DUL decodes the PDU, builds its primitive and checks the protocol version, and it
+            gives the association nothing unless all three pass. The version check here tests bit
+            0 alone, as PS3.8 section 9.3.2 says; the DUL compares the whole field, so
+            :meth:`read_association_request` hands it a copy that names version 1. The ``Association`` thread then
+            waits out ``timeout_seconds`` with its socket already closed, and it counts against
+            ``max_associations`` all that time. Nothing caps that once the association has started,
+            so a peer repeating such a request could go round the slots. These are the same three
+            steps, so a request that passes here is one the association will be given.
+
+            Then this runs the presentation-context negotiation the association runs, the same
+            pynetdicom function on the same contexts and roles, and refuses a request it raises on.
+            A raise there kills the ``Association`` thread, and each one writes an unthrottled
+            CRITICAL line under ``serve``. At least a context with no transfer syntax, and one with
+            no abstract syntax, raise there. Running the step itself, rather than listing the
+            shapes it fails on, covers whatever else it reads. The rest of the association's
+            negotiation is not run here, so ``_AdmittedSocket.ready`` is what ends a DUL whose
+            ``Association`` thread dies some other way.
+
+            Each of these refusals is a whole request read up to its end, so the peer is answered
+            before the connection closes. The comment above :data:`_RJ_WRONG_PROTOCOL` says what
+            each gets.
+
+            These checks run before ``EVT_REQUESTED``, so a request that fails one gets its answer
+            here even where the AE-title checks, or a paused intake, would have refused it too.
+
+            Both ``except Exception`` clauses wrap a third-party step on a peer's bytes, so what
+            they catch is the peer's to cause and is logged at DEBUG only, since a peer can repeat
+            it as often as it can connect. The refusal itself is the throttled WARNING."""
+            pdu = A_ASSOCIATE_RQ()
+            try:
+                pdu.decode(first_pdu)
+                primitive = pdu.to_primitive()
+            except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
+                logger.debug("DICOM association request did not decode: %s", safe_exc(exc))
+                abort = A_ABORT_RQ()
+                abort.source, abort.reason_diagnostic = 0x00, 0x00
+                self._answer(sock, abort.encode())
+                raise _RefusedPeer("its association request does not decode") from exc
+            if not pdu.protocol_version & _PROTOCOL_VERSION:
+                self._reject(sock, _RJ_WRONG_PROTOCOL)
+                raise _RefusedPeer("its association request has the wrong protocol")
+            negotiate = (
+                negotiate_unrestricted
+                if _config.UNRESTRICTED_STORAGE_SERVICE
+                else negotiate_as_acceptor
+            )
+            try:
+                # The roles as ACSE._negotiate_as_acceptor builds them from the request. Any: the
+                # key is a UID there by a cast, and a peer's item may carry none; the step decides.
+                roles: dict[Any, tuple[bool | None, bool | None]] = {
+                    item.sop_class_uid: (item.scu_role, item.scp_role)
+                    for item in primitive.user_information
+                    if isinstance(item, SCP_SCU_RoleSelectionNegotiation)
+                }
+                negotiate(primitive.presentation_context_definition_list, self.contexts, roles)
+            except Exception as exc:  # noqa: BLE001 - a third-party step on a peer's request
+                logger.debug("DICOM association request did not negotiate: %s", safe_exc(exc))
+                self._reject(sock, _RJ_DOES_NOT_NEGOTIATE)
+                raise _RefusedPeer("its association request does not negotiate") from exc
+
+        def _reject(self, sock: socket.socket, answer: tuple[int, int, int]) -> None:
+            """Answer with an A-ASSOCIATE-RJ of (result, source, diagnostic) ``answer``."""
+            primitive = A_ASSOCIATE()
+            primitive.result, primitive.result_source, primitive.diagnostic = answer
+            self._answer(sock, A_ASSOCIATE_RJ(primitive).encode())
+
+        def _answer(self, sock: socket.socket, pdu: bytes) -> None:
+            """Send ``pdu``, best effort, and then read off what the peer sent behind its request,
+            so that the close that follows does not reset the connection and lose the answer.
+
+            The drain is here, after an answer, and not in ``shutdown_request``: socketserver
+            also calls that on the accept loop for a peer ``source_ip_allowlist`` refuses, and
+            such a peer is closed before a byte is read from it.
+
+            This thread holds a slot, and shutdown() joins it, so its one send has the short bound
+            :data:`_ANSWER_SEND_SECONDS`, a stop included. A peer that does not take the answer
+            in that time gets a closed connection."""
+            try:
+                self._send_before(sock, pdu, time.monotonic() + _ANSWER_SEND_SECONDS)
+            except OSError as exc:  # the bound, a stop, a reset and an ssl.SSLError are all OSError
+                logger.debug("DICOM association answer not sent: %s", safe_exc(exc))
+                return
+            _drain_readable(sock)
+
+        def end_association(
+            self, sock: socket.socket, answer: tuple[int, int], host: str, reason: str
+        ) -> None:
+            """End a started association from the DUL thread: send an A-ABORT of (source, reason)
+            ``answer``, best effort, and log the end. The caller then hands the DUL an empty read,
+            its silent closed connection, and the DUL closes the socket, reading off what has
+            arrived first so that the A-ABORT is not lost to a reset. A peer that has sent more than
+            that can still get a reset in its place.
+
+            The line is the one a read deadline gets, :meth:`DicomScpSource._log_ended_association`,
+            throttled per address. ``reason`` names the limit, never a byte or a number the peer
+            sent."""
+            self._ended(host, reason)
+            abort = A_ABORT_RQ()
+            abort.source, abort.reason_diagnostic = answer
+            try:
+                self._send_before(sock, abort.encode(), time.monotonic() + _ANSWER_SEND_SECONDS)
+            except OSError as exc:
+                logger.debug("DICOM A-ABORT to %s not sent: %s", host, safe_exc(exc))
+
+        def send_for_association(self, sock: socket.socket, data: bytes, host: str) -> bool:
+            """One send of a started association, whole within ``timeout_seconds`` however slowly
+            the peer reads, and within :data:`_ANSWER_SEND_SECONDS` of noticing a stop, which it
+            looks for at least every :data:`_STOP_POLL_SECONDS`. Returns
+            whether all of ``data`` went.
+
+            A deadline for the whole send, not a timeout per system call: a peer that reads a
+            little at a time would let every call finish inside a per-call timeout, and hold the
+            DUL thread, and a stop with it, for as long as it liked. The end of a send that ran out
+            is logged as an end, the same throttled line a read deadline gets. A socket error, or
+            the `ValueError` an ssl socket closed under the send raises, is a closed connection,
+            as the stock send takes it to be. Anything else is a fault here, and is left to raise."""
+            seconds = cast(float, self.ae.network_timeout)
+            restore = sock.gettimeout()  # None: pynetdicom sends on a blocking socket
+            try:
+                self._send_before(sock, data, time.monotonic() + seconds, seconds=seconds)
+                return True
+            except _RefusedPeer as exc:
+                self._ended(host, str(exc))
+            except (OSError, ValueError) as exc:  # ValueError: an ssl socket closed under the send
+                logger.debug("A send to DICOM peer %s ended: %s", host, safe_exc(exc))
+            finally:
+                with contextlib.suppress(OSError):  # the association may have closed it
+                    sock.settimeout(restore)
+            return False
+
+        def _send_before(
+            self, sock: socket.socket, data: bytes, deadline: float, *, seconds: float | None = None
+        ) -> None:
+            """Send all of ``data`` before ``deadline``, in the slices of :meth:`_in_slices`, or
+            raise: a :class:`_RefusedPeer` naming ``seconds`` when that is given and the deadline
+            passes, else an ``OSError``. A slice that ends with nothing sent leaves the socket, and
+            any TLS state on it, as it was, so the next slice sends the same bytes again, as a TLS
+            write that did not finish must be retried."""
+            expired: Exception = (
+                TimeoutError("the send did not finish within its bound")
+                if seconds is None
+                else _RefusedPeer(f"a send did not finish within {seconds:g}s")
+            )
+            stop_seen: list[float] = []
+
+            def end_after_stop() -> float:
+                # A send that is moving when the stop begins gets a short while to finish: the
+                # C-STORE status for an object committed as the stop began is one, and stop() lets
+                # that commit finish. One the peer is not reading cannot hold the stop for longer.
+                if not stop_seen:
+                    stop_seen.append(time.monotonic() + _ANSWER_SEND_SECONDS)
+                return stop_seen[0]
+
+            left = memoryview(data)
+            while left:
+                send = functools.partial(sock.send, left)
+                sent: int = self._in_slices(sock, send, deadline, expired, on_stop=end_after_stop)
+                left = left[sent:]
 
         def _handshake(
             self, context: ssl.SSLContext, plain: socket.socket, host: str
@@ -435,12 +1105,8 @@ def _admitting_server_class() -> type[Any]:
             """Run the server side of the TLS handshake within the bound. Returns the TLS socket
             with the accepted socket's own timeout restored, or ``None`` after closing the connection.
 
-            The handshake runs in slices of :data:`_HANDSHAKE_POLL_SECONDS`, so that a stop is
-            noticed without closing a socket under the thread that is reading it. A slice that ends
-            with nothing to read raises a ``TimeoutError`` that carries no ``errno`` and leaves the
-            SSL object as it was, which is the state a non-blocking handshake is resumed from, so
-            the next slice resumes it. A ``TimeoutError`` that does carry one is the connection
-            itself timing out, and ends the handshake.
+            The handshake runs through :meth:`_in_slices`. A slice that ends with nothing to read
+            leaves the SSL object in the state a non-blocking handshake is resumed from.
 
             A handshake that fails is logged at DEBUG with its detail, and handed to
             ``handshake_failed`` to be counted (vault BACKLOG #3784), as the MLLP listener counts
@@ -455,20 +1121,8 @@ def _admitting_server_class() -> type[Any]:
                 # No I/O: without do_handshake_on_connect this only builds the SSL object.
                 tls = context.wrap_socket(plain, server_side=True, do_handshake_on_connect=False)
                 deadline = time.monotonic() + _TLS_HANDSHAKE_TIMEOUT
-                while True:
-                    if self._stopping.is_set():
-                        raise OSError("the listener is stopping")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("the handshake did not finish within its bound")
-                    tls.settimeout(min(remaining, _HANDSHAKE_POLL_SECONDS))
-                    try:
-                        tls.do_handshake()
-                    except TimeoutError as exc:
-                        if exc.errno is not None:
-                            raise
-                        continue
-                    break
+                expired = TimeoutError("the handshake did not finish within its bound")
+                self._in_slices(tls, tls.do_handshake, deadline, expired)
                 if self._stopping.is_set():  # finished after the stop began: refuse it unread
                     raise OSError("the listener is stopping")
                 tls.settimeout(restore)
@@ -487,6 +1141,193 @@ def _admitting_server_class() -> type[Any]:
             with contextlib.suppress(OSError):
                 (plain if tls is None else tls).close()
             return None
+
+    class _AdmittedSocket(AssociationSocket):
+        """An admitted connection's association socket. It first serves the PDU the server has
+        already read, and after that a read or a send cannot block the DUL thread for good."""
+
+        #: What is left of a PDU already read: first the association request, then each later
+        #: PDU's body, which :meth:`_read_pdu` reads with its header. The DUL reads a PDU's header
+        #: and then its body, so a read never asks for more than is left.
+        replay: bytearray
+        server: _AdmittingAssociationServer
+        host: str
+        tally: _ReceiptTally
+
+        @property
+        def ready(self) -> bool:
+            """Whether the DUL should read. Not before the request is answered, whatever has
+            arrived, not while a whole message waits for the ``Association`` thread, and not in
+            Sta13.
+
+            The DUL reads before it takes its next event, so a byte behind the request would have
+            it reading while the request itself waits, unanswered, on its queue. The association
+            then counts for a whole deadline before ``maximum_associations`` is checked, with its
+            slot already given back, so such peers would go round every cap.
+
+            The DUL hands each whole message to pynetdicom's ``dimse.msg_queue``, which has no
+            bound, and the ``Association`` thread takes one at a time and serves it, a C-STORE
+            for as long as its commit takes. A peer that sent objects without waiting for their
+            statuses would have them all held there. So while a whole message waits, the DUL
+            reads nothing more, and TCP holds the peer back. An association then holds at most
+            the message being served and the next one.
+
+            In Sta13 the DUL closes the connection as soon as this is ``False``, and reads a whole
+            PDU while it is ``True``. A PDU read there is thrown away, and a stalled one would hold
+            the close for a deadline, so this says ``False`` at once. :meth:`_shutdown_socket`
+            reads off what has already arrived, so that the A-ASSOCIATE-RJ or A-ABORT just sent is
+            not lost to a reset.
+
+            Holding off relies on the ``Association`` thread to answer, and only that thread reads
+            the idle timer, so this is also where a DUL finds it has nobody left. If that thread
+            has died, in any state, or was killed with no answer queued, no answer is coming and
+            nothing else would ever end the DUL: ``kill()`` itself waits for Sta1. So this closes
+            the connection, which puts the DUL's own closed-connection event on its queue. A
+            rejection queues its answer before it kills, and that answer still has to go out."""
+            if self.replay:
+                return True
+            assoc = self.assoc
+            state = assoc.dul.state_machine.current_state
+            if state == _STATE_CLOSING:
+                return False
+            unanswered = state in _STATES_BEFORE_THE_ANSWER
+            killed_unanswered = unanswered and assoc._kill and assoc.dul.to_provider_queue.empty()
+            if killed_unanswered or not assoc.is_alive():
+                self.close()
+                return False
+            if unanswered or not assoc.dimse.msg_queue.empty():
+                return False
+            return super().ready
+
+        def _shutdown_socket(self) -> None:
+            """``AssociationSocket._shutdown_socket``, after reading off what the peer has already
+            sent, so that the close is not over unread data that would reset the connection and
+            lose an answer just sent; see :func:`_drain_readable`.
+
+            ``close()``, the DUL's closing actions AA-4, AA-5 and AR-5, and
+            ``Association._abort_blocking`` come through here. Not every close does: at least the
+            ``Association`` thread's own close, at the end of ``Association.run``, hands the raw
+            socket to the server's ``shutdown_request``, which does not drain."""
+            if self.socket is not None:
+                _drain_readable(self.socket)
+            super()._shutdown_socket()
+
+        def recv(self, nr_bytes: int) -> bytearray:
+            if self.replay:
+                if nr_bytes >= len(self.replay):  # the whole of it: hand it over uncopied
+                    served, self.replay = self.replay, bytearray()
+                    return served
+                served, self.replay = self.replay[:nr_bytes], self.replay[nr_bytes:]
+                return served
+            if nr_bytes == _PDU_HEADER_BYTES:
+                return self._read_pdu()
+            if nr_bytes == 0:
+                return bytearray()  # an empty body: nothing to read
+            # Every other body is read with its header and served from replay, so a read of any
+            # other size is one this was not written for. It would pass both checks in _read_pdu,
+            # so the association ends instead.
+            sock = cast(socket.socket, self.socket)
+            reason = "pynetdicom asked for a read the SCP does not check"
+            self.server.end_association(sock, _ABORT_INVALID_MESSAGE, self.host, reason)
+            return bytearray()
+
+        def _read_pdu(self) -> bytearray:
+            """The DUL's read of a PDU header. It reads the body too, keeps it for the DUL's next
+            read, and returns the header, or ends the association and returns nothing.
+
+            The declared length is checked before a byte of the body is read (owner ruling
+            B462-R3). A P-DATA-TF may be as long as the ``max_pdu_size`` the SCP offered, and no
+            longer: pynetdicom fragments to exactly that, and PS3.8 Annex D.1 bounds that field.
+            Any other PDU PS3.8 defines may be as long as an association request, since none is
+            longer. Over either, the SCP sends an A-ABORT rather than read what may be 4 GiB.
+
+            A P-DATA-TF's fragments are then counted by :class:`_ReceiptTally` before the DUL sees
+            them. An object up to twice ``max_object_bytes`` reaches the C-STORE handler, which
+            answers ``0xC010``. One past that ends the association with an A-ABORT, so that what
+            the SCP holds of one object stays bounded (owner ruling B462-R3). So does a P-DATA-TF
+            pynetdicom would fail on.
+
+            Reading the body here also means a body cut short never reaches the DUL, which would
+            log it at ERROR. An empty header read is its silent closed connection, and that is what
+            each end above returns. A PDU of a type PS3.8 does not define ends the association with
+            its body unread, as the DUL's own AA-8 would, but through the throttled line rather than
+            the DUL's unthrottled ERROR."""
+            server, host = self.server, self.host
+            sock = cast(socket.socket, self.socket)
+            header = server.read_for_association(sock, _PDU_HEADER_BYTES, host)
+            if len(header) < _PDU_HEADER_BYTES:
+                return header  # the DUL's silent closed connection
+            if header[0] not in _PDU_TYPES:
+                reason = "a PDU of a type PS3.8 does not define"
+                server.end_association(sock, _ABORT_INVALID_MESSAGE, host, reason)
+                return bytearray()
+            declared = int.from_bytes(header[2:], "big")
+            if header[0] == _PDU_TYPE_P_DATA_TF:
+                limit = server.max_pdu_size
+            else:
+                limit = _MAX_ASSOCIATE_RQ_BYTES - _PDU_HEADER_BYTES
+            if declared > limit:
+                reason = f"a PDU declared a length over the {limit} bytes the SCP takes"
+                server.end_association(sock, _ABORT_PDU_TOO_LONG, host, reason)
+                return bytearray()
+            body = server.read_for_association(sock, declared, host)
+            if len(body) < declared:
+                return bytearray()  # the peer closed, or the read ran out: already logged
+            if header[0] == _PDU_TYPE_P_DATA_TF:
+                ended = self.tally.take(body)
+                if ended is not None:
+                    server.end_association(sock, ended[0], host, ended[1])
+                    return bytearray()
+            self.replay = body
+            return header
+
+        def send(self, bytestream: bytes) -> None:
+            """``AssociationSocket.send``, whole within ``timeout_seconds``, and within
+            :data:`_ANSWER_SEND_SECONDS` of noticing a stop. A peer that never reads, or reads a
+            little at a time, would otherwise hold the DUL thread here, and a stop with it. A send
+            that does not finish is a closed connection, as the stock ``send`` reports one."""
+            sock = self.socket
+            if sock is None:
+                super().send(bytestream)  # it reports the closed socket
+                return
+            if self.server.send_for_association(sock, bytestream, self.host):
+                evt.trigger(self.assoc, evt.EVT_DATA_SENT, {"data": bytestream})
+            else:
+                self.event_queue.put("Evt17")  # what the stock send does when its send fails
+
+    class _AdmittingRequestHandler(RequestHandler):
+        server: _AdmittingAssociationServer
+
+        def handle(self) -> None:
+            """``RequestHandler.handle``, with the association request read before the association
+            starts. Runs on the connection's own thread, which holds the connection's slot.
+
+            ``EVT_CONN_OPEN`` still fires before anything is read, so an association-rate wait
+            still comes first and does not spend the peer's deadline. A connection that ends here
+            never started its ``Association``, so there is no thread to stop and no ``kill()`` to
+            wait on. The socket is closed, and ``EVT_CONN_CLOSE`` fires, because pynetdicom pairs
+            every ``EVT_CONN_OPEN`` with one when its DUL closes a connection, and a handler that
+            counts open connections would otherwise drift up with every refused peer."""
+            assoc = self._create_association()
+            evt.trigger(assoc, evt.EVT_CONN_OPEN, {"address": self.client_address})
+            server = self.server
+            host = _address_host(self.client_address)
+            first_pdu: bytes | None = None
+            if _config.STORE_RECV_CHUNKED_DATASET:  # checked at start too; this is the backstop
+                server._refused(host, "a connection", _CHUNKED_RECEIPT_REFUSAL)
+            else:
+                first_pdu = server.read_association_request(self.request, host)
+            if first_pdu is None:
+                server.shutdown_request(self.request)
+                evt.trigger(assoc, evt.EVT_CONN_CLOSE, {"address": self.client_address})
+                return
+            sock = cast(_AdmittedSocket, assoc.dul.socket)
+            sock.__class__ = _AdmittedSocket  # why not a new socket: _admitting_server_class
+            sock.replay = bytearray(first_pdu)
+            sock.server = server
+            sock.host = host
+            sock.tally = _ReceiptTally(max_data_set_bytes=2 * server.max_object_bytes)
+            assoc.start()
 
     return _AdmittingAssociationServer
 
@@ -558,7 +1399,7 @@ class DicomScpSource(SourceConnector):
     double-read)."""
 
     #: The C-STORE status must tell a committed object from a refused one, and only the receipt
-    #: handler's ``None`` means "refused" (BACKLOG #1910). See :attr:`SourceConnector.wants_receipt`.
+    #: handler says which, and why (BACKLOG #1910, #2105). See :attr:`SourceConnector.wants_receipt`.
     wants_receipt: ClassVar[bool] = True
 
     def __init__(self, config: Source) -> None:
@@ -598,9 +1439,21 @@ class DicomScpSource(SourceConnector):
         self._max_pdu_size = count_setting(
             s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCP source"
         )
+        if not _MIN_PDU_SIZE <= self._max_pdu_size <= _MAX_PDU_SIZE:
+            raise ValueError(
+                f"DICOM-SCP source: max_pdu_size must be from {_MIN_PDU_SIZE} to {_MAX_PDU_SIZE}; "
+                "0 would offer a peer no limit on a PDU's length, a smaller size breaks a "
+                "pynetdicom sender, and a larger one is read whole before it is counted"
+            )
         self._timeout = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOM-SCP source"
         )
+        if self._timeout < _MIN_TIMEOUT_SECONDS:  # a hard deadline on every read and send
+            raise ValueError(
+                f"DICOM-SCP source: timeout_seconds must be at least {_MIN_TIMEOUT_SECONDS:g} "
+                "second; it is a deadline on every read and send, so a smaller one would end "
+                "nearly every peer"
+            )
         # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
         # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
         # the UNIT here is an association, not a message — see _pace_association for why a message-rate
@@ -637,6 +1490,11 @@ class DicomScpSource(SourceConnector):
         #: threads both reach it, and it carries its own lock. It also counts every refusal since
         #: this SCP was built, logged or not, and each line that is written reports that count.
         self._refusal_log = RefusalLog(
+            window_seconds=_REFUSAL_LOG_WINDOW_SECONDS, max_per_window=_REFUSAL_LOG_MAX_PER_WINDOW
+        )
+        #: The same throttle for associations the SCP ended at a read deadline; see
+        #: _log_ended_association. Its own, so those never spend an address's refusal line.
+        self._ended_log = RefusalLog(
             window_seconds=_REFUSAL_LOG_WINDOW_SECONDS, max_per_window=_REFUSAL_LOG_MAX_PER_WINDOW
         )
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
@@ -703,7 +1561,8 @@ class DicomScpSource(SourceConnector):
                 "silently, and while connections.toml [[inbound]] tables do accept the key, none of "
                 "their transports is DICOM."
             )
-        self._handler: InboundHandler | None = None
+        #: The runner's receipt handler (``wants_receipt``), never the generic InboundHandler.
+        self._handler: ReceiptHandler | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ae: Any = None
         self._server: Any = None
@@ -733,11 +1592,17 @@ class DicomScpSource(SourceConnector):
         return min(self._max_object_bytes, _dicom_inflate.DEFAULT_MAX_INFLATED_BYTES)
 
     async def start(
-        self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
+        self,
+        handler: ReceiptHandler | InboundHandler,
+        *,
+        leader_gate: Callable[[], bool] | None = None,
     ) -> None:
         # leader_gate is ignored: a listen source binds its own per-node endpoint, so there is no
         # shared-resource double-read to gate (accepted only so the runner's call is uniform).
-        self._handler = handler
+        # wants_receipt makes the runner pass its receipt handler here (BACKLOG #2105). The parameter
+        # keeps the base class's InboundHandler beside it only so the override stays substitutable;
+        # require_receipt refuses any other handler here, before a single message is accepted.
+        self._handler = require_receipt(handler, source="DICOM SCP source")
         self._stopping.clear()  # a restart must not inherit the previous stop's cut-short signal
         self._tls_failures.open()
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
@@ -747,10 +1612,13 @@ class DicomScpSource(SourceConnector):
     def _start_server(self) -> None:
         # Imported lazily (the [dicom] extra); a missing extra surfaces as an internal/connection error
         # at start, not a per-message data error — like the FHIR/SQL-Server backends.
-        from pynetdicom import AE, StoragePresentationContexts, evt
+        from pynetdicom import AE, StoragePresentationContexts, _config, evt
         from pynetdicom.sop_class import (  # type: ignore[attr-defined]
             Verification,  # generated SOP-class const
         )
+
+        if _config.STORE_RECV_CHUNKED_DATASET:
+            raise RuntimeError(f"DICOM server (SCP) not started: {_CHUNKED_RECEIPT_REFUSAL}")
 
         ae = AE(ae_title=self._ae_title)
         ae.maximum_associations = self._max_associations
@@ -791,8 +1659,11 @@ class DicomScpSource(SourceConnector):
             server_class=_admitting_server_class(),
             admit=self._admit_connection,
             refused=self._log_refused_peer,
+            ended=self._log_ended_association,
             handshake_failed=self._note_tls_failure,
             stopping=self._stopping,
+            max_pdu_size=self._max_pdu_size,
+            max_object_bytes=self._max_object_bytes,
         )
         server.start_serving()
         self._ae = ae
@@ -872,23 +1743,46 @@ class DicomScpSource(SourceConnector):
         The table holds an entry only for a line written inside the current window, so it never
         holds more than :data:`_REFUSAL_LOG_MAX_PER_WINDOW` addresses, whatever arrives. The MLLP
         listener's once-per-episode line is not reusable here: it is tied to that listener's table
-        of live connections per host, and its episode ends when the host has none left. A refused
-        peer never holds a connection, so it has no episode to end. The window throttle is
+        of live connections per host, and its episode ends when the host has none left. A peer
+        refused at accept never holds a connection, so it has no episode to end. The window throttle is
         :class:`~messagefoundry.transports.admission.RefusalLog`, which the socket listeners use for
         their allowlist refusals too (vault BACKLOG #2606).
         """
-        total = self._refusal_log.note(peer_ip)
+        self._throttled_warning(
+            self._refusal_log, peer_ip, f"refused {what} from {peer_ip}", reason, "refused"
+        )
+
+    def _log_ended_association(self, peer_ip: str, reason: str) -> None:
+        """Log an association the SCP ended: because a read or a send ran out its deadline, or
+        because the peer sent a PDU longer than the SCP takes, or an object past twice its cap.
+        The same throttle as :meth:`_log_refused_peer`, but a count and a table of its own.
+
+        It is not a refusal. The SCP accepted the association, and may have taken objects on it,
+        so the line says it ended one, and it does not spend the address's refusal line for the
+        window. A peer can make one of these as often as it can finish an association request,
+        so it is throttled the same way. The line names the address and the deadline or the
+        limit, never a byte the peer sent."""
+        self._throttled_warning(
+            self._ended_log, peer_ip, f"ended an association with {peer_ip}", reason, "ended so"
+        )
+
+    def _throttled_warning(
+        self, log: RefusalLog, peer_ip: str, event: str, reason: str, counted: str
+    ) -> None:
+        """One WARNING for ``event``, if ``log`` lets ``peer_ip`` have a line in this window. The
+        line carries ``log``'s running count, logged or not, as ``<count> <counted> in all``."""
+        total = log.note(peer_ip)
         if total is None:
             return
         logger.warning(
-            "DICOM server (SCP) %s refused %s from %s: %s. An address is logged at most once every "
-            "%gs. %d refused in all since this server started.",
+            "DICOM server (SCP) %s %s: %s. An address is logged at most once every %gs. %d %s in "
+            "all since this server started.",
             self._ae_title,
-            what,
-            peer_ip,
+            event,
             reason,
-            self._refusal_log.window_seconds,
+            log.window_seconds,
             total,
+            counted,
         )
 
     def _pace_association(self, event: Any) -> None:
@@ -908,18 +1802,20 @@ class DicomScpSource(SourceConnector):
         1.0 s here completed in 1.04 s total, at ``maximum_associations`` 10 and again at 1. So the
         wait delays only its own peer, never the loop and never a sibling.
 
-        **Nothing is dropped, refused or answered differently.** The peer is back-pressured by TCP
+        **This wait drops, refuses and answers nothing differently.** The peer is back-pressured by TCP
         while we decline to read, then its association proceeds in full. The delay is bounded by the
         deficit (``associations / rate``) rather than being a hard stop, for the reason
         :class:`~messagefoundry.transports.mllp._MessagePacer` gives: refusing to read at all would pin
         capacity indefinitely.
 
         **Residual, stated because a knob that hides one is worse than no knob.** The waiting
-        connection is already counted against ``max_associations``, so a rate low enough to make waits
-        long needs a ``max_associations`` high enough to hold the peers waiting behind it — and a wait
-        that outlasts the SCU's own ACSE timeout becomes an abort on the sender's side, which is a
-        refusal this control is otherwise careful never to make. That is the DIMSE form of the general
-        residual: a bound that demands a number cannot demand a sensible one.
+        connection has no association yet, so it holds one of the slots
+        :data:`_MAX_PENDING_CONNECTIONS` and its per-address twin count (vault BACKLOG #2712). A rate
+        low enough to make waits long can fill them, and a connection over them is closed, which is
+        the cap refusing it, not this wait. A wait that outlasts the SCU's own ACSE timeout becomes an
+        abort on the sender's side, which is a refusal this control is otherwise careful never to
+        make. That is the DIMSE form of the general residual: a bound that demands a number cannot
+        demand a sensible one.
         """
         pacer = self._pacer
         if pacer is None:  # pragma: no cover - the handler is only registered when one exists
@@ -945,7 +1841,7 @@ class DicomScpSource(SourceConnector):
         **Why refuse rather than wait.** The SCP could wait on ``EVT_CONN_OPEN``, before the request
         is read, the way :meth:`_pace_association` does. That wait is bounded by a rate deficit. A
         pause has no such bound: it lasts until the backlog drains or disk is freed. Waiting that long
-        would hold a ``max_associations`` slot per sender, and would outlast the sender's own
+        would hold a pending connection slot per sender, and would outlast the sender's own
         association timeout, which then drops the connection with no reason given. The rejection
         says what happened, at once.
 
@@ -954,7 +1850,9 @@ class DicomScpSource(SourceConnector):
         handler, reading the same ``AE`` settings this does. So the pause neither tells such a peer to
         retry nor reveals to it that intake is paused. ``source_ip_allowlist`` needs no mirror here:
         the SCP applies it when the connection is accepted (:meth:`_admit_connection`), so a peer
-        outside it is closed before it can send an association request.
+        outside it is closed before it can send an association request. A request that does not
+        decode, has the wrong protocol version, or does not negotiate is answered before this runs,
+        on the connection's own thread, so it gets that answer whatever the pause or its AE titles.
 
         **An association already accepted is left alone.** It finishes normally, and every C-STORE on
         it is still committed before its Success status. The pause is checked only here, so it never
@@ -1165,14 +2063,15 @@ class DicomScpSource(SourceConnector):
         """Bridge the received bytes onto the loop-owned ingress and block THIS thread until durably
         committed (commit-before-SUCCESS). Returns the DIMSE status.
 
-        The handler returns the committed message id, or ``None`` when it refused the object: it then
-        recorded ``ERROR`` and committed no ingress row. That refusal is a DIMSE failure, never Success
-        (BACKLOG #1910). It is Cannot Understand, the status the decode-failure path already answers for
-        an object the engine will not take, rather than the Out of Resources a commit timeout answers:
-        the refusal is deterministic, so the same object would be refused again on a re-send. A handler
-        that RAISES, or does not answer in time, has committed nothing for a reason that may clear, such
-        as a store that is down, so both answer Out of Resources and the sender re-sends (BACKLOG
-        #2103)."""
+        The handler returns a receipt: the committed message id, or a refusal, when it then recorded
+        ``ERROR`` and committed no ingress row. A refusal is a DIMSE failure, never Success (BACKLOG
+        #1910), mapped in step with the HTTP listener's answer (BACKLOG #2105). A TEMPORARY refusal
+        may clear on a re-send, so it answers Out of Resources, as the HTTP listener answers ``503``. A
+        permanent or over-size one is Cannot Understand, the status the decode-failure path already
+        answers for an object the engine will not take: the same object would be refused again. A
+        handler that RAISES, or does not answer in time, has committed nothing for a reason that may
+        clear, such as a store that is down, so both answer Out of Resources and the sender re-sends
+        (BACKLOG #2103)."""
         loop, handler = self._loop, self._handler
         if loop is None or handler is None:  # never started
             return _STATUS_OUT_OF_RESOURCES
@@ -1187,9 +2086,9 @@ class DicomScpSource(SourceConnector):
                 sop_instance,
             )
             return _STATUS_OUT_OF_RESOURCES
-        # The runner's receipt handler is an async def (a Coroutine), but InboundHandler is typed as the
+        # The runner's receipt handler is an async def (a Coroutine), but ReceiptHandler is typed as the
         # Awaitable; run_coroutine_threadsafe needs a Coroutine, so narrow it.
-        coro = cast("Coroutine[Any, Any, str | None]", handler(object_bytes))
+        coro = cast("Coroutine[Any, Any, IngressReceipt]", handler(object_bytes))
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError as exc:
@@ -1224,13 +2123,17 @@ class DicomScpSource(SourceConnector):
                 safe_exc(exc),
             )
             return _STATUS_OUT_OF_RESOURCES
-        if receipt is None:
+        if receipt.refusal is not None:
             logger.warning(
-                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR, "
+                "DICOM C-STORE refused by engine ingress from %s (SOP %s): recorded ERROR %s (%s), "
                 "returning failure",
                 peer_ip,
                 sop_instance,
+                receipt.message_id,
+                receipt.refusal.value,
             )
+            if receipt.refusal is RefusalKind.TEMPORARY:
+                return _STATUS_OUT_OF_RESOURCES
             return _STATUS_CANNOT_UNDERSTAND
         logger.info(
             "DICOM C-STORE accepted from %s (SOP class %s, instance %s)",
@@ -1418,7 +2321,13 @@ class DicomScuDestination(DestinationConnector):
         # really dials with, so a [tls].crl_file that reached this hop relaxes the refusal and a hop
         # it never reached keeps it. Disjoint from the cleartext guard above, which is taken only
         # when TLS is off.
+        #
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
+        # is handed to the guard as no context: see skips_validity_period (vault BACKLOG #2978, ADR
+        # 0173 §13). The owner's 2026-10-05 ruling names MLLP; its reach to this hop is the batch 191
+        # Manager's reading of "one rule everywhere".
         if self._ssl is not None:
+            expiry_relaxed = skips_validity_period(self._ssl)
             RevocationHopGuard.capture(
                 host=self._host,
                 cell="DICOM C-STORE client (SCU) over TLS",
@@ -1426,7 +2335,8 @@ class DicomScuDestination(DestinationConnector):
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                context=self._ssl,
+                context=None if expiry_relaxed else self._ssl,
+                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
             ).enforce_construction()
 
     async def send(

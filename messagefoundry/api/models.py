@@ -562,7 +562,8 @@ class PendingApprovalInfo(BaseModel):
     ``requester_not_authorized``, which the gate raises after the dwell floor: the requester no longer holds the authority the operation needs, read when the queue is
     listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
     one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it
-    does. The read can still report a requester account whose integrity seal fails, as any read
+    does. A listing that shows this value writes one ``approval.standing_shown`` row, naming the
+    caller and these requests (vault BACKLOG #3747). The read can still report a requester account whose integrity seal fails, as any read
     of that account does. ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
     standing the listing could not read, a seal that fails after the listing and the operation's own refusals, such as a
@@ -660,14 +661,8 @@ class ReloadResult(BaseModel):
     old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015).
     ``None`` means **not checked**: a dry run skips the settings preflight, so it cannot say.
 
-    An empty list is narrower than "no restart needed". It means no anchor this field covers
-    changed, including when none is configured. It covers only the engine process that answered:
-    another engine shard, or a cluster node that converges on the reload, reports its own anchors
-    only in its own log, as the audit row names no node. It never lists at least the dialling
-    settings CAs (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``,
-    ``[logging].forward_tls_ca_file``): their hops load the file by path and record no fingerprint
-    to compare with. A changed one can still need a restart or a rebuild of the connections that
-    use it; ``docs/SECURITY.md`` says which."""
+    An empty list is narrower than "no restart needed": ``docs/SECURITY.md``, *What a reload's
+    ``restart_required`` list covers*, says what it leaves out."""
 
     inbound: int
     outbound: int

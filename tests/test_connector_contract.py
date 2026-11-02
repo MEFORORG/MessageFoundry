@@ -48,6 +48,7 @@ from messagefoundry.transports.base import (
     registered_kinds,
 )
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
+from messagefoundry.transports.receipt import receipt_handler
 
 #: Per-call timeout for the idempotence check. A generous ceiling, not a performance bound: a
 #: stop() before start() has nothing to wait for, so anything near this is a hang.
@@ -312,7 +313,7 @@ async def test_stop_after_start_is_idempotent(kind: ConnectorType, tmp_path: Pat
     if kind is ConnectorType.FILE:
         (tmp_path / "contract.hl7").write_bytes(b"MSH|^~\\&|CONTRACT\r")
     handler, called = _recording_handler()
-    await source.start(handler)
+    await source.start(receipt_handler(handler))
     try:
         if kind in _CALLS_HANDLER_ON_START:
             # Run the loop past its first stop check, so stop() meets a RUNNING task.
@@ -337,7 +338,7 @@ async def test_stop_closes_an_established_idle_peer(kind: ConnectorType, tmp_pat
     ``server.wait_closed()`` (a known Windows Proactor wedge), which is not this obligation."""
     source = _build(kind, tmp_path)
     handler, _called = _recording_handler()
-    await source.start(handler)
+    await source.start(receipt_handler(handler))
     writer: asyncio.StreamWriter | None = None
     try:
         server: asyncio.Server = source._server  # type: ignore[attr-defined]

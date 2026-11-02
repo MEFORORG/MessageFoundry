@@ -39,6 +39,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.redaction import codec_safe_str, prints_a_codec_error
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -106,6 +107,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RestoreRecord,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -144,6 +146,7 @@ __all__ = [
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
     "ResendSourceNotFound",
+    "RestoreRecord",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -781,7 +784,12 @@ class QueueStore(StoreLifecycle, Protocol):
         headers; ``None``/empty stores ``NULL`` (byte-identical). It is JSON-encoded and encrypted at
         rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
         :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
-        ``response_get(dest).headers``)."""
+        ``response_get(dest).headers``). The store does not scrub it, because a scrub would rewrite
+        the values a Handler reads back; ``docs/PHI.md`` section 3 says what covers it (BACKLOG
+        #2984).
+
+        ``detail`` is scrubbed and bounded by ``safe_text(detail, limit=200)`` before the cipher on
+        every backend, as :meth:`record_ack_sent` does for its row (BACKLOG #2984)."""
         ...
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
@@ -844,7 +852,8 @@ class QueueStore(StoreLifecycle, Protocol):
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
-        :meth:`ingress_handoff`. ``None`` if the row/artifact is gone."""
+        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed, ``""``
+        if the artifact is gone."""
         ...
 
     async def mark_failed(
@@ -1067,14 +1076,17 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
-    # The operator mutations. Each takes an ``audit`` that builds the operator's audit row from the
-    # result, and the row commits in the mutation's own transaction (BACKLOG #2624, OperatorAudit).
+    # The operator mutations. Each takes a REQUIRED ``audit`` that builds the operator's audit row
+    # from the result, and the row commits in the mutation's own transaction (BACKLOG #2624,
+    # OperatorAudit). Required with no default, so a caller cannot run one and record nothing by
+    # leaving the argument out; ``enqueue_ingress`` stays optional because a live receipt has no
+    # operator. An ``OperatorAudit`` may still return ``None``, which records nothing.
     async def replay(
         self,
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def get_resend_record(self, resend_key: str) -> ResendKeyRecord | None: ...
@@ -1088,7 +1100,7 @@ class QueueStore(StoreLifecycle, Protocol):
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome: ...
 
@@ -1099,7 +1111,7 @@ class QueueStore(StoreLifecycle, Protocol):
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome: ...
 
@@ -1109,7 +1121,7 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int: ...
 
     async def cancel_queued(
@@ -1269,14 +1281,12 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         now: float | None = None,
     ) -> None:
-        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
-        inbound lifecycle (``established``/``closed``) + the pre-ingress failures
-        (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
-        + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
-        cleanly, such as a store outage at the ingress commit)
-        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
-        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
-        + the outbound lane transitions (``connection_lost``/``connection_restored``).
+        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): a
+        listener's lifecycle and pre-ingress refusals, a poll source's rejects, and the outbound lane
+        transitions. ``kind`` must be one of
+        :data:`messagefoundry.connection_events.CONNECTION_EVENT_KINDS`, the one vocabulary the
+        connectors, this store and the web console's filter share; an undeclared kind raises
+        :class:`ValueError` on every backend (BACKLOG #1624).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
         row and calling no finalizer, so it can never pin a message's disposition or inflate received
@@ -3098,6 +3108,32 @@ class AuthStore(Protocol):
         so a concurrent sign-in can still move the number before the revoke runs."""
         ...
 
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
+        return how many it revoked (BACKLOG #2614).
+
+        Raises the session epoch of at most the accounts its read of the account list returns,
+        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
+        what it may miss. A kept session whose seal does not verify raises
+        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
+        ...
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Record, once, a restore the engine has not yet recorded (BACKLOG #2614).
+
+        ``messagefoundry restore`` writes a one-row marker into the store it places. The first
+        call after that reads the marker, revokes every session as :meth:`revoke_all_sessions`
+        does, appends one ``store_restored`` audit row and deletes the marker, all in one
+        transaction, and returns what it found. Every later call, and every call on a store no
+        restore placed, returns ``None`` and writes nothing.
+
+        Only the SQLite backend can hold a marker: a server database's backup and restore are the
+        DBA's (BACKLOG #52), so ``restore`` never places one there, and those backends return
+        ``None``."""
+        ...
+
     async def enforce_session_cap(
         self,
         user_id: str,
@@ -3290,16 +3326,42 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     ``posture`` is the instance posture the caller holds. It reaches the two Vault hops a cipher
     build can dial, the key provider and the Transit cipher, whose revocation guard is keyed on it
     (vault BACKLOG #2983). ``None`` counts as enforcing there, so a caller with no posture gets
-    the strict answer."""
+    the strict answer.
+
+    **A codec error is not chained (BACKLOG #3471).** Its own text names a byte of what it decoded,
+    and its ``.object`` holds all of it, so a key source that yields bytes that are not text would
+    put key material in the refusal and in any traceback of it. A ``ValueError`` from the build
+    that is one, holds one, or has one on the links :func:`_carries_a_codec_error` follows, is
+    rendered with :func:`~messagefoundry.redaction.codec_safe_str` and raised outside the handler.
+    Every other ``ValueError`` keeps its text and its chain. An error of another class, such as a
+    ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
     except ValueError as exc:
-        raise StoreCipherConfigError(str(exc)) from exc
+        if not _carries_a_codec_error(exc):
+            raise StoreCipherConfigError(str(exc)) from exc
+        refusal = codec_safe_str(exc)
+    raise StoreCipherConfigError(refusal)
+
+
+def _carries_a_codec_error(exc: BaseException) -> bool:
+    """Whether ``exc``, or an error on its chain, is a codec error or prints one (BACKLOG #3471).
+    Each link is followed by its ``__cause__``, else its ``__context__``, as a traceback prints it;
+    a ``__context__`` beside a ``__cause__`` is not read."""
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, UnicodeError) or prints_a_codec_error(link):
+            return True
+        link = link.__cause__ or link.__context__
+    return False
 
 
 class StoreCipherConfigError(ValueError):
     """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
-    text is the build error's, which names settings and variables, never a key."""
+    text is the build error's, which names settings and variables, never a key. A codec error's
+    is rendered without the bytes it names (BACKLOG #3471)."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:

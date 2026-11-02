@@ -18,12 +18,13 @@ wildcard forms (``"."`` was dropped silently), and ``allowed_recipient_domains``
 from __future__ import annotations
 
 import ipaddress
+import string
 
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.settings import EgressSettings, SecuritySettings
-from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
+from messagefoundry.config.settings import EgressSettings, SecuritySettings, _not_a_host_address
+from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4, upn_suffix_key
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry_webconsole import _external
 from messagefoundry_webconsole._external import is_allowlisted, is_external
@@ -78,9 +79,20 @@ _ACCEPTED = [
 #: The stated difference: a canonical IPv4 address is a navigation host, never a mail domain.
 _IPV4 = "10.20.30.40"
 
-#: Canonical quads that are no one host's address: unspecified, limited broadcast, multicast and
-#: class E. Built from integers, so the file carries no routable literal for the leak scan.
-_NOT_ONE_HOST = [str(ipaddress.IPv4Address(n)) for n in (0, 0xFFFF_FFFF, 0xE000_0001, 0xF000_0001)]
+#: Canonical quads that are no one host's address: unspecified, the rest of its ``0.0.0.0/8`` block
+#: at both ends, limited broadcast, multicast and class E. Built from integers, so the file carries
+#: no routable literal for the leak scan.
+_NOT_ONE_HOST = [
+    str(ipaddress.IPv4Address(n))
+    for n in (0, 0x0001_0203, 0x00FF_FFFF, 0xFFFF_FFFF, 0xE000_0001, 0xF000_0001)
+]
+
+#: Addresses that must keep loading: the first after that block, the loopback address, which is
+#: this machine's, the last before multicast, and a plain address.
+_ONE_HOST = [
+    *(str(ipaddress.IPv4Address(n)) for n in (0x0100_0000, 0x7F00_0001, 0xDFFF_FFFF)),
+    _IPV4,
+]
 
 
 @pytest.mark.parametrize("value", list(_REFUSED))
@@ -136,14 +148,117 @@ def test_the_recipient_list_refuses_a_domain_no_address_can_carry() -> None:
 def test_the_navigation_lists_refuse_an_address_that_is_not_one_host_s(
     list_name: str, value: str
 ) -> None:
-    """BACKLOG #3075 item 7: the unspecified address, the limited broadcast, a multicast group and
+    """BACKLOG #3075 item 7: the ``0.0.0.0/8`` block, the limited broadcast, a multicast group and
     the reserved range are canonical dotted quads but no one host's address. ``0.0.0.0`` reaches the
-    local machine in some browsers, so as an entry it would mark a loopback page as internal. The
-    console and the engine still agree that each is an IPv4 entry; see the agreement test below.
+    local machine in some browsers, so as an entry it would mark a loopback page as internal.
+    BACKLOG #3765 item 7: the rest of that block, read by ``ipaddress`` as neither unspecified nor
+    reserved, is refused the same way. The console and the engine still agree that each is an IPv4
+    entry; see the agreement test below.
 
     Mutation: return False from ``_not_a_host_address``. Red: DID NOT RAISE."""
     with pytest.raises(ValidationError, match="an IPv4 address that is not one host's"):
         _load(list_name, value)
+
+
+@pytest.mark.parametrize("value", _ONE_HOST)
+@pytest.mark.parametrize("list_name", ["organization_domains", "external_link_allowlist"])
+def test_the_navigation_lists_keep_an_address_that_is_one_host_s(
+    list_name: str, value: str
+) -> None:
+    """The control for the refusal above: each edge of what it refuses stops where it should, and
+    loopback, which is one machine's address and is documented as accepted, loads.
+
+    Mutation: refuse ``0.0.0.0/7`` rather than ``/8``. Red: the first value."""
+    assert _load(list_name, value) == [value]
+
+
+@pytest.mark.parametrize("list_name", ["organization_domains", "external_link_allowlist"])
+def test_a_bare_public_suffix_loads_as_a_single_label(list_name: str) -> None:
+    """BACKLOG #3765 item 6, a pin of a stated decision and not a fix. ``com`` is one label, the
+    shape of an intranet name, and telling the two apart would need the Public Suffix List. It loads
+    and covers every host under it, as ``docs/CONFIGURATION.md`` tells the operator.
+
+    Mutation: refuse a single label in ``_bare_domain_entries``. Red: this test."""
+    assert _load(list_name, "com") == ["com"]
+    assert not is_external("https://example.com/", ("com",))
+
+
+@pytest.mark.parametrize("value", _NOT_ONE_HOST)
+def test_the_console_refuses_an_entry_that_is_not_one_host_s_however_it_arrived(value: str) -> None:
+    """BACKLOG #3765 item 8: settings refuse these at load, and an entry that reached the console
+    another way matched its own address, so a URL to it skipped the interstitial, or was exempted
+    by the allowlist. Such an entry now covers nothing, as a dot-led one does.
+
+    Mutation: drop the ``_is_one_host`` test from ``_matches_domain``. Red: the first assertion."""
+    url = f"https://{value}/"
+    assert is_external(url, (value,))
+    assert not is_allowlisted(url, (value,))
+
+
+@pytest.mark.parametrize(
+    ("address", "entry"),
+    [
+        (_NOT_ONE_HOST[0], "0"),
+        (_NOT_ONE_HOST[0], "0.0"),
+        (_NOT_ONE_HOST[0], "0.0.0"),
+        (_IPV4, "40"),
+        (_IPV4, "30.40"),
+        ("0x0.0.0.0", "0.0"),
+        ("00.0.0.0", "0.0"),
+        ("0.0.0", "0.0"),
+        ("[::ffff:0.0.0.0]", "0.0"),
+    ],
+)
+def test_a_partial_entry_covers_no_address(address: str, entry: str) -> None:
+    """BACKLOG #3765 item 8: ``0.0`` is no IPv4 entry, so it took a label-boundary match and covered
+    ``0.0.0.0``. An address has no parent domain, so a host a browser reads as one takes no such
+    match, whatever the entry looks like and however the host is spelled.
+
+    Mutation: test only ``_is_ipv4(domain)`` in ``_matches_domain``. Red: every case."""
+    url = f"https://{address}/"
+    assert is_external(url, (entry,))
+    assert not is_allowlisted(url, (entry,))
+
+
+#: Spellings a browser reads as addresses and settings refuse: octal, hexadecimal and integer forms
+#: of multicast and the limited broadcast, a short form, and IPv6 literals. Each entry is the host
+#: the URL names, so an exact match would cover it.
+_OTHER_SPELLINGS = [
+    ("0340.0.0.1", "0340.0.0.1"),
+    ("0xe0.0.0.1", "0xe0.0.0.1"),
+    ("3758096385", "3758096385"),
+    ("0xffffffff", "0xffffffff"),
+    ("0", "0"),
+    ("[::]", "::"),
+    ("[ff02::1]", "ff02::1"),
+]
+
+
+@pytest.mark.parametrize(("host", "entry"), _OTHER_SPELLINGS)
+def test_an_entry_covers_no_other_spelling_of_an_address(host: str, entry: str) -> None:
+    """BACKLOG #3765 item 8: ``_is_ipv4`` reads only the canonical form, so these fell to the exact
+    compare on the last line of ``_matches_domain`` and each entry covered its own spelling.
+
+    Mutation: return ``False`` from ``_reads_as_address``. Red: every case."""
+    url = f"https://{host}/"
+    assert is_external(url, (entry,))
+    assert not is_allowlisted(url, (entry,))
+
+
+def test_the_console_and_the_engine_agree_on_which_addresses_are_one_host_s() -> None:
+    """The console keeps its own copy of ``_not_a_host_address``, because importing the engine's
+    could fail against an older engine. Compared at the first and last address of every ``/16``,
+    so a new block of that size or larger in one copy turns this red; a smaller one might not.
+
+    Mutation: drop any arm of either copy. Red: the first address of that arm's range."""
+    verdicts = {}
+    for first in range(0, 2**32, 2**16):
+        for number in (first, first + 0xFFFF):
+            value = str(ipaddress.IPv4Address(number))
+            one_host = _external._is_one_host(value)
+            assert one_host is not _not_a_host_address(value), value
+            verdicts[one_host] = value
+    assert set(verdicts) == {True, False}
 
 
 def test_the_console_does_not_strip_a_leading_dot_from_an_entry() -> None:
@@ -156,11 +271,6 @@ def test_the_console_does_not_strip_a_leading_dot_from_an_entry() -> None:
     assert is_external(url, [".hospital.example"])
     assert not is_allowlisted(url, [".hospital.example"])
     assert not is_external(url, ["hospital.example"])
-
-
-@pytest.mark.parametrize("list_name", ["organization_domains", "external_link_allowlist"])
-def test_the_navigation_lists_take_a_canonical_ipv4_address(list_name: str) -> None:
-    assert _load(list_name, _IPV4) == [_IPV4]
 
 
 def test_the_recipient_list_refuses_an_ipv4_address() -> None:
@@ -184,8 +294,70 @@ def test_the_console_matches_an_ipv4_entry_exactly() -> None:
 )
 def test_the_console_and_the_engine_agree_on_what_is_an_ipv4_entry(value: str) -> None:
     # The console keeps its own stdlib check rather than import the engine module, so the two
-    # must not drift: an entry would move between exact and label-boundary matching.
+    # must not drift. A host that reads as an address can match only if this says it is canonical:
+    # read wider, _is_one_host would raise on a spelling settings refuse, and read narrower, an
+    # address settings accept would cover nothing.
     assert _external._is_ipv4(value) is is_canonical_ipv4(value)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [chr(0x212A) + "orp.example", chr(0xA0) + "korp.example", "korp.example" + chr(0x2003)],
+)
+def test_a_non_ascii_entry_covers_no_ascii_host(entry: str) -> None:
+    """BACKLOG #3765, the class of item 9 on the console's side. ``str.lower()`` turned the Kelvin
+    sign into an ASCII ``k`` and a plain ``strip()`` removed a non-ASCII space, so such an entry,
+    which settings would refuse or strip at load, covered an ASCII host if it reached the console
+    another way.
+
+    Mutation: put ``domain.strip().lower()`` back in ``_matches_domain``. Red: every case.
+    Mutation: drop the ``isascii()`` test. Red: the first case.
+    Mutation: call a plain ``strip()``. Red: the two white space cases."""
+    url = "https://korp.example/"
+    assert is_external(url, (entry,))
+    assert not is_allowlisted(url, (entry,))
+
+
+def test_an_ascii_entry_still_loses_its_padding_and_capitals() -> None:
+    # The control for the test above, with all six characters the strip removes.
+    padded = f"{string.whitespace}KORP.example{string.whitespace}"
+    assert not is_external("https://korp.example/", (padded,))
+    assert is_allowlisted("https://korp.example/", (padded,))
+
+
+def test_localhost_loads_as_a_name_and_covers_its_subdomains() -> None:
+    """``docs/CONFIGURATION.md`` says so, against the exact match an address entry gets. Control:
+    the loopback address covers nothing under it.
+
+    Mutation: match a single-label entry exactly in ``_matches_domain``. Red: the second
+    assertion."""
+    assert _load("organization_domains", "localhost") == ["localhost"]
+    assert not is_external("https://foo.localhost/", ("localhost",))
+    assert is_allowlisted("https://foo.localhost/", ("localhost",))
+    loopback = str(ipaddress.IPv4Address(0x7F00_0001))
+    assert is_external(f"https://foo.{loopback}/", (loopback,))
+
+
+def test_the_upn_compare_form_accepts_nothing_that_lowering_both_sides_refused() -> None:
+    """BACKLOG #3765 item 9: the OIDC suffix check moved from ``str.lower()`` on both sides to this
+    form, and the move must only tighten it. So over every character that has another case, in
+    each of its cases, bare and padded with an ASCII and a non-ASCII space: equal keys must mean
+    equal ``str.strip().lower()`` results.
+
+    Mutation: fold with ``casefold()`` in ``upn_suffix_key``. Red: a sharp s and ``ss``."""
+    forms = {
+        form
+        for c in map(chr, range(0x11_0000))
+        if c.lower() != c or c.upper() != c
+        for form in (c, c.lower(), c.upper())
+    }
+    assert len(forms) > 2000  # every BMP cased letter, so a filter gone wrong cannot pass this
+    by_key: dict[str, str] = {}
+    for form in sorted(forms):
+        for pad in ("", " ", chr(0xA0)):
+            suffix = f"{pad}{form}.example"
+            same_key = by_key.setdefault(upn_suffix_key(suffix), suffix)
+            assert same_key.strip().lower() == suffix.strip().lower()
 
 
 def test_a_blank_entry_is_skipped_by_every_list() -> None:

@@ -11,6 +11,17 @@
   active mode's credential header more than once is answered **`400`**, not the `401` of **AC-11**.
   AC-11 keeps its original text, with a dated note in place. See
   [Amendment 2026-09-29](#amendment-2026-09-29-a-repeated-credential-header-is-answered-400).
+- **Amended 2026-10-30 (vault BACKLOG #2287, Manager decision in batch 463):** `intake_client_subjects`
+  is keyed by the issuing CA's DN, and a subject is admitted only under the loaded CA whose key signed
+  the leaf. D6 and **AC-14** keep their original text. See
+  [Amendment 2026-10-30](#amendment-2026-10-30-intake_client_subjects-is-keyed-by-the-issuing-ca).
+- **Amended 2026-10-30 (BACKLOG #2105):** a body refused at ingress is answered by kind. The owner
+  ruling of 2026-09-30 answers a temporary refusal `503` with `Retry-After` and keeps a permanent one
+  at `422`; which refusals are temporary, the one `413` for over-size, and the id in the body are
+  Manager decision d20261030T155119571-255c98. A **temporary** refusal is **`503`** with `Retry-After`, an **over-size** one
+  **`413`** on every over-size path, and any other **`422`**, each naming the `ERROR` row as
+  `refused_message_id`. D5's note and **AC-8** keep their text, with a dated note in place. See
+  [Amendment 2026-10-30, refusal kinds](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
@@ -591,6 +602,9 @@ proxy client. The shipped `202` path keeps today's behaviour exactly.
 `422` and the same body, because a `202` misleads a plain receipt client exactly as it misleads a proxy
 client. See the
 [amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
+*(Amended 2026-10-30: the handler no longer returns `None`. It returns a refusal with its kind, and the
+answer is `503`, `413` or `422` on both paths. See the
+[amendment](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
 
 **This is a *post-record* refusal, not a pre-ingress one, and the distinction matters for count-and-log.**
 `_handle_inbound_http` returns `None` only *after* `record_received(status=MessageStatus.ERROR, …)` has
@@ -650,6 +664,8 @@ semantics** of a `reply_from`-less inbound, not to every byte on the wire. Sayin
 the claim. *(Amended 2026-09-26: a fourth delta now changes that path's status semantics too. A body the
 handler refuses is answered `422`, not `202`. See the
 [amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
+*(Amended 2026-10-30: that refusal is now `503`, `413` or `422` by kind. See the
+[amendment](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
 
 **Bounding is three independent clocks**: `receive_timeout` (read only, unchanged) + `reply_timeout` (the
 block) + `reply_write_timeout` (the drain). `self._active` already spans all of `_serve_one`, so
@@ -995,8 +1011,13 @@ to skip auth.
   *(Amended 2026-09-26: "the same `202` receipt" now covers a body the handler commits. A body it refuses,
   returning `None` after recording `ERROR`, is answered `422` as on the sync path. See the
   [amendment](#amendment-2026-09-26-a-body-refused-at-ingress-is-answered-422-on-both-paths).)*
+  *(Amended 2026-10-30: "the same `InboundHandler` contract" no longer holds for the receipt handler,
+  which returns an `IngressReceipt`. A refused body's answer names its `ERROR` row as `refused_message_id`, and is
+  `503` with `Retry-After` for a temporary refusal, `413` for an over-size one, and `422` otherwise. See
+  the [amendment](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
   → `tests/test_inbound_http_source.py::test_respond_with_receipt_on_ingress`
   → `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`
+  → `tests/test_ingress_refusal_kinds.py`
 - **AC-9** — WHILE a reply is being returned, THE SYSTEM SHALL NOT log the reply body at INFO or above nor
   place it in any exception, `connection_event.reason` or `message_events.detail`, SHALL bound the response
   drain by `reply_write_timeout`, and SHALL reject a captured `Content-Type` containing CR or LF **inside
@@ -1269,7 +1290,10 @@ as BACKLOG #1960.
 guards that do this live in `RegistryRunner._handle_inbound_http`; each records the message with status
 `ERROR` and commits no ingress row. D5 answered that `422` on the sync path only, and kept the `202`
 receipt path answering `202` with no `message_id`. Now both paths answer **`422`** with the fixed,
-non-PHI body `{"error":"message was not accepted"}`. One branch in `HttpSource._serve_one`
+non-PHI body `{"error":"message was not accepted"}`. *(Superseded 2026-10-30: the claim that every
+refused body gets this one fixed body and the status `422` no longer holds. The body now also names
+the `ERROR` row as `refused_message_id`, and the status is `503`, `413` or `422` by kind. See the
+[amendment of 2026-10-30](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)* One branch in `HttpSource._serve_one`
 ([`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py)) answers it before
 the mode is chosen, so the two paths cannot drift.
 
@@ -1308,11 +1332,17 @@ nothing is deployed.
 Before this amendment each of these answered `202`, which told the sender the body was stored, so the
 `422` is still the more honest answer. Fixing any of them widens the receipt-handler contract past
 `str | None`. That is unfiled, and it needs its own decision.
+*(Amended 2026-10-30: BACKLOG #2105 settles the code for each of the three and puts the id in the
+body. The strict-validation timeout stays `422`, and the refusal still emits no `connection_event`
+kind of its own. See the
+[amendment](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
 
 **Where the original text stays.** D5's note and AC-8 keep their wording, each with a dated italic note in
 place. AC-8 now links a second test,
 `tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, which pins
 the `422`, the exact body, exactly one `ERROR` row, no ingress row, and the `closed` event.
+*(Superseded 2026-10-30: the exact body that test pins now carries `refused_message_id`, and it covers
+only permanent refusals. See the [amendment of 2026-10-30](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).)*
 
 ## Amendment 2026-09-29: a repeated credential header is answered 400
 
@@ -1337,3 +1367,151 @@ attempt, so while `intake_auth_rate_limit` is on the same budget bounds it as an
 **Where the original text stays.** AC-11 keeps its wording, with a dated italic note in place. It now
 links a second test,
 `tests/test_inbound_http_intake_auth.py::test_a_repeated_credential_header_is_refused_before_any_comparison`.
+
+## Amendment 2026-10-30: `intake_client_subjects` is keyed by the issuing CA
+
+**A Manager seat decided the shape in batch 463, on 2026-10-30, building vault BACKLOG #2287.** The
+setting's operator-facing description is in [`CONNECTIONS.md`](../CONNECTIONS.md), in the `Http()`
+settings table. Read it there.
+
+**Why it was needed.** D6's allow-list matched a subject name alone. Every CA in the listener's
+`tls_ca_file` could issue a certificate with a listed subject, and the listener admitted it as that
+partner. This is the flaw BACKLOG #2237 closed on the operator API ([ADR 0083](0083-mtls-client-certificate-identity.md),
+Amendment 1), on a second surface. On a first deployment, a site loading more than one client CA into
+one `Http()` listener would have let any of them speak for any listed partner.
+
+**Decision.**
+
+- **The shape mirrors `[api].tls_client_cert_identities`.** The setting is a table: each key is the DN
+  of an issuing CA, as `cryptography`'s `Name.rfc4514_string()` renders that CA's subject, and each
+  value is a list of qualified subject names. The factory holds a key to the same canonical-form round
+  trip the API loader uses (`pki.canonical_dn`), and refuses one that does not round-trip to itself.
+- **The table is refused outside `mtls_subject`.** D6 already refused it under `none`, as a control
+  configured but never consulted. `api_key` and `bearer` never read a certificate either, so they now
+  refuse it too.
+- **The flat list is refused, with no compatibility shim.** It is refused at load with a message naming
+  the table to write. Nothing is deployed, so the break costs no one.
+- **The factory checks the whole shape itself.** The `connections.toml` type check stops one level in,
+  and `_reject_envref_in_lists` scans only list-valued settings. So `Http()` checks each key and each
+  item: types, non-empty, and an `env()` reference at any level, without repeating its default.
+- **The issuer is found by signature, from the bytes the context loaded.** `pki.IssuerIndex`, the
+  index the API uses, is built once from the exact `cadata` text the listener's `SSLContext` loaded as
+  its client trust store. The context builder hands that text back through a callback, so the listener
+  never reads `tls_ca_file` a second time, where a swapped file could differ. What makes a loaded CA
+  the issuer is stated once, on `IssuerIndex` in [pki.py](../../messagefoundry/pki.py).
+  The listener reads the leaf from `getpeercert(binary_form=True)`. It never reads
+  `getpeercert()["issuer"]`, which OpenSSL matches to a CA loosely, and never `get_verified_chain()`,
+  which is empty on a resumed session. The match itself is `client_cert_principal_under_issuer`, the
+  API's matcher.
+- **Only a loaded CA counts.** A leaf signed by an intermediate the client sends is refused, even when a
+  key names that intermediate's DN, unless that intermediate is itself loaded in `tls_ca_file`. Any
+  loaded CA could mint an intermediate with another CA's name, so only the copy the operator loaded is
+  trusted as an issuer. An operator whose partners use an intermediate loads it into `tls_ca_file`,
+  beside the root that signed it, and keys by the intermediate's DN.
+- **A key rollover under one DN denies both CAs, as on the API.** Two loaded CAs with one subject and
+  different keys name no issuer, so a partner CA re-keyed under its old name is refused until one of
+  the two leaves `tls_ca_file`. The start warning names the key. This keeps the API's rule rather than
+  invent a second one; ADR 0083 Amendment 1 records why the key is a name.
+- **The listener warns at start about a key that cannot match,** as the API does: one naming no loaded
+  CA, or naming two loaded CAs with one subject and different keys. Either would otherwise deny every
+  certificate under it with nothing in the log.
+- **Only the HTTP listener builds the index, and only under `mtls_subject`.** The MLLP listener calls the
+  same context builder without the callback, so its TLS behaviour is unchanged.
+
+**Where the original text stays.** D6 and AC-14 keep their wording. AC-14's test still covers the
+unlisted-subject `403`. The issuer cases, each with a control, are in
+`tests/test_inbound_http_intake_issuer.py`.
+
+## Amendment 2026-10-30: a temporary ingress refusal is answered 503 with Retry-After
+
+**The owner ruled on 2026-09-30,** relayed to the Lander that day and recorded on vault BACKLOG #2105: a
+temporary ingress refusal is answered `503` with `Retry-After`, and a permanent one stays `422`. A Manager
+seat decided the rest in batch 463, on 2026-10-30, after an adversarial review (decision
+d20261030T155119571-255c98): which refusals are temporary, the one code for over-size, and the id in the
+body. This settles the three known limits the 2026-09-26 amendment left open, with the exception noted
+below.
+
+**Why it was needed.** The 2026-09-26 amendment answered every refusal `422`. A sender that treats a
+`4xx` as final would give up on a body the engine refused only because it was busy, and the engine's
+own REST outbound dead-letters a `422`. So on a first deployment, an engine-to-engine hop would
+dead-letter messages that a re-send a few seconds later would have delivered.
+
+**The receipt contract.** A source that declares `wants_receipt` is started with a receipt handler that
+returns an `IngressReceipt` ([`transports/receipt.py`](../../messagefoundry/transports/receipt.py)). It
+holds the committed `message_id`, or a `RefusalKind` and the `ERROR` row's id. The generic
+`InboundHandler` that MLLP, TCP and the file sources use is unchanged. The `HttpReceiptHandler` alias
+the Context's code map names is gone; `ReceiptHandler` replaces it. A receipt is a refusal only when
+`enqueue_ingress` did not run, so an accepted body can never be reported refused.
+
+**The classification.** `RegistryRunner._handle_inbound_http` sorts each refusal, and the two receipt
+sources answer it in step.
+
+| Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers |
+| --- | --- | --- | --- |
+| the streaming detach's in-flight budget, held by other detaches | temporary | `503` with `Retry-After` | Out of Resources (`0xA700`) |
+| over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes` or over strict validation's own engine-default cap as `validate()` itself measures and reports it, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
+| every other refusal: at least a decode failure, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
+
+A body larger than the whole in-flight budget is over-size, not temporary: it could never fit, so a
+re-send would meet the same refusal. The budget is engine-wide and `max_message_bytes` is set per
+inbound, and nothing requires the first to be at least the second.
+
+No DICOM refusal is temporary today. A DICOM object takes the binary branch, which refuses only for
+size or a declared-type mismatch; the streaming detach is HL7 only. The SCP maps the kind in step so
+that a temporary refusal, should a binary path ever produce one, is answered as one.
+
+`Retry-After` is 5 seconds, from the module constant `TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS` in
+[`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py). Every answer to a
+refused body is `{"error": "message was not accepted", "refused_message_id": "<id>"}`, where the id is
+the `ERROR` row the runner wrote before it answered. The key is not `message_id`, which, where this
+listener's own answer carries it, names a committed message, so a refusal cannot be read as an
+acceptance. A proxied `reply_from` `200` or `502` answer carries the partner's own bytes, which may hold
+a `message_id` of the partner's (Lander decision d20261101T013132231-ef9540, decided under the owner's
+delegation of 2026-11-01). An operator can match a refusal to its row
+by id rather than by time and peer, and that row's error text opens with `[refusal kind: <kind>]`,
+ahead of any refused-body allowance note, so the kind is known before anyone resends the row. The `HL7MessageTooLarge` type the parse raises for an over-size body is
+named in that row's stored reason, where `HL7PeekError` was before.
+
+**The strict-validation timeout stays permanent.** The 2026-09-26 amendment named it as possibly
+temporary. It is not classed so, because a body that times out for its own content times out on every
+re-send, and each attempt leaves another `hl7apy` thread running that this path cannot stop. Inviting a
+retry would multiply the load the timeout exists to bound. **The cost is real:** the timeout also
+counts time spent waiting for a worker thread, so under load a valid body can time out, and it is then
+answered `422`, which a sender and the engine's REST outbound treat as final. Nothing here tells the
+two causes apart. **A strict-validation timeout caused by load answers `422` and is final (PERMANENT).**
+BACKLOG #2105's filing named the strict-validation timeout, beside the in-flight budget, as temporary:
+engine-side and possibly clearing on a retry. This amendment reclassifies it as permanent.
+It may be reclassified only if a discriminator is later measured that tells a body which would pass on
+a retry from one which would time out again.
+
+**One code for over-size.** A body over the listener's `max_body_bytes` already answered `413`, before
+the body is read and with no row. A body the runner refuses for size now answers `413` too, naming its
+`ERROR` row. The HL7 segment-count cap in `Peek.parse` is not a size cap and stays `422`.
+
+**The REST outbound is unchanged.** It already retries a `503` and dead-letters a `422` or `413`, as
+`tests/test_ingress_refusal_kinds.py` now pins against a live listener. It does not read `Retry-After`:
+its own `RetryPolicy` sets the delay, and a temporary refusal that never clears dead-letters after
+`max_attempts`.
+
+**What did not change.** Count-and-log: the `ERROR` row is still written before the answer. Each
+refused attempt is its own row, so a temporary refusal re-sent until it is accepted leaves one `ERROR`
+row per refused attempt beside the accepted one. Each of those rows names its kind in the
+`[refusal kind: <kind>]` tag its `error` text opens with, as above, and its reason names the in-flight
+budget. The
+pre-ingress refusals, the `202` on a committed body, and the `closed` connection event after a refusal
+are unchanged. The refusal still emits no `connection_event` kind of its own.
+
+**Where the original text stays.** D5's note and AC-8 keep their wording, each with a second dated
+italic note in place. AC-8's second test,
+`tests/test_inbound_http_source.py::test_a_body_refused_at_ingress_is_422_with_one_error_row`, now pins
+the `refused_message_id` in its exact body and carries only permanent causes. Its over-ceiling case moved to
+`tests/test_ingress_refusal_kinds.py`, which pins each kind with a control.
+
+*(Note 2026-11-01, BACKLOG #2431, added when batch 469 merged `main`: this amendment's decision did
+not cover it. One decode failure is temporary, not permanent: an inbound `encoding` naming no text
+codec. It refuses every body until an operator fixes the name, so the same body is accepted after,
+and it is the receipt form of the MLLP listener's `AE` for the same case. `Http()` answers it `503`
+with `Retry-After`, and its `ERROR` row's reason names the decode, not the in-flight budget. A DICOM
+object is never decoded, so the SCP never sees it. A decode failure in a usable charset stays
+permanent. A sender that honours `Retry-After` re-sends every 5 seconds until the name is fixed,
+leaving one `ERROR` row per attempt.)*

@@ -32,7 +32,8 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from messagefoundry.transports.base import DestinationConnector, NegativeAckError
+from messagefoundry.transports.base import ENCODING_CODE, DestinationConnector, NegativeAckError
+from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._refusal_log_capture import TOKEN, until
 from tests._refusal_log_capture import assert_no_token as _assert_no_token
@@ -315,10 +316,12 @@ async def test_a_permanently_refused_batch_logs_one_content_free_warning(
 class _MllpRecorder(MLLPDestination):
     """A real MLLP destination, so ``check_frame`` is the real one, whose send only records."""
 
-    def __init__(self) -> None:
+    def __init__(self, encoding: str = "utf-8") -> None:
         super().__init__(
             Destination(
-                name=OUT, type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 1}
+                name=OUT,
+                type=ConnectorType.MLLP,
+                settings={"host": "127.0.0.1", "port": 1, "encoding": encoding},
             )
         )
         self.sent: list[str] = []
@@ -327,22 +330,96 @@ class _MllpRecorder(MLLPDestination):
         self.sent.append(payload)
 
 
-async def test_a_batch_member_the_frame_refuses_logs_the_same_content_free_warning(
-    store: MessageStore, caplog: pytest.LogCaptureFixture
+#: The reason each refused member's line gives, by its refusal's code.
+_REASONS = {
+    FRAMING_CODE: "its frame cannot carry it",
+    MULTIPLE_MESSAGES_CODE: "it holds more than one message",
+    ENCODING_CODE: "its charset cannot encode it",
+    "reattach": "its document cannot be re-attached",
+}
+
+
+@pytest.mark.parametrize(
+    ("bad", "encoding", "code"),
+    [
+        # ADR 0205 rule 1: a member holding a frame byte.
+        (_adt(2, name=TOKEN + chr(0x1C)), "utf-8", FRAMING_CODE),
+        # ADR 0209: a member holding a second MSH line. The frame could carry it; the line must not
+        # say otherwise, or triage looks for a frame byte that is not there (BACKLOG #3759 item 1).
+        (_adt(2) + _adt(4), "utf-8", MULTIPLE_MESSAGES_CODE),
+        # A member the outbound's charset cannot encode: no frame byte either.
+        (_adt(2, name=TOKEN + chr(0xE9)), "ascii", ENCODING_CODE),
+    ],
+    ids=["frame-byte", "two-messages", "charset"],
+)
+async def test_a_refused_batch_member_logs_its_own_reason_content_free(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, bad: str, encoding: str, code: str
 ) -> None:
-    # ADR 0205 rule 1: one member holding a frame byte is dead-lettered alone. Its line shares the
-    # phrase and the throttle of the other permanent-refusal lines.
+    # One refused member is dead-lettered alone. Its line shares the phrase and the throttle of the
+    # other permanent-refusal lines, and names the reason its own refusal gives, and no other.
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
-    rec = _MllpRecorder()
+    rec = _MllpRecorder(encoding)
     runner = _batch_runner(store, rec)
-    bad = _adt(2, name=TOKEN + chr(0x1C))
     await _run_one_batch(store, runner, [_adt(1, name="DOE"), bad, _adt(3, name="DOE")])
 
     assert len(rec.sent) == 1 and await store.count_dead(allowed_channels=None) == 1
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "batch member" in text and "dead-lettered alone" in text
-    assert "NegativeAckError" in text
+    assert "NegativeAckError" in text and f"code {code!r}" in text
+    assert [reason for reason in _REASONS.values() if reason in text] == [_REASONS[code]]
+    _assert_no_token(caplog.records)
+
+
+def _unhashable_code_refusal() -> NegativeAckError:
+    """A connector's refusal whose code is not a string, nor hashable: the reason lookup must not
+    raise a TypeError after the dead-letter."""
+    refusal = NegativeAckError("refused", code="ZX", permanent=True)
+    refusal.code = ["ZX"]  # type: ignore[assignment]
+    return refusal
+
+
+class _RefusesMember2(DestinationConnector):
+    """A connector whose own frame check refuses member 2 permanently, with ``refusal``."""
+
+    def __init__(self, refusal: NegativeAckError) -> None:
+        self.refusal = refusal
+        self.sent: list[str] = []
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        if "MSG2" in payload:
+            raise self.refusal
+
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
+        self.sent.append(payload)
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        NegativeAckError("refused", code="ZX", permanent=True),
+        _CodelessRefusal(),
+        _unhashable_code_refusal(),
+    ],
+    ids=["unnamed-code", "no-code", "unhashable-code"],
+)
+async def test_a_member_refused_with_another_code_logs_the_neutral_reason(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, refusal: NegativeAckError
+) -> None:
+    # A code the reasons do not name, or none, claims no cause it cannot know (BACKLOG #3759).
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    rec = _RefusesMember2(refusal)
+    runner = _batch_runner(store, rec)
+    await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
+
+    assert len(rec.sent) == 1 and await store.count_dead(allowed_channels=None) == 1
+    (line,) = _refusal_lines(caplog)
+    text = line.getMessage()
+    assert "its frame check refused it" in text
+    assert [reason for reason in _REASONS.values() if reason in text] == []
     _assert_no_token(caplog.records)
 
 

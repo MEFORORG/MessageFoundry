@@ -34,6 +34,7 @@ import pytest
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStore, Stage
 from messagefoundry.store.store import MessageStatus
+from tests._store_audit import no_operator_audit
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
@@ -448,7 +449,7 @@ async def test_replay_and_reset_preserve_seq_position(store: Any) -> None:
     await store.mark_failed(
         head.id, "boom", RetryPolicy(max_attempts=9, backoff_seconds=5), now=110.0
     )
-    await store.replay(mids[0], now=120.0)
+    await store.replay(mids[0], now=120.0, audit=no_operator_audit)
     # After replay the head is due again and STILL leads the lane (seq unchanged), ahead of m2/m3.
     again = await store.claim_next_fifo(channel, now=130.0, stage=Stage.INGRESS.value)
     assert again is not None and again.message_id == mids[0]  # original position preserved

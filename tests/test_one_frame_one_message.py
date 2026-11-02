@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,8 @@ from messagefoundry.transports.framing import (
 )
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
+from messagefoundry.transports.timer import TimerSource
+from messagefoundry.transports.x12 import X12Source
 
 SB, EB, CR, BS, NUL = "\x0b", "\x1c", "\r", chr(92), "\x00"
 ENC = "^~" + BS + "&"
@@ -153,29 +156,7 @@ def _mllp(persistent: bool, no_ack: bool) -> MLLPDestination:
     return MLLPDestination(Destination(name="out", type=ConnectorType.MLLP, settings=settings))
 
 
-async def _never_dial() -> Any:
-    raise AssertionError("the refused payload opened a connection")
-
-
-@pytest.mark.parametrize("persistent", [False, True])
-@pytest.mark.parametrize("no_ack", [False, True])
-async def test_all_four_mllp_send_paths_refuse_before_any_dial(
-    monkeypatch: pytest.MonkeyPatch, persistent: bool, no_ack: bool
-) -> None:
-    dest = _mllp(persistent, no_ack)
-    monkeypatch.setattr(dest, "_dial", _never_dial)
-    try:
-        with pytest.raises(NegativeAckError) as caught:
-            await dest.send(SMUGGLED)
-    finally:
-        await dest.aclose()
-    assert caught.value.permanent is True
-
-
-@pytest.mark.parametrize("persistent", [False, True])
-async def test_both_tcp_send_paths_refuse_before_any_dial(
-    monkeypatch: pytest.MonkeyPatch, persistent: bool
-) -> None:
+def _tcp(persistent: bool = False) -> TcpDestination:
     settings: dict[str, object] = {
         "host": "127.0.0.1",
         "port": 1,
@@ -183,14 +164,41 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
         "timeout_seconds": 1,
         "persistent": persistent,
     }
-    dest = TcpDestination(Destination(name="out", type=ConnectorType.TCP, settings=settings))
-    monkeypatch.setattr(dest, "_dial", _never_dial)
-    try:
+    return TcpDestination(Destination(name="out", type=ConnectorType.TCP, settings=settings))
+
+
+async def _never_dial() -> Any:
+    raise AssertionError("the refused payload opened a connection")
+
+
+async def _refused_before_any_dial(
+    monkeypatch: pytest.MonkeyPatch, dest: MLLPDestination | TcpDestination, payload: str
+) -> NegativeAckError:
+    """Send ``payload`` through ``dest``'s real ``send()`` with a dial that fails the test, close
+    ``dest``, and return the refusal. The send-path tests of ADR 0205 and ADR 0209 share it, so
+    each keeps only the payload it sends and what it asserts of the refusal."""
+    async with aclosing(dest):
+        monkeypatch.setattr(dest, "_dial", _never_dial)
         with pytest.raises(NegativeAckError) as caught:
-            await dest.send(SMUGGLED_STX)
-    finally:
-        await dest.aclose()
-    assert caught.value.permanent is True and str(caught.value).startswith("TCP: ")
+            await dest.send(payload)
+    return caught.value
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("no_ack", [False, True])
+async def test_all_four_mllp_send_paths_refuse_before_any_dial(
+    monkeypatch: pytest.MonkeyPatch, persistent: bool, no_ack: bool
+) -> None:
+    refusal = await _refused_before_any_dial(monkeypatch, _mllp(persistent, no_ack), SMUGGLED)
+    assert refusal.permanent is True
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_both_tcp_send_paths_refuse_before_any_dial(
+    monkeypatch: pytest.MonkeyPatch, persistent: bool
+) -> None:
+    refusal = await _refused_before_any_dial(monkeypatch, _tcp(persistent), SMUGGLED_STX)
+    assert refusal.permanent is True and str(refusal).startswith("TCP: ")
 
 
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
@@ -488,7 +496,7 @@ async def _enqueue(store: MessageStore, bodies: list[str]) -> list[str]:
         pytest.param({"encoding_characters": "|^~" + BS + "&"}, {}, id="encoding-characters"),
     ],
 )
-def test_check_frame_sees_the_payload_after_the_send_rewrites(
+async def test_check_frame_sees_the_payload_after_the_send_rewrites(
     setting: dict[str, object], field: dict[str, Any]
 ) -> None:
     # A delimiter rewrite re-serializes the message, which drops a frame byte at either end, so a
@@ -496,20 +504,21 @@ def test_check_frame_sees_the_payload_after_the_send_rewrites(
     # shadow outbound would dead-letter what a live one delivers.
     settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, **setting}
     config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
-    rewriting = MLLPDestination(config)
-    rewriting.check_frame(CLEAN + EB)
-    with pytest.raises(NegativeAckError):
-        rewriting.check_frame(EMBEDDED_SB)  # an interior start byte survives any rewrite
-    with pytest.raises(NegativeAckError):
-        _SendRecorder().check_frame(CLEAN + EB)  # control: no rewrite, the byte reaches the frame
+    async with aclosing(MLLPDestination(config)) as rewriting, aclosing(_SendRecorder()) as plain:
+        rewriting.check_frame(CLEAN + EB)
+        with pytest.raises(NegativeAckError):
+            rewriting.check_frame(EMBEDDED_SB)  # an interior start byte survives any rewrite
+        with pytest.raises(NegativeAckError):
+            plain.check_frame(CLEAN + EB)  # control: no rewrite, the byte reaches the frame
 
 
-def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
+async def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
     settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, "framing": "stx_etx"}
-    dest = TcpDestination(Destination(name=DEST, type=ConnectorType.TCP, settings=settings))
-    dest.check_frame(CLEAN)
-    with pytest.raises(NegativeAckError) as caught:
-        dest.check_frame(SMUGGLED_STX)
+    tcp = TcpDestination(Destination(name=DEST, type=ConnectorType.TCP, settings=settings))
+    async with aclosing(tcp) as dest:
+        dest.check_frame(CLEAN)
+        with pytest.raises(NegativeAckError) as caught:
+            dest.check_frame(SMUGGLED_STX)
     assert caught.value.permanent is True and str(caught.value).startswith("TCP: ")
 
 
@@ -569,6 +578,101 @@ def test_frame_reply_neutralises_a_frame_byte_instead_of_raising() -> None:
     assert wire.count(b"\x0b") == 1 and wire.count(b"\x1c") == 1
     assert _frames(MLLP_CODEC, wire) == [(MSH + CR + "MSA|AA|C 1 " + CR).encode("utf-8")]
     assert frame_reply(MLLP_CODEC, CLEAN, "utf-8") == MLLP_CODEC.frame(CLEAN)
+
+
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "undefined", "base64"])
+def test_frame_reply_sends_utf8_when_the_inbound_charset_cannot_encode_it(encoding: str) -> None:
+    """BACKLOG #2431: the runner answers an unusable codec name with AE, and that AE must still
+    reach the sender rather than raise here after the ERROR row is written."""
+    assert frame_reply(MLLP_CODEC, CLEAN, encoding) == MLLP_CODEC.frame(CLEAN)
+
+
+def test_frame_reply_logs_its_utf8_fallback_by_connection_without_the_setting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLAUDE.md section 6: the fallback is never silent. The setting is configuration that may hold
+    anything, so the warning names the connection and leaves the value out."""
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_FALLBACK_LOG_ADT")
+        # Every message on that inbound fails alike, so a second reply adds no line.
+        frame_reply(MLLP_CODEC, CLEAN, "zz-secretish-codec", connection="IB_FALLBACK_LOG_ADT")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "IB_FALLBACK_LOG_ADT" in warnings[0] and "utf-8" in warnings[0]
+    assert "zz-secretish-codec" not in warnings[0]
+
+
+def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() -> None:
+    """``idna`` is a usable codec that raises for one reply. That is the reply's fault, so it is not
+    sent in utf-8 under an "unusable charset" warning, as ``decode_body`` decides it by the name."""
+    with pytest.raises(UnicodeError):
+        frame_reply(MLLP_CODEC, "a" * 64, "idna", connection="IB_IDNA")
+
+
+@pytest.mark.parametrize("declared", [b"latin-1", 8859])
+def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: object) -> None:
+    """BACKLOG #2431: a non-str name used to reach ``str.encode`` and raise ``TypeError``, so the AE
+    the runner built for it was never sent. Both listeners now hold the name the decode reads."""
+    mllp = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": declared},
+        )
+    )
+    tcp = TcpSource(
+        Source(
+            type=ConnectorType.TCP,
+            settings={"host": "127.0.0.1", "port": 0, "framing": "stx_etx", "encoding": declared},
+        )
+    )
+    assert mllp.encoding == tcp.encoding == str(declared)
+    assert frame_reply(MLLP_CODEC, CLEAN, mllp.encoding) == MLLP_CODEC.frame(CLEAN)
+    assert frame_reply(STX_ETX_CODEC, CLEAN, tcp.encoding) == STX_ETX_CODEC.frame(CLEAN)
+
+
+@pytest.mark.parametrize("declared", [None, ""])
+def test_the_timer_and_x12_sources_read_an_undeclared_encoding_as_utf8(declared: object) -> None:
+    """BACKLOG #2431: an explicit ``None`` or empty ``encoding`` is "not declared", as on the
+    listeners. These sources used ``str()`` of it, so a timer refused to build on a ``LookupError``
+    for a codec named ``None`` and an X12 source held that name for its replies."""
+    timer = TimerSource(
+        Source(
+            type=ConnectorType.TIMER,
+            settings={"body": "x", "run_once": True, "encoding": declared},
+        )
+    )
+    x12 = X12Source(
+        Source(
+            type=ConnectorType.X12,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": declared},
+        )
+    )
+    assert timer.encoding == x12.encoding == "utf-8"
+    assert timer._body_bytes == b"x"
+
+
+async def test_the_mllp_listener_sends_its_reply_when_its_encoding_is_not_a_str() -> None:
+    async def handler(raw: bytes) -> str:
+        return CLEAN
+
+    source = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0, "encoding": b"latin-1"},
+        )
+    )
+    await source.start(handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            writer.write(MLLP_CODEC.frame(CLEAN))
+            await writer.drain()
+            got = await asyncio.wait_for(reader.readuntil(b"\x1c"), 5)
+        finally:
+            writer.close()
+    finally:
+        await source.stop()
+    assert got == MLLP_CODEC.frame(CLEAN)[: len(got)]
 
 
 async def test_the_mllp_listener_sends_one_frame_when_its_reply_holds_a_start_byte() -> None:
@@ -648,17 +752,6 @@ X12 = (
 CONTENT = ("SND", "FORGED", "DOE", "ROE", "CTRL1", "CTRL2", "111", "999")
 
 
-def _tcp(persistent: bool = False) -> TcpDestination:
-    settings: dict[str, object] = {
-        "host": "127.0.0.1",
-        "port": 1,
-        "framing": "stx_etx",
-        "timeout_seconds": 1,
-        "persistent": persistent,
-    }
-    return TcpDestination(Destination(name="out", type=ConnectorType.TCP, settings=settings))
-
-
 def _assert_two_messages_refusal(exc: NegativeAckError, transport: str) -> None:
     assert exc.permanent is True
     assert exc.code == MULTIPLE_MESSAGES_CODE
@@ -685,14 +778,8 @@ async def test_all_four_mllp_send_paths_refuse_two_messages_before_any_dial(
     monkeypatch: pytest.MonkeyPatch, persistent: bool, no_ack: bool, payload: str
 ) -> None:
     # Before ADR 0209 each path framed the payload as asked: one frame, two messages, one ACK.
-    dest = _mllp(persistent, no_ack)
-    monkeypatch.setattr(dest, "_dial", _never_dial)
-    try:
-        with pytest.raises(NegativeAckError) as caught:
-            await dest.send(payload)
-    finally:
-        await dest.aclose()
-    _assert_two_messages_refusal(caught.value, "MLLP")
+    refusal = await _refused_before_any_dial(monkeypatch, _mllp(persistent, no_ack), payload)
+    _assert_two_messages_refusal(refusal, "MLLP")
 
 
 @pytest.mark.parametrize("payload", TWO_VARIANTS)
@@ -700,21 +787,15 @@ async def test_all_four_mllp_send_paths_refuse_two_messages_before_any_dial(
 async def test_both_tcp_send_paths_refuse_two_messages_before_any_dial(
     monkeypatch: pytest.MonkeyPatch, persistent: bool, payload: str
 ) -> None:
-    dest = _tcp(persistent)
-    monkeypatch.setattr(dest, "_dial", _never_dial)
-    try:
-        with pytest.raises(NegativeAckError) as caught:
-            await dest.send(payload)
-    finally:
-        await dest.aclose()
-    _assert_two_messages_refusal(caught.value, "TCP")
+    refusal = await _refused_before_any_dial(monkeypatch, _tcp(persistent), payload)
+    _assert_two_messages_refusal(refusal, "TCP")
 
 
 async def test_the_mllp_send_control_frames_one_message(monkeypatch: pytest.MonkeyPatch) -> None:
     # The control for the refusals above: the same destination sends one message as one frame.
-    dest = _mllp(persistent=False, no_ack=False)
-    sent = _record_wire(monkeypatch, dest)
-    await dest.send(CLEAN)
+    async with aclosing(_mllp(persistent=False, no_ack=False)) as dest:
+        sent = _record_wire(monkeypatch, dest)
+        await dest.send(CLEAN)
     assert sent == [MLLP_CODEC.frame(CLEAN)]
 
 
@@ -730,9 +811,9 @@ async def test_the_mllp_send_control_frames_one_message(monkeypatch: pytest.Monk
 async def test_the_tcp_send_carries_one_message_and_an_opaque_relay(
     monkeypatch: pytest.MonkeyPatch, payload: str
 ) -> None:
-    dest = _tcp()
-    sent = _record_wire(monkeypatch, dest)
-    await dest.send(payload)
+    async with aclosing(_tcp()) as dest:
+        sent = _record_wire(monkeypatch, dest)
+        await dest.send(payload)
     assert sent == [STX_ETX_CODEC.frame(payload)]
 
 
@@ -760,15 +841,15 @@ async def test_the_tcp_send_carries_one_message_and_an_opaque_relay(
         pytest.param(lambda: _tcp(), {}, "TCP", id="tcp"),
     ],
 )
-def test_check_frame_refuses_two_messages_as_a_send_does(
+async def test_check_frame_refuses_two_messages_as_a_send_does(
     dest: Any, kwargs: dict[str, Any], transport: str
 ) -> None:
     # check_frame is what a batch member (rewrite=False) and a shadow outbound are judged by, so
     # it must answer as a live send does; CLEAN is the control.
-    check = dest().check_frame
-    check(CLEAN, **kwargs)
-    with pytest.raises(NegativeAckError) as caught:
-        check(TWO, **kwargs)
+    async with aclosing(dest()) as built:
+        built.check_frame(CLEAN, **kwargs)
+        with pytest.raises(NegativeAckError) as caught:
+            built.check_frame(TWO, **kwargs)
     _assert_two_messages_refusal(caught.value, transport)
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 
+from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.framing import (
     MLLP_CODEC,
     PRESETS,
@@ -31,6 +32,7 @@ from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
+    "FRAMING_CODE",
     "MULTIPLE_MESSAGES_CODE",
     "FrameError",
     "FrameByteFault",
@@ -43,6 +45,7 @@ __all__ = [
     "PRESETS",
     "check_frame_bytes",
     "codec_for",
+    "declared_encoding",
     "frame_for_delivery",
     "frame_reply",
 ]
@@ -52,6 +55,15 @@ logger = logging.getLogger(__name__)
 #: The :class:`NegativeAckError` code of an MLLP or TCP delivery refused for holding more than one
 #: ``MSH`` segment (ADR 0209).
 MULTIPLE_MESSAGES_CODE = "multiple-messages"
+
+#: The :class:`NegativeAckError` code of a payload holding its codec's own start or end byte
+#: (ADR 0205 rule 1).
+FRAMING_CODE = "framing"
+
+#: The listeners whose reply-charset fallback has been logged. One line per connection, not per
+#: reply: an unusable name fails every message alike, and each one already has its ERROR row.
+#: Bounded by the configured inbounds, since the key is a connection name.
+_reply_fallback_logged: set[str] = set()
 
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
@@ -87,7 +99,7 @@ def check_frame_bytes(codec: FrameCodec, payload: str, encoding: str, *, transpo
     # harness; what is engine-only is the permanent delivery failure it becomes here.
     fault = codec.find_frame_byte(body)
     if fault is not None:
-        raise NegativeAckError(fault.describe(transport), code="framing", permanent=True)
+        raise NegativeAckError(fault.describe(transport), code=FRAMING_CODE, permanent=True)
     return body
 
 
@@ -106,7 +118,24 @@ def _refuse_more_than_one_message(payload: str, transport: str) -> None:
         )
 
 
-def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:
+def declared_encoding(declared: object) -> str:
+    """The charset name an inbound's ``encoding`` setting declares (default ``utf-8``).
+
+    The one rule for the name, read by the MLLP and TCP listeners for their replies, by the sources
+    that encode or decode with the setting themselves (at least the file, remote-file, timer, X12
+    and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
+    for the decode (BACKLOG #2431).
+    An explicit ``None`` or empty value means "not declared", so it falls back as an absent key does.
+    Config load refuses an inbound ``env()`` reference, every non-``str`` value but ``None`` and any
+    name naming no text codec (``Registry.encoding_problems``, BACKLOG #2431), so at run time this
+    sees a ``str`` or ``None``. The ``str()`` stays as a
+    backstop: a value that got past load anyway is never a ``TypeError`` out of ``encode`` or
+    ``decode``. Its ``str()`` either names a codec (``1252`` reads as ``cp1252``) or fails as a
+    ``LookupError`` the decode refuses and :func:`frame_reply` falls back from."""
+    return str(declared) if declared else "utf-8"
+
+
+def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str = "") -> bytes:
     """Frame a listener's reply, with each of the codec's start and end bytes replaced by a space.
 
     A listener replies AFTER it has committed the message, so a raise here would leave the sender
@@ -115,8 +144,31 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:
     as data). So the reply is neutralised rather than refused: the sender still gets exactly one
     frame, and an echoed control id that held a frame byte simply stops matching. A space is what
     the ACK builder already puts in place of an echoed CR or LF. The replacement is on bytes, for the
-    reason :func:`frame_for_delivery` checks bytes."""
-    body = reply.encode(encoding)
+    reason :func:`frame_for_delivery` checks bytes.
+
+    For the same reason a reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
+    that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
+    the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
+    cannot hold one reply's characters still raises, which the listener's last-resort arm owns.
+    Usable is decided by probing the NAME, as ``decode_body`` decides it: a usable codec such as
+    ``idna`` can raise a bare ``UnicodeError`` for one reply, which still raises here.
+    ``connection`` names the listener in the warning the fallback logs, once per connection. The
+    charset setting itself is not logged, since it is configuration that may hold anything."""
+    try:
+        body = reply.encode(encoding)
+    except UnicodeEncodeError:
+        raise
+    except (LookupError, UnicodeError):
+        if _is_text_codec(encoding):
+            raise
+        if connection not in _reply_fallback_logged:
+            _reply_fallback_logged.add(connection)
+            logger.warning(
+                "inbound %r: the reply charset is unusable, so its replies are encoded in utf-8 "
+                "instead (logged once per connection)",
+                connection,
+            )
+        body = reply.encode("utf-8")
     if codec.start in body or codec.end in body:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"

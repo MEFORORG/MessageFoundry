@@ -17,6 +17,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, NoReturn
 
 import pytest
@@ -31,6 +32,9 @@ from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import (
+    _ODBC_NO_TLS_VALUES,
+    _ODBC_PARAM_ALLOWLIST,
+    _ODBC_TLS_MODE_KEYWORDS,
     DatabaseDestination,
     DatabaseSource,
     _bind_params,
@@ -39,6 +43,7 @@ from messagefoundry.transports.database import (
     _build_odbc_dsn,
     _classify_db_error,
     _driver_code,
+    _is_tls_keyword,
     _is_transient,
     _lookup_connect_failure,
     _parse_named_params,
@@ -272,9 +277,14 @@ def test_build_odbc_dsn_postgres_shape() -> None:
     )
     assert "DRIVER={PostgreSQL Unicode}" in dsn
     assert "SERVER=db.example" in dsn and "SERVER={" not in dsn  # host unbraced, like the SS preset
-    assert "DATABASE={mefor}" in dsn
-    assert "UID={svc}" in dsn and "PWD={pw}" in dsn  # default credential keywords
-    assert "PORT={5432}" in dsn and "SSLmode={verify-full}" in dsn
+    # BACKLOG #2705: values are sent unbraced. psqlODBC kept braces on UID and DATABASE, did not
+    # honour a braced SSLmode (no TLS at all), and refused a braced PORT.
+    assert "DATABASE=mefor;" in dsn
+    assert "UID=svc;" in dsn and "PWD={pw};" in dsn  # default credential keywords
+    assert "PORT=5432;" in dsn and "SSLmode=verify-full;" in dsn
+    # Only the driver name and, for psqlODBC, the password are braced: psqlODBC URL-decodes an
+    # unbraced PWD.
+    assert dsn.count("{") == 2 and dsn.count("}") == 2
     # No SQL-Server TLS keywords are forced onto the generic path.
     assert "Encrypt=" not in dsn and "TrustServerCertificate=" not in dsn
 
@@ -294,8 +304,10 @@ def test_generic_dsn_warns_when_no_tls_keyword(caplog: pytest.LogCaptureFixture)
     assert any("TLS verification is NOT enforced" in r.getMessage() for r in caplog.records)
 
 
-def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureFixture) -> None:
-    # An operator who set a TLS keyword AT A VERIFYING VALUE has taken ownership → no WARNING (DEBUG).
+def test_generic_dsn_no_warn_when_a_mode_is_outside_the_deny_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A mode keyword at a value the deny-list does not name is delegated → no WARNING (DEBUG).
     # The other half of the pair is below: a TLS keyword at a NO-TLS value must still WARN. Before #333
     # the detector matched the regex against KEYS ONLY, so this test passed for `disable` too — which is
     # why the pair, not this test alone, is the control.
@@ -319,9 +331,10 @@ def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureF
         ("SSLMODE", "DISABLED"),  # MySQL Connector/ODBC
         ("SSLMODE", "PREFERRED"),  # MySQL Connector/ODBC: opportunistic
         ("Encrypt", "no"),
+        ("Encrypt", "Optional"),  # Microsoft ODBC 18 documents this as a synonym for `no`
         ("Encrypt", "0"),
         ("Encrypt", "false"),
-        ("Encrypt", "  Off  "),  # value classification tolerates case + surrounding whitespace
+        ("Encrypt", "OFF"),  # value classification tolerates case
     ],
 )
 def test_generic_dsn_warns_when_tls_keyword_is_at_a_no_tls_value(
@@ -333,10 +346,13 @@ def test_generic_dsn_warns_when_tls_keyword_is_at_a_no_tls_value(
     — psqlODBC's explicit *no TLS* spelling — was read as "the operator has taken TLS ownership" and the
     reminder dropped to DEBUG. That is the worst real case reported as the quiet one, and every surface
     built on top of it inherits the false negative."""
+    # MySQL's upper case modes need a MySQL driver name: any other driver takes libpq's spellings
+    # only (BACKLOG #2705).
+    mysql = value in ("DISABLED", "PREFERRED")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
         _build_odbc_dsn(
             {
-                "odbc_driver": "PostgreSQL Unicode",
+                "odbc_driver": "MySQL ODBC 8.0 Unicode Driver" if mysql else "PostgreSQL Unicode",
                 "server": "db.example",
                 "odbc_params": {key: value},
             }
@@ -360,7 +376,7 @@ def test_build_odbc_dsn_custom_credential_keywords() -> None:
             "odbc_password_key": "PASSWORD",
         }
     )
-    assert "USER={svc}" in dsn and "PASSWORD={pw}" in dsn
+    assert "USER=svc;" in dsn and "PASSWORD={pw};" in dsn  # MySQL is on the escape list
 
 
 def test_build_odbc_dsn_requires_driver() -> None:
@@ -442,7 +458,24 @@ def test_generic_destination_warning_names_the_connection(
     assert any("'OB_DB_GEN'" in m and "SSLmode=disable" in m for m in warned), warned
 
 
-_NO_TLS_WORDS = ("disable", "disabled", "allow", "prefer", "preferred", "no", "off", "false", "0")
+_NO_TLS_WORDS = (
+    "disable",
+    "disabled",
+    "allow",
+    "prefer",
+    "preferred",
+    "no",
+    "optional",
+    "off",
+    "false",
+    "0",
+)
+
+
+def test_the_no_tls_word_copy_matches_the_deny_list() -> None:
+    # The copy above pins the deny-list's content, and the sslpassword test below runs over it, so a
+    # word added to or dropped from either one must fail here rather than leave a word untested.
+    assert set(_NO_TLS_WORDS) == set(_ODBC_NO_TLS_VALUES)
 
 
 def _generic_dsn_logs(params: dict[str, str], caplog: pytest.LogCaptureFixture) -> str:
@@ -500,6 +533,114 @@ def test_a_lone_sslpassword_is_not_tls_ownership(password: str) -> None:
         "no TLS keyword is set in odbc_params"
     )
     assert generic_odbc_tls_unenforced({"sslpassword": password, "SSLmode": "verify-full"}) is None
+
+
+#: Every accepted keyword named like TLS that can set no mode. Read from the allowlist, so a TLS
+#: keyword added there later is held to this rule without anyone listing it here.
+_TLS_KEYWORDS_WITH_NO_MODE = sorted(
+    keyword
+    for keyword in _ODBC_PARAM_ALLOWLIST - _ODBC_TLS_MODE_KEYWORDS
+    if _is_tls_keyword(keyword)
+)
+_NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
+
+
+def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
+    # Positive control: an empty table would pass every test below. A mode keyword the build refuses
+    # would leave no accepted way to clear a hop.
+    assert {"sslca", "sslcapath", "sslcert", "sslcipher", "sslkey"} <= set(
+        _TLS_KEYWORDS_WITH_NO_MODE
+    )
+    assert _ODBC_TLS_MODE_KEYWORDS <= _ODBC_PARAM_ALLOWLIST
+
+
+@pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
+def test_a_lone_tls_keyword_that_sets_no_mode_is_not_tls_ownership(keyword: str) -> None:
+    """BACKLOG #2483. A key or certificate path with no mode beside it does not count as a mode. A
+    real mode beside it is the control."""
+    for spelling in (keyword, keyword.upper()):
+        assert generic_odbc_tls_unenforced({spelling: "fixture"}) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "require"}) is None
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "SSLmode": "verify-full"}) is None
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "prefer"}) == (
+        "TLS is explicitly not required: sslmode=prefer"
+    )
+
+
+def test_a_lone_sslrootcert_is_not_ownership() -> None:
+    # The ledger row names this keyword. The build refuses it (it is not on the allowlist), so the
+    # table above never reads it and only the classifier can be handed it.
+    assert generic_odbc_tls_unenforced({"sslrootcert": "ca.pem"}) == _NO_MODE_REASON
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"sslmode": ""},
+        {"sslmode": "   "},
+        {"Encrypt": ""},
+        {"sslmode": None},
+        {"SSLmode": "", "sslcert": "c.pem"},
+        {"sslmode": "", "Encrypt": "  "},
+        {"sslmode": ["disable"]},
+        {"Encrypt": ["yes"]},
+        {"sslmode": {"mode": "require"}},
+        {"Encrypt": True},
+        {"sslmode": 1},
+    ],
+)
+def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(params: dict[str, object]) -> None:
+    # connections.toml refuses a non-string value, so only a code-first table can hand one in.
+    assert generic_odbc_tls_unenforced(params) == _NO_MODE_REASON
+
+
+@pytest.mark.parametrize("value", [" require", "require ", "\tverify-full", "yes\n"])
+def test_a_padded_mode_value_sets_no_mode(value: str) -> None:
+    # psqlODBC switches on a value's first character, so a leading blank would select the driver's
+    # default. The build refuses a padded value outright since BACKLOG #2705; this pins the
+    # classifier the posture readers use on specs that were never built. The unpadded spelling is
+    # the control.
+    for keyword in ("sslmode", "Encrypt"):
+        assert generic_odbc_tls_unenforced({keyword: value}) == _NO_MODE_REASON
+        assert generic_odbc_tls_unenforced({keyword: value.strip()}) is None
+
+
+def test_a_padded_no_tls_value_is_still_named() -> None:
+    # Padding never hides the deny-list: that check reads the value trimmed.
+    assert generic_odbc_tls_unenforced({"sslmode": " disable"}) == (
+        "TLS is explicitly not required: sslmode=disable"
+    )
+
+
+def test_a_mode_keyword_named_twice_reads_the_same_in_either_order() -> None:
+    # The build refuses the duplicate, but the posture readers classify specs never built.
+    first: dict[str, object] = {"sslmode": "verify-full", "SSLMODE": ""}
+    second: dict[str, object] = {"SSLMODE": "", "sslmode": "verify-full"}
+    assert generic_odbc_tls_unenforced(first) is None
+    assert generic_odbc_tls_unenforced(second) is None
+
+
+def test_one_blank_mode_keyword_does_not_void_the_other() -> None:
+    assert generic_odbc_tls_unenforced({"sslmode": "", "Encrypt": "yes"}) is None
+    assert generic_odbc_tls_unenforced({"sslmode": "verify-full", "Encrypt": ""}) is None
+
+
+@pytest.mark.parametrize("value", ["bogus", "1", "VERIFY_IDENTITY"])
+def test_a_mode_value_the_deny_list_does_not_name_stays_delegated(value: str) -> None:
+    # A deny-list on purpose (see the comment above _ODBC_NO_TLS_VALUES). This pins the classifier
+    # only: since BACKLOG #2705 the build refuses an sslmode outside libpq's spellings on every
+    # driver but MySQL Connector/ODBC.
+    assert generic_odbc_tls_unenforced({"sslmode": value}) is None
+
+
+def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A relative name in an empty directory: no file can change the outcome, and it stays ASCII.
+    monkeypatch.chdir(tmp_path)
+    logged = _generic_dsn_logs({"sslcert": "absent.pem"}, caplog)
+    assert "TLS verification is NOT enforced" in logged and _NO_MODE_REASON in logged
+    assert "SSLmode=verify-full" in logged
 
 
 @pytest.mark.parametrize(
@@ -1429,7 +1570,8 @@ _MARKED_1 = [("UPDATE mf_inbox SET status='DONE' WHERE id=?", (1,))]
 class _StepCursor(_SrcCursor):
     """A source cursor that can hold a mark open, hold the cursor close that follows a mark, or hang
     every select from the ``hang_from``-th on, so a test can cancel stop() at a chosen point of the
-    poll."""
+    poll. With ``hold_through_cancel``, a held mark that is cancelled keeps the task until that
+    event is set, then lets the cancel out: a driver call that does not yield to a cancel."""
 
     def __init__(
         self,
@@ -1439,9 +1581,12 @@ class _StepCursor(_SrcCursor):
         mark_gate: asyncio.Event | None = None,
         close_gate: asyncio.Event | None = None,
         hang_from: int | None = None,
+        hold_through_cancel: asyncio.Event | None = None,
     ) -> None:
         super().__init__(columns, rows)
         self.mark_gate = mark_gate
+        self.hold_through_cancel = hold_through_cancel
+        self.in_held_cancel = asyncio.Event()
         self.close_gate = close_gate
         self.hang_from = hang_from
         self.selects = 0
@@ -1460,7 +1605,14 @@ class _StepCursor(_SrcCursor):
             self.in_mark.set()
             self.marking = True  # until the close that follows this mark
             if self.mark_gate is not None:
-                await self.mark_gate.wait()
+                try:
+                    await self.mark_gate.wait()
+                except asyncio.CancelledError:
+                    if self.hold_through_cancel is None:
+                        raise
+                    self.in_held_cancel.set()
+                    await self.hold_through_cancel.wait()
+                    raise
         await super().execute(sql, params)
 
     async def close(self) -> None:
@@ -1688,12 +1840,17 @@ async def _noop(raw: bytes) -> str | None:
 async def _cancelled_in_a_held_mark(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[DatabaseSource, asyncio.Task[None], _CountingPool, asyncio.Task[None], _StepCursor]:
-    """Start a poll whose mark never returns and whose cursor close is held on ``close_gate``, then
-    cancel stop() once, so the row grace runs out and the cut lands in the mark."""
+    """Start a poll whose mark never returns and does not yield to the cut until
+    ``hold_through_cancel`` is set, then cancel stop() once, so the row grace runs out and the cut
+    lands in the mark. Since BACKLOG #2394 a cut task no longer waits for its cursor close, so the
+    mark's call is what keeps the task alive past the cut."""
     monkeypatch.setattr(database_module, "_ROW_STEP_GRACE_S", 0.05)
     monkeypatch.setattr(database_module, "_POOL_CLOSE_TIMEOUT_S", 0.05, raising=False)
     cur = _StepCursor(
-        ["id", "payload"], [(1, "AAA")], mark_gate=asyncio.Event(), close_gate=asyncio.Event()
+        ["id", "payload"],
+        [(1, "AAA")],
+        mark_gate=asyncio.Event(),
+        hold_through_cancel=asyncio.Event(),
     )
     src, poll = await _started(cur, _noop)
     pool = src._pool
@@ -1704,34 +1861,37 @@ async def _cancelled_in_a_held_mark(
 async def test_a_further_cancel_during_the_cut_cannot_hang_the_pool_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cancel to stop() while the cut poll task is in its cursor close is not forwarded into the
-    task. stop() returns with the task still registered and the pool closed under it; the held
-    connection goes back once its close finishes, and the next stop() joins the task. Red on head
-    9a719f564, whose cancelling ``gather`` forwarded the cancel into the close, skipped the
-    release, and hung in ``wait_closed``."""
+    """A cancel to stop() while the cut poll task is still held by its call is not forwarded into
+    the task. stop() returns with the task still registered and the pool closed under it; the held
+    connection goes back once the call lets go, and the next stop() joins the task. Red on head
+    9a719f564, whose cancelling ``gather`` forwarded the cancel into the task's cleanup, skipped
+    the release, and hung in ``wait_closed``."""
     src, poll, pool, stop, cur = await _cancelled_in_a_held_mark(monkeypatch)
-    assert cur.close_gate is not None
-    await asyncio.wait_for(cur.in_close.wait(), 5.0)  # the grace ran out and the mark was cut
+    assert cur.hold_through_cancel is not None
+    await asyncio.wait_for(cur.in_held_cancel.wait(), 5.0)  # the grace ran out and the mark was cut
     stop.cancel()
     done, _ = await asyncio.wait({stop}, timeout=5.0)  # wait: see the next test
     assert done and stop.cancelled()
     assert src._task is poll and not poll.done() and pool.closed and src._pool is None
-    cur.close_gate.set()
+    cur.hold_through_cancel.set()
     await asyncio.wait_for(src.stop(), 5.0)
-    assert poll.cancelled() and pool.in_use == 0 and src._task is None
+    assert poll.cancelled() and src._task is None
+    # The cut mark's connection goes back from a detached step once its close ends (#2394).
+    await asyncio.wait_for(pool.wait_closed(), 5.0)
+    assert pool.in_use == 0
     assert cur.marks == []
 
 
 async def test_a_cut_task_a_driver_call_holds_does_not_hold_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The join of the cut task is bounded: a cursor close held on a driver thread keeps the task
-    alive past the cut, and stop() still returns, with the pool closed so a source nobody stops
+    """The join of the cut task is bounded: a driver call that does not yield to the cut keeps the
+    task alive past it, and stop() still returns, with the pool closed so a source nobody stops
     again leaks no connection. Red on head 9a719f564: stop() never returns. ``raising=False`` lets
     the test run, and fail on time, against a head without the bounds."""
     monkeypatch.setattr(database_module, "_CUT_JOIN_TIMEOUT_S", 0.05, raising=False)
     src, poll, pool, stop, cur = await _cancelled_in_a_held_mark(monkeypatch)
-    assert cur.close_gate is not None
+    assert cur.hold_through_cancel is not None
     try:
         # wait, not wait_for: on a head without the bound, wait_for's own cancel of the hung stop
         # would hang the test instead of failing it.
@@ -1740,7 +1900,7 @@ async def test_a_cut_task_a_driver_call_holds_does_not_hold_stop(
         assert stop.cancelled()
         assert src._task is poll and not poll.done() and pool.closed
     finally:
-        cur.close_gate.set()
+        cur.hold_through_cancel.set()
         await asyncio.wait_for(asyncio.gather(poll, return_exceptions=True), 5.0)
     await asyncio.wait_for(pool.wait_closed(), 5.0)
     assert pool.in_use == 0
@@ -1849,6 +2009,25 @@ def test_source_requires_core_settings(missing: str) -> None:
             Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings),
             egress=EgressSettings(deny_by_default=False),
         )
+
+
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "base64", "undefined", 8, True])
+def test_source_refuses_an_unusable_encoding_when_built(encoding: object) -> None:
+    # BACKLOG #2431: each polled row is encoded with this name, so an unusable one is refused when
+    # the source is built rather than surfacing per row. The message never renders the name.
+    settings = {**DatabasePoll(server="s", database="d", poll_statement=POLL).settings}
+    settings["encoding"] = encoding
+    with pytest.raises(ValueError, match="names no usable text codec") as ei:
+        build_source(
+            Source(type=ConnectorType.DATABASE, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert str(encoding) not in str(ei.value)
+
+
+@pytest.mark.parametrize("encoding", [None, "", "latin-1", "UTF_8"])
+def test_source_builds_with_a_usable_or_undeclared_encoding(encoding: object) -> None:
+    _src(encoding=encoding)
 
 
 # --- source connect-allowlist ([egress].allowed_db) --------------------------

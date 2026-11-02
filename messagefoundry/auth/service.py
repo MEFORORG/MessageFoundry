@@ -878,6 +878,11 @@ STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
 # that ends nobody's session of the caller's keeps the session window. Its own id and not
 # `session_terminate`, so a grant minted for DELETE /me/sessions cannot be spent on a map save.
 STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS = "save_ends_own_sessions"
+# BACKLOG #2614. `DELETE /sessions` ends every account's sessions, the caller's other ones included,
+# so it takes a proof bound to its own action, single-use and MFA-gated. Not `session_terminate` or
+# the map saves' id, so a grant minted to end the caller's own other sessions, or for a map save,
+# cannot be spent on ending everyone's.
+STEP_UP_ACTION_REVOKE_ALL_SESSIONS = "revoke_all_sessions"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
@@ -6984,12 +6989,18 @@ class AuthService:
         # inside that insert's transaction.) The federated caller has
         # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
         # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
-        federated = federated_subject is not None or mech == "oidc"
+        if mech == "oidc" and federated_subject is None:
+            # BACKLOG #2738 item 8, a programming error too. ``mech="oidc"`` alone used to count as
+            # federated: the login then skipped the bound-row refusal below, and its session insert
+            # required no pair, so it could sign in an account bound to another identity. No
+            # production caller did.
+            raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
+        federated = federated_subject is not None
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
             # other mechanism would let that OIDC session step up by password (ADR 0142 Amendment B).
             raise ValueError(
-                "a federated login (federated_subject or mech='oidc') needs the OIDC session"
+                "a federated login (one carrying federated_subject) needs the OIDC session"
                 " mechanism, and only a federated login may use it"
             )
         if federated and idp_auth_time is None:
@@ -11484,8 +11495,10 @@ class AuthService:
           gate refuses it for that reason, and does not audit it as a lapse.
         - ``"epoch"``: a whole-account revoke raised the account's epoch after this session was
           sealed, so the session belongs to sessions that were ended (BACKLOG #2592). That revoke
-          blanked every seal under the account's lock, so no write of the store's own leaves such
-          a row live: it is ended and reported like a row that fails its seal.
+          blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
+          a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
+          epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal;
+          docs/SECURITY.md, *Limits of the session sweep*, states what that costs.
 
         :meth:`logout` and :meth:`_supersede_session_hash` act on ``"credential"`` only. They read
         the account after their own revoke committed, so a whole-account revoke landing between
@@ -11719,6 +11732,41 @@ class AuthService:
             detail=_json({"scope": "admin", "user_id": user_id, "count": revoked}),
         )
         return revoked
+
+    async def revoke_every_session(
+        self, *, actor: str, keep_token_hash: str, client: str | None = None
+    ) -> tuple[int, bool]:
+        """Admin: end every account's sessions at once (BACKLOG #2614), for a suspected
+        compromise where walking the accounts one by one would leave the rest live meanwhile.
+        ``keep_token_hash`` keeps the caller's own session, so the administrator who ran it is not
+        signed out mid-response. Returns the count and whether that session was kept. Audited
+        even when the count is zero, because the act itself is the record an investigator looks
+        for. The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
+
+        A kept session whose seal fails makes the store write nothing. The caller's own session is
+        then suspect, so it is ended with the rest, and the audit row's scope says so, as
+        :meth:`revoke_other_sessions` does."""
+        try:
+            revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
+        except RowSealError:
+            # The sweep runs first, so the suspect row is counted with the rest: ended first by
+            # the seal-failure handler, the sweep would find it gone and the reply and the audit
+            # row would be one short. The handler still runs if the sweep raises, so the suspect
+            # row is ended either way; its own revoke then matches nothing, and it reports.
+            try:
+                revoked = await self._store.revoke_all_sessions()
+            finally:
+                await self._session_seal_failed(keep_token_hash)
+        # Read back rather than inferred: a revoke of the caller's own session that landed before
+        # the sweep leaves nothing kept, and the reply and the audit row must say so.
+        kept = await self._load_session(keep_token_hash) is not None
+        await self._audit(
+            "auth.session_revoked",
+            actor=actor,
+            detail=_json({"scope": "all_but_caller" if kept else "all", "count": revoked}),
+            client=client,
+        )
+        return revoked, kept
 
     async def _custom_permissions_for_ids(self, role_ids: Iterable[str]) -> frozenset[Permission]:
         """Resolve the permission overlay for any custom (``custom:``-prefixed) role ids the user holds
@@ -12377,6 +12425,7 @@ class AuthService:
     #: session never reaches its routes. It is listed anyway, for the owner's #1149 Reading B: a
     #: password re-proof from an MFA-pending session does not count as authenticating again, so
     #: ``POST /me/reauth`` and ``/ui/reauth`` mint that session no grant for it.
+    #: ``revoke_all_sessions`` (BACKLOG #2614) is listed for the same reason.
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
@@ -12384,6 +12433,7 @@ class AuthService:
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
             STEP_UP_ACTION_SESSION_TERMINATE,
             STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
         }
     )
 
@@ -16473,11 +16523,14 @@ class AuthService:
         used to say a first bind "adds a way in and withdraws none" and revoked nothing.
 
         The sweep is the write's own transaction (``Store.set_user_federated_subject``), so there
-        is no moment at which the pair is written and the earlier sessions are live. A Windows SSO
+        is no moment at which the pair is written and the earlier sessions are live, with the one
+        SQL Server exception at the end of this paragraph. A Windows SSO
         sign-in that read the row unbound either inserts its session before that transaction,
         which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
         the row bound and is refused. The account's own session never performs the bind: both
-        routes refuse a caller binding its own account.
+        routes refuse a caller binding its own account. One limit (BACKLOG #2738): on SQL Server
+        the sweep can miss a session rotated mid-scan. docs/SECURITY.md, *Limits of the session
+        sweep*, states what becomes of that session.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).

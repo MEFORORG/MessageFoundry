@@ -47,12 +47,21 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
+from tests._keyed_reopen_contract import (
+    CONTROL_CELL,
+    KeyedReopenReport,
+    assert_names_the_control_cell_alone,
+    remove_seal_passes,
+    server_keyed_reopen_report,
+)
+from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
-from tests._store_audit import ALERT_AUDIT, no_purge_audit
+from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -334,11 +343,29 @@ async def test_complete_with_response_parity(store) -> None:
         "MSA|AA",
     )
     # Re-send (replay → attempts reset to 0) → seq=2, no PK collision.
-    assert await store.replay(mid, now=400.0) == 1
+    assert await store.replay(mid, now=400.0, audit=no_operator_audit) == 1
     item2 = (await store.claim_ready(now=500.0))[0]
     await store.complete_with_response(item2.id, body="MSA|AA|2", outcome="accepted", now=600.0)
     caps2 = await store.correlate_response(mid)
     assert [(c.response_seq, c.body) for c in caps2] == [(1, "MSA|AA"), (2, "MSA|AA|2")]
+
+
+async def test_complete_with_response_scrubs_detail_pg(store) -> None:
+    # BACKLOG #2984: a reply's detail is stored through safe_text(detail, limit=200), as an ack_sent
+    # row's is, whatever the connector put in it. Synthetic PID fragment, invented for this test.
+    detail = "partner note PID|1||MRN7731^^^H^MR||ZEPHYRTEST^QUINN||19700101"
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(
+        item.id, body="MSA|AA", outcome="accepted", detail=detail, now=300.0
+    )
+    (reply,) = await store.correlate_response(mid)
+    # The exact value is pinned against safe_text on SQLite (tests/test_b2984_reply_detail_scrub.py);
+    # importing redaction here would widen this suite's serverdb path gate.
+    assert reply.detail is not None and reply.detail.startswith("partner note ")
+    assert "ZEPHYRTEST" not in reply.detail and "MRN7731" not in reply.detail
 
 
 # --- ADR 0021 "Response Sent" inbound ACK capture parity (MLLP-20) -----------------------------
@@ -697,7 +724,7 @@ async def test_replay_requeues(store) -> None:
     )
     item = (await store.claim_ready(now=200.0))[0]
     await store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1), now=200.0)  # -> dead
-    requeued = await store.replay(mid, now=300.0)
+    requeued = await store.replay(mid, now=300.0, audit=no_operator_audit)
     assert requeued == 1
     outbox = await store.outbox_for(mid)
     assert outbox[0]["status"] == OutboxStatus.PENDING.value and outbox[0]["attempts"] == 0
@@ -723,7 +750,7 @@ async def test_list_count_and_replay_dead(store) -> None:
     assert rows[0]["attempts"] == 1 and rows[0]["last_error"] == "boom"
     assert await store.count_dead(destination_name="OB1", allowed_channels=None) == 1
 
-    assert await store.replay_dead(destination_name="OB1", now=300.0) == 1
+    assert await store.replay_dead(destination_name="OB1", now=300.0, audit=no_operator_audit) == 1
     assert await store.count_dead(allowed_channels=None) == 1
     assert (await store.list_dead(allowed_channels=None))[0]["destination_name"] == "OB2"
 
@@ -783,7 +810,7 @@ async def test_replay_dead_only_dead_rows(store) -> None:
     await store.mark_done(done.id, now=110.0)
     await store.mark_failed(dead.id, "boom", RetryPolicy(max_attempts=1), now=110.0)
 
-    assert await store.replay_dead(now=200.0) == 1  # only the dead row
+    assert await store.replay_dead(now=200.0, audit=no_operator_audit) == 1  # only the dead row
     rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert rows["OB1"]["status"] == OutboxStatus.DONE.value
     assert rows["OB2"]["status"] == OutboxStatus.PENDING.value and rows["OB2"]["attempts"] == 0
@@ -900,7 +927,7 @@ async def test_dead_letter_missing_inbounds(store) -> None:
     assert (await store.get_message(orphan))["status"] == MessageStatus.ERROR.value
     assert (await store.outbox_for(outbound))[0]["status"] == OutboxStatus.PENDING.value
     # Replayable: the operator restores the inbound and the row comes back pending at its own stage.
-    assert await store.replay(orphan, now=300.0) == 1
+    assert await store.replay(orphan, now=300.0, audit=no_operator_audit) == 1
     item = await store.claim_next_fifo("GONE_IN", stage=Stage.INGRESS.value, now=300.0)
     assert item is not None and item.payload == RAW
 
@@ -1296,6 +1323,35 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
     await _assert_bind_sweeps_and_unbound_guard_contract(store)
 
 
+async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
+    """BACKLOG #2738 on the real Postgres backend: ``delete_user`` takes the account's ``users``
+    row before its sessions, as the bind does, so the two cannot deadlock.
+
+    The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
+    request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
+    from typing import Any
+
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_and_user_delete_take_one_lock_order,
+    )
+
+    async def _backend_pid(conn: Any) -> object:
+        return conn.get_server_pid()
+
+    async def _is_blocking(pid: object) -> bool:
+        return bool(
+            await store._fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
+                " AND $1::int = ANY(pg_blocking_pids(pid)))",
+                pid,
+            )
+        )
+
+    await _assert_bind_and_user_delete_take_one_lock_order(
+        store, holder_of=_backend_pid, is_blocking=_is_blocking
+    )
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 
@@ -1686,6 +1742,59 @@ async def test_staged_pipeline_processes_to_delivered(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+    """BACKLOG #3462: the Postgres twin of the SQLite test of the same name. ``reply_dropped``
+    rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
+    False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
+    ``events_for``, which decrypts ``detail``."""
+    detail = "HTTP 200; reply body over the 64-byte bound"
+
+    async def _to_outbound(now: float):
+        mid, routed_item = await _route_and_claim_routed(store, "IB", now)
+        assert routed_item is not None
+        assert await store.transform_handoff(
+            routed_id=routed_item.id,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[("OB1", "transformed")],
+            now=now,
+        )
+        out = await store.claim_next_fifo("OB1", now=now)
+        assert out is not None and out.stage == Stage.OUTBOUND.value
+        return mid, out
+
+    def _tail(events):
+        return [
+            (e["event"], e["destination"], e["detail"] if e["event"] == "reply_dropped" else None)
+            for e in events
+            if e["event"] in ("delivered", "reply_dropped")
+        ]
+
+    mid, out = await _to_outbound(100.0)
+    assert await store.mark_done(out.id, now=110.0, reply_dropped=detail) is True
+    after_drop = await store.events_for(mid)
+    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+    async def _dropped_anywhere():
+        # A count over every message, so a stray write against another message would show. It
+        # reads no detail, so no ciphertext comes back.
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM message_events WHERE event = 'reply_dropped'"
+        )
+        return int(rows[0]["n"])
+
+    assert await _dropped_anywhere() == 1
+    assert await store.mark_done("no-such-row", now=111.0, reply_dropped=detail) is False
+    assert await store.events_for(mid) == after_drop
+    assert await _dropped_anywhere() == 1  # the vanished row wrote nothing anywhere
+
+    plain, other = await _to_outbound(120.0)
+    assert await store.mark_done(other.id, now=130.0) is True
+    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert await _dropped_anywhere() == 1
+
+
 async def test_routed_to_filtered_collapse(store) -> None:
     """A routed message whose only handler transforms to ZERO deliveries collapses to FILTERED."""
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
@@ -2067,117 +2176,24 @@ async def test_keyless_open_of_encrypted_state_fails_closed(store) -> None:
 
 
 async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
-    """BACKLOG #1723: a no-key -> key restart must seal legacy plaintext IN PLACE on this backend, and
-    until now nothing on the ``postgres-store`` leg proved it at runtime.
+    """BACKLOG #1723: a no-key -> key restart must seal every written cell IN PLACE on this backend,
+    and each must then read back through its real read path.
 
-    ``_encrypt_existing_rows`` reaches its cells three different ways — the id-keyed ``_CIPHER_COLUMNS``
-    loop (``messages.raw``/``messages.error``, ``queue.last_error``), a composite-PK pass
-    (``state.value``, ``reference.value``) and an ``id_keyed=True`` composite pass
-    (``message_events.detail``). One cell per shape, so a pass dropped from any of the three reds here
-    rather than only in the static scan. The SQL Server twin is
-    ``test_legacy_plaintext_error_detail_migrated_on_open`` plus
-    ``test_state_plaintext_migrated_on_keyed_reopen`` in ``tests/test_sqlserver_store.py``; the static
-    both-backends-name-every-cell check is ``tests/test_store_cipher_sweep_parity.py``, which is what
-    covers the cells this test does not name.
-
-    Every assertion that a value is PLAINTEXT excludes the marker prefix outright rather than a single
-    marker version — a ``v1``-only spelling passes on an encrypted ``v2`` value and would make the
-    setup half of this test vacuous.
+    The cells are the ones ``tests/test_store_cipher_sweep_parity.py`` finds written in
+    ``postgres.py``, and the writers and readers are ``tests/_keyed_reopen_contract.py``, which the
+    ``sqlserver-store`` leg and the plain leg share. A pass dropped from any of the sweep's shapes
+    reds here by cell name.
     """
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.postgres import PostgresStore
+    assert await server_keyed_reopen_report(store) == KeyedReopenReport()
 
-    settings = load_settings(environ=os.environ).store
-    k = generate_key()
-    err, fail = "legacy bad parse", "legacy delivery failure"
 
-    def probes(eid: str, qid: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
-        """One at-rest read per cell, asked IDENTICALLY before and after the keying — a second copy
-        of this list is how the two halves drift until the 'plaintext' half checks a cell the
-        'sealed' half does not. ``detail <> ''`` mirrors the sweep's own skip-blank predicate, so a
-        legitimately empty value cannot read as an unmigrated one."""
-        return (
-            ("SELECT error AS v FROM messages WHERE id=$1", (eid,)),
-            ("SELECT raw AS v FROM messages WHERE id=$1", (qid,)),
-            ("SELECT last_error AS v FROM queue WHERE message_id=$1", (qid,)),
-            ("SELECT value AS v FROM state", ()),
-            ("SELECT value AS v FROM reference", ()),
-            (
-                "SELECT detail AS v FROM message_events WHERE detail IS NOT NULL AND detail <> ''",
-                (),
-            ),
-        )
-
-    try:
-        # (1) KEYLESS: every value below lands as plaintext at rest.
-        plain = await PostgresStore.open(settings)
-        try:
-            eid = await plain.record_received(
-                channel_id="IB", raw=RAW, status=MessageStatus.ERROR, error=err
-            )
-            qid = await plain.enqueue_message(
-                channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
-            )
-            item = (await plain.claim_ready(now=100.0))[0]
-            await plain.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)
-            mid, routed = await _route_and_claim_routed(plain, "IB", now=200.0)
-            await plain.transform_handoff(
-                routed_id=routed.id,
-                message_id=mid,
-                channel_id="IB",
-                deliveries=[("OB1", "x")],
-                state_ops=[("ns", "k", {"mrn": "M-LEGACY-STATE"})],
-                now=210.0,
-            )
-            await plain.write_reference_snapshot(
-                name="providers", version="v1", rows={"P1": {"mrn": "M-LEGACY-REF"}}
-            )
-            for sql, args in probes(eid, qid):
-                rows = await plain._fetchall(sql, *args)
-                assert rows, f"nothing written for {sql} — the keyless setup wrote no row"
-                assert all(not r["v"].startswith(MARKER_PREFIX) for r in rows), sql
-        finally:
-            await plain.close()
-
-        # (2) Re-open WITH a key: open() runs _encrypt_existing_rows over the legacy plaintext.
-        keyed = await PostgresStore.open(settings, cipher=make_cipher(k))
-        try:
-            for sql, args in probes(eid, qid):
-                rows = await keyed._fetchall(sql, *args)
-                assert rows and all(r["v"].startswith(MARKER_PREFIX) for r in rows), (
-                    f"still plaintext at rest after the keyed reopen: {sql}"
-                )
-            # ... and the read paths still return the original cleartext through the new key.
-            fetched = await keyed.get_message(eid)
-            assert fetched is not None
-            assert fetched["error"] == err
-            fetched = await keyed.get_message(qid)
-            assert fetched is not None
-            assert fetched["raw"] == RAW
-            assert (await keyed.list_dead(allowed_channels=None))[0]["last_error"] == fail
-            assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
-            assert keyed.reference_view()["providers"]["P1"] == {"mrn": "M-LEGACY-REF"}
-        finally:
-            await keyed.close()
-    finally:
-        # Shared-DB hygiene, even on assertion failure: rows sealed under this test's key make the
-        # next KEYLESS fixture open fail closed in _load_state_cache / _load_reference_cache, which
-        # cascades setup errors across every later test in the run.
-        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
-        try:
-            async with cleanup._pool.acquire() as conn:
-                for table in (
-                    "message_events",
-                    "state",
-                    "reference",
-                    "reference_version",
-                    "response",
-                    "queue",
-                    "messages",
-                ):
-                    await conn.execute(f"DELETE FROM {table}")
-        finally:
-            await cleanup.close()
+async def test_removing_a_cells_on_open_pass_reds_the_keyed_reopen_contract(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control on this backend's own sweep, so the test above is shown able to fail
+    here and not only on SQLite."""
+    remove_seal_passes(monkeypatch, type(store), {CONTROL_CELL})
+    assert_names_the_control_cell_alone(await server_keyed_reopen_report(store))
 
 
 async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -> None:
@@ -3308,7 +3324,8 @@ async def test_replay_resend_not_deduped_pg(store) -> None:
     assert item is not None
     await store.mark_done(item.id, now=300.0)
     assert len(await _pg_ledger(store)) == 1
-    assert await store.replay(mid, now=400.0) == 1  # re-send drops the ledger entry
+    # re-send drops the ledger entry
+    assert await store.replay(mid, now=400.0, audit=no_operator_audit) == 1
     assert await _pg_ledger(store) == []
     again = await store.claim_next_fifo("OB1", now=500.0)
     assert again is not None and again.id == item.id  # claimed normally, NOT deduped
@@ -3550,7 +3567,8 @@ async def test_pt_marker_is_stamped_and_a_mixed_replay_ends_processed_pg(store) 
     assert await _pg_deliver(store, now=120.0) == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
 
-    assert await store.replay(parent, now=200.0) == 1  # the real delivery only
+    # the real delivery only
+    assert await store.replay(parent, now=200.0, audit=no_operator_audit) == 1
     assert await _pg_deliver(store, now=210.0) == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
     assert await store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
@@ -3563,21 +3581,29 @@ async def test_pt_marker_is_never_a_resend_source_pg(store) -> None:
     parent = await _pg_pt_parent(store, outbound=True)
     assert await _pg_deliver(store, now=120.0) == 1
     outcome = await store.resend_to(
-        message_id=parent, to="OB_STANDBY", idempotency_key=uuid4().hex, now=200.0
+        message_id=parent,
+        to="OB_STANDBY",
+        idempotency_key=uuid4().hex,
+        now=200.0,
+        audit=no_operator_audit,
     )
     assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
 
     alone = await _pg_pt_parent(store, outbound=False)
     with pytest.raises(ResendSourceNotFound):
         await store.resend_to(
-            message_id=alone, to="OB_STANDBY", idempotency_key=uuid4().hex, now=300.0
+            message_id=alone,
+            to="OB_STANDBY",
+            idempotency_key=uuid4().hex,
+            now=300.0,
+            audit=no_operator_audit,
         )
 
 
 async def test_pt_depth_capped_marker_stays_out_of_bulk_dead_replay_pg(store) -> None:
     capped = await _pg_pt_parent(store, outbound=False, depth_capped=True)
     assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
-    assert await store.replay_dead(now=200.0) == 0
+    assert await store.replay_dead(now=200.0, audit=no_operator_audit) == 0
     assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
 
 
@@ -4296,7 +4322,9 @@ async def test_resend_plain_parity_pg(store) -> None:
     # at-least-once: a genuine NEW pending tail row shipping the retained TRANSFORMED body.
     mid = await _rs_seed(store)
     before = {r["id"] for r in await store.outbox_for(mid)}
-    out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    out = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert out.status == "resent" and out.to_destination == "OB2" and out.from_destination == "OB1"
     ob2 = [r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]
     assert len(ob2) == 1 and ob2[0]["id"] not in before and ob2[0]["id"] == out.outbox_id
@@ -4312,22 +4340,30 @@ async def test_resend_plain_parity_pg(store) -> None:
     assert seqs[ob2[0]["id"]] == max(seqs.values())
 
     # same-key duplicate -> exactly one row, reports the prior outcome.
-    dup = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    dup = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert dup.status == "duplicate" and dup.outbox_id == out.outbox_id
     assert len([r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]) == 1
     # new key -> a genuine second resend (source pinned; OB2 is now ambiguous).
-    out2 = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k2", from_="OB1")
+    out2 = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k2", from_="OB1", audit=no_operator_audit
+    )
     assert out2.status == "resent"
     assert len([r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]) == 2
 
     # key reused across a DIFFERENT message -> conflict (409), never a silent drop.
     m2 = await _rs_seed(store)
     with pytest.raises(ResendKeyConflict):
-        await store.resend_to(message_id=m2, to="OB2", idempotency_key="k1")
+        await store.resend_to(
+            message_id=m2, to="OB2", idempotency_key="k1", audit=no_operator_audit
+        )
     assert [r for r in await store.outbox_for(m2) if r["destination_name"] == "OB2"] == []
     # key reused for a DIFFERENT target -> conflict.
     with pytest.raises(ResendKeyConflict):
-        await store.resend_to(message_id=mid, to="OB3", idempotency_key="k1")
+        await store.resend_to(
+            message_id=mid, to="OB3", idempotency_key="k1", audit=no_operator_audit
+        )
 
     # retention-nulled source -> ResendSourceEmpty (never a zero-length PROCESSED body).
     m3 = await _rs_seed(store)
@@ -4335,20 +4371,26 @@ async def test_resend_plain_parity_pg(store) -> None:
         await store.mark_done(str(r["id"]))
     assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
     with pytest.raises(ResendSourceEmpty):
-        await store.resend_to(message_id=m3, to="OB2", idempotency_key="k3")
+        await store.resend_to(
+            message_id=m3, to="OB2", idempotency_key="k3", audit=no_operator_audit
+        )
 
     # no delivered body (ERROR-only) -> ResendSourceNotFound.
     eid = await store.record_received(
         channel_id="in1", raw=_RS_ADT, status=MessageStatus.ERROR, error="parse boom"
     )
     with pytest.raises(ResendSourceNotFound):
-        await store.resend_to(message_id=eid, to="OB2", idempotency_key="k4")
+        await store.resend_to(
+            message_id=eid, to="OB2", idempotency_key="k4", audit=no_operator_audit
+        )
 
     # a dead-lettered source is an eligible source (divert-to-standby, ADR 0090 §1).
     m4 = await _rs_seed(store)
     src = [r for r in await store.outbox_for(m4) if r["destination_name"] == "OB1"][0]
     await store.mark_failed(str(src["id"]), "permanent AR", RetryPolicy(max_attempts=0))
-    out4 = await store.resend_to(message_id=m4, to="OB2", idempotency_key="k5")
+    out4 = await store.resend_to(
+        message_id=m4, to="OB2", idempotency_key="k5", audit=no_operator_audit
+    )
     assert out4.status == "resent" and out4.from_destination == "OB1"
 
     # ambiguous multi-destination source requires from_; naming it ships THAT source's body.
@@ -4356,8 +4398,12 @@ async def test_resend_plain_parity_pg(store) -> None:
         store, deliveries=[("OB1", _RS_TRANSFORMED), ("OB3", _RS_TRANSFORMED + "X")]
     )
     with pytest.raises(ResendSourceAmbiguous):
-        await store.resend_to(message_id=m5, to="OB2", idempotency_key="k6")
-    out5 = await store.resend_to(message_id=m5, to="OB2", idempotency_key="k7", from_="OB3")
+        await store.resend_to(
+            message_id=m5, to="OB2", idempotency_key="k6", audit=no_operator_audit
+        )
+    out5 = await store.resend_to(
+        message_id=m5, to="OB2", idempotency_key="k7", from_="OB3", audit=no_operator_audit
+    )
     assert out5.status == "resent" and out5.from_destination == "OB3"
     p5 = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(m5)}
     assert p5["OB2"] == _RS_TRANSFORMED + "X"
@@ -4374,7 +4420,7 @@ async def test_resend_reopens_processed_to_routed_pg(store) -> None:
     for r in await store.outbox_for(mid):
         await store.mark_done(str(r["id"]))
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
-    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit)
     assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
     ob2 = [r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"][0]
     await store.mark_done(str(ob2["id"]))
@@ -4406,7 +4452,14 @@ async def test_resend_funnels_behind_uncommitted_producer_pg(store) -> None:
         await store._lock_outbound_lanes(conn, ("OB2",))
         await store._insert_outbound_row(conn, pmid, "IB", "OB2", "PRODUCER", 101.0)
         task = asyncio.create_task(
-            other.resend_to(message_id=mid, to="OB2", idempotency_key="k1", from_="OB1", now=102.0)
+            other.resend_to(
+                message_id=mid,
+                to="OB2",
+                idempotency_key="k1",
+                from_="OB1",
+                now=102.0,
+                audit=no_operator_audit,
+            )
         )
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
@@ -4439,7 +4492,9 @@ async def test_reingress_parity_pg(store) -> None:
 
     origin = await _rs_seed(store)
     before = await store.get_message(origin)
-    out = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1")
+    out = await store.reingress(
+        origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     assert out.status == "resubmitted" and out.message_id == origin and out.new_message_id != origin
     assert out.channel_id == "in1"
 
@@ -4468,7 +4523,9 @@ async def test_reingress_parity_pg(store) -> None:
     assert after["status"] == before["status"] and after["metadata"] == before["metadata"]
 
     # same key -> duplicate, same child, still exactly one child + one ingress row (no double-inject).
-    dup = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1")
+    dup = await store.reingress(
+        origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     assert dup.status == "duplicate" and dup.new_message_id == out.new_message_id
     async with store._pool.acquire() as conn:
         n = await conn.fetchval("SELECT COUNT(*) FROM messages WHERE id=$1", out.new_message_id)
@@ -4479,15 +4536,21 @@ async def test_reingress_parity_pg(store) -> None:
         )
     assert n == 1 and len(ing) == 1
     # new key -> a distinct second child.
-    out2 = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k2")
+    out2 = await store.reingress(
+        origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k2", audit=no_operator_audit
+    )
     assert out2.status == "resubmitted" and out2.new_message_id != out.new_message_id
     # key reused across a DIFFERENT message -> conflict.
     other = await _rs_seed(store)
     with pytest.raises(ResendKeyConflict):
-        await store.reingress(origin_message_id=other, raw=_RS_EDITED, idempotency_key="k1")
+        await store.reingress(
+            origin_message_id=other, raw=_RS_EDITED, idempotency_key="k1", audit=no_operator_audit
+        )
     # missing origin -> ReingressOriginMissing.
     with pytest.raises(ReingressOriginMissing):
-        await store.reingress(origin_message_id="nope", raw=_RS_EDITED, idempotency_key="k9")
+        await store.reingress(
+            origin_message_id="nope", raw=_RS_EDITED, idempotency_key="k9", audit=no_operator_audit
+        )
     # the re-ingress records its DISJOINT target key (@reingress:<channel>).
     async with store._pool.acquire() as conn:
         td = await conn.fetchval("SELECT to_destination FROM resend_log WHERE resend_key=$1", "k1")
@@ -4503,7 +4566,11 @@ async def test_direct_edit_parity_pg(store) -> None:
     assert before["status"] == MessageStatus.ERROR.value
 
     out = await store.resend_to(
-        message_id=origin, to="OB2", idempotency_key="k1", body_override=_RS_EDITED
+        message_id=origin,
+        to="OB2",
+        idempotency_key="k1",
+        body_override=_RS_EDITED,
+        audit=no_operator_audit,
     )
     assert out.status == "resent" and out.to_destination == "OB2" and out.message_id == origin
 
@@ -4540,7 +4607,13 @@ async def test_direct_edit_parity_pg(store) -> None:
     # empty edited body -> ResendSourceEmpty, with NO partial mutation (no OB2E row, no child).
     m2 = await _rs_seed(store)
     with pytest.raises(ResendSourceEmpty):
-        await store.resend_to(message_id=m2, to="OB2E", idempotency_key="k2", body_override="")
+        await store.resend_to(
+            message_id=m2,
+            to="OB2E",
+            idempotency_key="k2",
+            body_override="",
+            audit=no_operator_audit,
+        )
     async with store._pool.acquire() as conn:
         ne = await conn.fetch(
             "SELECT id FROM queue WHERE stage=$1 AND destination_name=$2",
@@ -4551,10 +4624,18 @@ async def test_direct_edit_parity_pg(store) -> None:
 
     # idempotent: same key/body -> duplicate, exactly one OB3 delivery on one child.
     first = await store.resend_to(
-        message_id=m2, to="OB3", idempotency_key="k3", body_override=_RS_EDITED
+        message_id=m2,
+        to="OB3",
+        idempotency_key="k3",
+        body_override=_RS_EDITED,
+        audit=no_operator_audit,
     )
     second = await store.resend_to(
-        message_id=m2, to="OB3", idempotency_key="k3", body_override=_RS_EDITED
+        message_id=m2,
+        to="OB3",
+        idempotency_key="k3",
+        body_override=_RS_EDITED,
+        audit=no_operator_audit,
     )
     assert first.status == "resent" and second.status == "duplicate"
     async with store._pool.acquire() as conn:
@@ -4808,6 +4889,9 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import delenv_at_rest_opt_out, setenv_at_rest_opt_out
 
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
     # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
     setenv_at_rest_opt_out(monkeypatch)
@@ -4843,6 +4927,7 @@ async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")  # as above (BACKLOG #2532)
     setenv_at_rest_opt_out(monkeypatch)  # a keyless chain, as above (vault BACKLOG #3054)
 
     await store.record_audit("message_view", actor="alice", detail="v1")
@@ -4948,6 +5033,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)  # new active
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)  # old, decrypt-only bridge
+    # At enforce the CLI passes the enforcing posture (BACKLOG #2532), which refuses this leg's
+    # plaintext container; at warn it passes none, as before.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     rc = await asyncio.to_thread(main, ["rotate-key"])  # asyncio.run inside → off the loop
     assert rc == 0
     assert "re-encrypted" in capsys.readouterr().out
@@ -5541,6 +5629,60 @@ async def test_queue_tag_contract(store) -> None:
         await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
     finally:
         await keyed.close()
+
+
+def _raw_adapters(s) -> tuple[object, object]:
+    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    from tests._session_seal_contract import dollar_placeholders
+
+    async def raw(sql: str, params: tuple[object, ...]) -> None:
+        async with s._pool.acquire() as conn:
+            await conn.execute(dollar_placeholders(sql), *params)
+
+    async def fetch(sql: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+        async with s._pool.acquire() as conn:
+            return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
+
+    return raw, fetch
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
+@pytest.mark.parametrize("case", ERASED_REPLY_CASES)
+async def test_erased_reply_contract(store, case, keyed) -> None:
+    """BACKLOG #1560: a replay never re-ingresses a reply retention erased, the same contract the
+    SQLite suite runs, on both cipher shapes."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    raw, fetch = _raw_adapters(store)
+    if not keyed:
+        await case(store, fetch, raw)
+        return
+    sealed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
+async def test_keyless_blank_contract(store, case) -> None:
+    """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
+    runs. The ``store`` fixture is the keyless handle, and it clears ``keyed_surface`` on entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    key = generate_key()
+
+    async def open_keyed() -> PostgresStore:
+        return await PostgresStore.open(
+            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+        )
+
+    raw, fetch = _raw_adapters(store)
+    await case(store, open_keyed, fetch, raw)
 
 
 async def test_cell_tag_contract(store) -> None:

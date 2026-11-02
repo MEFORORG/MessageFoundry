@@ -48,6 +48,7 @@ import ipaddress
 import logging
 import os
 import ssl
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -91,6 +92,8 @@ __all__ = [
     "HopDisposition",
     "HopPosture",
     "InsecureHopRefused",
+    "is_vault_hop_refusal",
+    "vault_hop_refusal_text",
     "RevocationHopGuard",
     "TrustAnchor",
     "TrustAnchorMode",
@@ -134,6 +137,8 @@ __all__ = [
     "narrow_tls13_suites",
     "narrow_to_approved_suites",
     "relax_verify_expiry",
+    "skips_validity_period",
+    "EXPIRY_RELAXED_WAYS_ACROSS",
     "verifies_peer_fully",
     "warn_hostname_check_off",
     "requests_verify_from_anchor",
@@ -872,7 +877,7 @@ def verifies_peer_fully(ctx: object) -> bool:
         isinstance(ctx, ssl.SSLContext)
         and ctx.verify_mode == ssl.CERT_REQUIRED
         and ctx.check_hostname
-        and not ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME
+        and not skips_validity_period(ctx)
     )
 
 
@@ -922,6 +927,34 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
         host or "(unspecified host)",
         still_verified,
     )
+
+
+def skips_validity_period(ctx: ssl.SSLContext) -> bool:
+    """Whether :func:`relax_verify_expiry` has set ``X509_V_FLAG_NO_CHECK_TIME`` on ``ctx``.
+
+    OpenSSL applies that flag to a CRL's validity window as well as the certificate's, so a CRL past
+    ``nextUpdate`` is accepted at the handshake on such a context. A CRL there is therefore no
+    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal. The MLLP
+    destination and the DICOM SCU ask this of the context they dial with and, on True, hand the
+    guard no context and name :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978, ADR 0173
+    §13). The REST family (vault BACKLOG #2188) and FTPS (vault BACKLOG #2193) reach the same answer
+    from the ``tls_allow_expired`` setting instead, and of those only FTPS names that remedy."""
+    return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
+
+
+#: The remedy a revocation refusal names on a hop whose context skips validity-period checks
+#: (``tls_allow_expired``, :func:`skips_validity_period`). No CRL can relax that refusal, so the
+#: connection-shaped default, which offers ``[tls].crl_file``, would name a lever that cannot work
+#: there (SDS-3.7).
+EXPIRY_RELAXED_WAYS_ACROSS = (
+    "This hop sets tls_allow_expired, so a CRL cannot admit it. A [tls].crl_file, if set, still "
+    "refuses a leaf certificate it lists, but do not attest on its strength: the relaxation "
+    "skips the CRL's validity window at the handshake, and a CA may drop an expired "
+    "certificate from its CRL, which is the certificate this setting accepts. Set "
+    "tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
+    "[tls].crl_file on this hop can admit it."
+)
 
 
 def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
@@ -2042,9 +2075,8 @@ def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
 # it carry PHI? is it production?) so every cell decides identically, and a legitimately-secure hop is
 # opted in per-connection (an AUDITED attestation) rather than via the blunt global escape.
 
-#: Host tokens that name the local box (loopback) with no DNS resolution — hoisted verbatim from
-#: ``transports.rest._LOOPBACK_HOST_NAMES`` so the HTTP-egress cell and this authority share ONE
-#: literal set. ``""`` (empty host) is treated as loopback (an on-box bind with no host component).
+#: Host tokens that name the local box (loopback) with no DNS resolution. ``""`` (empty host) is
+#: treated as loopback (an on-box bind with no host component).
 _LOOPBACK_HOP_HOST_NAMES = frozenset({"localhost", ""})
 
 
@@ -2069,6 +2101,32 @@ class InsecureHopRefused(ValueError):
     A ``ValueError`` subclass so it flows through the existing connector-construction error handling
     (the loader / ``build_check`` surfaces a ``ValueError`` as a ``WiringError``/422 at ``messagefoundry
     check`` / dry-run / reload) with no new except-arms needed."""
+
+
+#: The module that defines the Vault hop's marked refusal; see :func:`is_vault_hop_refusal`.
+_VAULT_HOP_MODULE = "messagefoundry.transports.strict_requests"
+
+
+def is_vault_hop_refusal(exc: BaseException | None) -> bool:
+    """Whether ``exc`` is exactly ``transports.strict_requests.VaultHopRefused``, the Vault hop's
+    refusal built from fixed text, and so the one hop refusal whose text a Vault handler may keep
+    (BACKLOG #3471). Any other ``InsecureHopRefused``, a subclass of the marked type included,
+    answers ``False``, as ``strict_requests.vault_failure_text`` reads it.
+
+    For a caller that cannot import that module: it needs the ``[vault]`` extra. A marked refusal
+    exists only once the module is loaded, so it is read from ``sys.modules``, never imported."""
+    module = sys.modules.get(_VAULT_HOP_MODULE)
+    return module is not None and type(exc) is getattr(module, "VaultHopRefused", None)
+
+
+def vault_hop_refusal_text(exc: InsecureHopRefused, connector: str) -> str:
+    """What a Vault client build says when its strict reader's mount refuses the hop (BACKLOG
+    #3471): the refusal's own fixed text when :func:`is_vault_hop_refusal`, else ``connector`` and
+    the type's name only. The build's handler catches the base type, so a refusal built elsewhere
+    keeps no text there, as ``strict_requests.vault_failure_text`` keeps none."""
+    if is_vault_hop_refusal(exc):
+        return str(exc)
+    return f"{connector}: the hop was refused ({type(exc).__name__})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2102,14 +2160,31 @@ class HopPosture:
 
 def is_loopback_hop_host(host: str) -> bool:
     """Whether ``host`` names the local box (loopback), so a cleartext hop to it is on-box, not a
-    network exposure. Hoisted verbatim from ``transports.rest._is_loopback_egress_host`` so the
-    HTTP-egress cell and this authority agree on exactly one definition.
+    network exposure. Hoisted here from the REST transport by ADR 0092, so the HTTP-egress cell and
+    this authority agree on exactly one definition.
 
     Covers all of ``127.0.0.0/8`` and ``::1`` via :mod:`ipaddress` (not just the literal
     ``127.0.0.1``), plus the ``localhost`` name and an empty host. It **never resolves DNS**: any other
-    name cannot be *proven* loopback, so it is treated as remote (fail-closed) — a name that happens to
-    resolve to a loopback address is still refused, because resolution is attacker-influenceable and
-    would let a hostname smuggle an off-box hop past the on-box carve-out."""
+    name cannot be *proven* loopback, so it is treated as remote, which fails closed at the cleartext
+    guards — a name that happens to resolve to a loopback address is still refused, because
+    resolution is attacker-influenceable and would let a hostname smuggle an off-box hop past the
+    on-box carve-out.
+
+    **A limit (vault BACKLOG #2706): apart from case, a name is read as written, and a host is an
+    address only where :mod:`ipaddress` reads it as one.** So at least ``localhost.``, ``127.0.0.1.``
+    and ``%6cocalhost`` read as remote here, though a resolver may take the first two as this box,
+    and urllib decodes the third to ``localhost`` before it dials. The cleartext guards judge them
+    as they judge any remote hop, and a proxy that applies takes them with the connection's proxy
+    credential, so a hop spelled this way can leave the box through a proxy. This limit only ever
+    reads a spelling as remote, so it adds no hop to the ones judged on-box. Where remote is the
+    permissive answer this reading is not enough, as ``config.settings._names_this_host`` records.
+
+    ``transports.rest._proxy_bypasses`` strips a trailing dot and this does not, so a
+    ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as remote here.
+    The two disagree only toward "remote": that match opens no on-box carve-out, and
+    ``transports.rest.ProxyConfig.for_host`` says what it does to the route. A plain
+    ``rstrip(".")`` is not the fix, because the host of ``http://./x`` is ``.``, and stripping it
+    leaves the empty host, which reads as loopback."""
     h = host.lower()
     if h in _LOOPBACK_HOP_HOST_NAMES:
         return True
@@ -2538,6 +2613,10 @@ _CONNECTION_WAYS_ACROSS = (
 )
 
 
+#: The attestation setting a revocation record names for a hop that is a connection.
+_CONNECTION_ATTESTATION = "tls_revocation_attested"
+
+
 @dataclass(frozen=True, slots=True)
 class RevocationHopGuard:
     """A captured revocation-refusal decision for one VERIFYING outbound TLS hop (#201, ADR 0078 amend).
@@ -2566,6 +2645,10 @@ class RevocationHopGuard:
     #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
+    #: Whether that CRL is a real check: :attr:`crl_checked`, on a context that does not skip time
+    #: validity (:func:`skips_validity_period`). It decides whether the attested crossing is
+    #: logged, at :meth:`enforce_construction` and the AI broker's own arm; no disposition reads it.
+    crl_is_a_check: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
     #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
@@ -2589,6 +2672,10 @@ class RevocationHopGuard:
     #: The declaring connection's name, recorded in the same audit line so an auditor can trace the
     #: crossing to the declaration to fix. ``None`` for a hop that is not a connection.
     connection: str | None = None
+    #: The setting the same audit line names as the attestation. The default is a connection's flag;
+    #: a hop attested through another setting passes its name, or the record points an auditor at a
+    #: setting the operator never set.
+    declaration: str = _CONNECTION_ATTESTATION
 
     @classmethod
     def capture(
@@ -2603,6 +2690,7 @@ class RevocationHopGuard:
         ways_across: str | None = None,
         attested_reason: str | None = None,
         connection: str | None,
+        declaration: str = _CONNECTION_ATTESTATION,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -2625,7 +2713,11 @@ class RevocationHopGuard:
         in-gate cell is byte-identical. **This parameter exists so those callers do not have to
         re-stamp the contextvar themselves:** ``active_hop_posture(None)`` *clears* an ambient posture
         rather than inheriting it, so the obvious hand-rolled wrapper is a live footgun for any hop
-        that is sometimes in-gate and sometimes not."""
+        that is sometimes in-gate and sometimes not.
+
+        ``declaration`` is the setting :attr:`declaration` says it is; omitted, the record names a
+        connection's flag."""
+        crl_checked = context_checks_revocation(context)
         return cls(
             host=host,
             cell=cell,
@@ -2633,10 +2725,13 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=context_checks_revocation(context),
+            crl_checked=crl_checked,
+            crl_is_a_check=crl_checked
+            and not (context is not None and skips_validity_period(context)),
             ways_across=ways_across,
             attested_reason=attested_reason,
             connection=connection,
+            declaration=declaration,
         )
 
     def disposition(self) -> HopDisposition | None:
@@ -2679,18 +2774,24 @@ class RevocationHopGuard:
         if posture is None:
             return
         disposition = self._disposition(posture)
-        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the disposition is
-        # ALLOW only because tls_revocation_attested fired before the REFUSE arm, so an operator should
-        # see the unchecked-revocation hop was crossed on their attestation.
-        # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
-        # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
-        # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
-        # one `posture.enforcing` already excludes the line.
+        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the operator should
+        # see the hop crossed with no revocation check, on their attestation. A hop whose CRL is a
+        # real check crossed on that check, so this line would be a false record there and it is
+        # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
+        # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Its
+        # disposition is ALLOW on that CRL flag, which this line does not move. Nothing here refuses
+        # such a CRL: each caller makes the choice at its own call site, passing no context on a
+        # tls_allow_expired hop. At least the REST, SOAP and FHIR destinations, FTPS
+        # (_guard_ftps_revocation), MLLP and the DICOM SCU do (ADR 0173 §4.3 and §13), so those
+        # hops cross on the attestation and keep the line for that reason.
+        # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
+        # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
             and self.attested
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
+            and not self.crl_is_a_check
         ):
             log_attested_crossing(
                 logger,
@@ -2698,7 +2799,7 @@ class RevocationHopGuard:
                 connection=self.connection,
                 detail=f"{self.cell}: {self._detail()}",
                 reason=self.attested_reason,
-                declaration="tls_revocation_attested",
+                declaration=self.declaration,
             )
         enforce_insecure_hop(
             disposition, message=self._detail(), cell=self.cell, connection=self.connection

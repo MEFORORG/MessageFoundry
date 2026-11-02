@@ -15,9 +15,10 @@ be driven two ways:
 Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and no setting
 turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
 bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
-protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
-requests run as the full-access system identity (SYS-1). Both factories refuse that opt-in beside
-an auth service or auth settings. Only embedders and tests pass it; ``serve`` never does.
+protected route is refused. Only ``allow_no_auth=True`` opens the bearer-token gates, which then
+ask for no token and run a request as the full-access system identity (SYS-1). Both factories
+refuse that opt-in beside an auth service or auth settings. Only embedders and tests pass it;
+``serve`` never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -42,7 +43,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -64,6 +65,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
+from pydantic import PrivateAttr
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -231,6 +233,7 @@ from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
+    ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
     alert_sink_for,
@@ -388,6 +391,7 @@ from messagefoundry.config.tls_policy import (
     phi_read_hop_disposition,
 )
 from messagefoundry.config.wiring import (
+    POSSIBLY_GENERIC_DB_HOP,
     EnvRef,
     InboundConnection,
     Registry,
@@ -403,7 +407,7 @@ from messagefoundry.config.wiring import (
     revocation_attested_hops,
     unverified_generic_db_hops,
 )
-from messagefoundry.connection_names import inbound_name_of
+from messagefoundry.connection_names import inbound_name_of, is_connection_name
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -433,6 +437,7 @@ from messagefoundry.pipeline.alert_sinks import (
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import (
+    STORE_RESTORED_SUBJECT,
     AlertSink,
     LoggingAlertSink,
     administrator_granted_alert,
@@ -440,6 +445,8 @@ from messagefoundry.pipeline.alerts import (
     no_enabled_administrator_alert,
     step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
+    store_restored_detail,
+    utc_or_unknown,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
@@ -1092,9 +1099,13 @@ def _connection_purge_audit(
     *, actor: str | None, name: str, scope: str, client: str | None
 ) -> OperatorAudit[int]:
     """The ``connection_purge`` row the inline route and the released purge both commit with the
-    cancel (BACKLOG #2624, vault BACKLOG #3217). Written UNCONDITIONALLY, cancelled=0 included
+    cancel (BACKLOG #2624, vault BACKLOG #3217), so a failed append cancels nothing and a release
+    whose append failed is recorded as 'failed'. Written UNCONDITIONALLY, cancelled=0 included
     (BACKLOG #1641): a purge that cancels nothing is still a completed destructive command, unlike
-    a replay that re-transmitted nothing. No channel_id: purge targets an outbound, which spans
+    a replay that re-transmitted nothing, and a refused purge reaches no cancel and writes no row.
+    So action='connection_purge' answers "which outbound, at what scope, cancelling how many" for
+    gated and ungated purges alike. A released purge's row names the REQUESTER and no ``client``,
+    per _record_reload_audit's docstring. No channel_id: purge targets an outbound, which spans
     every inbound feeding it."""
 
     def _row(cancelled: int) -> AuditAppend:
@@ -1121,6 +1132,12 @@ def _reload_refusal(identity: Identity) -> str | None:
     reload's core refuses on it and ``GET /config/provenance`` reports it as ``reload_refused``, so
     the console's form cannot disagree with the refusal (BACKLOG #3189)."""
     return None if _cross_channel_in_scope(identity) else RELOAD_REFUSED_CHANNEL_SCOPED
+
+
+#: The scopes a purge admits. The JSON route's pattern is built from it and the ``_purge`` approval
+#: executor refuses any other, so those two cannot disagree (vault BACKLOG #3798). The console's
+#: routes keep their own literal checks.
+_PURGE_SCOPES = ("top", "all")
 
 
 def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
@@ -1155,22 +1172,27 @@ async def _reload_hold_params(
 def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException | None:
     """Why a purge of outbound ``name`` would be refused right now, or ``None``. The route raises
     it, and the proof-free rejoin reads it first, so a repeat is told its hold id only while the
-    purge it repeats would still be held (vault BACKLOG #2625)."""
-    if rr is None or name not in rr.registry.outbound:
+    purge it repeats would still be held (vault BACKLOG #2625). The ``_purge`` approval executor
+    skips on it with this same text (vault BACKLOG #3798), so a release refuses a target the route
+    refuses."""
+    if rr is None:
+        return HTTPException(404, f"no graph is loaded, so no outbound connection: {name}")
+    if name not in rr.registry.outbound:
         return HTTPException(404, f"no such outbound connection: {name}")
     # ADR 0073: purge is owner-only on a sharded engine — a non-owning shard's quiesced signal is
     # vacuous (it never runs the lane), so it would green-light a purge racing the owner's claims.
     owner = rr.destination_owner(name)
     if owner is not None and owner != rr.registry.shard_id:
+        # The engine shard before the name: a skipped release carries this text off-box, where the
+        # row's detail is cut, and an outbound name can be long.
         return HTTPException(
             409,
-            f"outbound {name!r} is owned by engine shard {owner!r} — stop and purge it on that "
+            f"owned by engine shard {owner!r}, so stop and purge outbound {name!r} on that engine "
             "shard's API",
         )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
     # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
-    # so purge must wait until the lane is paused AND fully quiesced. The load-bearing dual-control
-    # re-check lives in the `_purge` approval executor (the release path never re-enters the route).
+    # so purge must wait until the lane is paused AND fully quiesced.
     if not rr.outbound_quiesced(name):
         return HTTPException(409, "stop the outbound and let it quiesce before purging its queue")
     return None
@@ -1686,14 +1708,12 @@ def _build_approval_gate(
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
         # directly (purge_connection is NOT re-entered on the release path), and it claims the row
-        # ('executing', BACKLOG #1562) BEFORE executing — so the require-quiesced precondition must be
-        # re-checked HERE, and a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise
-        # by rolling the row to 'failed' and auditing it, so a raise no longer strands it; skipping
-        # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
-        # miss the operator can clear, not a failed operation.) A non-quiesced
-        # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
-        # it would mis-fire; skip fail-closed and record cancelled=0/skipped in the approval audit. The
-        # operator re-Stops (lets it quiesce) and re-requests.
+        # ('executing', BACKLOG #1562) BEFORE executing, so the route's preconditions must be
+        # re-checked HERE (_purge_target_refusal below). Vault BACKLOG #3798 decides each refusal by
+        # whether the operator can clear it. Since ASVS 2.3.3 the gate compensates a raise by rolling
+        # the row to 'failed' and auditing it, so a raise no longer strands it, but a precondition
+        # the operator can clear is a retryable miss, not a failed operation, so it SKIPS. A hold
+        # that nothing can clear RAISES, because 'failed' is then true.
         #
         # Vault BACKLOG #3217: the connection_purge row is attributed to the REQUESTER, so a hold
         # whose params carry none is refused before anything runs, rather than released as a
@@ -1709,30 +1729,29 @@ def _build_approval_gate(
                 "this purge request records no requester, so its connection_purge row could not "
                 "name who ran it; it was not run",
             )
-        rr = engine.registry_runner
-        if rr is not None:
-            # ADR 0073: a non-owning shard's quiesced signal is vacuous (it never runs the lane), so
-            # an ownership miss must skip fail-closed here exactly like the non-quiesced case.
-            owner = rr.destination_owner(str(p["name"]))
-            if owner is not None and owner != rr.registry.shard_id:
-                return {"cancelled": 0, "skipped": f"outbound owned by shard {owner}"}
-            if not rr.outbound_quiesced(str(p["name"])):
-                return {"cancelled": 0, "skipped": "outbound running"}
-        # Vault BACKLOG #3217: the same connection_purge row the inline route writes, committed
-        # with the cancel and attributed to the REQUESTER, so a failed append cancels nothing and
-        # the gate's compensation records the release as 'failed'. No `client`, per
-        # _record_reload_audit's docstring.
-        scope = "top" if p.get("scope") == "top" else "all"
+        # Vault BACKLOG #3798: a scope or outbound name the route does not admit is a stored row no
+        # request filed. No operator act clears it, and reading such a scope as "all" would cancel
+        # every queued row, so it raises. 422 is the approve route's "the released operation was
+        # refused". approval.failed names only the error type, so the log line says why.
+        scope, name = p.get("scope"), p.get("name", "")
+        if scope not in _PURGE_SCOPES or not is_connection_name(name):
+            _log.warning("released purge refused: its stored outbound or scope is not valid")
+            raise ApprovalError(
+                422,
+                "this purge request records no valid outbound or scope, so what it would cancel "
+                "is not known; it was not run",
+            )
+        # A retryable miss, so it skips fail-closed and records cancelled=0/skipped in the approval
+        # audit: the operator clears the cause the refusal names, then re-requests.
+        refusal = _purge_target_refusal(engine.registry_runner, name)
+        if refusal is not None:
+            return {"cancelled": 0, "skipped": str(refusal.detail)}
         cancelled = await engine.store.cancel_queued(
             None,
-            str(p["name"]),
+            name,
             top_only=(scope == "top"),
-            audit=_connection_purge_audit(
-                actor=requester,
-                name=str(p["name"]),
-                scope=scope,
-                client=None,
-            ),
+            # The row's contract: _connection_purge_audit.
+            audit=_connection_purge_audit(actor=requester, name=name, scope=scope, client=None),
         )
         return {"cancelled": cancelled}
 
@@ -1799,16 +1818,7 @@ def _build_approval_gate(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
                 raise ApprovalError(422, answer) from exc
-            registry = outcome.registry
-            return {
-                "inbound": len(registry.inbound),
-                "outbound": len(registry.outbound),
-                "degraded": outcome.applied and bool(failures),
-                "failures": failures,
-                # The settings anchors a restart must apply, as the inline route reports them
-                # (BACKLOG #3015).
-                "restart_required": _restart_required(outcome),
-            }
+            return _reload_result(engine, outcome, failures, dry_run=False).model_dump()
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped. A refusal
@@ -1904,6 +1914,7 @@ def _posture_loosenings(
     runner: RegistryRunner | None,
     *,
     graph: Registry | None = None,
+    graph_env_values: Mapping[str, Any] | None = None,
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
     service_env: ServiceEnvPosture,
@@ -1925,8 +1936,10 @@ def _posture_loosenings(
     The per-connection entries are read off ``graph``, or off ``runner``'s live graph when no
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
-    #3076). The settings-scoped entries are the same for either graph: a reload changes no
-    settings."""
+    #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
+    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
+    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
     # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
@@ -1967,7 +1980,7 @@ def _posture_loosenings(
     # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
     # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
     # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
-    # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
+    # being honoured, a generic DB hop has no TLS mode or one pinned to no TLS, a hop is attested secure, or a
     # revocation refusal is attested away, and a stale or absent list would understate the
     # posture. An engine with no
     # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
@@ -1986,7 +1999,28 @@ def _posture_loosenings(
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
     query_hops = hops(query_credential_hops)
-    db_hops = hops(unverified_generic_db_hops)
+    # A DATABASE dialect given as env() is resolved against the values the graph builds with, so a
+    # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
+    # the reader's marker beside its name, because this entry keeps names only and its text states
+    # that each named hop is generic. A passed graph comes with its own values, which the start's
+    # snapshot took beside it; the live graph's are the runner's.
+    db_env_values = (
+        graph_env_values
+        if graph is not None
+        else (runner.env_values if runner is not None else None)
+    )
+    db_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({POSSIBLY_GENERIC_DB_HOP})"
+            if reason.startswith(POSSIBLY_GENERIC_DB_HOP)
+            else name
+            for name, reason in unverified_generic_db_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     attested_hops = hops(attested_secure_hops)
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
@@ -2102,6 +2136,11 @@ class _LoadedConfig:
     #: that; a reload's row does not, since an in-flight reload may still roll back (vault BACKLOG
     #: #2257; see :func:`_record_reload_audit`).
     registry: Registry | None
+    #: The ``env()`` values ``registry`` resolves against, taken with it, so the start row's
+    #: loosenings resolve a DATABASE hop's ``env()`` dialect as ``GET /security/posture`` does.
+    #: ``None`` when the snapshot did not take them, as a reload's row does not. They include
+    #: secret values, so they are kept out of the repr and of equality.
+    env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def _of(
@@ -2109,9 +2148,10 @@ class _LoadedConfig:
         directory: Path | None,
         registry: Registry | None,
         fingerprint: Mapping[str, object] | None,
+        env_values: Mapping[str, Any] | None = None,
     ) -> _LoadedConfig:
         # A reload rebinds the fingerprint rather than editing it; the copy keeps the snapshot safe
-        # even if that changes.
+        # even if that changes. The values are copied for the same reason.
         return cls(
             directory=str(directory) if directory else None,
             shard=registry.shard_id if registry else None,
@@ -2119,6 +2159,7 @@ class _LoadedConfig:
             outbound=len(registry.outbound) if registry else 0,
             fingerprint=dict(fingerprint) if fingerprint is not None else None,
             registry=registry,
+            env_values=dict(env_values) if env_values is not None else None,
         )
 
     @classmethod
@@ -2129,6 +2170,7 @@ class _LoadedConfig:
             engine.running_config_dir,
             rr.registry if rr else None,
             engine.loaded_config_fingerprint,
+            rr.env_values if rr else None,
         )
 
     @classmethod
@@ -2181,11 +2223,27 @@ async def _reload_or_record_interruption(
         raise
 
 
-def _restart_required(outcome: ReloadOutcome) -> list[str] | None:
-    """:attr:`ReloadOutcome.restart_required` as :attr:`ReloadResult.restart_required` reports it:
-    a list, or ``None`` when the reload did not check (BACKLOG #3015)."""
+def _reload_result(
+    engine: Engine, outcome: ReloadOutcome, failures: list[str], *, dry_run: bool
+) -> ReloadResult:
+    """A reload's answer, one shape for the inline route and a released hold, so dual control is
+    never the quieter of the two (BACKLOG #1111, #3015). The names come from a callback and are made
+    text, so validating them cannot raise after the swap, which would report a reload that ran as
+    failed (BACKLOG #1940)."""
+    registry = outcome.registry
+    runner = engine.registry_runner
     names = outcome.restart_required
-    return None if names is None else list(names)
+    return ReloadResult(
+        inbound=len(registry.inbound),
+        outbound=len(registry.outbound),
+        routers=len(registry.routers),
+        handlers=len(registry.handlers),
+        running=bool(runner and runner.running),
+        dry_run=dry_run,
+        degraded=outcome.applied and bool(failures),
+        failures=failures,
+        restart_required=None if names is None else [str(name) for name in names],
+    )
 
 
 async def _reload_and_record(
@@ -2488,7 +2546,7 @@ async def _answer_refused_reload(
 def _refused_by_trust_anchor(exc: WiringError) -> bool:
     """Whether a refused reload's ``WiringError`` is a trust-anchor check's refusal: its explicit
     cause, under any further ``WiringError`` wrappers, is a :class:`TrustAnchorError`. That is
-    the shape the settings preflight and ``refused_connection_anchor`` raise.
+    the shape the settings preflight and ``connection_anchor_failure`` raise.
 
     A refusal under any other cause is not one. A typo in a literal ``tls_ca_pin`` is the
     factory's ``ValueError``, whose own cause is ``parse_anchor_pin``'s refusal, and that is a
@@ -2629,8 +2687,7 @@ async def _audit_refused_reload(
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
         )
         action, detail["reason"] = "config_reload_failed", "store_unavailable"
-        status = 503
-        answer = "the engine could not reach its store to check a trust anchor; see the engine log"
+        status, answer = 503, _ANCHOR_STORE_DETAIL
     elif isinstance(exc, WiringError):
         anchor_refused = _refused_by_trust_anchor(exc)
         warn(
@@ -3098,6 +3155,45 @@ def _raise_config_changed(
         _log.warning("the config_changed alert could not be raised: %s", safe_exc(exc))
 
 
+async def _record_a_restore(store: Store, sink: AlertSink) -> None:
+    """Record a restore at the first start after it (BACKLOG #2614): end every session, write the
+    ``store_restored`` audit row and raise the alert.
+
+    HOW "THE FIRST OPEN AFTER A RESTORE" IS DETECTED. ``restore`` writes a one-row marker into the
+    store it places (``store.store.write_restore_marker``), and the store's consume reads it,
+    acts and deletes it in one transaction. The marker lives in the store, not beside it, so it
+    travels with a store that is copied or renamed after the restore.
+
+    It is consumed HERE, at the engine's start, and not in the store's ``open``. Every other
+    command that opens the store, such as ``provision-admin`` or ``admin-unlock`` run against the
+    restored file first, would otherwise consume it, and the alert would be lost: only a serving
+    engine holds the alert sink. This process serves no request before this runs. Other engine
+    processes on the same store, such as ``serve --shard`` processes, check sessions too, and may
+    start before or after this one; what keeps the archive's sessions from them is the restore
+    itself, which ended every session in the file before placing it (``write_restore_marker``).
+    This revoke repeats that for anything minted since, and raises every account's epoch.
+
+    A store write that fails here raises, so the start fails rather than serving the archive's
+    sessions. The alert itself never raises: the record is already committed."""
+    record = await store.consume_restore_record()
+    if record is None:
+        return
+    try:
+        detail = store_restored_detail(
+            archive_created_at=record.archive_created_at,
+            last_audit_at=record.last_audit_at,
+            restored_at=record.restored_at,
+            revoked=record.sessions_revoked,
+        )
+        sink.store_restored(
+            STORE_RESTORED_SUBJECT,
+            detail=detail,
+            last_audit_at=utc_or_unknown(record.last_audit_at),
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert failure must not change the start
+        _log.warning("the store_restored alert could not be raised: %s", safe_exc(exc))
+
+
 async def _record_start_audit(
     app: FastAPI,
     engine: Engine,
@@ -3145,6 +3241,7 @@ async def _record_start_audit(
                 engine,
                 None,
                 graph=loaded.registry,
+                graph_env_values=loaded.env_values,
                 remote_debug=remote_debug_posture(),
                 startup=await asyncio.to_thread(startup_posture),
                 service_env=await asyncio.to_thread(service_env_posture),
@@ -3680,11 +3777,22 @@ async def _record_control_audit(
     role: str,
     running: bool,
     client: str | None,
+    reason: str | None = None,
+    refused: bool = False,
 ) -> None:
-    """Audit a completed start/stop/restart of a connection (BACKLOG #1642).
+    """Audit a start/stop/restart of a connection (BACKLOG #1642).
 
-    Written on the SUCCESS path only — the denial paths already write ``auth.channel_denied``, and a
-    409/404 means the lane never moved, so a row there would assert an action that did not happen.
+    Written when the action completed, and for at least an inbound's refused start or restart and
+    an outbound's the store stopped (:func:`_record_refused_control_audit`), where ``running`` is
+    the lane's state after the refusal. A refused restart has already stopped the lane, so that row
+    records something that happened. The denial paths write ``auth.channel_denied`` instead. At least a 404 and the 409 for a connection not deployed
+    write no row here: nothing was attempted, so a row would assert an action that did not happen.
+
+    ``reason``, where set, joins the row's detail. Only a store fault sets it (vault BACKLOG #3746),
+    with the value a reload's row uses for one, so an audit reader can tell it from a refused CA.
+
+    ``refused`` marks the row of a refused start or restart with ``refused: true``, so it cannot
+    read as a completed action when ``running`` is true (vault BACKLOG #3746).
 
     ``role`` is the RESOLVED role of the branch that ran (``source`` for an inbound, ``destination``
     for an outbound), never ``_dual_role_control``'s ``role`` ARGUMENT: that argument is ``None`` on
@@ -3702,8 +3810,69 @@ async def _record_control_audit(
         "connection_control",
         actor=identity.username,
         channel_id=name if role == "source" else None,
-        detail=json.dumps({"connection": name, "action": action, "role": role, "running": running}),
+        detail=json.dumps(
+            {"connection": name, "action": action, "role": role, "running": running}
+            | ({"refused": True} if refused else {})
+            | ({"reason": reason} if reason is not None else {})
+        ),
         client=client,
+    )
+
+
+async def _record_refused_control_audit(
+    engine: Engine,
+    identity: Identity,
+    name: str,
+    action: str,
+    *,
+    role: str,
+    running: bool,
+    store_fault: bool,
+    client: str | None,
+) -> None:
+    """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
+    outbound's the store stopped. ``role`` is the resolved role and ``running`` the lane's state
+    after the refusal, which is not always stopped: at least a lane that failed at boot on a store
+    fault stays unpaused through a start the store stopped.
+
+    Written fail-soft, as :func:`_audit_refused_reload`'s row is. The refusal's answer stands
+    whether or not the row lands, and a store that stopped the trust-anchor check is likely to
+    refuse this row too, which would turn that answer into a 500 (vault BACKLOG #3746). A failed
+    write is logged at ERROR, and a cancel waits a bounded time for the row."""
+    actor = identity.username
+    reason = "store_unavailable" if store_fault else None
+    await write_audit_soft(
+        lambda: _write_through_cancel(
+            _record_control_audit(
+                engine,
+                identity,
+                name,
+                action,
+                role=role,
+                running=running,
+                client=client,
+                reason=reason,
+                refused=True,
+            ),
+            lambda: _lost_row(
+                "connection_control",
+                actor,
+                f"refused {action} of {name} at {client or '-'}, reason {reason or '-'}",
+            ),
+        ),
+        log=_log,
+        message="a refused %s of %s connection %s by %s at %s, reason %s: its "
+        "connection_control row failed",
+        args=lambda: (
+            action,
+            role,
+            scrub_log_argument(name),
+            scrub_log_argument(actor),
+            scrub_log_argument(client or "-"),
+            reason or "-",
+        ),
+        # (), as write_audit_soft's docstring asks where a raise would replace the answer owed.
+        defects=(),
     )
 
 
@@ -3769,10 +3938,39 @@ async def _audit_alert_rules_withheld(
 #: What the connection-test routes return for a refused trust anchor, in place of its text.
 _ANCHOR_REFUSED_DETAIL = "trust anchor refused; see the server log"
 
+#: What a route answers for a trust-anchor check the store stopped, which says nothing against the
+#: anchor (BACKLOG #3091): at least a reload, an operator start of an inbound or an outbound, and a
+#: connection test. Fixed text, because a connection test's detail is written to
+#: ``audit_log.detail`` (vault BACKLOG #3746).
+_ANCHOR_STORE_DETAIL = (
+    "the engine could not reach its store to check a trust anchor; see the engine log"
+)
 
-async def _run_connection_test(
-    rr: RegistryRunner, name: str, direction: str
-) -> ConnectionTestResult:
+#: :data:`_ANCHOR_STORE_DETAIL` for a restart, whose stop half already ran. The connection stays
+#: stopped only until the next start, which need not be an operator's (vault BACKLOG #3746).
+_ANCHOR_STORE_RESTART_DETAIL = (
+    "the engine could not reach its store to check a trust anchor, so this restart left the "
+    "connection stopped until its next start, which at least an operator, a schedule or a rule "
+    "can make; see the engine log"
+)
+
+
+def _anchor_store_detail(action: str) -> str:
+    """The fixed answer for a start or restart whose trust-anchor check the store stopped."""
+    return _ANCHOR_STORE_RESTART_DETAIL if action == "restart" else _ANCHOR_STORE_DETAIL
+
+
+class _ConnectionTestRun(ConnectionTestResult):
+    """A :class:`ConnectionTestResult`, plus what the route's audit row needs and the reply does
+    not carry (vault BACKLOG #3746). ``_check_stopped`` is True when the test ended in
+    ``check_test_anchor``, before its connector was built. ``_reason`` is the row's ``reason``, set
+    only for a check the store stopped. Private attributes, so neither reaches the response."""
+
+    _check_stopped: bool = PrivateAttr(default=False)
+    _reason: str | None = PrivateAttr(default=None)
+
+
+async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) -> _ConnectionTestRun:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
     Reports a config (bad ``env()``/egress/settings) or connectivity failure in the result rather than
     raising — only an unexpected bug would 500. Closes the test connector afterward.
@@ -3784,9 +3982,15 @@ async def _run_connection_test(
     that a connector's exceptions never interpolate a credential *value* — this is depth, not the seal."""
 
     def _result(
-        *, supported: bool, success: bool, ms: float, detail: str | None
-    ) -> ConnectionTestResult:
-        return ConnectionTestResult(
+        *,
+        supported: bool,
+        success: bool,
+        ms: float,
+        detail: str | None,
+        check_stopped: bool = False,
+        reason: str | None = None,
+    ) -> _ConnectionTestRun:
+        run = _ConnectionTestRun(
             name=name,
             direction=direction,
             supported=supported,
@@ -3794,6 +3998,8 @@ async def _run_connection_test(
             duration_ms=round(ms, 1),
             detail=detail,
         )
+        run._check_stopped, run._reason = check_stopped, reason
+        return run
 
     # A not-deployed connection (#233, ADR 0111) has no live endpoint to reach, and its env() must
     # NEVER be resolved — so short-circuit BEFORE build_test_connector, which would resolve env()
@@ -3810,22 +4016,42 @@ async def _run_connection_test(
             detail="connection is not deployed (deployed=false) — nothing to test",
         )
 
+    checked = False
     try:
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
+        checked = True
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
         # audit write sits AFTER this call, so a raise past here skipped the OUTCOME row on a
         # security-relevant probe — the authz GRANT row still landed (BACKLOG #1824).
+        if explicit_cause(exc, AnchorStoreUnavailable) is not None:
+            # Neither a refused CA nor a failed build (vault BACKLOG #3746). The check logged the
+            # store's own error; this line names the test it stopped.
+            _log.warning(
+                "connection test of %s stopped: the store refused its trust-anchor audit",
+                scrub_log_argument(name),
+            )
+            return _result(
+                supported=True,
+                success=False,
+                ms=0.0,
+                detail=_ANCHOR_STORE_DETAIL,
+                check_stopped=True,
+                reason="store_unavailable",
+            )
+        failure = safe_text(str(exc))
         if trust_anchor_cause(exc) is not None:
             # A trust-anchor refusal names the CA's path, the folders above it and its SHA-256. The
             # full text goes to the operator log, as the reload route's does; the caller and the
             # audit row get a fixed line (BACKLOG #1142).
             _log.warning("connection test refused %r (trust anchor): %s", name, exc)
-            return _result(supported=True, success=False, ms=0.0, detail=_ANCHOR_REFUSED_DETAIL)
-        return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
+            failure = _ANCHOR_REFUSED_DETAIL
+        return _result(
+            supported=True, success=False, ms=0.0, detail=failure, check_stopped=not checked
+        )
     start = time.monotonic()
     supported, success, detail = True, False, None
     try:
@@ -4693,7 +4919,10 @@ def create_app(
         static_hops = [
             StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
             for hop in static_credential_hops(
-                registry=runner.registry if runner is not None else None, settings=cred_settings
+                registry=runner.registry if runner is not None else None,
+                settings=cred_settings,
+                # A database hop's env() dialect, resolved as the runner's build resolves it.
+                env_values=runner.env_values if runner is not None else None,
             )
             if visible is None or visible(hop.name)
         ]
@@ -5293,7 +5522,8 @@ def create_app(
         The name and its scope are resolved by :func:`_resolve_connection`."""
         rr, side = await _resolve_connection(engine, identity, name, client, role=role)
         if rr is not None and side == "in":
-            refused: str | None = None
+            refused: HTTPException | None = None
+            store_fault = False
             try:
                 # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
@@ -5307,11 +5537,17 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
-            except TrustAnchorError:
+            except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
                 # the CA's path and SHA-256, is not left on the 409's __context__.
-                refused = _ANCHOR_REFUSED_DETAIL
+                # Vault BACKLOG #3746: the lane's fixed line is a TrustAnchorError for a store fault
+                # too, raised from it. Nothing is known against the CA, so that is a 503.
+                store_fault = explicit_cause(exc, AnchorStoreUnavailable) is not None
+                if store_fault:
+                    refused = HTTPException(503, _anchor_store_detail(action))
+                else:
+                    refused = HTTPException(409, _ANCHOR_REFUSED_DETAIL)
             except (WiringError, InsecureHopRefused) as exc:
                 # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
                 # gate an auto_start = false listener first meets here. It escaped as a 500 with no
@@ -5325,25 +5561,41 @@ def create_app(
                     name,
                     scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
                 )
-                refused = f"inbound connection {name!r}: {action} refused; see the server log"
-            if refused is not None:
-                await _record_control_audit(
-                    engine, identity, name, action, role="source", running=False, client=client
+                refused = HTTPException(
+                    409, f"inbound connection {name!r}: {action} refused; see the server log"
                 )
-                raise HTTPException(409, refused)
+            if refused is not None:
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    role="source",
+                    running=rr.inbound_running(name),
+                    store_fault=store_fault,
+                    client=client,
+                )
+                raise refused
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
+            held = False
             try:
                 if action == "start":
-                    await rr.start_outbound(name)
+                    await rr.start_outbound(name, hold_on_store_fault=True)
                 elif action == "stop":
                     await rr.stop_outbound(name)
                 else:
-                    await rr.restart_outbound(name)
+                    await rr.restart_outbound(name, hold_on_store_fault=True)
+            except TrustAnchorError as exc:
+                # Vault BACKLOG #3746: the store stopped the lane's CA check, and the lane was not
+                # resumed. Answered below, outside this handler, as the inbound arm does.
+                if explicit_cause(exc, AnchorStoreUnavailable) is None:
+                    raise
+                held = True
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5357,6 +5609,18 @@ def create_app(
                 # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
                 # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
+            if held:
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    role="destination",
+                    running=rr.outbound_running(name),
+                    store_fault=True,
+                    client=client,
+                )
+                raise HTTPException(503, _anchor_store_detail(action))
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client
@@ -5436,9 +5700,9 @@ def create_app(
         except ConfigWriteAuditFailed as exc:
             # The audit log did not record the row, so the engine refused the toggle and undid it,
             # or says it could not (vault BACKLOG #2945). The audit log, not the request, is at
-            # fault, so 503 as for any refused audit write. The route's only 503, which the console
-            # relies on to name this fix.
-            raise HTTPException(503, str(exc)) from exc
+            # fault, so 503 as for any refused audit write. Typed, because it is not the route's
+            # only 503 and the console names this fix (BACKLOG #3811).
+            raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
             # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
             # which writes no config file (vault BACKLOG #2933): the edit never landed.
@@ -5538,20 +5802,42 @@ def create_app(
         # Scope before existence, so a scoped caller cannot probe for names (BACKLOG #2551).
         rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         result = await _run_connection_test(rr, name, direction)
-        await engine.store.record_audit(
-            "connection_test",
-            actor=identity.username,
-            channel_id=name if direction == "in" else None,
-            detail=json.dumps(
-                {
-                    "connection": name,
-                    "direction": direction,
-                    "supported": result.supported,
-                    "success": result.success,
-                    "detail": result.detail,
-                }
+        actor, client = identity.username, client_ip(request)
+        row = json.dumps(
+            {
+                "connection": name,
+                "direction": direction,
+                "supported": result.supported,
+                "success": result.success,
+                "detail": result.detail,
+            }
+            | ({"reason": result._reason} if result._reason is not None else {})
+        )
+
+        def write_row() -> Coroutine[Any, Any, None]:
+            channel_id = name if direction == "in" else None
+            return engine.store.record_audit(
+                "connection_test", actor=actor, channel_id=channel_id, detail=row, client=client
+            )
+
+        if not result._check_stopped:
+            await write_row()
+            return result
+        # Vault BACKLOG #3746: a test that ended at its CA check dialled nothing, and a store that
+        # refused the check's rows is likely to refuse this one too. A raise would replace the
+        # answer with a 500, so () defects.
+        await write_audit_soft(
+            lambda: _write_through_cancel(
+                write_row(), lambda: _lost_row("connection_test", actor, row)
             ),
-            client=client_ip(request),
+            log=_log,
+            message="a connection test by %s at %s: its connection_test row failed. Lost row: %s",
+            args=lambda: (
+                scrub_log_argument(actor),
+                scrub_log_argument(client or "-"),
+                scrub_log_argument(row),
+            ),
+            defects=(),
         )
         return result
 
@@ -5640,7 +5926,7 @@ def create_app(
         response: Response,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        scope: str = Query("all", pattern="^(top|all)$"),
+        scope: str = Query("all", pattern=f"^({'|'.join(_PURGE_SCOPES)})$"),
         identity: Identity = Depends(
             require_step_up_action(
                 STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE, proof_in_route=True
@@ -5729,12 +6015,8 @@ def create_app(
             )
             if pending is not None:
                 return _held_reply(response, pending, "connection_purge")
-        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included, so a zero-cancel purge is
-        # told apart from the 409s above, which changed nothing and wrote nothing. The row commits
-        # with the cancel (BACKLOG #2624). A dual-control purge returns 202 above, and the `_purge`
-        # executor in _build_approval_gate writes the same row at release, attributed to the
-        # requester (vault BACKLOG #3217), so action='connection_purge' answers "which outbound, at
-        # what scope, cancelling how many" for gated and ungated purges alike.
+        # A dual-control purge returned 202 above; the `_purge` executor in _build_approval_gate
+        # writes this row at release. The row's contract: _connection_purge_audit.
         cancelled = await engine.store.cancel_queued(
             None,
             name,
@@ -6538,12 +6820,14 @@ def create_app(
 
     @app.get("/approvals", response_model=ApprovalList)
     async def list_approvals(
+        request: Request,
         identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalList:
         """Open high-value actions: ``pending`` ones awaiting a second approver, then ``interrupted``
         releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``, and
-        ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460)."""
+        ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460). A listing that
+        shows ``requester_not_authorized`` writes one ``approval.standing_shown`` row."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
         try:
@@ -6556,6 +6840,14 @@ def create_app(
         # settled between the reads still shows as pending; approving it then answers 409.
         cut_off = {a["id"] for a in interrupted}
         rows = [a for a in pending if a["id"] not in cut_off] + interrupted
+        # Vault BACKLOG #3747: here and not in a gate, because the console calls this handler
+        # directly, past `require`. Every listing writes its own: a held request may have no
+        # expiry, so a de-dup key or a throttle would hide months of views.
+        shown = [a["id"] for a in rows if a["release_blocked"] == "requester_not_authorized"]
+        if shown:
+            await gate.record_standing_shown(
+                shown, actor=identity.username, client=client_ip(request)
+            )
         return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in rows])
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)
@@ -6800,7 +7092,6 @@ def create_app(
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
                 )
-            registry = outcome.registry
         except Exception as exc:  # noqa: BLE001 - a reload's faults are audited too (#3157)
             await _answer_refused_reload(engine, exc, req, request, user)
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
@@ -6820,26 +7111,15 @@ def create_app(
                 detail=json.dumps(
                     {
                         "dir": str(outcome.directory),
-                        "inbound": len(registry.inbound),
-                        "outbound": len(registry.outbound),
+                        "inbound": len(outcome.registry.inbound),
+                        "outbound": len(outcome.registry.outbound),
                         "dry_run": True,
                         **(fingerprint or {}),
                     }
                 ),
                 client=client_ip(request),
             )
-        rr = engine.registry_runner
-        return ReloadResult(
-            inbound=len(registry.inbound),
-            outbound=len(registry.outbound),
-            routers=len(registry.routers),
-            handlers=len(registry.handlers),
-            running=bool(rr and rr.running),
-            dry_run=req.dry_run,
-            degraded=outcome.applied and bool(failures),
-            failures=failures,
-            restart_required=_restart_required(outcome),
-        )
+        return _reload_result(engine, outcome, failures, dry_run=req.dry_run)
 
     # --- messages ------------------------------------------------------------
 
@@ -11374,10 +11654,10 @@ def create_managed_app(
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
-    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
-    and a build with neither logs one WARNING. Beside ``auth_settings`` that opt-in raises
-    ``ValueError``.
+    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused.
+    Only ``allow_no_auth=True``, the same opt-in :func:`create_app` takes, opens the bearer-token
+    gates. The build logs one WARNING naming which of the two it got. Beside ``auth_settings`` that
+    opt-in raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -11979,6 +12259,9 @@ def create_managed_app(
         # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
         credential_reminder: asyncio.Task[None] | None = None
         security_notifier = None
+        # BACKLOG #2614: hoisted for the same teardown reason. The restore record runs first in the
+        # span, so a raise from it would otherwise reach the finally before `auth` is bound.
+        auth: AuthService | None = None
         # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
@@ -11998,10 +12281,12 @@ def create_managed_app(
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            # BACKLOG #2614: the first start on a restored store ends the archive's sessions and
+            # records the restore, before the auth service exists and so before any request.
+            await _record_a_restore(store, notifier or LoggingAlertSink())
             # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
             # (the OIDC revocation guard, #1887) stops startup before any connection starts.
             # BACKLOG #2131 moved initialize() and the notice gate up here too, below.
-            auth: AuthService | None = None
             if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
                 # transport, sent to each affected user's own address. The notifier is wired only when the
@@ -12351,15 +12636,25 @@ def create_managed_app(
         phi_read_hop_secure=phi_read_hop_secure,
         configured_log_level=configured_log_level,
     )
-    if auth_settings is None and not allow_no_auth:
-        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app fails closed.
-        # Said here, once create_app has accepted the build, and not in create_app, which every
-        # managed app calls with auth=None before the lifespan attaches a service.
-        _log.warning(
-            "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
-            "service attaches and the permission-gated routes are refused (%s). auth_settings "
-            "attaches sign-in; allow_no_auth=True instead answers those routes to any caller as the "
-            "full-access system identity",
-            AUTH_NOT_CONFIGURED,
-        )
+    if auth_settings is None:
+        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app is in one
+        # of two modes. The denied line cannot sit in create_app, which every managed app calls
+        # with auth=None before the lifespan attaches a service, and the open line stays beside it.
+        # The outer test stays on auth_settings because no managed app has a service at build, so
+        # app.state cannot answer it. The mode comes from app.state through open_mode, as the gates
+        # read it, and not from the allow_no_auth argument.
+        if open_mode(app.state):
+            _log.warning(
+                "create_managed_app: built with allow_no_auth=True and no auth_settings, so no "
+                "service attaches and the API's bearer-token gates ask for no token and run a "
+                "request as the full-access system identity, with no sign-in"
+            )
+        else:
+            _log.warning(
+                "create_managed_app: built with no auth_settings and without allow_no_auth, so %s: "
+                "no service attaches and the API's bearer-token gates refuse. auth_settings "
+                "attaches sign-in; allow_no_auth=True instead has those gates ask for no token "
+                "and run a request as the full-access system identity",
+                AUTH_NOT_CONFIGURED,
+            )
     return app

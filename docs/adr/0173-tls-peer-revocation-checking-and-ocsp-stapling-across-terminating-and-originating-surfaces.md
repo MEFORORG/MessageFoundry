@@ -749,6 +749,7 @@ OpenSSL 3.5.7: a CRL past `nextUpdate` refuses the handshake with "CRL has expir
 flag, and the same handshake is accepted with it. So that arm stays refused unless attested, as it
 was before #2188.
 The MLLP destination's guard reads a context built the same way. That hop is not changed here.
+*(Note 2026-10-30: it is changed since, with the DICOM C-STORE SCU, by §13.)*
 
 `opener` is now a required keyword, so a new caller cannot omit it and bring back the false
 refusal.
@@ -757,7 +758,28 @@ refusal.
 also sets `tls_revocation_attested`, is logged as crossing "without certificate revocation
 checking". The record says more than happened and loses nothing. A one-condition fix was built and
 reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
-and the attestation, where the line was the only record of the attestation.
+and the attestation, where the line was the only record of the attestation. *(Note 2026-10-31: no
+longer over-states on a hop whose CRL is a real check; the CORRECTED 2026-10-30 paragraph below
+says what changed.)*
+
+**CORRECTED 2026-10-30 (BACKLOG #2193):** the guard's `crl_is_a_check` reads the context's
+time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
+line. A guard handed a context that skips time validity keeps it, because that context's CRL is no
+real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the line too: at least
+MLLP and the DICOM SCU (since §13), the REST, SOAP and FHIR hops (§4.3 above) and the FTPS hops
+(§7.1's note of 2026-10-28 on the inbound FTPS poll, and §13) hand the guard no context there, so such a hop crosses on its attestation alone. **The guard's own
+disposition does not apply that reading:** it still admits a context that skips time validity on
+that context's CRL, with no attestation, so the rule rests on each caller passing no context. The
+choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
+`SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
+`_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.
+At least `FhirLookupExecutor` (`fhir.py`) and `DicomWebDestination` (`dicomweb.py`) pass their
+opener unconditionally, and neither builds an expiry-relaxed opener today; other guarded hops pass
+their context unconditionally too. On a `tls_allow_expired` hop the line's over-statement stands
+only in part, since a certificate the CRL lists is still refused at the handshake. This correction
+changed no disposition. Where the line no longer fires, the
+attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
+`security_loosenings()` names an `[alerts]` pair.
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.
@@ -975,7 +997,7 @@ proposed accept, and only an owner ruling makes it one.
 | `store/postgres.py`, `_build_ssl`, `trust_server_certificate` branch | the whole PHI store | **Verify-off** | refused on an enforcing instance before any context is built |
 | `transports/rest.py`, `_insecure_opener` | message bodies | **Verify-off** | the dev escape, clamped by ADR 0092 |
 | `config/tls_policy.py`, `build_smtp_tls_context`, `verify=False` arm | message bodies, alerts | **Verify-off** | EMAIL and DIRECT refuse it through ADR 0092's clamp. The alert sink cannot read that clamp, so on an enforcing instance the serve gate refuses it unless `[security].allow_unverified_alert_smtp_tls` is set |
-| `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Guarded** | `RevocationHopGuard.capture` in `DicomScuDestination.__init__`, taken whenever TLS is on (this connector has no verify-off arm) and handed the context the association dials with, so a `[tls].crl_file` that reaches it through the trust anchor relaxes the refusal. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor".)* |
+| `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Guarded** | `RevocationHopGuard.capture` in `DicomScuDestination.__init__`, taken whenever TLS is on (this connector has no verify-off arm) and handed the context the association dials with, so a `[tls].crl_file` that reaches it through the trust anchor relaxes the refusal. *(Note 2026-10-30: not on a context that sets `tls_allow_expired`, which hands the guard no context, by §13.)* *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor".)* |
 | `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) and `RemoteFileSource` (the inbound FTPS poll) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `_guard_ftps_revocation`, which `RemoteFileDestination.__init__` and `RemoteFileSource.__init__` each call after the client is built, handing it that client's own context; taken only when the context verifies. The poll's attestation is the inbound's typed `tls_revocation_attested` pair, which the runner's `_source_config` carries onto its `Source`. *(Corrected 2026-10-28: BACKLOG #2193 slice (a) guarded the poll. Until then this cell graded the upload alone and said the poll still needed a guard; that text is kept below, marked superseded.)* *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* *(Superseded 2026-10-28, kept as the record: "`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD. It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. A CRL can reach that context now: on the verifying arm, `[tls].crl_file` loads onto it for any non-loopback host. Nothing refuses the poll when no CRL is set, so the guard is still needed.")* *(Corrected 2026-10-07: engine PR 2065, vault BACKLOG #2370, gave `Source` a `trust_anchor_policy`, which the runner's `_source_config` fills and `RemoteFileSource` passes to `_make_client`. The text this replaces read: "No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none".)* |
 | `transports/remotefile.py`, `_ftps_ssl_context`, `tls_verify=false` arm | message files of an anonymous hop | **Verify-off** | refused on an enforcing instance even with the escape set. A credentialed hop is refused outright in every posture, so no FTP login crosses this arm (vault BACKLOG #2636, CORRECTED 2026-10-06: this row listed the FTP login) |
 | `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Guarded** | `RevocationHopGuard.capture` in `_refuse_ad_revocation`, which `LdapAuthenticator.__init__` calls after the `NarrowedTls` is built, handing it a context that `NarrowedTls`'s factory builds, the recipe every bind's `wrap_socket` runs. Its CRL is the hop's own `[auth].ad_tls_crl_file`, which the factory loads on every bind, failing closed on a file it cannot load; `[tls].crl_file` does not reach it. Built outside the connector gate like the OIDC legs, so `AuthService` and the privilege probe pass it the posture. No attestation exists for this hop, by the owner ruling of 2026-10-27. *(Graded "Needs a guard, tracked by #2193" until 2026-10-28, when BACKLOG #2193 slice (b) built it. It read: "a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.**" CORRECTED 2026-09-30 before that: "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context.)* |
@@ -1088,7 +1110,7 @@ of the list above:
 |---|---|---|---|---|
 | SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*), and since 2026-10-17 `Encrypt=strict` in place of `Encrypt=yes`; see the finding below and its amendment. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS keyword, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
+| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS mode, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read for revocation. *(CORRECTED 2026-10-30, BACKLOG #2483: this cell read "sets no TLS keyword" and "documentation was not read". The guard now keys on a TLS mode, and the two drivers' TLS-mode keywords have since been read; their revocation behaviour has not.)* | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
 | `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row. *(Since 2026-10-26 that leg has a guard of its own, vault BACKLOG #3561; §12 says how.)* | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
@@ -1458,3 +1480,54 @@ words to older text, the older words are kept.
 
 **What this amendment does not do.** It adds no check on the wire, builds no CRL lever, and does
 not grade any hop §7.1 did not already name.
+
+## 13. Amendment 2026-10-30 -- a CRL does not admit an MLLP or DICOM SCU hop with `tls_allow_expired` (vault BACKLOG #2978)
+
+**The ruling.** Owner ruling 2026-10-05: an MLLP destination with `tls_allow_expired` stays refused
+unless attested, the same as the HTTP family, "one rule everywhere". **The owner's words name MLLP.**
+Reaching the DICOM C-STORE SCU with it is the batch 191 Manager's reading of "one rule everywhere";
+the owner may reverse that reading. The FTPS upload and poll already followed the rule.
+
+**The defect it closes.** §4.3 records that `relax_verify_expiry` sets `X509_V_FLAG_NO_CHECK_TIME`,
+which OpenSSL applies to a CRL's validity window too, so a CRL past `nextUpdate` is accepted at the
+handshake. The MLLP destination and the DICOM SCU handed the guard that relaxed context, so a
+`[tls].crl_file` that reached either would have admitted an off-box hop under an enforcing posture,
+on first deployment, with no attestation.
+
+**What changed.**
+
+- Both hops now hand `RevocationHopGuard` no context when theirs skips validity-period checks, so a
+  CRL cannot admit them and only `tls_revocation_attested` with its reason crosses. The refusal names
+  `EXPIRY_RELAXED_WAYS_ACROSS`, the FTPS remedy moved to `config/tls_policy.py` and shared, so it does
+  not offer the CRL the hop already has.
+- **Where the flag is read:** at the two call sites, off the context the hop dials with
+  (`skips_validity_period`), as `context_checks_revocation` reads the CRL flag. The guard and
+  `context_checks_revocation` are unchanged. REST, SOAP, FHIR and FTPS read the setting at their call
+  sites; on these hops the setting and the flag are set together.
+- The attested crossing still logs its audit line: with no CRL credit, the attestation is what
+  crosses the hop.
+- On an instance that does not enforce, these hops used to cross on the CRL without the revocation
+  WARNING. They now log it at each build, as any hop without a check does. At least three cases still
+  cross there without the revocation WARNING, as on every hop the guard decides: `MEFOR_TLS_REVOCATION_ATTESTED` set
+  (BACKLOG #299), the connection's own `tls_revocation_attested`, and a loopback hop.
+- Without `tls_allow_expired` both hops are unchanged: a CRL that reaches the context admits them.
+- **Two older passages read as before this amendment.** Where the §7.1 row for the DICOM SCU says a
+  CRL that reaches the context relaxes the refusal, that now holds only for a hop without
+  `tls_allow_expired`; the row carries a dated pointer here. The §7.1 MLLP row says no such thing, and
+  §4.3's sentence that the MLLP hop "is not changed here" carries the pointer instead. And the reason §4.3's *One audit line still over-states* gives
+  for reverting its one-condition fix, that the fix silenced the line for an MLLP hop with
+  `tls_allow_expired`, a CRL and the attestation, no longer holds: that hop now has no CRL credit,
+  so the fix would not silence it. This amendment does not revisit that fix. *(Note 2026-10-31:
+  §4.3's CORRECTED 2026-10-30 paragraph records a different condition, `crl_is_a_check`, which
+  keeps the line for a context that skips time validity. Its effect matches that fix for every
+  shipped caller, because each passes no context when its context skips time validity, so the line
+  is silenced where the CRL is a real check.)*
+
+Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
+refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
+credit, warned when not enforcing, and admitted by the same CRL without the relaxation, for each
+hop.
+
+**Left open.** The REST, SOAP and FHIR refusals on this shape still name the default remedy, which
+offers `[tls].crl_file`; they hand the guard no opener, so that lever cannot cross them. This
+amendment does not change those three call sites.

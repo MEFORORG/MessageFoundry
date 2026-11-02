@@ -171,10 +171,21 @@ def _takes_a_spec(fn: Any) -> bool:
 #: has a value that fits and the settings that must come with it, so the factory builds and the
 #: container is still populated for the surface walk. Keyed by factory, so another factory's setting
 #: of the same name keeps the generic probe. vault BACKLOG #2804: FHIR's Bundle entry lists take
-#: FHIR verbs and type names, and apply only to a transaction or batch connection.
-GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[list[str], dict[str, Any]]] = {
+#: FHIR verbs and type names, and apply only to a transaction or batch connection. vault BACKLOG
+#: #2287: Http's intake_client_subjects is keyed by an issuing CA's DN, which ``X-Probe-Auth`` is not.
+GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {
     ("FHIR", "allowed_entry_methods"): (["POST"], {"interaction": "transaction"}),
     ("FHIR", "allowed_entry_types"): (["Patient"], {"interaction": "transaction"}),
+    # mtls_subject and its TLS settings, or the factory refuses the table and the walk sees none.
+    ("Http", "intake_client_subjects"): (
+        {"CN=Probe CA": ["CN:x-probe"]},
+        {
+            "intake_auth": "mtls_subject",
+            "tls": True,
+            "tls_cert_file": "server.pem",
+            "tls_ca_file": "ca.pem",
+        },
+    ),
 }
 
 
@@ -409,6 +420,11 @@ HANDLED_CONTAINERS: dict[str, str] = {
     "allowed_entry_types": (
         "FHIR resource TYPE names a Bundle entry may name (vault BACKLOG #2804) -- ASCII letters "
         "only by construction, public by nature"
+    ),
+    "intake_client_subjects": (
+        "issuing-CA DNs mapped to certificate subject names that may submit (vault BACKLOG #2287) -- "
+        "topology, not a secret (ADR 0154 D6): both are in every handshake's certificates, and "
+        "masking them would hide the access-control decision from the operator who audits it"
     ),
 }
 

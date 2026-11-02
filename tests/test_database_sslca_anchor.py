@@ -530,7 +530,7 @@ def test_a_directory_leaves_no_descriptor_open(
         with pytest.raises(OSError):
             ta.evaluate_anchor(ta.AnchorSpec("outbound:X", "setting", str(tmp_path)))
     else:
-        assert f"SSLCA={{{tmp_path}}}" in _build_odbc_dsn(_settings(tmp_path), connection=_OUT)
+        assert f"SSLCA={tmp_path};" in _build_odbc_dsn(_settings(tmp_path), connection=_OUT)
     assert opened == []
     assert closed == []
 

@@ -38,6 +38,7 @@ from messagefoundry.transports import http_listener as http_module
 from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.receipt import receipt_handler
 from tests.test_mllp_tls import ADT, _ack, _cert, _close_raw, _Events, _tls_source, _until
 
 _PLAINTEXT = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -559,7 +560,7 @@ async def test_the_http_listener_records_a_failed_handshake(
     source, cert = _http_tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
-    await source.start(_no_reply)
+    await source.start(receipt_handler(_no_reply))
     try:
         assert source._upgrade_tls is (runner == "listener")
         # The control: a completed handshake is no failure.
@@ -603,7 +604,7 @@ async def test_the_http_listener_window_shortens_through_the_shared_seam(
     source, _cert_path = _http_tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
-    await source.start(_no_reply)
+    await source.start(receipt_handler(_no_reply))
     try:
         await _plaintext_peer(source.sockport)
         await _plaintext_peer(source.sockport)
@@ -727,9 +728,9 @@ async def test_a_restarted_listener_counts_again(tmp_path: Path) -> None:
 
     async def restart_then_fail(source: Any, handler: Any) -> None:
         source.on_connection_event = _Events()
-        await source.start(handler)
+        await source.start(receipt_handler(handler))
         await asyncio.wait_for(source.stop(), timeout=10.0)
-        await source.start(handler)
+        await source.start(receipt_handler(handler))
         try:
             await _plaintext_peer(source.sockport)
             await _until(lambda: source.tls_handshake_failures == 1, "not counted again")

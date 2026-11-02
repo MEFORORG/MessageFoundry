@@ -39,23 +39,29 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
     TLS_REVOCATION_ATTESTED_ENV,
+    HopDisposition,
     HopPosture,
     InsecureHopRefused,
+    RevocationHopGuard,
     TrustAnchorPolicy,
     active_hop_posture,
     build_smtp_tls_context,
     context_checks_revocation,
     relax_verify_expiry,
+    skips_validity_period,
 )
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.transports import dicom as dicom_module
 from messagefoundry.transports import direct as direct_module
 from messagefoundry.transports import fhir as fhir_module
+from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports import remotefile as remotefile_module
 from messagefoundry.transports.dicom import DicomScuDestination
 from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
@@ -442,12 +448,15 @@ def _scu(
     host: str,
     *,
     tls: bool = True,
+    allow_expired: bool = False,
     attested: bool = False,
     policy: TrustAnchorPolicy | None = None,
 ) -> Destination:
     settings: dict[str, object] = {"ae_title": "MF_SCU", "host": host, "port": 11112}
     if tls:
         settings["tls"] = True
+    if allow_expired:
+        settings["tls_allow_expired"] = True
     return _dest("OB_PACS", ConnectorType.DIMSE, settings, attested=attested, policy=policy)
 
 
@@ -459,6 +468,86 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
     ):
         DicomScuDestination(_scu(REMOTE))
     assert "connection 'OB_PACS';" in str(exc.value)
+
+
+def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
+    return RevocationHopGuard.capture(
+        host=REMOTE,
+        cell="test",
+        description="verified TLS egress (no revocation check)",
+        attested=True,
+        attested_reason=REASON,
+        context=context,
+        posture=ENFORCING,
+        connection="OB_TEST",
+        **over,
+    )
+
+
+def _crl_context(*, skip_validity: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    if skip_validity:
+        relax_verify_expiry(ctx, host=REMOTE)
+    return ctx
+
+
+def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
+    """The line says the hop crossed WITHOUT a revocation check, so on a hop that has one it is a
+    false record. ``_attested_guard(None)`` is the control: the same hop with no CRL logs it."""
+    with _guard_log() as log:
+        _attested_guard(_crl_context(skip_validity=False)).enforce_construction()
+        assert not log.audit, log.state()
+        _attested_guard(None).enforce_construction()
+    assert log.audit, log.state()
+
+
+def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -> None:
+    """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check that may
+    silence the line. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
+    the condition cannot be ``self.crl_checked``, which is what this arm tells apart."""
+    guard = _attested_guard(_crl_context(skip_validity=True))
+    assert guard.crl_checked is True
+    assert guard.disposition() is HopDisposition.ALLOW
+    with _guard_log() as log:
+        guard.enforce_construction()
+    assert "crossed without certificate revocation checking" in log.audit, log.state()
+
+
+def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
+    """The default keeps every connection's record byte-identical; a hop whose operator set another
+    setting names that one, so the record leads back to what they set."""
+    with _guard_log() as default:
+        _attested_guard(None).enforce_construction()
+    assert default.audit.endswith(f"(tls_revocation_attested; reason: {REASON})"), default.state()
+    with _guard_log() as named:
+        _attested_guard(None, declaration="[x].y_attested").enforce_construction()
+    assert named.audit.endswith(f"([x].y_attested; reason: {REASON})"), named.state()
+
+
+def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_check(
+    bare_crl: str,
+) -> None:
+    """What the attested-crossing line says, read off the context the association really dials
+    with. A CRL on a hop that keeps the time check is a check, so the hop crossed on it and a line
+    saying it crossed without one would be false. ``tls_allow_expired`` sets
+    ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
+    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. The
+    relaxed SCU hands the guard no context (ADR 0173 §13), so it crosses on its attestation, not its
+    CRL, and this half does not reach ``crl_is_a_check``; the guard-level test above pins that
+    field. This limb moves a log line, never a disposition."""
+    with active_hop_posture(ENFORCING), _guard_log() as checked:
+        kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(kept._ssl) is True
+    assert not checked.audit, checked.state()
+    relaxed_cfg = _scu(REMOTE, attested=True, policy=_crl_policy(bare_crl))
+    relaxed_cfg.settings["tls_allow_expired"] = True
+    with active_hop_posture(ENFORCING), _guard_log() as relaxed:
+        skipped = DicomScuDestination(relaxed_cfg)
+    assert context_checks_revocation(skipped._ssl) is True
+    assert "crossed without certificate revocation checking" in relaxed.audit, relaxed.state()
+    assert "connection 'OB_PACS';" in relaxed.audit, relaxed.state()
+    assert REASON in relaxed.audit, relaxed.state()
 
 
 def test_a_dicom_tls_association_is_admitted_when_a_crl_reaches_its_own_context(
@@ -702,10 +791,10 @@ def test_a_crl_does_not_admit_an_ftps_hop_that_ignores_certificate_expiry(bare_c
         # The refusal offers only levers that can cross it: not the CRL it already has.
         assert "tls_allow_expired" in str(exc.value)
         assert "Configure [tls].crl_file" not in str(exc.value)
-        assert remotefile_module._EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+        assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
         with pytest.raises(InsecureHopRefused, match="revocation") as exc:
             RemoteFileDestination(_ftps(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
-        assert remotefile_module._EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+        assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
         assert "Configure [tls].crl_file" not in str(exc.value)
         # The control: the same hop without the relaxation is admitted by that CRL.
         RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
@@ -996,3 +1085,159 @@ def test_a_credentialed_direct_hop_that_verifies_nothing_keeps_its_own_refusal(
     with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
         DirectDestination(_direct(direct_material, REMOTE, tls_verify=False))
     assert "revocation" not in str(exc.value)
+
+
+# --- tls_allow_expired on the MLLP destination and the DICOM SCU (vault BACKLOG #2978) -------------
+#
+# A context that skips validity-period checks earns no CRL credit (``skips_validity_period``).
+# These two hops handed the guard that context, so a CRL that reached them admitted an off-box hop
+# under an enforcing posture. Owner ruling 2026-10-05 names MLLP; the DICOM SCU's reach is the batch
+# 191 Manager's reading of "one rule everywhere" (ADR 0173 §13). Each hop gets four arms: refused
+# with the CRL on the relaxed context, crossed and audited on its attestation with no CRL credit,
+# warned rather than silently admitted when not enforcing, and unchanged without the relaxation.
+
+
+def _mllp(
+    host: str,
+    *,
+    allow_expired: bool = False,
+    attested: bool = False,
+    policy: TrustAnchorPolicy | None = None,
+) -> Destination:
+    settings: dict[str, object] = {"host": host, "port": 5000, "tls": True}
+    if allow_expired:
+        settings["tls_allow_expired"] = True
+    return _dest("OB_MLLP", ConnectorType.MLLP, settings, attested=attested, policy=policy)
+
+
+def _recording(
+    real: Callable[..., ssl.SSLContext | None], built: list[ssl.SSLContext]
+) -> Callable[..., ssl.SSLContext | None]:
+    """A stand-in for a context builder that records the context ``real`` returns, so a test can
+    read the context a connector really built even when its construction raises."""
+
+    def stand_in(*args: Any, **kwargs: Any) -> ssl.SSLContext | None:
+        ctx = real(*args, **kwargs)
+        if ctx is not None:
+            built.append(ctx)
+        return ctx
+
+    return stand_in
+
+
+def _assert_refused_for_the_relaxation(
+    built: list[ssl.SSLContext], exc: pytest.ExceptionInfo[InsecureHopRefused], connection: str
+) -> None:
+    # The CRL did reach the context the hop built, so this is the relaxation's refusal and not a CRL
+    # that never arrived: a guard that read that context's CRL flag would have admitted it.
+    assert len(built) == 1
+    assert context_checks_revocation(built[0]) is True
+    assert skips_validity_period(built[0]) is True
+    text = str(exc.value)
+    # The refusal offers only levers that can cross it: not the CRL it already has.
+    assert EXPIRY_RELAXED_WAYS_ACROSS in text
+    assert "Configure [tls].crl_file" not in text
+    assert f"connection '{connection}';" in text
+
+
+def test_a_crl_does_not_admit_an_mllp_destination_that_ignores_certificate_expiry(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[ssl.SSLContext] = []
+    monkeypatch.setattr(
+        mllp_module, "_mllp_ssl_context", _recording(mllp_module._mllp_ssl_context, built)
+    )
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        MLLPDestination(_mllp(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+    _assert_refused_for_the_relaxation(built, exc, "OB_MLLP")
+
+
+def test_an_expiry_relaxed_mllp_destination_crosses_on_its_attestation_and_is_audited(
+    bare_crl: str,
+) -> None:
+    """The attestation is the one lever, and the audit line is its record (ADR 0173 §4.3)."""
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        dest = MLLPDestination(
+            _mllp(REMOTE, allow_expired=True, attested=True, policy=_crl_policy(bare_crl))
+        )
+    # The CRL reached the context, so the missing credit is the relaxation's.
+    assert dest._ssl is not None and context_checks_revocation(dest._ssl) is True
+    assert dest._revocation_guard is not None
+    assert dest._revocation_guard.crl_checked is False
+    shipped = _shipped(log.audit)
+    assert "connection 'OB_MLLP';" in shipped and REASON in shipped, log.state()
+
+
+def test_a_crl_still_admits_an_mllp_destination_that_checks_expiry(bare_crl: str) -> None:
+    """The control: without ``tls_allow_expired`` the same CRL admits the same hop, as before."""
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        dest = MLLPDestination(_mllp(REMOTE, policy=_crl_policy(bare_crl)))
+    assert dest._revocation_guard is not None
+    assert dest._revocation_guard.crl_checked is True
+    assert log.audit == "", log.state()
+
+
+def test_a_crl_does_not_admit_a_dicom_scu_that_ignores_certificate_expiry(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[ssl.SSLContext] = []
+    monkeypatch.setattr(
+        dicom_module, "_client_ssl_context", _recording(dicom_module._client_ssl_context, built)
+    )
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        DicomScuDestination(_scu(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
+    _assert_refused_for_the_relaxation(built, exc, "OB_PACS")
+
+
+def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The SCU keeps no guard on itself, so the guard it captures is recorded on the way out.
+    guards: list[RevocationHopGuard] = []
+    real_capture = RevocationHopGuard.capture
+
+    def recording_capture(**kwargs: Any) -> RevocationHopGuard:
+        guard = real_capture(**kwargs)
+        guards.append(guard)
+        return guard
+
+    monkeypatch.setattr(RevocationHopGuard, "capture", staticmethod(recording_capture))
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        dest = DicomScuDestination(
+            _scu(REMOTE, allow_expired=True, attested=True, policy=_crl_policy(bare_crl))
+        )
+    # The CRL reached the context, so the missing credit is the relaxation's.
+    assert context_checks_revocation(dest._ssl) is True
+    assert [guard.crl_checked for guard in guards] == [False]
+    shipped = _shipped(log.audit)
+    assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
+    assert "DICOM C-STORE client (SCU) over TLS" in shipped
+
+
+def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str) -> None:
+    """Before vault BACKLOG #2978 the CRL admitted both hops silently here. With no CRL credit they
+    take the same WARN as any unchecked hop on a non-enforcing instance."""
+    policy = _crl_policy(bare_crl)
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+        mllp = MLLPDestination(_mllp(REMOTE, allow_expired=True, policy=policy))
+        scu = DicomScuDestination(_scu(REMOTE, allow_expired=True, policy=policy))
+    # The CRL reached both contexts, so each WARNING is the relaxation's.
+    assert mllp._ssl is not None and context_checks_revocation(mllp._ssl) is True
+    assert context_checks_revocation(scu._ssl) is True
+    revocation = [m for m in log.messages if "revocation" in m]
+    assert any("verified MLLP-over-TLS egress" in m for m in revocation), log.state()
+    assert any("verified DICOM-over-TLS association" in m for m in revocation), log.state()
+
+
+def test_a_crl_still_admits_a_dicom_scu_that_checks_expiry(bare_crl: str) -> None:
+    """The control: without ``tls_allow_expired`` the same CRL admits the same hop, as before."""
+    with active_hop_posture(ENFORCING), _guard_log() as log:
+        dest = DicomScuDestination(_scu(REMOTE, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(dest._ssl) is True
+    assert log.audit == "", log.state()

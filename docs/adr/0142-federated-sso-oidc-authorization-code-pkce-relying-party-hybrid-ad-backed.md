@@ -595,6 +595,15 @@ sessions and no user is left half deleted.
 [SECURITY.md](../SECURITY.md#federated-sign-in-oidc-browser-only--adr-0142) is the source of
 record for both.
 
+**CORRECTED 2026-10-30 (BACKLOG #2738).** The paragraph above is kept as written and no longer
+describes the code. Its claim that a missed session lasts until it expires no longer holds in
+general: the session epoch (BACKLOG #2592) refuses it on its next presentation, with at least one
+exception. The deadlock with
+a user delete has since been closed on both server stores (BACKLOG #2733, #2738). Its "being
+retried" did not say who retries a failed request. It also did not say that both limits were read
+from the code and not run. SECURITY.md, linked above, is the source of record for what remains,
+including what a failed request costs.
+
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.
 [ADR 0207](0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md) takes

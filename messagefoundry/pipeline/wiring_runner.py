@@ -46,9 +46,11 @@ from messagefoundry.auth.trust_anchors import (
     AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
+    anchor_store_refusal,
+    connection_anchor_failure,
+    explicit_cause,
     inbound_lane_reads_ca,
     lane_ca_setting,
-    refused_connection_anchor,
 )
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
@@ -111,6 +113,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
     resolved_encoding_problems,
 )
+from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
@@ -131,13 +134,15 @@ from messagefoundry.parsing import (
 from messagefoundry.parsing.binary import (
     DOC_REF_MARKER,
     DocRefError,
+    EscapedDocumentError,
+    UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import PEEK_READ_FAULTS
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7MessageTooLarge
 from messagefoundry.parsing.sniff import (
     attachment_mime_agrees,
     b64_head,
@@ -149,13 +154,14 @@ from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transfo
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
+    IngressCodecUnusable,
     IngressGuardError,
+    IngressTooLarge,
     carry_binary_ingress,
     check_binary_size,
     check_declared_type,
     check_decoded,
     decode_body,
-    listener_encoding,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -182,7 +188,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_max_rows,
     reference_statement,
 )
-from messagefoundry.pipeline.refused_body import RefusedBodyAllowance
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, with_refusal_note
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -230,7 +236,9 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
+from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
+    ENCODING_CODE,
     ConnectionEventSink,
     IntakeAuditSink,
     IntakeGate,
@@ -244,9 +252,12 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.egress import warn_url_query_credentials
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
+from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
 __all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
@@ -260,8 +271,25 @@ type _LaneFault = Literal["credential", "configuration"]
 """A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
 
 type _RefusedMember = tuple[str, str, NegativeAckError]
-"""A batch member its frame refused: its outbox row id, the content-free error the store keeps, and
-the refusal, with no traceback, whose class name and code the log line reads (BACKLOG #3043)."""
+"""A batch member its frame check or the batch re-attach refused: its outbox row id, the
+content-free error the store keeps, and the refusal, with no traceback, whose class name and code
+the log line reads (BACKLOG #3043)."""
+
+#: The :class:`NegativeAckError` code of a payload that itself breaks the re-attach of its detached
+#: document (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
+_REATTACH_CODE = "reattach"
+
+#: The reason a refused batch member's log line gives, by the refusal's code: ``framing`` is
+#: ADR 0205 rule 1, ``multiple-messages`` ADR 0209, ``encoding`` ``encode_wire_body``'s, and
+#: ``reattach`` the batch path's own re-attach refusal, which no frame check raised.
+#: A code not named here, or none, reads as the neutral reason below; the line names the code too.
+_MEMBER_REFUSAL_REASONS: Mapping[str, str] = {
+    FRAMING_CODE: "its frame cannot carry it",
+    MULTIPLE_MESSAGES_CODE: "it holds more than one message",
+    ENCODING_CODE: "its charset cannot encode it",
+    _REATTACH_CODE: "its document cannot be re-attached",
+}
+_MEMBER_REFUSAL_REASON_OTHER = "its frame check refused it"
 
 
 log = logging.getLogger(__name__)
@@ -796,6 +824,8 @@ _CONN_EVENT_BURST_MAX = 256
 # never reaches this; a run of them says the STORE is refusing, and every further attempt pays a full
 # acquire wait to learn the same thing. See `_rewrite_connection_events_singly`.
 _CONN_EVENT_SALVAGE_GIVE_UP = 3
+# How much of an undeclared connection-event kind the refusal warning keys on and shows (BACKLOG #1624).
+_UNDECLARED_KIND_SHOWN = 64
 
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
@@ -883,7 +913,28 @@ class _StreamBudgetExceeded(Exception):
     """A very-large-document detach was refused because it would push the aggregate in-flight streaming
     budget ([inbound].stream_inflight_budget_bytes) over its ceiling (#149, ADR 0105 Phase 1a) — the
     backpressure DoS guard that replaces the frame cap. Caught in the ingress path and turned into an
-    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
+    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message.
+
+    ``alone`` is True when the body by itself is over the whole budget, so the refusal can never
+    clear however the concurrent detaches finish: a receipt source answers it as over-size rather
+    than inviting a re-send (BACKLOG #2105)."""
+
+    def __init__(self, message: str, *, alone: bool = False) -> None:
+        # The default keeps cls(*args), which pickle and copy rebuild an exception with, working.
+        super().__init__(message)
+        self.alone = alone
+
+
+#: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
+#: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
+#: by one alone. Not every raise: a body the separator read refuses (a registered fuzz known finding,
+#: ``fuzz/targets.py``) still escapes as a bare ``ValueError``.
+_DETACH_REFUSALS: tuple[type[Exception], ...] = (
+    _StreamBudgetExceeded,
+    StreamingAttachmentsUnsupported,
+    DocRefError,
+    EscapedDocumentError,
+)
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -1751,6 +1802,9 @@ class RegistryRunner:
         self._conn_event_q: asyncio.Queue[ConnectionEventWrite] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
+        # Throttles the undeclared-kind warning per (connection, kind), and counts every refusal so
+        # the next line written reports the volume behind a quiet log (BACKLOG #1624).
+        self._undeclared_kind_log = RefusalLog()
         # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
         self._shard_watchdog: asyncio.Task[None] | None = None
         # BACKLOG #1611 part B: the in-flight watch (see _inflight_watch). Every mode, every backend.
@@ -2203,9 +2257,24 @@ class RegistryRunner:
         reason: str | None,
     ) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
-        connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
+        connection-event flood must never block a listener/delivery lane or grow memory unbounded.
+
+        **An undeclared kind is refused here, before it can join a burst** (BACKLOG #1624). The store
+        refuses one too, but there a single bad row fails the whole burst, and a run of them trips the
+        drainer's store-is-refusing cutoff and loses the declared rows behind them. Refused here it
+        is dropped, added to the overflow-drop tally, and warned about through a throttled line that
+        reports the running total; the store's check stays as the backstop for any other writer.
+
+        All of that holds only while the drain queue exists. With no queue the method returns first,
+        so any event, declared or not, is discarded with no row, no count and no warning. At least
+        one configuration reaches that: the ``[diagnostics].connection_events`` master switch off
+        with one inbound's ``capture_connection_errors`` on, which builds a sink but no queue."""
         q = self._conn_event_q
         if q is None:
+            return
+        if kind not in CONNECTION_EVENT_KINDS:
+            self._conn_events_dropped += 1
+            self._warn_undeclared_connection_event(connection, kind)
             return
         try:
             q.put_nowait(
@@ -2221,6 +2290,30 @@ class RegistryRunner:
             )
         except asyncio.QueueFull:
             self._conn_events_dropped += 1
+
+    def _warn_undeclared_connection_event(self, connection: str, kind: str) -> None:
+        """Log a refused undeclared kind, at most once per (connection, kind) per
+        :class:`RefusalLog` window and within its cross-key cap. Every refusal is noted, and each
+        line carries the running total, so refusals inside a quiet window show in the next line.
+
+        The kind is a code identifier, but it reached here through a variable, so it is treated as
+        free text. The throttle keys on its raw first ``_UNDECLARED_KIND_SHOWN`` characters, which
+        never reach the log. The line shows ``safe_text(kind, limit=_UNDECLARED_KIND_SHOWN)``:
+        redacted whole, then bounded. Cutting first would be the form ``messagefoundry.redaction``
+        documents as a leak, because a cut can leave a name fragment too short to match. A long
+        single-token kind therefore shows as an ellipsis with its length. The scrub runs only when a
+        line is written, so a refusal that is not logged pays no redaction pass."""
+        total = self._undeclared_kind_log.note(f"{connection}\x00{kind[:_UNDECLARED_KIND_SHOWN]}")
+        if total is None:
+            return
+        log.warning(
+            "connection %r emitted an undeclared connection_event kind %r; the event was dropped "
+            "(%d such event(s) dropped by this runner so far; repeats inside a minute are not "
+            "logged). Declare the kind in messagefoundry.connection_events",
+            connection,
+            safe_text(kind, limit=_UNDECLARED_KIND_SHOWN),
+            total,
+        )
 
     async def _connection_event_drainer(self) -> None:
         """Write queued connection events to the store OFF the listener/delivery hot path (#46), one
@@ -2337,7 +2430,9 @@ class RegistryRunner:
             reason=reason,
         )
         try:
-            self._alert_sink.connection_error(name, kind="connection_lost", detail=reason)
+            self._alert_sink.connection_error(
+                name, kind="connection_lost", detail=reason, error_class=type(exc).__name__
+            )
         except Exception:
             log.warning("alert sink raised on connection_error for %r", name)
 
@@ -2486,20 +2581,47 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` is passed to :class:`FhirLookupExecutor`; a reload passes False
-        (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
+        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
+        recorded while its lookup is down, whether its build or another setting failed (ASVS
+        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
+        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
+        and logs none. A caller
+        whose build check has already warned passes False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
 
-        def build(
-            names: Iterable[str], failed: Mapping[str, str] | None = None
-        ) -> FhirLookupExecutor:
+        def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
-            resolved = {
-                name: _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-                for name in names
-            }
+            return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
+
+        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
+            # ``resolved`` is None when a setting failed to resolve. The url alone is then
+            # resolved, so an env() URL is still named while the lookup is down.
+            if resolved is None:
+                try:
+                    resolved = resolve_env_settings(
+                        {"url": specs[name].settings.get("url")},
+                        self._env_values,
+                        connection=fhir_lookup_record_name(name),
+                    )
+                except WiringError:  # names the key, never a value
+                    # The lookup's own failure may name another setting, so say this one too.
+                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
+                    # as a secret, and a lookup name may end in a credential word.
+                    log.info(
+                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
+                        "check could not read it",
+                        name,
+                    )
+                    return
+            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
+
+        def build(
+            resolved: Mapping[str, Mapping[str, Any]],
+            failed: Mapping[str, str] | None = None,
+        ) -> FhirLookupExecutor:
             # #200 (ADR 0092): stamp the derived posture around the live executor build so each
             # connection's cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off)
             # captures THIS instance's posture rather than the unstamped fail-closed default.
@@ -2515,29 +2637,66 @@ class RegistryRunner:
                     egress=self._egress,
                     trust_anchor_policy=self._trust_anchor_policy,
                     failed=failed,
-                    warn_query_credentials=warn_query_credentials,
+                    # Logged once per lookup below; this method may build one three times.
+                    warn_query_credentials=False,
                 )
 
-        try:
-            return build(specs)  # a healthy graph builds once, as it always did
-        except Exception:
-            if isolated is None:
-                raise
-        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
-        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
-        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
-        # and attestation lines, so on this path each surviving lookup logs them again per build.
-        # That cost falls only on a start that already failed, and keeps the healthy start to one build.
+        # Settings resolve once, with no I/O, so the warning has one call site and comes before any
+        # build: a lookup that then fails to build keeps its record.
+        #
+        # Both steps isolate one lookup's failure as its build does (ADR 0031, vault BACKLOG #3008),
+        # so it costs that lookup only and never unwinds the start. WiringError is a configuration
+        # fault, recorded and alerted with the lookup. Anything else is a defect, so it is also
+        # logged at ERROR with its traceback. A lookup whose security warning step raises is
+        # degraded rather than started without its record, which fails safe.
+        settled: dict[str, dict[str, Any]] = {}
         errors: dict[str, Exception] = {}
         for name in specs:
             try:
-                build([name])
+                settled[name] = resolve(name)
+            except WiringError as exc:
+                errors[name] = exc
+            except Exception as exc:
+                log.error("FhirLookup %r settings failed to resolve", name, exc_info=True)
+                errors[name] = exc
+            if not warn_query_credentials:
+                continue
+            try:
+                warn(name, settled.get(name))
+            except Exception as exc:
+                log.error(
+                    "FhirLookup %r URL query-credential check failed, so it is not started",
+                    name,
+                    exc_info=True,
+                )
+                errors.setdefault(name, exc)
+                settled.pop(name, None)
+        if not errors:
+            try:
+                return build(settled)  # a healthy graph builds once, as it always did
+            except Exception:
+                if isolated is None:
+                    raise
+        if isolated is None:
+            raise next(iter(errors.values()))
+        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
+        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
+        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its TLS
+        # warning and attestation lines, so on this path each surviving lookup logs those again per
+        # build. That cost falls only on a start that already failed, and keeps the healthy start to
+        # one build.
+        for name, lookup_settings in settled.items():
+            try:
+                build({name: lookup_settings})
             except Exception as exc:
                 errors[name] = exc
+        errors = {name: errors[name] for name in specs if name in errors}  # in graph order
         failed = {name: safe_exc(err) for name, err in errors.items()}
-        executor = build([name for name in specs if name not in errors], failed)
+        survivors = {name: s for name, s in settled.items() if name not in errors}
+        # Before the final build, so a graph-wide failure there still leaves each lookup's own
+        # failure for the start's backstop to log.
         isolated.update(errors)
-        return executor
+        return build(survivors, failed)
 
     def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
@@ -3287,8 +3446,10 @@ class RegistryRunner:
         """Check the dialling CA a connection test is about to read (vault BACKLOG #2371). The route
         awaits it before :meth:`build_test_connector`, which is synchronous, so a test never dials
         with a CA the lane check would refuse. Raises :class:`WiringError` from the refusal, as
-        that method wraps a build failure, so the route's anchor arm reports it. The same name
-        order: an inbound wins over an outbound."""
+        that method wraps a build failure, so the route's anchor arm reports it. A store that
+        stopped the check is neither a refusal nor a failed build, so it is raised through
+        :func:`anchor_store_refusal`, for the route's store arm (vault BACKLOG #3746). The same
+        name order: an inbound wins over an outbound."""
         if self._lane_anchor_check is None:
             return
         ic = self.registry.inbound.get(name)
@@ -3305,6 +3466,8 @@ class RegistryRunner:
                 await self._check_lane_anchor("outbound", name, dest.settings, fails_lane=False)
         except WiringError:
             raise
+        except AnchorStoreUnavailable as exc:
+            raise anchor_store_refusal(exc) from exc
         except Exception as exc:
             raise WiringError(f"connector build failed: {exc}") from exc
 
@@ -3484,7 +3647,7 @@ class RegistryRunner:
                 name, owner=self._destination_owner(name), shard=self.registry.shard_id
             )
 
-    async def start_outbound(self, name: str) -> None:
+    async def start_outbound(self, name: str, *, hold_on_store_fault: bool = False) -> None:
         """RESUME delivery on one outbound connection (no-op if not paused). The OPPOSITE primitive to
         the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
         so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073).
@@ -3510,13 +3673,16 @@ class RegistryRunner:
         that marker unlogged. :meth:`_reconcile_outbounds` now asks the same gate before it does.
 
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before that gate, so a
-        refused start neither probes the log nor pages."""
+        refused start neither probes the log nor pages.
+
+        ``hold_on_store_fault`` is the operator control route's alone: see
+        :meth:`_start_outbound_unsafe`, which raises for it (vault BACKLOG #3746)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
             if not self._outbound_start_permitted(name):
                 return
-            await self._start_outbound_unsafe(name)
+            await self._start_outbound_unsafe(name, hold_on_store_fault=hold_on_store_fault)
 
     async def stop_outbound(self, name: str) -> None:
         """PAUSE delivery on one outbound connection while RETAINING its queued rows PENDING (the
@@ -3534,7 +3700,7 @@ class RegistryRunner:
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
 
-    async def restart_outbound(self, name: str) -> None:
+    async def restart_outbound(self, name: str, *, hold_on_store_fault: bool = False) -> None:
         """Stop + start delivery for one outbound in a single lock span (atomic w.r.t. a concurrent
         reload). The connector is kept WARM throughout (``_destinations[name]`` is never torn down) — a
         restart deliberately keeps MLLP sockets / DB pools / SMART tokens warm, exactly like a reload.
@@ -3557,7 +3723,10 @@ class RegistryRunner:
         ``_gate_parked`` marker is put back: a calendar park the stop half drops is not.
 
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before either half, so
-        neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067)."""
+        neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067).
+
+        ``hold_on_store_fault`` is the operator control route's alone, as on :meth:`start_outbound`.
+        The stop half has run by then, so a raise leaves the lane paused."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
@@ -3565,7 +3734,7 @@ class RegistryRunner:
             try:
                 self._stop_outbound_unsafe(name)
                 if self._outbound_start_permitted(name):
-                    await self._start_outbound_unsafe(name)
+                    await self._start_outbound_unsafe(name, hold_on_store_fault=hold_on_store_fault)
             finally:
                 if engine_parked and name in self._outbound_paused:
                     self._gate_parked.add(name)
@@ -4087,17 +4256,17 @@ class RegistryRunner:
                     if isinstance(exc, AnchorSettingRefused)
                     else lane_ca_setting(settings)
                 )
-                error = refused_connection_anchor(exc, setting=_lane_setting(direction, name, key))
+                error = connection_anchor_failure(exc, setting=_lane_setting(direction, name, key))
                 raise error from error.__cause__
             passed.append((direction, name))
         if store_fault is not None:
-            error = refused_connection_anchor(store_fault)
+            error = connection_anchor_failure(store_fault)
             raise error from error.__cause__
         return passed
 
     async def _ensure_destination_built(
         self, name: str, *, warn_query_credentials: bool = True
-    ) -> None:
+    ) -> Exception | None:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
         an operator start (#115). The ``auto_start=False`` boot gate leaves a CONNECTOR-LESS lane, so a
         resume alone could never deliver a single byte: the advertised ``POST /connections/{name}/start``
@@ -4122,12 +4291,16 @@ class RegistryRunner:
         EXCEPT for a lane that has left the DR park unbuilt (vault BACKLOG #3263): that one stays
         parked with its rows held (:meth:`_start_outbound_unsafe`). A reload that builds such a
         lane leaves it parked the same way (:meth:`_reconcile_outbounds`), and passes
-        ``warn_query_credentials=False`` because its build check already warned (vault BACKLOG #2910)."""
+        ``warn_query_credentials=False`` because its build check already warned (vault BACKLOG #2910).
+
+        Returns the lane's fixed line when the store stopped the CA check, else ``None`` (vault
+        BACKLOG #3746), for an operator start to raise: see :meth:`_start_outbound_unsafe`. The
+        test reads the line's cause, since that line stays a ``TrustAnchorError``."""
         if name in self._destinations or ("outbound", name) in self._filtered:
-            return
+            return None
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
-            return
+            return None
         connector: DestinationConnector | None = None
         try:
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
@@ -4159,12 +4332,14 @@ class RegistryRunner:
             # first failed for another reason keeps that older reason in its status; the CA
             # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
             # item 3, declined: recording it again is what the alert-storm test pins against).
+            # A store fault's line is a TrustAnchorError too, so it is held to the same rule.
             if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
                 self._record_failed(name, exc, kind="outbound")
-            return
+            return exc if explicit_cause(exc, AnchorStoreUnavailable) is not None else None
         self._destinations[name] = connector
         self._failed.pop(("outbound", name), None)
         self._dr_unbuilt.pop(name, None)
+        return None
 
     async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
         """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
@@ -4177,12 +4352,24 @@ class RegistryRunner:
         except Exception:
             log.exception("closing the rejected connector for outbound %r raised", name)
 
-    async def _start_outbound_unsafe(self, name: str) -> None:
+    async def _start_outbound_unsafe(self, name: str, *, hold_on_store_fault: bool = False) -> None:
         """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
         its connector first if the lane has none (a start-disabled or failed lane is connector-less —
         see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a pause never
         tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent for a
         name that isn't paused.
+
+        ``hold_on_store_fault`` is for the operator control route alone (vault BACKLOG #3746). When
+        the store stopped the lane's CA check it raises the lane's fixed line, for the route to
+        answer, and does not resume the lane: nothing is known against the CA, and a resumed lane
+        with no connector charges each row it claims an attempt, which under a finite
+        ``max_attempts`` would dead-letter it.
+
+        **The hold ends at the lane's next start**, which at least an operator, a schedule or a
+        rule can make. With the default, every other caller resumes the lane as it always has. While a lane
+        is held it sits in ``_outbound_paused``, which suppresses its buildup and stall pages. The
+        raise pauses nothing: a lane that was not paused, such as one that failed at boot on the
+        same fault, keeps claiming with no connector, unless a restart's stop half paused it.
 
         REFUSES a DR-parked lane with :class:`DrParkedError`, which its public doors raise first;
         this one is the backstop for an internal caller that forgot to ask.
@@ -4201,7 +4388,7 @@ class RegistryRunner:
             # passive start's record goes, so a fault still there is recorded in this build's own
             # words (vault BACKLOG #3263).
             self._failed.pop(("outbound", name), None)
-        await self._ensure_destination_built(name)
+        check_stopped = await self._ensure_destination_built(name)
         if name in self._dr_unbuilt and name not in self._destinations:
             # The build failed on a lane held since it left the DR park (vault BACKLOG #3263).
             # Resuming it would charge each held row an attempt with no connector. The park
@@ -4212,7 +4399,11 @@ class RegistryRunner:
                 self._gate_parked.add(name)
             else:
                 self._park_outbound_lane(name)
+            if check_stopped and hold_on_store_fault:
+                raise check_stopped
             return
+        if check_stopped and hold_on_store_fault:
+            raise check_stopped
         self._outbound_paused.discard(name)
         self._schedule_parked.discard(name)
         # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
@@ -4758,9 +4949,9 @@ class RegistryRunner:
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
         # A source that answers the sender with its own protocol status declares wants_receipt, and gets
-        # the receipt handler: the committed message_id, or None when the body was refused and recorded
-        # ERROR. The HTTP listener (ADR 0023) owns what it answers for each (HttpSource._serve_one);
-        # the DICOM C-STORE SCP maps None to a
+        # the receipt handler: an IngressReceipt carrying the committed message_id, or the refusal's
+        # kind and the ERROR row's id (BACKLOG #2105). The HTTP listener (ADR 0023) owns what it answers
+        # for each (HttpSource._serve_one); the DICOM C-STORE SCP maps a refusal to a
         # DIMSE failure (BACKLOG #1910). Every other source gets the standard handler, whose str return is
         # a wire reply/ACK and whose None means both "committed" and "refused". The transport declares the
         # contract rather than the runner keying on a connector type (CLAUDE.md sec. 4).
@@ -5237,7 +5428,9 @@ class RegistryRunner:
                 self._resume_pooled_lane(dispatcher, stage, name)
         return True
 
-    async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
+    async def _start_outbound(
+        self, name: str, oc: OutboundConnection, *, warn_query_credentials: bool
+    ) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
         ``env()`` / cert, an egress-allowlist refusal, a capture/backend mismatch) is ISOLATED
         (ADR 0031): the connection is recorded failed and the worker is STILL spawned, but with no
@@ -5245,7 +5438,7 @@ class RegistryRunner:
         preserving the count-and-log + at-least-once invariants) and a later reload/restart that builds
         the connector self-heals the lane. retry/ordering/etc. are set regardless of build outcome
         because the worker reads them live per item (a reload can swap a working connector under the
-        already-spawned worker)."""
+        already-spawned worker). ``warn_query_credentials`` is :meth:`start`'s."""
         self._retry[name] = oc.retry or self._delivery_defaults
         self._ordering[name] = oc.ordering or self._ordering_default
         # ADR 0066 D4: pick this lane's delivery consumer NOW, before the park/spawn branches below and
@@ -5325,7 +5518,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
-                connector = build_destination(dest, egress=self._egress)
+                connector = build_destination(
+                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
             # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
@@ -5357,7 +5552,12 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
-    async def start(self) -> None:
+    async def start(self, *, warn_query_credentials: bool = True) -> None:
+        """Bring the graph up. ``warn_query_credentials=False`` is for a caller that has just run
+        :meth:`build_check` on this graph, which logged the URL query-credential WARNING, at least
+        ``Engine.reload_detail`` with no runner yet (vault BACKLOG #2910). It reaches only the
+        builds this call makes. A later window open or operator start builds a lane this start left
+        unbuilt, and that build logs the WARNING."""
         async with self._reload_lock:
             if self._running:
                 return
@@ -5469,7 +5669,9 @@ class RegistryRunner:
                 if self._log_write_stopped:
                     self._park_delivery_for_log_failure()
                 for name, oc in self.registry.outbound.items():
-                    await self._start_outbound(name, oc)
+                    await self._start_outbound(
+                        name, oc, warn_query_credentials=warn_query_credentials
+                    )
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
@@ -5480,7 +5682,7 @@ class RegistryRunner:
                 # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
                 # A restart and a clustered node's start on promotion both come through here.
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor(
-                    isolated=fhir_lookup_isolated
+                    isolated=fhir_lookup_isolated, warn_query_credentials=warn_query_credentials
                 )
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
@@ -5786,6 +5988,13 @@ class RegistryRunner:
                 except Exception:
                     log.exception("alert sink raised on sandbox_worker_refused for %r", name)
             raise
+        except SystemExit as exc:
+            # The Router or Handler called sys.exit() (vault BACKLOG #3134): an ordinary fault for
+            # the caller's internal-error policy, never a stop of the event loop. UserCodeCalledSysExit says
+            # why this differs from the config-code rule. Raised after the handler ends, so the
+            # SystemExit, whose code may be the author's text, is on neither chain.
+            exited = UserCodeCalledSysExit.from_exit(exc)
+        raise exited
 
     async def stop(
         self,
@@ -7688,23 +7897,30 @@ class RegistryRunner:
     def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
         # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
         # receipt can carry it (AC-2) — distinct from the MLLP/TCP handler, whose str return is a wire
-        # REPLY to frame. So HTTP gets its own handler returning the committed message_id (or None when
-        # the body was NOT committed: a recorded ERROR from a decode/size guard). The receipt semantics
-        # (which the source maps to 202/4xx) are HTTP's own response logic, exactly as the HL7 ACK is
-        # MLLP's — the ingress commit + count-and-log + disposition machine are the SAME as _handle_inbound.
-        # Every source declaring wants_receipt binds this handler, the DICOM SCP included (BACKLOG #1910),
-        # so None here must keep meaning "not committed": the SCP answers a DIMSE failure on it.
-        async def on_request(raw: bytes) -> str | None:
+        # REPLY to frame. So HTTP gets its own handler returning an IngressReceipt: the committed
+        # message_id, or the refusal's kind and the ERROR row's id when the body was NOT committed. The
+        # receipt semantics (which the source maps to 202/4xx/503) are HTTP's own response logic, exactly
+        # as the HL7 ACK is MLLP's — the ingress commit + count-and-log + disposition machine are the SAME
+        # as _handle_inbound. Every source declaring wants_receipt binds this handler, the DICOM SCP
+        # included (BACKLOG #1910), so a refusal here must keep meaning "not committed": the SCP answers a
+        # DIMSE failure on it.
+        async def on_request(raw: bytes) -> IngressReceipt:
             return await self._handle_inbound_http(ic, raw)
 
-        return on_request
+        return receipt_handler(on_request)
 
     async def _declared_content_mismatch(
-        self, ic: InboundConnection, raw: bytes, *, text: str | None = None
-    ) -> bool:
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        *,
+        text: str | None = None,
+        kind: RefusalKind | None = None,
+    ) -> str | None:
         """Whether a NON-HL7 ingress body contradicts its inbound's declared ``content_type`` (ASVS
-        5.2.2, BACKLOG #1109). ``True`` means the body was dead-lettered here and the caller must stop;
-        ``False`` means it matched (or the type carries no reliable signature) and ingress continues.
+        5.2.2, BACKLOG #1109). A message id means the body was dead-lettered here, as that ``ERROR``
+        row, and the caller must stop; ``None`` means it matched (or the type carries no reliable
+        signature) and ingress continues.
 
         The rule is :func:`~messagefoundry.pipeline.ingress_guards.check_declared_type`, which the
         operator resend calls too. The file sources have run the same magic-byte sniff since the
@@ -7727,50 +7943,54 @@ class RegistryRunner:
             check_declared_type(ic, raw if text is None else text_sniff_head(text))
         except IngressGuardError as exc:
             # PHI-safe: the reason names the declared type only — never a byte of the rejected body.
-            await self._record_refused(
+            return await self._record_refused(
                 ic,
                 raw,
                 text,
                 error=exc.reason,
                 message_type=ic.content_type.value,
+                kind=kind,
             )
-            return True
-        return False
+        return None
 
-    async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> str | None:
-        """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
-        first-slice receipt, ADR 0023 D3). Returns ``None`` when the body was NOT committed — one of
-        the guards below refused it and recorded an ``ERROR`` (count-and-log: still persisted, never
-        accepted-and-dropped). What the source answers for each is the source's own logic
+    async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> IngressReceipt:
+        """Commit a POSTed HTTP body to the ingress stage and return its receipt: the engine
+        ``message_id`` (the first-slice receipt, ADR 0023 D3), or a refusal when the body was NOT
+        committed — one of the guards below refused it and recorded an ``ERROR`` (count-and-log: still
+        persisted, never accepted-and-dropped). A refusal carries that ``ERROR`` row's id and its
+        :class:`~messagefoundry.transports.receipt.RefusalKind`, which is what lets the source tell a
+        sender to re-send later from one that must not (BACKLOG #2105, the ADR 0154 amendment of
+        2026-10-30). What the source answers for each is the source's own logic
         (``HttpSource._serve_one`` for HTTP). A pre-ingress oversize/malformed/allowlist refusal is the
-        source's own synchronous ``4xx`` BEFORE this runs.
+        source's own synchronous ``4xx`` BEFORE this runs. A codec NAME that sets up no decode is a
+        temporary refusal, not a permanent one: the configuration is at fault, not the body, so the
+        same body is accepted once it is fixed (BACKLOG #2431; :meth:`_refuse_guarded`).
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
-        :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
+        :meth:`_handle_inbound`; it differs only in returning a receipt instead of a wire ACK and in not
         building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt).
 
         It is the receipt handler for EVERY source that declares ``wants_receipt``, not only HTTP. The
-        DICOM C-STORE SCP answers a DIMSE failure on ``None`` (BACKLOG #1910), so no path here may return
-        ``None`` after ``enqueue_ingress`` has committed, or an accepted object reads as refused."""
+        DICOM C-STORE SCP answers a DIMSE failure on a refusal (BACKLOG #1910), so no path here may
+        return a refusal after ``enqueue_ingress`` has committed, or an accepted object reads as
+        refused. Every refusal below is built from the id ``_record_refused`` returned, and every
+        acceptance from the id ``enqueue_ingress`` returned, so neither can stand for the other."""
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
             # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. The shared
-            # guard bounds the RAW bytes (SEC-017), as _handle_inbound does. ERROR + None on overrun.
+            # guard bounds the RAW bytes (SEC-017), as _handle_inbound does. ERROR + refusal on overrun.
             try:
                 check_binary_size(raw)
             except IngressGuardError as exc:
-                await self._record_refused(
-                    ic,
-                    raw,
-                    None,
-                    error=exc.reason,
-                    message_type=ic.content_type.value,
+                return await self._refuse_guarded(
+                    ic, raw, None, exc, message_type=ic.content_type.value
                 )
-                return None
-            if await self._declared_content_mismatch(ic, raw):
-                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+            mismatch = await self._declared_content_mismatch(ic, raw, kind=RefusalKind.PERMANENT)
+            if mismatch is not None:
+                # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+                return IngressReceipt.refused(RefusalKind.PERMANENT, mismatch)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=carry_binary_ingress(raw, ic),
@@ -7780,51 +8000,36 @@ class RegistryRunner:
                 summary=None,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
-            return mid
+            return IngressReceipt.accepted(mid)
 
         # The same decode and post-decode guards as _handle_inbound, from ingress_guards (#1689).
-        encoding = listener_encoding(ic)
         try:
-            text = decode_body(raw, ic, encoding=encoding)
+            text = decode_body(raw, ic)
         except IngressGuardError as exc:
-            await self._record_refused(
-                ic,
-                raw,
-                None,
-                error=exc.reason,
-                message_type=None if hl7v2 else ic.content_type.value,
+            return await self._refuse_guarded(
+                ic, raw, None, exc, message_type=None if hl7v2 else ic.content_type.value
             )
-            return None
 
         try:
             check_decoded(text, ic)
-        except IngressBodyRejected as exc:
+        except IngressGuardError as exc:
             # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
             # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte inside the
-            # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4).
-            await self._record_refused(
-                ic,
-                raw,
-                text,
-                error=exc.reason,
-                message_type=None if hl7v2 else ic.content_type.value,
+            # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4). So does
+            # the engine ceiling on a NON-HL7 body (SEC-017), a ``size``-phase refusal answered as
+            # over-size; check_decoded never raises that for HL7.
+            return await self._refuse_guarded(
+                ic, raw, text, exc, message_type=None if hl7v2 else ic.content_type.value
             )
-            return None
-        except IngressGuardError as exc:
-            # The engine ceiling on a NON-HL7 body (SEC-017); check_decoded never raises it for HL7.
-            await self._record_refused(
-                ic,
-                raw,
-                text,
-                error=exc.reason,
-                message_type=ic.content_type.value,
-            )
-            return None
 
         if not hl7v2:
-            if await self._declared_content_mismatch(ic, raw, text=text):
-                return None  # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+            mismatch = await self._declared_content_mismatch(
+                ic, raw, text=text, kind=RefusalKind.PERMANENT
+            )
+            if mismatch is not None:
+                # ERROR recorded; the receipt source owns its reply (no HL7 ACK)
+                return IngressReceipt.refused(RefusalKind.PERMANENT, mismatch)
             mid = await self.store.enqueue_ingress(
                 channel_id=ic.name,
                 raw=text,
@@ -7834,7 +8039,7 @@ class RegistryRunner:
                 summary=None,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
-            return mid
+            return IngressReceipt.accepted(mid)
 
         # HL7-over-HTTP: parse (+ optional strict validate) before committing, recording ERROR on a
         # malformed message exactly as MLLP does — but the synchronous response is the source's 202/4xx,
@@ -7846,17 +8051,21 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
-            await self._record_refused(
+            # Over the peek's max_bytes is over-size, as the engine ceiling is on any other body; every
+            # other parse refusal is about the body's content.
+            return await self._refuse(
                 ic,
                 raw,
                 text,
+                RefusalKind.OVERSIZE
+                if isinstance(exc, HL7MessageTooLarge)
+                else RefusalKind.PERMANENT,
                 error=(
                     f"parse error: {safe_exc(exc)}"
                     if isinstance(exc, HL7PeekError)
                     else _peek_read_fault(ic, exc)
                 ),
             )
-            return None
         if ic.validation.strict and streaming_over:
             # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
             # MSH structure Peek.parse validated) — see _handle_inbound for the rationale.
@@ -7882,26 +8091,47 @@ class RegistryRunner:
                 # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
                 # it instead of pinning intake. The message string is PHI-safe/value-free (only the
                 # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
+                #
+                # PERMANENT, not temporary (BACKLOG #2105): a body that times out for its own content
+                # times out on every re-send, and each attempt orphans another hl7apy thread this path
+                # cannot kill, so inviting a retry would multiply the very load this timeout bounds. A
+                # timeout caused by load instead cannot be told apart from it here. ADR 0154's
+                # 2026-10-30 amendment records the cost and when it may be reclassified.
                 timed_out = f"strict-validation timed out after {timeout}s"
-                await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
-                return None
+                return await self._refuse(
+                    ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
+                )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
-                await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                return None
+                # validate() keeps its own size cap, the engine default, even where the inbound's
+                # max_message_bytes admitted the body to the peek. It says itself when that cap
+                # refused the body, measured on the text it normalized, so nothing here re-derives it.
+                kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
+                return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns None, which the source answers as a refusal — never
-        # accepted-and-dropped.
+        # failure records ERROR + returns a refusal — never accepted-and-dropped.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
-                await self._record_refused(
-                    ic, raw, text, error=f"streaming detach failed: {safe_exc(exc)}", peek=peek
+            except _DETACH_REFUSALS as exc:
+                # Only the in-flight budget is the engine's own and clears as concurrent detaches
+                # finish, so only it invites a re-send, and only when the body would fit the budget
+                # once they have: one larger than the whole budget is over-size. An unsupported
+                # backend, a malformed handle and an escaped document refuse the same body every time.
+                if isinstance(exc, _StreamBudgetExceeded):
+                    kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+                else:
+                    kind = RefusalKind.PERMANENT
+                return await self._refuse(
+                    ic,
+                    raw,
+                    text,
+                    kind,
+                    error=f"streaming detach failed: {safe_exc(exc)}",
+                    peek=peek,
                 )
-                return None
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=skeleton,
@@ -7912,7 +8142,50 @@ class RegistryRunner:
             attachment_refs=attachment_refs or None,
         )
         self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
-        return mid
+        return IngressReceipt.accepted(mid)
+
+    async def _refuse(
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        text: str | None,
+        kind: RefusalKind,
+        *,
+        error: str,
+        message_type: str | None = None,
+        peek: Peek | None = None,
+    ) -> IngressReceipt:
+        """Record a refused body as ``ERROR`` and return that row as a receipt refusal of ``kind``.
+
+        The receipt is built from the id ``_record_refused`` returned, so it always names the row."""
+        mid = await self._record_refused(
+            ic, raw, text, error=error, message_type=message_type, peek=peek, kind=kind
+        )
+        return IngressReceipt.refused(kind, mid)
+
+    async def _refuse_guarded(
+        self,
+        ic: InboundConnection,
+        raw: bytes,
+        text: str | None,
+        exc: IngressGuardError,
+        *,
+        message_type: str | None,
+    ) -> IngressReceipt:
+        """Record an ingress-guard refusal as ``ERROR`` and return it as a receipt refusal.
+
+        The engine ceiling (:class:`IngressTooLarge`) is answered as over-size on every path (BACKLOG
+        #2105). A codec NAME that sets up no decode (:class:`IngressCodecUnusable`) is temporary: the
+        inbound's configuration is at fault, not the body, so every body fails alike until the
+        operator fixes it and the same body is accepted after, the receipt form of the MLLP
+        listener's ``AE`` (BACKLOG #2431). Every other guard is about the body and is permanent."""
+        if isinstance(exc, IngressTooLarge):
+            kind = RefusalKind.OVERSIZE
+        elif isinstance(exc, IngressCodecUnusable):
+            kind = RefusalKind.TEMPORARY
+        else:
+            kind = RefusalKind.PERMANENT
+        return await self._refuse(ic, raw, text, kind, error=exc.reason, message_type=message_type)
 
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
@@ -7939,15 +8212,20 @@ class RegistryRunner:
 
         Raises :class:`_StreamBudgetExceeded` when the aggregate in-flight budget would be exceeded, and
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
-        support (SQL Server / Postgres in Phase 1a) — both are turned into an ``ERROR``/NAK by the
-        caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
+        support (SQL Server / Postgres in Phase 1a), and
+        :class:`~messagefoundry.parsing.binary.EscapedDocumentError` when a document's ``OBX-5.5``
+        holds an HL7 escape (vault BACKLOG #2809) — each, as one of :data:`_DETACH_REFUSALS`, is turned
+        into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
         budget = self._stream_inflight_budget
         if budget and self._stream_inflight_bytes + size > budget:
+            alone = size > budget
             raise _StreamBudgetExceeded(
                 f"streaming in-flight budget exceeded ({self._stream_inflight_bytes} + {size} > "
-                f"{budget} bytes); refusing the detach (backpressure)"
+                f"{budget} bytes); refusing the detach "
+                + ("(the body alone is over the budget)" if alone else "(backpressure)"),
+                alone=alone,
             )
         # Reserve the budget for the whole detach window (buffer + per-chunk seal); release in finally the
         # instant the attachment(s) are durable and the skeleton is small — the peak this bounds is passed.
@@ -7958,8 +8236,11 @@ class RegistryRunner:
             # and seal inside put_attachment. Measured 2026-10-06 on SQLite with the AES-GCM cipher,
             # the longest event-loop stall fell from about 0.3 s to 0.03 s at a 15 MiB body and from
             # 1.5-2.0 s to 0.1-0.2 s at 64 MiB. What is left is the longest single string operation,
-            # which holds the GIL in any thread. The scan stays lazy, one document at a time, as the
-            # budget assumes. Only one thread touches `message` at a time: each hop is awaited.
+            # which holds the GIL in any thread. The scan yields one document at a time, as the budget
+            # assumes, but its first hop does the per-OBX reads for every OBX (OBX-2 and OBX-5.4, each
+            # a split of the field) and scans every raw OBX-5.5 for an escape, so a refusal comes
+            # before any document is stored (vault BACKLOG #2809). Only one thread touches `message`
+            # at a time: each hop is awaited.
             message = await asyncio.to_thread(Message.parse, text)
             documents = iter_obx_documents(message)
 
@@ -8013,7 +8294,7 @@ class RegistryRunner:
                     message_type=ic.content_type.value,
                 )
                 return None
-            if await self._declared_content_mismatch(ic, raw):
+            if await self._declared_content_mismatch(ic, raw) is not None:
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
             # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
@@ -8037,11 +8318,11 @@ class RegistryRunner:
         # raw and the delivered copy (review H-3). HL7 also normalizes line endings to \r; a non-HL7
         # body (JSON/XML/text) is decoded verbatim — \r-normalizing it would corrupt it (ADR 0004).
         # The decode and the post-decode guards below are ingress_guards' (#1689), the same two calls
-        # the dry-run makes. The encoding setting reaches decode_body unresolved on purpose;
-        # listener_encoding says why.
-        encoding = listener_encoding(ic)
+        # the dry-run makes, and decode_body resolves the codec name by the dry-run's rule. Config load
+        # refuses a bad name; one that got past it is this same ERROR row, with an AE, rather than an
+        # escape into the transport (BACKLOG #2431).
         try:
-            text = decode_body(raw, ic, encoding=encoding)
+            text = decode_body(raw, ic)
         except IngressGuardError as exc:
             decode_err = exc.reason
             mid = await self._record_refused(
@@ -8051,8 +8332,11 @@ class RegistryRunner:
                 error=decode_err,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
+            # A codec name that cannot decode anything is the configuration's fault, so AE (resend
+            # once it is fixed); bytes invalid in a usable charset are the message's, so AR.
+            nak_code = "AE" if isinstance(exc, IngressCodecUnusable) else "AR"
             ack = (
-                build_ack(raw, code="AR", text="decode error", ack_mode=ack_mode)
+                build_ack(raw, code=nak_code, text="decode error", ack_mode=ack_mode)
                 if (hl7v2 and reply)
                 else None
             )
@@ -8060,7 +8344,7 @@ class RegistryRunner:
                 await self._capture_ack(
                     mid,
                     ic.name,
-                    ack_code="AR",
+                    ack_code=nak_code,
                     ack_phase="decode",
                     ack_body=None,
                     detail=decode_err,
@@ -8117,7 +8401,7 @@ class RegistryRunner:
             return None
 
         if not hl7v2:
-            if await self._declared_content_mismatch(ic, raw, text=text):
+            if await self._declared_content_mismatch(ic, raw, text=text) is not None:
                 return None  # ERROR recorded; no HL7 ACK for a non-HL7 content type
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
             # HL7 ACK. The decoded body is committed verbatim and the router/transform workers route it
@@ -8243,22 +8527,25 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure (budget/backpressure or an unsupported backend) is a synchronous ERROR + NAK AE
-        # — the message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
+        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure or an unsupported
+        # backend, AR for an escaped document (below) — the message is NEVER accepted-and-dropped, and
+        # no ACK is sent for a body we couldn't store.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
-            except (
-                _StreamBudgetExceeded,
-                StreamingAttachmentsUnsupported,
-                DocRefError,
-            ) as exc:
+            except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
+                # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
+                # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
+                if isinstance(exc, EscapedDocumentError):
+                    nak_code, nak_text = "AR", "escaped document in OBX-5.5"
+                else:
+                    nak_code, nak_text = "AE", "streaming detach failed"
                 ack = (
-                    build_ack(peek, code="AE", text="streaming detach failed", ack_mode=ack_mode)
+                    build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8266,7 +8553,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code=nak_code,
                         ack_phase="ingest",
                         ack_body=None,
                         detail=detach_err,
@@ -8312,6 +8599,7 @@ class RegistryRunner:
         error: str,
         message_type: str | None = None,
         peek: Peek | None = None,
+        kind: RefusalKind | None = None,
     ) -> str:
         """Record a body refused before ingress as ``ERROR``. Every refusal phase lands here, so every
         one is counted and logged (CLAUDE.md section 2). ``wire`` is the body as received and
@@ -8319,7 +8607,14 @@ class RegistryRunner:
         after the parse passes ``peek`` so the row carries the header fields an operator searches by.
         The per-inbound refused-body allowance decides whether the whole body or its head is stored;
         its length always is, and a digest keyed from the store's audit key whenever the store holds
-        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it."""
+        one in heap (vault BACKLOG #2608). The caller's ACK or NAK does not depend on it.
+
+        ``kind``, which a receipt source's refusal passes, leads the stored error as
+        ``[refusal kind: <kind>]``, so an operator can tell a temporary refusal from a final one
+        before resending the row (BACKLOG #2105). It is added after the allowance's bound, so it goes
+        ahead of the allowance note too: the text opens with it whether or not the allowance is spent.
+        Both notes go first because the store's redaction cuts from a quoted segment id to the end of
+        the text."""
         bounded = self._refused_body.bound(
             ic.name,
             wire,
@@ -8333,7 +8628,11 @@ class RegistryRunner:
             channel_id=ic.name,
             raw=bounded.raw,
             status=MessageStatus.ERROR,
-            error=bounded.error,
+            error=(
+                bounded.error
+                if kind is None
+                else with_refusal_note(f"[refusal kind: {kind.value}] ", bounded.error)
+            ),
             control_id=peek.control_id if peek is not None else None,
             message_type=peek.message_type if peek is not None else message_type,
             source_type=ic.spec.type.value,
@@ -8752,7 +9051,13 @@ class RegistryRunner:
         IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
         support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
         the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption)."""
+        into the partner's ``OBX-5.5`` = silent corruption). A malformed handle (:class:`DocRefError`) takes that
+        same retryable path. A failure the payload itself causes, an
+        :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
+        :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
+        other ``ValueError`` propagates to the outbound's internal-error policy, a stored document
+        holding a CR or LF included: no payload can cause one, so it is store corruption or an
+        engine bug."""
         if DOC_REF_MARKER not in payload:
             return payload  # no detached document → byte-identical, no store read (the common path)
 
@@ -8772,6 +9077,17 @@ class RegistryRunner:
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
+        except UnreattachableDocumentError as exc:
+            # Only these two failures, which the MESSAGE causes: the payload does not parse as HL7, or its
+            # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809). The same payload fails
+            # the same way on every attempt, so a retry could never succeed: refuse it permanently,
+            # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
+            # fault in the re-attach, a stored document holding a CR or LF included, still reaches
+            # the outbound's internal-error policy, and STOP still stops the lane. Raised after the
+            # handler ends, so a parse error that quotes the payload is on neither chain (see
+            # IngressGuardError).
+            refused = f"document re-attach failed: {safe_exc(exc)}"
+        raise NegativeAckError(refused, code=_REATTACH_CODE, permanent=True)
 
     async def _pace_outbound(self, name: str) -> None:
         """Apply this outbound lane's egress send pacing (BACKLOG #82): wait until at least
@@ -8887,9 +9203,11 @@ class RegistryRunner:
                 # check_frame runs the same delimiter rewrite send() does, so on this single-row
                 # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
-                # member with rewrite=False and never rewrites the envelope. A hydration failure is
-                # not a refusal, so it stays what shadow made it before, a completed delivery. A
-                # store read fault is not a hydration failure: it re-pends, as live (vault #2756).
+                # member with rewrite=False and never rewrites the envelope. A retryable hydration
+                # failure (a DeliveryError) is not a refusal, so it stays what shadow made it before,
+                # a completed delivery. A shadow outbound that does not frame never hydrates, so it
+                # completes the row. A store read fault is not a hydration failure: it re-pends, as
+                # live (vault #2756).
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))
@@ -9142,9 +9460,11 @@ class RegistryRunner:
         + complete all N in one store transaction. Mirrors the single-row disposition ladder over the whole
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
-        The one exception (ADR 0205 rule 1): a member whose payload the frame cannot carry is taken out
-        before the envelope is built and dead-lettered alone, and "all N" above means the rest. The
-        envelope's head is then the first member that survived.
+        The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
+        carry, that holds more than one message (ADR 0209), or that itself breaks the re-attach of
+        its detached document (vault BACKLOG #2809), is taken out before the envelope is built and
+        dead-lettered alone, and "all N" above means the rest. The envelope's head is then the
+        first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
         ``seq`` order (``reset_stale_inflight``). The members are the lane's oldest contiguous rows in
@@ -9286,15 +9606,33 @@ class RegistryRunner:
             # mfdoc:v1:ref: handle). Members with no handle are byte-identical; a missing attachment raises
             # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
             # A store read fault is a _StoreReadFault and re-pends the same way (vault BACKLOG #2756).
-            hydrated = [await self._hydrate_payload(it.payload) for it in items]
-            # ADR 0205 rule 1, per member: one member the frame cannot carry is dead-lettered alone
-            # and the rest batch, rather than all N dying on one envelope offset. It runs before the
-            # shadow branch below, so a simulate outbound records the same dispositions. The split
-            # writes nothing; the refused members are dead-lettered after this try, on every path.
+            # A member whose own payload breaks the re-attach (a permanent NegativeAckError, vault
+            # BACKLOG #2809) is refused alone, as the frame split below refuses one. Kept local until
+            # every member has hydrated, so a fault that sends the whole batch to an arm below takes
+            # that member with it rather than leaving it in two dispositions.
+            hydrated_items: list[OutboxItem] = []
+            hydrated: list[str] = []
+            unhydratable: list[_RefusedMember] = []
+            for it in items:
+                try:
+                    hydrated.append(await self._hydrate_payload(it.payload))
+                except NegativeAckError as exc:
+                    unhydratable.append((it.id, safe_exc(exc), exc.with_traceback(None)))
+                else:
+                    hydrated_items.append(it)
+            # ADR 0205 rule 1, per member: one member the frame cannot carry, or that holds more
+            # than one message (ADR 0209), is dead-lettered alone and the rest batch, rather than
+            # all N dying on one envelope offset. It runs before the shadow branch below, so a
+            # simulate outbound records the same dispositions. The split writes nothing; the
+            # refused members are dead-lettered after this try, on every path.
             if _frames(connector):
-                kept, members, refused = self._split_unframeable_members(connector, items, hydrated)
+                kept, members, unframeable = self._split_unframeable_members(
+                    connector, hydrated_items, hydrated
+                )
+                refused = unhydratable + unframeable
             else:
-                kept, members = list(items), list[Message | str](hydrated)
+                kept, members = hydrated_items, list[Message | str](hydrated)
+                refused = unhydratable
             ids = [it.id for it in kept]
             if kept:
                 first = kept[0]  # the envelope's head is the first member that survived
@@ -9410,8 +9748,11 @@ class RegistryRunner:
         rule 1). Pure: it writes and logs nothing, so a store fault cannot strike between a refusal
         and the send, and the caller dead-letters and logs the refused members once the rest are
         resolved. A refusal that is not permanent, or one that must stop the lane, is re-raised for
-        the whole batch, as a send would raise it. The error text names a byte and an offset in that
-        member, never content."""
+        the whole batch, as a send would raise it. The MLLP and TCP checks name no content: a
+        member the frame cannot carry is named by the frame byte and its offset, one its charset
+        cannot encode by the position of its first offending character, and a
+        ``multiple-messages`` member (ADR 0209) by the rule it breaks. Another connector's own
+        refusal text is its own, stored through ``safe_exc``."""
         kept: list[OutboxItem] = []
         kept_payloads: list[Message | str] = []
         refused: list[_RefusedMember] = []
@@ -9430,20 +9771,33 @@ class RegistryRunner:
         return kept, kept_payloads, refused
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
-        """Dead-letter each batch member :meth:`_split_unframeable_members` refused, alone, then log
-        it. The line used to be written in the split, before any write, so a member a later
-        refusal sent back with the whole batch was logged as dead-lettered when it was not. It goes
-        through the same throttle as the other permanent-refusal lines (BACKLOG #3043)."""
+        """Dead-letter each batch member :meth:`_split_unframeable_members` or the batch re-attach
+        refused, alone, then log it. The line used to be written in the split, before any write, so
+        a member a later refusal sent back with the whole batch was logged as dead-lettered when it
+        was not. It goes through the same throttle as the other permanent-refusal lines (BACKLOG
+        #3043). Its reason
+        follows the refusal's code (``_MEMBER_REFUSAL_REASONS``): a ``framing`` member is one its
+        frame cannot carry (ADR 0205 rule 1), a ``multiple-messages`` one holds more than one
+        message (ADR 0209), an ``encoding`` one is not in the charset, a ``reattach`` one is a
+        payload that itself breaks its document's re-attach (vault BACKLOG #2809), and any other reads as
+        refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)
+            # getattr and str, as _RefusalLog.warning reads it: a connector may raise a subclass
+            # built without a code, or with one that is not a string, and neither may turn this
+            # loop into an AttributeError or a TypeError after the dead-letter.
+            reason = _MEMBER_REFUSAL_REASONS.get(
+                str(getattr(exc, "code", "?")), _MEMBER_REFUSAL_REASON_OTHER
+            )
             self._refusal_log.warning(
                 name,
                 exc,
                 1,
-                "delivery worker %r: batch member %s refused permanently, its frame cannot "
-                "carry it; dead-lettered alone, apart from the rest of its batch",
+                "delivery worker %r: batch member %s refused permanently, %s; dead-lettered "
+                "alone, apart from the rest of its batch",
                 name,
                 outbox_id,
+                reason,
             )
 
     def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
@@ -10506,14 +10860,14 @@ class RegistryRunner:
         try:
             with run_contexts(rc, phase="router"):
                 names = route_only(self.registry, ic, item.payload)
-        except (
-            Exception
-        ) as exc:  # CONTENT: route_only raise → PR3 re-raises inside internal_error try
+        # CONTENT: route_only raise → PR3 re-raises inside internal_error try. SystemExit too: a
+        # Router's sys.exit() is a content fault here, not an engine stop (UserCodeCalledSysExit, #3134).
+        except (Exception, SystemExit) as exc:
             return _FusedRouteResult(
                 names=[],
                 disposition=None,
                 handed_off=False,
-                route_exc=exc,
+                route_exc=_as_content_fault(exc),
                 handoff_exc=None,
                 wake_target=None,
             )
@@ -10635,14 +10989,14 @@ class RegistryRunner:
                 deliveries_preview, state_preview, meta_preview, declined = transform_one(
                     self.registry, hname, item.payload, content_type
                 )
-        except (
-            Exception
-        ) as exc:  # CONTENT: transform_one raise → PR3 re-raises inside internal_error try
+        # CONTENT: transform_one raise → PR3 re-raises inside internal_error try. SystemExit too: a
+        # Handler's sys.exit() is a content fault here, not an engine stop (UserCodeCalledSysExit, #3134).
+        except (Exception, SystemExit) as exc:
             return _FusedTransformResult(
                 deliveries=[],
                 pt_deliveries=[],
                 applied_state=[],
-                xform_exc=exc,
+                xform_exc=_as_content_fault(exc),
                 handoff_exc=None,
                 outbound_wakes=(),
                 ingress_wakes=(),
@@ -11259,6 +11613,40 @@ class RegistryRunner:
 class _RedactedFault(Exception):
     """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
+
+
+class UserCodeCalledSysExit(_RedactedFault):
+    """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
+    #3134). Converted at least where the engine runs that code in-process, so the message takes the
+    internal-error policy as for any other raise. Not under ``[sandbox].mode`` subprocess or
+    isolated, where the child's handler arm catches only ``Exception``.
+
+    **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
+    to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code
+    the operator runs: a setting cast or a diagnostic, during a load the operator started. A Router
+    or Handler runs once per message, after the ACK, in a worker thread, and a ``SystemExit`` there
+    is a script habit in one piece of logic, not a request to stop the engine. Left alone, asyncio
+    re-raises it out of the event loop and every connection stops. Only ``SystemExit`` is converted.
+    The catch is no wider, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router or Handler
+    code raises itself still escapes, as it did before this class existed. In a worker thread a
+    ``KeyboardInterrupt`` is no signal to the engine, since Python delivers Ctrl+C to the main
+    thread, so one Router or Handler code raises would still be re-raised out of the event loop and
+    stop every connection. Converting it too is not done here.
+
+    Redacted by construction: the text names an integer exit code and nothing else, since
+    ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
+    underscore because the name reaches operators, in a dead-letter reason and an alert detail."""
+
+    @classmethod
+    def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
+        code = exc.code
+        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+        return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
+
+
+def _as_content_fault(exc: Exception | SystemExit) -> Exception:
+    """``exc``, with a ``SystemExit`` from Router or Handler code turned into :class:`UserCodeCalledSysExit`."""
+    return UserCodeCalledSysExit.from_exit(exc) if isinstance(exc, SystemExit) else exc
 
 
 class _StoreReadFault(_RedactedFault):

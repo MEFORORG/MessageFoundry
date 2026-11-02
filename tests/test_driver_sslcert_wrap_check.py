@@ -115,7 +115,7 @@ def test_an_encrypted_key_in_sslcert_with_no_sslpassword_is_refused(
 def test_the_same_key_with_its_sslpassword_builds(tmp_path: Path, client: _Client) -> None:
     """The control: an approved wrap with its passphrase set goes to the driver unchanged."""
     path = _write(tmp_path, client.cert_pem + client.approved_key)
-    assert f"sslcert={{{path}}}" in _build(path, sslpassword=_PASSPHRASE)
+    assert f"sslcert={path};" in _build(path, sslpassword=_PASSPHRASE)
 
 
 def test_a_legacy_proc_type_key_is_refused_even_with_its_sslpassword(
@@ -131,7 +131,7 @@ def test_a_legacy_proc_type_key_is_refused_even_with_its_sslpassword(
 
 def test_a_plain_pem_certificate_builds(tmp_path: Path, client: _Client) -> None:
     path = _write(tmp_path, client.cert_pem)
-    assert f"sslcert={{{path}}}" in _build(path)
+    assert f"sslcert={path};" in _build(path)
 
 
 def test_a_der_certificate_builds(tmp_path: Path, client: _Client) -> None:
@@ -140,24 +140,25 @@ def test_a_der_certificate_builds(tmp_path: Path, client: _Client) -> None:
     it as no encrypted key, and it builds."""
     assert keywrap._der_problem(client.cert_der, known_encrypted=False) == (False, None)
     path = _write(tmp_path, client.cert_der, "client.der")
-    assert f"sslcert={{{path}}}" in _build(path)
+    assert f"sslcert={path};" in _build(path)
 
 
 def test_a_certificate_with_its_plain_key_builds(tmp_path: Path, client: _Client) -> None:
     """The private-key-label refusal an ``sslca`` file takes (BACKLOG #3745) is not applied: a
     client certificate file may hold its own key."""
     path = _write(tmp_path, client.cert_pem + client.plain_key)
-    assert f"sslcert={{{path}}}" in _build(path)
+    assert f"sslcert={path};" in _build(path)
 
 
 def test_a_missing_sslcert_is_left_to_the_driver(tmp_path: Path) -> None:
     path = str(tmp_path / "no-such-client.pem")
-    assert f"sslcert={{{path}}}" in _build(path)
+    assert f"sslcert={path};" in _build(path)
 
 
-def test_a_padded_value_is_checked_as_a_driver_may_trim_it(tmp_path: Path, client: _Client) -> None:
+def test_a_padded_value_is_refused(tmp_path: Path, client: _Client) -> None:
+    """BACKLOG #2705: a padded value is refused at build, before the file is judged."""
     path = _write(tmp_path, client.cert_pem + client.approved_key)
-    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
         _build(f" {path} ")
 
 
@@ -189,7 +190,7 @@ def test_a_file_that_is_not_regular_is_not_read(
 
     monkeypatch.setattr(os, "open", opening)
     monkeypatch.setattr(os, "fstat", as_pipe)
-    assert f"sslcert={{{path}}}" in _build(path)
+    assert f"sslcert={path};" in _build(path)
     assert handles
     # The same pipe named as sslkey is refused unread, as keywrap refused what it could not read.
     with pytest.raises(KeyWrapRefused, match="not a regular file"):
@@ -201,7 +202,7 @@ def test_a_pipe_named_as_sslcert_is_left_to_the_driver_unread(tmp_path: Path) ->
     """Reading a pipe with no writer would wait, which is what the check exists to prevent."""
     pipe = tmp_path / "client.pipe"
     os.mkfifo(pipe)
-    assert f"sslcert={{{pipe}}}" in _build(str(pipe))
+    assert f"sslcert={pipe};" in _build(str(pipe))
 
 
 def test_an_sslcert_past_the_read_cap_is_refused(
@@ -278,7 +279,7 @@ def test_a_read_failure_that_names_no_file_is_the_only_one_left_to_the_driver(
         with pytest.raises(KeyWrapRefused, match="could not be read"):
             _build(plain, extra={"sslkey": path})
     else:
-        assert f"sslkey={{{path}}}" in _build(plain, extra={"sslkey": path})
+        assert f"sslkey={path};" in _build(plain, extra={"sslkey": path})
 
 
 def _record_looks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -332,7 +333,7 @@ def test_a_failed_read_is_judged_from_the_first_error_with_no_second_stat(
         with pytest.raises(ValueError, match="could not be read"):
             _build(path, spelling="sslca")
     else:
-        assert f"sslca={{{path}}}" in _build(path, spelling="sslca")
+        assert f"sslca={path};" in _build(path, spelling="sslca")
     assert path not in looked
 
 
@@ -351,7 +352,7 @@ def test_an_unreachable_sslca_the_driver_never_reads_does_not_fail_the_build(
         raise error
 
     monkeypatch.setattr(database, "read_if_regular", failing)
-    assert f"sslca={{{path}}}" in _build(path, spelling="sslca", extra={"SSLmode": mode})
+    assert f"sslca={path};" in _build(path, spelling="sslca", extra={"SSLmode": mode})
     with pytest.raises(ValueError, match="could not be read"):
         _build(path, spelling="sslca")
 
@@ -372,18 +373,17 @@ def test_a_directory_swapped_in_that_fails_the_open_is_judged_as_one(
 
     monkeypatch.setattr(database, "read_if_regular", failing)
     if left:
-        assert f"{spelling}={{{folder}}}" in _build(str(folder), spelling=spelling)
+        assert f"{spelling}={folder};" in _build(str(folder), spelling=spelling)
     else:
         with pytest.raises(KeyWrapRefused, match="not a regular file"):
             _build(_write(tmp_path, b"plain"), extra={spelling: str(folder)})
 
 
-def test_an_unreachable_sslca_under_tls_off_is_read_at_one_spelling_only(
+def test_a_padded_unreachable_sslca_is_refused_before_any_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A padded value has two spellings on one share. Once the first is left to the driver as
-    unreached, the trimmed one is not read, since it would wait out the same timeout again. Red
-    with the loop going on to the next spelling: two reads."""
+    """A padded value is refused at build since BACKLOG #2705, and before any read, so a padded
+    share is not waited on at all."""
     path = _write(tmp_path, b"unread")
     error = _read_failure("notfound:53")
     reads: list[str] = []
@@ -394,8 +394,9 @@ def test_an_unreachable_sslca_under_tls_off_is_read_at_one_spelling_only(
 
     monkeypatch.setattr(database, "read_if_regular", failing)
     padded = path + "  "
-    assert "sslca=" in _build(padded, spelling="sslca", extra={"SSLmode": "disable"})
-    assert reads == [padded]
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
+        _build(padded, spelling="sslca", extra={"SSLmode": "disable"})
+    assert reads == []
 
 
 @pytest.mark.parametrize(
@@ -442,20 +443,16 @@ def test_with_sslkey_set_sslcert_is_not_read(tmp_path: Path, client: _Client) ->
     cert = _write(tmp_path, client.cert_pem + client.approved_key)
     key = _write(tmp_path, client.plain_key, "client.key")
     dsn = _build(cert, extra={"sslkey": key})
-    assert f"sslcert={{{cert}}}" in dsn and f"sslkey={{{key}}}" in dsn
+    assert f"sslcert={cert};" in dsn and f"sslkey={key};" in dsn
     # The control: the same sslcert alone is refused.
     with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
         _build(cert)
 
 
-def test_a_padded_sslkey_is_checked_as_a_driver_may_trim_it(
-    tmp_path: Path, client: _Client
-) -> None:
-    """``sslkey`` is read the way ``sslcert`` and ``sslca`` are, so a padded value is checked at
-    its trimmed spelling too. Red with ``_refuse_weak_driver_key`` back on ``refuse_weak_key_file``:
-    the raw spelling names no file, and the encrypted key passes."""
+def test_a_padded_sslkey_is_refused(tmp_path: Path, client: _Client) -> None:
+    """BACKLOG #2705: a padded ``sslkey`` is refused at build, as every padded value is."""
     key = _write(tmp_path, client.approved_key, "client.key")
-    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
         _build(_write(tmp_path, client.cert_pem), extra={"sslkey": f" {key} "})
 
 
@@ -469,13 +466,11 @@ def test_a_pipe_named_as_sslkey_is_refused_without_waiting(tmp_path: Path, clien
         _build(_write(tmp_path, client.cert_pem), extra={"sslkey": str(pipe)})
 
 
-def test_a_blank_sslkey_does_not_turn_off_the_sslcert_check(
-    tmp_path: Path, client: _Client
-) -> None:
-    """A blank ``sslkey`` names no key file, so a driver that trims it takes the key from
-    ``sslcert``. Red with the ``.strip()`` taken out of ``_refuse_weak_driver_cert``."""
+def test_a_blank_sslkey_is_refused(tmp_path: Path, client: _Client) -> None:
+    """BACKLOG #2705: a blank ``sslkey`` is refused at build, so it cannot leave the driver to take
+    the key from ``sslcert`` unchecked."""
     cert = _write(tmp_path, client.cert_pem + client.approved_key)
-    with pytest.raises(KeyWrapRefused, match="Set odbc_params sslpassword"):
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
         _build(cert, extra={"sslkey": " "})
 
 
@@ -485,4 +480,4 @@ def test_a_directory_named_as_sslkey_is_still_refused(tmp_path: Path, client: _C
     cert = _write(tmp_path, client.cert_pem)
     with pytest.raises(KeyWrapRefused, match="not a regular file"):
         _build(cert, extra={"sslkey": str(tmp_path)})
-    assert f"sslcert={{{tmp_path}}}" in _build(str(tmp_path))
+    assert f"sslcert={tmp_path};" in _build(str(tmp_path))

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import errno
 import functools
 import hmac
@@ -52,15 +53,16 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, BinaryIO, cast
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.last_resort import run_guarded
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import Store
@@ -320,6 +322,45 @@ class RestoreResult:
     key_id: str | None
     config_dir: str | None
     config_files: int
+    #: BACKLOG #2614: the SHA-256 of the archive bytes this restore read, the archive's own
+    #: ``created_utc`` as epoch seconds, and the newest audit row it held; each time ``None`` when
+    #: the archive did not say. The restore writes them into the store's restore marker.
+    archive_sha256: str
+    archive_created_at: float | None = None
+    last_audit_at: float | None = None
+    #: How many open sessions the restore ended in the store it placed (BACKLOG #2614).
+    sessions_revoked: int = 0
+
+
+class _HashingReader:
+    """A read-only view of ``raw`` that hashes every byte it hands out (BACKLOG #2614). The restore
+    reads the archive through it, so the hash it records is of the bytes it decrypted, not of a
+    second read that a replaced file could answer differently."""
+
+    def __init__(self, raw: io.BufferedReader) -> None:
+        import hashlib
+
+        self._raw = raw
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self.digest.update(data)
+        return data
+
+
+def _manifest_time(manifest: dict[str, object]) -> float | None:
+    """The archive's ``created_utc`` as epoch seconds, or ``None`` when it is absent or not the
+    ``YYYY-MM-DDTHH:MM:SSZ`` the backup writes (BACKLOG #2614)."""
+    import calendar
+
+    value = manifest.get("created_utc")
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return None
 
 
 class BackupRunner:
@@ -351,8 +392,8 @@ class BackupRunner:
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
         # The instance posture, for the Vault hop a key resolve or a full verify can dial on every
-        # pass (vault BACKLOG #2983). The engine passes its own. `None`, which the `backup`
-        # command passes, counts as enforcing on that hop.
+        # pass (vault BACKLOG #2983). The engine and the `backup` command pass their own. `None`
+        # counts as enforcing on that hop.
         self._hop_posture = hop_posture
         self._config_dir_source = config_dir
         self._engine_version = engine_version
@@ -530,16 +571,35 @@ class BackupRunner:
                 raise BackupError("write", f"archive already exists: {occupied}")
 
         # Build everything in one staging directory: the data dir on a SQLite store, `.mefor-staging`
-        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). First the sweep removes
-        # what a crashed or killed run left there. It goes by each directory's lock, never by age, so
-        # a sibling engine shard's live run survives it. Both run off the loop.
+        # under the destination otherwise (BACKLOG #1174; see `_open_staging`). The sweep removes what
+        # a crashed or killed run left in the staging root. It goes by each directory's lock, never by
+        # age, so a sibling engine shard's live run survives it, and only by this account's owner:
+        # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
+        # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
+        # owner a new directory of this process gets, as `_process_owner` reads it. When that read
+        # answers, a volume a killed run filled is freed before this run needs room for its own
+        # directory, and a run whose open fails still sweeps. On Windows the read is itself a probe
+        # directory written in the OS temp dir: when that write fails, or a sibling's sweep removes
+        # the probe before its owner is read, it answers None, and both this sweep and the OS-temp
+        # sweep below are off for this run. The staging root is then swept only by the space check's
+        # probe below, when the run is short, and by this run's own directory's owner once it is
+        # open. Where the staging root gives a directory another owner, the space check below sweeps
+        # by that one too before it refuses. Off the loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
-        await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
-        # After the sweep, which frees what a dead run left, and before anything is written: a run
-        # that cannot fit fails here, naming the volume, not half-way through a multi-GB write. It
-        # runs before the OS temp sweep below, which needs this run's own directory to know which
-        # account to sweep for; on a box where the temp dir shares the data volume, a killed
-        # standalone verify's leftovers are still counted as used here.
+        early_owner = await asyncio.to_thread(_process_owner)
+        if early_owner is not None:
+            await asyncio.to_thread(_sweep_owned, staging_root, early_owner, own=None)
+        # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine leaves
+        # its decrypted copy there. Each backup sweeps it too, by the process's own owner: a verify
+        # this account ran there made its directory with that owner, whatever owner a share's server
+        # gives this run's staging directory.
+        await asyncio.to_thread(_sweep_os_temp, early_owner)
+        # After those sweeps, which free what dead runs left when they ran (both are off when the
+        # owner read above answered None), and before this run's directory is opened or any of its
+        # bytes is staged. It is not before every write: the owner probes, above on Windows and below
+        # on a short run, are bare directories written first. A run that cannot fit fails here with kind `space`, naming the volume, not half-way through
+        # a multi-GB write.
+        swept_by: list[object] = [] if early_owner is None else [early_owner]
         shortfall = await asyncio.to_thread(
             self._space_shortfall,
             staging_root,
@@ -547,6 +607,27 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
+        if shortfall is not None:
+            # On a share whose server sets the owner, or where the early read failed, the early sweep
+            # missed what this account's killed run left, and it would refuse every later run until
+            # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
+            # removed before this returns. Only when that owner is not one a sweep above already went
+            # by, sweep by it and check once more whatever the sweep counted: a leftover it emptied
+            # but could not remove is not counted, yet frees the space. No run directory is open yet, so a refusal still leaves no lock or marker.
+            # Residuals, at least: the probe is a write, so on a volume full to the last block
+            # `mkdtemp` can fail and the refusal stands; and a sibling shard's sweep can remove a
+            # live probe before its owner is read, which answers None and skips this sweep.
+            probed = await asyncio.to_thread(_probe_owner, staging_root)
+            if probed is not None and probed not in swept_by:
+                swept_by.append(probed)
+                await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
+                shortfall = await asyncio.to_thread(
+                    self._space_shortfall,
+                    staging_root,
+                    dest_dir,
+                    config_only=config_only,
+                    config_dir=config_dir,
+                )
         if shortfall is not None:
             raise BackupError(
                 "space", f"not enough free space to stage this backup: it {shortfall}"
@@ -584,10 +665,17 @@ class BackupRunner:
         # writes afterwards behind. The loop's own release covers only the paths the worker never ran.
         staging_leftover: str | None = None
         try:
-            # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine
-            # leaves its decrypted copy there. Each backup sweeps it too, taking only what this
-            # account owns (see `_sweep_abandoned_staging`).
-            await asyncio.to_thread(_sweep_os_temp, work.path)
+            # Swept again by this run's own directory's owner only where no sweep above went by it,
+            # such as a share whose server sets the owner, or where the early read failed.
+            own_owner = await asyncio.to_thread(_owner_of, work.path)
+            if own_owner is None:
+                log.warning(
+                    "DR staging: cannot read the owner of %s, so %s is not swept",
+                    work.path,
+                    staging_root,
+                )
+            elif own_owner not in swept_by:
+                await asyncio.to_thread(_sweep_owned, staging_root, own_owner, own=work.path)
             snap_path: Path | None = None
             if not config_only:
                 snap_path = work.path / _STORE_MEMBER
@@ -1595,57 +1683,375 @@ def _remove_tree(path: Path) -> bool:
     return not os.path.lexists(path)
 
 
-#: ``os.walk``, named here so a test can refuse a listing without patching every caller's walk.
-_walk = os.walk
+def _fd_walk(
+    top: Path, onerror: Callable[[OSError], object]
+) -> Iterator[tuple[str, list[str], list[str], int]]:
+    """``os.fwalk``'s shape, top down, for the POSIX fail-safe: each directory comes with a descriptor
+    and every child is opened relative to its parent's with ``O_NOFOLLOW``. Unlike ``os.fwalk`` it
+    reports every listing and open failure to ``onerror`` and walks on: a directory that will not list
+    or open, or one swapped for a link after it was listed, is reported and is never the end of the
+    walk. One case is skipped silently: an entry whose ``is_dir`` raises is listed as a file, so if it
+    is a directory it is never walked, and the fail-safe's ``lstat`` of it then finds no regular file
+    and reports nothing."""
+    if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
+        raise OSError("the descriptor walk runs only on POSIX")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        stack = [(os.fspath(top), os.open(top, flags))]
+    except OSError as exc:
+        onerror(exc)
+        return
+    try:
+        while stack:
+            path, fd = stack.pop()
+            try:
+                try:
+                    entries = list(os.scandir(fd))
+                except OSError as exc:
+                    onerror(OSError(exc.errno, exc.strerror, path))
+                    continue
+                dirs: list[str] = []
+                files: list[str] = []
+                for entry in entries:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_dir = False
+                    (dirs if is_dir else files).append(entry.name)
+                yield path, dirs, files, fd
+                for name in reversed(dirs):
+                    child = os.path.join(path, name)
+                    try:
+                        stack.append((child, os.open(name, flags, dir_fd=fd)))
+                    except OSError as exc:
+                        onerror(OSError(exc.errno, exc.strerror, child))
+            finally:
+                os.close(fd)
+    finally:
+        for _path, fd in stack:
+            os.close(fd)
+
+
+#: The walk the truncate fail-safe uses, named here so a test can refuse a listing without patching
+#: every caller's walk. POSIX walks by descriptor (:func:`_fd_walk`). Windows has no such walk, so there
+#: it goes by path and each directory's and file's final path is checked instead (see
+#: :func:`_empty_files_in_place`).
+if sys.platform == "win32":
+    _walk = os.walk
+else:
+    _walk = _fd_walk
 
 
 def _empty_files_in_place(staging: Path) -> list[str]:
     """Truncate every regular file under ``staging`` to zero bytes. Returns what could NOT be shown
     empty: a file that refused, or a directory that could not be listed.
 
-    Walked with ``os.walk`` and ``os.lstat`` rather than ``Path.rglob`` and ``Path.is_file``, which on
-    Python 3.14 swallow ``OSError``: a directory that cannot be listed would read as empty, and a file
-    that cannot be stat'ed as absent, and both would be reported clean while still full."""
+    Walked with a walk that reports a listing error, and an ``lstat``, rather than ``Path.rglob`` and
+    ``Path.is_file``, which on Python 3.14 swallow ``OSError``: a directory that cannot be listed would
+    read as empty, and a file that cannot be stat'ed as absent, and both would be reported clean while
+    still full.
+
+    The sweep runs this on directories it did not make this run, so it truncates the object it
+    checked, never a name it checked a moment earlier (BACKLOG #2420). Each file is opened without
+    following a link, and the OPEN handle must be a regular file with one link before it is truncated:
+
+    - POSIX: :func:`_fd_walk` hands over a descriptor per directory and opens each child directory with
+      ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
+    - Windows: ``staging`` and each directory under it are opened without following a reparse point
+      that names another path, and must lie under ``staging``'s final path, or the directory is left
+      unwalked and reported without its name. Each file is opened the same way, and its final path
+      must lie under ``staging``'s too. A reparse point that names no path (a cloud, deduplicated or
+      tiered file) is opened again so its filter serves it, and must still be the same file.
+
+    What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
     unproven: list[str] = []
 
     def _unlisted(exc: OSError) -> None:
         unproven.append(f"{Path(exc.filename or staging).name}/ (not listed)")
 
-    for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
-        # Never descend through a link or, on Windows, a junction, which `os.walk` follows even
-        # with `followlinks=False`: truncating there would empty files outside the directory.
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
-        ]
-        for name in filenames:
-            entry = Path(dirpath) / name
+    def _report(reason: str | None) -> None:
+        # The reason for something reached through a link carries no name, so it is said once.
+        if reason is not None and not (reason == _OUTSIDE_REASON and reason in unproven):
+            unproven.append(reason)
+
+    walked = False
+    if sys.platform == "win32":
+        try:
+            inside = _win_real_directory(staging)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in _WIN_FINAL_PATH_UNSUPPORTED:
+                # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM
+                # disks) cannot name a handle's final path, so nothing here can be shown to lie
+                # inside the directory. Truncating by path instead is what BACKLOG #2420 removed,
+                # so nothing is emptied, and that is said, without any file's name.
+                log.warning(
+                    "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
+                    "cannot report a file's final path, so no file in it was emptied",
+                    staging,
+                )
+            _unlisted(exc)
+            return unproven
+        for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
+            walked = True
+            # Checked before any of its entries is opened or named: a directory swapped for a
+            # junction after its listing, or reached through one, is not walked.
             try:
-                st = os.lstat(entry)
-            except FileNotFoundError:
+                outside = not _win_real_directory(Path(dirpath)).startswith(inside)
+            except NotADirectoryError:
+                outside = True
+            except OSError as exc:
+                dirnames[:] = []
+                _unlisted(exc)
                 continue
-            except OSError:
-                unproven.append(name)
+            if outside:
+                dirnames[:] = []
+                _report(_OUTSIDE_REASON)
                 continue
-            # A link is never followed: truncating through one would empty a file outside the
-            # directory, and the link itself holds no plaintext.
-            if not stat.S_ISREG(st.st_mode):
-                continue
-            # Nor is a HARD link truncated: it shares its bytes with a name outside this directory.
-            # No file the engine stages has a second link, so one here was put there by someone
-            # else, and the orphan sweep runs this on directories it did not make this run.
-            if st.st_nlink > 1:
-                unproven.append(f"{name} (hard-linked, not truncated)")
-                continue
-            try:
-                with open(entry, "r+b") as fh:
-                    fh.truncate(0)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                unproven.append(name)
+            # Never descend through a link or a junction, which `os.walk` follows even with
+            # `followlinks=False`.
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
+            ]
+            for name in filenames:
+                _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
+    else:
+        for dirpath, _dirnames, filenames, dirfd in _walk(staging, onerror=_unlisted):
+            walked = True
+            for name in filenames:
+                _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
+    if not walked and not unproven:
+        # A walk that yields nothing at all and reports nothing still did not show the root empty.
+        unproven.append(f"{staging.name}/ (not listed)")
     return unproven
+
+
+#: What the fail-safe reports for something it reached through a link. Not named: it lives outside
+#: the staging directory, wherever the link pointed, and its name may be anyone's.
+_OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
+
+#: The Win32 errors ``GetFinalPathNameByHandleW`` returns on a volume that does not support it:
+#: ``ERROR_INVALID_FUNCTION``, ``ERROR_NOT_SUPPORTED`` and ``ERROR_INVALID_PARAMETER``, the set
+#: ``transports/file.py`` treats as "this volume does not do that".
+_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50, 87})
+
+
+def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
+    """Truncate ``entry`` if it is a regular file with one link, checked on the handle that truncates
+    it. ``None`` when it was emptied or holds nothing to empty, else what to report.
+
+    ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
+    path on Windows, as :func:`_win_real_directory` returns it. The ``lstat`` first only skips a link
+    or a hard link without opening it; the check that decides is the one on the open handle."""
+    name = entry.name
+    try:
+        st = (
+            os.lstat(entry)
+            if dir_fd is None
+            else os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return name
+    # A link is never followed: truncating through one would empty a file outside the directory, and
+    # the link itself holds no plaintext.
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    # Nor is a HARD link truncated: it shares its bytes with a name outside this directory. No file
+    # the engine stages has a second link, so one here was put there by someone else.
+    if st.st_nlink > 1:
+        return f"{name} (hard-linked, not truncated)"
+    try:
+        fd = _open_unfollowed(entry, dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return name
+    try:
+        if inside is not None and not _win_final_path(fd).startswith(inside):
+            return _OUTSIDE_REASON
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or _names_another_path(fd):
+            return f"{name} (changed while being emptied, not truncated)"
+        if opened.st_nlink > 1:
+            return f"{name} (hard-linked, not truncated)"
+        os.ftruncate(fd, 0)
+    except OSError:
+        return name
+    finally:
+        os.close(fd)
+    return None
+
+
+def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
+    """Open ``entry`` for writing without following a link at its last component, and return a
+    descriptor. A test seam.
+
+    POSIX opens ``entry.name`` relative to ``dir_fd`` (``entry`` itself without one) with
+    ``O_NOFOLLOW``, so a link there fails with ``ELOOP``. ``O_NONBLOCK`` too, so a FIFO swapped in
+    after the check fails at once rather than holding the teardown's thread until a reader comes; it
+    also makes an open that breaks a file lease fail rather than wait, and that file is reported.
+
+    Windows opens ``entry`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, so a link or junction there is
+    opened as itself, which the caller's check then refuses. A reparse point that names no path is
+    opened again so its filter serves its data, and must be the same file, or this raises."""
+    if sys.platform == "win32":
+        # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
+        access = 0x80000000 | 0x40000000
+        fd = _win_open(entry, access, _WIN_OPEN_REPARSE_POINT, os.O_RDWR)
+        try:
+            attributes, tag = _win_attribute_tag(fd)
+            if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and not tag & _WIN_NAME_SURROGATE:
+                first = os.fstat(fd)
+                os.close(fd)
+                fd = -1
+                fd = _win_open(entry, access, 0, os.O_RDWR)
+                again = os.fstat(fd)
+                if (again.st_dev, again.st_ino) != (first.st_dev, first.st_ino):
+                    raise OSError(errno.ESTALE, "not the file first opened", str(entry))
+        except OSError:
+            if fd >= 0:
+                os.close(fd)
+            raise
+        return fd
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+    if dir_fd is None:
+        return os.open(entry, flags)
+    return os.open(entry.name, flags, dir_fd=dir_fd)
+
+
+#: Win32 constants for the fail-safe: ``FILE_FLAG_OPEN_REPARSE_POINT``, the bit a reparse tag carries
+#: when it names another path (a symbolic link, a junction), and ``FileAttributeTagInfo``.
+_WIN_OPEN_REPARSE_POINT = 0x00200000
+#: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
+#: lock file or marker planted as a link. Windows has none, and follows one there.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+#: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_WIN_NAME_SURROGATE = 0x20000000
+_WIN_FILE_ATTRIBUTE_TAG_INFO = 9
+
+
+@functools.cache
+def _win_api() -> Any:
+    """``kernel32`` with the prototypes the Windows half of :func:`_empty_files_in_place` uses."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    return kernel32
+
+
+def _win_open(path: Path, access: int, flags: int, fd_flags: int) -> int:
+    """Open ``path`` with the given ``CreateFileW`` flags, sharing everything, and return a descriptor
+    that owns the handle."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    import msvcrt
+
+    api = _win_api()
+    handle = api.CreateFileW(
+        str(path),
+        access,
+        0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        flags,
+        None,
+    )
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(handle, fd_flags | os.O_BINARY)
+    except BaseException:
+        api.CloseHandle(handle)
+        raise
+
+
+def _win_attribute_tag(fd: int) -> tuple[int, int]:
+    """The attributes and reparse tag of the object open on ``fd``. ``os.fstat`` reports no tag."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    import msvcrt
+
+    info = (ctypes.c_uint32 * 2)()  # FILE_ATTRIBUTE_TAG_INFO: FileAttributes, ReparseTag
+    if not _win_api().GetFileInformationByHandleEx(
+        msvcrt.get_osfhandle(fd), _WIN_FILE_ATTRIBUTE_TAG_INFO, info, ctypes.sizeof(info)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return info[0], info[1]
+
+
+def _names_another_path(fd: int) -> bool:
+    """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
+    symbolic link or a junction opened as itself. Always ``False`` on POSIX, where ``O_NOFOLLOW``
+    already refused one."""
+    if sys.platform != "win32":
+        return False
+    attributes, tag = _win_attribute_tag(fd)
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _WIN_NAME_SURROGATE)
+
+
+def _win_final_path(fd: int) -> str:
+    """The final path of the object open on ``fd``, every link and junction resolved, in
+    ``os.path.normcase`` form."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    import msvcrt
+
+    size = 512
+    while True:
+        buf = ctypes.create_unicode_buffer(size)
+        got = _win_api().GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, size, 0)
+        if got == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if got < size:
+            return os.path.normcase(buf.value)
+        size = got + 1  # too small: `got` is the size it needs
+
+
+def _win_real_directory(path: Path) -> str:
+    """The final path of ``path`` with a trailing separator, for a prefix test. Opened without
+    following a reparse point; raises ``OSError`` when it cannot be opened, is not a directory, or is
+    itself a link or junction."""
+    # FILE_READ_ATTRIBUTES, with FILE_FLAG_BACKUP_SEMANTICS so a directory opens at all.
+    fd = _win_open(path, 0x00000080, 0x02000000 | _WIN_OPEN_REPARSE_POINT, os.O_RDONLY)
+    try:
+        attributes = getattr(os.fstat(fd), "st_file_attributes", 0)
+        if not attributes & stat.FILE_ATTRIBUTE_DIRECTORY or _names_another_path(fd):
+            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", str(path))
+        return _win_final_path(fd).rstrip("\\") + "\\"
+    finally:
+        os.close(fd)
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
@@ -1728,6 +2134,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
 _SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
+#: The bare directory :func:`_probe_owner` makes to learn the owner a new directory gets. Never a
+#: staging directory; a leaked one is empty, and the sweep removes it by ``rmdir`` alone.
+_OWNER_PROBE_PREFIX = "mefor-owner-probe-"
 
 #: The server-DB staging root, a dot-prefixed directory under the backup destination.
 _SERVER_DB_STAGING_DIR = ".mefor-staging"
@@ -1839,9 +2248,12 @@ def _teardown_staging(path: Path) -> str | None:
     files are all the proof needs."""
     leftover = _discard_verify_staging(path)
     if os.path.lexists(path):
+        # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
+        # otherwise hold this thread in the open until a reader came, which may be never.
+        flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
         try:
             for name in (_LOCK_NAME, _HELD_MARKER_NAME):
-                os.close(os.open(path / name, os.O_WRONLY | os.O_CREAT, 0o600))
+                os.close(os.open(path / name, flags, 0o600))
         except OSError as exc:
             log.warning(
                 "DR staging directory %s survived its teardown and could not be marked for the next "
@@ -2070,21 +2482,64 @@ def _standalone_staging_root() -> Path:
     return Path(tempfile.gettempdir()).absolute()
 
 
-def _sweep_os_temp(owned_like: Path) -> int:
+def _sweep_os_temp(owner: object | None) -> int:
     """The backup's sweep of the OS temp dir, for what a killed standalone verify on this account
-    left there. Never raises: a temp dir that cannot be found is a reason to skip, not to fail."""
+    left there, keyed on ``owner``, the process's own as :func:`_process_owner` reads it. Never
+    raises: a temp dir that cannot be found, or an owner that could not be read, is a reason to skip,
+    not to fail."""
     try:
         root = _standalone_staging_root()
     except OSError as exc:
         log.warning("DR staging: no OS temp dir to sweep: %s", safe_exc(exc))
         return 0
-    return _sweep_abandoned_staging(root, owned_like=owned_like)
+    if owner is None:
+        log.warning("DR staging: cannot read this process's owner, so %s is not swept", root)
+        return 0
+    return _sweep_owned(root, owner, own=None)
+
+
+def _process_owner() -> object | None:
+    """The owner a directory this process creates gets, as :func:`_owner_of` reports it, read
+    without creating one in the staging root. ``None`` when it cannot be read.
+
+    POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
+    directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
+    default owner wherever it is made. On a share whose server sets the owner this answer differs
+    from what a directory there gets, and the backup then sweeps by its own directory's owner too.
+    On Windows this is ``None`` when the probe cannot be made, or a sibling's sweep removes it before
+    its owner is read; the backup then skips its early staging-root sweep and its OS-temp sweep."""
+    if sys.platform != "win32":
+        return os.geteuid()
+    return _probe_owner(None)
+
+
+def _probe_owner(root: Path | None) -> object | None:
+    """The owner a directory this process makes under ``root`` gets, as :func:`_owner_of` reports
+    it, learned by making a bare ``mefor-owner-probe-*`` directory there and removing it. ``None``
+    for the OS temp dir; ``None`` returned when the probe cannot be made or its owner read, and
+    nothing is created when ``root`` does not exist.
+
+    The probe holds no file, no lock and no marker, so it is never a staging directory. One whose
+    removal fails is left empty, and the next sweep of that root by its owner removes it
+    (:func:`_sweep_owned`).
+    A sibling shard's sweep can remove a probe before its owner is read here; that answers ``None``,
+    and the caller only skips a sweep."""
+    try:
+        probe = Path(tempfile.mkdtemp(prefix=_OWNER_PROBE_PREFIX, dir=root))
+    except OSError:
+        return None
+    try:
+        return _owner_of(probe)
+    finally:
+        with contextlib.suppress(OSError):
+            probe.rmdir()
 
 
 def _owner_of(path: Path) -> object | None:
     """Who owns ``path``: a uid on POSIX, an owner SID on Windows. ``None`` when it cannot be read,
-    and ``None`` for a link or any other reparse point, whose owner is never reported: Windows would
-    read through it to its target. Compared only with another ``_owner_of`` answer.
+    and ``None`` for a link or a junction, whose owner is never reported: Windows would read through
+    it to its target. A reparse point that names no other path, such as a cloud placeholder, is read
+    as itself (BACKLOG #2420). Compared only with another ``_owner_of`` answer.
 
     On Windows an elevated process's default owner is Administrators, not its user, so every elevated
     account on the box, and SYSTEM, can share one owner here."""
@@ -2092,8 +2547,10 @@ def _owner_of(path: Path) -> object | None:
         st = os.lstat(path)
     except OSError:
         return None
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & reparse:
+    reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if stat.S_ISLNK(st.st_mode) or (
+        reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
+    ):
         return None
     if sys.platform != "win32":
         return st.st_uid
@@ -2104,7 +2561,7 @@ def _owner_of(path: Path) -> object | None:
     return _resolve_sid(found.group(1)) if found else None
 
 
-def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> int:
+def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
 
     A directory is removed only when its lock file exists, its lock can be taken, and it holds the
@@ -2113,20 +2570,24 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
     its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
     never consulted. Returns how many directories were removed.
 
-    ``owned_like`` names a directory this run just created. When given, only a directory with the same
-    owner is a candidate, and nothing is swept if that owner cannot be read. A standalone verify and
-    each backup pass it for the OS temp dir, which can be shared: another account could plant a
-    directory there holding a lock file and a marker, and the teardown must never run on a tree it
-    controls."""
+    ``owned_like`` names a directory this run just created, and only a directory with its owner is a
+    candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
+    standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
+    temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
+    with :func:`_sweep_owned` by the same rule, keyed on the process's own owner. Another account
+    could plant a directory in either holding a lock file and a marker, and the teardown must never
+    run on a tree it controls."""
+    owner = _owner_of(owned_like)
+    if owner is None:
+        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
+        return 0
+    return _sweep_owned(root, owner, own=owned_like)
+
+
+def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
+    """:func:`_sweep_abandoned_staging` for a known ``owner``, as :func:`_owner_of` reports it,
+    leaving ``own`` alone."""
     swept = 0
-    owner: object | None = None
-    if owned_like is not None:
-        owner = _owner_of(owned_like)
-        if owner is None:
-            log.warning(
-                "DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root
-            )
-            return 0
     try:
         entries = list(os.scandir(root))
     except FileNotFoundError:
@@ -2135,7 +2596,8 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
         log.warning("DR staging: could not list staging root %s: %s", root, safe_exc(exc))
         return 0
     for entry in entries:
-        if not entry.name.startswith(_SWEPT_PREFIXES):
+        probe = entry.name.startswith(_OWNER_PROBE_PREFIX)
+        if not probe and not entry.name.startswith(_SWEPT_PREFIXES):
             continue
         try:
             if not entry.is_dir(follow_symlinks=False) or os.path.isjunction(entry.path):
@@ -2143,21 +2605,38 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path | None = None) -> i
         except OSError:
             continue
         path = Path(entry.path)
-        if owned_like is not None and path == owned_like:
+        if path == own:
             continue  # this run's own directory, held live
+        if probe:
+            # A probe `_probe_owner` failed to remove. `rmdir` alone, which refuses a directory that
+            # holds anything and never follows a link, so nothing but an empty directory goes.
+            if _owner_of(path) == owner:
+                with contextlib.suppress(OSError):
+                    os.rmdir(path)
+            continue
         # No lock file is no proof either way. Checked before the owner, which on Windows costs a
         # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
         if not os.path.lexists(path / _LOCK_NAME):
             continue
-        if owner is not None and _owner_of(path) != owner:
-            continue  # not this account's: another account's run, or a plant
+        if _owner_of(path) != owner:
+            # Not this account's, or an owner that could not be read: another account's run, such as
+            # an administrator's interactive one, or a plant. Said, not skipped silently.
+            log.warning(
+                "DR staging: staging directory %s has another owner, so the sweep leaves it", path
+            )
+            continue
         try:
-            fd = os.open(path / _LOCK_NAME, os.O_RDWR | getattr(os, "O_BINARY", 0))
+            # `_O_NONBLOCK` as the re-mark has it: a FIFO planted at the lock must not hold the sweep.
+            fd = os.open(
+                path / _LOCK_NAME,
+                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
+            )
         except FileNotFoundError:
             continue  # no lock file: no proof either way
         except OSError as exc:
-            # Most often a directory another account made -- an interactive `backup` run as an
-            # administrator -- which this account cannot open. Said, not skipped silently.
+            # A directory with this account's owner whose lock file this account still cannot open;
+            # another owner's directory never reaches here, since the owner is checked first. Said,
+            # not skipped silently.
             log.warning(
                 "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
                 path,
@@ -2386,6 +2865,11 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+#: sqlite3's own default. Nothing else writes a snapshot these checks open, the backup's own or an
+#: extracted one, so it never waits.
+_SNAPSHOT_BUSY_TIMEOUT = 5.0
+
+
 def _count_tables(db_path: Path) -> dict[str, int]:
     """Row counts for EVERY table in ``db_path``'s own schema, via a plain read-only sqlite3
     connection (no engine store). The table set is DERIVED from ``sqlite_master`` at count time
@@ -2411,10 +2895,11 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
     ``sqlite_%`` names are excluded: they are sqlite's own bookkeeping (e.g. ``sqlite_sequence`` for
     an ``AUTOINCREMENT`` column), not store data, and are not guaranteed to exist at all until some
-    other operation (a first autoincrement insert, an ``ANALYZE``) creates them."""
-    import sqlite3
+    other operation (a first autoincrement insert, an ``ANALYZE``) creates them.
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    Opened through :func:`connect_readonly`, so a ``#`` or ``?`` in the staging path cannot cut the
+    URI and count an empty stand-in (BACKLOG #2186)."""
+    conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         names = sorted(
             r[0]
@@ -2436,10 +2921,9 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
 
 def _integrity_check(db_path: Path) -> tuple[bool, str]:
-    """``PRAGMA integrity_check`` on a snapshot via a plain read-only sqlite3 connection."""
-    import sqlite3
-
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    """``PRAGMA integrity_check`` on a snapshot, opened through :func:`connect_readonly`, so a ``#``
+    or ``?`` in the staging path cannot cut the URI and check an empty stand-in (BACKLOG #2186)."""
+    conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         results = [str(r[0]) for r in conn.execute("PRAGMA integrity_check")]
     finally:
@@ -2576,10 +3060,6 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
-#: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
-_SNAPSHOT_BUSY_TIMEOUT = 5.0
-
-
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> tuple[str, str, int]:
@@ -2608,8 +3088,6 @@ def _decrypt_check(
     store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
     this pass reads anything.
     """
-    import sqlite3
-
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
     first_blob: str | None = None
@@ -2844,6 +3322,67 @@ _DECRYPT_REFUSAL = (
 )
 
 
+#: What a restore undoes, said once for the refusal and the CLI summary (BACKLOG #2614).
+REAPPLY_NOTICE = (
+    "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
+    "delete, role change and reset made after its newest audit row must be re-applied by hand."
+)
+
+
+def restored_accounts_notice(sessions_revoked: int) -> str:
+    """The CLI summary's whole notice: what to re-apply, and what the restore already did. Worded
+    from the count the restore's own revoke returned, so it never claims more than it ended."""
+    return (
+        f"{REAPPLY_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
+        "placed, and the first engine start on this store ends every session again and records "
+        "the restore."
+    )
+
+
+#: How far ahead of this host's clock an archive's date may be before it counts as undated: a
+#: backup host whose clock leads by a little is ordinary, one a day ahead is not (BACKLOG #2614).
+_ARCHIVE_CLOCK_SKEW_SECONDS = 3600.0
+
+
+def _refuse_an_old_archive(
+    *,
+    archive_created_at: float | None,
+    last_audit_at: float | None,
+    max_age_seconds: float,
+    now: float,
+) -> None:
+    """Refuse an archive taken more than ``max_age_seconds`` before ``now``, or one that does not
+    say when it was taken (BACKLOG #2614). A restore undoes every account change made after the
+    archive, so the older it is the more an operator must re-apply, and the refusal names the
+    time after which that is so. The caller words how to override it; the CLI's
+    ``--allow-old-archive`` skips this check."""
+    newest = utc_or_unknown(last_audit_at)
+    kind = "age"
+    if archive_created_at is None:
+        taken = "the archive does not say when it was taken"
+        kind = "age_undated"
+    elif archive_created_at > now + _ARCHIVE_CLOCK_SKEW_SECONDS:
+        # A date in the future says the backup host's clock was wrong, so the age is not known.
+        taken = (
+            f"the archive says it was taken {utc_or_unknown(archive_created_at)}, after now, so "
+            "its age is not known"
+        )
+        kind = "age_undated"
+    else:
+        age = now - archive_created_at
+        if age <= max_age_seconds:
+            return
+        taken = (
+            f"the archive was taken {utc_or_unknown(archive_created_at)}, "
+            f"{age / 86400:.1f} days ago, past the {max_age_seconds / 86400:g}-day limit"
+        )
+    raise BackupError(
+        kind,
+        f"{taken}. Its newest audit row is {newest}. A restore of it would bring the accounts back "
+        f"as they were then. {REAPPLY_NOTICE} Nothing was written.",
+    )
+
+
 def _codec_refusal(exc: BackupCodecError) -> BackupError:
     """Translate a ``.mfbak`` codec failure into the restore path's refusal — the single seam, so both
     the header read and the decrypt word it once and order the arms once.
@@ -2865,9 +3404,14 @@ async def run_restore(
     dest_store_path: str | Path,
     store_settings: object,
     config_dest: str | Path | None = None,
+    max_age_seconds: float | None = None,
 ) -> RestoreResult:
     """Restore a ``.mfbak`` archive's store member to ``dest_store_path`` (ADR 0049's missing half; the
     primitive ADR 0048's cold seed consumes).
+
+    ``max_age_seconds`` refuses an archive taken longer ago than that, or one whose manifest does
+    not say when, before anything is written (BACKLOG #2614). ``None`` checks no age: the
+    ``restore`` CLI passes its limit unless the operator gave ``--allow-old-archive``.
 
     Resolves the store's decrypt-capable keyring exactly as :func:`run_restore_verify` does (active +
     retired, AC-5 "incl. retired keys"), then decrypts the archive ONCE and verifies the extracted
@@ -2902,6 +3446,7 @@ async def run_restore(
         dest_store_path=Path(dest_store_path),
         config_dest=Path(config_dest) if config_dest is not None else None,
         keys=keys,
+        max_age_seconds=max_age_seconds,
     )
 
 
@@ -2911,10 +3456,13 @@ def _restore_blocking(
     dest_store_path: Path,
     config_dest: Path | None,
     keys: list[bytes],
+    max_age_seconds: float | None,
 ) -> RestoreResult:
     """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
     :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``,
-    and ``cleanup`` for the one failure that follows a whole restore -- see below).
+    ``age`` for an archive past ``max_age_seconds`` and ``age_undated`` for one whose age is not
+    known (BACKLOG #2614), and ``cleanup`` for the one
+    failure that follows a whole restore -- see below).
 
     It runs the verify's checks itself rather than calling :func:`_verify_archive_blocking` first, for
     two reasons. A .mfbak archive is the size of the store, so a verify pass followed by a restore pass
@@ -2940,7 +3488,12 @@ def _restore_blocking(
     store and bundle intact."""
     import sqlite3
 
-    from messagefoundry.store.store import _secure_file, forget_store_salt
+    from messagefoundry.store.store import (
+        _secure_file,
+        forget_store_salt,
+        newest_audit_time,
+        write_restore_marker,
+    )
 
     if not Path(archive_path).is_file():
         raise BackupError("archive", f"no archive at {archive_path}")
@@ -3016,7 +3569,8 @@ def _restore_blocking(
         ) as tmp:
             staging = Path(tmp)
             tar_path = staging / "archive.tar"
-            with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as dst:
+                src = _HashingReader(raw_src)
                 _secure_file(tar_path)
                 if match_key is not None:
                     # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome
@@ -3033,7 +3587,10 @@ def _restore_blocking(
                     # _MAX_RESTORE_PLAINTEXT_BYTES.
                     try:
                         decrypt_stream(
-                            src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
+                            cast(BinaryIO, src),
+                            dst,
+                            match_key,
+                            max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES,
                         )
                     except BackupCodecError as exc:
                         raise _codec_refusal(exc) from exc
@@ -3098,6 +3655,20 @@ def _restore_blocking(
                 raise BackupError("restore", f"archive has no {_STORE_MEMBER} member to restore")
 
             row_counts = _verify_extracted_store(snap, manifest)
+            # BACKLOG #2614: when the archive was taken, and its newest audit row, read from the
+            # checked bytes. Both feed the age refusal, the restore marker and the summary.
+            archive_created_at = _manifest_time(manifest)
+            try:
+                last_audit_at = newest_audit_time(snap)
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
+            if max_age_seconds is not None:
+                _refuse_an_old_archive(
+                    archive_created_at=archive_created_at,
+                    last_audit_at=last_audit_at,
+                    max_age_seconds=max_age_seconds,
+                    now=time.time(),
+                )
             # ADR 0196 (C+): the restored store must not seal a single value under the archive's data
             # sub-key. That key's persisted count is the archive's, which may trail the key's real use
             # -- the primary kept sealing after the backup, and the ADR 0048 cold seed can run beside
@@ -3111,6 +3682,23 @@ def _restore_blocking(
             if dropped and "store_salt" in row_counts:
                 # The counts were taken to check the archive; the summary reports the placed store.
                 row_counts = {**row_counts, "store_salt": 0}
+            # BACKLOG #2614: the archive's accounts, password hashes, roles, factors and sessions
+            # come back as they were. Mark the store so its first engine start ends every session
+            # and records the restore (`MessageStore.consume_restore_record`). Written after the
+            # checks, like the salt drop, so the bytes checked are the archive's; the marker is
+            # this restore's own row.
+            archive_sha256 = src.digest.hexdigest()
+            try:
+                sessions_revoked = write_restore_marker(
+                    snap,
+                    archive_sha256=archive_sha256,
+                    archive_created_at=archive_created_at,
+                    last_audit_at=last_audit_at,
+                    restored_at=time.time(),
+                )
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
+            row_counts = {**row_counts, "restore_marker": 1}
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -3168,6 +3756,10 @@ def _restore_blocking(
         key_id=key_id,
         config_dir=str(config_dest) if config_dest is not None else None,
         config_files=config_files,
+        archive_sha256=archive_sha256,
+        archive_created_at=archive_created_at,
+        last_audit_at=last_audit_at,
+        sessions_revoked=sessions_revoked,
     )
 
 

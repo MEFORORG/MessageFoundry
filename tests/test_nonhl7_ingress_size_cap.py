@@ -24,6 +24,7 @@ from messagefoundry.parsing.binary import is_marked
 from messagefoundry.pipeline import ingress_guards
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.receipt import RefusalKind
 
 
 def _is_ar_nak(ack: str | None) -> bool:
@@ -301,7 +302,8 @@ async def test_http_decode_error_nul_dead_letters_mfb64_returns_none(store: Mess
 
     result = await runner._handle_inbound_http(reg.inbound["IB_HL7"], _HL7_DECODE_ERR_NUL)
 
-    assert result is None  # the HTTP listener answers 422 (ADR 0154 amendment 2026-09-26)
+    # A permanent refusal, which the HTTP listener answers 422 (ADR 0154 amendment 2026-10-30)
+    assert result.refusal is RefusalKind.PERMANENT
     rows = await _rows(store)
     assert len(rows) == 1
     assert rows[0]["status"] == MessageStatus.ERROR.value
@@ -315,7 +317,7 @@ async def test_http_happy_body_with_nul_dead_letters_returns_none(store: Message
 
     result = await runner._handle_inbound_http(reg.inbound["IB_HL7"], _HL7_HAPPY_NUL)
 
-    assert result is None
+    assert result.refusal is RefusalKind.PERMANENT
     rows = await _rows(store)
     assert len(rows) == 1
     assert rows[0]["status"] == MessageStatus.ERROR.value

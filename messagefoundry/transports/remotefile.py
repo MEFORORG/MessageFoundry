@@ -76,7 +76,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
@@ -93,6 +93,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
     RevocationHopGuard,
     TrustAnchorPolicy,
     build_verifying_client_context,
@@ -143,6 +144,7 @@ from messagefoundry.transports.file import (
     render_filename,
     scan_inbound_file,
 )
+from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = ["RemoteFileDestination", "RemoteFileSource"]
@@ -295,6 +297,34 @@ class _RemoteError(Exception):
         """True for a credential or a configuration fault: a fault of the connection, which every
         row meets alike, rather than of one message or one path."""
         return self.credential_fault or self.config_fault
+
+    def without_names(self, names: Iterable[str]) -> _RemoteError:
+        """A copy of this error, same markers, with every basename in ``names`` replaced by its
+        ``safe_name`` label, in any letter case (BACKLOG #2814). A server reply can quote the path
+        it refused, and on an upload that path ends in a name rendered from message fields, in its
+        temp form or as a bumped candidate; a case-insensitive server may echo it in its stored
+        case. A temp name holds the name it is for, so replacing the name covers it. One pass,
+        longest name first, so a label already put in is never matched again. Each echo takes the
+        label of the name as rendered, whatever its case, so it matches the label the upload's own
+        log lines carry.
+
+        It is a denylist over the server's free text: a reply that cuts a name short or encodes it
+        some other way keeps that form. A very short name is also replaced where it appears as
+        other text, such as a reply code."""
+        text = str(self)
+        bases = sorted({posixpath.basename(n) for n in names} - {""}, key=len, reverse=True)
+        if bases:
+            labels = {base.casefold(): safe_name(base) for base in bases}
+            pattern = re.compile("|".join(map(re.escape, bases)), re.IGNORECASE)
+            text = pattern.sub(
+                lambda m: labels.get(m.group(0).casefold()) or safe_name(m.group(0)), text
+            )
+        return _RemoteError(
+            text,
+            permanent=self.permanent,
+            credential_fault=self.credential_fault,
+            config_fault=self.config_fault,
+        )
 
     def as_delivery_error(self) -> DeliveryError:
         """The pipeline error for this failure: a transient one retries, a permanent one is a
@@ -2060,20 +2090,6 @@ def _make_client(
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
 
 
-#: The remedy a ``tls_allow_expired`` FTPS hop's revocation refusal names. No CRL can relax that
-#: refusal (see :func:`_guard_ftps_revocation`), so the connection-shaped default, which offers
-#: ``[tls].crl_file``, would name a lever that cannot work there (SDS-3.7).
-_EXPIRY_RELAXED_WAYS_ACROSS = (
-    "This hop sets tls_allow_expired, so a CRL cannot admit it. A [tls].crl_file, if set, still "
-    "refuses a leaf certificate it lists, but do not attest on its strength: the relaxation "
-    "skips the CRL's validity window at the handshake, and a CA may drop an expired "
-    "certificate from its CRL, which is the certificate this setting accepts. Set "
-    "tls_revocation_attested=true with a "
-    "tls_revocation_attested_reason on this connection, or remove tls_allow_expired so a "
-    "[tls].crl_file on this hop can admit it."
-)
-
-
 def _guard_ftps_revocation(
     context: ssl.SSLContext | None,
     s: dict[str, Any],
@@ -2114,7 +2130,7 @@ def _guard_ftps_revocation(
         attested_reason=attested_reason,
         connection=connection,
         context=None if expiry_relaxed else context,
-        ways_across=_EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+        ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
     ).enforce_construction()
 
 
@@ -2362,6 +2378,7 @@ class RemoteFileDestination(DestinationConnector):
         # Write to a unique temp name then rename, so a poller on the far side never sees a partial
         # file. The temp suffix is unguessable so two concurrent uploads never collide on it.
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
+        failed: _RemoteError | None = None
         try:
             self._client.store(tmp, data)
         except _RemoteError as exc:
@@ -2374,19 +2391,25 @@ class RemoteFileDestination(DestinationConnector):
             # _prepare_remote_dir connected just before, so that case is rare.
             if not exc.connection_fault:
                 self._remove_temp(tmp, name, "store")
-            raise
-        try:
-            if self._overwrite:  # replacing is what it asks for
-                self._client.rename(tmp, posixpath.join(self._remote_dir, name))
-            else:
-                self._publish_new(tmp, name, candidates)
-        except _RemoteError:
-            # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
-            # delivery is classified (retry/dead-letter) by send(). Unlike the store branch, this
-            # tries even after a connection fault: the store succeeded, so a whole message sits in
-            # the temp, and the lane stops right after, so it costs one more login at most.
-            self._remove_temp(tmp, name, "rename")
-            raise
+            failed = exc
+        if failed is None:
+            try:
+                if self._overwrite:  # replacing is what it asks for
+                    self._client.rename(tmp, posixpath.join(self._remote_dir, name))
+                else:
+                    self._publish_new(tmp, name, candidates)
+            except _RemoteError as exc:
+                # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise
+                # so the delivery is classified (retry/dead-letter) by send(). Unlike the store
+                # branch, this tries even after a connection fault: the store succeeded, so a whole
+                # message sits in the temp, and the lane stops right after, so it costs one more
+                # login at most.
+                self._remove_temp(tmp, name, "rename")
+                failed = exc
+        if failed is not None:
+            # A reply can quote the paths this upload chose (BACKLOG #2814). Raised outside the
+            # handlers, so the unscrubbed reply is on neither __cause__ nor __context__.
+            raise failed.without_names([name, *candidates])
 
     def _publish_new(self, tmp: str, name: str, candidates: list[str]) -> None:
         """Publish ``tmp`` under the first of ``candidates`` still free when the client tries it,
@@ -2496,10 +2519,10 @@ class RemoteFileSource(SourceConnector):
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
-        # The declared charset, resolved as ingress_guards.ingress_encoding resolves it (an absent or
-        # None setting is utf-8): the batch split decodes with it to find the MSH boundaries (ADR
-        # 0206 rule 5). A name the codec registry lacks makes the split hand the file over whole.
-        self._encoding: str = s.get("encoding") or "utf-8"
+        # The declared charset, by the rule ingress_guards.ingress_encoding reads (BACKLOG #2431):
+        # the batch split decodes with it to find the MSH boundaries (ADR 0206 rule 5). A name the
+        # codec registry lacks makes the split hand the file over whole.
+        self._encoding: str = declared_encoding(s.get("encoding"))
         self._poll_seconds: float = poll_interval(s, default=5.0, transport="REMOTEFILE source")
         self._after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self._after_read not in ("move", "delete", "leave"):

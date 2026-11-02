@@ -249,7 +249,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
 | | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
-| | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
+| | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode that verifies the server, such as psqlODBC `SSLmode=verify-full` or MySQL `SSLMODE=VERIFY_IDENTITY` (*connection-scoped*; inbound **and** outbound). The engine cannot check that a mode verifies; its gate refuses only a missing or no-TLS mode |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
@@ -467,7 +467,7 @@ false premise.
   `allow_no_auth`, with no auth service attached. It is an app opt-in, not a setting, so it is not
   in the registry (`security_loosenings()`) and has no row in the tables on this page. So
   `messagefoundry security show` would never name it: that command reads settings, and no
-  setting holds it.
+  setting holds it. `create_managed_app` also logs one WARNING at build; `create_app` does not.
 
 ### `require_mfa = false` — single-factor sign-in
 - **What you lose:** every account with no second factor enrolled, Administrators included,
@@ -659,7 +659,10 @@ is refused, so an opt-out does nothing and is not reported.
   code knows this posture. A plain `ldap://` AD bind is not: it is refused at every posture, and
   the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
   BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
-  (vault BACKLOG #2354): at least the CLI commands that open the store without one.
+  (vault BACKLOG #2354): at least the CLI commands that open the store without one. That includes
+  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers and
+  `admin-revoke-sessions`, which pass the instance posture only at `enforce` (see *Which callers
+  know the posture* below).
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
@@ -732,7 +735,12 @@ This section is kept rather than deleted, because the claim it used to make is t
   sealed. One example is rows written by a keyless run of a store that was keyed before. Since
   BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
   even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
-  keyed open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+  keyed open to seal them, then turn it back off. It does not seal a blank on a column that is
+  already sealed: an empty body such a run left on a live queue row there stays refused at the
+  claim, as a plant would be (BACKLOG #3495). A blank is sealed only by the open that first seals
+  `queue.payload`, a column with no `keyed_surface` record and no ciphertext, and only on a
+  `pending` or `inflight` inline row outside the `response` stage. That open seals it whether or not
+  this is on. It is a no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
@@ -1401,8 +1409,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Which callers know the posture:** at least `serve`, `check-privileges` and
   `provision-admin` hand it to the guard. On an instance at `enforcement = warn` they cross an
   unattested off-box Vault with a WARNING. **A command that holds no posture refuses that
-  Vault even on a `warn` instance.** That includes at least `rotate-key`, `backup` and
-  `audit-verify`, at least today. **`verify` passes no posture to either of its Vault hops, on
+  Vault even on a `warn` instance.** That includes at least `support-bundle`, `restore` and
+  `restore-verify`. The commands that open the store under BACKLOG #2532, at least `rotate-key`,
+  `backup`, `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-set-notify-email`,
+  `admin-reset-totp` and `store attest-transit-bound` / `withdraw-transit-bound`, pass the
+  instance posture only at `enforce`, where it refuses as no posture does. So does
+  `admin-revoke-sessions` (BACKLOG #2614), which came later. At `warn` they pass none, so they
+  refuse that Vault there too. For the #2532 commands that keeps what they did before #2532, and
+  `admin-revoke-sessions` has refused that way since it was added: no command loosens (Manager
+  decision d20261031T021248404-699a64, under the owner's delegation of 2026-10-22).
+  **`verify` passes no posture to either of its Vault hops, on
   purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
   `warn` instance `verify` dials neither unattested off-box Vault. Its store rows FAIL there,
   on a hop `serve` crosses with a WARNING. Its `fed.client_secret` or `fed.client_key` row reads
@@ -1471,6 +1487,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What the engine refuses without it:** each hop verifies the peer's certificate, and its
   handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
   off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
+  Both hold on a host the `smtp_allowed_hosts` or `webhook_allowed_hosts` allowlist admits; a host
+  off it is left to the per-send refusal.
   A relay with no login takes no guard at all, so the `email` pair does nothing there.
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
@@ -1494,10 +1512,12 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **How it is reported:** `security_loosenings()` names it as `alerts.email_tls_revocation_attested`
   or `alerts.webhook_tls_revocation_attested`, with the reason, so `security show`,
   `GET /security/posture` and the serve-time loosening WARNING list it. It is named whenever the
-  flag is set, whether or not the hop it covers is configured. A hop that crosses an enforcing
-  posture on it logs a WARNING carrying the reason. That line names the declaration as
-  `tls_revocation_attested`, the shared guard's spelling, with no connection; its cell names the
-  `[alerts]` hop. `messagefoundry check` has no line for these pairs.
+  flag is set, whether or not the hop it covers is configured. When a crossing on it logs a
+  WARNING carrying the reason is stated once, in the `email_tls_revocation_attested` and
+  `webhook_tls_revocation_attested` rows of [CONFIGURATION.md `[alerts]`](CONFIGURATION.md#alerts).
+  That line names the setting as
+  `[alerts].email_tls_revocation_attested` or `[alerts].webhook_tls_revocation_attested`, and no
+  connection; its cell names the `[alerts]` hop. `messagefoundry check` has no line for these pairs.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused.
 - **Reversible:** yes. Delete both lines and restart.
@@ -1677,9 +1697,17 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > `[settings]` key. `FhirLookup` does not take it. CORRECTED 2026-10-01: this said no inbound takes it,
 > which was false for that poller.
 > [ADR 0094](adr/0094-granular-expiry-only-tls-relaxation.md).
-- **What you lose:** the certificate **validity-period** check on that hop, and nothing else. An expired
-  server certificate is accepted **indefinitely** — the relaxation has no end date, and nothing removes
-  it when the peer renews.
+- **What you lose:** the certificate **validity-period** check on that hop, and with it the CRL lever on
+  the revocation guard. An expired server certificate is accepted **indefinitely** — the relaxation has
+  no end date, and nothing removes it when the peer renews. The same flag also skips a CRL's own
+  validity window, so a `[tls].crl_file` that reaches the hop earns it no credit with the revocation
+  guard. Off the box on an enforcing instance such a hop is therefore refused unless the connection
+  sets `tls_revocation_attested` with a reason: on REST, SOAP and FHIR, already refused on main; on
+  both FTPS directions since vault BACKLOG #2193; and on MLLP and the DICOM C-STORE SCU since vault
+  BACKLOG #2978
+  ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+  §13). A CRL that reaches the hop still refuses a leaf certificate it lists. CORRECTED 2026-10-30:
+  this said the validity-period check was lost "and nothing else".
 - **What you keep, and it is most of it:** the chain signature, name constraints, key usage / EKU, basic
   constraints and the hostname match all still apply — it ORs exactly one flag
   (`X509_V_FLAG_NO_CHECK_TIME`). The hostname match holds only while the same connection leaves
@@ -1700,9 +1728,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   in `security_loosenings()`, and so in `GET /security/posture` on a running engine. **Not** the
   serve-time loosening warning — that fires before the graph is loaded, exactly as for
   `cleartext_accepted`, and the construction WARN covers the same ground moments later.
-- **What it cannot do — and the one thing you must supply:** it is **advisory only**. No posture gate
-  keys on it, `[security].enforcement = enforce` does not touch it, and no `MEFOR_ALLOW_INSECURE_TLS`
-  is needed to set it. Reported is not gated. The engine will tell you *which* connections have it set,
+- **What it cannot do — and the one thing you must supply:** it is **advisory only** as a setting. No
+  posture gate refuses the setting itself, `[security].enforcement = enforce` does not clamp it, and no
+  `MEFOR_ALLOW_INSECURE_TLS` is needed to set it. Reported is not gated. What it does change is the
+  revocation guard's answer, in either posture. Under an enforcing posture the hop is refused as *What
+  you lose* says. On an instance that does not enforce, an MLLP or DICOM C-STORE SCU hop that sets it,
+  which a CRL used to admit without the revocation WARNING, now logs that WARNING at each build, except at
+  least when `MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own
+  `tls_revocation_attested`, or on a loopback hop. CORRECTED 2026-10-30:
+  this said "No posture gate keys on it", which was false once the call sites handed the guard no
+  context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged. The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -1817,20 +1852,28 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
 > outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
-> parameter named like a credential: `key`, `sig`, `signature`, a name ending in `token`, `secret`,
-> `password` or `credential` (as `access_token` or `accessToken`), and the rest of the engine's
-> credential vocabulary. ASVS 14.2.1.
+> parameter named like a credential: `key`, `sig`, `signature`, most names ending in `token`,
+> `secret`, `password` or `credential` (as `access_token` or `accessToken`), and the rest of the
+> engine's credential vocabulary. A few such names are not named, at least `page_token` and
+> `next_token`, because they usually carry a paging cursor; the detector never reads what a
+> parameter carries, so a credential under one of them is missed. `secretscrub.py`
+> `_QUERY_NOT_CREDENTIAL_TAILS` is the list. ASVS 14.2.1.
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
   does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
   engine's own log lines drop the query, and `GET /metadata` and `graph --json` withhold the whole
   URL. The rule that decides which URL settings are withheld, and what a withheld one shows, is
   stated once, in `config/wiring.py` `_url_may_carry_a_credential`; it withholds more than this
   entry's URLs, and it does not reach a secret that is a bare path segment.
-- **Why it is reported and not refused:** a credential in the URL's user part, `user:password@`, is
-  refused at construction, because that shape never authenticated anything and its error text carried
-  the password. A query credential does authenticate, and some partner APIs take it nowhere else, such
-  as a shared-access `sig` or an API `key`. The detection is also a guess from the parameter name, and
-  a wrong refusal would have no override.
+- **Where it is refused, and why it is only reported elsewhere:** the HTTP rows of
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer)
+  refuse it with no escape, and that section says which hops they cover. There, a name that only
+  looks like a credential is refused too: the peer is unverified, so a false refusal is the cost
+  that rule accepts. Where those rows do not apply, it is reported. A credential in the URL's user
+  part, `user:password@`, is refused at construction, because that shape never authenticated
+  anything and its error text carried the password. A query credential does authenticate, and some
+  partner APIs take it nowhere else, such as a shared-access `sig` or an API `key`. The detection is
+  also a guess from the parameter name, so on a verified peer a refusal would remove a working hop,
+  with no override, for a name that may not be a credential.
 - **When acceptable:** the partner accepts the credential only in the query. If it takes a header, use
   `bearer_token`, basic auth, or a `headers` table supplied whole by `env()`.
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
@@ -1839,10 +1882,19 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   parameter names, never a value. It is logged at least whenever a build check builds the connection
   (at least `messagefoundry check` when its `build-check` leg runs, and a reload, `dry_run`
   included) and whenever a connection is built without one (at least a start, an operator start and
-  a connection test). A reload that replaces a running graph skips it on its rebuilds, because that
-  reload's build check has already logged it. It can still appear more than once for one connection,
-  at least on a reload into an engine started without a graph, because that reload runs a start
-  after its build check, and on a start where one `FhirLookup` fails to build. There is also a
+  a connection test). A reload skips it on the builds it makes after its build check, which has
+  already logged it, so a reload logs it once for each connection that check builds. That holds for
+  a reload into an engine started without a graph as well as for one that replaces a running graph.
+  A reload of a runner that exists but is not started makes no builds, so the later start logs it
+  again. At a start that logs it, each `FhirLookup` whose `url` resolved logs it once, before any
+  build, so the URL is named while the lookup is down, whether its build or another setting failed;
+  its failure is recorded and alerted. The exception is a lookup whose warning step itself raises:
+  it is degraded, with an ERROR line and no WARNING. A lookup whose `url` did not resolve has no
+  URL to read and logs none. The egress check logs it
+  before any of its refusals, so an outbound or a lookup that check refuses, for example over an
+  unlisted forward proxy, has logged it. An outbound that fails before that check, at least on an
+  unresolved `env()` value, logs none. An `env()` URL on a connection that logged none appears
+  nowhere until a later build or check logs it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
@@ -1853,35 +1905,50 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `deployed=False` outbound is never built or build-checked, so no WARNING fires for it; an `env()`
   URL on such a lane appears nowhere meanwhile.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
-  know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's
+  know, and it will name a parameter that only looks like one, such as `primary_key`. OIDC's
   `response_mode=query` is a different matter and stays a recorded delta.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
-> verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
+> TLS mode, or a mode pinned to no TLS. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
 > `dialect='generic'`. [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 > (2026-07-12 amendment).
 - **What you lose:** on `dialect='generic'` MessageFoundry cannot introspect an arbitrary ODBC driver's
   TLS posture, so the posture-keyed weakened-TLS refusal does not apply and TLS is delegated entirely to
-  the driver's own keyword. With no such keyword — or with one pinned to a no-TLS value — the rows, and
+  the driver's own keyword. With no mode set — or with one pinned to a no-TLS value — the rows, and
   the credential in the DSN, may cross in plaintext.
-- **Why it is a delegation rather than a refusal:** the engine cannot enumerate an arbitrary driver's
-  keywords, and a guess-based refusal would break legitimate drivers. The delegation is correct; what
-  was wrong, until #333, was that its only control was a log line.
-- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
+- **Why a set mode stays a delegation:** the engine cannot tell whether an arbitrary driver's value
+  verifies anything, and a guess-based refusal would break legitimate drivers. The delegation is
+  correct; what was wrong, until #333, was that its only control was a log line.
+- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying TLS mode —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
-- **How it is detected, precisely:** a TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) whose
-  **value** is not one of the known no-TLS spellings. The value check matters: matching the key alone
-  read `SSLmode=disable` as TLS ownership. A passphrase-shaped key such as `sslpassword` is not
+- **How it is detected, precisely:** the hop counts as owned only when `sslmode` or `encrypt`, in any
+  case, has a non-blank string value with no blank at either end, and no TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known
+  no-TLS spellings. The value check matters: matching the key alone read `SSLmode=disable` as TLS
+  ownership. So did a lone key or certificate path, or a blank mode, none of which the engine counts
+  as a mode (BACKLOG #2483). A passphrase-shaped key such as `sslpassword` is not
   TLS-shaped for this check, and its value is never classified or reported (BACKLOG #1352).
-  **Known residual:** an *encrypted-but-unverified* value
+  **Known residuals:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
-  for "verified" are not consistent enough to grade without guessing.
-- **It is never silent:** a WARN at each construction naming the connection and the offending keyword;
+  for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
+  clears the check however it is spelled. The build refuses an `sslmode` outside libpq's six
+  lower-case spellings on every driver but MySQL Connector/ODBC (BACKLOG #2705), so a typo still
+  clears an `encrypt` value, or an `sslmode` on MySQL Connector/ODBC, and on some drivers it would
+  select no TLS. `encrypt` is unproven, and absent from psqlODBC's keyword parser.
+  [CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql) records both.
+- **What reports it:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
-  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
-- **What it cannot do:** it is advisory only, on every posture, in both directions. Nothing refuses it.
+  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`. A
+  `dialect` given as `env()`: `GET /security/posture` resolves it against the running engine's
+  values, as the build does, and lists the hop only when it resolves to `generic`, or marks the
+  name *possibly generic* when those values do not resolve it. `messagefoundry check` has no
+  values, so it lists such a hop as possibly generic and names the reference's key, never its
+  value.
+- **What it cannot do:** the WARN and these reports refuse nothing. The refusal is
+  `generic_cleartext_hop_guard` (BACKLOG #1178): an enforcing instance refuses this hop off-loopback,
+  in both directions, unless a per-connection declaration relaxes it
+  ([CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql)).
 
 ### `store_principal_over_granted` — the engine's database credential holds more than its runbook allows
 

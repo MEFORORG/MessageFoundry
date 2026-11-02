@@ -222,29 +222,49 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # folded into [dicom].
 # pydicom is capped below 3.1 because the deflate guard replays private pydicom header readers, and the
 # agreement test (tests/test_dicom_deflate_guard.py) only proves the locked release (BACKLOG #1926).
-# pynetdicom is capped below 3.1 for the same kind of reason (vault BACKLOG #2713; the cap was below 4
-# until then). The DICOM listener's association server (_admitting_server_class in
+# pynetdicom is pinned exactly for a stronger form of the same reason (vault BACKLOG #2713 capped it below
+# 3.1, and it was below 4 until then; #2712 made the pin exact). The DICOM listener's association server (_admitting_server_class in
 # messagefoundry/transports/dicom.py) subclasses pynetdicom's threaded server and overrides the
 # socketserver hooks it accepts connections through. That subclass was read against pynetdicom 3.0.4, the
 # locked release, and against CPython's socketserver. Its guard, _require_socketserver_routing, refuses to
 # start the listener on a pynetdicom that left that routing, but a site would only learn that when the
-# listener failed to start. For 3.1 and later, the cap moves that stop to install time, where it is a
-# reviewed step. A 3.0.x patch above 3.0.4 would still be allowed, unread. None exists today. Only the
-# startup guard stands in front of one, and it checks the routing alone.
+# listener failed to start. The pin moves that stop to install time, where it is a reviewed step.
+# That subclass's request handler also reads the association request ahead of pynetdicom (vault BACKLOG
+# #2712). So it relies on private names too, at least these: RequestHandler._create_association, the order of
+# the steps in RequestHandler.handle, Association.dul.socket, Association._kill, Association.is_alive,
+# DULServiceProvider.to_provider_queue, DULServiceProvider._is_transport_event testing AssociationSocket.ready,
+# AssociationSocket.recv, send, close and _shutdown_socket, the stock send's Evt17 and EVT_DATA_SENT,
+# DULServiceProvider._read_pdu_data reading a 6-byte header and then the body through AssociationSocket.recv,
+# taking a short header read as a silent closed connection and not reading the body of an unknown PDU type,
+# and the state machine: dul.state_machine.current_state, the names Sta1, Sta2, Sta3 and Sta13, and what
+# Evt17 does in each. Its receipt count (_ReceiptTally) splits a P-DATA-TF as pdu.P_DATA_TF._generate_items
+# does, and starts again where dimse_messages.DIMSEMessage.decode_msg completes a message: a data set's last
+# fragment, or a command set's last fragment whose CommandDataSetType, read by dsutils.decode, is 0x0101,
+# after its CommandField is looked up in dimse_messages._MESSAGE_TYPES. Its ready holds off reading while
+# Association.dimse.msg_queue holds a whole message.
+# Its pre-check also runs the association's own presentation-context negotiation:
+# presentation.negotiate_as_acceptor and negotiate_unrestricted, _config.UNRESTRICTED_STORAGE_SERVICE,
+# the request's SCP_SCU_RoleSelectionNegotiation items, and AssociationServer.contexts, as
+# ACSE._negotiate_as_acceptor passes them. _require_association_seams refuses to start without some of
+# those names, and tests in tests/test_dicom_scp_pre_association.py and tests/test_dicom_scp_receipt_bounds.py
+# pin more of them at the locked version.
+# THAT IS WHY THIS PIN IS EXACT, AS CLAUDE.md SECTION 7 ASKS WHERE A MEASURED GUARANTEE DEPENDS ON THE
+# VERSION: the read, send and receipt bounds rest on behaviour that was measured at 3.0.4, and that a name
+# check cannot see.
 # The harness DIMSE driver (harness/drivers/dimse.py) also overrides a private hook, AE._create_socket, to
 # cap what it reads from the engine; its read-cap test in tests/test_harness_dimse.py fails if the hook moves.
-# TO RAISE IT: re-read _admitting_server_class against the new release's pynetdicom/transport.py. Measure
-# again whatever dicom.py and tests/test_dicom_scp_admission.py record as measured at 3.0.4. Then, in one PR:
-# - lift the cap here, its entry in .github/dependabot.yml and the versions in that test file;
-# - move the locked version to the new release, so CI runs the DICOM tests on it. A plain `uv lock` keeps
-#   3.0.4, which still satisfies a wider range; `uv lock --upgrade-package pynetdicom` moves it;
-# - update each statement of the range in docs/, at least in docs/DICOM.md and docs/CONNECTIONS.md.
-# What the cap excludes today: no final 3.1 exists, so no stable release. PyPI does carry a 3.1.0.dev0
-# development release, which the old cap allowed to an install that opts into pre-releases and this one does
-# not. That release still requires pydicom>=3,<4. No 4.x exists on PyPI or in the GitHub tags (checked
-# 2026-10-02; BACKLOG #2505 first checked 2026-10-01). Sources:
+# TO RAISE IT: re-read _admitting_server_class and _ReceiptTally against the new release's pynetdicom/transport.py,
+# dul.py, pdu.py and dimse_messages.py. Measure again whatever dicom.py, tests/test_dicom_scp_admission.py,
+# tests/test_dicom_scp_pre_association.py and tests/test_dicom_scp_receipt_bounds.py record as measured at
+# 3.0.4. Then, in one PR:
+# - move the pin here, its entry in .github/dependabot.yml and the versions in that test file;
+# - move the locked version to the new release with `uv lock`, so CI runs the DICOM tests on it;
+# - update each statement of the version in docs/, at least in docs/DICOM.md and docs/CONNECTIONS.md.
+# What the pin excludes: at least any 3.0.x patch above 3.0.4, none of which existed when this was last
+# checked, and PyPI's 3.1.0.dev0 development release. No final 3.1 and no 4.x exists on PyPI or in the
+# GitHub tags (checked 2026-10-02; BACKLOG #2505 first checked 2026-10-01). Sources:
 # https://pypi.org/pypi/pynetdicom/json and https://github.com/pydicom/pynetdicom/tags
-dicom = ["pynetdicom>=3.0.4,<3.1", "pydicom>=3.0.2,<3.1"]
+dicom = ["pynetdicom==3.0.4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
 # implementation-guide validator (e.g. 005010X222A1 for 837P) and also emits the 997/999 ack as a
@@ -273,9 +293,20 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # advisory stream is WebAuthn-relevant supply chain; never let this floor drift down), and
 # pyasn1-modules>=0.4.2. pyasn1 rides in via ldap3 (0.6.3 was the CVE-2026-30922 decoder-DoS fix); the
 # lock moved to pyasn1 0.6.4 for CVE-2026-59885/59886 (BER OID quadratic-decode + univ.Real float DoS,
-# both fixed in 0.6.4) — treat 0.6.4 as the floor, never let a re-lock regress it. Reachable here only
-# via WebAuthn attestation parsing (optional [webauthn] extra, auth + password re-proof gated); ldap3
-# and pyspnego do NOT route untrusted DER through pyasn1's vulnerable decoders.
+# both fixed in 0.6.4), then to 0.6.5 for CVE-2026-119194/119195/119196/119197 (quadratic CPU in BER/CER/
+# DER decoding of schema-less containers, constructed OCTET STRING/character strings/indefinite ANY,
+# constructed BIT STRING, and binary REAL; all fixed in 0.6.5) — treat 0.6.5 as the floor, never let a
+# re-lock regress it. Callers read at the pins of 2026-10-30, by reading the wheels, not by running an
+# attack. webauthn 3.0.1 BER-decodes x5c[0] with a Certificate schema (android_key.py), which holds at
+# least BIT STRING, OCTET STRING and ANY. The client picks the attestation format, so attestation=NONE does not rule
+# this out, but the decode comes after the chain reaches a known root and the signature verifies.
+# Whether a constructed string survives the OpenSSL parse before it was NOT measured, so treat this
+# path as reachable (optional [webauthn] extra; the 2026-07 reading gated it behind auth + password
+# re-proof, not re-read here). ldap3 2.9.1 has pyasn1 decoder calls, but its default fast_decoder=True
+# parses LDAP responses and the paged-search control with its own decoder. messagefoundry/auth/ldap.py
+# never sets fast_decoder, and the one extended operation it calls, who_am_i, keeps the base class's
+# asn1_spec=None, so none of those calls is on the path read here. pyspnego does not depend on pyasn1. sigstore DER-decodes
+# a certificate extension as UTF8String (verify/policy.py), but it is only in the release-tools group.
 # OSV sweep 2026-07-03: all five pins CLEAR (webauthn/pyopenssl/pyasn1/pyasn1-modules/cbor2).
 webauthn = ["webauthn>=3.0.0,<4"]
 # HashiCorp Vault KeyProvider (ADR 0019 §3, BACKLOG #196): envelope-decrypt the store DEK via Vault

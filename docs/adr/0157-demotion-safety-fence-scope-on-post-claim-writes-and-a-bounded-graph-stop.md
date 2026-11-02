@@ -1,6 +1,6 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling), 2026-10-30 (a note under Amendment B's "Not covered" paragraph for the Database source: a writing `poll_statement` is now refused, BACKLOG #2178)
 
 > **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
 > `mark_batch_failed`'s, now carry a status term on all three backends, by owner ruling. It was
@@ -11,8 +11,13 @@
 > conjunct" line; it now binds the terminal resolves only.
 
 > **All six increments are BUILT: 0, 1, 2, 3, 4 and 5.** C1 (terminal writes only, fail-open) and C6
-> (yes, bounded, abandon-don't-await) were decided by the owner. Two named residuals stay open: the
-> SQL Server renew clamp (Inc 0, deviation 3) and the same-process re-promotion case (Consequence 1c).
+> (yes, bounded, abandon-don't-await) were decided by the owner. The SQL Server renew clamp (Inc 0,
+> deviation 3) was BUILT on 2026-10-30 (BACKLOG #1497); the as-built note is at deviation 3. At least
+> these residuals stay open: the same-process re-promotion case (Consequence 1c); on SQL Server, a
+> renew that can land up to about twice the clamp after it is issued, because its borrow and its
+> statement each get the full clamp while the margin check compares the clamp alone; the SQL Server
+> claim's COMMIT, which the clamp does not bound; and the SQL Server heartbeat, config-version refresh
+> and stepdown release, which still run under `[store].command_timeout`.
 >
 > **Inc 3 is BUILT (2026-09-26, BACKLOG #1497), on a measured premise.** Its gate asked whether a
 > coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. Hosted CI
@@ -34,7 +39,8 @@
 > re-specification are both kept below; read the as-built note at the end of the re-specification.
 >
 > **Inc 0 shipped with three deviations from its own paragraph** — the check's subject, refuse-rather-
-> than-warn, and a Postgres-only clamp. Each is recorded with its reason at the increment.
+> than-warn, and a Postgres-only clamp. Each is recorded with its reason at the increment. The third
+> was closed on 2026-10-30: the clamp now binds the SQL Server claim too.
 >
 > Three clauses were corrected during implementation, each because the drafted version was
 > **strand-direction** — the one outcome the at-least-once invariant forbids:
@@ -369,13 +375,34 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    drafted fired on stock defaults, and a hard failure on every install is unshippable. Once the
 >    defaults pass cleanly that constraint is gone, the three neighbouring `[cluster]` validators all
 >    raise, and — CLAUDE.md §0 — with zero deployments a breaking default costs nothing to change.
-> 3. **The clamp is POSTGRES-ONLY, and that is a named residual, not an oversight.** The SQL Server
->    coordinator's renew still inherits `[store].command_timeout` from the ODBC connection; a
->    per-statement override there lives in `store/sqlserver.py`, which was held by other in-flight
->    work. `build_coordinator` therefore does not pass the clamp to `SqlServerCoordinator` at all —
+> 3. **The clamp shipped POSTGRES-ONLY on 2026-09-10, as a named residual, not an oversight.** The
+>    SQL Server coordinator's renew then inherited `[store].command_timeout` from the ODBC connection;
+>    a per-statement override there lives in `store/sqlserver.py`, which was held by other in-flight
+>    work. `build_coordinator` therefore did not pass the clamp to `SqlServerCoordinator` at all —
 >    naming a bound that does not bind is the defect in 1, one level down. The **baseline stamp** did
->    land on both coordinators, and on SQL Server it is currently the only thing keeping the margin
+>    land on both coordinators, and on SQL Server it was then the only thing keeping the margin
 >    real, which is why it was not scoped to Postgres with the clamp.
+>
+>    **BUILT 2026-10-30 (BACKLOG #1497): the SQL Server clamp.** `build_coordinator` now passes the
+>    clamp to `SqlServerCoordinator`, whose claim/renew MERGE runs through
+>    `SqlServerStore._fetchone_clamped`. That sets the clamp as the pyodbc connection's statement
+>    timeout before the cursor is opened, and puts `[store].command_timeout` back afterwards, on an
+>    ordinary error too. A cancellation skips the restore, because the connection is quarantined on
+>    the same exit. As on Postgres, a shorter `command_timeout` still wins. Two differences from
+>    Postgres. First, the timeout counts whole seconds, so the clamp is rounded DOWN, never above the
+>    value `_renew_fits_the_margin` checked, and never below 1, and
+>    `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp under 1 s on this
+>    backend. Second, it binds the claim call only: its borrow waits at most the clamp too, but
+>    unlike Postgres the borrow and the statement do not share one deadline (a whole-second timeout
+>    cannot carry what a borrow leaves of a 1 s clamp), so a renew can land up to about twice the
+>    clamp after it is issued, while the margin check compares the clamp alone. The COMMIT after the
+>    statement is not bounded by it, and the heartbeat, config-version refresh and stepdown release
+>    still run under `command_timeout`. The first difference is on purpose; the second is a kept
+>    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and
+>    `serve` logs `ServiceSettings.sqlserver_renew_bound_warning` at start-up, without refusing, when
+>    twice the clamp reaches the margin. Deviation 4 says what that means for the derived default.
+>    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
+>    ending a slow statement at the clamp.
 > 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
 >    increment, before merge.** The first cut shipped a constant 5.0 and it refused **this
 >    repository's own failover configurations** at config load: `harness/load/profiles/failover.toml`
@@ -395,7 +422,12 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    a function of the fence/TTL pair. The 0.5 is deliberately the same fraction as
 >    `pipeline.cluster._DEMOTE_BUDGET_FRACTION`, off the same margin: the teardown and a still-in-
 >    flight renew are **concurrent**, both start at the fence moment, so each takes half and each is
->    strictly inside. An **explicitly set** clamp is still checked and still refused — never silently
+>    strictly inside. **That holds on Postgres only**, where the renew's borrow and statement share one
+>    deadline. On SQL Server each gets the full clamp (deviation 3), so the derived default is not
+>    safe by construction there: at the shipped 10/20/30 the 4.5 s clamp runs as a 4.5 s borrow plus
+>    a 4 s statement, about 8.5 s of the 9.0 s margin, and at the failover profile above (margin
+>    1.2 s, clamp floored to 1.0 s) as about 2 s, past the margin. An **explicitly set** clamp is
+>    still checked and still refused — never silently
 >    shrunk to fit, which would make the check accept everything — and a fence/TTL pair with **no
 >    margin at all** (`ttl − fence − fence_tick <= 0`, which `_fence_ordering` accepts: fence 4.0 /
 >    TTL 4.5 orders fine and leaves −0.3) is refused before the clamp is resolved, naming the pair
@@ -693,7 +725,15 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
 
 - Consequence 1(c): a promote, demote and re-promote in one process passes every guard, on both
   backends. Only a per-claim token closes it.
-- The SQL Server renew still inherits `[store].command_timeout` (Inc 0, deviation 3).
+- The SQL Server renew inherited `[store].command_timeout` until 2026-10-30 (Inc 0, deviation 3,
+  now BUILT). Its claim's borrow and statement are clamped. Neither the clamp nor
+  `[store].command_timeout` is known to bound the claim's COMMIT, or the ROLLBACK after a failed
+  claim, by a reading of pyodbc's documentation, not a measurement;
+  [`docs/CONFIGURATION.md`](../CONFIGURATION.md), the `lease_renew_timeout_seconds` row, says why.
+  At least these are not clamped either: the start-up
+  `_register` and `_ensure_tables`, and the heartbeat, config-version and release statements. The
+  claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
+  leader whose pool is busy but healthy can self-fence sooner.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading
   then either, so nothing else moves.
 - A cancel that commits a `claim_fifo_heads` claim leaves the row for the next start or promotion, as
@@ -871,8 +911,9 @@ must still **land**. No case may produce a strand; duplicates permitted.
 Plus the stalled-renew case. **The stock 30/30 `command_timeout` collision this line was written
 against is gone on Postgres** — Inc 0 stopped the renew inheriting `command_timeout` — but the case it
 was probing is not: a renew that stalls past the fence must still leave the fence rejecting post-claim
-writes, i.e. Inc 1 holds where Inc 5's timing argument does not. **On SQL Server the collision itself
-still stands**, since that renew still inherits `command_timeout`; construct it there.
+writes, i.e. Inc 1 holds where Inc 5's timing argument does not. **On SQL Server the collision went
+with the clamp on 2026-10-30** (deviation 3), but a renew can still stall in its COMMIT, which the
+clamp does not bound; construct it there.
 
 **Standing gate, every increment:** `ruff check` + `ruff format --check`, `mypy` strict, `pytest`, and the
 Windows CI legs. Local pytest **silently skips** the Postgres and SQL Server legs, so a green local run
@@ -1275,6 +1316,17 @@ At least these, read 2026-10-26:
   status-flag claim), the select itself claims every row it returns, so a cut in the select, or the
   stop check between rows, leaves claimed rows that never reached the store. That was true of the
   serial loop too.
+
+  *Amended 2026-10-30 (BACKLOG #2178):* this case is now refused rather than left uncovered.
+  `DatabasePoll` when declared, and `DatabaseSource` when built, refuse any `poll_statement` that
+  fails the `db_lookup` read-only test, so at least an `UPDATE ... RETURNING` or status-flag claim
+  in the poll, and a stored-procedure poll, are refused. In the shipped code the same shape would
+  also have lost the rows past `poll_max_rows` on every full poll, and at least a row whose hand-off
+  failed. With a poll that does
+  not write, a row is marked only by `mark_statement`, after its hand-off, so a cut in the select or
+  at the stop check leaves the row unmarked, and the next poll reads it again. The test reads only
+  the statement's shape, so a poll it does not catch can still claim at the select;
+  `docs/CONNECTIONS.md`, *Database source*, names at least the shapes it misses.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
   `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.

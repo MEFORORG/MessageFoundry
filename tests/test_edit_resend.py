@@ -33,6 +33,7 @@ from messagefoundry.store import MessageStatus, OutboxStatus
 from messagefoundry.store.base import ReingressOriginMissing, ResendKeyConflict, ResendSourceEmpty
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.store import REINGRESS_TARGET_PREFIX, MessageStore, Stage
+from tests._store_audit import no_operator_audit
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 EDITED = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||200^^^H^MR||DOE^JOHN\r"
@@ -105,7 +106,9 @@ async def _cell_tag(store: MessageStore, column: str, mid: str) -> bytes:
 
 async def test_reingress_creates_correlated_received_child(store: MessageStore) -> None:
     origin = await _seed(store)
-    out = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k1")
+    out = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     assert out.status == "resubmitted"
     assert out.message_id == origin and out.new_message_id != origin
     assert out.channel_id == "in1"
@@ -159,7 +162,9 @@ async def test_reingress_after_retention_purge_rebases_the_lineage(store: Messag
     await store._db.commit()
 
     # Pre-purge: the child inherits the ancestry.
-    before = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="pre")
+    before = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="pre", audit=no_operator_audit
+    )
     fetched = await store.get_message(before.new_message_id)
     assert fetched is not None
     pre_meta = json.loads(fetched["metadata"])
@@ -172,7 +177,9 @@ async def test_reingress_after_retention_purge_rebases_the_lineage(store: Messag
     assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
     assert await store.message_metadata_json(origin) is None
 
-    after = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="post")
+    after = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="post", audit=no_operator_audit
+    )
     fetched = await store.get_message(after.new_message_id)
     assert fetched is not None
     post_meta = json.loads(fetched["metadata"])
@@ -187,7 +194,9 @@ async def test_reingress_leaves_original_byte_identical(store: MessageStore) -> 
     origin = await _seed(store)
     before = await store.get_message(origin)
     assert before is not None
-    await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k1")
+    await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     after = await store.get_message(origin)
     assert after is not None
     # The ORIGINAL row is never opened for write: raw + status + metadata unchanged.
@@ -200,8 +209,12 @@ async def test_reingress_leaves_original_byte_identical(store: MessageStore) -> 
 
 async def test_reingress_same_key_delivers_once(store: MessageStore) -> None:
     origin = await _seed(store)
-    first = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k1")
-    second = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k1")
+    first = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
+    second = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     assert first.status == "resubmitted" and second.status == "duplicate"
     # the retry reports the SAME child — never a second re-ingress (no double-deliver)
     assert second.new_message_id == first.new_message_id
@@ -217,8 +230,12 @@ async def test_reingress_same_key_delivers_once(store: MessageStore) -> None:
 
 async def test_reingress_new_key_is_a_second_child(store: MessageStore) -> None:
     origin = await _seed(store)
-    a = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k1")
-    b = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k2")
+    a = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
+    b = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k2", audit=no_operator_audit
+    )
     assert a.status == "resubmitted" and b.status == "resubmitted"
     assert a.new_message_id != b.new_message_id  # a NEW key IS a genuine second resubmit
 
@@ -226,14 +243,20 @@ async def test_reingress_new_key_is_a_second_child(store: MessageStore) -> None:
 async def test_reingress_key_reused_across_messages_is_a_conflict(store: MessageStore) -> None:
     m1 = await _seed(store)
     m2 = await _seed(store)
-    await store.reingress(origin_message_id=m1, raw=EDITED, idempotency_key="k1")
+    await store.reingress(
+        origin_message_id=m1, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     with pytest.raises(ResendKeyConflict):
-        await store.reingress(origin_message_id=m2, raw=EDITED, idempotency_key="k1")
+        await store.reingress(
+            origin_message_id=m2, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+        )
 
 
 async def test_reingress_missing_origin_raises(store: MessageStore) -> None:
     with pytest.raises(ReingressOriginMissing):
-        await store.reingress(origin_message_id="nope", raw=EDITED, idempotency_key="k1")
+        await store.reingress(
+            origin_message_id="nope", raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+        )
 
 
 async def test_reingress_records_a_disjoint_target_key(store: MessageStore) -> None:
@@ -241,7 +264,9 @@ async def test_reingress_records_a_disjoint_target_key(store: MessageStore) -> N
     # resend-to-alternate's (message_id, <outbound>) — so a resend and a reingress can share the ledger
     # without a target collision.
     origin = await _seed(store)
-    out = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="k1")
+    out = await store.reingress(
+        origin_message_id=origin, raw=EDITED, idempotency_key="k1", audit=no_operator_audit
+    )
     async with store._read() as db:
         cur = await db.execute("SELECT to_destination FROM resend_log WHERE resend_key=?", ("k1",))
         row = await cur.fetchone()
@@ -265,7 +290,11 @@ async def test_direct_edit_ships_edited_body_to_a_correlated_child(store: Messag
     assert before is not None
 
     out = await store.resend_to(
-        message_id=origin, to="OB2", idempotency_key="k1", body_override=EDITED
+        message_id=origin,
+        to="OB2",
+        idempotency_key="k1",
+        body_override=EDITED,
+        audit=no_operator_audit,
     )
     assert out.status == "resent" and out.to_destination == "OB2"
     assert out.message_id == origin  # the outcome names the ORIGIN the operator acted on
@@ -306,7 +335,13 @@ async def test_direct_edit_ships_edited_body_to_a_correlated_child(store: Messag
 async def test_direct_edit_empty_body_is_rejected(store: MessageStore) -> None:
     origin = await _seed(store)
     with pytest.raises(ResendSourceEmpty):
-        await store.resend_to(message_id=origin, to="OB2", idempotency_key="k1", body_override="")
+        await store.resend_to(
+            message_id=origin,
+            to="OB2",
+            idempotency_key="k1",
+            body_override="",
+            audit=no_operator_audit,
+        )
     # no partial mutation: no OB2 row was created anywhere (origin or a child)
     assert await _outbound_rows(store, "OB2") == []
 
@@ -314,10 +349,18 @@ async def test_direct_edit_empty_body_is_rejected(store: MessageStore) -> None:
 async def test_direct_edit_is_idempotent(store: MessageStore) -> None:
     origin = await _seed(store)
     first = await store.resend_to(
-        message_id=origin, to="OB2", idempotency_key="k1", body_override=EDITED
+        message_id=origin,
+        to="OB2",
+        idempotency_key="k1",
+        body_override=EDITED,
+        audit=no_operator_audit,
     )
     second = await store.resend_to(
-        message_id=origin, to="OB2", idempotency_key="k1", body_override=EDITED
+        message_id=origin,
+        to="OB2",
+        idempotency_key="k1",
+        body_override=EDITED,
+        audit=no_operator_audit,
     )
     assert first.status == "resent" and second.status == "duplicate"
     # exactly ONE OB2 delivery total (on the single child), never a second child/send on retry

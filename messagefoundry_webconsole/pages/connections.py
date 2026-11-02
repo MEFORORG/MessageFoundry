@@ -25,6 +25,7 @@ __all__ = [
     "bulk_control_result",
     "connection_details",
     "connections_fragment",
+    "control_notice_code",
     "dashboard",
     "decode_row_key",
     "flag_not_recorded",
@@ -334,8 +335,36 @@ def unprovisioned_banner(unprovisioned: bool) -> Markup:
     return el("p", UNPROVISIONED_NOTICE, class_="banner", role="alert")
 
 
-def dashboard(rows: list[ConnectionRow], *, unprovisioned: bool = False) -> Markup:
+# The notices a refused per-name control redirects with, keyed by the ?m= code. An allow-list, so
+# the query string can select a sentence but never supply one. The two store lines are the engine's
+# answers, and a console test pins them to it (vault BACKLOG #3746).
+_CONTROL_NOTICES: dict[str, str] = {
+    "control_store": (
+        "the engine could not reach its store to check a trust anchor; see the engine log"
+    ),
+    "control_store_restart": (
+        "the engine could not reach its store to check a trust anchor, so this restart left the "
+        "connection stopped until its next start, which at least an operator, a schedule or a rule "
+        "can make; see the engine log"
+    ),
+    "control_refused": "the engine refused that action; check the connection's status below",
+}
+
+
+def control_notice_code(status: int, *, restart: bool) -> str | None:
+    """The ``?m=`` code for a refused per-name control: a 503 is a store fault and a 409 a refusal.
+    ``None`` for any other status, which the caller lets through."""
+    if status == 503:
+        return "control_store_restart" if restart else "control_store"
+    return "control_refused" if status == 409 else None
+
+
+def dashboard(
+    rows: list[ConnectionRow], *, unprovisioned: bool = False, notice: str = ""
+) -> Markup:
     """The connections dashboard page; the table auto-refreshes via the first-party poll script.
+
+    ``notice`` is a redirect's ``?m=`` code and selects from :data:`_CONTROL_NOTICES` only.
 
     ``unprovisioned`` raises :data:`UNPROVISIONED_NOTICE` above the table — the first-run affordance
     for an operator with an empty channel scope (BACKLOG #1152). It is DELIBERATELY a page banner
@@ -357,6 +386,7 @@ def dashboard(rows: list[ConnectionRow], *, unprovisioned: bool = False) -> Mark
         data_poll_ms="5000",
     )
     livestats = el("div", id="livestats", class_="livestats")
+    refused = _CONTROL_NOTICES.get(notice)
     return page(
         "Connections",
         # Header + the filter/bulk-action toolbar on one row.
@@ -365,6 +395,7 @@ def dashboard(rows: list[ConnectionRow], *, unprovisioned: bool = False) -> Mark
         # survive it — an operator who scrolls past the first refresh must still see why the page
         # is empty.
         unprovisioned_banner(unprovisioned),
+        Markup("") if refused is None else el("p", refused, class_="banner", role="alert"),
         livestats,
         live,
         active="dashboard",

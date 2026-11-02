@@ -230,9 +230,9 @@ cbor2==6.1.2 \
     --hash=sha256:c02b7d94fe9914798a346a2f089f0f7f85be71d120d40080916d131fa0bd0442 \
     --hash=sha256:f93179b4b1ba958b5c37b56969b8f07b4fcf44a83319f47559c59f28a1c564a4
     # via webauthn
-certifi==2026.10.19 \
-    --hash=sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae \
-    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
+certifi==2026.10.23 \
+    --hash=sha256:a9895e6e2758b371e0545e321a3a8fd1fcfd9829ada8824a936dfb16aaaf36cd \
+    --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
     # via
     #   httpcore
     #   httpx
@@ -410,9 +410,9 @@ execnet==2.1.2 \
     --hash=sha256:63d83bfdd9a23e35b9c6a3261412324f964c2ec8dcd8d3c6916ee9373e0befcd \
     --hash=sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec
     # via pytest-xdist
-fastapi==0.146.0 \
-    --hash=sha256:0eb9985a7d5bb11ce9a962d4b65e0cf1a2e13d6aca2e14da57bc526370e26748 \
-    --hash=sha256:e96047fc353ff43f7fda069c3578a7d94902a762d9aca2e065f7f801abd91a49
+fastapi==0.162.0 \
+    --hash=sha256:3785963de305dd09912426cb81f2d230fce98ab3521cdfe97265c8d14983128c \
+    --hash=sha256:6a22c1e2e6e32e0633ee7e170f00009a29b8228b16feb219ee42f32fd8d88a8f
     # via messagefoundry
 fhir-core==1.1.12 \
     --hash=sha256:2ae218ed43b32705ce1c37150253942bd88350248a77f66e8ca2b6c3ed8263b2 \
@@ -783,9 +783,9 @@ psutil==7.2.2 \
     --hash=sha256:eed63d3b4d62449571547b60578c5b2c4bcccc5387148db46e0c2313dad0ee00 \
     --hash=sha256:fd04ef36b4a6d599bbdb225dd1d3f51e00105f6d48a28f006da7f9822f2606d8
     # via messagefoundry
-pyasn1==0.6.4 \
-    --hash=sha256:9c447d8431c947fe4c8febc4ed9e760bc29011a5b01e5c74b67025bd9fb8ce81 \
-    --hash=sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b
+pyasn1==0.6.5 \
+    --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587 \
+    --hash=sha256:6b11616a6bcf3a40e635f082bb232fa57b5e0dd7f517bd7ddd69ec3794508a47
     # via
     #   ldap3
     #   pyasn1-modules
@@ -939,26 +939,26 @@ pyopenssl==26.4.0 \
     --hash=sha256:28dfcce0162b9211413e26dfbfdf1d24317fbeba18fc93c12400a1856b2a0bc7 \
     --hash=sha256:f0eb0cb2d581d3ad2b9c489468485e7f2ab6727d08401bcf9d824c3caddf3c1c
     # via webauthn
-pyside6==6.11.2 \
-    --hash=sha256:0444ac71d0791a19bded35f6d9a94515941f23a6eb7098ca45a1b64a338be697 \
-    --hash=sha256:13a3c79816879d9743672a669f1988f74459a78f89a97a2624fae4fe059ffa3a \
-    --hash=sha256:3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f \
-    --hash=sha256:57fe867a6c93821a085d74e8a26f863fc2363516848181c466032595b33b1729 \
-    --hash=sha256:dc6d03990489a5085842770718392ef5de36352d8f608d9a9fe03e60af4d7b66
+pyside6==6.11.3 \
+    --hash=sha256:aa85bea06acb593564ec9cc1b0218510115341bcaa9585348760e4b9cac260cf \
+    --hash=sha256:adf77fd541dd97a3e96ccc081982231afbeae2af3b74b98253176f463703085c \
+    --hash=sha256:c01ca54bb64f065129ab23eeb82696b4d4b47f594078ee18ac9b0698009b096c \
+    --hash=sha256:ef2bdb61b1ad7e5e8db8ca7fb1a60d8b7960dfd490c582d005d8903044ab44f1 \
+    --hash=sha256:f52e98bfcc409e2cec4d70b4ca47e11a51737d48b3ea2a0a1af23652bfb8395a
     # via messagefoundry
-pyside6-addons==6.11.2 \
-    --hash=sha256:354c574a839f7d0751960ba03f33bec87c95e0f2796dca3287f54d03abe97dac \
-    --hash=sha256:a2ca3c73e5f060d4aca49451abd9fba68dd0e1c66ff40cea3a1fe0415def579a \
-    --hash=sha256:a8b00956925fbdeffc7052cf933506391289f35ac4f3f71a0a167ec195cd47b4 \
-    --hash=sha256:d5606af369484b862b4d5741cfc179e19d2b8819c3e04d210b8188e0c9f85988 \
-    --hash=sha256:f449ea4431da20e7b86752cca8d166f93434516fe417f981c27e5f8e1b554407
+pyside6-addons==6.11.3 \
+    --hash=sha256:5cab663fbff1b7a1fa7e641754de3ca1ea410407fc70bd4e240144b42d09a69c \
+    --hash=sha256:6d536493003c5f409ba1bf52d8053e23f9c97f291e2a347a676902bfe0a1a31e \
+    --hash=sha256:70bc141b13db2a36323bf0288b9e8a6f7e9bb3c3d0faeaa722ea61334f555e01 \
+    --hash=sha256:94a17b92bd9285e4044b11e78c18d4b452c5ed637906dabd383a11836f24f86f \
+    --hash=sha256:a9af3d2719578f2bb8899098754183d5bee9c8d707b777aac98e10f2e9e55002
     # via pyside6
-pyside6-essentials==6.11.2 \
-    --hash=sha256:77795c145202e65a78d88f7cd409d186e3ba23d159bdb3ba2dcd159ae5e5f0d9 \
-    --hash=sha256:aaf9f25f0f324874085fa5b26a610318db8a8e243cf85bb3e5400595191c7778 \
-    --hash=sha256:c8a29def77032773a30879f7f24415b5395ad08592d147c170824ef4c735dfc1 \
-    --hash=sha256:d3ec6e1885c46e57f16364f38ea8040ffc5dc0b18341058f608fede3ba930567 \
-    --hash=sha256:fadd75c5c20800d64dd0a586ea8cb337c5e630aa2246df0e5105738afa46e02c
+pyside6-essentials==6.11.3 \
+    --hash=sha256:b7d77901d5fb413e96788cb15c56177cbbad0ff12605c716abdc79eabe4ba859 \
+    --hash=sha256:c6a5c3b58bf55aef6e09a7de690ff6133335014ab81a7f22f56363ea08e8f6a3 \
+    --hash=sha256:ca3a6dc165d66d714f443f22cb8631be8d3c5d0c27d0a104d394ee662f1f853a \
+    --hash=sha256:e153290e03ef5bae4b29c584db0193e14d291a21c32030f6953fe98879b3202c \
+    --hash=sha256:ea61687d2c27f8cc7a851c259481be1001dbffa3bebacea4491d9905e7a5d0cf
     # via
     #   pyside6
     #   pyside6-addons
@@ -975,9 +975,9 @@ pytest==9.1.1 \
     #   pytest-rerunfailures
     #   pytest-timeout
     #   pytest-xdist
-pytest-asyncio==1.4.0 \
-    --hash=sha256:933ca923a23075a87fb7070c0ec272a6848489824d887c85c812670932835aa1 \
-    --hash=sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42
+pytest-asyncio==1.4.1 \
+    --hash=sha256:507afa78ec77c6661164ef1a2368bc7820383fd1a14b2a7f813de8b5a92949cc \
+    --hash=sha256:e8266eb094e5ee9ffdb2068c9836f33e209ea77a970eb846933d416b5602669b
     # via messagefoundry
 pytest-rerunfailures==16.7 \
     --hash=sha256:6956ddfb65ca1d07e7e3d99e2c5359d82300f4cb062e6049563bd2c106f72d5c \
@@ -1048,12 +1048,12 @@ ruff==0.15.22 \
     --hash=sha256:e8b9b3f8779a4f08c969defc3c8c35abffaa757e601ed5ae66d6d1db6519969a \
     --hash=sha256:fabfd168afdf29fee5be98b831efa9683c94d7c5a3b58b9ce5a2e38444589a74
     # via messagefoundry
-shiboken6==6.11.2 \
-    --hash=sha256:4bbbd6fa4d7cff5ec5e12bc4c10e1d845fa30c89457ecb13cc64f7bddb77f6f9 \
-    --hash=sha256:53659683b1f7a08e9f87eff9b1065f1ceb7110cd7a4bc09fdf5efe43d286604d \
-    --hash=sha256:6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a \
-    --hash=sha256:7a7a0a72a9ed26c9bf77d42246b1c736486befb8f31aa2fb29957ea4cdd1c1c2 \
-    --hash=sha256:97c49432488df958f0308736f3d15b6915d8826fc380af17bb4b9ec5c4a5e81b
+shiboken6==6.11.3 \
+    --hash=sha256:01d172ec9599fed315aec025b1424ff945ae5358f87588a848797616a18de6e7 \
+    --hash=sha256:1d38919492d08417b7579ad077bc81110d05183d21eb21d66316bc556140a8a3 \
+    --hash=sha256:28c826799dba54bbea95417130127b70e05ddcb0190f4d28e9da8fc8808bdc1b \
+    --hash=sha256:9287279112201e18a7820d29ce9dc4ceca4148c681f4189aff6f4cea652d43af \
+    --hash=sha256:e601c957011345c741b88f661a12486f478db881d6777bdf37e3dc7a8d3387c6
     # via
     #   pyside6
     #   pyside6-addons
@@ -1078,9 +1078,9 @@ sspilib==0.6.0 ; sys_platform == 'win32' \
     --hash=sha256:b4d4e3402230f14cd93999f3953619163075bcaca3e13dcf2ab5942c269627f4 \
     --hash=sha256:b841fabe630101d9e2be6ba56407a2a539087ee85d6ca1477748c21135c9f636
     # via pyspnego
-starlette==1.9.0 \
-    --hash=sha256:3d931de246ed870e35ce605974440816ef895e592f255d1396cfdf191d4c4318 \
-    --hash=sha256:fd3f159936e882d06c1108f84688f7cda2cf85fc6a592a50edbd175e882c2ddc
+starlette==1.10.0 \
+    --hash=sha256:478c0ab3b4ced6e82719849c118fa406f0278a3499c1a898cd15cd31bdc38ce4 \
+    --hash=sha256:b8399098d4c1e3522734f7235dc79b1fc967f96cf139c81e0fa30479e0685f9b
     # via
     #   fastapi
     #   messagefoundry

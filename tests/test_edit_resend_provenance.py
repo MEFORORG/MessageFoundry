@@ -47,6 +47,7 @@ from messagefoundry.store.crypto import (
     verify_audit_body_digest,
 )
 from messagefoundry.store.store import AuditAppend, MessageOrigin, MessageStore
+from tests._store_audit import no_operator_audit
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 EDITED = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||200^^^H^MR||DOE^JOHN\r"
@@ -227,14 +228,23 @@ async def test_each_insert_path_records_its_origin(store: MessageStore) -> None:
     assert await _origin(store, origin) == (MessageOrigin.PARTNER.value, None)
 
     reroute = await store.reingress(
-        origin_message_id=origin, raw=EDITED, idempotency_key="k1", actor="alice"
+        origin_message_id=origin,
+        raw=EDITED,
+        idempotency_key="k1",
+        actor="alice",
+        audit=no_operator_audit,
     )
     assert await _origin(store, reroute.new_message_id) == (
         MessageOrigin.OPERATOR_EDIT.value,
         "alice",
     )
     direct = await store.resend_to(
-        message_id=origin, to="OB2", idempotency_key="k2", body_override=EDITED, actor="bob"
+        message_id=origin,
+        to="OB2",
+        idempotency_key="k2",
+        body_override=EDITED,
+        actor="bob",
+        audit=no_operator_audit,
     )
     assert direct.new_message_id is not None
     assert await _origin(store, direct.new_message_id) == (
@@ -242,7 +252,9 @@ async def test_each_insert_path_records_its_origin(store: MessageStore) -> None:
         "bob",
     )
     # A plain resend adds a delivery to the same message and names no child.
-    plain = await store.resend_to(message_id=origin, to="OB3", idempotency_key="k3")
+    plain = await store.resend_to(
+        message_id=origin, to="OB3", idempotency_key="k3", audit=no_operator_audit
+    )
     assert plain.new_message_id is None
     # The origin row is untouched by any of this.
     assert await _origin(store, origin) == (MessageOrigin.PARTNER.value, None)
@@ -266,7 +278,12 @@ async def test_an_upload_inject_records_the_operator(tmp_path: Path) -> None:
 async def test_retention_keeps_the_origin_when_it_blanks_the_body(store: MessageStore) -> None:
     origin = await store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[])
     child = await store.reingress(
-        origin_message_id=origin, raw=EDITED, idempotency_key="k1", actor="alice", now=1.0
+        origin_message_id=origin,
+        raw=EDITED,
+        idempotency_key="k1",
+        actor="alice",
+        now=1.0,
+        audit=no_operator_audit,
     )
     # Resolve the child so retention may take its body.
     await store._db.execute(
