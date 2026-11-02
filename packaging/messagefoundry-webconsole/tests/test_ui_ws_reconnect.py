@@ -48,19 +48,22 @@ _RUN_TIMEOUT_S = 60
 #: the warm-up runs the real harness over the real app.js. Concurrent load, the cause BACKLOG #1304
 #: measured for pwsh launches, is not ruled out; there the launch never returned, here the later
 #: launches did. If one stall spanned both of run 41490064678's killed launches, it ran over 120 s
-#: and under about 180 s; that is an inference too. The warm-up warns with its time when it runs
-#: past _COLD_START_WARN_S, so the next occurrence leaves a measurement.
-_COLD_START_TIMEOUT_S = 240
+#: and under about 180 s; that is an inference too. The warm-up FAILS SOFT: a timeout or a non-zero
+#: exit only warns, and each test then runs under its own 60 s bound, so the warm-up can never error
+#: the tests by itself and a real app.js fault still fails them by name. It also warns with its time
+#: when it runs past _COLD_START_WARN_S, so the next occurrence leaves a measurement.
+_COLD_START_TIMEOUT_S = 180
 _COLD_START_WARN_S = 10
 
 pytestmark = [
     pytest.mark.skipif(_NODE is None, reason="node is not installed"),
-    # The cold start is charged to the setup of the module's first test. Under the CI tiers'
-    # per-test --timeout, which today sits below this marker, pytest-timeout's thread method would
-    # kill the worker before the cold-start bound fires, losing the TimeoutExpired that names the
-    # stalled command. One cold start plus one run, plus 60 s of slack, lets each subprocess bound
-    # fire first. A cold start past the step's faulthandler_timeout writes a stack dump to the log;
-    # the dump does not end the run, so on its own it is not a failure.
+    # The cold start is charged to the setup of whichever test first asks for the module fixture,
+    # which -k or another --dist mode can change, so the marker covers the module. Under the CI
+    # tiers' per-test --timeout, which today sits below this marker, pytest-timeout's thread method
+    # would kill the worker before the cold-start bound fires. One cold start plus one run, plus
+    # 60 s of slack, lets each subprocess bound fire first. (func_only=True would keep the call
+    # bound tight but leave fixture setup with no watchdog at all.) A cold start past the step's
+    # faulthandler_timeout writes a stack dump to the log; the dump does not end the run.
     pytest.mark.timeout(_COLD_START_TIMEOUT_S + _RUN_TIMEOUT_S + 60),
 ]
 
@@ -125,13 +128,13 @@ console.log(JSON.stringify(out));
 """
 
 
-def _run(scenario: list[str], harness: Path, timeout: int = _RUN_TIMEOUT_S) -> list[int]:
+def _run(scenario: list[str], harness: Path) -> list[int]:
     assert _NODE is not None
     proc = subprocess.run(
         [_NODE, str(harness), str(_APP_JS), json.dumps(scenario)],
         capture_output=True,
         text=True,
-        timeout=timeout,
+        timeout=_RUN_TIMEOUT_S,
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
@@ -144,13 +147,25 @@ def harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Write the harness once and pay the first-launch cost on it, outside the run bound."""
     path = tmp_path_factory.mktemp("ws_reconnect") / "harness.js"
     path.write_text(_HARNESS, encoding="utf-8")
-    # The same argv shape every test uses, so whatever the cold cost is, this run pays it. An empty
-    # scenario still loads app.js, so a spin at load fails here, at the cold-start bound.
+    # The same argv shape every test uses, so whatever the cold cost is, this run pays it. It never
+    # fails the fixture: an empty scenario still loads app.js, so a fault at load fails every test
+    # under its own bound instead.
+    assert _NODE is not None
     started = time.monotonic()
-    assert _run([], path, timeout=_COLD_START_TIMEOUT_S) == []
+    try:
+        proc = subprocess.run(
+            [_NODE, str(path), str(_APP_JS), "[]"],
+            capture_output=True,
+            text=True,
+            timeout=_COLD_START_TIMEOUT_S,
+            check=False,
+        )
+        outcome = "ok" if proc.returncode == 0 else f"exit {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        outcome = f"timed out at {_COLD_START_TIMEOUT_S} s"
     elapsed = time.monotonic() - started
-    if elapsed > _COLD_START_WARN_S:
-        warnings.warn(f"node cold start took {elapsed:.1f} s", stacklevel=1)
+    if outcome != "ok" or elapsed > _COLD_START_WARN_S:
+        warnings.warn(f"node cold start took {elapsed:.1f} s: {outcome}", stacklevel=1)
     return path
 
 
