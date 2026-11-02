@@ -2589,7 +2589,9 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
 - a value file read from disk on a network share the engine cannot reach would read as absent, not
-  as a fault, so an `env()` reference with a default would take that default, with no refusal;
+  as a fault, so an `env()` reference with a default would take that default, with no refusal. A
+  config directory on a drive letter this process does not have reads as absent too, even where the
+  letter is mapped in another session;
 - a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
   out what it cannot read and does not tell its caller, so it can be partial;
 - a swap that fails while reconciling outbound connections does not roll those connections back.

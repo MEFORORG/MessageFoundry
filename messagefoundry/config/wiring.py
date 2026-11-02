@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import errno
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -54,7 +55,7 @@ from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from types import CodeType, MappingProxyType, ModuleType
-from typing import Any, Final, Literal, NamedTuple, TypeIs
+from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
@@ -111,7 +112,7 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.redaction import safe_name
+from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.secretscrub import (
     _QUERY_NAME_SEPARATORS,
     _QUERY_NOT_CREDENTIAL_TAILS,
@@ -8626,21 +8627,44 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
     that path (:func:`~messagefoundry.config.fingerprint.is_missing_directory`), or by a name
     ``os.scandir`` refuses outright. A reload maps only that to not_found, so a directory moved
     away after the reload's own check still answers as missing (BACKLOG #3157). Any other fault
-    raises its ``OSError`` with ``strict``, and otherwise the refusal a lax read's unlistable ``.``
-    gets. Listed, not ``is_dir``, which answers ``False`` for a share Windows cannot reach or a
-    parent this account cannot traverse, and so would call either one missing."""
+    is refused by :func:`_refuse_config_dir`. Listed, not ``is_dir``, which answers ``False`` for a
+    share Windows cannot reach or a parent this account cannot traverse, and so would call either
+    one missing. A directory that lists while ``is_dir`` says no is a fault too, because
+    :func:`_assert_safe_config_source` vets nothing where ``is_dir`` says no, and what follows this
+    check runs the directory's modules."""
     try:
         with os.scandir(directory):
-            return
+            pass
     except ValueError:
         pass  # an embedded NUL, which is_dir answered False for
     except OSError as exc:
         if not is_missing_directory(exc):
-            if strict:
-                raise
-            raise _unreadable_source(directory, (".",)) from exc
+            _refuse_config_dir(directory, exc, strict=strict)
+    else:
+        if directory.is_dir():
+            return
+        _refuse_config_dir(
+            directory,
+            PermissionError(
+                errno.EACCES, "config directory lists but is not vetted", str(directory)
+            ),
+            strict=strict,
+        )
     # Outside the handler, so the error it replaces does not ride __context__.
     raise ConfigDirMissing(f"config directory not found: {directory}")
+
+
+def _refuse_config_dir(directory: Path, fault: OSError, *, strict: bool) -> NoReturn:
+    """Raise ``fault`` with ``strict``, whose caller logs it, and otherwise log it and raise the
+    refusal a lax read's unlistable ``.`` gets."""
+    if strict:
+        raise fault
+    _logger.warning(
+        "config directory %s could not be read: %s",
+        scrub_log_argument(str(directory)),
+        scrub_log_argument(safe_exc(fault)),
+    )
+    raise _unreadable_source(directory, (".",)) from fault
 
 
 def _require_loadable(snapshot: ConfigSnapshot) -> None:
@@ -9905,11 +9929,11 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     """
     directory = Path(directory)
     try:
-        # Fail loudly, not silently empty (review M-24), and as load_config judges the directory.
+        # Fail loudly, not silently empty (review M-24), by load_config's own first check.
         _require_config_dir(directory, strict=False)
         # Same trust boundary as load_config: never execute Python from an unsafe source (review low-11).
         _assert_safe_config_source(directory)
-    except (ConfigDirMissing, WiringError) as exc:
+    except (OSError, WiringError) as exc:  # OSError takes in ConfigDirMissing
         return [Diagnostic(message=str(exc), file=str(directory))]
     # One read, as load_config's, so the modules, tables and connections it reports on are one
     # set of bytes (vault BACKLOG #2596). A file it needs but cannot read is a diagnostic.

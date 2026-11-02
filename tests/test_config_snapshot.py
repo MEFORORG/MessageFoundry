@@ -784,12 +784,44 @@ def test_a_load_goes_on_past_a_value_folder_on_a_lost_share_and_the_digest_says_
 def test_a_load_refuses_a_base_directory_on_a_lost_share_rather_than_run_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The base still answers ``is_dir`` here, so only the read can refuse. It read as an empty
-    bundle before, and with ``allow_empty`` that returned an empty graph."""
+    """The first check lists it, and it still answers ``is_dir``, so only the read can refuse. It
+    read as an empty bundle before, and with ``allow_empty`` that returned an empty graph."""
     cfg = _config(tmp_path / "cfg")
-    _lost_share(monkeypatch, cfg, answers_is_dir=True)
+    _lost_share(monkeypatch, cfg, answers_is_dir=True, after=1)
     with pytest.raises(WiringError, match=r"could not read \."):
         load_config(cfg, allow_empty=True)
+
+
+def test_a_directory_that_lists_but_is_not_a_directory_to_is_dir_runs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trust check vets nothing where ``is_dir`` says no, so such a directory must not reach
+    the load that runs its modules. ``_lost_share`` with every listing allowed is that case."""
+    cfg = _config(tmp_path / "cfg")
+    ran = tmp_path / "ran.txt"
+    (cfg / "graph.py").write_text(f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8")
+    _lost_share(monkeypatch, cfg, after=sys.maxsize)
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(cfg, allow_empty=True)
+    with pytest.raises(OSError) as refused:
+        read_trusted_snapshot(cfg, strict=True)
+    assert not isinstance(refused.value, ConfigDirMissing)
+    assert "could not read ." in validate_config(cfg, allow_empty=True)[0].message
+    assert not ran.exists()
+
+
+def test_validate_config_reports_a_trust_check_that_cannot_list_a_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It returns every problem and raises none, and the check's walk raises what it cannot list."""
+    cfg = _config(tmp_path / "cfg")
+
+    def unlistable(directory: Path) -> list[Path]:
+        raise PermissionError(13, "Permission denied", str(directory))
+
+    monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
+    [diagnostic] = validate_config(cfg, allow_empty=True)
+    assert "Permission denied" in diagnostic.message
 
 
 def test_a_lax_load_of_a_base_lost_after_its_check_keeps_the_fault_the_read_recorded(
@@ -880,8 +912,9 @@ def test_a_share_windows_really_cannot_reach_is_a_fault() -> None:
     "name", ["gone", "a-file", "embedded\0nul"], ids=["absent", "a-file", "embedded-nul"]
 )
 def test_a_directory_really_missing_still_answers_as_missing(tmp_path: Path, name: str) -> None:
-    """The listing that replaced ``Path.is_dir`` keeps its answers for everything no directory can
-    be opened by, a name ``os.scandir`` refuses with ``ValueError`` included."""
+    """The listing that replaced ``Path.is_dir`` keeps its answer for these, a name ``os.scandir``
+    refuses with ``ValueError`` included. A reserved Windows device name such as ``NUL`` is not one
+    of them: its listing raises an error ``is_missing_directory`` does not class as missing."""
     (tmp_path / "a-file").write_text("", encoding="utf-8")
     target = tmp_path / name
     message = re.escape(f"config directory not found: {target}")

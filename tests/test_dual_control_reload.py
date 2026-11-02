@@ -1763,6 +1763,53 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
 
 
+def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
+    """Fail every listing of ``cfg`` past the next one, which is the reload's target check."""
+    real_scandir = os.scandir
+    listings = 0
+
+    def _scandir(path: Any) -> Any:
+        nonlocal listings
+        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
+            listings += 1
+            if listings > 1:
+                raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+
+
+async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_inline(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ungated reload's strict read fails, so the load reads the directory itself and refuses."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        _lose_after_one_listing(monkeypatch, (tmp_path / "cfg").resolve())
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+
+
+async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release has no digest to check, so it is refused before anything runs."""
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: _lose_after_one_listing(monkeypatch, (tmp_path / "cfg").resolve()),
+    )
+    monkeypatch.undo()
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
+
+
 async def test_a_file_added_during_the_load_is_not_released_with_it(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
