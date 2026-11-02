@@ -488,19 +488,11 @@ roster alias of the Lander.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.
 > - One wrong high reading binds until the reset, up to a week. The highest reading in a period binds and
->   a reading over 100 stays a number, so every true lower reading for that reset is refused, the window
->   goes stale, and its floor keeps the gate at HALT. This fails closed.
+>   a reading over 100 stays a number, so every true lower reading for that reset is refused and the
+>   window goes stale. Its floor then keeps the gate at HALT only at the ceiling, or at the rung with
+>   trusted provenance; otherwise the gate answers REVIEW. This fails closed.
 > - If usage ever does fall inside a period, the kept reading stops being refreshed and goes stale in
 >   20 minutes. The gate then answers REVIEW below the rung and HALT at it, until the reset.
->
-> **A numeric string in `used_percentage` is decided, so it is not on that list.** One already in
-> `latest.json` reads UNKNOWN, so the gate answers REVIEW, where a "99" read CRITICAL and HIT before this
-> amendment. That stops an unreviewed spawn and clears nothing, at the cost of moving a "99" from HALT to
-> REVIEW. A fire carrying one is dropped as an absent window, so a published lower reading stands until the
-> 20-minute age limit, and the gate can clear on it until then. No route to that exists today: client
-> 2.1.308 builds the field with `Math.min` (read in the binary on 2026-11-02, not run), the docs show
-> numbers, no test fixture modelling a real payload sends a numeric string, and the collector writes a
-> double.
 >
 > **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
 > with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.

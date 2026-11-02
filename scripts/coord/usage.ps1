@@ -428,10 +428,14 @@ function Get-Rate($CurrentResetEpoch) {
             $observed = Get-Percentage $r.seven_day
             if ($null -eq $observed) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
+            # NOTHING DATED AFTER NOW, at any distance. Such a row would become the newest row and could
+            # turn the rate negative, which clears a burn. This compares the instants, because an age is
+            # rounded and a row seconds ahead rounds to 0. After a backward clock step it also skips real
+            # rows until the clock catches up, which leaves fewer rows for the rate.
+            $at = ConvertTo-UtcDateTime $r.at
+            if ($null -eq $at -or $at -gt $nowUtc) { continue }
             $age = Get-AgeMinutes $r.at
-            # Bounded both ways, like the reading's own age: a row ahead of the clock would become the
-            # newest row and could turn the rate negative, which clears a burn.
-            if ($null -eq $age -or $age -gt $RateWindowMinutes -or $age -lt -2) { continue }
+            if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
             $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
         }
     } catch { return $null }
@@ -480,8 +484,16 @@ function Get-Finite($Value) {
 }
 
 # A percentage out of JSON, or $null: a finite number, and not below 0. usage-collect.ps1 holds the same
-# function and says why a reading over 100 stays a number; tests/test_coord_usage.py pins them.
+# function and says why a numeric string counts and a reading over 100 stays a number;
+# tests/test_coord_usage.py pins them.
 function Get-Percentage($Value) {
+    if ($Value -is [string]) {
+        $parsed = 0.0
+        $style = [System.Globalization.NumberStyles]::Float
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [double]::TryParse($Value, $style, $culture, [ref]$parsed)) { return $null }
+        $Value = $parsed
+    }
     $d = Get-Finite $Value
     if ($null -eq $d -or $d -lt 0) { return $null }
     return $d
@@ -489,15 +501,8 @@ function Get-Percentage($Value) {
 
 # A WINDOW WITH NO NUMBER HOLDS NO READING. `[double]$null` and `[double]""` are both 0, NaN compares false
 # with every level, a negative is below every level, and an object, an array or a date casts to nothing,
-# so each of those read OK or worse. Anything Get-Percentage refuses is refused before any cast. One
-# definition, as above.
-#
-# A NUMERIC STRING IS REFUSED TOO, ON PURPOSE, THOUGH A "99" READ CRITICAL BEFORE THIS CHECK. Only a writer
-# other than the collector produces one: the client builds the field with Math.min, and the collector
-# writes a [double]. One already in latest.json reads UNKNOWN, so the gate answers REVIEW, which stops an
-# unreviewed spawn and clears nothing. A fire carrying one is dropped as an absent window, so a published
-# lower reading stands until the 20-minute age limit; no route to that exists today. Decided on PR 2705,
-# and ADR 0211 records it.
+# so each of those read OK or worse. Anything Get-Percentage refuses is refused here, and no bare cast
+# reads this field. One definition, as above.
 function Test-WindowHasNumber($w) {
     return ($null -ne (Get-Percentage $w.used_percentage))
 }
@@ -531,7 +536,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "no current reading: this window carries no percentage"; used_percentage = $null }
     }
     $age = Get-AgeMinutes $w.captured_at
-    $pct = [double]$w.used_percentage
+    $pct = Get-Percentage $w.used_percentage
     $resetEpoch = $w.resets_at_epoch
     $minsToReset = $null
     if ($resetEpoch) {
@@ -712,7 +717,7 @@ function Get-RootSummary([string]$Root) {
     # survey four lines later printed it as this root's own.
     $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
     $sevenGone = Test-WindowResetPassed $d.seven_day
-    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone -and (Test-WindowHasNumber $d.seven_day)) { [double]$d.seven_day.used_percentage } else { $null }
+    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone -and (Test-WindowHasNumber $d.seven_day)) { Get-Percentage $d.seven_day.used_percentage } else { $null }
     # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
     # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
     # six-hour-old reading rendered as "[seen 0 min ago]".

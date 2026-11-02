@@ -989,7 +989,10 @@ def test_a_published_window_with_no_number_is_not_a_reading_of_zero(
         pytest.param(None, id="absent"),
         pytest.param("", id="blank"),
         pytest.param(True, id="bool"),
-        pytest.param("99", id="numeric-string"),
+        pytest.param("abc", id="text"),
+        pytest.param("NaN", id="nan-string"),
+        pytest.param("Infinity", id="infinity-string"),
+        pytest.param("-5", id="negative-string"),
         pytest.param(-5, id="negative"),
         pytest.param(-0.1, id="just-below-zero"),
         pytest.param(float("nan"), id="nan"),
@@ -1036,7 +1039,8 @@ def test_the_survey_prints_no_number_for_a_window_with_none(fake_home: Path) -> 
     "value",
     [
         pytest.param("", id="blank"),
-        pytest.param("99", id="numeric-string"),
+        pytest.param("abc", id="text"),
+        pytest.param("-5", id="negative-string"),
         pytest.param(-5, id="negative"),
     ],
 )
@@ -1055,6 +1059,41 @@ def test_a_percentage_that_is_not_one_is_no_reading(tmp_path: Path, value: Any) 
     assert not (empty / "latest.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("text", "number"),
+    [pytest.param("99", 99.0, id="whole"), pytest.param("99.5", 99.5, id="decimal")],
+)
+def test_a_numeric_string_in_a_payload_is_a_reading(
+    tmp_path: Path, text: str, number: float
+) -> None:
+    """Dropping it would leave a lower reading published and fresh. It is published as a number."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven)
+    _session_fire(tmp_path, {**seven, "used_percentage": text})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(number)
+    assert history(tmp_path)[-1]["seven_day"] == pytest.approx(number), history(tmp_path)
+
+
+def test_a_numeric_string_in_the_document_keeps_its_verdict(tmp_path: Path) -> None:
+    publish(tmp_path, seven=40.0)
+    doc = latest(tmp_path)
+    doc["seven_day"]["used_percentage"] = "99"
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    code, got = read(tmp_path)
+    assert code == CRITICAL and got["seven_day"]["used_percentage"] == pytest.approx(99.0), got
+
+
+def test_a_published_numeric_string_still_binds_the_reset(tmp_path: Path) -> None:
+    """The highest reading binds, so a lower one for the same reset does not replace it."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven)
+    doc = latest(tmp_path)
+    doc["seven_day"]["used_percentage"] = "99"
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _session_fire(tmp_path, seven)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == "99"
+
+
 def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) -> None:
     """The client clamps this window at 100 today, and the clamp is the client's. Refusing 104 would turn
     a spent pool into UNKNOWN, so it reads as the stop it is."""
@@ -1064,9 +1103,17 @@ def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) ->
     assert code == CRITICAL and doc["seven_day"]["used_percentage"] == pytest.approx(104.0), doc
 
 
-def test_a_future_dated_history_row_is_skipped(tmp_path: Path) -> None:
-    """One row ahead of the clock became the newest row, turned the rate negative and cleared a burn. The
-    tolerance is the reader's own two minutes, and the row inside it is the control."""
+@pytest.mark.parametrize(
+    "minutes_ahead",
+    [
+        pytest.param(5.0, id="past-the-readers-tolerance"),
+        pytest.param(1.0, id="inside-the-readers-tolerance"),
+        pytest.param(0.5, id="thirty-seconds"),
+    ],
+)
+def test_a_history_row_dated_after_now_is_skipped(tmp_path: Path, minutes_ahead: float) -> None:
+    """One row ahead of the clock became the newest row, turned the rate negative and cleared a burn, at
+    any distance ahead. A row just behind the clock is the control."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=40.0, seven_epoch=epoch)
 
@@ -1078,11 +1125,11 @@ def test_a_future_dated_history_row_is_skipped(tmp_path: Path) -> None:
     want_code, want = rows(good)
     assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), want
 
-    got_code, got = rows([*good, (-5.0, 20.0)])
+    got_code, got = rows([*good, (-minutes_ahead, 20.0)])
     assert got_code == want_code, got
     assert got["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), got
 
-    _, kept = rows([*good, (-1.0, 41.0)])
+    _, kept = rows([*good, (0.1, 41.0)])
     assert kept["seven_day"]["rate_pct_per_hr"] == pytest.approx(11.0, abs=0.5), kept
 
 

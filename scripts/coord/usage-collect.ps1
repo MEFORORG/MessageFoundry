@@ -144,12 +144,22 @@ function Get-Finite($Value) {
 # A percentage out of JSON, or $null: a finite number, and not below 0. usage.ps1 holds the same function,
 # and tests/test_coord_usage.py pins them.
 #
+# A NUMERIC STRING COUNTS. It parses under the invariant culture, so a comma-decimal machine reads it the
+# same. Dropped, a "99" would leave a lower reading published and fresh, and the gate would clear on it.
+#
 # OVER 100 STAYS A NUMBER. The statusLine docs give this window as 0 to 100, and client 2.1.308 clamps it
 # there (Math.min, read in the binary 2026-11-02, not run). But the clamp is the client's, the same client
 # passes spend_limit through unclamped, and its docs say that one runs above 100. A refused 104 would turn
 # a spent pool into UNKNOWN and lose the stop, so a wrong high number costs a deferral and the other
 # choice could cost a cutoff. Below 0 no reading of a pool can land, and a negative clears the gate.
 function Get-Percentage($Value) {
+    if ($Value -is [string]) {
+        $parsed = 0.0
+        $style = [System.Globalization.NumberStyles]::Float
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [double]::TryParse($Value, $style, $culture, [ref]$parsed)) { return $null }
+        $Value = $parsed
+    }
     $d = Get-Finite $Value
     if ($null -eq $d -or $d -lt 0) { return $null }
     return $d
@@ -357,7 +367,7 @@ try {
         $seenEpoch = $seven.resets_at_epoch -as [long]
         $publishedEpoch = $published.resets_at_epoch -as [long]
         # A window with no number in it holds no level to keep, so it is not a 0 this reading can equal.
-        $publishedPct = Get-Finite $published.used_percentage
+        $publishedPct = Get-Percentage $published.used_percentage
         $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
             ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
