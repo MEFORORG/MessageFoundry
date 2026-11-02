@@ -240,11 +240,20 @@ it could reach only its own copy.
    the store closes. A write still running then may not land. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
    Left on that list, a row with no digest would read as a degraded baseline and the next start would
    compare nothing.
+
+   **An engine's toggles land one at a time, in arrival order.** The tracked task holds an engine
+   lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
+   Without it, a clear running beside an uncommitted set could delete nothing on a server backend
+   and still append the newest row. The 10-second bound starts before the wait for that lock, so a
+   toggle queued behind a stuck one answers the same 503 within its own 10 seconds, having written
+   nothing, rather than meeting the request deadline. A toggle still queued when a shutdown's drain
+   begins answers 409.
 7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering
    a gate is a decision of its own, not a side effect of this move.
 8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept
    a config write and its baseline row together went with it. The tracking and the shutdown drain
-   stayed, around the store write, and keep their names. `tests/test_config_write_census.py` now
+   stayed, around the store write, and keep their names. The engine lock stayed around it too, as
+   `_config_write_lock`, since no TOML is left to name it for. `tests/test_config_write_census.py` now
    fails on an engine write through at least the writers it names, and on a direct write whose target
    names the config directory.
 
@@ -273,6 +282,15 @@ hidden rows included. Unticked, a click adds every row it can take and leaves th
 That states what the box does, and accepts nothing further. The toggle gives the same reach with an
 audit row: at least the Deployment role holds `config:deploy` and no bulk-action permission.
 
+**Left open: the engine lock reaches one process. Not an accepted residual.** Engine shards and
+cluster nodes share the store and each holds its own lock, so two of them can toggle one connection
+at once. On Postgres at READ COMMITTED, a clear beside another process's uncommitted set deletes
+nothing and then waits on the audit lock, so the flag would stay set under a newest row that says it
+is clear, until the next toggle. One process can reach the same state only through a commit cut off
+at the bound, since the lock frees when the store call ends. That is read from the store's code and
+was not run on a server, and SQL Server was not examined for it. SQLite's writer runs one transaction
+at a time, so a toggle there is whole. No database lock was built for this.
+
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.
 [SECURITY.md](../SECURITY.md) records it, until a dry run can run in a throwaway worker.
@@ -293,6 +311,11 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
   that filter, and say why on the page.
   → `tests/test_connection_audit_writes.py::test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page`,
   `packaging/messagefoundry-webconsole/tests/test_ui_flag_read_failed.py`
+- **AC-6** — WHEN two toggles of one connection overlap in one engine process, THE SYSTEM SHALL land
+  them in arrival order, so the flag matches the newest `connection_flag_set` row, whether or not
+  the earlier caller is still waiting.
+  → `tests/test_connection_flag.py::test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row`,
+  `tests/test_connection_flag.py::test_a_clear_never_runs_during_a_set_it_could_miss`
 
 ---
 

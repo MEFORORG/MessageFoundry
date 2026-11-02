@@ -159,11 +159,12 @@ _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 #: How long a connection flag toggle waits for the store (BACKLOG #2623). A write normally takes
 #: milliseconds, so this is a stuck or saturated store. Well under the API's 120 s request deadline
 #: (``api/request_timeout.py``), so the caller hears the toggle's own refusal and the console shows
-#: its page, not the deadline's JSON. It bounds the store call and nothing before it: the auth gate
-#: writes first, so a store stopped outright can still meet that deadline there. The refusal comes
-#: once the store call has unwound, which a stalled store can stretch past this, by
-#: ``_ROLLBACK_TIMEOUT`` on SQLite. It sits inside the tracked write, so it also ends a write whose
-#: caller has gone. Read at call time.
+#: its page, not the deadline's JSON. One clock covers the wait for the engine's write lock and the
+#: store call, so a toggle queued behind a stuck one is refused here too, and at most this long
+#: after it arrived. It bounds nothing before them: the auth gate writes first, so a store stopped
+#: outright can still meet that deadline there. A refusal in the store call comes once that call
+#: has unwound, which a stalled store can stretch past this, by ``_ROLLBACK_TIMEOUT`` on SQLite. It
+#: sits inside the tracked write, so it also ends a write whose caller has gone. Read at call time.
 CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS = 10.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
@@ -242,7 +243,9 @@ class ConnectionFlagNotRecorded(Exception):
     commit whose answer was lost may have landed both, and one cut off at
     :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS` may land after this is raised, so nothing here
     says which. A row that lands that way is in the audit chain but not the off-box tee
-    (``store.store.AuditedWrite``). The API answers 503: the store, not the request, is at fault.
+    (``store.store.AuditedWrite``). A toggle refused while it queued behind another wrote nothing,
+    but the one it queued behind may still land, so it gets this same refusal. The API answers
+    503: the store, not the request, is at fault.
 
     While the store stays open, that bound is what cuts a write off. A request deadline or a
     shutdown ends only its caller's wait, so that caller never gets this.
@@ -741,9 +744,15 @@ class Engine:
         # waiting but leaves its write running, so drain_config_writes waits for these, bounded,
         # before the store closes, or the flag and its row could not land.
         self._config_writes: set[asyncio.Task[None]] = set()
-        # Set by drain_config_writes before it waits for them; a write that arrives after that is
-        # refused.
+        # Set by drain_config_writes before it waits for them; a write that arrives after that, or
+        # gets the lock below after that, is refused.
         self._config_writes_closed = False
+        # Serializes those writes in this process, each held by its tracked task, so a write whose
+        # caller has gone keeps it. The toggles of one connection must not overlap: on a server
+        # backend a clear running beside an uncommitted set deletes nothing and still appends the
+        # newest audit row. asyncio.Lock wakes waiters in arrival order, so the last toggle lands
+        # last. It reaches no other process; set_connection_flag's docstring says what that leaves.
+        self._config_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
         # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
@@ -2549,14 +2558,25 @@ class Engine:
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
         no such connection: the name has to be a real one, because the store would take any text.
-        It raises the same once :meth:`drain_config_writes` has begun. Raises
-        :class:`ConnectionFlagNotRecorded` when the store did not confirm the write within
-        :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`.
+        It raises the same once :meth:`drain_config_writes` has begun, including to a toggle that
+        was queued when it began. Raises :class:`ConnectionFlagNotRecorded` when the store did not
+        confirm the write within :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`, a bound that starts
+        before the wait for the lock below.
 
         The write runs as a tracked task the caller only waits on, so a caller cancelled from then
         on (a request deadline, a client that went away, a shutdown) stops waiting and does not stop
-        the write. The bound still holds it, and :meth:`drain_config_writes` waits for it, for a
-        bounded time, before the store closes; a write still running then may not land."""
+        the write, queued or running. The bound still holds it, and :meth:`drain_config_writes`
+        waits for it, for a bounded time, before the store closes; a write still running then may
+        not land.
+
+        That task holds the engine's write lock across the store call, so this process's toggles
+        land one at a time, in arrival order, and the flag matches the newest
+        ``connection_flag_set`` row. The lock frees when the store call has ended, which a commit
+        cut off at the bound may outlive, so such a commit can still overlap the next toggle. The
+        lock also reaches no other process: engine shards and cluster nodes share the store, so two
+        of them can overlap, and on a server backend the flag could then disagree with that row
+        (ADR 0007, amendment of 2026-10-31). The flag drives no engine path, so a disagreement
+        misstates a marker and its record, and the next toggle puts them right."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner
@@ -2590,13 +2610,30 @@ class Engine:
         async def _write() -> None:
             bound = CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS
             deadline = asyncio.timeout(bound)
+            started = False
             try:
-                async with deadline:
+                async with deadline, self._config_write_lock:
+                    # The drain saw this task, but it may give up on it and close the store.
+                    if self._config_writes_closed:
+                        raise WiringError(
+                            "the engine is stopping, so a connection flag cannot be set"
+                        )
+                    started = True
                     await self.store.set_connection_flag(
                         name, direction, flagged=flagged, audit=audit
                     )
+            except WiringError:
+                raise
             except Exception as exc:
-                if deadline.expired():
+                if not started:
+                    log.error(
+                        "a connection flag change waited %g s behind another and was not started "
+                        "(%s %s)",
+                        bound,
+                        direction,
+                        name,
+                    )
+                elif deadline.expired():
                     # Cancelling the wait does not stop a commit already handed to the store.
                     log.error(
                         "the store did not confirm a connection flag change within %g s (%s %s), "
@@ -2638,9 +2675,10 @@ class Engine:
         A write whose caller was cancelled is still running, and it needs the store (BACKLOG
         #2623). One still running past ``timeout`` is logged, and it is lost if the store closes
         before it lands. The gate closes first, so a toggle that arrives from then on is refused
-        rather than started as a write this drain never saw. Waiting never cancels a write. The
-        managed API lifespan calls it under its shutdown budget (BACKLOG #3191), and :meth:`stop`
-        calls it again, so a write that drain left running gets one more short wait."""
+        rather than started as a write this drain never saw, and one still queued for the lock is
+        refused when it gets the lock. Waiting never cancels a write. The managed API lifespan calls
+        it under its shutdown budget (BACKLOG #3191), and :meth:`stop` calls it again, so a write
+        that drain left running gets one more short wait."""
         self._config_writes_closed = True
         if not self._config_writes:
             return
