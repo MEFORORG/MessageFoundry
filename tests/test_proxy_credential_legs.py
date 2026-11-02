@@ -45,6 +45,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config.models import ConnectorType, Destination
@@ -66,6 +67,8 @@ from messagefoundry.transports.bounded_read import (
     _proxies_of,
     build_strict_opener,
 )
+from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.remotefile import RemoteFileDestination
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
 from tests._wire_proxy import _WireProxy
@@ -230,6 +233,11 @@ def test_admission_never_covers_a_credential_from_a_proxy_url() -> None:
 
 
 _OFF_BOX_HTTPS_PROXY = "https://proxy.example.com:3128"
+_PROXY_LOGIN: dict[str, Any] = {
+    "proxy_url": _OFF_BOX_HTTPS_PROXY,
+    "proxy_user": "u5er",
+    "proxy_password": "pa55w0rd",
+}
 
 
 def test_proxy_user_with_a_proxy_written_https_is_refused_when_the_connection_is_built() -> None:
@@ -244,22 +252,279 @@ def test_proxy_user_with_a_proxy_written_https_is_refused_when_the_connection_is
         )
 
 
-@pytest.mark.parametrize("declaration", ["accepted", "attested"])
-def test_control_a_declared_connection_builds_and_its_handler_admits_the_header(
-    declaration: str,
-) -> None:
-    """``cleartext_accepted`` with ``cleartext_reason``, or ``tls_hop_attested`` with
-    ``tls_hop_attested_reason``: the guard admits the credential, and the proxy handler carries that
-    admission to send time."""
-    dest = _rest(
-        _HTTPS_TARGET,
-        proxy_url=_OFF_BOX_HTTPS_PROXY,
-        proxy_user="u5er",
-        proxy_password="pa55w0rd",
-        **{declaration: True},  # type: ignore[arg-type]
-    )
+def test_control_a_declared_connection_builds_and_its_handler_admits_the_header() -> None:
+    """``cleartext_accepted`` with ``cleartext_reason``: the guard admits the credential, and the
+    proxy handler carries that admission to send time."""
+    dest = _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN)
     assert dest._headers["Proxy-Authorization"] == _HEADER
     assert _proxy_handler(dest).caller_header_admitted is True
+
+
+@pytest.mark.parametrize("enforcing", [True, False], ids=["enforce", "warn"])
+def test_tls_hop_attested_does_not_admit_a_proxy_credential(
+    caplog: pytest.LogCaptureFixture, enforcing: bool
+) -> None:
+    """B462-R1 of the 2026-10-30 rulings, for this cell only (vault BACKLOG #3007)."""
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(InsecureHopRefused, match="tls_hop_attested does not admit it"),
+    ):
+        _rest(_HTTPS_TARGET, posture=HopPosture(enforcing=enforcing), attested=True, **_PROXY_LOGIN)
+    assert not [r for r in caplog.records if "ATTESTED secure" in r.getMessage()]
+
+
+def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None:
+    """``outbound()`` refuses the pair, and so does the model itself, which is the one check a
+    directly built ``Destination`` or ``OutboundConnection`` meets. Before, both built and the
+    acceptance admitted the proxy login. On a cleartext body hop the disposition reads the
+    attestation first, so that hop would cross with no acceptance record (decision
+    d20261101T062731002-a2d0f9 keeps ``cleartext_accepted`` as the proxy route and gives
+    ``tls_hop_attested`` none). The refusal is the model's, so the target does not matter."""
+    with pytest.raises(ValueError, match="opposite claims"):
+        _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
+
+
+_SECRET_MARK = "SYNTHETIC-SECRET-MARK"
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        pytest.param(
+            {"cleartext_accepted": True, "cleartext_reason": "r", "tls_hop_attested": True}
+            | {"tls_hop_attested_reason": "r"},
+            id="typed-pair",
+        ),
+        pytest.param(
+            {
+                "cleartext_accepted": True,
+                "cleartext_reason": "r",
+                "settings": {"tls_hop_attested": True, "tls_hop_attested_reason": "r"},
+            },
+            id="settings-pair",
+        ),
+        pytest.param({"settings": {"tls_hop_attested": True}}, id="settings-flag-no-reason"),
+        pytest.param(
+            {"settings": {"tls_hop_attested": True, "tls_hop_attested_reason": "a\nb"}},
+            id="settings-reason-control-character",
+        ),
+        pytest.param({"settings": {"tls_hop_attested": "yes"}}, id="settings-flag-not-a-bool"),
+        pytest.param({"tls_hop_attested": True}, id="typed-flag-no-reason"),
+        pytest.param({"cleartext_accepted": True}, id="acceptance-no-reason"),
+        pytest.param({"tls_revocation_attested": True}, id="revocation-no-reason"),
+    ],
+)
+def test_a_destination_refusal_echoes_no_secret_from_its_settings(
+    declarations: dict[str, Any],
+) -> None:
+    """A model validator's refusal carries the whole input as its ``input``, and every rendering of
+    the error shows it, so a caller that logs one would log the secret beside it. The refusal's own
+    words stay, so the fault can still be read."""
+    kwargs = dict(declarations)
+    settings = {**kwargs.pop("settings", {}), "basic_password": _SECRET_MARK}
+    with pytest.raises(ValidationError) as refused:
+        Destination(name="OB", type=ConnectorType.REST, **kwargs, settings=settings)
+    exc = refused.value
+    for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
+        assert _SECRET_MARK not in rendered
+    assert exc.errors()[0]["msg"].startswith("Value error, ")
+
+
+def test_the_proxy_login_refusal_does_not_steer_an_attested_connection_to_the_pair() -> None:
+    """An attested connection meets this refusal, so "add ``cleartext_accepted``" would send it into
+    the pair rule above. The text offers the acceptance only in place of the attestation, and says
+    a leg held secure by a tunnel has no route (decision d20261101T062731002-a2d0f9)."""
+    with pytest.raises(InsecureHopRefused) as refused:
+        _rest(_HTTPS_TARGET, attested=True, **_PROXY_LOGIN)
+    text = str(refused.value)
+    assert "in place of any tls_hop_attested, never beside it" in text
+    assert "held secure by a tunnel has no route off this machine" in text
+
+
+_FTP_ATTESTED: dict[str, Any] = {
+    "protocol": "ftp",
+    "host": "partner.example.test",
+    "remote_dir": "/in",
+    "tls_hop_attested": True,
+    "tls_hop_attested_reason": "IPsec tunnel to the partner",
+}
+
+
+def test_a_directly_built_destination_refuses_a_settings_attestation_beside_accepted() -> None:
+    """The anonymous-FTP guard reads the attestation out of ``Destination.settings``, where
+    ``_dest_config`` mirrors the typed field. A ``Destination`` built directly with the attestation
+    only there, beside ``cleartext_accepted``, used to build, and the cleartext hop crossed on the
+    attestation with no acceptance record."""
+    with (
+        active_hop_posture(HopPosture(enforcing=True)),
+        pytest.raises(ValueError, match="opposite claims"),
+    ):
+        RemoteFileDestination(
+            Destination(
+                name="OB_FTP",
+                type=ConnectorType.REMOTEFILE,
+                settings=dict(_FTP_ATTESTED),
+                cleartext_accepted=True,
+                cleartext_reason="legacy partner listener has no TLS",
+            )
+        )
+
+
+def test_control_the_mirrored_settings_attestation_alone_still_builds() -> None:
+    """The shape ``_dest_config`` produces: the typed field, mirrored into the settings, and no
+    acceptance. Refusing the settings key outright would refuse this."""
+    with active_hop_posture(HopPosture(enforcing=True)):
+        RemoteFileDestination(
+            Destination(
+                name="OB_FTP",
+                type=ConnectorType.REMOTEFILE,
+                settings=dict(_FTP_ATTESTED),
+                tls_hop_attested=True,
+                tls_hop_attested_reason="IPsec tunnel to the partner",
+            )
+        )
+
+
+def _ftp_with_settings_reason(**reason: object) -> RemoteFileDestination:
+    """A ``Destination`` built directly with the attestation only in its settings, and no typed
+    declaration, built under an enforcing posture."""
+    settings = {k: v for k, v in _FTP_ATTESTED.items() if k != "tls_hop_attested_reason"}
+    settings.update(reason)
+    with active_hop_posture(HopPosture(enforcing=True)):
+        return RemoteFileDestination(
+            Destination(name="OB_FTP", type=ConnectorType.REMOTEFILE, settings=settings)
+        )
+
+
+@pytest.mark.parametrize(
+    ("reason", "refusal"),
+    [
+        pytest.param({}, "requires tls_hop_attested_reason", id="missing"),
+        pytest.param({"tls_hop_attested_reason": "   "}, "non-empty", id="blank"),
+        pytest.param(
+            {"tls_hop_attested_reason": "ok\nWARNING forged line"},
+            "control characters",
+            id="cr-lf",
+        ),
+    ],
+)
+def test_a_directly_built_destination_holds_its_settings_attestation_to_the_reason_rules(
+    reason: dict[str, Any], refusal: str
+) -> None:
+    """The anonymous-FTP guard crosses on a settings attestation, so the model holds it to the
+    rules the factories apply. Before, each of these built and crossed an enforcing hop, logging
+    no reason or a forged second line."""
+    with pytest.raises(ValueError, match=refusal):
+        _ftp_with_settings_reason(**reason)
+
+
+def test_control_a_settings_attestation_with_a_reason_builds() -> None:
+    _ftp_with_settings_reason(tls_hop_attested_reason="IPsec tunnel to the partner")
+
+
+_ACCEPTED: dict[str, Any] = {
+    "cleartext_accepted": True,
+    "cleartext_reason": "legacy partner listener has no TLS",
+}
+
+
+def _lookup(**declarations: object) -> FhirLookupExecutor:
+    """One ``FhirLookupExecutor`` built directly, with the proxy login, under an enforcing posture."""
+    settings = {
+        "url": _HTTPS_TARGET,
+        **_PROXY_LOGIN,
+        "tls_revocation_attested": True,
+        "tls_revocation_attested_reason": "revocation-checking PKI at the partner edge",
+        **declarations,
+    }
+    with active_hop_posture(HopPosture(enforcing=True)):
+        return FhirLookupExecutor({"lk": settings}, egress=permitting(settings))
+
+
+def test_a_directly_built_fhir_lookup_refuses_attested_beside_accepted() -> None:
+    """``FhirLookup()`` and the runner's settings builder refuse the pair, and so does the executor,
+    so one built directly from a settings mapping cannot hold it."""
+    attested = {"tls_hop_attested": True, "tls_hop_attested_reason": "IPsec tunnel to the partner"}
+    with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*opposite claims"):
+        _lookup(**attested, **_ACCEPTED)
+
+
+@pytest.mark.parametrize("reason", [None, "   "], ids=["missing", "blank"])
+def test_a_directly_built_fhir_lookup_refuses_an_acceptance_with_no_reason(
+    reason: str | None,
+) -> None:
+    """``FhirLookupSpec`` refuses it, and the executor now does too, so a proxy login is not
+    admitted on an acceptance whose record would carry no reason."""
+    with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*cleartext_reason"):
+        _lookup(cleartext_accepted=True, cleartext_reason=reason)
+
+
+@pytest.mark.parametrize("reason", [None, "   "], ids=["missing", "blank"])
+def test_a_directly_built_fhir_lookup_refuses_a_revocation_attestation_with_no_reason(
+    reason: str | None,
+) -> None:
+    """The sibling pair ``FhirLookupSpec`` refuses the same way."""
+    with pytest.raises(ValueError, match=r"FhirLookup 'lk'.*tls_revocation_attested_reason"):
+        _lookup(**_ACCEPTED, tls_revocation_attested_reason=reason)
+
+
+def test_control_a_directly_built_fhir_lookup_with_the_acceptance_alone_builds() -> None:
+    """The same settings without the attestation: the declared route builds and sends the login."""
+    assert _lookup(**_ACCEPTED)._headers["lk"]["Proxy-Authorization"] == _HEADER
+
+
+def test_control_tls_hop_attested_still_carries_the_body_hop_past_a_credential_free_proxy() -> None:
+    """The attestation's other work is untouched: the cleartext body hop is what it declares."""
+    assert _rest(_HTTP_TARGET, attested=True, proxy_url=_OFF_BOX_HTTPS_PROXY)._hop_guard is not None
+
+
+def test_an_accepted_proxy_user_build_writes_the_cleartext_acceptance_audit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The destination is ``https``, so the only cleartext crossing on this connection is the leg
+    to the proxy, and the control with no ``proxy_user`` writes no record (vault BACKLOG #3007)."""
+    marker = "cleartext hop crossed on an operator acceptance"
+    with caplog.at_level("WARNING"):
+        _rest(_HTTPS_TARGET, accepted=True, proxy_url=_OFF_BOX_HTTPS_PROXY)
+    assert not [r for r in caplog.records if marker in r.getMessage()]
+    with caplog.at_level("WARNING"):
+        _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN)
+    audit = [r.getMessage() for r in caplog.records if marker in r.getMessage()]
+    assert len(audit) == 1
+    assert "'OB_REST'" in audit[0]
+    assert "web-proxy cleartext credentials" in audit[0]
+    assert "legacy partner listener has no TLS" in audit[0]
+    for part in ("u5er", "pa55w0rd", _HEADER):
+        assert part not in audit[0], part
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({"proxy_auth_type": "ntlm"}, id="deferred-type"),
+        pytest.param({"proxy_auth_type": "kerberos"}, id="unknown-type"),
+        pytest.param({"headers": {"Proxy-Authorization": "Basic eA=="}}, id="static-header"),
+    ],
+)
+def test_a_refused_accepted_proxy_user_build_writes_no_acceptance_audit(
+    caplog: pytest.LogCaptureFixture, extra: dict[str, Any]
+) -> None:
+    """The acceptance record says a crossing was accepted, so a build refused for the proxy
+    credential's type or for a static header beside it must not leave one (vault BACKLOG #3007)."""
+    marker = "cleartext hop crossed on an operator acceptance"
+    with caplog.at_level("WARNING"), pytest.raises(ValueError):
+        _rest(_HTTPS_TARGET, accepted=True, **_PROXY_LOGIN, **extra)
+    assert not [r for r in caplog.records if marker in r.getMessage()]
+
+
+def test_enforcement_warn_with_no_declaration_refuses_a_proxy_credential() -> None:
+    """``_shipped_strict_disposition`` floors the dial's WARN back to REFUSE. The control is the same
+    connection, with the acceptance, on the same dial."""
+    warn = HopPosture(enforcing=False)
+    with pytest.raises(InsecureHopRefused, match="before any TLS"):
+        _rest(_HTTPS_TARGET, posture=warn, **_PROXY_LOGIN)
+    accepted = _rest(_HTTPS_TARGET, posture=warn, accepted=True, **_PROXY_LOGIN)
+    assert _proxy_handler(accepted).caller_header_admitted is True
 
 
 def test_control_a_proxy_written_https_with_no_proxy_user_builds_as_before() -> None:

@@ -89,6 +89,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     bool_setting,
+    check_attested_and_accepted,
     check_db_connect_timeout,
     flag_from_settings,
     remote_file_protocol,
@@ -840,15 +841,12 @@ def refuse_resolved_verify_off(
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
-    """Refuse a declaration that claims its hop is both secure and not secure.
-
-    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
-    record never fire, and the hop crosses silently while declaring an accepted risk."""
-    if attested and accepted:
-        raise WiringError(
-            f"{where}: tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
-            "secure) are opposite claims. Declare the one that is true"
-        )
+    """:func:`~messagefoundry.config.models.check_attested_and_accepted`, raised as a
+    :class:`WiringError` that names the connection."""
+    try:
+        check_attested_and_accepted(attested, accepted)
+    except ValueError as exc:
+        raise WiringError(f"{where}: {exc}") from exc
 
 
 def refuse_raw_hop_attestation(settings: Mapping[str, Any], where: str) -> None:
@@ -3544,7 +3542,7 @@ def Rest(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """An HTTP(S) endpoint (**outbound only** today — there is no REST source yet, ADR 0003). The
     Handler produces the request body; this delivers it to ``url`` via ``method`` with ``content_type``
@@ -3556,7 +3554,10 @@ def Rest(
     ``proxy`` routes egress through a corporate **forward proxy** (ADR 0126): ``"default"`` uses the OS
     default web proxy, an ``http(s)://`` address is explicit, unset inherits ``[egress].proxy_url``.
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
-    Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly.
+    Basic/Digest); ``proxy_no_proxy`` lists hosts that skip this proxy. Such a host gets no proxy
+    handler and no proxy credential from this connection, but it is not proven direct: the opener
+    still follows a proxy from the environment or the system settings, and with
+    ``proxy = "default"`` the system proxy itself still applies (``ProxyConfig.for_host``).
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
@@ -3647,7 +3648,7 @@ def FHIR(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
@@ -4058,7 +4059,7 @@ def DICOMweb(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """A **DICOMweb STOW-RS** endpoint (ADR 0025 Phase 2 — **outbound destination only**; an inbound
     STOW-RS receiver awaits the HTTP listener, ADR 0023). The Handler produces (or forwards) a DICOM
@@ -4495,7 +4496,7 @@ def Soap(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """A SOAP web-service endpoint (**outbound only**, ADR 0003 + 0015).
 
@@ -6244,8 +6245,22 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         for ic in registry.inbound.values()
         if _listed(ic.tls_hop_attested)
     ]
+
+    def _pair_refused(name: str, accepted: bool) -> bool:
+        # outbound() refuses the pair, and the Destination model refuses an OutboundConnection
+        # built directly with it, so such an entry is a hop the engine never builds.
+        try:
+            _refuse_attested_and_accepted(name, True, accepted)
+        except WiringError:
+            return True
+        return False
+
     out += [
-        AttestedHop(oc.name, _attested_reason_text(oc.tls_hop_attested_reason), False)
+        AttestedHop(
+            oc.name,
+            _attested_reason_text(oc.tls_hop_attested_reason),
+            _pair_refused(oc.name, oc.cleartext_accepted),
+        )
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]

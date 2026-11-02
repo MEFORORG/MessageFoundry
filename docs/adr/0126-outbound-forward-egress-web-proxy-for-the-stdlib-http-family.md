@@ -81,7 +81,8 @@ proxy hop** is refused **regardless of the destination scheme** (an `https` dest
 authority (`refuse_cleartext_credential_hop`, ADR 0092): a production-PHI cleartext proxy hop is REFUSED
 (the blunt global escape is inert for prod-PHI), a non-prod PHI hop is refused unless the clamped escape
 downgrades it to a loud WARN, and an on-box loopback (a local `cntlm`), per-hop-attested, or synthetic
-proxy hop is allowed. The message names only the proxy **host** — never the URL, scheme, or credential.
+proxy hop is allowed. [Corrected 2026-11-01: a per-hop attestation no longer admits a proxy
+credential; see Amendment G.] The message names only the proxy **host** — never the URL, scheme, or credential.
 
 **`[egress].allowed_http` gate scope — the proxy host is OUT of scope.** The fail-closed allowlist gates
 the **destination** host (where PHI is sent), which is unchanged. The forward proxy is an operator-chosen
@@ -331,6 +332,16 @@ hop and distinct proxy value in a process. Unlike the start WARNING it is a per-
 not a probe: it names the result of the send's own proxy selection. The start WARNING is
 unchanged, and so is every `proxy_url`. What it says, and what it does not, is in
 [CONFIGURATION.md](../CONFIGURATION.md#the-vault-and-openbao-clients-also-name-a-proxy-where-they-use-it).
+
+### Amendment G (2026-10-30) — a proxy credential has one declared route
+
+B462-R1, R2 and R4 of the vault's `OWNER-RULINGS-2026-10-30-BATCH462.md` add to R1 of
+`ASVS-OWNER-RULINGS-2026-10-05.md` (vault BACKLOG #3007, #3416). `tls_hop_attested` no longer admits
+a proxy credential, so `cleartext_accepted` with a reason is the one declaration left. A credential
+in a `proxy_url`, a connection's own or an inherited `[egress].proxy_url`, now fails the
+connection's build whatever it declares, which is stricter than the 2026-10-05 text. The rule stays
+in two seams, the build and the send, because an environment proxy is known only at send.
+[CONNECTIONS.md](../CONNECTIONS.md) states it.
 
 ## Deviations from the phase doc
 

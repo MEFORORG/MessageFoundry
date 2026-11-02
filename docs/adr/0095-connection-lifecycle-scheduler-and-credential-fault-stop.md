@@ -322,6 +322,8 @@ proxy challenge can raise it only for an `http://` destination, since proxy Dige
 `https://`. A `proxy_url` that carries credentials and is not written `https://` never meets a
 407 at all: the opener refuses it before any request leaves (vault BACKLOG #2572, engine PR 2018),
 as a `ProxyCredentialsRefusedError`, which each send reads as unreachable and retries.
+*Overtaken 2026-10-30 (vault BACKLOG #3007): a connection's own `proxy_url` with a credential now
+fails its build. The send-time refusal still meets one from the environment.*
 
 The probe arms and the `FhirLookup` read are not deliveries, so they carry no fault marker. A probe
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.

@@ -50,22 +50,19 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal, get_args
+from typing import Any, Final, Literal
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    GetCoreSchemaHandler,
     PrivateAttr,
     ValidationError,
     ValidationInfo,
-    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
-from pydantic_core import ErrorDetails, InitErrorDetails, PydanticCustomError, core_schema
 
 from messagefoundry.api_tls_source import api_tls_source
 from messagefoundry.childenv import outside_engine_namespace
@@ -74,6 +71,8 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     SecurityEnforcement,
 )
+from messagefoundry.config.input_hiding import HIDDEN_INPUT as HIDDEN_INPUT
+from messagefoundry.config.input_hiding import _InputHidingModel as _InputHidingModel
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -351,88 +350,6 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     if value is not None and not Path(value).is_file():
         raise ValueError(f"{setting} path does not exist or is not a file: {value!r}")
     return value
-
-
-#: What a settings validation error shows in place of the value it refused (BACKLOG #296).
-HIDDEN_INPUT = "[not shown]"
-
-
-#: Every error type pydantic-core knows. One of these is rebuilt from its own template and ``ctx``,
-#: so the rendered message is never fed back in as a template, where a ``{error}`` the operator
-#: wrote would be substituted again at each level.
-_KNOWN_ERROR_TYPES = frozenset(get_args(core_schema.ErrorType))
-
-
-def _without_input(err: ErrorDetails) -> InitErrorDetails:
-    """One error, rebuilt with :data:`HIDDEN_INPUT` in place of its input."""
-    if err["type"] in _KNOWN_ERROR_TYPES:
-        detail = InitErrorDetails(type=err["type"], loc=err["loc"], input=HIDDEN_INPUT)
-        if "ctx" in err:
-            detail["ctx"] = err["ctx"]
-        # A PydanticCustomError may reuse a known type name with another ctx (pydantic's own
-        # EmailStr raises 'value_error' with a 'reason'), which the known template refuses.
-        try:
-            ValidationError.from_exception_data("probe", [detail])
-        except (TypeError, ValueError, KeyError):
-            pass
-        else:
-            return detail
-    # A validator's own PydanticCustomError: keep its type and rendered message, with no context,
-    # so the message is not formatted a second time.
-    return InitErrorDetails(
-        type=PydanticCustomError(err["type"], err["msg"]), loc=err["loc"], input=HIDDEN_INPUT
-    )
-
-
-def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
-    """Validate ``value``; on a refusal, re-raise every error with its input replaced.
-
-    A refusal from an ``after``-mode model validator carries the whole section's input mapping as
-    its ``input``, and ``str(exc)``, ``repr(exc)``, ``exc.errors()`` and ``exc.json()`` all render
-    it. That mapping holds whatever secrets the section reads from the environment, so any caller
-    that prints or logs the error would disclose them. ``hide_input_in_errors`` is not enough: it
-    hides the input from ``str`` and ``repr`` only, and only on the outermost model.
-
-    Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
-    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT
-    ONLY. The message and ``ctx`` stay as raised, and they can quote the value: a validator that
-    quotes what it refused still shows it there, and so does at least one error a library raised
-    inside a validator. :func:`settings_error_detail` names at least the ones known. None is meant
-    to hold a secret, but a URL can carry one, so a validator message must name the setting, never
-    quote a secret value.
-    """
-    try:
-        return handler(value)
-    except ValidationError as exc:
-        title, errors = exc.title, exc.errors(include_url=False)
-    # Rebuilt OUTSIDE the handler: anything raised while rebuilding would otherwise carry the
-    # original, input-bearing error on its __context__.
-    raise ValidationError.from_exception_data(title, [_without_input(err) for err in errors])
-
-
-class _InputHidingModel(BaseModel):
-    """A settings model whose validation errors never carry the value they refused (BACKLOG #296).
-
-    The wrap sits OUTSIDE the whole model schema, its own validators included, so it holds for
-    direct construction and for the model nested in another one. A per-raise helper cannot, since
-    the next plain ``ValueError`` added to a validator would bring the echo back.
-    """
-
-    # Keeps the placeholder, and its misleading input_type of str, out of str(exc); errors() and
-    # json() still carry the placeholder. Inherited and merged into each subclass's own config.
-    model_config = ConfigDict(hide_input_in_errors=True)
-
-    @classmethod
-    def __get_pydantic_core_schema__(
-        cls, source: type[BaseModel], handler: GetCoreSchemaHandler
-    ) -> core_schema.CoreSchema:
-        schema = handler(source)
-        # A section nested in ServiceSettings hands back its own stored schema, already wrapped.
-        if schema["type"] == "function-wrap" and schema["function"]["function"] is (
-            _refuse_without_input
-        ):
-            return schema
-        return core_schema.no_info_wrap_validator_function(_refuse_without_input, schema)
 
 
 class _Section(_InputHidingModel):
@@ -5360,9 +5277,10 @@ class EgressSettings(_Section):
     # the environment proxy urllib reads on its own). "default" = the OS default web
     # proxy (getproxies()); an http(s):// address = an explicit proxy. A loopback host is never
     # proxied, whichever of these named the proxy (vault BACKLOG #2579). Put proxy credentials on each
-    # connection (secrets via env()). This field has no validator, so a user:password@ written in it
-    # is inherited with the URL; docs/CONFIGURATION.md [egress] says what then applies.
-    # Env: MEFOR_EGRESS_PROXY_URL.
+    # connection (secrets via env()). Its shape is checked at load by _proxy_url_shape below. A
+    # user:password@ written in it passes that check and is inherited with the URL; each connection
+    # that inherits it then fails to build (vault BACKLOG #3007), and docs/CONFIGURATION.md [egress]
+    # says what else applies. Env: MEFOR_EGRESS_PROXY_URL.
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
@@ -5433,6 +5351,36 @@ class EgressSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("proxy_url", mode="after")
+    @classmethod
+    def _proxy_url_shape(cls, value: str | None) -> str | None:
+        """Refuse at load a site proxy URL the transport's one proxy parse refuses (vault BACKLOG
+        #2965), so the fault names this setting rather than surfacing on each connection that
+        inherits it, and a value no connection inherits is still caught.
+
+        ``"default"`` (any case) passes, and a blank value reads as unset. ``"default"`` is written
+        out rather than read from ``transports.rest.PROXY_DEFAULT``, so this import stays off the
+        sentinel's path; a test pins that the two agree. The refusal is the parse's fixed text,
+        which names no part of the value; the base model also hides the input. A ``user:password@``
+        passes here, as the parse allows a userinfo: the build of each inheriting connection
+        refuses it (vault BACKLOG #3007), and the static-credential report still lists it."""
+        if value is None:
+            return None
+        proxy = value.strip()
+        if not proxy:
+            # Blank reads as unset. Kept as written it would be truthy, so each connection would
+            # inherit it and fail its build for a scheme it does not have.
+            return None
+        if proxy.lower() == "default":
+            return value
+        # Lazy, as config/static_credentials.py does: the transport owns how a proxy URL is read,
+        # and importing the transports package when this module loads would tie the two together.
+        # It is imported only when a site proxy URL is set.
+        from messagefoundry.transports.proxy_address import parse_proxy_url
+
+        parse_proxy_url(proxy)
+        return value
 
     @field_validator("allowed_recipient_domains", mode="after")
     @classmethod
@@ -10751,9 +10699,8 @@ def security_loosenings(
                 f"{len(attested_hops)} connection(s) are ATTESTED secure by means the engine cannot "
                 f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
                 "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
-                "and any credential cross in the clear, except an HTTP-family credential other than "
-                "a forward-proxy login, which is still refused over cleartext http off this machine "
-                "or with verification off",
+                "and any credential cross in the clear, except an HTTP-family credential, which is "
+                "still refused over cleartext http off this machine or with verification off",
             )
         )
     if revocation_attested_hops:

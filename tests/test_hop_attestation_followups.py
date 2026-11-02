@@ -31,6 +31,8 @@ from messagefoundry.config.wiring import (
     AttestedHop,
     DatabaseLookupSpec,
     FhirLookupSpec,
+    File,
+    OutboundConnection,
     Registry,
     WiringError,
     attested_secure_hop_records,
@@ -125,6 +127,33 @@ def test_an_attestation_beside_a_typed_cleartext_acceptance_is_marked_refused() 
     spec.settings["tls_hop_attested_reason"] = REASON
     reg.add_fhir_lookup(spec)
     assert attested_secure_hop_records(reg) == [AttestedHop("fhir_lookup:LK", REASON, refused=True)]
+
+
+def test_an_outbound_attested_beside_its_acceptance_is_marked_refused() -> None:
+    """``outbound()`` refuses the pair, and the ``Destination`` model refuses an
+    ``OutboundConnection`` built directly with it, so the report marks that entry. The control is
+    the same connection without the acceptance."""
+    reg = Registry()
+    spec = File(directory=".")
+    reg.add_outbound(
+        OutboundConnection(
+            "OB_BOTH",
+            spec,
+            tls_hop_attested=True,
+            tls_hop_attested_reason=REASON,
+            cleartext_accepted=True,
+            cleartext_reason="legacy peer",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB_ATTESTED", spec, tls_hop_attested=True, tls_hop_attested_reason=REASON
+        )
+    )
+    assert attested_secure_hop_records(reg) == [
+        AttestedHop("OB_ATTESTED", REASON, refused=False),
+        AttestedHop("OB_BOTH", REASON, refused=True),
+    ]
 
 
 def test_a_name_holding_a_newline_is_escaped_in_the_report() -> None:

@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
 # Re-exported: the enum moved to a stdlib-only leaf so `parsing/` can use it without loading this
@@ -352,6 +353,24 @@ def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
         why="an accepted risk that stops being visible has stopped being accepted and started being "
         "forgotten (ADR 0153)",
     )
+
+
+def check_attested_and_accepted(attested: bool, accepted: bool) -> None:
+    """Refuse a declaration that claims its hop is both secure and not secure.
+
+    The body hop's disposition checks the attestation first, so on a cleartext body hop with both set
+    the acceptance's WARN and audit record never fire, and the hop crosses silently while declaring
+    an accepted risk. (The proxy leg reads the acceptance alone, so there the pair adds nothing; it
+    is refused as an incoherent declaration all the same.) The factories refuse the pair through
+    ``config.wiring``; this is the one rule they share with :class:`Destination` and the
+    ``FhirLookup`` read executor, so neither can be constructed directly with the pair. It runs at
+    construction only: :class:`Destination` does not validate on assignment, so a flag set on a
+    built model afterwards is not re-checked."""
+    if attested and accepted:
+        raise ValueError(
+            "tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
+            "secure) are opposite claims. Declare the one that is true"
+        )
 
 
 def _check_revocation_attestation(attested: bool, reason: str | None) -> None:
@@ -789,9 +808,12 @@ class WindowsCredential(BaseModel):
         return cls.model_validate(data)
 
 
-class Destination(BaseModel):
+class Destination(_InputHidingModel):
     """An outbound connector endpoint. Each outbound connection queues independently
-    so a slow/failed one never blocks the others."""
+    so a slow/failed one never blocks the others.
+
+    Input-hiding because ``settings`` holds resolved secrets, and a refusal from a validator here
+    carries the whole input on the error."""
 
     name: str
     type: ConnectorType
@@ -860,6 +882,13 @@ class Destination(BaseModel):
     def _validate_hop_attestation(self) -> Destination:
         _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
         _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
+        # The settings-driven seams (at least the anonymous-FTP guard) read the attestation from
+        # ``settings``, where _dest_config mirrors the typed field. So that carrier is held to the
+        # same flag, reason and control-character rules, and the pair is judged on either.
+        settings_attested = hop_attestation_from_settings(self.settings)
+        check_attested_and_accepted(
+            self.tls_hop_attested or settings_attested, self.cleartext_accepted
+        )
         _check_revocation_attestation(
             self.tls_revocation_attested, self.tls_revocation_attested_reason
         )

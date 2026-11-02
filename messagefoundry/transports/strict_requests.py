@@ -961,8 +961,9 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
 _CLEARTEXT_PROXY_CREDENTIALS = (
     "the proxy in front of the Vault address carries credentials in its URL and is not an "
     "https:// proxy, or its URL cannot be read. requests would send those credentials to the "
-    "proxy in cleartext. Use an https:// proxy, or a proxy that takes no credentials in its URL; "
-    "refusing (BACKLOG #2547)"
+    "proxy in cleartext. Use a proxy that takes no credentials in its URL. An https:// proxy "
+    "clears this check alone: the engine's other HTTP hops can still refuse a credential in a "
+    "proxy URL; refusing (BACKLOG #2547)"
 )
 
 

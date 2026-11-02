@@ -67,11 +67,12 @@ _UNCACHED_URLSPLIT: Callable[[str], urllib.parse.SplitResult] = inspect.unwrap(
 
 #: The fixed refusal text. It names the setting and the rule, never the value.
 _REFUSED = (
-    "proxy_url must be http(s)://[user:password@]host[:port] with nothing after the port but an "
+    "proxy_url must be http(s)://[userinfo@]host[:port] with nothing after the port but an "
     "optional '/': no path, query or fragment, a host that is a DNS name, an IPv4 address or a "
     "bracketed IPv6 address, written in ASCII, and a port from 1 to 65535 with no leading zero. "
-    "Percent-encode any '/', '?', '#' or '@' in the user or password, or set them in "
-    "proxy_user/proxy_password (vault BACKLOG #2965)"
+    "A proxy login "
+    "goes in proxy_user/proxy_password: a user or a password in the URL fails the connection's "
+    "build (vault BACKLOG #2965, #3007)"
 )
 
 
@@ -86,6 +87,14 @@ class ProxyAddress:
     host: str
     port: int | None
     userinfo: str | None = field(default=None, repr=False)
+
+    @property
+    def holds_credential(self) -> bool:
+        """A user or a password in the userinfo, split as urllib splits it. ``@`` and ``:@`` hold
+        neither. urllib sends a header only when it reads both, so this asks what the URL holds,
+        not what goes on the wire (``rest.proxy_url_sends_userinfo`` asks that)."""
+        user, _, password = (self.userinfo or "").partition(":")
+        return bool(user or password)
 
     @property
     def hostname(self) -> str:

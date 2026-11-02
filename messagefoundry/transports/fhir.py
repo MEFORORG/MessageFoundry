@@ -64,7 +64,10 @@ from typing import Any, Literal, NamedTuple, overload
 from messagefoundry.config.models import (
     ConnectorType,
     Destination,
+    _check_cleartext_acceptance,
+    _check_revocation_attestation,
     bool_setting,
+    check_attested_and_accepted,
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
@@ -1117,7 +1120,6 @@ class FhirDestination(DestinationConnector):
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
             dest_scheme=scheme,
-            attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
             connection=config.name,
@@ -1920,6 +1922,12 @@ class FhirLookupExecutor:
             try:
                 attested = hop_attestation_from_settings(s)
                 lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
+                # FhirLookupSpec refuses an acceptance or a revocation attestation with no reason,
+                # and FhirLookup() and the runner's settings builder refuse the attested-plus-
+                # accepted pair. A directly built executor meets those rules here too.
+                _check_cleartext_acceptance(lk_accepted, lk_reason)
+                _check_revocation_attestation(*revocation_attestation_from_settings(s)[:2])
+                check_attested_and_accepted(attested, lk_accepted)
             except ValueError as exc:
                 raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
@@ -1927,7 +1935,6 @@ class FhirLookupExecutor:
             proxy = egress_route_from_settings(
                 s,
                 dest_scheme=scheme,
-                attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
                 connection=label,
