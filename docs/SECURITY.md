@@ -2452,7 +2452,7 @@ reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline,
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
-for the config directory itself: at least one that is missing, and a share lost between the
+for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
@@ -2588,11 +2588,8 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
-- a network share the engine cannot reach can read as absent, not as a fault. At least a share lost
-  between the target check and the reload's read of the directory would answer `not_found`, and
-  `validate_config`, which `messagefoundry check` runs, would report a config directory on such a
-  share as absent. A value file read from disk would read as absent there too, so an `env()`
-  reference with a default would take that default, with no refusal;
+- a value file read from disk on a network share the engine cannot reach would read as absent, not
+  as a fault, so an `env()` reference with a default would take that default, with no refusal;
 - a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
   out what it cannot read and does not tell its caller, so it can be partial;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
