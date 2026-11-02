@@ -346,7 +346,7 @@ def _scaling_ratios(
 
 
 def _attempts(readings: list[float]) -> str:
-    return "attempts: " + ", ".join(f"{reading:.1f}x" for reading in readings)
+    return "attempts: " + ", ".join(f"{reading:.2f}x" for reading in readings)
 
 
 @pytest.mark.parametrize(
@@ -361,7 +361,7 @@ def test_a_pathological_dn_is_judged_in_linear_time(
     readings = _scaling_ratios(canonical_group_dn, make, 4_000)
     ratio = min(readings)
     assert ratio < _MAX_LINEAR_RATIO, (
-        f"4x the input took {ratio:.1f}x the time ({_attempts(readings)})"
+        f"4x the input took {ratio:.2f}x the time ({_attempts(readings)})"
     )
 
 
@@ -371,8 +371,7 @@ def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
 
     This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
     start at each separator. Its work grows with the square of the length. It runs at ``k`` =
-    2,000, where one small call takes about 10 ms, against 1.6 ms at the 1,000 that CI read under
-    the line (BACKLOG #3452)."""
+    2,000; :func:`_scaling_ratios` says why the size went up (BACKLOG #3452)."""
 
     def quadratic(text: str) -> None:
         for end in range(100, len(text) + 1, 100):
@@ -382,7 +381,7 @@ def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
     readings = _scaling_ratios(quadratic, make, 2_000)
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
-        f"a quadratic parser scaled by only {ratio:.1f}x ({_attempts(readings)})"
+        f"a quadratic parser scaled by only {ratio:.2f}x ({_attempts(readings)})"
     )
 
 
@@ -404,8 +403,8 @@ def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...])
 @pytest.mark.parametrize(
     ("attempts", "spent", "failure"),
     [
-        ((4.0, 4.0, 4.0), 1, "only 4.0x (attempts: 4.0x)"),
-        ((15.0, 15.0, 4.0), 3, "only 4.0x (attempts: 15.0x, 15.0x, 4.0x)"),
+        ((4.0, 4.0, 4.0), 1, "only 4.00x (attempts: 4.00x)"),
+        ((15.0, 15.0, 4.0), 3, "only 4.00x (attempts: 15.00x, 15.00x, 4.00x)"),
         ((8.0, 8.0, 8.0), 3, None),
         ((15.0, 9.0, 12.0), 3, None),
     ],
@@ -431,8 +430,8 @@ def test_the_quadratic_control_passes_only_when_every_attempt_reads_over_the_lin
     ("attempts", "spent", "failure"),
     [
         ((9.0, 3.9, 20.0), 2, None),
-        ((9.0, 12.0, 10.0), 3, "took 9.0x the time (attempts: 9.0x, 12.0x, 10.0x)"),
-        ((8.0, 8.0, 8.0), 3, "took 8.0x the time (attempts: 8.0x, 8.0x, 8.0x)"),
+        ((9.0, 12.0, 10.0), 3, "took 9.00x the time (attempts: 9.00x, 12.00x, 10.00x)"),
+        ((8.0, 8.0, 8.0), 3, "took 8.00x the time (attempts: 8.00x, 8.00x, 8.00x)"),
     ],
     ids=["clears", "never-clears", "at-the-line"],
 )
