@@ -48,7 +48,7 @@ import json
 import logging
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -304,8 +304,12 @@ class SecuritySignalDetector:
         *,
         clock: Callable[[], float] = time.monotonic,
         identity: Callable[[], str | None] = lambda: None,
+        verify_clean: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         self._sink = sink
+        #: Handed the resolve a clean start row asks for. :func:`install_security_signals` passes
+        #: its live posture read, which runs the resolve only on a clean reading.
+        self._verify_clean = verify_clean
         t = thresholds
         self._window_label = f"{t.window_seconds:g} s"
         #: How long a listener stays quiet after its refusal burst raised.
@@ -448,7 +452,10 @@ class SecuritySignalDetector:
             # A marked row leaves the alert open, which the next unmarked clean start resolves. An
             # unchecked mark from a failed baseline read saw no swap, and it waits all the same.
             if not any(row.get(mark) for mark in _NOT_RESTORING_MARKS):
-                self._restore(subject)
+                if self._verify_clean is None:
+                    self._restore(subject)
+                else:
+                    self._verify_clean(lambda: self._restore(subject))
             return
         names = _bounded(", ".join(str(s) for s in switches), _SWITCH_LIST_LIMIT)
         self._posture_raised = subject
@@ -502,6 +509,7 @@ def install_security_signals(
     *,
     identity: Callable[[], str | None] = lambda: None,
     resolve_on_stop: bool = False,
+    live_posture_clean: Callable[[], Awaitable[bool]] | None = None,
 ) -> Callable[[], None]:
     """Register a :class:`SecuritySignalDetector` on the audit tee, and on the listeners' refusal
     observers while it counts refusals; returns the function that removes it.
@@ -513,9 +521,48 @@ def install_security_signals(
     docs/SECURITY.md, *Audit*, says when the alert can stay open anyway. The function must run on
     ``loop``'s thread, before the store closes.
 
+    A clean start row resolves ``posture_loosened`` only once ``live_posture_clean`` has read the
+    running engine as clean, because the row's list is read off the start's snapshot and a reload
+    can land before the row commits. Fails closed: with no reader, a reader that raises or returns
+    False, or a read still running at removal, nothing is resolved. The read runs as its own task,
+    since it may leave the loop and this observer runs on the audit writer's path. The stop-time
+    inverse takes no read: ``resolve_on_stop`` names a subject no later start can come back to.
+
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
     onto ``loop``, so the detector's state and the sink are only touched from one thread."""
-    detector = SecuritySignalDetector(sink, thresholds, identity=identity)
+    reads: set[asyncio.Task[None]] = set()
+    removed = False
+
+    async def _resolve_if_clean(
+        read: Callable[[], Awaitable[bool]], resolve: Callable[[], None]
+    ) -> None:
+        try:
+            clean = await read()
+        except Exception as exc:  # noqa: BLE001 - a failed read means no resolve, and no more
+            log.warning(
+                "the live posture could not be read (%s); a clean start resolves no "
+                "posture_loosened alert",
+                type(exc).__name__,
+            )
+            return
+        if not clean:
+            log.warning(
+                "a start recorded no loosening but the live posture does not read clean, so its "
+                "posture_loosened alert stays open"
+            )
+            return
+        resolve()
+
+    def _verify_clean(resolve: Callable[[], None]) -> None:
+        if live_posture_clean is None or removed:
+            return
+        read = loop.create_task(_resolve_if_clean(live_posture_clean, resolve))
+        reads.add(read)
+        read.add_done_callback(reads.discard)
+
+    detector = SecuritySignalDetector(
+        sink, thresholds, identity=identity, verify_clean=_verify_clean
+    )
 
     def _on_loop(judge: Callable[..., None], *args: str | None) -> None:
         try:
@@ -549,6 +596,10 @@ def install_security_signals(
         add_refusal_observer(_refused)
 
     def _remove() -> None:
+        nonlocal removed
+        removed = True
+        for read in tuple(reads):
+            read.cancel()
         remove_audit_observer(_observe)
         remove_refusal_observer(_refused)
         if resolve_on_stop:

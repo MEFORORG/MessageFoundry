@@ -3159,12 +3159,18 @@ def _install_security_signals(
     sink: AlertSink,
     alerts_settings: AlertsSettings | None,
     cluster_settings: ClusterSettings | None,
+    state: Any,
 ) -> Callable[[], None]:
     """Install the security-signal layer for the managed lifespan (vault BACKLOG #2613) and
     return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
     itself a loosening, and the posture detector, the one it leaves running, is what reports it.
     The posture subject names this engine process, and an unpinned cluster node, whose id changes
-    on every start, raises the inverse for its own posture alert as it shuts down."""
+    on every start, raises the inverse for its own posture alert as it shuts down. A clean start
+    row resolves the alert only on a clean :func:`_live_posture_is_clean` reading off ``state``."""
+
+    async def _live_clean() -> bool:
+        return await _live_posture_is_clean(state, engine)
+
     return install_security_signals(
         sink,
         SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
@@ -3172,7 +3178,28 @@ def _install_security_signals(
         identity=lambda: engine.instance_identity,
         resolve_on_stop=engine.coordinator.is_clustered()
         and not (cluster_settings is not None and cluster_settings.node_id),
+        live_posture_clean=_live_clean,
     )
+
+
+async def _live_posture_is_clean(state: Any, engine: Engine) -> bool:
+    """Whether the running engine reads clean, by the reading ``GET /security/posture`` takes: the
+    live graph, not a start's snapshot. A scope note means the reading could not see the graph, so
+    an empty list then says nothing, and that is not a clean reading. No await follows the read,
+    so a caller that acts on the answer at once acts before a reload's swap can run."""
+    remote_debug = remote_debug_posture()
+    startup = await asyncio.to_thread(startup_posture)
+    service_env = await asyncio.to_thread(service_env_posture)
+    pairs, scope = _posture_loosenings(
+        state,
+        engine,
+        engine.registry_runner,
+        remote_debug=remote_debug,
+        startup=startup,
+        service_env=service_env,
+        security=_posture_security(state),
+    )
+    return not pairs and scope is None
 
 
 async def _record_a_restore(store: Store, sink: AlertSink) -> None:
@@ -12286,7 +12313,7 @@ def create_managed_app(
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
         remove_security_signals = _install_security_signals(
-            engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings
+            engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings, app.state
         )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise

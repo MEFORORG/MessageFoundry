@@ -8,7 +8,8 @@
   shorter `security_window_seconds` while any count is above `0`, are now loosenings that
   `GET /security/posture` names; with the layer off the posture detector still runs, so the start
   raises `posture_loosened`, whose list of names is cut when long. A start that records no loosening, in a row marked
-  neither `superseded` nor `baseline_unchecked`, raises the new `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
+  neither `superseded` nor `baseline_unchecked`, and with a clean live posture read, raises the new
+  `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
   process; that alert's key now carries `@node:<id>` or `@shard:<id>` where several engine
   processes share the store, and an unpinned cluster node raises the inverse for its own as it
   shuts down. When that alert can still stay open, and how an operator resolves it, is in

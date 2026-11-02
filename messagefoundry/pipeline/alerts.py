@@ -952,7 +952,8 @@ class AlertSink(Protocol):
     def posture_restored(self, name: str) -> None:
         """The INVERSE of the ``posture_loosened`` security signal: a start recorded an empty
         loosenings list in a ``config_loaded`` row marked neither ``superseded`` nor
-        ``baseline_unchecked`` (vault BACKLOG #2613). Emits **no**
+        ``baseline_unchecked``, and a live posture read then named none (vault BACKLOG #2613).
+        Emits **no**
         notification (a recovery needs no page); it exists so durable alert-state (ADR 0044)
         **auto-resolves** the open ``posture_loosened`` instance for the same ``name``, which is
         ``posture:start`` with this process's ``@node:<id>`` or ``@shard:<id>`` suffix where several

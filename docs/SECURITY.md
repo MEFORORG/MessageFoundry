@@ -6544,7 +6544,7 @@ process and pages nobody. A row marked `superseded` or `baseline_unchecked` rais
 even with an empty list: the list is read off the graph the start's snapshot took, and a reload
 may have replaced that graph. A start whose baseline read failed, or that took no digest, carries
 the same mark and raises none either. The alert stays open until a later start's unmarked row
-lists none.
+lists none and the live posture reads clean, as the next paragraph says.
 An unpinned cluster node's identity changes on every start, so that node raises the inverse for
 its own alert as it shuts down instead. That alert can stay open after shutdown, at least after a
 hard kill or a resolve that did not land. An alert also stays open when no later start comes back
@@ -6554,12 +6554,15 @@ under its identity, at least after an engine shard is removed from the config or
 scope check, so both need an account that is not channel-scoped and holds `monitoring:diagnose`. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
 records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
-**A resolved `posture_loosened` does not prove the engine runs clean.** The detector reads
-`config_loaded` rows and no `config_reload` row, so at least these two reloads go unseen. One lands
-after the start's swap check and before its row is written, which leaves a clean, unmarked row. The
-other lands after a clean start. In the first case the row resolves the alert while the reloaded,
-loosened graph runs. In the second the alert was resolved already, and nothing raises it again until
-a later start. `GET /security/posture` reads the live graph, so read that for the current posture.
+**A resolved `posture_loosened` does not prove the engine runs clean.** A clean, unmarked row
+resolves the alert only after a read of the live posture, the reading `GET /security/posture` takes,
+names no loosening. A read that fails, that cannot see the graph, or that is still running at
+shutdown resolves nothing. So a reload that swaps the graph before the row commits leaves the alert
+open. The detector reads `config_loaded` rows and no `config_reload` row, so at least these go
+unseen. A reload whose swap lands after that read leaves the alert resolved while the loosened graph
+runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
+reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
+read that for the current posture.
 
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The

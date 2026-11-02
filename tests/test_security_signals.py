@@ -1195,6 +1195,153 @@ def test_a_mark_that_is_not_set_still_lets_a_clean_start_restore() -> None:
     assert sink.restored == ["posture:start"]
 
 
+async def _clean_start_through_install(sink: _PostureSink, **install: Any) -> Any:
+    """A real install, one clean unmarked row through the tee, and the remover, not yet run."""
+    remove = install_security_signals(sink, _thresholds(), asyncio.get_running_loop(), **install)
+    cast(Any, audit_tee).emit_audit_tee(
+        action="config_loaded",
+        actor="system",
+        channel_id=None,
+        detail=json.dumps({"loosenings": []}),
+        ts=0.0,
+        row_id=1,
+        seq=1,
+        row_hash="0" * 64,
+    )
+    return remove
+
+
+async def _settled() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize(
+    ("reading", "resolved"),
+    [(True, True), (False, False)],
+)
+async def test_a_clean_row_resolves_only_on_a_clean_live_read(
+    reading: bool, resolved: bool
+) -> None:
+    async def _read() -> bool:
+        return reading
+
+    sink = _PostureSink()
+    remove = await _clean_start_through_install(sink, live_posture_clean=_read)
+    try:
+        await _settled()
+    finally:
+        remove()
+    assert sink.restored == (["posture:start"] if resolved else [])
+
+
+async def test_a_live_read_that_raises_resolves_nothing_and_logs_only_the_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def _read() -> bool:
+        raise RuntimeError(_LEAK_TOKEN)
+
+    sink = _PostureSink()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+        remove = await _clean_start_through_install(sink, live_posture_clean=_read)
+        try:
+            await _settled()
+        finally:
+            remove()
+    assert sink.restored == []
+    assert "RuntimeError" in caplog.text and _LEAK_TOKEN not in caplog.text
+
+
+async def test_an_install_with_no_live_read_resolves_nothing() -> None:
+    sink = _PostureSink()
+    remove = await _clean_start_through_install(sink)
+    try:
+        await _settled()
+    finally:
+        remove()
+    assert sink.restored == []
+
+
+async def test_a_read_still_running_at_removal_resolves_nothing() -> None:
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def _read() -> bool:
+        entered.set()
+        await release.wait()
+        return True
+
+    sink = _PostureSink()
+    remove = await _clean_start_through_install(sink, live_posture_clean=_read)
+    await entered.wait()
+    remove()
+    release.set()
+    await _settled()
+    assert sink.restored == []
+
+
+async def test_a_row_judged_after_removal_starts_no_read() -> None:
+    reads: list[int] = []
+
+    async def _read() -> bool:
+        reads.append(1)
+        return True
+
+    sink = _PostureSink()
+    remove = install_security_signals(
+        sink, _thresholds(), asyncio.get_running_loop(), live_posture_clean=_read
+    )
+    # Joined without yielding, so the hop onto the loop is still queued when remove() runs.
+    other = threading.Thread(
+        target=cast(Any, audit_tee).emit_audit_tee,
+        kwargs={
+            "action": "config_loaded",
+            "actor": "system",
+            "channel_id": None,
+            "detail": json.dumps({"loosenings": []}),
+            "ts": 0.0,
+            "row_id": 1,
+            "seq": 1,
+            "row_hash": "0" * 64,
+        },
+    )
+    other.start()
+    other.join()
+    remove()
+    await _settled()
+    assert reads == [] and sink.restored == []
+
+
+async def test_a_stop_resolve_needs_no_live_read() -> None:
+    """An unpinned node's subject dies with the process, so its stop-time inverse is not gated. The
+    read cannot speak for a process that is leaving, and no later start could resolve it."""
+
+    async def _read() -> bool:
+        return False
+
+    sink = _PostureSink()
+    remove = install_security_signals(
+        sink,
+        _thresholds(),
+        asyncio.get_running_loop(),
+        identity=lambda: "node:h-1",
+        resolve_on_stop=True,
+        live_posture_clean=_read,
+    )
+    cast(Any, audit_tee).emit_audit_tee(
+        action="config_loaded",
+        actor="system",
+        channel_id=None,
+        detail=json.dumps({"loosenings": ["security.allow_x"]}),
+        ts=0.0,
+        row_id=1,
+        seq=1,
+        row_hash="0" * 64,
+    )
+    remove()
+    assert sink.restored == ["posture:start@node:h-1"]
+
+
 def test_the_unchecked_mark_is_spelled_as_the_engine_spells_it() -> None:
     assert security_signals._BASELINE_UNCHECKED == CONFIG_BASELINE_UNCHECKED_KEY
 
@@ -1272,6 +1419,7 @@ async def test_the_lifespan_wiring_names_the_process_and_resolves_only_an_unpinn
         sink,
         AlertsSettings(security_signals=False),  # installed even with the layer off
         ClusterSettings(node_id=node_id),
+        object(),  # no clean row here, so nothing reads the state
     )
     try:
         cast(Any, audit_tee).emit_audit_tee(
