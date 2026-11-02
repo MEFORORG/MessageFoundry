@@ -178,8 +178,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # #131, BACKLOG #2623: the object-flag toggle. config:deploy + same-origin (like bulk-control);
         # NO step-up (no engine path reads it), so it registers no write-action. The reused JSON handler
-        # writes the store, and REFUSES a name the running graph does not have with 409, which we
-        # render as a friendly notice.
+        # writes the store, and REFUSES with 409 a name the running graph does not have, and any
+        # toggle once the engine is stopping. We render that as a friendly notice.
         assert_same_origin(request)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         direction = form.get("direction", "")
@@ -199,7 +199,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return HTMLResponse(pages.flag_not_recorded(name, str(exc.detail)))
         except HTTPException as exc:
             if exc.status_code == 409:
-                # The running graph has no such connection.
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
             raise
         return RedirectResponse("/ui", status_code=303)

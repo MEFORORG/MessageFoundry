@@ -228,19 +228,23 @@ it could reach only its own copy.
    flagging a connection and flags nothing. There are no deployments, so there is nothing to migrate
    and no compatibility to keep.
 5. **Any connection in the running graph takes the flag**, code-first included. That is the branch
-   the 2026-07-19 scope fork deferred. A name the running graph does not have is refused **409**. A
-   cluster node toggles like any other: the store is the one thing the nodes share.
+   the 2026-07-19 scope fork deferred. A name the running graph does not have is refused **409**,
+   and so is any toggle once a shutdown's drain has begun. A cluster node toggles like any other:
+   the store is the one thing the nodes share.
 6. **A toggle still writes `connection_flag_set`**, with its actor and client, in the same transaction
    as the flag. If the row fails the flag does not change, and the route answers **503**. A commit
    whose answer was lost answers 503 too, and then both may have landed. So does a write the store
    leaves unanswered past the engine's 10-second bound, and a commit cut off there may land after
-   the 503. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
+   the 503. That bound is the one thing that cuts the write off: the engine runs it as a tracked
+   task, so a request deadline or a shutdown ends the caller's wait and not the write, and a
+   shutdown waits for it, for a bounded time, before the store closes. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
    Left on that list, a row with no digest would read as a degraded baseline and the next start would
    compare nothing.
 7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering
    a gate is a decision of its own, not a side effect of this move.
 8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept
-   a config write and its baseline row together went with it. `tests/test_config_write_census.py` now
+   a config write and its baseline row together went with it. The tracking and the shutdown drain
+   stayed, around the store write, and keep their names. `tests/test_config_write_census.py` now
    fails on an engine write through at least the writers it names, and on a direct write whose target
    names the config directory.
 

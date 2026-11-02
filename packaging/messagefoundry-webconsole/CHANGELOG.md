@@ -38,9 +38,9 @@ this line.**
   raises the `messagefoundry` floor to the engine release that adds it. The seam digest does not
   cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
 - **The flag toggle is on every row but a draining one, and the store holds the flag.** A code-first connection takes
-  the flag like any other, and a cluster node no longer refuses it. The refused-toggle page now
-  has one hint, for a name the running graph does not have. Needs the engine seam without
-  `ConnectionRow.toml_managed`. (`BACKLOG #2623`)
+  the flag like any other, and a cluster node no longer refuses it. The refused-toggle page's hint
+  now covers a name the running graph does not have and an engine that is stopping. Needs the
+  engine seam without `ConnectionRow.toml_managed`. (`BACKLOG #2623`)
 - **A failed flag read reads as unknown, not as unflagged.** Until the read recovers, a row offers
   no toggle, Flagged only hides no row, select-all under it takes no such row, and a notice above
   the table says why. (`BACKLOG #2623`)

@@ -199,6 +199,25 @@ async def test_flag_route_answers_503_when_the_audit_row_fails(toml_engine: Engi
     assert await toml_engine.store.list_connection_flags() == set()
 
 
+async def test_flag_route_answers_409_once_the_drain_has_begun(toml_engine: Engine) -> None:
+    """BACKLOG #2623: the gate's refusal reaches the caller as the route's 409, naming the cause, and
+    audits nothing, as a stopping engine's refusal did when the flag had a config file."""
+    service = await _deployer(toml_engine)
+    transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c)
+        await toml_engine.drain_config_writes(0.1)
+        r = await c.post(
+            "/connections/OB_TOML/flag",
+            json={"direction": "outbound", "flagged": True},
+            headers=h,
+        )
+    assert r.status_code == 409, r.text
+    assert "stopping" in r.json()["detail"]
+    assert await toml_engine.store.list_connection_flags() == set()
+    assert await toml_engine.store.list_audit(action="connection_flag_set") == []
+
+
 async def test_the_dashboard_shows_the_flag_on_each_direction_and_a_code_first_row(
     toml_engine: Engine,
 ) -> None:

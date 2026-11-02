@@ -474,6 +474,7 @@ async def test_a_store_that_never_answers_gets_the_refusal_within_the_bound(
         async with asyncio.timeout(5):
             await _flag(engine, "OB_TOML", "outbound")
     assert "within 0.05 s (outbound OB_TOML)" in caplog.text
+    assert not engine._config_writes
 
 
 @pytest.mark.parametrize("landed", [False, True], ids=["before-commit", "after-commit"])
@@ -503,6 +504,141 @@ async def test_a_refusal_at_the_bound_cannot_say_whether_the_write_landed(
     assert len(await store.list_audit(action="connection_flag_set")) == int(landed)
     await _flag(engine, "OB_CODE", "outbound")
     assert ("OB_CODE", "outbound") in await store.list_connection_flags()
+
+
+# --- The write outlives its caller ---------------------------------------------------------------
+
+
+class _SlowWrite:
+    """Holds the store's flag write open until :attr:`release`, then runs it. ``ended`` records how
+    it finished, so a test can tell a write that landed from one its caller cut short."""
+
+    def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+        self.ended: list[str] = []
+        real = engine.store.set_connection_flag
+
+        async def _slow(*args: object, **kwargs: object) -> None:
+            self.entered.set()
+            try:
+                await self.release.wait()
+                await real(*args, **kwargs)
+            except asyncio.CancelledError:
+                self.ended.append("cancelled")
+                raise
+            self.ended.append("landed")
+
+        monkeypatch.setattr(engine.store, "set_connection_flag", _slow)
+
+
+async def test_a_request_deadline_stops_the_wait_and_not_the_write(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deadline cancels the route (``api/request_timeout.py``, an ``asyncio.timeout`` around
+    the handler, which this reproduces). The write is the engine's task, so it runs on and lands
+    with its row. RED while the write runs inside the request, which cancels it."""
+    slow = _SlowWrite(engine, monkeypatch)
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.1):
+            await _flag(engine, "OB_TOML", "outbound")
+    assert slow.entered.is_set(), "control: the deadline fell during the write"
+    assert slow.ended == [], "the deadline reached the write"
+    slow.release.set()
+    await asyncio.wait_for(asyncio.gather(*engine._config_writes), 5)
+    assert slow.ended == ["landed"]
+    assert await engine.store.list_connection_flags() == {("OB_TOML", "outbound")}
+    assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
+    assert not engine._config_writes
+
+
+async def test_stop_waits_for_a_write_whose_caller_went(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write whose caller was cancelled still has its store write to finish, so stop waits for it
+    before the store closes, and the flag and its row are there at the next start. RED while the
+    write runs inside the request: the cancel ends it, and stop has nothing to wait for."""
+    _config_dir(tmp_path)
+    eng = await _engine(tmp_path)
+    slow = _SlowWrite(eng, monkeypatch)
+    real_close = eng.store.close
+
+    async def _close() -> None:
+        slow.ended.append("store closed")
+        await real_close()
+
+    monkeypatch.setattr(eng.store, "close", _close)
+    caller = asyncio.ensure_future(_flag(eng, "OB_TOML", "outbound"))
+    await asyncio.wait_for(slow.entered.wait(), 5)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    asyncio.get_running_loop().call_later(0.1, slow.release.set)
+    await eng.stop()
+    assert slow.ended == ["landed", "store closed"]
+    again = await _engine(tmp_path)
+    try:
+        assert await again.store.list_connection_flags() == {("OB_TOML", "outbound")}
+        assert len(await again.store.list_audit(action="connection_flag_set")) == 1
+    finally:
+        await again.stop()
+
+
+async def test_a_toggle_once_the_drain_has_begun_is_refused(engine: Engine) -> None:
+    """The gate closes before the drain waits, so a toggle that arrives after it is refused rather
+    than started as a write the drain never saw, landing as the store closes. RED with no gate."""
+    await engine.drain_config_writes(0.1)
+    with pytest.raises(WiringError, match="stopping"):
+        await _flag(engine, "OB_TOML", "outbound")
+    assert await engine.store.list_connection_flags() == set()
+    assert await engine.store.list_audit(action="connection_flag_set") == []
+
+
+async def test_the_bound_holds_for_a_write_whose_caller_went(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bound sits inside the write, so a hung store ends a write nobody is waiting on, and the
+    drain has nothing left to wait for. Its failure is logged once, through ``safe_exc``, and not
+    also reported by asyncio as an exception nobody retrieved."""
+    entered = asyncio.Event()
+
+    async def _hung(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(BOUND, 0.2)
+    monkeypatch.setattr(engine.store, "set_connection_flag", _hung)
+    caller = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
+        await asyncio.wait_for(entered.wait(), 5)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await asyncio.wait_for(asyncio.wait(set(engine._config_writes)), 5)
+        await asyncio.sleep(0.05)
+    messages = [record.getMessage() for record in caplog.records]
+    abandoned = [m for m in messages if m.startswith("config write failed after its caller")]
+    assert len(abandoned) == 1, messages
+    assert "did not confirm this toggle" in abandoned[0]
+    assert "within 0.2 s (outbound OB_TOML)" in caplog.text
+    assert not engine._config_writes
+
+
+async def test_a_write_cancelled_before_its_first_step_leaves_no_task_behind(
+    engine: Engine,
+) -> None:
+    """A task cancelled before it ever ran is still forgotten, or the drain would wait on it."""
+    caller = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound"))
+    # One pass of the loop: the caller schedules its task, which has not run yet.
+    await asyncio.sleep(0)
+    (task,) = engine._config_writes
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert task.cancelled()
+    assert not engine._config_writes
+    # And the engine still takes a write.
+    await _flag(engine, "OB_TOML", "outbound")
+    assert await engine.store.list_connection_flags() == {("OB_TOML", "outbound")}
 
 
 # --- What no longer holds the flag ---------------------------------------------------------------

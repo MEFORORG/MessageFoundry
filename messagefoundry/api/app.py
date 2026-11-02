@@ -1579,6 +1579,21 @@ def _managed_teardown_steps(
         )
     )
     steps += _app_drain_steps(app, store, auth, owns_auth=True)
+    # BACKLOG #2623: a connection flag write whose caller was cancelled still commits its row.
+    # Drained here, under the budget, rather than by the 5 s wait engine.stop() runs when no drain
+    # ran first. Draining closes the engine's gate, and engine.stop() then gives a write still
+    # running only a 1 s late wait, inside its reserve. Handed _INNER_SHARE of its bound, so its
+    # wait ends before the step is cut; the wait never cancels a write. A small floor, since the
+    # gate closes at once and most shutdowns have no write running. The embedded lifespan
+    # (create_app(engine=...)) has no such step, so its caller's engine.stop() runs the 5 s wait,
+    # outside the reserve that lifespan's budget assumes.
+    steps.append(
+        _TeardownStep(
+            "the config-write drain",
+            0.25,
+            lambda b: engine.drain_config_writes(b * _INNER_SHARE),
+        )
+    )
     if security_notifier is not None:
         # It drains queued user emails, and records a notice it could not send in the audit log,
         # so it closes while the store is open, after the lock notices that hand it mail (BACKLOG
@@ -5760,8 +5775,10 @@ def create_app(
         """Set the object-of-interest flag on a connection in the running graph (#131, BACKLOG
         #2623). The store holds the flag, so a toggle runs no config module and writes no file, and
         the flag and its ``connection_flag_set`` row commit together. A name the graph does not have
-        is refused **409**, and a toggle the store did not confirm **503**, which does not say the
-        flag is unchanged (:class:`ConnectionFlagNotRecorded`). Paced and audited.
+        is refused **409**, as is a toggle once a shutdown's drain has begun, and a toggle the store
+        did not confirm **503**, which does not say the flag is unchanged
+        (:class:`ConnectionFlagNotRecorded`). The request deadline ends this handler's wait, not the
+        write (:meth:`Engine.set_connection_flag`). Paced and audited.
 
         Gated by ``config:deploy``, which the flag's old home justified and which stays by decision:
         the flag marks what an operator should look at, and a change of gate is its own decision
@@ -5793,7 +5810,7 @@ def create_app(
             # not the route's only 503 and the console names this fix (BACKLOG #3811).
             raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
-            # The one 409: the running graph has no such connection.
+            # The running graph has no such connection, or the engine is stopping.
             raise HTTPException(409, str(exc)) from exc
         return {"name": name, "direction": req.direction, "flagged": req.flagged}
 

@@ -570,8 +570,8 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
 
 def flag_rejected(name: str, detail: str) -> Markup:
     """Shown when a flag toggle is refused (#131): the running graph has no such connection, as for
-    a page drawn before a reload removed it (BACKLOG #2623). Both ``name`` and ``detail`` are
-    escaped."""
+    a page drawn before a reload removed it, or the engine is stopping (BACKLOG #2623). Both
+    ``name`` and ``detail`` are escaped."""
     body = el(
         "div",
         el("h1", "Flag not changed"),
@@ -580,7 +580,8 @@ def flag_rejected(name: str, detail: str) -> Markup:
         el(
             "p",
             "Only a connection in the running graph can be flagged. A connection removed from the "
-            "config stops being one when the reload that removed it applies.",
+            "config stops being one when the reload that removed it applies. An engine that is "
+            "stopping takes no toggle, so try again once it is back.",
             class_="muted",
         ),
         el("p", el("a", "← Connections", href="/ui")),

@@ -142,6 +142,31 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     assert "try again" not in r.text.lower()
 
 
+async def test_ui_flag_tells_the_operator_a_stopping_engine_took_no_toggle(engine: Engine) -> None:
+    """BACKLOG #2623: once the shutdown's drain has begun, a toggle gets the 409's page, whose hint
+    has to fit this refusal as well as an unknown name."""
+    graph = Registry()
+    graph.add_inbound(
+        InboundConnection("IB_A", ConnectionSpec(ConnectorType.MLLP, {"port": 2579}), router="r")
+    )
+    graph.add_router("r", lambda m: [])
+    engine.add_registry(graph)
+    service = await auth_service(engine)
+    await provision(service, "dep", [Role.DEPLOYMENT.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "dep")
+        await engine.drain_config_writes(0.1)
+        r = await c.post(
+            "/ui/connections/IB_A/flag",
+            data={"direction": "inbound", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+    assert r.status_code == 200, r.text[:300]
+    assert "Flag not changed" in r.text
+    assert "the engine is stopping" in r.text
+    assert "An engine that is stopping takes no toggle" in r.text
+
+
 async def test_ui_flag_shows_the_not_confirmed_page_for_a_store_that_never_answers(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

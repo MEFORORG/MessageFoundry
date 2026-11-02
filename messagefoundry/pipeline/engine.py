@@ -145,13 +145,25 @@ log = logging.getLogger(__name__)
 #: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
 _ALERT_STATE_DRAIN_SECONDS = 5.0
 
+#: How long stop waits for config writes whose callers were cancelled (BACKLOG #2623), so their
+#: audit rows reach the store before it closes. Short, for the same reason as above. Only when no
+#: drain ran first: the managed API lifespan runs one under its shutdown budget (BACKLOG #3191), and
+#: stop then waits only :data:`_CONFIG_WRITE_LATE_DRAIN_SECONDS`.
+_CONFIG_WRITE_DRAIN_SECONDS = 5.0
+
+#: How long stop waits for a config write the lifespan's drain left running. Within the share of
+#: the shutdown budget the API reserves for stop (``_ENGINE_STOP_RESERVE_SECONDS`` in
+#: ``api/app.py``), and spent only while such a write is still running.
+_CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
+
 #: How long a connection flag toggle waits for the store (BACKLOG #2623). A write normally takes
 #: milliseconds, so this is a stuck or saturated store. Well under the API's 120 s request deadline
 #: (``api/request_timeout.py``), so the caller hears the toggle's own refusal and the console shows
 #: its page, not the deadline's JSON. It bounds the store call and nothing before it: the auth gate
 #: writes first, so a store stopped outright can still meet that deadline there. The refusal comes
 #: once the store call has unwound, which a stalled store can stretch past this, by
-#: ``_ROLLBACK_TIMEOUT`` on SQLite. Read at call time.
+#: ``_ROLLBACK_TIMEOUT`` on SQLite. It sits inside the tracked write, so it also ends a write whose
+#: caller has gone. Read at call time.
 CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS = 10.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
@@ -230,7 +242,23 @@ class ConnectionFlagNotRecorded(Exception):
     commit whose answer was lost may have landed both, and one cut off at
     :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS` may land after this is raised, so nothing here
     says which. A row that lands that way is in the audit chain but not the off-box tee
-    (``store.store.AuditedWrite``). The API answers 503: the store, not the request, is at fault."""
+    (``store.store.AuditedWrite``). The API answers 503: the store, not the request, is at fault.
+
+    That bound is the one thing that cuts a write off. A request deadline or a shutdown ends only
+    its caller's wait, so that caller never gets this; :meth:`Engine.set_connection_flag` says what
+    happens to the write."""
+
+
+def _log_abandoned_config_write(task: asyncio.Task[None]) -> None:
+    """Log how a config write ended after its caller was cancelled, since nobody else reads it.
+
+    Reading the error here also marks it retrieved, so asyncio does not report it again."""
+    if task.cancelled():
+        log.warning("config write cancelled after its caller had gone")
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("config write failed after its caller had gone: %s", safe_exc(exc))
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +736,14 @@ class Engine:
         self._graph_wake = asyncio.Event()
         self._graph_lock = asyncio.Lock()
         self._graph_reconcile_interval = 1.0
+        # The config writes started and not finished: today the connection flag's store write
+        # (BACKLOG #2623), the one write this engine tracks. A caller that is cancelled stops
+        # waiting but leaves its write running, so drain_config_writes waits for these, bounded,
+        # before the store closes, or the flag and its row could not land.
+        self._config_writes: set[asyncio.Task[None]] = set()
+        # Set by drain_config_writes before it waits for them; a write that arrives after that is
+        # refused.
+        self._config_writes_closed = False
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
         # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
@@ -2513,8 +2549,14 @@ class Engine:
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
         no such connection: the name has to be a real one, because the store would take any text.
-        Raises :class:`ConnectionFlagNotRecorded` when the store did not confirm the write within
-        :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`."""
+        It raises the same once :meth:`drain_config_writes` has begun. Raises
+        :class:`ConnectionFlagNotRecorded` when the store did not confirm the write within
+        :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`.
+
+        The write runs as a tracked task the caller only waits on, so a caller cancelled from then
+        on (a request deadline, a client that went away, a shutdown) stops waiting and does not stop
+        the write. It still ends at the bound, and :meth:`drain_config_writes` waits for it, for a
+        bounded time, before the store closes."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner
@@ -2525,6 +2567,10 @@ class Engine:
             graph.inbound_names() if direction == "inbound" else graph.outbound
         ):
             raise WiringError(f"the running graph has no {direction} connection {name!r}")
+        # No await between this and the task joining the set, so a drain either sees the task or
+        # this refuses it.
+        if self._config_writes_closed:
+            raise WiringError("the engine is stopping, so a connection flag cannot be set")
         audit = AuditAppend(
             "connection_flag_set",
             actor=actor,
@@ -2540,29 +2586,67 @@ class Engine:
             ),
             client=client,
         )
-        bound = CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS
-        deadline = asyncio.timeout(bound)
+
+        async def _write() -> None:
+            bound = CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS
+            deadline = asyncio.timeout(bound)
+            try:
+                async with deadline:
+                    await self.store.set_connection_flag(
+                        name, direction, flagged=flagged, audit=audit
+                    )
+            except Exception as exc:
+                if deadline.expired():
+                    # Cancelling the wait does not stop a commit already handed to the store.
+                    log.error(
+                        "the store did not confirm a connection flag change within %g s (%s %s), "
+                        "and it may still land: %s",
+                        bound,
+                        direction,
+                        name,
+                        safe_exc(exc),
+                    )
+                else:
+                    log.error(
+                        "the store did not confirm a connection flag change: %s", safe_exc(exc)
+                    )
+                raise ConnectionFlagNotRecorded(
+                    "the store did not confirm this toggle, so the flag may or may not have "
+                    "changed. Read it before you repeat the toggle. If this keeps failing, the "
+                    "engine log names the cause"
+                ) from exc
+
+        # asyncio.wait rather than asyncio.shield, as approvals._outlive_caller does: a shield
+        # reports a failure after its caller has gone to the loop's handler with a raw traceback,
+        # where this logs it once, rendered by safe_exc.
+        task = asyncio.ensure_future(_write())
+        self._config_writes.add(task)
+        task.add_done_callback(self._config_writes.discard)
         try:
-            async with deadline:
-                await self.store.set_connection_flag(name, direction, flagged=flagged, audit=audit)
-        except Exception as exc:
-            if deadline.expired():
-                # Cancelling the wait does not stop a commit already handed to the store.
-                log.error(
-                    "the store did not confirm a connection flag change within %g s (%s %s), and "
-                    "it may still land: %s",
-                    bound,
-                    direction,
-                    name,
-                    safe_exc(exc),
-                )
-            else:
-                log.error("the store did not confirm a connection flag change: %s", safe_exc(exc))
-            raise ConnectionFlagNotRecorded(
-                "the store did not confirm this toggle, so the flag may or may not have changed. "
-                "Read it before you repeat the toggle. If this keeps failing, the engine log names "
-                "the cause"
-            ) from exc
+            await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            task.add_done_callback(_log_abandoned_config_write)
+            raise
+        task.result()
+
+    async def drain_config_writes(self, timeout: float) -> None:
+        """Refuse every later config write, then wait up to ``timeout`` for the running ones.
+
+        A write whose caller was cancelled is still running, and it needs the store (BACKLOG
+        #2623). One still running past ``timeout`` is logged, and it is lost if the store closes
+        before it lands. The gate closes first, so a toggle that arrives from then on is refused
+        rather than started as a write this drain never saw. Waiting never cancels a write. The
+        managed API lifespan calls it under its shutdown budget (BACKLOG #3191), and :meth:`stop`
+        calls it again, so a write that drain left running gets one more short wait."""
+        self._config_writes_closed = True
+        if not self._config_writes:
+            return
+        _done, pending = await asyncio.wait(set(self._config_writes), timeout=timeout)
+        if pending:
+            log.warning(
+                "%d config write(s) still running at shutdown; their audit rows may be lost",
+                len(pending),
+            )
 
     @property
     def running_config_dir(self) -> Path | None:
@@ -3552,6 +3636,16 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # A config write whose caller was cancelled is still running, and its row needs the store
+        # (BACKLOG #2623). Under the managed API lifespan a drain has already run, bounded by its
+        # shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets only
+        # the short late wait here, inside this step's reserve; with none running it costs nothing.
+        # A caller whose shutdown ran no drain gets the fixed bound.
+        await self.drain_config_writes(
+            _CONFIG_WRITE_LATE_DRAIN_SECONDS
+            if self._config_writes_closed
+            else _CONFIG_WRITE_DRAIN_SECONDS
+        )
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
         # to land before the store closes. Last, so it covers every stop step above.
