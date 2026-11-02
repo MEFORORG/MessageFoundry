@@ -96,12 +96,15 @@ sufficient -- and reaping a live holder only drops us back to the unsynchronised
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from itertools import count
@@ -234,6 +237,19 @@ _REAP_RUNS_AFTER_S: Final = 86400.0
 _LOCKED_INTERPRETERS: Final = frozenset({"pwsh", "powershell"})
 
 _POLL_S: Final = 0.05
+
+
+def _binary_name(spelling: str) -> str:
+    """The interpreter a command spelling names: ``C:\\...\\pwsh.EXE`` is ``pwsh``."""
+    # SPLIT ON BOTH SEPARATORS REGARDLESS OF HOST, which pathlib alone does not. PurePosixPath
+    # does not treat a backslash as a separator, so on Linux the .name of a Windows-spelled pwsh
+    # path is the WHOLE SPELLING and this allowlist then refuses a launch it should take. That is
+    # measured on the ubuntu leg, which is where it failed. The tier writes Windows spellings and
+    # this module is imported on both platforms, so the parse cannot be the host path flavour.
+    # test_spawn_lock.py pins the refuted value beside the fixed one, so a later simplification
+    # back to pathlib has to argue with it rather than rediscover it on a red leg.
+    return spelling.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+
 
 #: Distinguishes concurrent readers inside ONE process. xdist workers are separate processes, so the
 #: pid separates those; a ``ThreadPoolExecutor`` inside one test is why the thread id and counter are
@@ -476,6 +492,138 @@ def spawn_burst(label: str) -> Iterator[None]:
                 gate.unlink(missing_ok=True)
 
 
+#: The signals a NATIVE CRASH dies on (BACKLOG #2746). ``subprocess`` reports a child killed by
+#: signal N as returncode ``-N``. SIGKILL and SIGTERM are absent on purpose: something else sends
+#: those -- the OOM killer, a timeout, a test -- so a child dying on one did not crash.
+#: ``hasattr`` because SIGBUS does not exist on Windows; the set is only compared, never sent.
+_CRASH_SIGNALS: Final = frozenset(
+    getattr(signal, n)
+    for n in ("SIGSEGV", "SIGABRT", "SIGBUS", "SIGILL", "SIGFPE")
+    if hasattr(signal, n)
+)
+
+#: The Windows face of the same event. Windows reports an NTSTATUS exit code, which Python returns
+#: unsigned, rather than a negative signal number. These two are the access violation and the stack
+#: overflow; a .NET stack overflow ALSO prints ``Stack overflow.`` to stderr, so the empty-streams
+#: condition below already excludes the managed one and only a silent native one qualifies.
+_WINDOWS_CRASH_STATUS: Final = {
+    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC00000FD: "STATUS_STACK_OVERFLOW",
+}
+
+
+class NativeCrashWarning(UserWarning):
+    """A launch died natively, with no output, and was retried once. Visible in pytest's summary."""
+
+
+class NativeCrashTwice(AssertionError):
+    """The retried launch died natively too. An AssertionError so pytest reports it as a failure."""
+
+
+def _native_crash(proc: object) -> str | None:
+    """Name the native crash ``proc`` died of, or ``None`` if it is anything else.
+
+    BOTH STREAMS MUST HAVE BEEN CAPTURED AND BE EMPTY. A stream that was not captured is ``None``,
+    and an unread stream is not an empty one, so an uncaptured launch is never classed as a crash.
+    Any output at all means the process got far enough to say something, and what it said is the
+    evidence: the runtime's own abort text, a managed stack overflow, or a real failure.
+
+    Anything but a ``CompletedProcess`` -- a test's fake ``subprocess.run`` -- is no crash.
+    """
+    if not isinstance(proc, subprocess.CompletedProcess):
+        return None
+    if proc.stdout is None or proc.stderr is None or proc.stdout or proc.stderr:
+        return None
+    rc = proc.returncode
+    if rc < 0 and -rc in _CRASH_SIGNALS:
+        return f"{signal.Signals(-rc).name} (returncode {rc})"
+    status = _WINDOWS_CRASH_STATUS.get(rc & 0xFFFFFFFF) if rc > 0 else None
+    return f"{status} (returncode {rc:#x})" if status else None
+
+
+@functools.cache
+def _interpreter_version(binary: str) -> str:
+    """The ``pwsh`` and .NET versions, read for the crash warning; text rather than a raise.
+
+    #2746's first closing step asks for both, and nothing on the runner records them. A SECOND
+    launch, so it runs only on the crash path, and its own failure is reported rather than raised:
+    a diagnostic must never be what fails the run. Cached: it cannot change within a process.
+    """
+    name = _binary_name(binary)
+    if name not in _LOCKED_INTERPRETERS:
+        return f"not read ({name} is not pwsh)"
+    probe = (
+        "$PSVersionTable.PSVersion.ToString() + ' on ' + "
+        "[System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription"
+    )
+    try:
+        out = subprocess.run(
+            [binary, "-NoProfile", "-NonInteractive", "-Command", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"unreadable ({type(exc).__name__})"
+    return out.stdout.strip() or f"unreadable (exit {out.returncode}, no output)"
+
+
+def run_retrying_a_native_crash(
+    cmd: Sequence[str], **kwargs: Any
+) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run``, launched ONCE MORE if the child crashed natively -- BACKLOG #2746.
+
+    THE FAILURE. ``pwsh`` on the ubuntu harness leg dies on SIGSEGV with stdout and stderr both
+    empty, in tests that change nothing about it; the row counts at least six, across different
+    tests and unrelated pull requests, each passing on a rerun. The test's own assertion then reports
+    ``exited -11`` as if the guard under test had failed. It had not: it never ran.
+
+    THE CONDITION IS NARROW ON PURPOSE, and each limb excludes something. A crash signal (or its
+    Windows NTSTATUS) and not any non-zero exit, so a real failure -- exit 1 -- is returned at once.
+    Both streams captured and empty, so a crash that said anything, such as .NET's ``Stack
+    overflow.`` or an unhandled-exception abort, stays the caller's to read. Once, never more: a
+    second crash raises :class:`NativeCrashTwice`, because a crash that repeats is a finding.
+
+    THE CAUSE IS NOT ESTABLISHED, and the warning says so rather than naming one. #1260 records the
+    trap: a retry wrapper that prints a plausible cause onto a leg where it was never measured turns
+    a true observation into an invented mechanism. A retried crash still leaves a
+    :class:`NativeCrashWarning` in pytest's summary, so the retry hides the red, not the evidence.
+
+    NO CRASH DUMP IS REQUESTED on the retry. ``DOTNET_DbgEnableMiniDump`` would write one, but
+    nothing on the leg uploads it, so collecting it needs a workflow change this helper does not
+    make; the dump stays #2746's first closing step.
+
+    A caller-supplied ``stdin`` stream is not retried, since the first launch may have consumed it;
+    ``input=`` is replayed as given. ``subprocess.run`` is looked up at call time, as ``run_single``
+    explains.
+    """
+    first = cast("subprocess.CompletedProcess[str]", subprocess.run(cmd, **kwargs))
+    replayable = kwargs.get("stdin") in (None, subprocess.PIPE, subprocess.DEVNULL)
+    crash = _native_crash(first)
+    if crash is None or not replayable:
+        return first
+    shown = subprocess.list2cmdline(list(cmd))
+    version = _interpreter_version(cmd[0])
+    warnings.warn(
+        NativeCrashWarning(
+            f"NATIVE CRASH: {shown} died on {crash} with stdout and stderr both empty, so it never "
+            f"reported anything; interpreter {version}. Retrying ONCE. This is not a test failure, "
+            "and the CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
+        ),
+        stacklevel=2,
+    )
+    second = cast("subprocess.CompletedProcess[str]", subprocess.run(cmd, **kwargs))
+    again = _native_crash(second)
+    if again is not None:
+        raise NativeCrashTwice(
+            f"NATIVE CRASH TWICE: {shown} died on {crash}, then on {again} when retried, with no "
+            f"output either time; interpreter {version}. No test assertion ran on it, and the "
+            "CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
+        )
+    return second
+
+
 def run_single(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     """``subprocess.run`` for ONE INTERPRETER launch, held on the shared side of the lock.
 
@@ -496,16 +644,8 @@ def run_single(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess
     diagnostic -- still intercepts this call. A ``from subprocess import run`` here would silently
     bypass that test's patch and the test would stop proving anything.
     """
-    # SPLIT ON BOTH SEPARATORS REGARDLESS OF HOST, which pathlib alone does not. PurePosixPath
-    # does not treat a backslash as a separator, so on Linux the .name of a Windows-spelled pwsh
-    # path is the WHOLE SPELLING and this allowlist then refuses a launch it should take. That is
-    # measured on the ubuntu leg, which is where it failed. The tier writes Windows spellings and
-    # this module is imported on both platforms, so the parse cannot be the host path flavour.
-    # test_spawn_lock.py pins the refuted value beside the fixed one, so a later simplification
-    # back to pathlib has to argue with it rather than rediscover it on a red leg.
     spelling = cmd[0] if cmd else ""
-    binary = spelling.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
-    if binary not in _LOCKED_INTERPRETERS:
+    if _binary_name(spelling) not in _LOCKED_INTERPRETERS:
         raise ValueError(
             f"run_single is for an interpreter launch, not {spelling!r}. Only "
             f"{sorted(_LOCKED_INTERPRETERS)} are expensive enough to be worth the lock; holding a "
@@ -513,4 +653,4 @@ def run_single(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess
             "disables this module. Call subprocess.run directly."
         )
     with single_spawn():
-        return cast("subprocess.CompletedProcess[str]", subprocess.run(cmd, **kwargs))
+        return run_retrying_a_native_crash(cmd, **kwargs)
