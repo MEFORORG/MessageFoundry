@@ -555,6 +555,10 @@ def engine_probe(monkeypatch: pytest.MonkeyPatch) -> str:
     return name
 
 
+#: How a refusal the loader rebuilds opens: it has no frame of the module on its traceback.
+_NAMED = "error loading config module feed.py: "
+
+
 def _calling(name: str, call: str) -> str:
     return f"import {name} as probe\n\nprobe.{call}\n"
 
@@ -562,10 +566,10 @@ def _calling(name: str, call: str) -> str:
 @pytest.mark.parametrize(
     ("call", "kept"),
     [
-        (f"wraps_a_builtin({NEEDLE!r})", "inbound 'IB_3765': [ValueError text withheld]"),
+        (f"wraps_a_builtin({NEEDLE!r})", f"{_NAMED}inbound 'IB_3765': [ValueError text withheld]"),
         (
             f"wraps_its_repr({NEEDLE!r})",
-            "error loading config module feed.py: knob: [ValueError text withheld]",
+            f"{_NAMED}knob: [ValueError text withheld]",
         ),
     ],
     ids=["wiring-error", "plain-error"],
@@ -594,7 +598,7 @@ def test_a_refusal_hiding_a_builtin_with_from_none_drops_it_from_the_chain(
     # `from None` hides the context from the printer. A reader of __context__ still gets the value.
     _write(tmp_path, "feed.py", _calling(engine_probe, f"hides_a_builtin({NEEDLE!r})"))
     err = _load_error(tmp_path)
-    assert str(err) == "knob is not a number (value withheld)"
+    assert str(err) == f"{_NAMED}knob is not a number (value withheld)"
     assert err.__cause__ is None and err.__context__ is None
 
 
@@ -603,7 +607,7 @@ def test_a_refusal_wrapping_author_code_loses_the_authors_text(
 ) -> None:
     body = f"def boom():\n    raise KeyError({NEEDLE!r})\n\nprobe.wraps_author_code(boom)\n"
     _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{body}")
-    assert str(_load_error(tmp_path)) == "callback failed: [KeyError text withheld]"
+    assert str(_load_error(tmp_path)) == f"{_NAMED}callback failed: [KeyError text withheld]"
 
 
 def test_an_author_str_that_raises_withholds_the_whole_refusal(
@@ -649,7 +653,7 @@ def test_a_rebuilt_refusal_keeps_a_textless_import_cause(tmp_path: Path, engine_
     # The engine-shard preflight reads the cause's type for its helper advice.
     _write(tmp_path, "feed.py", _calling(engine_probe, "wraps_a_failed_import()"))
     err = _load_error(tmp_path)
-    assert str(err) == "an extra is missing"
+    assert str(err) == f"{_NAMED}an extra is missing"
     assert isinstance(err.__cause__, ModuleNotFoundError)
     assert not err.__cause__.args
 
@@ -834,7 +838,7 @@ def test_an_inner_error_a_library_holds_as_an_attribute_is_foreign_too(
 ) -> None:
     # urllib3 keeps one in `reason`, where neither __cause__ nor __context__ points at it.
     _write(tmp_path, "feed.py", _calling(engine_probe, f"wraps_a_held_error({NEEDLE!r})"))
-    assert str(_load_error(tmp_path)) == "wrapped: [ValueError text withheld]"
+    assert str(_load_error(tmp_path)) == f"{_NAMED}wrapped: [ValueError text withheld]"
 
 
 def test_a_refusal_quoting_an_exception_group_member_loses_its_text(
@@ -842,7 +846,7 @@ def test_a_refusal_quoting_an_exception_group_member_loses_its_text(
 ) -> None:
     _write(tmp_path, "feed.py", _calling(engine_probe, f"wraps_a_group_member({NEEDLE!r})"))
     err = _load_error(tmp_path)
-    assert str(err) == "wrapped: [ValueError text withheld]"
+    assert str(err) == f"{_NAMED}wrapped: [ValueError text withheld]"
     assert err.__cause__ is None and err.__context__ is None
 
 
@@ -856,7 +860,7 @@ def test_a_note_a_module_adds_to_a_refusal_does_not_ride_out(
     )
     _write(tmp_path, "feed.py", f"import {engine_probe} as probe\n\n{body}")
     err = _load_error(tmp_path)
-    assert str(err) == "engine refusal 3765"
+    assert str(err) == f"{_NAMED}engine refusal 3765"
     assert not hasattr(err, "__notes__")
     assert err.__cause__ is None and err.__context__ is None
 
@@ -866,7 +870,7 @@ def test_a_note_on_a_link_of_a_kept_chain_does_not_ride_out(
 ) -> None:
     _write(tmp_path, "feed.py", _calling(engine_probe, f"wraps_a_noted_one({NEEDLE!r})"))
     err = _load_error(tmp_path)
-    assert str(err) == "wrapped: engine refusal 3765"
+    assert str(err) == f"{_NAMED}wrapped: engine refusal 3765"
     assert err.__cause__ is None and err.__context__ is None
 
 
@@ -1567,6 +1571,106 @@ def test_a_gate_refuses_a_module_that_exits(
     output = captured.out + captured.err
     assert "feed.py" in output and "sys.exit()" in output
     assert NEEDLE not in output
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"try:\n    int({NEEDLE!r})\nexcept ValueError:\n    {_REFUSED_FACTORY}\n",
+        "from messagefoundry.config.wiring import WiringError\n\n"
+        "try:\n"
+        f"    {_REFUSED_FACTORY}\n"
+        "except WiringError as exc:\n"
+        f"    exc.add_note({NEEDLE!r})\n"
+        "    raise\n",
+    ],
+    ids=["handling-a-builtin", "a-note"],
+)
+def test_a_rebuilt_refusal_names_its_module_in_its_text_and_a_logged_traceback(
+    tmp_path: Path, body: str
+) -> None:
+    # What a logged start failure prints, and the str() the flag route's 409 and the reload WARNING
+    # read. The rebuilt refusal's traceback starts in the loader, so only its text can say which.
+    _write(tmp_path, "feed.py", f"from messagefoundry import Http\n\n{body}")
+    err = _load_error(tmp_path)
+    logged = logging.Formatter().formatException((type(err), err, err.__traceback__))
+    assert str(err).startswith(_NAMED)
+    assert "reply_on_timeout" in str(err)
+    assert _NAMED in logged
+    assert NEEDLE not in logged
+
+
+def test_an_exception_a_module_was_handling_does_not_rewrite_a_connection_name(
+    tmp_path: Path,
+) -> None:
+    body = (
+        "from messagefoundry import MLLP, inbound\n\n"
+        "try:\n"
+        "    {}['tls']\n"
+        "except KeyError:\n"
+        "    inbound('IB_tls', MLLP(port=2575), router='r', source_ip_allowlist=['nope'])\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    text = str(_load_error(tmp_path))
+    assert "'IB_tls'" in text and "text withheld" not in text
+
+
+_K = "[KeyError text withheld]"
+
+
+@pytest.mark.parametrize(
+    ("text", "quotation", "expected"),
+    [
+        # A part of a longer token stays: these are what an operator searches a log for.
+        ("inbound 'IB_tls': bad", "tls", "inbound 'IB_tls': bad"),
+        ("inbound 'tls_IB': bad", "tls", "inbound 'tls_IB': bad"),
+        ("inbound 'IB-tls': bad", "tls", "inbound 'IB-tls': bad"),
+        ("inbound 'IB9tls9': bad", "tls", "inbound 'IB9tls9': bad"),
+        # Standing alone it goes, whatever punctuation a raise site puts around it.
+        ("bad: tls", "tls", f"bad: {_K}"),
+        ("bad tls.", "tls", f"bad {_K}."),
+        ("key=tls&x=1", "tls", f"key={_K}&x=1"),
+        ("https://tls.example/", "tls", f"https://{_K}.example/"),
+        ("tls", "tls", _K),
+        # An edge that is punctuation cannot split a token, so nothing beside it spares the quotation.
+        ("value'tls'x", "'tls'", f"value{_K}x"),
+        # Text equal to a whole identifier is withheld: the two cannot be told apart.
+        ("inbound 'tls': bad", "tls", f"inbound '{_K}': bad"),
+    ],
+)
+def test_a_quotation_is_withheld_alone_and_kept_inside_a_token(
+    text: str, quotation: str, expected: str
+) -> None:
+    assert wiring._withhold_quotations(text, {quotation: "KeyError"}) == expected
+
+
+def test_a_shorter_quotation_overlapping_a_longer_one_leaves_none_of_the_longer() -> None:
+    quoted = {"the port": "KeyError", "port=planted": "ValueError"}
+    assert wiring._withhold_quotations("the port=planted", quoted) == (
+        "the [ValueError text withheld]"
+    )
+
+
+def test_a_setting_name_equal_to_a_handled_exceptions_text_is_withheld_as_the_cheaper_failure(
+    tmp_path: Path,
+) -> None:
+    # The cost of keeping every standalone quotation out: pinned, so a change to it is a decision.
+    body = (
+        "from messagefoundry import MLLP, inbound\n\n"
+        "try:\n"
+        "    {}['source_ip_allowlist']\n"
+        "except KeyError:\n"
+        "    inbound('IB_a', MLLP(port=2575), router='r', source_ip_allowlist=['nope'])\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    assert "[KeyError text withheld] entry 0" in str(_load_error(tmp_path))
+
+
+def test_a_quotation_does_not_match_inside_a_marker_or_a_longer_quotation() -> None:
+    quoted = {"text": "KeyError", "withheld": "ValueError", "a text b": "OSError"}
+    assert wiring._withhold_quotations("a text b, text", quoted) == (
+        "[OSError text withheld], [KeyError text withheld]"
+    )
 
 
 def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:

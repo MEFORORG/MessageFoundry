@@ -10,11 +10,16 @@
   library or author code, the whole text of that exception is replaced by its type name, and the
   refusal is rebuilt as a plain `WiringError`: every note and its whole chain go, engine links
   included, and an `ImportError` cause stays only as a textless stand-in. A refusal with a note on
-  it, or on anything it wraps, is rebuilt the same way. A slice of the text, or text copied before
-  the raise, is not caught. In a config module, at least the `tls_ca_pin`, `intake_auth`,
+  it, or on anything it wraps, is rebuilt the same way. A slice of the text, text copied before
+  the raise, or text run into a longer token by a letter, a digit, `_` or `-`, is not caught: that
+  last is what keeps an argument such as `tls` from rewriting the connection name `IB_tls`. Text equal
+  to a whole identifier or word of the refusal, such as a connection named `tls` or the setting
+  `source_ip_allowlist`, is replaced there too. In a config module, at least the `tls_ca_pin`, `intake_auth`,
   `intake_auth_health`, `reply_on_timeout`, `reply_on_empty`, `reply_content_type`,
   `source_ip_allowlist`, `content_type` and `ws_password_type` refusals, an `intake_client_subjects`
-  subject and an issuer that is not a DN no longer quote the value. A call with an unexpected or
+  subject and an issuer that is not a DN no longer quote the value. An issuer key that does parse as a
+  DN is still quoted by the later `intake_client_subjects` refusals, so that check withholds only a
+  key that fails its first test. A call with an unexpected or
   repeated keyword now reads `TypeError at line N naming 'keyword'`, when the source line spells
   that keyword. A config module that raises a `BaseException` that is not an `Exception` is now
   refused as a failed module, with no text, and a `SystemExit` of any class is refused the same way
@@ -40,6 +45,12 @@
   `WiringError` itself; one that builds a class whose name holds a value; one that compiles code
   under an engine file name to forge a frame; the frames on an interrupt's traceback,
   which still hold the withheld exception; and the traceback of a refusal, whose module frames hold
-  that module's globals. That traceback is kept, because a logged start failure reads it to name the
-  module and line, and because the loader's own frames on it would still reach those values through
-  the load's snapshot of the files and through its registry.
+  that module's globals. That traceback is kept on a refusal that stands as raised, and on the
+  original that an engine exception other than a `WiringError` keeps as its cause, because a logged
+  start failure reads it to name the module and line, and because the loader's own frames on it would
+  still reach those values through the load's snapshot of the files and through its registry. Any
+  other refusal the loader rebuilds has no frame of the module on it, so its text opens with
+  `error loading config module <file>:`, which is how a logged start failure, the reload WARNING and
+  the flag route's 409 name it. That is the module being loaded: not its line, nor a helper the
+  refusal came from. A refusal that stands as raised has no such opening, so that WARNING and that
+  409 do not name its module.

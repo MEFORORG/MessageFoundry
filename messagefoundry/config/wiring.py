@@ -9889,12 +9889,58 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
     return any(type(exc) is limit for limit in _RUNTIME_LIMITS) and raised_only_by_the_engine(exc)
 
 
-def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
-    """The diagnostic for ``exc``, an engine refusal, with the whole text it quotes from each foreign
-    link of its chain replaced by that exception's type name, or ``None`` when it has no such link
-    and no note, and stands as raised (vault BACKLOG #3765 item 1). The caller builds a new, plain
-    ``WiringError`` from this text, so a subclass, every note and the whole chain go with it,
-    engine links included.
+def _splits_a_token(text: str, at: int, quotation: str) -> bool:
+    """Whether ``quotation``, found in ``text`` at ``at``, is part of a longer token rather than
+    standing alone: an edge of it that is an identifier character, against another one in ``text``."""
+    following = at + len(quotation)
+    before = at > 0 and _is_identifier_character(text[at - 1])
+    after = following < len(text) and _is_identifier_character(text[following])
+    return (before and _is_identifier_character(quotation[0])) or (
+        after and _is_identifier_character(quotation[-1])
+    )
+
+
+def _is_identifier_character(character: str) -> bool:
+    return character.isalnum() or character in "_-"
+
+
+def _withhold_quotations(text: str, quoted: Mapping[str, str]) -> str:
+    """``text`` with each key of ``quoted`` replaced by a marker naming its value, a type.
+
+    The spans are chosen before anything is written, so a quotation cannot match inside a marker. No
+    regular expression: these patterns are a config module's text. Longest first over the whole text,
+    so a repr goes before the str inside it, and a shorter quotation overlapping a longer one cannot
+    leave the longer one's tail printed. A quotation that is only part of a longer token stays, or an
+    argument such as ``tls`` would rewrite the connection name ``IB_tls``. Standing alone it is
+    replaced, even where it equals an identifier or a word of the refusal: nothing here can tell a
+    connection named ``tls`` from a quoted value, and the marker is the failure to prefer."""
+    taken = bytearray(len(text))
+    spans: list[tuple[int, int, str]] = []
+    for quotation in sorted(quoted, key=len, reverse=True):
+        at = text.find(quotation)
+        while at != -1:
+            following = at + len(quotation)
+            if any(taken[at:following]) or _splits_a_token(text, at, quotation):
+                at = text.find(quotation, at + 1)
+                continue
+            taken[at:following] = b"\x01" * len(quotation)
+            spans.append((at, following, quoted[quotation]))
+            at = text.find(quotation, following)
+    pieces: list[str] = []
+    written = 0
+    for at, following, kind in sorted(spans):
+        pieces += [text[written:at], f"[{kind} text withheld]"]
+        written = following
+    pieces.append(text[written:])
+    return "".join(pieces)
+
+
+def _rewritten_refusal(exc: BaseException) -> str | None:
+    """The text of ``exc``, an engine refusal, with the whole text it quotes from each foreign link
+    of its chain replaced by that exception's type name, or ``None`` when it has no such link and no
+    note, and stands as raised (vault BACKLOG #3765 item 1). The caller builds a new, plain
+    ``WiringError`` from this text, so a subclass, every note and the whole chain go with it, engine
+    links included.
 
     A foreign link is one that is not :func:`_is_engine_text`, ``from None`` or not: that hides a
     context from
@@ -9903,9 +9949,9 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
 
     A template of ours around somebody else's text is not ours: ``f"{where}: {exc}"`` prints what
     ``int()`` or a library said, and either can quote the value it was given. A quotation in any
-    other shape, such as a slice of that text, is not caught. So the raise sites that wrap are still
-    the place to convert a failure. A short quotation can also take a word of the engine's prose
-    with it, which is the cheaper failure."""
+    other shape, such as a slice of that text or that text run into a longer token, is not caught.
+    So the raise sites that wrap are still the place to convert a failure. A short quotation can
+    also take a word of the engine's prose with it, which is the cheaper failure."""
     links = list(exception_chain(exc))
     foreign = [link for link in links if link is not exc and not _is_engine_text(link)]
     if not foreign and not any(hasattr(link, "__notes__") for link in links):
@@ -9916,13 +9962,7 @@ def _rewritten_refusal(path: Path, exc: BaseException) -> str | None:
         for quotation in (repr(link), str(link), *(a for a in link.args if isinstance(a, str)))
         if len(quotation) >= _SHORTEST_QUOTATION
     }
-    text = str(exc)
-    # Longest first, so a repr goes before the str inside it.
-    for quotation in sorted(quoted, key=len, reverse=True):
-        text = text.replace(quotation, f"[{quoted[quotation]} text withheld]")
-    if issubclass(type(exc), WiringError):
-        return text
-    return f"error loading config module {path.name}: {text}"
+    return _withhold_quotations(str.__str__(str(exc)), quoted)
 
 
 def _refusal_for(
@@ -9937,7 +9977,7 @@ def _refusal_for(
     value; tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no
     refusal that sits behind another. What it was raised from that the engine did not word can hold
     a value: the whole text of such an exception is taken out of the refusal, and the chain goes. A
-    slice of that text, or a copy made before the raise, stays. Only an exact ``WiringError`` whose
+    slice of that text, a copy made before the raise, or that text run into a longer token, stays. Only an exact ``WiringError`` whose
     arguments are text stands as raised: a subclass can write what prints through more methods than
     one, and ``check`` formats a refusal with an f-string, so any other is rebuilt plain.
 
@@ -9952,7 +9992,7 @@ def _refusal_for(
     fault: BaseException
     try:
         if _keeps_engine_wording(exc):
-            text = _rewritten_refusal(path, exc)
+            text = _rewritten_refusal(exc)
             if text is None:
                 # The real type: ``__class__`` can answer WiringError, and a ``raise`` of that would
                 # leave ``validate_config``, which catches only the real one. Only text: a caller
@@ -9963,14 +10003,17 @@ def _refusal_for(
                     # ``!s``, or the f-string would run a ``__format__`` of the class's own.
                     return WiringError(f"error loading config module {path.name}: {exc!s}"), exc
                 text = str(exc)
+            # A refusal built here starts its traceback in the loader, with no frame of the module
+            # on it, so its text has to name the module for a log line or a 409 to say which failed.
+            # An exact ``str``: ``str()`` can return a subclass, whose own ``__format__`` the f-string
+            # would run, and whose own ``__str__`` a caller would run past this guard.
+            text = f"error loading config module {path.name}: {str.__str__(text)}"
             imported = exc.__cause__
         else:
             text = _module_failure(path, exc, source_of)
             imported = exc
         cause = _textless_import_error(imported) if isinstance(imported, ImportError) else None
-        # An exact ``str``: ``str()`` can return a subclass, whose own ``__str__`` a caller would run
-        # past this guard.
-        return WiringError(str.__str__(text)), cause
+        return WiringError(text), cause
     except BaseException as caught:  # noqa: BLE001 - _read_fault lets an interrupt through
         fault = caught
     _read_fault(path, fault)
@@ -10103,8 +10146,9 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
                 # Not scrubbed, because the scrub would mangle the engine's own fix advice, which
                 # spells `credential_password=env(...)`. `_exec_module` has already withheld a
                 # module's own text (vault BACKLOG #3249) and the whole text of a foreign exception
-                # an engine refusal wraps (vault BACKLOG #3765 item 1). It cannot reach a slice of
-                # that text, or a value a raise site interpolates.
+                # an engine refusal wraps (vault BACKLOG #3765 item 1). It cannot reach at least a
+                # slice of that text, that text run into a longer token, or a value a raise site
+                # interpolates.
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
