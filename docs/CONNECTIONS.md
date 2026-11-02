@@ -1802,8 +1802,8 @@ port compared.
 
 `[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords:
 the list is hand-chosen, no keyword is on it in order to name a host, and a file
-keyword's value is screened separately by spelling (vault BACKLOG #2577). **The list covers
-keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
+keyword's value is screened separately, as the paragraph on file keywords below says (vault
+BACKLOG #2577). **The list covers keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
 in a braced password (*The password*, below), and the driver reading `SERVER` as its target
 (*This is a rule about keywords*, below).** The keywords set at least a port, a TLS mode, a local file or a session option:
 
@@ -1838,10 +1838,12 @@ first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The 
 file with its own TLS library, which can wait for a password on an encrypted block. At least
 these cases are left to the driver unchecked: a file that does not exist, a directory (an
 `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
-over 1 MiB, is refused. That includes a share Windows cannot reach when the connection is
-built, however it fails. One case is left to the driver instead: under the TLS-off modes the lane
-check below names, a share Windows reports as not found because it could not reach it (errors
-53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+over 1 MiB, is refused. A path the file-keyword check above finds leads to a share is refused
+before this read, in every SSL mode, whether Windows can reach the share or not. A path that
+check cleared, which then fails this read because Windows cannot reach a share, is refused too,
+however it fails. One case is left to the driver instead: under the TLS-off modes the lane check
+below names, such a path Windows reports as not found because it could not reach the share
+(errors 53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
 first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
 material.
 

@@ -23,7 +23,8 @@ import stat
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -33,6 +34,7 @@ from messagefoundry.auth.trust_anchors import (
     AUDIT_ACTION,
     ENCRYPTION_HEADER_SCOPE,
     PRIVATE_KEY_SCOPE,
+    AnchorSettingRefused,
     TrustAnchorError,
 )
 from messagefoundry.config import wiring
@@ -444,6 +446,55 @@ def test_a_value_that_can_name_another_host_is_never_opened(
             ta.lane_anchor_spec("outbound", _OUT, _settings(remote))
     assert touched == []
     assert "db-ca.invalid" not in str(refused.value)
+
+
+async def test_a_refused_sslca_names_the_setting_the_operator_set(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A DATABASE lane takes no ``tls_ca_file``, so its refusal names ``odbc_params sslca``, and never
+    the value. Through the real lane check, a start and a passive standby's line, and the setting a
+    reload refusal carries. It still refuses: the check raises ``AnchorSettingRefused`` and writes
+    no row. Red with these lines back on ``tls_ca_pin or tls_ca_file``. The control: a lane whose
+    CA is a ``tls_ca_file`` keeps that name."""
+    settings = _settings("//files.invalid/share/ca.pem")
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    with pytest.raises(AnchorSettingRefused, match="must be a plain local path") as refused:
+        await check("outbound", _OUT, settings)
+    assert await _rows(store, f"outbound:{_OUT}") == []
+
+    line = wiring_runner._lane_anchor_line("outbound", _OUT, settings, refused.value, passive=False)
+    assert str(line) == (
+        f"outbound connection '{_OUT}': its odbc_params sslca setting was refused. Fix the setting, "
+        "then reload and start the connection; the server log says why"
+    )
+    assert line.setting == f"outbound connection '{_OUT}' odbc_params sslca"
+    passive = wiring_runner._lane_anchor_line(
+        "outbound", _OUT, settings, refused.value, passive=True
+    )
+    assert "its odbc_params sslca setting was refused on this passive DR" in str(passive)
+    assert "files.invalid" not in str(line) and "files.invalid" not in str(passive)
+
+    async def refusing(*_args: object, **_kwargs: object) -> None:
+        raise AnchorSettingRefused("refused")
+
+    reloading = SimpleNamespace(
+        _lane_anchor_check=check,
+        _reload_anchor_lanes=lambda *_a: [("outbound", _OUT, settings)],
+        _check_lane_anchor=refusing,
+    )
+    with pytest.raises(wiring.WiringError) as reload_refused:
+        await wiring_runner.RegistryRunner._check_reload_lane_anchors(
+            cast(Any, reloading), Registry(), Registry(), []
+        )
+    cause = reload_refused.value.__cause__
+    assert isinstance(cause, TrustAnchorError)
+    assert cause.setting == f"outbound connection '{_OUT}' odbc_params sslca"
+
+    plain = {"tls_ca_file": str(_ca(tmp_path)), "tls_ca_pin": ""}
+    assert wiring_runner._refused_setting_keys(plain) == "tls_ca_pin or tls_ca_file"
+    assert "tls_ca_pin or tls_ca_file setting was refused" in str(
+        wiring_runner._lane_anchor_line("outbound", _OUT, plain, refused.value, passive=False)
+    )
 
 
 def test_a_ca_that_leads_off_the_host_after_the_build_is_refused_not_skipped(

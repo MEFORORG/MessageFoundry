@@ -2600,7 +2600,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and
     :class:`AnchorSettingRefused`, a ``ValueError``, for a ``tls_ca_pin`` that is blank, unread or
-    does not parse, or a CA path the OS will not take. Each names the connection. A lane with no
+    does not parse, a CA path the OS will not take, or a generic DATABASE ``sslca`` value
+    :func:`~messagefoundry.transports.database.names_another_host` refuses (BACKLOG #2705), in
+    every ``sslmode``. Each names the connection. A lane with no
     CA it reads is a no-op: no store call, no audit row. A store that refuses the audit read or
     write raises :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered
     below, so the next check reads the file again (BACKLOG #3091).

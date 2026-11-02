@@ -14,7 +14,8 @@ job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T
 any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
 list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`): the list is hand-chosen, no keyword is on it in order to
-name a host, and a file keyword's value is screened separately by spelling.
+name a host, and a file keyword's value is screened separately: by its spelling, and on Windows
+by a best-effort check of where the path leads (:func:`names_another_host`).
 ``[egress].allowed_db`` reads the host from the ``server`` setting (vault BACKLOG #2577). The list covers
 keywords only, and relies on at least a driver named on the escape list reading the ``}}`` escape in a
 braced password (:func:`_odbc_password`), and the driver reading ``SERVER`` as its target
@@ -291,8 +292,9 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # driver has its own keywords for a host, an address, a data source name, a socket or a whole option
 # string, and a new driver release can add another. A list of refused names would always trail the
 # drivers. Here the list is hand-chosen, no keyword is on it in order to name a host,
-# and a file keyword's value is screened separately by spelling. :func:`_build_odbc_dsn` refuses
-# everything else when the connection is built.
+# and a file keyword's value is screened separately: by its spelling, and on Windows by a
+# best-effort check of where the path leads (:func:`names_another_host`).
+# :func:`_build_odbc_dsn` refuses everything else when the connection is built.
 #
 # WHAT EARNS A PLACE. A keyword whose value is a port, a TLS mode, a local file the driver verifies or
 # authenticates with, or a session setting. Nothing that names a host, a service, a data source or a
@@ -1048,7 +1050,9 @@ def _refuse_encrypted_driver_ca(
     :func:`~messagefoundry.auth.trust_anchors.has_private_key_label_bytes` (BACKLOG #3745).
 
     :func:`_driver_file_spellings` says which paths are left to the driver, and which spellings
-    are read. A share Windows reports as not found because it could not reach it is refused,
+    are read. A value :func:`names_another_host` refuses is refused unread in every ``sslmode``,
+    including a share Windows could not reach during that check. A path that check cleared, whose
+    read then reports it as not found because Windows could not reach the share, is refused too,
     unless ``sslmode`` turns TLS off (:func:`generic_odbc_tls_off`): then the driver reads no CA,
     so it never meets that file.
 
