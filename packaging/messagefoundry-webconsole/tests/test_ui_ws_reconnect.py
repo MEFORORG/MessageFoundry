@@ -28,7 +28,49 @@ import messagefoundry_webconsole
 _APP_JS = Path(messagefoundry_webconsole.__file__).parent / "static" / "app.js"
 _NODE = shutil.which("node")
 
-pytestmark = pytest.mark.skipif(_NODE is None, reason="node is not installed")
+#: The bound on ONE harness run, which is what catches a reconnect hang. The harness cannot loop on
+#: its own: ``setTimeout`` only pushes onto ``timers``, ``setInterval`` is a no-op, ``fetch`` never
+#: resolves, and "flush" swaps the due list out (``const due = timers; timers = [];``) before running
+#: it, so a timer that re-arms lands in the NEXT flush. A run that outlives this bound is therefore
+#: app.js spinning synchronously, which is the hang this file must still fail on. Locally a run takes
+#: about 0.05 s.
+_RUN_TIMEOUT_S = 60
+
+#: The bound on the FIRST node launch of the job, kept apart from the run bound above. On
+#: windows-2025 under xdist the first launch of the image's node.exe has stalled past 60 s twice
+#: (merge-queue evictions, BACKLOG #4773): run 41141529043 lost the first of this file's four
+#: launches and run 41490064678 the first two; every later launch in both jobs, the same harness
+#: over the same app.js, passed. No other file in this suite starts node. So the stall is node's
+#: first launch, not app.js -- an inference, since the logs carry no per-launch timing. Unlike the
+#: never-returning pwsh launch BACKLOG #1304 records, this stall ended, so a longer bound on the
+#: cold start alone absorbs it. Run 41490064678 puts it over 120 s and under about 180 s.
+_COLD_START_TIMEOUT_S = 240
+
+pytestmark = [
+    pytest.mark.skipif(_NODE is None, reason="node is not installed"),
+    # The cold start is charged to the first test's setup, so the CI tier's --timeout=120 (60 in
+    # pyproject) would kill the worker through --timeout-method=thread with no test named. One cold
+    # start plus one run, plus 60 s of slack, lets each subprocess bound fire first and name its
+    # command.
+    pytest.mark.timeout(_COLD_START_TIMEOUT_S + _RUN_TIMEOUT_S + 60),
+]
+
+
+def _node(*args: str, timeout: int) -> str:
+    """Run node with ``args`` under ``timeout`` seconds; return its stdout, failing on a non-zero exit."""
+    assert _NODE is not None
+    proc = subprocess.run(
+        [_NODE, *args], capture_output=True, text=True, timeout=timeout, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _node_started() -> None:
+    """Pay node's cold-start cost once, outside the harness's own bound."""
+    _node("-e", "0", timeout=_COLD_START_TIMEOUT_S)
+
 
 #: Loads app.js against just enough of a browser for the [data-poll] feature, then runs a scenario:
 #: a list of "open", "close", "flush" (fire every pending timer) and "advance:<ms>" steps. Prints the
@@ -93,16 +135,8 @@ console.log(JSON.stringify(out));
 def _run(scenario: list[str], tmp_path: Path) -> list[int]:
     harness = tmp_path / "harness.js"
     harness.write_text(_HARNESS, encoding="utf-8")
-    assert _NODE is not None
-    proc = subprocess.run(
-        [_NODE, str(harness), str(_APP_JS), json.dumps(scenario)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    counts: list[int] = json.loads(proc.stdout.strip().splitlines()[-1])
+    out = _node(str(harness), str(_APP_JS), json.dumps(scenario), timeout=_RUN_TIMEOUT_S)
+    counts: list[int] = json.loads(out.strip().splitlines()[-1])
     return counts
 
 
