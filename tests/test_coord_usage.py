@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
@@ -635,8 +636,8 @@ def test_a_stale_reading_with_unverified_provenance_is_no_floor(
 def test_at_the_ceiling_unverified_provenance_still_leaves_a_floor(
     tmp_path: Path, pct: float, expected: float | None
 ) -> None:
-    """A fresh reading at the ceiling stops work on any provenance, and an equal reading does not
-    refresh its age, so without this the stop would decay on an unchanged number."""
+    """A fresh reading at the ceiling stops work on any provenance, and an idle session's equal reading
+    does not refresh its age, so without this the stop would decay on an unchanged number."""
     publish(tmp_path, seven=pct, age_min=21)
     assert read(tmp_path)[1]["seven_day"]["level_floor"] == expected
 
@@ -667,12 +668,25 @@ def _age_window(state: Path, minutes: float) -> None:
 
 
 def _session_fire(
-    state: Path, seven: dict[str, Any], session: str = "S", api_ms: float | None = None
+    state: Path, seven: dict[str, Any], session: str = "S", api_ms: float | str | None = None
 ) -> None:
     payload: dict[str, Any] = {"session_id": session, "rate_limits": {"seven_day": seven}}
     if api_ms is not None:
         payload["cost"] = {"total_api_duration_ms": api_ms}
     collect(state, payload)
+
+
+def _mark(state: Path, session: str = "S") -> Path:
+    return state / "live-marks" / f"mark-{session}.json"
+
+
+def _age_min(state: Path) -> float:
+    return (datetime.now(UTC) - captured_at(state)).total_seconds() / 60
+
+
+def _marks(state: Path) -> list[Path]:
+    """Every file under the state directory that holds a mark, wherever the collector puts it."""
+    return [p for p in state.rglob("*") if p.is_file() and "mark" in p.name]
 
 
 def test_a_session_that_called_the_api_confirms_an_equal_reading(tmp_path: Path) -> None:
@@ -708,9 +722,21 @@ def _confirm_refused_case(state: Path, case: str) -> None:
         _session_fire(state, seven, api_ms=500)
     elif case == "lower-number":
         _session_fire(state, {**seven, "used_percentage": 30.0}, api_ms=2000)
-    elif case == "unreadable-marks":
-        (state / "live-marks.json").write_text("{ not json", encoding="utf-8")
+    elif case == "unreadable-mark":
+        _mark(state).write_text("{ not json", encoding="utf-8")
         _session_fire(state, seven, api_ms=2000)
+    elif case == "missing-mark":
+        _mark(state).unlink()
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "mark-with-no-counter":
+        _mark(state).write_text('{"at": 1}', encoding="utf-8")
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "mark-with-a-blank-counter":
+        _mark(state).write_text('{"api_ms": ""}', encoding="utf-8")
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "payload-with-a-blank-counter":
+        _session_fire(state, seven, session="T", api_ms="")
+        _session_fire(state, seven, session="T", api_ms=2000)
     else:
         raise AssertionError(case)
 
@@ -723,13 +749,167 @@ def _confirm_refused_case(state: Path, case: str) -> None:
         "no-counter",
         "counter-fell",
         "lower-number",
-        "unreadable-marks",
+        "unreadable-mark",
+        "missing-mark",
+        "mark-with-no-counter",
+        "mark-with-a-blank-counter",
+        "payload-with-a-blank-counter",
     ],
 )
 def test_nothing_else_confirms_an_equal_reading(tmp_path: Path, case: str) -> None:
     _confirm_refused_case(tmp_path, case)
     code, doc = read(tmp_path)
     assert code == UNKNOWN and doc["seven_day"]["reading_age_min"] >= 24, doc
+
+
+def test_a_mark_that_cannot_be_written_leaves_the_age_counting(tmp_path: Path) -> None:
+    """If the write fails, the mark keeps the old counter, so every idle repeat would read as a rise and
+    a frozen number would stay fresh for good. A read-only mark makes the real rename fail. The control
+    is the same fire with the write working again."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+    marks = _marks(tmp_path)
+    assert marks, "the first fire left no mark to hold read-only"
+    for mark in marks:
+        mark.chmod(stat.S_IREAD)
+    try:
+        _session_fire(tmp_path, seven, api_ms=2000)
+        assert _age_min(tmp_path) > 24, "a rise whose mark was lost confirmed the reading"
+        _session_fire(tmp_path, seven, api_ms=2000)
+        assert _age_min(tmp_path) > 24, "an idle repeat confirmed the reading"
+    finally:
+        for mark in marks:
+            mark.chmod(stat.S_IREAD | stat.S_IWRITE)
+    _session_fire(tmp_path, seven, api_ms=3000)
+    assert _age_min(tmp_path) < 5, "control: with the write working, a rise confirms"
+
+
+def test_a_blocked_mark_directory_costs_the_refresh_and_not_the_publish(tmp_path: Path) -> None:
+    """The directory cannot be made, so the mark write throws. That must not reach the outer catch and
+    cost the session its reading."""
+    (tmp_path / "live-marks").write_text("in the way", encoding="utf-8")
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+    line = collect(
+        tmp_path,
+        {
+            "session_id": "S",
+            "cost": {"total_api_duration_ms": 2000},
+            "rate_limits": {"seven_day": seven},
+        },
+    )
+    assert line.startswith("7d 40%"), line
+    assert _age_min(tmp_path) > 24, "a rise with no mark confirmed the reading"
+    _session_fire(tmp_path, {**seven, "used_percentage": 41.0}, api_ms=3000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(41.0)
+
+
+def test_one_sessions_late_write_cannot_restore_another_sessions_mark(tmp_path: Path) -> None:
+    """The race on one shared file, made deterministic: T's write lands after S has recorded a rise. If
+    both sessions shared a file, that write would put S's older counter back, and S's idle repeat would
+    then read as a rise."""
+    seven = window(40.0, 280000)
+    other = "44444444-aaaa-4bbb-8ccc-000000000004"
+    _session_fire(tmp_path, seven, api_ms=1000)
+    before = {p: p.read_bytes() for p in _marks(tmp_path)}
+    _session_fire(tmp_path, seven, session=other, api_ms=7000)
+    late = {p: p.read_bytes() for p in _marks(tmp_path) if before.get(p) != p.read_bytes()}
+    assert late, "control: the other session's fire wrote nothing"
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    for path, content in late.items():
+        path.write_bytes(content)
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert _age_min(tmp_path) > 24, "an idle repeat read as a rise"
+
+
+def test_two_sessions_keep_their_own_marks(tmp_path: Path) -> None:
+    """Each session has one file and writes no other. Neither fire disturbs the other's counter."""
+    seven = window(40.0, 280000)
+    other = "44444444-aaaa-4bbb-8ccc-000000000004"
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _session_fire(tmp_path, seven, session=other, api_ms=7000)
+    held = _mark(tmp_path, other).read_bytes()
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert _mark(tmp_path, other).read_bytes() == held
+    assert json.loads(_mark(tmp_path).read_text(encoding="utf-8"))["api_ms"] == 2000
+
+    _session_fire(tmp_path, seven, session=other, api_ms=8000)
+    assert json.loads(_mark(tmp_path).read_text(encoding="utf-8"))["api_ms"] == 2000
+    assert json.loads(_mark(tmp_path, other).read_text(encoding="utf-8"))["api_ms"] == 8000
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        pytest.param("../escaped", id="relative-forward"),
+        pytest.param("..\\escaped", id="relative-back"),
+        pytest.param("..", id="parent"),
+        pytest.param("C:\\escaped", id="absolute"),
+        pytest.param("name.with.dots", id="dots"),
+        pytest.param("name\n", id="trailing-newline"),
+        pytest.param("x" * 129, id="too-long"),
+    ],
+)
+def test_a_session_id_that_is_not_a_plain_name_writes_no_mark(tmp_path: Path, session: str) -> None:
+    """The id comes from a JSON payload and names a file. An id that is not a plain name is refused
+    rather than cleaned up, because two ids cleaned to one name would share a mark."""
+    state = tmp_path / "root" / "mefor-usage"
+    state.mkdir(parents=True)
+    seven = window(40.0, 280000)
+    _session_fire(state, seven, session=session, api_ms=1000)
+    _age_window(state, 25)
+    _session_fire(state, seven, session=session, api_ms=2000)
+    assert _age_min(state) > 24, "a refused id cannot prove a rise"
+    written = {p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file()}
+    assert written == {"root/mefor-usage/latest.json", "root/mefor-usage/history.jsonl"}, written
+
+
+def test_a_new_session_clears_marks_nobody_touched_for_a_week(tmp_path: Path) -> None:
+    """One file per session has no other bound. An old mark's loss costs one refresh, never a rise."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    old, recent = _mark(tmp_path, "old"), _mark(tmp_path, "recent")
+    other = tmp_path / "live-marks" / "note.txt"
+    for path in (old, recent, other):
+        path.write_text('{"api_ms": 5}', encoding="utf-8")
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(old, (eight_days_ago, eight_days_ago))
+    os.utime(other, (eight_days_ago, eight_days_ago))
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert old.exists(), "control: a session's later fires prune nothing"
+
+    _session_fire(tmp_path, seven, session="new", api_ms=1000)
+    assert not old.exists()
+    assert recent.exists() and other.exists() and _mark(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [pytest.param(None, id="absent"), pytest.param("", id="blank")],
+)
+def test_a_published_window_with_no_number_is_not_a_reading_of_zero(
+    tmp_path: Path, missing: str | None
+) -> None:
+    """A published window with no percentage must not compare as 0. A live 0 for the same reset would
+    otherwise be kept, its age refreshed, over a window with no number in it."""
+    seven = window(0.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    doc = latest(tmp_path)
+    if missing is None:
+        del doc["seven_day"]["used_percentage"]
+    else:
+        doc["seven_day"]["used_percentage"] = missing
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _age_window(tmp_path, 25)
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == 0, latest(tmp_path)
 
 
 def test_a_session_of_another_root_cannot_confirm_this_roots_reading(tmp_path: Path) -> None:
@@ -766,27 +946,32 @@ def test_a_gone_window_cannot_be_confirmed(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("pct", "stamped", "code", "state"),
+    ("pct", "stamped", "code", "state", "floor"),
     [
-        pytest.param(100.0, False, 11, "CRITICAL", id="spent-unstamped"),
-        pytest.param(98.0, True, 11, "CRITICAL", id="ceiling-stamped"),
-        pytest.param(90.0, True, 10, "WARN", id="high-stamped"),
-        pytest.param(85.0, True, 10, "WARN", id="warn-band-stamped"),
-        pytest.param(84.9, True, UNKNOWN, "UNKNOWN", id="below-the-band"),
-        pytest.param(90.0, False, UNKNOWN, "UNKNOWN", id="high-with-no-floor"),
+        pytest.param(100.0, False, CRITICAL, "CRITICAL", 100.0, id="spent-unstamped"),
+        pytest.param(98.0, True, CRITICAL, "CRITICAL", 98.0, id="ceiling-stamped"),
+        pytest.param(97.9, True, UNKNOWN, "UNKNOWN", 97.9, id="just-below-the-ceiling"),
+        pytest.param(90.0, True, UNKNOWN, "UNKNOWN", 90.0, id="at-the-gates-level"),
+        pytest.param(85.0, True, UNKNOWN, "UNKNOWN", 85.0, id="fresh-warn-band"),
+        pytest.param(84.9, True, UNKNOWN, "UNKNOWN", 84.9, id="below-the-band"),
+        pytest.param(90.0, False, UNKNOWN, "UNKNOWN", None, id="high-with-no-floor"),
     ],
 )
-def test_a_floor_sets_the_exit_code_and_the_window_stays_unknown(
-    tmp_path: Path, pct: float, stamped: bool, code: int, state: str
+def test_only_a_floor_at_the_ceiling_sets_the_verdict(
+    tmp_path: Path, pct: float, stamped: bool, code: int, state: str, floor: float | None
 ) -> None:
-    """The header promises exit 11 at the ceiling. The window's own state stays UNKNOWN because that is
-    what the gate reads below the rung; test_afk_gate holds the gate to it."""
+    """The header promises exit 11 at the ceiling. Below it the number is only a lower bound, so the
+    verdict stays UNKNOWN (exit 20), while level_floor still carries it to the gate; test_afk_gate holds
+    the gate to it. The window's own state is UNKNOWN throughout, which is what the gate reads below the
+    rung."""
     publish(tmp_path, seven=pct, age_min=25)
     if stamped:
         _stamp(tmp_path, tmp_path.parent)
     got, doc = read(tmp_path)
     assert (got, doc["state"]) == (code, state), doc
     assert doc["seven_day"]["state"] == "UNKNOWN", doc
+    assert doc["seven_day"]["level_floor"] == floor, doc
+    assert ("COMMIT NOW" in doc["advice"]) == (state == "CRITICAL"), doc
 
 
 def test_a_root_wired_elsewhere_gets_no_floor_and_a_wired_one_does(fake_home: Path) -> None:

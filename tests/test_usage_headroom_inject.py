@@ -352,9 +352,9 @@ def test_a_live_session_repeating_a_spent_reading_prints_it_as_current(tmp_path:
     ), ctx
 
 
-def test_a_floor_below_the_warn_band_still_prints_its_number(tmp_path: Path) -> None:
-    state = tmp_path / "s"
-    collect(state, reading(seven=70.0))
+def stale_stamped_reading(state: Path, pct: float) -> None:
+    """A stale reading that holds a floor at any level: stamped with the root it sits under."""
+    collect(state, reading(seven=pct))
     age_document(state, minutes=25)
     p = state / "latest.json"
     doc = json.loads(p.read_text(encoding="utf-8"))
@@ -362,8 +362,19 @@ def test_a_floor_below_the_warn_band_still_prints_its_number(tmp_path: Path) -> 
     doc["published_by"]["config_root_env"] = root
     doc["seven_day"]["config_root_env"] = root
     p.write_text(json.dumps(doc), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "pct",
+    [pytest.param(70.0, id="below-the-band"), pytest.param(90.0, id="at-the-gates-level")],
+)
+def test_a_floor_below_the_ceiling_is_unknown_and_still_prints_its_number(
+    tmp_path: Path, pct: float
+) -> None:
+    state = tmp_path / "s"
+    stale_stamped_reading(state, pct)
     ctx = context_of(state)
-    assert "verdict: UNKNOWN" in ctx and "at least 70.0%" in ctx, ctx
+    assert "verdict: UNKNOWN" in ctx and f"at least {pct:.1f}%" in ctx, ctx
 
 
 def test_an_unreadable_source_says_so_rather_than_going_quiet(tmp_path: Path) -> None:
@@ -968,6 +979,42 @@ def test_a_steward_file_that_was_never_written_is_unknown(tmp_path: Path) -> Non
     (tmp_path / "steward-status.json").unlink()
     ctx = desktop_context(tmp_path, args)
     assert "fallback verdict: UNKNOWN -- the Steward has never written this file" in ctx, ctx
+
+
+@pytest.mark.parametrize(
+    ("pct", "verdict"),
+    [
+        pytest.param(100.0, "CRITICAL", id="at-the-ceiling"),
+        pytest.param(92.0, "UNKNOWN", id="at-the-gates-level"),
+    ],
+)
+def test_a_floor_tells_a_session_that_cannot_refresh_why_it_is_held(
+    tmp_path: Path, pct: float, verdict: str
+) -> None:
+    """The gate HALTs on a floor at 90, and at the ceiling the verdict is CRITICAL rather than UNKNOWN.
+    A Desktop session there can do nothing about the file, so it must be told that, and it gets the
+    Steward's number beside the stale one."""
+    state = tmp_path / "s"
+    stale_stamped_reading(state, pct)
+    env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
+    payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
+    args = steward_files(tmp_path, {ORG: steward_entry(weekly=31.5)})
+    ctx = context_of(state, env_extra=env, extra_args=args, payload=payload)
+    assert f"verdict: {verdict}" in ctx and f"at least {pct:.1f}%" in ctx, ctx
+    assert PUBLISHER_NOTE in ctx, ctx
+    assert FALLBACK_LABEL in ctx and "31.5%" in ctx, ctx
+
+
+def test_a_fresh_reading_at_the_ceiling_gets_no_fallback(tmp_path: Path) -> None:
+    """The control for the test above: the verdict is the same and there is no floor. The number is
+    current, so nothing needs explaining."""
+    state = tmp_path / "s"
+    collect(state, reading(seven=100.0))
+    env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
+    payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
+    ctx = context_of(state, env_extra=env, extra_args=steward_files(tmp_path), payload=payload)
+    assert "verdict: CRITICAL" in ctx and "at least" not in ctx.split("Ages")[0], ctx
+    assert PUBLISHER_NOTE not in ctx and FALLBACK_LABEL not in ctx, ctx
 
 
 def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Path) -> None:

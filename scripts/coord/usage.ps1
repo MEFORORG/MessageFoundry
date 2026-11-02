@@ -26,10 +26,11 @@
          it changed, or a session that had just called the API reported it. An idle session's repeat
          does not count; usage-collect.ps1 says why.
       2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the window's state is UNKNOWN. Not
-         an extrapolation, not a last-known value dressed up as current. A number that holds a
-         level_floor at a band still sets that band's exit code, as "at least this". Below two samples in the current
-         window, or one tick under -MinRateSpanMinutes, there is no rate and no projection, and the
-         percentage bands still grade the reading.
+         an extrapolation, not a last-known value dressed up as current. A level_floor at the ceiling
+         still sets CRITICAL, as "at least this"; below the ceiling a floor is only a lower bound, so the
+         verdict stays UNKNOWN. Below two samples in the current window, or one tick under
+         -MinRateSpanMinutes, there is no rate and no projection, and the percentage bands still grade the
+         reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -49,12 +50,13 @@
 
     EXIT CODES, so a coordinator can branch without parsing prose:
         0  OK
-        10 WARN        -- high, or projected to exhaust before reset with slack. A stale reading counts
-                          as high only through a level_floor, because it has reached at least that
+        10 WARN        -- high, or projected to exhaust before reset with slack, on a fresh reading only
         11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling, fresh or as a
                           stale level_floor
-        20 UNKNOWN     -- no data, stale data below those, a window whose reset has passed, or a reading
-                          this root may not trust
+        20 UNKNOWN     -- no data, stale data with no level_floor at the ceiling, a window whose reset has
+                          passed, or a reading this root may not trust. A level_floor below the ceiling
+                          reads UNKNOWN too, because the number is only a lower bound; the gate reads
+                          level_floor for itself
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
     FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
@@ -508,9 +510,10 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # Set only on a reading past -MaxAgeMinutes with its reset ahead and inside one 7-day window, and
         # with trusted provenance unless it is at the ceiling. Usage does not fall inside a reset period,
         # so such a reading says the window has reached at least this level, unless the reset has moved
-        # or usage did fall.
-        # Get-DecisionCostRung halts on it at the level or the ceiling, and nothing else reads it.
-        # At least a future date, an undateable reading and one with no reset set nothing.
+        # or usage did fall. Past -MaxAgeMinutes means nothing confirmed the number: an idle session's
+        # repeat does not refresh its age, and a live session's does only once its mark is written.
+        # Get-DecisionCostRung halts on it at the level or the ceiling. The verdict below reads it at the
+        # ceiling, and the spawn hook prints it. At least a future date, an undateable reading and one with no reset set nothing.
         level_floor      = $null
         state            = "OK"
         reason           = ""
@@ -593,21 +596,22 @@ $overall = $seven.state
 # verified stamp, or a root it does not trust, gets no floor and stays UNKNOWN. An explicit -StateDir is
 # exempt from the wiring half, as it is from the verdict below: the operator named the directory.
 #
-# AT THE CEILING IT DOES NOT. A fresh reading there is a stop on any provenance, and an equal reading
-# does not refresh the age, so this test would turn that stop into REVIEW 21 minutes later with nothing
-# changed. A document or window stamped with another root was refused above and never gets here.
+# AT THE CEILING IT DOES NOT. A fresh reading there is a stop on any provenance, and an idle session's
+# equal reading does not refresh the age, so this test would turn that stop into REVIEW 21 minutes later
+# with nothing changed. A document or window stamped with another root was refused above and never gets
+# here.
 if ($seven.Contains('level_floor') -and $seven.level_floor -lt $CeilingPct -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
     $seven.level_floor = $null
 }
 
-# A FLOOR GRADES THE VERDICT, AND LEAVES THE WINDOW'S STATE AT UNKNOWN. The number has reached at least
-# that, so the exit code and the advice must say so: a spent pool with an unchanged reading is still
-# CRITICAL. The window stays UNKNOWN because nothing fresh backs a rate or a clear, and that is what
-# Get-DecisionCostRung reads below the rung, so this cannot loosen the gate. 85 is the WARN band below.
-if ($null -ne $seven.level_floor) {
-    if ($seven.level_floor -ge $CeilingPct) { $overall = "CRITICAL" }
-    elseif ($seven.level_floor -ge 85) { $overall = "WARN" }
-}
+# A FLOOR AT THE CEILING GRADES THE VERDICT, AND LEAVES THE WINDOW'S STATE AT UNKNOWN. A spent pool with
+# an unchanged reading is still CRITICAL, so the exit code and the advice must say so. BELOW THE CEILING
+# THE VERDICT STAYS UNKNOWN: the number is only a lower bound, so "commit at your next stop" would grade
+# a number nothing fresh backs. Get-DecisionCostRung reads level_floor for itself and hits at its rung
+# whatever this says, and the spawn hook prints the number and why. The window stays UNKNOWN because
+# nothing fresh backs a rate or a clear, and that is what the gate reads below the rung, so this cannot
+# loosen it.
+if ($null -ne $seven.level_floor -and $seven.level_floor -ge $CeilingPct) { $overall = "CRITICAL" }
 
 # A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The
 # diagnosis used to reach the prose only, so a root the script itself called mis-wired still exited 0

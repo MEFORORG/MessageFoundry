@@ -130,31 +130,57 @@ function Write-AtomicText([string]$Path, [string]$Text) {
     return $false
 }
 
+# A number out of JSON, or $null. `$null -as [double]` and `"" -as [double]` are both 0 in PowerShell
+# (measured 2026-11-02), and a missing value is neither a rise nor a reading of 0.
+function Get-Finite($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $null }
+    $d = $Value -as [double]
+    if ($null -eq $d -or -not [double]::IsFinite($d)) { return $null }
+    return $d
+}
+
 # DID THIS SESSION CALL THE API SINCE ITS LAST FIRE? cost.total_api_duration_ms only rises when it did,
 # and rate_limits arrives on an API response, so a rise is the one thing in the payload that tells a live
-# session's reading from an idle one's cached number. The mark is per session, because the counter is.
-# A session with no mark, a payload with no counter, or an unreadable file proves nothing: false, which
-# leaves the age counting. A lost write costs one refresh, for the same reason.
+# session's reading from an idle one's cached number. A missing or unreadable mark, or a payload with no
+# counter, proves nothing: false, which leaves the age counting.
+#
+# ONE MARK FILE PER SESSION, BECAUSE THE COUNTER IS PER SESSION AND A SHARED FILE CANNOT HOLD IT. Every
+# session on a root fires here, unlocked, so with one file a session could write back the older counter
+# of another that had just risen, and that session's next idle repeat would read as a rise. A session's
+# file has only that session's fires as writers.
+#
+# THE ID COMES FROM THE PAYLOAD AND NAMES A FILE, so anything but a plain name is refused rather than
+# cleaned up: it could leave this directory, and two ids cleaned to one name would share a mark.
+#
+# A RISE COUNTS ONLY ONCE ITS MARK IS WRITTEN. A failed write leaves the old counter, so every later idle
+# repeat would read as the same rise for as long as the write keeps failing, and a frozen number would
+# stay fresh. A lost write costs a live session one refresh. The try holds because Write-AtomicText can
+# throw, and that reaching the outer catch would cost the session its publish as well.
 function Test-SessionCalledApi([string]$Dir, $Payload) {
     $sid = [string]$Payload.session_id
-    $counter = $Payload.cost.total_api_duration_ms
-    if (-not $sid -or $null -eq $counter) { return $false }
-    $ms = $counter -as [double]
-    if ($null -eq $ms) { return $false }
-    $path = Join-Path $Dir "live-marks.json"
-    $marks = @{}
-    try {
-        $doc = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        foreach ($prop in $doc.PSObject.Properties) { $marks[$prop.Name] = $prop.Value }
-    } catch { }
-    $prev = if ($marks.ContainsKey($sid)) { $marks[$sid].api_ms -as [double] } else { $null }
+    $ms = Get-Finite $Payload.cost.total_api_duration_ms
+    # \A and \z, not ^ and $: `$` also matches before a trailing newline.
+    if ($sid -cnotmatch '\A[A-Za-z0-9_-]{1,128}\z' -or $null -eq $ms) { return $false }
+    $markDir = Join-Path $Dir "live-marks"
+    $path = Join-Path $markDir "mark-$sid.json"
+    $prev = $null
+    try { $prev = Get-Finite (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).api_ms } catch { }
+    # Only a change writes, so a mark changes once per API call.
     if ($null -ne $prev -and $prev -eq $ms) { return $false }
-    $marks[$sid] = [pscustomobject]@{ api_ms = $ms; at = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
-    $kept = [ordered]@{}
-    # Only a rise writes, so this file changes once per API call. The newest 32 sessions are plenty.
-    foreach ($e in ($marks.GetEnumerator() | Sort-Object { [long]$_.Value.at } -Descending | Select-Object -First 32)) { $kept[$e.Key] = $e.Value }
-    Write-AtomicText $path ($kept | ConvertTo-Json -Depth 3) | Out-Null
-    return ($null -ne $prev -and $ms -gt $prev)
+    $written = $false
+    try {
+        [void][System.IO.Directory]::CreateDirectory($markDir)
+        # A session's first mark clears the marks nobody touched for a week, which is longer than a window.
+        # A mark lost here costs that session one refresh, and nothing else bounds this directory.
+        if ($null -eq $prev) {
+            $cutoff = [datetime]::UtcNow.AddDays(-7)
+            Get-ChildItem -LiteralPath $markDir -Filter "mark-*" -File |
+                Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
+                Remove-Item -Force
+        }
+        $written = Write-AtomicText $path (@{ api_ms = $ms } | ConvertTo-Json -Compress)
+    } catch { }
+    return ($written -and $null -ne $prev -and $ms -gt $prev)
 }
 
 function Format-Reset([object]$EpochSeconds) {
@@ -299,14 +325,16 @@ try {
         $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $seenEpoch = $seven.resets_at_epoch -as [long]
         $publishedEpoch = $published.resets_at_epoch -as [long]
-        $notHigher = $seven.used_percentage -le ($published.used_percentage -as [double])
+        # A window with no number in it holds no level to keep, so it is not a 0 this reading can equal.
+        $publishedPct = Get-Finite $published.used_percentage
+        $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
             ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
         $confirmed = $calledApi -and ($stampEnv -eq "unset" -or $stampEnv -ieq $ownRoot) -and
             $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and
-            $seven.used_percentage -eq ($published.used_percentage -as [double])
+            $seven.used_percentage -eq $publishedPct
     }
 
     # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new

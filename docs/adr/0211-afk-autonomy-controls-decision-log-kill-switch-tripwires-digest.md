@@ -410,8 +410,11 @@ roster alias of the Lander.
 > The payload carries no time of its own, so an idle session's cached number looks like a live flat one.
 > Restamping an equal reading let one idle terminal keep a frozen number fresh, and the rung read OK on
 > it. So an equal reading refreshes the age only when the session reporting it has just called the API:
-> `cost.total_api_duration_ms` rose since that session's last fire (`live-marks.json`), the reset is the
-> same and still ahead, and the session is pinned to this root or unpinned. A pool nobody has called for 20
+> `cost.total_api_duration_ms` rose since that session's last fire and that rise was written to its own
+> mark file (`live-marks/mark-<session>.json`), the reset is the same and still ahead, and the session is
+> pinned to this root or unpinned. A mark is per session because a shared file, written unlocked, could
+> put back another session's older counter, and a mark that cannot be written proves nothing, so neither
+> reads as a rise on an idle repeat. A pool nobody has called for 20
 > minutes goes stale and reads UNKNOWN, so a healthy live flat account stays fresh and an idle one does
 > not. The statusLine docs list the counter, as read on 2026-11-01. No real payload on this box was checked
 > for it; with no counter, nothing refreshes and the account goes stale as before. Whether a call that failed
@@ -428,9 +431,12 @@ roster alias of the Lander.
 > ceiling. Every other stale reading answers REVIEW at any level, including at least a future-dated one,
 > an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
 > fresh 95 with no rate on such a root is hit, and the same reading once stale answers REVIEW. A Desktop
-> session on a root holding such a floor gets HALT, which narrows the gap this section names. A floor also
-> sets `usage.ps1`'s verdict and exit code, CRITICAL (11) at the ceiling and WARN (10) from 85 percent, and
-> the spawn hook prints its number as "at least". The window's own state stays UNKNOWN, which is what the
+> session on a root holding such a floor gets HALT, which narrows the gap this section names. A floor at
+> the ceiling also sets `usage.ps1`'s verdict and exit code to CRITICAL (11). Below the ceiling the verdict
+> stays UNKNOWN (20), because the number is only a lower bound, and the gate still reads `level_floor` for
+> itself and hits at the rung. The spawn hook prints a floor's number as "at least", and on any floor it
+> also prints the cause note and the Steward's fallback, so a halted Desktop session is told why and that
+> it cannot refresh the file. The window's own state stays UNKNOWN, which is what the
 > gate reads below the rung, so the verdict cannot clear anything.
 >
 > **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale

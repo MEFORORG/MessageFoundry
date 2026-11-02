@@ -85,8 +85,9 @@
     A DESKTOP SESSION GETS A SECOND, LABELLED SOURCE (BACKLOG #1459; seat decision under owner
     delegation 2026-10-08, not an owner ruling). A Desktop or SDK session never runs a statusLine, so
     on a Desktop-only config root the statusLine reading stays UNKNOWN for good. When it is UNKNOWN for
-    such a session, the hook also reads the Steward's out-of-repo `status.json` and prints it as its
-    own block. Four rules keep it from passing as a statusLine reading:
+    such a session, or stale but held as a level_floor under any verdict, the hook also reads the
+    Steward's out-of-repo `status.json` and prints it as its own block. Four rules keep it from passing
+    as a statusLine reading:
 
       Its own label. Every line it prints says where it came from, and its verdict line never
       replaces the statusLine verdict above it.
@@ -327,7 +328,7 @@ $AGE_NOTE = "Ages are part of the reading, counted from the last time the number
 #   A WIRING FAULT the reader named -- for one, PowerShell source that bash cannot parse, which the
 #   reader used to call WIRED_HERE. Any state but WIRED_HERE is named here. That is deliberately
 #   wider than the reader's $dxUntrusted, which decides whether a READING is trusted; this decides
-#   whether a fault is worth naming beside an UNKNOWN, and every one of them is. Skipped under
+#   whether a fault is worth naming beside an UNKNOWN or a floor, and every one of them is. Skipped under
 #   -StateDir, mirroring the reader: the caller named a directory, and the root above it need not be
 #   wired at all.
 #
@@ -753,8 +754,12 @@ if ((Get-Folded $j.provenance) -eq "UNVERIFIED") {
     $lines += "  provenance: UNVERIFIED -- the publisher recorded no config root, so the cross-account guard could not run"
 }
 
-# A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does.
-if ($state -eq "UNKNOWN") {
+# A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does. SO DOES
+# A FLOOR, WHATEVER ITS VERDICT. It is a stale number too, and at the ceiling the verdict is CRITICAL, so
+# testing UNKNOWN alone would leave a session the gate has halted with no word of why, or that nothing it
+# does can refresh the file.
+$unconfirmed = $state -eq "UNKNOWN" -or $null -ne $j.seven_day.level_floor
+if ($unconfirmed) {
     $lines += @(Get-CauseNote $j)
 }
 
@@ -762,6 +767,6 @@ $advice = Get-Folded $j.advice
 if ($advice) { $lines += "  $advice" }
 $lines += "  $AGE_NOTE"
 # AFTER the age note, which is about the statusLine reading and does not apply to the fallback.
-if ($state -eq "UNKNOWN") { $lines += @(Get-StewardFallback) }
+if ($unconfirmed) { $lines += @(Get-StewardFallback) }
 
 Write-Context ($lines -join "`n") $state
