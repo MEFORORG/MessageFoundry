@@ -50,7 +50,15 @@ class _Probe(NamedTuple):
 
 #: The CLI reaches `config.tls_policy` through `logging_setup`. Before #2514, loading that leaf ran
 #: `config/__init__.py`, which loaded pydantic and every model.
-_CLI_DEFERRED = frozenset({"pydantic", "messagefoundry.config.models", "sqlite3", "tomllib"})
+_CLI_DEFERRED = frozenset(
+    {
+        "pydantic",
+        "messagefoundry.config.models",
+        "messagefoundry.exception_origin",
+        "sqlite3",
+        "tomllib",
+    }
+)
 _CLI_ENGINE = frozenset(
     {
         "messagefoundry",
