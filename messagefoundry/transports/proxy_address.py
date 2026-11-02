@@ -67,7 +67,7 @@ _UNCACHED_URLSPLIT: Callable[[str], urllib.parse.SplitResult] = inspect.unwrap(
 
 #: The fixed refusal text. It names the setting and the rule, never the value.
 _REFUSED = (
-    "proxy_url must be http(s)://[userinfo@]host[:port] with nothing after the port but an "
+    "proxy_url must be http(s)://host[:port] with nothing after the port but an "
     "optional '/': no path, query or fragment, a host that is a DNS name, an IPv4 address or a "
     "bracketed IPv6 address, written in ASCII, and a port from 1 to 65535 with no leading zero. "
     "A proxy login "
@@ -161,8 +161,9 @@ def parse_proxy_url(value: str) -> ProxyAddress:
     bracketed IPv6 address with no zone; a port outside 1 to 65535 or written with a leading
     zero; and any value on which ``urlsplit`` and urllib's ``_parse_proxy`` read a different
     scheme, userinfo, host or port. The code below is the full rule; this list is a guide to it.
-    A userinfo stays allowed. The caller strips the value and handles ``"default"``
-    first. Neither the message nor the exception chain carries any part of the value."""
+    A userinfo stays allowed by this parse, though the connector build then refuses one that
+    holds a credential (:attr:`ProxyAddress.holds_credential`). The caller strips the value and
+    handles ``"default"`` first. Neither the message nor the exception chain carries any part of the value."""
     try:
         parts = _UNCACHED_URLSPLIT(value)
         u_scheme, u_user, u_password, u_hostport = read_like_urllib(value)

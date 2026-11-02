@@ -2028,7 +2028,7 @@ class _ProxyDigestRecipe:
     """Inputs for a fresh reactive proxy Digest handler (#127, http-destination only). Rebuilt per
     opener (a urllib handler binds to its opener, so it is never shared across openers)."""
 
-    proxy_url: str = field(repr=False)  # may carry a user; a password there fails the build (#3007)
+    proxy_url: str = field(repr=False)  # a user or a password in it fails the build first (#3007)
     user: str
     password: str = field(repr=False)
 
@@ -2046,8 +2046,9 @@ class ProxyConfig:
     target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)
     or is a loopback host, which is never proxied (vault BACKLOG #2579)."""
 
-    # Kept out of the repr, as the digest recipe's fields are: the URL may carry a user. A user and
-    # password in an explicit proxy_url fail the build (vault BACKLOG #3007); the repr stays hidden.
+    # Kept out of the repr, as the digest recipe's fields are. A user or a password in an explicit
+    # proxy_url fails the build (vault BACKLOG #3007), so neither reaches here from the settings; the
+    # repr stays hidden all the same.
     proxies: tuple[tuple[str, str], ...] = field(repr=False)  # () when use_default
     use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
     bypass: tuple[str, ...]
@@ -2394,10 +2395,12 @@ def proxy_config_from_settings(
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
 
-    A user and a password in an ``http(s)://`` ``proxy_url`` raise :class:`InsecureHopRefused`, in
-    every posture and under every declaration, including one inherited from
-    ``[egress].proxy_url`` (vault BACKLOG #3007). At send they would meet a refusal that retries,
-    so a known fault is reported here rather than on each message.
+    A user, a password or both in an ``http(s)://`` ``proxy_url`` raise :class:`InsecureHopRefused`,
+    in every posture and under every declaration, including one inherited from
+    ``[egress].proxy_url`` (vault BACKLOG #3007). At send, both together would meet a refusal that
+    retries, and either alone would stay in the URL dialled, so a known fault is reported here rather
+    than on each message. A userinfo with nothing in it holds no credential and is not refused for
+    one.
 
     An explicit URL is then parsed once, by :func:`~messagefoundry.transports.proxy_address.parse_proxy_url`,
     which refuses a path, a query, a fragment and any value urllib's proxy parser would read as

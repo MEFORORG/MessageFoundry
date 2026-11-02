@@ -5278,7 +5278,7 @@ class EgressSettings(_Section):
     # proxy (getproxies()); an http(s):// address = an explicit proxy. A loopback host is never
     # proxied, whichever of these named the proxy (vault BACKLOG #2579). Put proxy credentials on each
     # connection (secrets via env()). Its shape is checked at load by _proxy_url_shape below. A
-    # user:password@ written in it passes that check and is inherited with the URL; each connection
+    # user or a password written in it passes that check and is inherited with the URL; each connection
     # that inherits it then fails to build (vault BACKLOG #3007), and docs/CONFIGURATION.md [egress]
     # says what else applies. Env: MEFOR_EGRESS_PROXY_URL.
     proxy_url: str | None = None
@@ -5362,9 +5362,10 @@ class EgressSettings(_Section):
         ``"default"`` (any case) passes, and a blank value reads as unset. ``"default"`` is written
         out rather than read from ``transports.rest.PROXY_DEFAULT``, so this import stays off the
         sentinel's path; a test pins that the two agree. The refusal is the parse's fixed text,
-        which names no part of the value; the base model also hides the input. A ``user:password@``
+        which names no part of the value; the base model also hides the input. A user or a password
         passes here, as the parse allows a userinfo: the build of each inheriting connection
-        refuses it (vault BACKLOG #3007), and the static-credential report still lists it."""
+        refuses it (vault BACKLOG #3007). The static-credential report lists a user and a password
+        together, which is what urllib would send, and not either one alone."""
         if value is None:
             return None
         proxy = value.strip()
