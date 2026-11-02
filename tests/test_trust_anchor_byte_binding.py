@@ -469,7 +469,7 @@ _STRAY_END = b"-----END CERTIFICATE-----"
 
 class _Refused(NamedTuple):
     """``anchor_cadata`` refuses this file with ``why``, and ``cafile=`` loads ``by_file``, or
-    refuses it too when that is None. A refusal is never wider than ``cafile=``: it trusts nothing."""
+    refuses it too when that is None."""
 
     by_file: list[str] | None
     why: str = "non-ASCII byte inside a PEM block"
@@ -487,6 +487,10 @@ def _non_ascii_after_begin(pem: bytes) -> bytes:
     """No byte of the added line is base64. Measured, ``cafile=`` reads this block, and it refuses
     the same block with :data:`_E_ACUTE` on that line."""
     return pem.replace(b"-----\n", b"-----\n\xc3\xa9\n", 1)
+
+
+def _mark_in_body(pem: bytes) -> bytes:
+    return pem.replace(b"-----\n", b"-----\n" + _BOM, 1)
 
 
 @pytest.mark.parametrize(
@@ -542,6 +546,20 @@ def _non_ascii_after_begin(pem: bytes) -> bytes:
             _Refused(["good-ca"]),
             id="comment holding a BEGIN, then non-ASCII",
         ),
+        # OpenSSL drops a mark only after an END that closed a block it was reading.
+        pytest.param(
+            lambda a, b: a + _STRAY_END + b"\n" + _BOM + b, ["good-ca"], id="stray END, then mark"
+        ),
+        pytest.param(
+            lambda a, b: b"x\n" + _BOM + a + _BOM + b,
+            _Refused(None, _NO_BLOCK),
+            id="mark hides a block, and a mark after that block's END",
+        ),
+        pytest.param(
+            lambda a, b: a + _STRAY_END + _LONG[len(_STRAY_END) :] + _mark_in_body(b),
+            _Refused(None),
+            id="END and BEGIN on one line, mark on the next",
+        ),
         pytest.param(lambda a, b: a + _LONG + b, ["evil-ca", "good-ca"], id="long, ASCII"),
         pytest.param(
             lambda a, b: a + _LONG + b + _E_ACUTE + b"\n",
@@ -574,9 +592,10 @@ def test_a_byte_order_mark_hides_or_shows_exactly_the_blocks_cafile_does(
     ``cafile=`` never loaded, which is how round two of this slice's QA found it. Each case is held
     against ``cafile=`` itself, so the expectation is OpenSSL's, not this module's.
 
-    The same holds for what ``anchor_cadata`` drops: a line it removes must not show OpenSSL a block
-    ``cafile=`` never read, and a block OpenSSL reads must not lose a line. Where its line model
-    cannot match OpenSSL, it refuses (:class:`_Refused`), so it never trusts more."""
+    The same holds for what ``anchor_cadata`` drops: in these rows, a line it removes must not show
+    OpenSSL a block ``cafile=`` never read, and a block OpenSSL reads must not lose a line. A row
+    where its line model and ``cafile=`` differ refuses (:class:`_Refused`). This holds these shapes
+    only: it is a line model, not OpenSSL's reader, so other shapes can still differ."""
     good, evil = cas
     data = shape(good.pem, evil.pem)
     anchor = tmp_path / "bundle.pem"
