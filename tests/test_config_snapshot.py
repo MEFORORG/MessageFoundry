@@ -68,6 +68,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxWorkerRefused,
     graph_shape,
 )
+from tests._share_fault import _share_fault
 
 RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||900001||DOE^JANE\r"
 
@@ -597,17 +598,6 @@ def test_serve_s_value_reader_parses_the_snapshot_or_answers_none(
 # --- vault BACKLOG #3535: a share Windows cannot reach is a fault, not a missing path ------------
 
 
-def _share_fault(winerror: int = 53) -> OSError:
-    """The error Windows raises for a share it cannot reach, which Python on Windows maps to a
-    ``FileNotFoundError``. POSIX ignores the code and builds a plain ``OSError``, which would
-    pass on the old code, so there the same error is built by hand."""
-    fault = OSError(None, "share unreachable", None, winerror)
-    if not isinstance(fault, FileNotFoundError):
-        fault = FileNotFoundError(2, "share unreachable")
-        fault.winerror = winerror  # type: ignore[attr-defined]
-    return fault
-
-
 def _lost_share(
     monkeypatch: pytest.MonkeyPatch,
     path: Path,
@@ -822,6 +812,31 @@ def test_validate_config_reports_a_trust_check_that_cannot_list_a_folder(
     monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
     [diagnostic] = validate_config(cfg, allow_empty=True)
     assert "Permission denied" in diagnostic.message
+
+
+def test_a_trust_check_that_cannot_list_a_folder_refuses_a_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw error here is no reload refusal, so a reload would answer 500 as a fault. A strict read
+    raises it, which its caller reports as a digest it could not take."""
+    cfg = _config(tmp_path / "cfg")
+
+    def unlistable(directory: Path) -> list[Path]:
+        raise PermissionError(13, "Permission denied", str(directory))
+
+    monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
+    with pytest.raises(WiringError, match="could not vet it"):
+        load_config(cfg, allow_empty=True)
+    with pytest.raises(PermissionError):
+        read_trusted_snapshot(cfg, strict=True)
+
+
+def test_a_name_listing_refuses_outright_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger=wiring.__name__), pytest.raises(ConfigDirMissing):
+        load_config(tmp_path / "embedded\0nul", allow_empty=True)
+    assert "cannot be opened" in caplog.text
 
 
 def test_a_lax_load_of_a_base_lost_after_its_check_keeps_the_fault_the_read_recorded(

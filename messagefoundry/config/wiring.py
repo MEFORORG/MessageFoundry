@@ -8617,14 +8617,24 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
     _require_config_dir(directory, strict=strict)
-    _assert_safe_config_source(directory)
+    try:
+        _assert_safe_config_source(directory)
+    except OSError as exc:
+        # Its walk raises what it cannot list, and a path it could not vet must not load. Outside
+        # strict that is a refusal, not a raw error, which a reload would answer as a 500.
+        if strict:
+            raise
+        raise WiringError(
+            f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(exc)}"
+        ) from exc
     snapshot = read_config_snapshot(directory, strict=strict)
     # Before the directory is judged again, so that judging it cannot replace a fault this read
     # recorded with a different answer.
     _require_loadable(snapshot)
     if not strict and not snapshot.files:
         # A lax read reads a vanished directory as an empty one; a load must not run that as an
-        # empty graph, so it still answers as missing (BACKLOG #3157).
+        # empty graph. Judged again: missing if it is gone, refused if it cannot be read (BACKLOG
+        # #3157).
         _require_config_dir(directory, strict=False)
     return snapshot
 
@@ -8644,8 +8654,13 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
     try:
         with os.scandir(directory):
             pass
-    except ValueError:
-        pass  # an embedded NUL, which is_dir answered False for
+    except ValueError as exc:
+        # An embedded NUL, which is_dir answered False for.
+        _logger.warning(
+            "config directory %s cannot be opened: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(safe_exc(exc)),
+        )
     except OSError as exc:
         if not is_missing_directory(exc):
             _refuse_config_dir(directory, exc, strict=strict)
@@ -10232,8 +10247,10 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
         _require_config_dir(directory, strict=False)
         # Same trust boundary as load_config: never execute Python from an unsafe source (review low-11).
         _assert_safe_config_source(directory)
-    except (OSError, WiringError) as exc:  # OSError takes in ConfigDirMissing
+    except (ConfigDirMissing, WiringError) as exc:
         return [Diagnostic(message=str(exc), file=str(directory))]
+    except OSError as exc:
+        return [Diagnostic(message=safe_exc(exc), file=str(directory))]
     # One read, as load_config's, so the modules, tables and connections it reports on are one
     # set of bytes (vault BACKLOG #2596). A file it needs but cannot read is a diagnostic.
     snapshot = read_config_snapshot(directory, strict=False)

@@ -61,6 +61,7 @@ from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
+from tests._share_fault import _share_fault
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
 from tests.test_trust_anchors import _block, _FaultyAuditStore, _judged_clean
 
@@ -1764,8 +1765,10 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
 
 
 def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
-    """Fail every listing of ``cfg`` past the next one, which is the reload's target check."""
-    real_scandir = os.scandir
+    """Fail every listing of ``cfg`` past the next one, which is the reload's target check, as a
+    share Windows cannot reach fails, and answer ``Path.is_dir`` of it ``False``, as both do for a
+    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory."""
+    real_scandir, real_is_dir = os.scandir, Path.is_dir
     listings = 0
 
     def _scandir(path: Any) -> Any:
@@ -1773,10 +1776,14 @@ def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
         if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
             listings += 1
             if listings > 1:
-                raise PermissionError(13, "Permission denied", str(path))
+                raise _share_fault()
         return real_scandir(path)
 
+    def _is_dir(self: Path, **kwargs: Any) -> bool:
+        return self.resolve() != cfg and real_is_dir(self, **kwargs)
+
     monkeypatch.setattr(os, "scandir", _scandir)
+    monkeypatch.setattr(Path, "is_dir", _is_dir)
 
 
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_inline(
