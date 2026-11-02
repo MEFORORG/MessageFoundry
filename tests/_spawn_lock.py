@@ -647,8 +647,14 @@ def run_retrying_a_native_crash(
     replayable = kwargs.get("stdin") in (None, subprocess.PIPE, subprocess.DEVNULL)
     # The second launch runs BEFORE anything is warned, so a warnings-as-errors filter can fail
     # the test only after the retry has run, never in place of it.
-    second = subprocess.run(cmd, **kwargs) if replayable else None
-    again = _native_crash(second) if replayable else None
+    second: Any = None
+    relaunch_error: OSError | subprocess.SubprocessError | None = None
+    if replayable:
+        try:
+            second = subprocess.run(cmd, **kwargs)
+        except (OSError, subprocess.SubprocessError) as exc:
+            relaunch_error = exc  # warned about below first, so the crash is not lost behind it
+    again = _native_crash(second)
     args = [str(a) for a in cmd]
     shown = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
     version = _interpreter_version(args[0], kwargs)
@@ -662,15 +668,25 @@ def run_retrying_a_native_crash(
             f"NATIVE CRASH TWICE: {crashed} Launched once more, it died again on {again}, with no "
             f"output. No test assertion ran on either launch. {unknown}"
         )
-    outcome = (
-        "Launched once more; that launch did not crash, and its result is the one the test "
-        "checks. The crash itself is not a test failure."
-        if replayable
-        else "NOT launched again: its stdin stream cannot be replayed, so the test receives this "
-        "crash as its result and will report it as a failure. That failure is this native crash, "
-        "not an assertion about the script."
-    )
+    if relaunch_error is not None:
+        outcome = (
+            f"Launched once more; that launch raised {type(relaunch_error).__name__}, which is "
+            "raised after this warning. Whatever that error is labelled, the first launch crashed."
+        )
+    elif replayable:
+        outcome = (
+            "Launched once more; that launch did not crash, and its result is the one the test "
+            "checks. The crash itself is not a test failure."
+        )
+    else:
+        outcome = (
+            "NOT launched again: its stdin stream cannot be replayed, so the test receives this "
+            "crash as its result. Whatever the test concludes from that result, it is this native "
+            "crash, not the script's own exit."
+        )
     warnings.warn(NativeCrashWarning(f"{crashed} {outcome} {unknown}"), stacklevel=_warn_depth)
+    if relaunch_error is not None:
+        raise relaunch_error
     return _checked(second if replayable else first, check)
 
 

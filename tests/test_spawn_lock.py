@@ -580,6 +580,8 @@ def test_a_silent_signal_death_is_retried_once_and_reported(
     # that printed a plausible mechanism onto an unmeasured leg is the error BACKLOG #1260 recorded.
     for part in ("NATIVE CRASH", "SIGSEGV", "guard.ps1", "7.9.9 on .NET 99", "NOT ESTABLISHED"):
         assert part in message, (part, message)
+    # The positive control for the unreplayable branch's test below, which asserts this is absent.
+    assert "is not a test failure" in message
 
 
 def test_a_silent_windows_access_violation_is_retried_once(
@@ -661,6 +663,26 @@ def test_the_retried_warning_does_not_call_the_crash_a_pass_or_a_fail(
     assert "is not a test failure" not in str(seen[0].message)
 
 
+def test_a_relaunch_that_raises_still_leaves_the_crash_on_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry that times out must not hide the crash before it behind a timeout label."""
+    launches = iter([subprocess.CompletedProcess(_PWSH, _SEGV, "", "")])
+
+    def crash_then_hang(cmd: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        for result in launches:
+            return result
+        raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=45)
+
+    monkeypatch.setattr(subprocess, "run", crash_then_hang)
+    monkeypatch.setattr(_spawn_lock, "_interpreter_version", lambda binary, kwargs: "stub")
+    with (
+        pytest.warns(NativeCrashWarning, match="TimeoutExpired"),
+        pytest.raises(subprocess.TimeoutExpired),
+    ):
+        run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
+
+
 def test_run_single_takes_the_retry(lock_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``run_single`` is the shared launcher for the wrapped files, so the retry sits under it."""
     calls = _scripted(monkeypatch, (_SEGV, "", ""), (0, "ok", ""))
@@ -739,7 +761,7 @@ def test_a_caller_stdin_stream_is_not_replayed(
     # Not replayed, but still warned about and counted: it is the same crash.
     with (
         payload.open(encoding="utf-8") as stream,
-        pytest.warns(NativeCrashWarning, match="will report it as a failure"),
+        pytest.warns(NativeCrashWarning, match="NOT launched again"),
     ):
         proc = run_retrying_a_native_crash(_PWSH, stdin=stream, capture_output=True, text=True)
     assert len(calls) == 1
