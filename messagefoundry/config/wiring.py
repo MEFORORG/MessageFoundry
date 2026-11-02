@@ -42,7 +42,6 @@ import logging
 import math
 import os
 import re
-import signal
 import sys
 import threading
 import tokenize
@@ -54,6 +53,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
+from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, TypeIs
 
@@ -108,6 +108,7 @@ from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.exception_origin import (
     exception_chain,
     raised_only_by_the_engine,
+    raised_outside_the_engine,
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
@@ -9689,19 +9690,23 @@ def _is_a_signal(exc: BaseException) -> bool:
     delivers a signal only to the main thread, so on any other, such as a reload's worker, an
     interrupt is code, and one leaving there would stop the event loop.
 
-    Only Python's own handler turns a signal into this exception, so under any other it is code too.
-    uvicorn holds SIGINT for the whole lifespan, where ``serve``'s first load runs, and a Ctrl-C
-    there only sets a flag on the server. A handler that raises one itself, as asyncio's does at a
-    second Ctrl-C, reads as code, and refusing the module ends that load as well.
+    Under any handler but Python's own it is treated as code too, whether or not a signal raised it.
+    uvicorn holds SIGINT for the whole lifespan, where ``serve`` loads its graph, and a Ctrl-C there
+    only sets a flag on the server. A handler can also raise one itself, as asyncio's does at a second
+    Ctrl-C: that module is refused, which ends a load, and ``validate`` goes on to its next module.
 
-    The state is read here because a traceback cannot answer: an interrupt that stopped on a ``raise``
-    is code, but ``signal.default_int_handler()`` called from a module stops on a call, as a real
-    signal does. With Python's handler in force, what passes this can be either, so
-    :func:`_exec_module` logs which module was loading."""
+    Under Python's own handler, one that stopped on a ``raise`` statement outside the engine is code,
+    because that handler stops on a call or a loop instruction. The engine's own is
+    :func:`_read_fault` passing a real one on. That is as far as a frame goes: a module calling
+    ``signal.default_int_handler()`` or throwing one into a generator stops as a real signal does,
+    and the handler in force is read here, after the module ran, so a module can have put Python's
+    back. What passes this can still be code, so :func:`_exec_module` logs which module was
+    loading."""
     return (
         type(exc) is KeyboardInterrupt
         and threading.current_thread() is threading.main_thread()
-        and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        and getsignal(SIGINT) is default_int_handler
+        and not raised_outside_the_engine(exc)
     )
 
 
@@ -9933,10 +9938,10 @@ def _withhold_quotations(text: str, quoted: Mapping[str, str]) -> str:
     regular expression: these patterns are a config module's text. Occurrences that overlap or touch
     become one span with one marker, naming the type of the longest, so neither the head nor the tail
     of either prints, and two side by side do not each pass for part of a token. A span made only of
-    identifier characters that another one touches stays, or an argument such as ``tls`` would
-    rewrite the connection name ``IB_tls``. Any other span is replaced, even where it equals an
-    identifier or a word of the refusal: nothing here can tell a connection named ``tls`` from a
-    quoted value, and the marker is the failure to prefer."""
+    identifier characters, with another identifier character next to it, stays, or an argument such
+    as ``tls`` would rewrite the connection name ``IB_tls``. Any other span is replaced, even where
+    it equals an identifier or a word of the refusal: nothing here can tell a connection named
+    ``tls`` from a quoted value, and the marker is the failure to prefer."""
     spans: list[tuple[int, int, str, int]] = []
     for at, following, kind in sorted(
         (at, at + len(quotation), kind)
@@ -10109,7 +10114,7 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         helpers.unregister(mod_name, module)
         refusal = _refusal_for(path, failure, helpers.source_of)
     except KeyboardInterrupt:
-        # The stop is bare, and it can be a module's own raise, so this is all that says where it
+        # The stop is bare, and it can be code the module ran, so this is all that says where it
         # happened. The file and a fixed sentence, never the original's text.
         _logger.warning(
             "config module %s: a KeyboardInterrupt stopped the load here, from Ctrl-C or from "

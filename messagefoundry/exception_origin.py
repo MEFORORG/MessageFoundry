@@ -43,6 +43,7 @@ __all__ = [
     "exception_chain",
     "raised_by_the_engine",
     "raised_only_by_the_engine",
+    "raised_outside_the_engine",
     "worded_by_the_engine",
 ]
 
@@ -121,6 +122,14 @@ def raised_by_the_engine(exc: BaseException) -> bool:
     frame, and its text quotes ``value``. Use :func:`worded_by_the_engine` where that matters."""
     entries = _entries(exc)
     return bool(entries) and _in_the_engine(entries[-1])
+
+
+def raised_outside_the_engine(exc: BaseException) -> bool:
+    """Whether the innermost frame of ``exc``'s traceback stopped on a ``raise`` statement in code
+    that is not this package's. A signal Python's own handler turned into an exception stops on a
+    call or a loop instruction, so this can prove code and can never prove a signal."""
+    entries = _entries(exc)
+    return bool(entries) and _stopped_on_a_raise(entries[-1]) and not _in_the_engine(entries[-1])
 
 
 def raised_only_by_the_engine(exc: BaseException) -> bool:

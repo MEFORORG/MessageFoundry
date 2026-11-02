@@ -30,17 +30,20 @@
   repeated keyword now reads `TypeError at line N naming 'keyword'`, when the source line spells
   that keyword. A config module that raises a `BaseException` that is not an `Exception` is now
   refused as a failed module, with no text, and a `SystemExit` of any class is refused the same way
-  on every thread, with nothing it was raised from. An exact `KeyboardInterrupt` on the main thread
-  with Python's own SIGINT handler in force, where it cannot be told from Ctrl-C, stops the load as
-  a new, bare `KeyboardInterrupt` that carries none of the original's arguments, notes or chain, and
-  one WARNING line names the file that was loading and quotes nothing of the exception. Anywhere else
-  no signal can raise it, so it is refused like the rest: on any other thread, and under another
-  handler, which includes `serve`'s load in the API lifespan because uvicorn holds SIGINT there. So a
-  module that raises one there fails the start with its refusal, and a real Ctrl-C there only asks
-  the server to exit. `serve`'s earlier load, which runs when the environment file is missing, is on
-  Python's handler and stops with that line. The loader's read of a failed module's exception runs
-  the module's code, so a real Ctrl-C can land in it, and an interrupt there is judged the same way,
-  with no exception chained to it. Any other fault in
+  on every thread, with nothing it was raised from. An exact `KeyboardInterrupt` that can be Ctrl-C
+  stops the load as a new, bare `KeyboardInterrupt` that carries none of the original's arguments,
+  notes or chain, and one WARNING line names the file that was loading and quotes nothing of the
+  exception. That means on the main thread, with Python's own SIGINT handler in force, and not
+  stopped on a `raise` statement outside the engine. Any other is treated as code, whether or not a
+  signal raised it, and is refused like the rest. So a module's `raise KeyboardInterrupt` is a failed
+  module, and so is one under another handler, which includes `serve`'s load in the API lifespan: uvicorn
+  holds SIGINT there, so a real Ctrl-C only asks the server to exit. A handler that raises one
+  itself, as asyncio's does at a second Ctrl-C, is refused the same way, and `validate` then goes on
+  to its next module. A module that calls `signal.default_int_handler()` or throws one into a
+  generator cannot be told from Ctrl-C, so it stops the load with that line, and a module can put
+  Python's handler back first, even under uvicorn. The loader's read of a failed module's exception
+  runs the module's code, so a real Ctrl-C can land in it, and an interrupt there is judged the same
+  way, with no exception chained to it. Any other fault in
   that read is absorbed and that module is refused, a `SystemExit` of any class on every thread
   included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
   no output on a module that failed. An exact `WiringError` also stands only while its arguments

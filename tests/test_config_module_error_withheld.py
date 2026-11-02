@@ -1116,7 +1116,7 @@ def test_no_loader_frame_on_a_refusal_holds_the_withheld_original(tmp_path: Path
 
 @pytest.mark.usefixtures("sigint_raises")
 def test_no_loader_frame_on_an_interrupt_holds_the_original(tmp_path: Path) -> None:
-    _write(tmp_path, "feed.py", f"raise KeyboardInterrupt({NEEDLE!r})\n")
+    _write(tmp_path, "feed.py", _thrown(f"KeyboardInterrupt({NEEDLE!r})"))
     with pytest.raises(KeyboardInterrupt) as ei:
         load_config(tmp_path)
     assert _frames_holding(ei.value, KeyboardInterrupt) == []
@@ -1324,10 +1324,30 @@ def _assert_bare(exc: BaseException) -> None:
     assert exc.__cause__ is None and exc.__context__ is None
 
 
-def _assert_one_line_names_the_module(caplog: pytest.LogCaptureFixture) -> None:
+def _thrown(exc: str) -> str:
+    """Module code that puts ``exc`` on the stack with no ``raise`` statement, as a signal does."""
+    return f"g = (x for x in [0]); next(g); g.throw({exc})"
+
+
+def _assert_the_load_stops(d: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """It stops as a bare interrupt, and one line says which module was loading, quoting nothing."""
+    with caplog.at_level(logging.INFO), pytest.raises(KeyboardInterrupt) as ei:
+        load_config(d)
+    _assert_bare(ei.value)
     (line,) = [r.getMessage() for r in caplog.records if "stopped the load" in r.getMessage()]
     assert "feed.py" in line
     assert NEEDLE not in caplog.text
+
+
+def _refusal_with_no_stop(d: Path, caplog: pytest.LogCaptureFixture) -> WiringError:
+    with caplog.at_level(logging.INFO):
+        try:
+            err = _load_error(d)
+        except KeyboardInterrupt:  # one left alone ends the whole run
+            pytest.fail("the interrupt left the load as a Ctrl-C")
+    assert NEEDLE not in str(err) and NEEDLE not in caplog.text
+    assert "stopped the load" not in caplog.text
+    return err
 
 
 def _load_on_a_worker(d: Path) -> BaseException | None:
@@ -1353,6 +1373,27 @@ def sigint_raises() -> Iterator[None]:
 @pytest.mark.parametrize(
     "body",
     [
+        "import signal\nsignal.default_int_handler(2, None)\n",
+        _thrown(f"KeyboardInterrupt({NEEDLE!r})"),
+        f"e = KeyboardInterrupt()\ne.__cause__ = ValueError({NEEDLE!r})\n{_thrown('e')}\n",
+        f"try:\n    raise ValueError({NEEDLE!r})\n"
+        f"except ValueError:\n    {_thrown('KeyboardInterrupt()')}\n",
+        f"e = KeyboardInterrupt()\ne.add_note({NEEDLE!r})\n{_thrown('e')}\n",
+    ],
+    ids=["handler-called", "with-text", "from", "in-handler", "with-note"],
+)
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_no_frame_can_tell_from_a_signal_stops_the_load(
+    tmp_path: Path, body: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # None of these stops on a `raise` statement, so each looks as a real signal does.
+    _write(tmp_path, "feed.py", body)
+    _assert_the_load_stops(tmp_path, caplog)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
         "raise KeyboardInterrupt\n",
         f"raise KeyboardInterrupt({NEEDLE!r})\n",
         f"raise KeyboardInterrupt from ValueError({NEEDLE!r})\n",
@@ -1362,31 +1403,36 @@ def sigint_raises() -> Iterator[None]:
     ids=["bare", "with-text", "from", "in-handler", "with-note"],
 )
 @pytest.mark.usefixtures("sigint_raises")
-def test_an_interrupt_stops_the_load_with_nothing_on_it(
+def test_a_raise_statement_is_a_refused_module_under_pythons_handler(
     tmp_path: Path, body: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # With Python's own handler in force, code cannot be told from a signal, so all of these stop,
-    # with no text. The one line says which module was loading, and quotes nothing of the exception.
+    # Python's handler stops on a call or a loop instruction, never on a `raise`, so this is code.
     _write(tmp_path, "feed.py", body)
-    with (
-        caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"),
-        pytest.raises(KeyboardInterrupt) as ei,
-    ):
-        load_config(tmp_path)
-    _assert_bare(ei.value)
-    _assert_one_line_names_the_module(caplog)
+    assert "KeyboardInterrupt at line" in str(_refusal_with_no_stop(tmp_path, caplog))
 
 
 @pytest.mark.usefixtures("sigint_raises")
-def test_an_interrupt_with_another_handler_in_force_is_a_refused_module(tmp_path: Path) -> None:
-    # Only Python's own handler turns a signal into this exception, so under any other it is code.
-    _write(tmp_path, "feed.py", f"raise KeyboardInterrupt({NEEDLE!r})\n")
+def test_an_interrupt_with_another_handler_in_force_is_a_refused_module(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Thrown, so only the handler can say: a `raise` is refused under any handler.
+    _write(tmp_path, "feed.py", _thrown(f"KeyboardInterrupt({NEEDLE!r})"))
     signal.signal(signal.SIGINT, lambda _signum, _frame: None)
-    try:
-        err = _load_error(tmp_path)
-    except KeyboardInterrupt:
-        pytest.fail("the interrupt left the load as a Ctrl-C")  # one left alone ends the whole run
-    assert NEEDLE not in str(err) and "KeyboardInterrupt at line 1" in str(err)
+    assert "KeyboardInterrupt at line 1" in str(_refusal_with_no_stop(tmp_path, caplog))
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_module_that_puts_pythons_handler_back_reads_as_ctrl_c(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # What the rule does not catch, pinned: the handler is read after the module ran.
+    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    body = (
+        "import signal\n\nsignal.signal(signal.SIGINT, signal.default_int_handler)\n"
+        f"{_thrown(f'KeyboardInterrupt({NEEDLE!r})')}\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    _assert_the_load_stops(tmp_path, caplog)
 
 
 @pytest.mark.usefixtures("sigint_raises")
@@ -1394,8 +1440,9 @@ def test_an_interrupt_in_serves_lifespan_load_is_a_refused_module(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # uvicorn holds SIGINT for the whole lifespan, so a real Ctrl-C here only sets a flag on the
-    # server and no KeyboardInterrupt ever reaches the load. So this one is code, and the start has
-    # to say which module failed. Through the real server on the main thread, as `serve` runs it.
+    # server and no KeyboardInterrupt reaches the load. So this one is treated as code, and the start
+    # has to say which module failed. Through the real server on the main thread, as `serve` runs it.
+    # Thrown, so only the handler can say: a `raise` is refused under any handler.
     config = tmp_path / "config"
     config.mkdir()
     _write(
@@ -1406,7 +1453,7 @@ def test_an_interrupt_in_serves_lifespan_load_is_a_refused_module(
         "    f'{signal.getsignal(signal.SIGINT)!r} '\n"
         "    f'{threading.current_thread() is threading.main_thread()}'\n"
         ")\n"
-        f"raise KeyboardInterrupt({NEEDLE!r})\n",
+        f"{_thrown(f'KeyboardInterrupt({NEEDLE!r})')}\n",
     )
     app = create_managed_app(
         db_path=tmp_path / "store.db",
@@ -1416,7 +1463,7 @@ def test_an_interrupt_in_serves_lifespan_load_is_a_refused_module(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_config=None))
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(SystemExit) as ei:
+    with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as ei:
         try:
             server.run()
         except KeyboardInterrupt:  # one left alone ends the whole run
@@ -1472,11 +1519,11 @@ def fails_in_the_read(
 @pytest.mark.parametrize(
     "fault",
     [
-        f"raise KeyboardInterrupt({NEEDLE!r})",
+        _thrown(f"KeyboardInterrupt({NEEDLE!r})"),
         # Sent in a loop for the reason test_a_real_interrupt_inside_a_handler_stops_the_load gives.
         "import signal\n        while True:\n            signal.raise_signal(signal.SIGINT)",
     ],
-    ids=["from-code", "real-signal"],
+    ids=["thrown", "real-signal"],
 )
 @pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_in_the_loaders_read_stops_the_load(
@@ -1489,13 +1536,25 @@ def test_an_interrupt_in_the_loaders_read_stops_the_load(
     # config error, and it leaves as a new, bare one with no module exception on it. One line says
     # which module, however many of the loader's guards it left through.
     fails_in_the_read(fault)
-    with (
-        caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"),
-        pytest.raises(KeyboardInterrupt) as ei,
-    ):
-        load_config(tmp_path)
-    _assert_bare(ei.value)
-    _assert_one_line_names_the_module(caplog)
+    _assert_the_load_stops(tmp_path, caplog)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_raise_of_an_interrupt_in_the_loaders_read_is_absorbed(
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    fails_in_the_read(f"raise KeyboardInterrupt({NEEDLE!r})")
+    _refusal_with_no_stop(tmp_path, caplog)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_in_the_loaders_read_under_another_handler_is_absorbed(
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    # Where serve's lifespan load sits: the read is judged by the same rule as the module's run.
+    fails_in_the_read(_thrown(f"KeyboardInterrupt({NEEDLE!r})"))
+    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    _refusal_with_no_stop(tmp_path, caplog)
 
 
 @pytest.mark.parametrize(
@@ -1849,7 +1908,9 @@ def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:
 
 
 @pytest.mark.usefixtures("sigint_raises")
-def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> None:
+def test_a_real_interrupt_inside_a_handler_stops_the_load(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     # Python sets a signal's KeyboardInterrupt's __context__ to whatever was being handled. Sent in a
     # loop because the handler can run inside a weakref callback, which swallows the interrupt.
     body = (
@@ -1858,9 +1919,7 @@ def test_a_real_interrupt_inside_a_handler_stops_the_load(tmp_path: Path) -> Non
         "except ValueError:\n    while True:\n        signal.raise_signal(signal.SIGINT)\n"
     )
     _write(tmp_path, "feed.py", body)
-    with pytest.raises(KeyboardInterrupt) as ei:
-        load_config(tmp_path)
-    _assert_bare(ei.value)
+    _assert_the_load_stops(tmp_path, caplog)
 
 
 # Item 3: a harness graph's knob refusal reaches its reader, through the node's captured output.
