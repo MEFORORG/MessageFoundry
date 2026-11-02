@@ -60,7 +60,9 @@ jobs:
         # Windows is the deployment target; Linux is the cheap breadth.
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    # Setup, install (a fallback install runs one requirement at a time), the TLS tests, and the
+    # suite step's 90-minute cap.
+    timeout-minutes: 130
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONFAULTHANDLER: "1"
@@ -191,13 +193,14 @@ jobs:
         id: suite
         if: steps.install.outcome == 'success' || steps.fallback.outcome == 'success'
         continue-on-error: true
-        timeout-minutes: 50
+        # Sized to the suite, not to a hang: py314-latest-canary.yml's suite step says why and gives
+        # the measurements. At 50 minutes this step killed the windows-latest leg on run 40504909930.
+        timeout-minutes: 90
         run: |
           STATUS=0
           python -m pytest -q -n auto --dist loadfile -p no:cacheprovider -m 'not tooling' \
             --ignore-glob='*messagefoundry-webconsole*' --continue-on-collection-errors \
-            --timeout=120 > suite.txt 2>&1 || STATUS=$?
-          tail -200 suite.txt
+            --timeout=120 2>&1 | tee suite.txt || STATUS=$?
           echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 
