@@ -4251,7 +4251,7 @@ class RegistryRunner:
                 # The lane's setting, for a refusal that does not name its own: a DR abort shows
                 # it in place of the refusal's text (vault BACKLOG #3498).
                 key = (
-                    _SETTING_KEYS
+                    _refused_setting_keys(settings)
                     if isinstance(exc, AnchorSettingRefused)
                     else lane_ca_setting(settings)
                 )
@@ -12359,7 +12359,7 @@ def _lane_anchor_line(
     ca = lane_ca_setting(settings)
     fault = _lane_anchor_fault(exc)
     if fault == "setting":
-        what = f"{_SETTING_KEYS} setting was refused"
+        what = f"{_refused_setting_keys(settings)} setting was refused"
         start = "" if passive else " and start the connection"
         advice = f"Fix the setting, then reload{start}; the server log says why"
     elif fault == "file":
@@ -12376,13 +12376,24 @@ def _lane_anchor_line(
     where = " on this passive DR standby, and POST /dr/activate needs it" if passive else ""
     return TrustAnchorError(
         f"{direction} connection '{name}': its {what}{where}. {advice}",
-        setting=_lane_setting(direction, name, _SETTING_KEYS if fault == "setting" else ca),
+        setting=_lane_setting(
+            direction, name, _refused_setting_keys(settings) if fault == "setting" else ca
+        ),
         fixed_text=True,
     )
 
 
-#: The keys a lane's setting refusal names: the check does not say which of the two it refused.
+#: The keys a lane's setting refusal names when the lane's CA is a ``tls_ca_file``: the check does
+#: not say which of the two it refused. :func:`_refused_setting_keys` picks the name for a lane.
 _SETTING_KEYS = "tls_ca_pin or tls_ca_file"
+
+
+def _refused_setting_keys(settings: Mapping[str, Any]) -> str:
+    """What a lane's setting refusal names. A generic DATABASE lane whose CA is its ``odbc_params``
+    ``sslca`` (:func:`lane_ca_setting`) names that, since it is the setting the operator set and
+    the lane takes no ``tls_ca_file``. Any other lane names :data:`_SETTING_KEYS` (BACKLOG #2705)."""
+    ca = lane_ca_setting(settings)
+    return _SETTING_KEYS if ca == "tls_ca_file" else ca
 
 
 def _lane_setting(direction: str, name: str, key: str) -> str:

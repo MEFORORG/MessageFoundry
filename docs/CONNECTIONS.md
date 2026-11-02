@@ -1808,8 +1808,8 @@ port compared.
 
 `[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords:
 the list is hand-chosen, no keyword is on it in order to name a host, and a file
-keyword's value is screened separately by spelling (vault BACKLOG #2577). **The list covers
-keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
+keyword's value is screened separately, as the paragraph on file keywords below says (vault
+BACKLOG #2577). **The list covers keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
 in a braced password (*The password*, below), and the driver reading `SERVER` as its target
 (*This is a rule about keywords*, below).** The keywords set at least a port, a TLS mode, a local file or a session option:
 
@@ -1826,10 +1826,15 @@ keyword is sent as you wrote it, and not every driver trims it. A keyword given 
 case, is refused. The list says what the engine accepts. It does not say which keywords your
 driver reads, so check the driver's own manual.
 
-A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local path: a drive
-letter, or one leading separator. A path that starts with two separators, or with a device
-prefix, is refused, because it can name another host. This reads the spelling only. It does
-not follow a mapped drive or a link, so keep those files on a local disk.
+Keep a file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) on a local disk of this host.
+When the connection is built, the engine refuses a value that starts with two separators or
+with a device prefix, such as a share spelling. That part is enforced on every platform. On
+Windows the engine also runs a best-effort check of the path, and refuses the value when that
+check finds the path leads to another host, or cannot finish reading the trimmed path. Both
+refusals apply in every SSL mode. The check is defence in depth, not a guarantee. It misses at
+least: links to some object paths; paths that change after the build; the contents of an
+`SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The check does not change the
+value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -1839,10 +1844,12 @@ first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The 
 file with its own TLS library, which can wait for a password on an encrypted block. At least
 these cases are left to the driver unchecked: a file that does not exist, a directory (an
 `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
-over 1 MiB, is refused. That includes a share Windows cannot reach when the connection is
-built, however it fails. One case is left to the driver instead: under the TLS-off modes the lane
-check below names, a share Windows reports as not found because it could not reach it (errors
-53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+over 1 MiB, is refused. A path the file-keyword check above finds leads to a share is refused
+before this read, in every SSL mode, whether Windows can reach the share or not. A path that
+check cleared, which then fails this read because Windows cannot reach a share, is refused too,
+however it fails. One case is left to the driver instead: under the TLS-off modes the lane check
+below names, such a path Windows reports as not found because it could not reach the share
+(errors 53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
 first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
 material.
 
@@ -1853,9 +1860,10 @@ again. A file another account can replace, or whose content now fails, refuses t
 is built or an operator starts it, at `[security].enforcement = enforce`; `warn` warns about the
 ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
 the whole reload, and the running lane is not stopped. A file swapped since the last check is
-audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
-where the driver reads no CA, and there is no pin for this file. A missing file or a directory
-is left to the driver here too, and a pipe or device is refused unread. **What it does not
+audited as `changed`. Under `SSLmode=disable` (or `SSLMODE=DISABLED`), where the driver reads no
+CA, the file-keyword refusal above still applies to `SSLCA`, and the file is not checked as an
+anchor. There is no pin for this file. A missing file or a directory is left to the driver here
+too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
 for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all.
