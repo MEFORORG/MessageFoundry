@@ -4,14 +4,17 @@
 # It closes at the second before pull_request run 41500903043, which was in progress when listed; every run in the pool
 # had finished. A later re-run of a run in the window adds an attempt this pool does not hold.
 # One line per windows-2022 engine job execution (every attempt), or one no-job line for a run without that job.
-# step_conclusion is the API's, except no-step (the job holds no such step) and unfinished (the step started and never
-# ended, as when a runner is lost and the job cap ends the job).
+# step_conclusion is the API's, except three values this file adds: no-job (the run has no such job), no-step (the
+# job holds no such step) and unfinished (the step started and never ended: run 40558206270, whose job was cancelled
+# 71:00 after it started with the step still in progress, so the 55:00 step cap never ended it).
 # step_s is the step's completed_at minus started_at, in seconds. keep says whether the line is a row of the pool.
 # job_s and setup_s serve the job-cap re-derivation; the row check reads neither. They are taken from STEP stamps, the
 # first step's start to the last step's end, and to the Tests step's start: on runs created about 2026-11-01T09:00Z
-# the API reports some run and job stamps an hour late, created_at among them, while the step stamps are right.
-# On an unfinished line job_s is the job's own completed_at minus started_at. setup_s is empty for a skipped step.
-# Two changes land inside the window. From PR 2639 (merged 2026-10-29T23:04:08Z) the timing-quarantine tests leave
+# the API reports some run and job stamps an hour late, created_at among them, while the step stamps are right. The
+# created_at column keeps the API's value, which the window filter read; the runs it shifts are 41287785200, 41288555635,
+# 41288556823, 41288558135, 41289217735, 41290266818 and 41290943841. job_s is empty where no step ended or one never
+# did, and setup_s is empty for a skipped step.
+# At least these changes land inside the window. From PR 2639 (merged 2026-10-29T23:04:08Z) the timing-quarantine tests leave
 # this step, and a LOW margin is only a warning on merge_group, so gate_conclusion reads success there below 1.30x.
 # From PR 2653 (merged 2026-10-30T15:10:02Z) pull_request warns down to 1.20x. A run takes these from its own tree.
 # NO ROW BINDS THIS FILE YET. The 55:00 `step_timeout` in ci.yml is under 1.30x this pool's worst passing row, so
@@ -350,7 +353,7 @@ run_id	event	created_at	job_id	attempt	step_conclusion	step_s	step_clock	job_con
 40558139170	merge_group	2026-10-27T18:14:43Z	122379902718	1	success	2068	34:28	success	success	row	2109	36
 40558142221	merge_group	2026-10-27T18:14:44Z	122380530486	1	success	2231	37:11	success	success	row	2334	97
 40558202548	merge_group	2026-10-27T18:15:06Z	122380766105	1	cancelled	110	1:50	cancelled	success	no-row	161	48
-40558206270	merge_group	2026-10-27T18:15:07Z	122380154031	1	unfinished			cancelled		no-row	4260	43
+40558206270	merge_group	2026-10-27T18:15:07Z	122380154031	1	unfinished			cancelled		no-row		43
 40558208655	merge_group	2026-10-27T18:15:08Z	122380794240	1	success	2304	38:24	success	success	row	2357	48
 40558213806	merge_group	2026-10-27T18:15:10Z	122380443832	1	success	2380	39:40	success	success	row	2438	53
 40558219695	merge_group	2026-10-27T18:15:12Z	122381046048	1	success	2385	39:45	success	success	row	2433	43
