@@ -141,6 +141,20 @@ function Get-Finite($Value) {
     return $d
 }
 
+# A percentage out of JSON, or $null: a finite number, and not below 0. usage.ps1 holds the same function,
+# and tests/test_coord_usage.py pins them.
+#
+# OVER 100 STAYS A NUMBER. The statusLine docs give this window as 0 to 100, and client 2.1.308 clamps it
+# there (Math.min, read in the binary 2026-11-02, not run). But the clamp is the client's, the same client
+# passes spend_limit through unclamped, and its docs say that one runs above 100. A refused 104 would turn
+# a spent pool into UNKNOWN and lose the stop, so a wrong high number costs a deferral and the other
+# choice could cost a cutoff. Below 0 no reading of a pool can land, and a negative clears the gate.
+function Get-Percentage($Value) {
+    $d = Get-Finite $Value
+    if ($null -eq $d -or $d -lt 0) { return $null }
+    return $d
+}
+
 # DID THIS SESSION CALL THE API SINCE ITS LAST FIRE? cost.total_api_duration_ms only rises when it did,
 # and rate_limits arrives on an API response, so a rise is the one thing in the payload that tells a live
 # session's reading from an idle one's cached number. A missing or unreadable mark, or a payload with no
@@ -156,7 +170,7 @@ function Get-Finite($Value) {
 # writes nothing. Neither does any counter over a mark that is there and did not read: the read failed,
 # or the file holds no number, so it may hide a higher counter. That is no rise and no write. Both leave
 # the session stale, which is the safe side: a restarted counter until it passes the old mark, and an
-# unreadable mark until a prune clears it.
+# unreadable mark until at least a read that works again, a hand delete, or the prune below ends it.
 #
 # THIS DOES NOT MAKE A MARK MONOTONIC. At least two routes put a lower counter in place on one shared id,
 # and each can cost one false refresh, not a loop: unlocked writes can land the lower counter last, and
@@ -187,7 +201,8 @@ function Test-SessionCalledApi([string]$Dir, $Payload) {
     try {
         [void][System.IO.Directory]::CreateDirectory($markDir)
         # A session's first mark clears the marks nobody touched for a week. A mark lost here costs its
-        # session one refresh, nothing else bounds this directory, and an unreadable mark ends only here.
+        # session one refresh, and nothing else bounds this directory. An unreadable mark that age goes
+        # too, but only through another session's first mark: its own session never reaches this line.
         if ($absent) {
             $cutoff = [datetime]::UtcNow.AddDays(-7)
             Get-ChildItem -LiteralPath $markDir -Filter "mark-*" -File |
@@ -256,7 +271,7 @@ try {
     # must not share a representation.
     function Get-Window($w) {
         if ($null -eq $w) { return $null }
-        $pct = Get-Finite $w.used_percentage
+        $pct = Get-Percentage $w.used_percentage
         if ($null -eq $pct) { return $null }
         return [ordered]@{
             used_percentage = $pct

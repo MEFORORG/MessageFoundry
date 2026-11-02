@@ -423,11 +423,14 @@ function Get-Rate($CurrentResetEpoch) {
     try {
         foreach ($line in (Get-Content -LiteralPath $histPath -Tail 400 -ErrorAction Stop)) {
             try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ($null -eq $r.seven_day) { continue }                  # carried-forward or absent: not an observation
+            # Carried forward, absent or not a percentage: not an observation. A NaN row would turn the
+            # whole rate into NaN and clear a burn, and a blank row reads as 0 and fakes one.
+            $observed = Get-Percentage $r.seven_day
+            if ($null -eq $observed) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
             $age = Get-AgeMinutes $r.at
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
-            $rows += [pscustomobject]@{ AgeMin = $age; Pct = [double]$r.seven_day }
+            $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
         }
     } catch { return $null }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
@@ -474,11 +477,25 @@ function Get-Finite($Value) {
     return $d
 }
 
+# A percentage out of JSON, or $null: a finite number, and not below 0. usage-collect.ps1 holds the same
+# function and says why a reading over 100 stays a number; tests/test_coord_usage.py pins them.
+function Get-Percentage($Value) {
+    $d = Get-Finite $Value
+    if ($null -eq $d -or $d -lt 0) { return $null }
+    return $d
+}
+
 # A WINDOW WITH NO NUMBER HOLDS NO READING. `[double]$null` and `[double]""` are both 0, NaN compares false
-# with every level, and an object, an array or a date casts to nothing, so each of those read OK or
-# worse. A percentage that is not a finite number is refused before any cast. One definition, as above.
+# with every level, a negative is below every level, and an object, an array or a date casts to nothing,
+# so each of those read OK or worse. Anything Get-Percentage refuses is refused before any cast. One
+# definition, as above.
+#
+# A NUMERIC STRING IS REFUSED TOO, ON PURPOSE, THOUGH A "99" READ CRITICAL BEFORE THIS CHECK. Only a writer
+# other than the collector produces one: the client builds the field with Math.min, and the collector
+# writes a [double]. Such a document reads UNKNOWN, so the gate answers REVIEW, which stops an unreviewed
+# spawn and clears nothing. Decided on PR 2705, and ADR 0211 records it.
 function Test-WindowHasNumber($w) {
-    return ($null -ne (Get-Finite $w.used_percentage))
+    return ($null -ne (Get-Percentage $w.used_percentage))
 }
 
 # The band this reader calls "at the ceiling". A fresh reading here stops work on any provenance, so a

@@ -924,7 +924,8 @@ def test_a_mark_the_read_fails_on_is_not_replaced(tmp_path: Path) -> None:
 
 
 def test_a_prune_clears_an_unreadable_mark_and_the_session_recovers(tmp_path: Path) -> None:
-    """An unreadable mark is never written, so nothing else would ever end it."""
+    """A file holding no number does not mend itself. At least a read that works again or a hand delete
+    also ends an unreadable mark; this is the route the collector takes itself."""
     seven = window(40.0, 280000)
     _session_fire(tmp_path, seven, api_ms=1000)
     _mark(tmp_path).write_text("{ not json", encoding="utf-8")
@@ -988,6 +989,9 @@ def test_a_published_window_with_no_number_is_not_a_reading_of_zero(
         pytest.param(None, id="absent"),
         pytest.param("", id="blank"),
         pytest.param(True, id="bool"),
+        pytest.param("99", id="numeric-string"),
+        pytest.param(-5, id="negative"),
+        pytest.param(-0.1, id="just-below-zero"),
         pytest.param(float("nan"), id="nan"),
         pytest.param(float("inf"), id="infinity"),
         pytest.param(float("-inf"), id="negative-infinity"),
@@ -1028,26 +1032,88 @@ def test_the_survey_prints_no_number_for_a_window_with_none(fake_home: Path) -> 
     assert row["seven"] is None, row
 
 
-def test_a_blank_percentage_in_a_payload_is_no_reading(tmp_path: Path) -> None:
-    """An absent window is carried, and a blank one is absent: [double]"" would have published a 0."""
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("", id="blank"),
+        pytest.param("99", id="numeric-string"),
+        pytest.param(-5, id="negative"),
+    ],
+)
+def test_a_percentage_that_is_not_one_is_no_reading(tmp_path: Path, value: Any) -> None:
+    """An absent window is carried, and one with no percentage in it is absent. The control is that
+    nothing replaced the reading, and the empty directory below publishes nothing at all."""
     seven = window(40.0, 280000)
     _session_fire(tmp_path, seven)
-    _session_fire(tmp_path, {**window(0.0, 290000), "used_percentage": ""})
+    _session_fire(tmp_path, {**window(0.0, 290000), "used_percentage": value})
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(40.0)
     assert len(history(tmp_path)) == 1, history(tmp_path)
 
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _session_fire(empty, {**window(0.0, 290000), "used_percentage": value})
+    assert not (empty / "latest.json").exists()
 
-def test_the_collector_and_the_hook_agree_on_what_a_number_is() -> None:
+
+def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) -> None:
+    """The client clamps this window at 100 today, and the clamp is the client's. Refusing 104 would turn
+    a spent pool into UNKNOWN, so it reads as the stop it is."""
+    collect(tmp_path, {"session_id": "S", "rate_limits": {"seven_day": window(104.0, 280000)}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(104.0)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["used_percentage"] == pytest.approx(104.0), doc
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param("", id="blank"),
+        pytest.param(True, id="bool"),
+        pytest.param(-5, id="negative"),
+        pytest.param({}, id="object"),
+    ],
+)
+def test_a_history_row_with_no_number_is_skipped(tmp_path: Path, bad: Any) -> None:
+    """At either end of the span. A NaN row used to read OK and clear a burn, and a blank one faked a
+    burn from 0. The control is the same history without the bad rows: the answer must match it."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=40.0, seven_epoch=epoch)
+
+    def rows(points: list[tuple[float, Any]]) -> None:
+        (tmp_path / "history.jsonl").write_text(
+            "".join(
+                json.dumps({"at": _minutes_ago(m), "seven_day": v, "seven_reset": epoch}) + "\n"
+                for m, v in points
+            ),
+            encoding="utf-8",
+        )
+
+    good: list[tuple[float, Any]] = [(60, 30.0), (30, 40.0)]
+    rows(good)
+    want_code, want = read(tmp_path)
+    assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), want
+    rows([(80, bad), *good, (1, bad)])
+    got_code, got = read(tmp_path)
+    assert got_code == want_code, got
+    assert got["seven_day"]["rate_pct_per_hr"] == pytest.approx(
+        want["seven_day"]["rate_pct_per_hr"], abs=0.5
+    ), got
+
+
+def test_every_copy_of_a_number_rule_agrees() -> None:
     """Copies of one rule in three files that must each survive without the others, so drift goes red
     here."""
     hook = ROOT / "scripts" / "hooks" / "usage-headroom-inject.ps1"
-    body = re.compile(r"^function Get-Finite\(\$Value\) \{$.*?^\}$", re.M | re.S)
-    copies = []
-    for path in (COLLECT, READ, hook):
-        found = body.search(path.read_text(encoding="utf-8"))
-        assert found, f"no Get-Finite in {path}"
-        copies.append(found.group())
-    assert copies[0] == copies[1] == copies[2]
+    for name, paths in (("Get-Finite", (COLLECT, READ, hook)), ("Get-Percentage", (COLLECT, READ))):
+        body = re.compile(rf"^function {name}\(\$Value\) \{{$.*?^\}}$", re.M | re.S)
+        copies = set()
+        for path in paths:
+            found = body.search(path.read_text(encoding="utf-8"))
+            assert found, f"no {name} in {path}"
+            copies.add(found.group())
+        assert len(copies) == 1, copies
 
 
 def test_a_session_of_another_root_cannot_confirm_this_roots_reading(tmp_path: Path) -> None:

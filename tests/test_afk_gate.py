@@ -677,13 +677,19 @@ def test_a_floor_below_the_ceiling_reads_unknown_and_the_gate_reads_the_floor(
 
 @pytest.mark.parametrize(
     "shape",
-    [pytest.param(float("nan"), id="nan"), pytest.param({}, id="object")],
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param({}, id="object"),
+        pytest.param(-5, id="negative"),
+        pytest.param("99", id="numeric-string"),
+    ],
 )
 def test_a_window_with_no_number_cannot_clear_the_gate(
     sb: Sandbox, tmp_path: Path, shape: Any
 ) -> None:
     """Fresh, and on a wired root, so nothing but the number is wrong. NaN compares false with every
-    level, so it used to grade below the rung and clear."""
+    level and a negative is below every level, so each used to grade below the rung and clear. A numeric
+    string is REVIEW by decision; ADR 0211 says why."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
