@@ -341,6 +341,8 @@ def test_no_live_schema_read_calls_a_qualified_multi_argument_unnest() -> None:
     select = re.compile(r"\bSELECT\b", re.IGNORECASE)
     queries = [t for name, t in texts if name == postgres.__name__ and select.search(t)]
     assert len(queries) > 5, f"{postgres.__name__}: no SQL constants read"
+    assert postgres._LIVE_COLUMNS_SQL in queries and postgres._LIVE_INDEXES_SQL in queries
+    assert any(name == server_schema_verify.__name__ for name, _ in texts)
     offenders = [f"{name}: {text}" for name, text in texts if _QUALIFIED_MULTI_UNNEST.search(text)]
     assert offenders == [], offenders
     assert "ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))" in (

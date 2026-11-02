@@ -2308,18 +2308,18 @@ class _PythonClassDictPrintsVars(Exception):
 
 
 def test_a_python_class_dict_reader_never_prints_a_codec_error_whichever_way_it_reads() -> None:
+    plain = _PythonClassDictPrintsVars("bad")
     error = _PythonClassDictPrintsVars("bad")
     error.payload = _encode_error()  # type: ignore[attr-defined]  # stored by the generic setattr
-    try:
-        printed = str(error)
-    except TypeError:  # through 3.14: its own str() raises, and the scan must fail closed
-        pass
-    else:  # from 3.15 its own str() prints the codec error, character and all
-        assert any(spelling in printed for spelling in _CHAR_SPELLINGS)
-    for text in (redaction.safe_exc(error), codec_safe_str(error)):
-        assert redaction._HOLDER_TEXT in text
-        for spelling in _CHAR_SPELLINGS:
-            assert spelling not in text
+    if sys.version_info >= (3, 15):
+        # The read succeeds, so the verdict below is the payload's: without it the text renders.
+        assert redaction.safe_exc(plain) == "_PythonClassDictPrintsVars: ctx {}"
+        assert any(spelling in str(error) for spelling in _CHAR_SPELLINGS)  # its own str() leaks
+    else:
+        with pytest.raises(TypeError):  # the read raises, and the scan fails closed on it
+            str(error)
+    assert redaction.safe_exc(error) == f"_PythonClassDictPrintsVars: {redaction._HOLDER_TEXT}"
+    assert codec_safe_str(error) == redaction._HOLDER_TEXT
 
 
 @dataclasses.dataclass

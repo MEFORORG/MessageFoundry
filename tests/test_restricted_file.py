@@ -382,23 +382,31 @@ def test_posix_raises_and_leaves_nothing_when_the_mode_does_not_read_back(
 ) -> None:
     # A filesystem that ignores modes reports something broader than was asked for.
     path = tmp_path / "store.key"
-    real_fstat = os.fstat
+    real_open, real_fstat = os.open, os.fstat
+    created: set[int] = set()
 
-    class _Broad:
-        """The real status with a broader mode. Every other field reads through: code outside the
-        one under test calls ``os.fstat`` while the patch is in place, and pytest 9.2's own capture
-        reads ``st_size`` from it."""
+    def opening(name: Any, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(name, *args, **kwargs)
+        if os.fspath(name) == os.fspath(path):
+            created.add(fd)
+        return fd
 
-        def __init__(self, real: os.stat_result) -> None:
-            self._real = real
-            self.st_mode = stat.S_IFREG | 0o644
+    # Only the descriptor of the file under test reads back broad. Every other one is the real
+    # status, because other code calls os.fstat while the patch is in place: pytest 9.2's capture
+    # reads st_size from it.
+    def broad(fd: int) -> os.stat_result:
+        result = real_fstat(fd)
+        if fd not in created:
+            return result
+        fields = list(result)
+        fields[0] = stat.S_IFREG | 0o644
+        return os.stat_result(fields)
 
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._real, name)
-
-    monkeypatch.setattr(os, "fstat", lambda fd: _Broad(real_fstat(fd)))
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "fstat", broad)
     with pytest.raises(RestrictedFileError, match="owner alone"):
         write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
+    assert created  # control: the fake saw the descriptor the product opened
     assert not path.exists()
 
 
