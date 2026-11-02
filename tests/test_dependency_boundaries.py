@@ -1197,22 +1197,41 @@ _TRAY_START_LEAVES = (
 )
 _TRAY_START_LOADS = frozenset({"messagefoundry", "messagefoundry.childenv", "messagefoundry.tray"})
 
+# WHY THE PROBE ALSO ACCEPTS A FILE SITTING DIRECTLY IN THE STDLIB DIRECTORY. `sys.stdlib_module_names`
+# omits the modules a POSIX `make install` GENERATES into that directory. On 3.15 `traceback` imports
+# one of them, `_missing_stdlib_info`, so the probe charged it to the tray and went red on the 3.15
+# canary's Linux leg. A Windows build ships no such file. Only a top-level module whose file sits
+# directly in sysconfig's `stdlib` directory counts. site-packages is a subdirectory of it, and a
+# venv's own `Lib` is not it, so a third-party module never qualifies.
+_STDLIB_DIR_FILTER = (
+    "import os, sysconfig\n"
+    "def _canon(p):\n"
+    "    return os.path.normcase(os.path.realpath(p))\n"
+    "stdlib_dir = _canon(sysconfig.get_path('stdlib'))\n"
+    "def in_stdlib_dir(top):\n"
+    "    f = getattr(sys.modules.get(top), '__file__', None)\n"
+    "    return bool(f) and _canon(os.path.dirname(f)) == stdlib_dir\n"
+)
+
 
 def _tray_leaf_probe(
     plant: str = "", *, path_head: Path | None = None
 ) -> tuple[set[str], set[str]]:
     """The `messagefoundry` modules, and the top-level modules outside the standard library, that a
-    fresh interpreter loads importing `_TRAY_START_LEAVES`. `plant` runs first, as a control."""
+    fresh interpreter loads importing `_TRAY_START_LEAVES`. `plant` runs first, as a control.
+
+    The filter is imported before the snapshot, so its own imports are not charged to the leaves."""
     code = (
         "import json, sys\n"
+        f"{_STDLIB_DIR_FILTER}"
         "before = set(sys.modules)\n"
         f"{plant}\n"
         f"for name in {_TRAY_START_LEAVES!r}:\n"
         "    __import__(name)\n"
         "new = set(sys.modules) - before\n"
         "ours = sorted(m for m in new if m.partition('.')[0] == 'messagefoundry')\n"
-        "other = sorted({m.partition('.')[0] for m in new} - set(sys.stdlib_module_names)\n"
-        "               - {'messagefoundry'})\n"
+        "other = sorted(t for t in {m.partition('.')[0] for m in new} - set(sys.stdlib_module_names)\n"
+        "               - {'messagefoundry'} if not in_stdlib_dir(t))\n"
         f"print({_PROBE_MARK!r} + json.dumps([ours, other]))\n"
     )
     ours, other = _run_marked_probe(code, path_head=path_head)
@@ -1233,6 +1252,18 @@ def test_the_tray_leaf_probe_sees_an_engine_import_and_a_third_party_one(tmp_pat
     (tmp_path / "mf_2822_third_party.py").write_text("", encoding="utf-8")
     _ours, other = _tray_leaf_probe("import mf_2822_third_party", path_head=tmp_path)
     assert other == {"mf_2822_third_party"}
+    # A single-file module in the real site-packages, which on POSIX sits UNDER the stdlib directory:
+    # the stdlib-directory filter must still charge it.
+    _ours, other = _tray_leaf_probe("import typing_extensions")
+    assert other == {"typing_extensions"}
+
+
+def test_the_tray_leaf_probe_admits_a_stdlib_file_the_name_list_omits() -> None:
+    """The stdlib-directory filter is live. `__hello__` stands in for `_missing_stdlib_info`: it sits
+    directly in the stdlib directory and `sys.stdlib_module_names` omits it."""
+    assert "__hello__" not in sys.stdlib_module_names, "control: pick another omitted stdlib file"
+    _ours, other = _tray_leaf_probe("import __hello__")
+    assert other == set()
 
 
 # --- BACKLOG #1596: parsing/'s client carve-out, as one allowlist checked two ways -------------------
