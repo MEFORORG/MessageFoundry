@@ -244,9 +244,9 @@ class ConnectionFlagNotRecorded(Exception):
     says which. A row that lands that way is in the audit chain but not the off-box tee
     (``store.store.AuditedWrite``). The API answers 503: the store, not the request, is at fault.
 
-    That bound is the one thing that cuts a write off. A request deadline or a shutdown ends only
-    its caller's wait, so that caller never gets this; :meth:`Engine.set_connection_flag` says what
-    happens to the write."""
+    While the store stays open, that bound is what cuts a write off. A request deadline or a
+    shutdown ends only its caller's wait, so that caller never gets this.
+    :meth:`Engine.set_connection_flag` says what happens to the write."""
 
 
 def _log_abandoned_config_write(task: asyncio.Task[None]) -> None:
@@ -2555,8 +2555,8 @@ class Engine:
 
         The write runs as a tracked task the caller only waits on, so a caller cancelled from then
         on (a request deadline, a client that went away, a shutdown) stops waiting and does not stop
-        the write. It still ends at the bound, and :meth:`drain_config_writes` waits for it, for a
-        bounded time, before the store closes."""
+        the write. The bound still holds it, and :meth:`drain_config_writes` waits for it, for a
+        bounded time, before the store closes; a write still running then may not land."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner
@@ -2608,7 +2608,10 @@ class Engine:
                     )
                 else:
                     log.error(
-                        "the store did not confirm a connection flag change: %s", safe_exc(exc)
+                        "the store did not confirm a connection flag change (%s %s): %s",
+                        direction,
+                        name,
+                        safe_exc(exc),
                     )
                 raise ConnectionFlagNotRecorded(
                     "the store did not confirm this toggle, so the flag may or may not have "
@@ -2644,7 +2647,8 @@ class Engine:
         _done, pending = await asyncio.wait(set(self._config_writes), timeout=timeout)
         if pending:
             log.warning(
-                "%d config write(s) still running at shutdown; their audit rows may be lost",
+                "%d connection flag write(s) still running at shutdown; each change and its audit "
+                "row land together or not at all",
                 len(pending),
             )
 

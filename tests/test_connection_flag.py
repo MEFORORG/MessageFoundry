@@ -18,6 +18,7 @@ import dataclasses
 import json
 import logging
 import textwrap
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -516,7 +517,7 @@ class _SlowWrite:
     def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         self.entered, self.release = asyncio.Event(), asyncio.Event()
         self.ended: list[str] = []
-        real = engine.store.set_connection_flag
+        real: Callable[..., Awaitable[None]] = engine.store.set_connection_flag
 
         async def _slow(*args: object, **kwargs: object) -> None:
             self.entered.set()
@@ -603,18 +604,44 @@ async def test_the_bound_holds_for_a_write_whose_caller_went(
     slow = _SlowWrite(engine, monkeypatch)
     monkeypatch.setattr(BOUND, 0.2)
     caller = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound"))
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
-        await asyncio.wait_for(slow.entered.wait(), 5)
+    # One pass of the loop, so the caller is waiting on its task. Cancelled here rather than once
+    # the store is entered, so no timing of the bound can reach the caller first.
+    await asyncio.sleep(0)
+    (task,) = engine._config_writes
+    with caplog.at_level(logging.WARNING):
         caller.cancel()
         with pytest.raises(asyncio.CancelledError):
             await caller
-        await asyncio.wait_for(asyncio.wait(set(engine._config_writes)), 5)
+        await asyncio.wait_for(asyncio.wait({task}), 5)
+    assert slow.entered.is_set(), "control: the write reached the store after its caller went"
     messages = [record.getMessage() for record in caplog.records]
     abandoned = [m for m in messages if m.startswith("config write failed after its caller")]
     assert len(abandoned) == 1, messages
     assert "did not confirm this toggle" in abandoned[0]
     assert "within 0.2 s (outbound OB_TOML)" in caplog.text
+    assert not [m for m in messages if "shielded future" in m]
     assert not engine._config_writes
+    assert await engine.store.list_connection_flags() == set()
+    assert await engine.store.list_audit(action="connection_flag_set") == []
+
+
+async def test_a_drain_that_runs_out_leaves_the_write_running(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Waiting never cancels a write. One still running when the drain's wait ends is logged and
+    left, so a slow shutdown does not cut off a commit, and it lands if the store is still open."""
+    slow = _SlowWrite(engine, monkeypatch)
+    caller = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound"))
+    await asyncio.wait_for(slow.entered.wait(), 5)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
+        await engine.drain_config_writes(0.05)
+    assert "1 connection flag write(s) still running at shutdown" in caplog.text
+    assert slow.ended == [], "the drain reached the write"
+    assert not caller.done(), "the caller still waits on the write"
+    slow.release.set()
+    await asyncio.wait_for(caller, 5)
+    assert slow.ended == ["landed"]
+    assert await engine.store.list_connection_flags() == {("OB_TOML", "outbound")}
 
 
 async def test_a_write_cancelled_before_its_first_step_leaves_no_task_behind(

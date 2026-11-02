@@ -163,7 +163,7 @@ def test_an_engine_wiring_error_passes_through_unchanged(tmp_path: Path) -> None
 
 
 def test_load_config_withholds_the_text_too(tmp_path: Path) -> None:
-    # The route the reload WARNING and the flag write's validate-before-persist go through.
+    # The route the reload WARNING goes through.
     _write(tmp_path, "feed.py", f"raise RuntimeError({NEEDLE!r})\n")
     with pytest.raises(WiringError) as ei:
         load_config(tmp_path)
@@ -171,15 +171,14 @@ def test_load_config_withholds_the_text_too(tmp_path: Path) -> None:
     assert "RuntimeError" in str(ei.value) and "line 1" in str(ei.value)
 
 
-# --- the connection-flag 409 (vault PR 2297's amendment to #3249) -----------------------------------
+# --- the connection-flag route, which no longer loads a module (BACKLOG #2623) ----------------------
 
 _LOGIC_PY = """
 import pathlib
 
 from messagefoundry import Send, handler, router
 
-# Trips only once the test drops the marker, so the engine loads clean and the flag write's own
-# validate-before-persist is the load that fails.
+# Trips only once the test drops the marker, so the engine loads clean and any later load fails.
 if (pathlib.Path(__file__).parent / "_trip").exists():
     raise RuntimeError({needle!r})
 

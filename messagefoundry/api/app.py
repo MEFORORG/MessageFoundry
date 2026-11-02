@@ -5810,7 +5810,7 @@ def create_app(
             # not the route's only 503 and the console names this fix (BACKLOG #3811).
             raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
-            # The running graph has no such connection, or the engine is stopping.
+            # The running graph has no such connection, or a shutdown's drain has begun.
             raise HTTPException(409, str(exc)) from exc
         return {"name": name, "direction": req.direction, "flagged": req.flagged}
 

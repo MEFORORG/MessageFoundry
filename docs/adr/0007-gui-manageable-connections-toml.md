@@ -235,9 +235,9 @@ it could reach only its own copy.
    as the flag. If the row fails the flag does not change, and the route answers **503**. A commit
    whose answer was lost answers 503 too, and then both may have landed. So does a write the store
    leaves unanswered past the engine's 10-second bound, and a commit cut off there may land after
-   the 503. That bound is the one thing that cuts the write off: the engine runs it as a tracked
-   task, so a request deadline or a shutdown ends the caller's wait and not the write, and a
-   shutdown waits for it, for a bounded time, before the store closes. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
+   the 503. The engine runs the write as a tracked task, so a request deadline or a shutdown ends
+   the caller's wait and not the write, and a shutdown waits for it, for a bounded time, before
+   the store closes. A write still running then may not land. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
    Left on that list, a row with no digest would read as a degraded baseline and the next start would
    compare nothing.
 7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering

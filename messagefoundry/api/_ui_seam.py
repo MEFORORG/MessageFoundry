@@ -894,7 +894,7 @@ class CoreHandlers:
     graph_edges: Callable[..., Awaitable[Any]]
     # The object-flag toggle (BACKLOG #131, #2623; seam v9), config:deploy. Any connection in the
     # running graph; the store holds the flag. An unknown name is refused 409, as is any toggle
-    # once the engine is stopping.
+    # once a shutdown's drain has begun.
     set_connection_flag: Callable[..., Awaitable[Any]]
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on

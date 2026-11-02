@@ -10113,8 +10113,8 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     A module that calls ``sys.exit()`` at import is a bad config, not a request to end the process
     (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module leave
     ``SystemExit`` alone because it is not their kind of failure; this runs the author's module: on a
-    serving engine (a reload, a connection-flag write) it would leave the event loop and stop every
-    connection, and at ``check`` it would end the run as if it had passed. So it is refused like any
+    serving engine (at least a reload) it would leave the event loop and stop every connection, and
+    at ``check`` it would end the run as if it had passed. So it is refused like any
     failing module, by its real type, because ``isinstance`` would run a ``__class__`` of the
     module's own. The exit code is not quoted, since it may be the author's text.
 
