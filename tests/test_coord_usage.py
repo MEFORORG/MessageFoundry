@@ -881,8 +881,66 @@ def test_a_session_id_that_is_not_a_plain_name_writes_no_mark(tmp_path: Path, se
     assert written == {"root/mefor-usage/latest.json", "root/mefor-usage/history.jsonl"}, written
 
 
+@pytest.mark.parametrize(
+    "damaged",
+    [
+        pytest.param("{ not json", id="not-json"),
+        pytest.param('{"at": 1}', id="no-counter"),
+        pytest.param('{"api_ms": ""}', id="blank-counter"),
+        pytest.param('{"api_ms": NaN}', id="not-finite"),
+    ],
+)
+def test_a_mark_that_cannot_be_read_is_not_replaced(tmp_path: Path, damaged: str) -> None:
+    """It may hide a higher counter, so a lower one must not replace it: the process holding the higher
+    counter would then read its own idle repeat as a rise."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=8000)
+    _mark(tmp_path).write_text(damaged, encoding="utf-8")
+    _age_window(tmp_path, 25)
+
+    _session_fire(tmp_path, seven, api_ms=5000)
+    assert _mark(tmp_path).read_text(encoding="utf-8") == damaged, "the mark was replaced"
+    _session_fire(tmp_path, seven, api_ms=8000)
+    assert _mark(tmp_path).read_text(encoding="utf-8") == damaged, "the mark was replaced"
+    assert _age_min(tmp_path) > 24, "an idle repeat read as a rise"
+
+
+def test_a_mark_the_read_fails_on_is_not_replaced(tmp_path: Path) -> None:
+    """The failed-read route: a good mark at 8000, its read denied, while replacing it still works
+    (measured). Nothing here says the counter is lower, so the 5000 must not land."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=8000)
+    _age_window(tmp_path, 25)
+    mark = str(_mark(tmp_path))
+    user = os.environ["USERNAME"]
+    subprocess.run(["icacls", mark, "/deny", f"{user}:(RD)"], capture_output=True, check=True)
+    try:
+        _session_fire(tmp_path, seven, api_ms=5000)
+    finally:
+        subprocess.run(["icacls", mark, "/reset"], capture_output=True, check=True)
+    assert json.loads(_mark(tmp_path).read_text(encoding="utf-8"))["api_ms"] == 8000
+    _session_fire(tmp_path, seven, api_ms=8000)
+    assert _age_min(tmp_path) > 24, "an idle repeat read as a rise"
+
+
+def test_a_prune_clears_an_unreadable_mark_and_the_session_recovers(tmp_path: Path) -> None:
+    """An unreadable mark is never written, so nothing else would ever end it."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _mark(tmp_path).write_text("{ not json", encoding="utf-8")
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(_mark(tmp_path), (eight_days_ago, eight_days_ago))
+
+    _session_fire(tmp_path, seven, session="new", api_ms=1000)
+    assert not _mark(tmp_path).exists()
+    _session_fire(tmp_path, seven, api_ms=2000)
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, seven, api_ms=3000)
+    assert _age_min(tmp_path) < 5, "control: a new mark confirms a rise again"
+
+
 def test_a_new_session_clears_marks_nobody_touched_for_a_week(tmp_path: Path) -> None:
-    """One file per session has no other bound. An old mark's loss costs one refresh, never a rise."""
+    """One file per session has no other bound. An old mark's loss costs that session one refresh."""
     seven = window(40.0, 280000)
     _session_fire(tmp_path, seven, api_ms=1000)
     old, recent = _mark(tmp_path, "old"), _mark(tmp_path, "recent")
@@ -926,13 +984,25 @@ def test_a_published_window_with_no_number_is_not_a_reading_of_zero(
 
 @pytest.mark.parametrize(
     "missing",
-    [pytest.param(None, id="absent"), pytest.param("", id="blank")],
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("", id="blank"),
+        pytest.param(True, id="bool"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param({}, id="object"),
+        pytest.param([], id="empty-array"),
+        pytest.param([95], id="one-element-array"),
+        pytest.param([1, 2], id="array"),
+        pytest.param("2026-11-02T10:00:00Z", id="date-string"),
+    ],
 )
 def test_the_reader_does_not_turn_a_window_with_no_number_into_a_zero(
-    tmp_path: Path, missing: str | None
+    tmp_path: Path, missing: Any
 ) -> None:
-    """Fresh, stamped and with its reset ahead, so nothing but the number is wrong. A 0 here would read
-    OK and clear the gate. The survey prints no number either."""
+    """Fresh, stamped and with its reset ahead, so nothing but the number is wrong. Each of these read
+    OK or a 0, and NaN cleared the gate. The survey prints no number either."""
     publish(tmp_path, seven=40.0)
     doc = latest(tmp_path)
     if missing is None:
@@ -968,15 +1038,16 @@ def test_a_blank_percentage_in_a_payload_is_no_reading(tmp_path: Path) -> None:
 
 
 def test_the_collector_and_the_hook_agree_on_what_a_number_is() -> None:
-    """Two copies of one rule in two files that must each survive the other, so drift goes red here."""
+    """Copies of one rule in three files that must each survive without the others, so drift goes red
+    here."""
     hook = ROOT / "scripts" / "hooks" / "usage-headroom-inject.ps1"
     body = re.compile(r"^function Get-Finite\(\$Value\) \{$.*?^\}$", re.M | re.S)
     copies = []
-    for path in (COLLECT, hook):
+    for path in (COLLECT, READ, hook):
         found = body.search(path.read_text(encoding="utf-8"))
         assert found, f"no Get-Finite in {path}"
         copies.append(found.group())
-    assert copies[0] == copies[1]
+    assert copies[0] == copies[1] == copies[2]
 
 
 def test_a_session_of_another_root_cannot_confirm_this_roots_reading(tmp_path: Path) -> None:

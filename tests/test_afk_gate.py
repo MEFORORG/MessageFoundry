@@ -675,6 +675,30 @@ def test_a_floor_below_the_ceiling_reads_unknown_and_the_gate_reads_the_floor(
     assert code == expected, why(doc)
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [pytest.param(float("nan"), id="nan"), pytest.param({}, id="object")],
+)
+def test_a_window_with_no_number_cannot_clear_the_gate(
+    sb: Sandbox, tmp_path: Path, shape: Any
+) -> None:
+    """Fresh, and on a wired root, so nothing but the number is wrong. NaN compares false with every
+    level, so it used to grade below the rung and clear."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    seven = {"used_percentage": 40, "resets_at": int(ago().timestamp()) + 200000}
+    assert _fire(sb, state, seven, env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["used_percentage"] = shape
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW, why(doc)
+
+
 def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
     sb: Sandbox, tmp_path: Path
 ) -> None:

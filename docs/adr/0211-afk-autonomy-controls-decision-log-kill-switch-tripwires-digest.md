@@ -413,9 +413,12 @@ roster alias of the Lander.
 > `cost.total_api_duration_ms` rose past that session's mark and the rise was written to its own mark
 > file (`live-marks/mark-<session>.json`), the reset is the same and still ahead, and the session is
 > pinned to this root or unpinned. A mark is per session because a shared file, written unlocked, could
-> put back another session's older counter. It only ever rises, because two processes can share one
-> session id. A mark that cannot be written proves nothing. So none of these reads as a rise on an idle
-> repeat. A pool nobody has called for 20
+> put back another session's older counter. Two processes can share one session id, so a counter that
+> fell writes nothing, and neither does any counter over a mark that is there and did not read, because
+> that mark may hide a higher counter. A mark that cannot be written proves nothing. Each of these leaves
+> the age counting. This does not make a mark monotonic: at least unlocked writes on one shared session
+> id, which can land the lower counter last, and a pruned mark, which takes whichever counter fires next,
+> can each still cost one false refresh, and neither loops. A pool nobody has called for 20
 > minutes goes stale and reads UNKNOWN, so a healthy live flat account stays fresh and an idle one does
 > not. The statusLine docs list the counter, as read on 2026-11-01. No real payload on this box was checked
 > for it; with no counter, nothing refreshes and the account goes stale as before. Whether a call that failed

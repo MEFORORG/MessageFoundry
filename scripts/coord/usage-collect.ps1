@@ -131,8 +131,9 @@ function Write-AtomicText([string]$Path, [string]$Text) {
 }
 
 # A number out of JSON, or $null. `$null -as [double]` and `"" -as [double]` are both 0 in PowerShell
-# (measured 2026-11-02), and a missing value is neither a rise nor a reading of 0. The spawn hook holds
-# the same function, because each must survive without the other; tests/test_coord_usage.py pins them.
+# (measured 2026-11-02), and a missing value is neither a rise nor a reading of 0. The spawn hook
+# and usage.ps1 hold the same function, because each must survive without the others;
+# tests/test_coord_usage.py pins the copies equal.
 function Get-Finite($Value) {
     if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $null }
     $d = $Value -as [double]
@@ -149,10 +150,17 @@ function Get-Finite($Value) {
 # session on a root fires here, unlocked, so with one file a session could write back the older counter
 # of another that had just risen, and that session's next idle repeat would read as a rise.
 #
-# A MARK ONLY EVER RISES. Two processes can share one id, through a resume in a second terminal, and if a
-# lower counter were written back they would read each other's counters as a rise on every idle fire. So
-# a counter that fell writes nothing. A session whose counter really restarted then goes stale until it
-# passes its old mark, which is the safe side.
+# ONLY A COUNTER ABOVE A MARK THAT READS, OR THE FIRST COUNTER WHERE NO MARK EXISTS, IS WRITTEN. Two
+# processes can share one id, through a resume in a second terminal, and if a lower counter replaced a
+# higher mark they would read each other's counters as a rise on every idle fire. So a counter that fell
+# writes nothing. Neither does any counter over a mark that is there and did not read: the read failed,
+# or the file holds no number, so it may hide a higher counter. That is no rise and no write. Both leave
+# the session stale, which is the safe side: a restarted counter until it passes the old mark, and an
+# unreadable mark until a prune clears it.
+#
+# THIS DOES NOT MAKE A MARK MONOTONIC. At least two routes put a lower counter in place on one shared id,
+# and each can cost one false refresh, not a loop: unlocked writes can land the lower counter last, and
+# a pruned mark takes whichever counter fires next.
 #
 # THE ID COMES FROM THE PAYLOAD AND NAMES A FILE, so anything but a plain name is refused rather than
 # cleaned up: it could leave this directory, and two ids cleaned to one name would share a mark.
@@ -168,16 +176,19 @@ function Test-SessionCalledApi([string]$Dir, $Payload) {
     if ($sid -cnotmatch '\A[A-Za-z0-9_-]{1,128}\z' -or $null -eq $ms) { return $false }
     $markDir = Join-Path $Dir "live-marks"
     $path = Join-Path $markDir "mark-$sid.json"
+    $absent = $false
     $prev = $null
-    try { $prev = Get-Finite (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).api_ms } catch { }
-    # Only a rise writes, so a mark changes once per API call.
-    if ($null -ne $prev -and $ms -le $prev) { return $false }
+    try { $prev = Get-Finite (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).api_ms }
+    catch [System.Management.Automation.ItemNotFoundException] { $absent = $true }
+    catch { }
+    # Only a rise over a mark that reads writes, so a mark changes once per API call.
+    if (-not $absent -and ($null -eq $prev -or $ms -le $prev)) { return $false }
     $written = $false
     try {
         [void][System.IO.Directory]::CreateDirectory($markDir)
-        # A session's first mark clears the marks nobody touched for a week, which is longer than a window.
-        # A mark lost here costs that session one refresh, and nothing else bounds this directory.
-        if ($null -eq $prev) {
+        # A session's first mark clears the marks nobody touched for a week. A mark lost here costs its
+        # session one refresh, nothing else bounds this directory, and an unreadable mark ends only here.
+        if ($absent) {
             $cutoff = [datetime]::UtcNow.AddDays(-7)
             Get-ChildItem -LiteralPath $markDir -Filter "mark-*" -File |
                 Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
@@ -185,7 +196,7 @@ function Test-SessionCalledApi([string]$Dir, $Payload) {
         }
         $written = Write-AtomicText $path (@{ api_ms = $ms } | ConvertTo-Json -Compress)
     } catch { }
-    return ($written -and $null -ne $prev)
+    return ($written -and -not $absent)
 }
 
 function Format-Reset([object]$EpochSeconds) {

@@ -465,11 +465,20 @@ function Test-WindowResetPassed($w) {
     return [bool]($epoch -and $epoch -le [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
 }
 
-# A WINDOW WITH NO NUMBER HOLDS NO READING. `[double]$null` and `[double]""` are both 0, and a 0 reads OK
-# and clears the gate, so a missing percentage is refused before any cast. One definition, as above.
+# A number out of JSON, or $null. usage-collect.ps1 and the spawn hook hold the same function, because
+# each must survive without the others; tests/test_coord_usage.py pins the copies equal.
+function Get-Finite($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $null }
+    $d = $Value -as [double]
+    if ($null -eq $d -or -not [double]::IsFinite($d)) { return $null }
+    return $d
+}
+
+# A WINDOW WITH NO NUMBER HOLDS NO READING. `[double]$null` and `[double]""` are both 0, NaN compares false
+# with every level, and an object, an array or a date casts to nothing, so each of those read OK or
+# worse. A percentage that is not a finite number is refused before any cast. One definition, as above.
 function Test-WindowHasNumber($w) {
-    $v = $w.used_percentage
-    return -not ($null -eq $v -or $v -is [string] -or $v -is [bool])
+    return ($null -ne (Get-Finite $w.used_percentage))
 }
 
 # The band this reader calls "at the ceiling". A fresh reading here stops work on any provenance, so a
