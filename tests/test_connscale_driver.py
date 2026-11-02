@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -43,6 +45,21 @@ def _driver_with_fakes(count: int) -> tuple[ConnScaleDriver, list[list]]:
 
     driver._conns = [_FakeConn(i) for i in range(count)]  # type: ignore[misc]  # a duck-typed fake
     return driver, sent_per_conn
+
+
+def test_send_one_each_returns_the_seq_of_each_send_it_queued() -> None:
+    """The warm-up waits on these seqs (BACKLOG #3132), so a send a full buffer turned away must
+    not be among them: it would be waited on and could never arrive."""
+    driver, sent = _driver_with_fakes(3)
+    driver._conns[1].submit_nowait = lambda out, on_done=None: False  # type: ignore[method-assign]
+    seqs = iter((10, 11, 12))
+    corpus: Any = SimpleNamespace(
+        sampler=lambda _mix: None, next=lambda _sampler: SimpleNamespace(seq=next(seqs))
+    )
+
+    assert driver.send_one_each(corpus=corpus, mix=_MIX) == [10, 12]
+    assert sent == [[10], [], [12]]
+    assert driver._m.counters.deferred == 1
 
 
 def test_round_robin_spreads_evenly_across_connections() -> None:

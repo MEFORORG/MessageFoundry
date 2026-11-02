@@ -43,6 +43,7 @@ from typing import Any
 from messagefoundry.parsing.peek import (
     DEFAULT_MAX_MESSAGE_BYTES,
     DEFAULT_MAX_SEGMENTS,
+    HL7MessageTooLarge,
     HL7PeekError,
     enforce_size_limits,
     normalize,
@@ -235,11 +236,16 @@ def _first_choice_error(element: Any, ref: _Reference) -> str | None:
 
 @dataclass(frozen=True)
 class ValidationResult:
-    """Outcome of strict validation. Truthy iff the message is conformant."""
+    """Outcome of strict validation. Truthy iff the message is conformant.
+
+    ``oversize`` is True when the message failed :func:`validate`'s ``max_bytes`` cap, measured on
+    the text that function itself normalizes, so a caller can answer a size refusal as one without
+    re-deriving that measurement (BACKLOG #2105)."""
 
     ok: bool
     version: str | None
     errors: list[str]
+    oversize: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -285,7 +291,9 @@ def validate(
     try:
         enforce_size_limits(norm, max_bytes=max_bytes, max_segments=max_segments)
     except HL7PeekError as exc:
-        return ValidationResult(False, expected_version, [str(exc)])
+        return ValidationResult(
+            False, expected_version, [str(exc)], oversize=isinstance(exc, HL7MessageTooLarge)
+        )
 
     try:
         # TOLERANT, stated rather than inherited: it is hl7apy's default, but that default is

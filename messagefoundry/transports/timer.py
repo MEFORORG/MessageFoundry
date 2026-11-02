@@ -32,6 +32,7 @@ from messagefoundry.transports.base import (
     positive_seconds,
     register_source,
 )
+from messagefoundry.transports.framing import declared_encoding
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +193,7 @@ class TimerSource(SourceConnector):
         if "body" not in s:
             raise ValueError("timer source requires a 'body' setting")
         self.body = str(s["body"])
-        self.encoding = str(s.get("encoding", "utf-8"))
+        self.encoding = declared_encoding(s.get("encoding"))
         # Pre-encode once: the emitted bytes are deterministic across fires (re-run-stable, ADR 0011 §5).
         self._body_bytes = self.body.encode(self.encoding)
         self.run_once = bool(s.get("run_once", False))

@@ -65,6 +65,7 @@ Pure stdlib, so it can be used from any engine package.
 
 from __future__ import annotations
 
+import builtins
 import encodings
 import encodings.aliases
 import hashlib
@@ -86,8 +87,10 @@ from types import (
     FunctionType,
     GetSetDescriptorType,
     MemberDescriptorType,
+    MethodDescriptorType,
     SimpleNamespace,
     TracebackType,
+    WrapperDescriptorType,
 )
 from typing import Any
 
@@ -2603,9 +2606,9 @@ def safe_traceback(ei: ExcInfo) -> str:
     A different exception that HOLDS a Unicode error, as ``RuntimeError(exc)``, has the same
     ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
     a ``SyntaxError`` from ``.msg``, ``.text``, ``.filename`` and ``.lineno`` instead, and any
-    exception's ``__notes__`` after its line, so those are replaced or dropped on such a node. One
-    whose message
-    was built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
+    exception's ``__notes__`` after its line, so those are replaced or dropped on such a node; a
+    ``UnicodeError`` keeps only the notes that read like a codec's own (:func:`_kept_notes`). One whose message was
+    built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
     third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
@@ -2613,11 +2616,15 @@ def safe_traceback(ei: ExcInfo) -> str:
     # The stdlib builds one TracebackException per exception it will print, so the two trees walk in
     # step, and a link it chose not to print (a suppressed context, a repeat) is None on its side.
     pending: list[tuple[Any, Any]] = [(te, value)]
+    # Verdicts one link's scan reached for a later link, so a long chain is read about once, not
+    # once per link (vault BACKLOG #3340): each link's own code may print the rest. Each link's
+    # first pass has a whole budget; the added passes share one, which _ScanShare says leaves open.
+    share = _ScanShare()
     while pending:
         node, exc = pending.pop()
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
-        line = _codec_line(exc)
+        line = _codec_line(exc, share)
         if line is not None:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
@@ -2626,8 +2633,13 @@ def safe_traceback(ei: ExcInfo) -> str:
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None
-            if getattr(node, "__notes__", None) is not None:
-                node.__notes__ = None  # printed after the line, each by its own str() or repr()
+            notes = getattr(node, "__notes__", None)
+            if notes is not None:  # printed after the line, each by its own str() or repr()
+                # A Unicode error's own keep only the codec's note (vault BACKLOG #3340, item 7).
+                # A caller's note can be built from the failing input, as add_note(f"{seg!r}"), so
+                # it goes with every other note, and a holder's go whole, as its message did.
+                keep = isinstance(exc, UnicodeError) and _own_notes(exc) is notes
+                node.__notes__ = _kept_notes(notes) if keep else None
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
@@ -2635,12 +2647,54 @@ def safe_traceback(ei: ExcInfo) -> str:
     return "".join(te.format()).removesuffix("\n")
 
 
-def _codec_line(exc: BaseException) -> str | None:
+_EXC_DICT: Any = BaseException.__dict__["__dict__"]
+
+
+def _own_notes(exc: BaseException) -> Any:
+    """The list ``add_note`` keeps on ``exc``, read from its instance dict, or None.
+
+    The stdlib's renderer reads ``__notes__`` with ``getattr``, and when that raises it puts a list
+    of its own in their place, holding ``Ignored error getting __notes__:`` and the ``repr()`` of
+    what was raised. That can be a Unicode error, and its ``repr()`` prints the whole input, so only
+    the list the exception itself holds is kept (vault BACKLOG #3340). Builtin methods, so none of
+    the caller's code runs; a list another object returned in its place is not this one."""
+    try:
+        storage = _EXC_DICT.__get__(exc)
+        # A key with the same hash runs its own __eq__ here, and that can raise.
+        notes = dict.get(storage, "__notes__") if type(storage) is dict else None
+    except Exception:  # noqa: BLE001 -- fail closed: notes the read cannot vouch for are dropped
+        return None
+    return notes if type(notes) is list else None
+
+
+#: The note the stdlib adds to an error a codec raised, as ``decoding with 'utf-8' codec failed``.
+#: The name is what the caller passed, written as it is between single quotes, not its ``repr()``.
+#: A name holding a quote or a line break does not match, so its note is dropped.
+_CODEC_NOTE = re.compile(r"(?P<op>encoding|decoding) with (?P<name>'[^'\n]*') codec failed")
+#: Each name :func:`_names_a_codec` prints, as that note quotes it.
+_KNOWN_CODEC_REPRS = frozenset(repr(name) for name in _KNOWN_CODECS)
+
+
+def _kept_notes(notes: list[Any]) -> list[str]:
+    """What a Unicode error's traceback prints of its own notes: each one that reads exactly like
+    the stdlib's codec note, whoever added it, naming the codec only when :func:`_names_a_codec`
+    would, since the name is text the caller chose. Every other note is dropped, plain text
+    included, since a caller can build one from the failing input (vault BACKLOG #3340, item 7)."""
+    kept: list[str] = []
+    for note in notes:
+        match = _CODEC_NOTE.fullmatch(note) if type(note) is str else None
+        if match is not None:
+            known = match["name"] in _KNOWN_CODEC_REPRS
+            kept.append(note if known else f"{match['op']} with a codec failed")
+    return kept
+
+
+def _codec_line(exc: BaseException, share: _ScanShare | None = None) -> str | None:
     """What a traceback prints after the class name, when ``exc`` is a ``UnicodeError`` or holds
     one, or None when its own ``str()`` is safe to print."""
     if isinstance(exc, UnicodeError):
         return _unicode_error_detail(exc)
-    return _HOLDER_TEXT if prints_a_codec_error(exc) else None
+    return _HOLDER_TEXT if prints_a_codec_error(exc, share=share) else None
 
 
 def codec_safe_str(exc: BaseException) -> str:
@@ -2737,14 +2791,61 @@ def _class_attribute(kind: type[Any], name: str) -> Any:
     return _NOT_FOUND
 
 
+type _Readers = tuple[Any, ...] | None
+#: Beyond ``first``: ``plain``'s readers, then ``beneath``'s; then ``beneath``'s beyond ``plain``.
+#: Each is ``target`` itself where :func:`_less` says so. A read after a plain one is always deep
+#: (:func:`_added_pass`), so no entry is needed for a plain read after a plain one.
+type _ReaderGains = tuple[_Readers, _Readers, _Readers]
+#: :func:`_reader_record`'s answer for one class: the three reader sets, whether it opens, and
+#: the readers each of the added pass's reads takes beyond the reads before it
+#: (:func:`_added_pass`), worked out once per class per scan rather than once per object.
+type _ReaderRecord = tuple[_Readers, _Readers, _Readers, bool, _ReaderGains]
+#: One scan's :func:`_reader_record` answers: ``id(class)`` -> (the class, its record).
+type _RecordMemo = dict[int, tuple[type[Any], _ReaderRecord]]
+
 #: ``id(class)`` -> (a weak reference to the class, its :func:`_readers` answer). Keyed by id
 #: because hashing a class runs its metaclass. The reference's callback drops the entry when the
-#: class dies, which is before its id can be reused, so a reloaded config module's classes are
-#: not kept alive here.
-_READERS: dict[int, tuple[Any, tuple[Any, ...] | None]] = {}
+#: class dies, which is before its id can be reused. Only :func:`_readers` writes here; the added
+#: pass's readers (:func:`_reader_record`) are kept for one scan, so they keep no class alive past
+#: it (vault BACKLOG #3340).
+_READERS: dict[int, tuple[Any, _Readers]] = {}
 _READERS_MAX = 1024
 _EXC_STR: Any = BaseException.__dict__["__str__"]
 _EXC_REPR: Any = BaseException.__dict__["__repr__"]
+#: ``BaseException``'s own chain links. A ``__str__`` or ``__repr__`` written in Python may print
+#: either (vault BACKLOG #3340, item 3). The builtin descriptors read the instance's own links,
+#: whatever a subclass defines under those names, and run none of its code.
+_CHAIN_LINKS: tuple[Any, ...] = (
+    BaseException.__dict__["__cause__"],
+    BaseException.__dict__["__context__"],
+)
+
+
+def _builtin_exc_renders(namespace: dict[str, Any]) -> frozenset[int]:
+    """:data:`_BUILTIN_EXC_RENDERS` for ``namespace``. ``type()`` and the builtin descriptors, not
+    ``isinstance`` or ``vars``, so a value whose ``__class__`` or ``__dict__`` raises is skipped
+    rather than making this module's import raise."""
+    found: set[int] = set()
+    for kind in namespace.values():
+        if not issubclass(type(kind), type) or not issubclass(kind, BaseException):
+            continue
+        own = _TYPE_DICT.__get__(kind)
+        for name in ("__str__", "__repr__"):
+            method = own.get(name)
+            if type(method) is WrapperDescriptorType or type(method) is MethodDescriptorType:
+                found.add(id(method))
+    return frozenset(found)
+
+
+#: The ``id`` of each ``__str__`` and ``__repr__`` a builtin exception class defines. Each is C
+#: code that prints at most the exception's own slots and ``.args``, some of them through their
+#: ``repr()``, and never its chain. An object held in a slot or ``.args`` can print its own
+#: attributes that way, and the walk reads those slots and ``.args`` plainly. Ids, so testing a caller's method against them runs
+#: none of the caller's code. A true builtin's method lives as long as the interpreter, so its id
+#: is never reused; one of a class another module put there might not (docs/PHI.md lists it open).
+#: Only C slot wrappers and method descriptors count: a module that put a class of its own into
+#: ``builtins`` before this one was imported would otherwise vouch for its Python method.
+_BUILTIN_EXC_RENDERS = _builtin_exc_renders(vars(builtins))
 
 
 def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
@@ -2759,13 +2860,16 @@ def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
     One that does define either is read through every slot its classes define, the builtin ones
     included (an ``OSError``'s ``strerror`` and ``filename``, a ``SyntaxError``'s ``msg``).
 
+    These are the readers :class:`_Scan`'s first pass uses. What the added pass reads beyond them
+    is :func:`_reader_record`'s.
+
     The answer is kept per class, since this runs for every log argument that is not a scalar. A
     class changed after an instance of it was first logged keeps its first answer."""
     key = id(kind)
     cached = _READERS.get(key)
     if cached is not None and cached[0]() is kind:
         return cached[1]
-    found = _find_readers(kind)
+    found = _find_reader_sets(kind, first_only=True)[0]
     if len(_READERS) >= _READERS_MAX:
         _READERS.clear()
     try:
@@ -2776,7 +2880,77 @@ def _readers(kind: type[Any]) -> tuple[Any, ...] | None:
     return found
 
 
-def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
+def _reader_record(kind: type[Any], memo: _RecordMemo) -> _ReaderRecord:
+    """For ``kind``: :func:`_readers`' answer, then the readers :class:`_Scan`'s added pass uses
+    for an instance it reaches plainly, then those it uses for one beneath an exception whose own
+    code renders it, then whether ``kind`` is such an exception, then what each added read takes
+    beyond the reads before it (:data:`_ReaderGains`).
+
+    Kept in ``memo``, one scan's, and never in :data:`_READERS`: the descriptors of a class's own
+    slots hold the class, and a class whose :func:`_readers` answer holds none of them must be
+    free to go once the scan ends. :func:`_readers`' answer is read from that cache when it is
+    there and never written to it, so a class only the added pass reaches is not cached."""
+    known = memo.get(id(kind))
+    if known is not None and known[0] is kind:
+        return known[1]
+    cached = _READERS.get(id(kind))
+    record: _ReaderRecord
+    if not issubclass(kind, BaseException):
+        # Every read is the first pass's, so no read adds anything: no class walk is needed here.
+        if cached is not None and cached[0]() is kind:
+            first = cached[1]
+        else:
+            first = _find_reader_sets(kind, first_only=True)[0]
+        none = None if first is None else (None,)
+        record = (first, first, first, False, (none, none, none))
+    else:
+        fresh, plain, beneath, opens = _find_reader_sets(kind)
+        first = cached[1] if cached is not None and cached[0]() is kind else fresh
+        gains = (_less(first, plain), _less(first, beneath), _less(plain, beneath))
+        record = (first, plain, beneath, opens, gains)
+    memo[id(kind)] = (kind, record)
+    return record
+
+
+#: ``id(class)`` -> (a weak reference to the class, :func:`_starts_added_reads`' answer). A flag,
+#: not the readers, so it holds no descriptor and keeps no class alive; the entry goes when the
+#: class dies, as :data:`_READERS`' does.
+_STARTS: dict[int, tuple[Any, bool]] = {}
+
+
+def _starts_added_reads(kind: type[Any], memo: _RecordMemo) -> bool:
+    """Whether :func:`_added_pass` starts from an instance of ``kind`` the first pass read: an
+    exception whose own code renders it, or one whose plain readers add to the first pass's. Kept
+    per class, since this runs for every exception a scan reads."""
+    if not issubclass(kind, BaseException):
+        return False
+    key = id(kind)
+    cached = _STARTS.get(key)
+    if cached is not None and cached[0]() is kind:
+        return cached[1]
+    _first, _plain, _beneath, opens, gains = _reader_record(kind, memo)
+    found = opens or _reads_any(gains[0])
+    if len(_STARTS) >= _READERS_MAX:
+        _STARTS.clear()
+    try:
+        alive = weakref.ref(kind, lambda _gone: _STARTS.pop(key, None))
+    except TypeError:  # a class that cannot be weakly referenced is not kept
+        return found
+    _STARTS[key] = (alive, found)
+    return found
+
+
+def _less(had: _Readers, target: _Readers) -> _Readers:
+    """``target``'s readers that ``had`` lacks (:func:`_added_readers`), or ``target`` itself when
+    either is None."""
+    return target if had is None or target is None else _added_readers(had, target)
+
+
+def _find_reader_sets(
+    kind: type[Any], *, first_only: bool = False
+) -> tuple[_Readers, _Readers, _Readers, bool]:
+    """:func:`_readers`' answer, then :func:`_reader_record`'s three sets after it; with
+    ``first_only``, only the first is worked out, and the rest repeat it."""
     # Identity tests along the real MRO, so no caller code answers for the class.
     mro = _TYPE_MRO.__get__(kind)
     names: tuple[str, ...] | None = None
@@ -2792,11 +2966,14 @@ def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
                 names = ()
         if base is BaseException:
             is_exception = True
-    if is_exception and (
-        _class_attribute(kind, "__str__") is not _EXC_STR
-        or _class_attribute(kind, "__repr__") is not _EXC_REPR
-    ):
-        names = (names or ()) + tuple(
+    renders = (_class_attribute(kind, "__str__"), _class_attribute(kind, "__repr__"))
+    own_render = is_exception and (renders[0] is not _EXC_STR or renders[1] is not _EXC_REPR)
+    # The first pass's readers, :func:`_readers`' answer: each slot not named as a dunder, and a
+    # name listed twice is read, and charged, twice.
+    first = _resolve_readers(
+        kind,
+        (names or ())
+        + tuple(
             name
             for owner in mro
             for name, value in _TYPE_DICT.__get__(owner).items()
@@ -2804,20 +2981,76 @@ def _find_readers(kind: type[Any]) -> tuple[Any, ...] | None:
             and type(name) is str
             and not name.startswith("__")
         )
+        if own_render
+        else names,
+        (),
+        exc_dict=False,
+    )
+    if first_only or not is_exception:
+        return first, first, first, False
+    slots = tuple(
+        dict.fromkeys(  # each name is a str, so hashing it runs no caller code
+            (
+                *(names or ()),
+                *(
+                    name
+                    for owner in mro
+                    if owner is not BaseException  # its one slot, __suppress_context__, is a bool
+                    for name, value in _TYPE_DICT.__get__(owner).items()
+                    if type(value) is MemberDescriptorType and type(name) is str
+                ),
+            )
+        )
+    )
+    # Beneath an object whose own code renders it, that code may print any attribute of this
+    # exception, its chain included, whatever its own __str__ prints (vault BACKLOG #3340, item 2).
+    everything = _resolve_readers(kind, slots, _CHAIN_LINKS)
+    if not own_render:  # prints .args alone
+        return first, first, everything, False
+    if all(id(method) in _BUILTIN_EXC_RENDERS for method in renders):  # its own slots at most
+        return first, _resolve_readers(kind, slots, ()), everything, False
+    return first, everything, everything, True  # code of its own: it may print anything it reaches
+
+
+def _resolve_readers(
+    kind: type[Any], names: tuple[str, ...] | None, extra: tuple[Any, ...], *, exc_dict: bool = True
+) -> tuple[Any, ...] | None:
+    """The instance ``__dict__``'s descriptor or None, then each of ``names`` that is a slot of
+    ``kind``, then ``extra``; or None when ``names`` is None. ``exc_dict`` is False for the first
+    pass's readers (:func:`_readers`), which read an instance dict only through the descriptor the
+    class itself keeps under ``__dict__``."""
     if names is None:
         return None
     own_dict = _class_attribute(kind, "__dict__")
     # A Python class keeps it behind a getset descriptor, and SimpleNamespace behind a member.
-    found: list[Any] = [
-        own_dict
-        if type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
-        else None
-    ]
+    reader = type(own_dict) is GetSetDescriptorType or type(own_dict) is MemberDescriptorType
+    if not reader and exc_dict and issubclass(kind, BaseException):
+        # The added pass's readers only. Every exception has an instance dict, and BaseException's
+        # own descriptor reads it: a property or `__dict__ = None` must not hide it from the added
+        # pass. Another class's getset is still used, so a read that raises fails closed.
+        own_dict, reader = _EXC_DICT, True
+    found: list[Any] = [own_dict if reader else None]
     for name in names:
         slot = _class_attribute(kind, name)
         if type(slot) is MemberDescriptorType:
             found.append(slot)
+    found.extend(extra)
     return tuple(found)
+
+
+def _added_readers(had: tuple[Any, ...], target: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The readers in ``target`` that ``had`` lacks, in :func:`_readers`' shape: the instance
+    ``__dict__``'s descriptor, or None when ``had`` reads it already, then the rest. Compared by
+    identity, so no descriptor's own code runs."""
+    own_dict = None if had[0] is not None else target[0]
+    seen = {id(s) for s in had[1:]}  # ids are ints, so hashing them runs no descriptor's code
+    rest = tuple(r for r in target[1:] if id(r) not in seen)
+    return (own_dict, *rest)
+
+
+def _reads_any(readers: tuple[Any, ...] | None) -> bool:
+    """Whether reading through ``readers`` reads anything at all."""
+    return readers is not None and (readers[0] is not None or len(readers) > 1)
 
 
 def _attribute_values(arg: Any, readers: tuple[Any, ...], limit: int) -> list[Any]:
@@ -2960,11 +3193,14 @@ def _some(elements: Any, limit: int | None) -> list[Any]:
     return list(elements) if limit is None else list(islice(elements, limit))
 
 
-def prints_a_codec_error(exc: BaseException) -> bool:
+def prints_a_codec_error(exc: BaseException, *, share: _ScanShare | None = None) -> bool:
     """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one (vault
     BACKLOG #3295). It looks in at least: its ``.args``; its fields, when it is a dataclass; and,
     when a class of its own defines ``__str__`` or ``__repr__``, the attributes in its instance
-    ``__dict__`` and its slots, which that method may print.
+    ``__dict__`` and its slots, which that method may print. When that method is not a builtin
+    exception's, also its ``__cause__`` and ``__context__`` along the whole chain, and at least the
+    instance ``__dict__``, slots and chain links of each exception it reaches, from what budget is
+    left (:class:`_Scan`'s added pass, vault BACKLOG #3340).
 
     IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least an object of a class
     that is not read by attribute, text already built from the error, or anything past the
@@ -2979,7 +3215,8 @@ def prints_a_codec_error(exc: BaseException) -> bool:
 
     An exception group whose ``str()`` is the builtin one prints only its message and a count, so
     it is False however its members read; a traceback prints each member on its own line. It never
-    raises, and it answers True when the arguments cannot be read."""
+    raises, and it answers True when the arguments cannot be read. ``share`` is
+    :func:`safe_traceback`'s, for the scans of one traceback (:class:`_ScanShare`)."""
     kind = type(exc)
     if issubclass(kind, UnicodeError):
         return False
@@ -2987,9 +3224,55 @@ def prints_a_codec_error(exc: BaseException) -> bool:
         own_str: Any = kind.__str__
         if issubclass(kind, BaseExceptionGroup) and own_str is BaseExceptionGroup.__str__:
             return False
-        return id(exc) in _Scan(exc, charged_root=True).holds
+        if share is not None:
+            known = share.verdicts.get(id(exc))
+            if known is not None and known[0] is exc:
+                return known[1]
+        return id(exc) in _Scan(exc, charged_root=True, share=share).holds
     except Exception:  # noqa: BLE001 -- fail closed: it might
         return True
+
+
+class _ScanShare:
+    """What the scans of one traceback share (:func:`safe_traceback`, vault BACKLOG #3340). This is
+    the one place the added pass's budgets and costs are written down; :class:`_Scan`,
+    :func:`_added_pass` and :func:`safe_traceback` point here.
+
+    BUDGETS. These rules apply to every scan, with or without a share. A link is each exception
+    :func:`safe_traceback` walks. Each link's first pass has a whole
+    :data:`_ATTRIBUTE_BUDGET`, as a log argument's scan does. A scan with no share runs its added
+    pass on what its first pass left. In a traceback, a link's added pass runs on the smaller of
+    that and what is left of ``added``, one more budget the added passes of every link share, so a
+    long chain whose scans each run out is not read once per link. The first passes never draw on
+    ``added``. Any pass, first or added, with or without a share, can end up to two units past what
+    it was given (a dict read at an odd limit). ``added`` is charged what a link's added pass
+    spent, at most what it was given. One link's added reads can spend most of ``added`` (each link
+    is charged at most ``_ATTRIBUTE_BUDGET - 1`` of it), leaving less of ``added`` for later links.
+
+    COSTS IN THE ADDED PASS (:func:`_added_pass`). It reads an object at most twice: once the plain
+    way, and once the deep way, beneath or as an exception whose own code renders it. Each read
+    takes only the readers the reads before it lacked. A read of an object the scan has not recorded
+    yet costs one unit, one for each element read when it is a container, scalars included, and one
+    for each value read through its readers; an object of a class not read at all is charged that
+    one unit each time and never recorded. Of an object the scan has recorded, a plain read with no
+    reader left to add costs nothing; any other plain read costs one unit and each value read, and follows
+    none of its elements again; a deep read costs one unit, each value read, and one for each
+    non-scalar element not yet read the deep way, which it follows again.
+
+    VERDICTS. ``verdicts`` maps an exception's id to that exception and its answer, so a later
+    link's scan returns the answer without reading. A scan records one only for an exception whose
+    own ``__str__`` or ``__repr__`` is not a builtin exception's, and only when its added pass read
+    that exception the deep way: True when the scan finds it holding a Unicode error or an object it
+    could not read (fail closed), and False only when the scan's
+    remainder is larger than the most slots and chain links any one of its reads went through, which
+    it takes as the sign that no read was cut short."""
+
+    __slots__ = ("added", "verdicts")
+
+    def __init__(self) -> None:
+        # The exception too, so its id is not reused while the traceback is rendered.
+        self.verdicts: dict[int, tuple[BaseException, bool]] = {}
+        self.added = _ATTRIBUTE_BUDGET
 
 
 class _Scan:
@@ -3006,12 +3289,25 @@ class _Scan:
 
     The second walk reads by attribute (:func:`_readers`) each object the first one met, and
     adds what its attributes hold to its elements. A dataclass that is also an exception or a
-    container has both. What it reaches, at any depth, is read with a limit, and the whole second
-    walk spends at most :data:`_ATTRIBUTE_BUDGET`. A container it reads may be cut short. No
+    container has both. What it reaches, at any depth, is read with a limit, on the budgets
+    :class:`_ScanShare` sets out. A container it reads may be cut short. No
     message text is built from such a list, since an object read by attribute prints as a fixed
     note; a rebuilt ``ChainMap`` root's storage, which a later handler may read, can be short of
     keys for that reason. ``charged_root`` skips the first walk, so everything beneath the root is
     read with the limit.
+
+    THE SECOND WALK HAS TWO PASSES, AND THE ORDER IS THE GUARANTEE AGAIN (vault BACKLOG #3340). The
+    first pass is the whole of the walk above, through :func:`_readers` alone. The added pass
+    (:func:`_added_pass`) runs after it, on what budget is left (:class:`_ScanShare`), and reads
+    what an exception's own code may print beyond those readers: at least its dunder-named slots;
+    and, when that code is not a builtin exception's, its ``__cause__`` and ``__context__`` and,
+    beneath it, the instance ``__dict__``, slots and chain links of each exception it reaches,
+    whatever that exception's own ``__str__`` prints. The added pass adds elements and errors to
+    what the first pass recorded, and never reorders any. The one removal is its failure path: an
+    object whose added read raises has its recorded elements replaced by None, which marks it
+    unreadable, so it counts as holding an error (fails closed). So every object the first pass
+    found holding an error still holds one, and the added pass can only turn "holds no error" into
+    "holds an error".
 
     WHEN THE BUDGET RUNS OUT THE SCAN SAYS NOTHING, and a caller reads that as "holds no error".
     So an error past the budget prints raw, as it did before any object was read by attribute. A
@@ -3020,7 +3316,9 @@ class _Scan:
 
     __slots__ = ("holds", "nodes")
 
-    def __init__(self, root: Any, *, charged_root: bool = False) -> None:
+    def __init__(
+        self, root: Any, *, charged_root: bool = False, share: _ScanShare | None = None
+    ) -> None:
         # id -> (the object, its elements or None when unreadable, why it was unreadable). Holding
         # the object keeps its id from being reused while the walk runs.
         nodes: dict[int, tuple[Any, list[Any] | None, str]] = {}
@@ -3055,6 +3353,7 @@ class _Scan:
                 charged.append(arg)
         budget = _ATTRIBUTE_BUDGET
         read: set[int] = set()  # read by attribute, or first met by the second walk
+        order: list[Any] = []  # the same, in the order read, for the added pass to start from
         while charged and budget > 0:
             arg = charged.pop()
             kind = type(arg)
@@ -3062,6 +3361,7 @@ class _Scan:
             if kind in _ARG_SCALARS or key in read:
                 continue
             read.add(key)
+            order.append(arg)
             if issubclass(kind, UnicodeError):
                 if key not in nodes:
                     nodes[key] = (arg, [], "")
@@ -3102,21 +3402,160 @@ class _Scan:
                     nodes[id(child)] = (child, [], "")
                     seeds.append(id(child))
             charged.extend(reversed(follow))  # popped in the order read: .args before attributes
+        # The first pass ends above; a negative remainder gives the added pass nothing.
+        room = max(budget, 0) if share is None else min(max(budget, 0), share.added)
+        budget, opened, widest = _added_pass(nodes, seeds, read, order, room)
+        if share is not None:
+            share.added -= room - max(budget, 0)
+        # A read through readers with n slots can stop before a slot it never tried and still
+        # leave fewer than n units, so only a remainder above every reader count shows that no
+        # read was cut short. Only a shared scan hands on a verdict, so only it needs this.
+        if share is not None:
+            for arg in order:
+                readers = _readers(type(arg))
+                if readers is not None:
+                    widest = max(widest, len(readers) - 1)
         self.nodes = nodes
         self.holds: set[int] = set()
-        if not seeds:
-            return
-        parents: dict[int, list[int]] = {}
-        for key, (_arg, elements, _why) in nodes.items():
-            for child in elements or ():
-                if id(child) in nodes:
-                    parents.setdefault(id(child), []).append(key)
-        self.holds.update(seeds)
-        while seeds:
-            for parent in parents.get(seeds.pop(), ()):
-                if parent not in self.holds:
-                    self.holds.add(parent)
-                    seeds.append(parent)
+        if seeds:
+            parents: dict[int, list[int]] = {}
+            for key, (_arg, elements, _why) in nodes.items():
+                for child in elements or ():
+                    if id(child) in nodes:
+                        parents.setdefault(id(child), []).append(key)
+            self.holds.update(seeds)
+            while seeds:
+                for parent in parents.get(seeds.pop(), ()):
+                    if parent not in self.holds:
+                        self.holds.add(parent)
+                        seeds.append(parent)
+        if share is not None:
+            for opened_exc in opened:
+                if id(opened_exc) in self.holds:
+                    share.verdicts[id(opened_exc)] = (opened_exc, True)
+                elif budget > widest:  # nothing was cut short: its own scan reads no more
+                    share.verdicts[id(opened_exc)] = (opened_exc, False)
+
+
+def _added_pass(
+    nodes: dict[int, tuple[Any, list[Any] | None, str]],
+    seeds: list[int],
+    first_read: set[int],
+    order: list[Any],
+    budget: int,
+) -> tuple[int, list[Any], int]:
+    """:class:`_Scan`'s added pass: what an exception's own code may print beyond :func:`_readers`
+    (:func:`_reader_record`), read on ``budget``, the first pass's remainder (vault BACKLOG #3340).
+
+    It starts from each exception the first pass read, in the order read, whose own code may print
+    more than that pass read of it. It only adds to ``nodes`` and ``seeds``: an object's elements
+    are kept and what it adds is appended, and an object whose added read fails is marked
+    unreadable, which counts as holding an error. So it can turn "holds no error" into "holds an
+    error", and never the other way.
+
+    What each read costs is written once, in :class:`_ScanShare`.
+
+    Returns what is left of ``budget``, each exception whose own code renders it that was read the
+    deep way, and the most slots any read here went through."""
+    # id -> 1 when read the plain way here, 2 when read the deep way.
+    done: dict[int, int] = {}
+    memo: _RecordMemo = {}
+    opened: list[Any] = []
+    pending: list[tuple[Any, bool]] = []
+    widest = 0
+    if budget <= 0:
+        return budget, opened, widest
+    for arg in reversed(order):  # popped from the end, so in the order the first pass read them
+        kind = type(arg)
+        if kind in _ARG_SCALARS or issubclass(kind, UnicodeError):
+            continue
+        if _starts_added_reads(kind, memo):
+            pending.append((arg, False))
+    while pending and budget > 0:
+        arg, deep = pending.pop()
+        kind = type(arg)
+        key = id(arg)
+        if kind in _ARG_SCALARS:
+            continue
+        if issubclass(kind, UnicodeError):
+            if key not in nodes:
+                nodes[key] = (arg, [], "")
+                seeds.append(key)
+            continue
+        known = nodes.get(key)
+        if known is not None and known[1] is None:
+            continue  # unreadable, and it already counts as an error
+        _first, plain, beneath, opens, gains = _reader_record(kind, memo)
+        inner = deep or opens  # what it reaches is read the deep way
+        level = 2 if inner else 1
+        before = done.get(key, 0)
+        if before >= level:
+            continue
+        # Only what the reads before it lacked, worked out once for the class.
+        if before:
+            # A plain read sets level 1 only when ``opens`` is False, so a later read that gets
+            # past ``before >= level`` is deep.
+            target = gains[2]
+        elif key in first_read:
+            target = gains[1] if deep else gains[0]
+        else:
+            target = beneath if deep else plain
+        reads = _reads_any(target)
+        if not inner and not reads and known is not None:
+            done[key] = level  # nothing to add, and its elements were followed already
+            continue
+        done[key] = level
+        if inner and opens:
+            opened.append(arg)
+        if known is None and target is None and not issubclass(kind, _ARG_WALKED):
+            budget -= 1  # an object that is not read at all: nothing beneath it to follow
+            continue
+        try:
+            if known is not None:
+                children = known[1] or []
+                # Followed again only to read them the deep way, so not one read that way already.
+                found = (
+                    list(
+                        islice(
+                            (
+                                c
+                                for c in children
+                                if type(c) not in _ARG_SCALARS and done.get(id(c), 0) < 2
+                            ),
+                            budget,
+                        )
+                    )
+                    if inner
+                    else []
+                )
+            elif issubclass(kind, _ARG_WALKED):
+                children = found = _children(arg, kind, budget)
+            else:
+                children, found = [], []
+            budget -= 1 + len(found)
+            held: list[Any] = []
+            if target is not None and reads and budget > 0:
+                widest = max(widest, len(target) - 1)
+                held = _attribute_values(arg, target, budget)
+                budget -= len(held)
+        except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
+            nodes[key] = (arg, None, type(exc).__name__)
+            seeds.append(key)
+            continue
+        if known is None or held:
+            nodes[key] = (arg, children + held, "")
+        follow: list[Any] = []
+        for child in found + held:
+            child_kind = type(child)
+            if child_kind in _ARG_SCALARS:
+                continue
+            if not issubclass(child_kind, UnicodeError):
+                follow.append(child)
+            elif id(child) not in nodes:
+                nodes[id(child)] = (child, [], "")
+                seeds.append(id(child))
+        pending.extend((child, inner) for child in reversed(follow))
+    return budget, opened, widest
 
 
 def _joined(items: list[Any]) -> str:
@@ -3304,8 +3743,14 @@ class _Rebuild:
         return None
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
-        # An exception, or an object read by attribute: never printed through its own code.
-        if not issubclass(kind, _ARG_WALKED) or _readers(kind) is not None:
+        # An exception, or an object read by attribute: never printed through its own code. An
+        # exception's elements are not rendered either: the note prints none of them, and the
+        # added pass puts what its attributes and chain hold among them (vault BACKLOG #3340).
+        if (
+            issubclass(kind, BaseException)
+            or not issubclass(kind, _ARG_WALKED)
+            or _readers(kind) is not None
+        ):
             return _holder_note(kind)
         if issubclass(kind, UserDict):
             own: Any = kind.__repr__

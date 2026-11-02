@@ -1233,6 +1233,7 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         service_module.STEP_UP_ACTION_WEBAUTHN_ENROLL,
         service_module.STEP_UP_ACTION_SESSION_TERMINATE,
         service_module.STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+        service_module.STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
     } == AuthService._PENDING_REFUSED_ACTIONS and _called(
         _service_func("complete_oidc_step_up"), "_factor_binding_is_blocked_hash"
     ), (

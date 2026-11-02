@@ -61,6 +61,8 @@ from messagefoundry.pipeline.ingress_guards import (
     decode_ingress,
     peek_max_bytes,
     store_safe_raw,
+    strict_validate_timeout,
+    strict_validation_due,
 )
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
 from messagefoundry.store import MessageStatus
@@ -591,6 +593,11 @@ def transform_one(
     return TransformOutcome(deliveries, state_ops, meta_ops, declined)
 
 
+#: The ``(set name, file path)`` pairs whose skip :func:`_dry_run_reference_view` has already logged
+#: in this process; the path too, so another config's set of the same name still logs. A test resets it.
+_skipped_reference_sets_logged: set[tuple[str, str]] = set()
+
+
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
     declaration with a literal path. DB-backed or ``env()``-path sets can't be materialized without a
@@ -598,7 +605,9 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
 
     Each value goes through the same JSON encoding the store applies, so a preview reads what the live
     engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
-    set the store would refuse to encode is omitted, as the live sync would refuse to commit it."""
+    set the store would refuse to encode is omitted, as the live sync would refuse to commit it. So is
+    a set whose file did not load (vault BACKLOG #3340); both log a warning naming it, the second once
+    per set per process."""
     view: dict[str, Mapping[str, Any]] = {}
     for spec in registry.references.values():
         if spec.source.kind != "file":
@@ -611,6 +620,15 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
                 k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
             }
         except CodeSetError:
+            # A missing, malformed or unreadable file. Say so, or a later read of the set reports it
+            # missing with nothing to say why. The set name only, never the loader's text: that can
+            # quote a KEY (a duplicate one), which may be PHI for a patient-keyed set, and `check`
+            # writes this line into a CI log. No cause either: a guess from the path (missing versus
+            # malformed) misnames a permission or a directory. Once per set per process, since
+            # `check` reloads the view for every fixture on every inbound.
+            if (spec.name, path) not in _skipped_reference_sets_logged:
+                _skipped_reference_sets_logged.add((spec.name, path))
+                log.warning("dry-run: reference set %r skipped, its file did not load", spec.name)
             continue
         except TypeError:
             # The live sync would refuse to commit this set, so the preview omits it too; say why, or
@@ -620,6 +638,27 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
             )
             continue
     return view
+
+
+class UserCodeCalledSysExit(Exception):
+    """A Router, an ``accepts=`` predicate or a Handler called ``sys.exit()`` during a preview.
+
+    :func:`route_message` turns the ``SystemExit`` into this, so its callers' ``except Exception``
+    reports the message as ``ERROR`` rather than letting the exit leave ``dry_run`` and end
+    ``messagefoundry check`` with whatever code the script passed, 0 included, which reads as a pass.
+    The text is the live runner's own (``wiring_runner.UserCodeCalledSysExit``, vault BACKLOG #3134),
+    kept as a copy because ``wiring_runner`` imports this module, and
+    ``tests/test_user_code_system_exit.py`` fails if the two drift. It names an integer exit code and
+    nothing else: ``sys.exit("...")`` carries the author's text,
+    which could quote a field. It is raised outside the ``except`` that caught the exit, so the
+    ``SystemExit``, and that text, is not on its ``__context__`` either. ``KeyboardInterrupt`` is not
+    converted; it stops the preview."""
+
+    @classmethod
+    def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
+        code = exc.code
+        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+        return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
 
 
 def route_message(
@@ -642,7 +681,8 @@ def route_message(
     Bench / CLI preview, which want the whole routing outcome in one shot. The live **staged** engine
     instead runs the two halves at *separate* stages (router worker → transform worker), so it and the
     dry-run path route identically. Each handler still gets its own :class:`Message` (via
-    :func:`transform_one`). Router/Handler exceptions propagate to the caller.
+    :func:`transform_one`). Router/Handler exceptions propagate to the caller, a ``SystemExit`` as
+    :class:`UserCodeCalledSysExit`.
 
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
@@ -699,20 +739,33 @@ def route_message(
         # Message in place — see _shareable_payload — so each consumer re-parses its own, which is
         # also cheaper than parse-once-then-deep-copy). Value-identical either way.
         shared = _shareable_payload(raw, ct)
-        names = route_only(
-            registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
-        )
-        for hname in names:
-            ds, ops, meta, skipped = transform_one(
-                registry,
-                hname,
-                raw,
-                ct,
-                payload=shared,
-                tracer=tracer,
-                sandbox=sandbox,
-                run_context=rc,
+        # A SystemExit is converted, then raised after its handler ends, so the exit and the
+        # author's text it carries are not chained onto the converted fault (UserCodeCalledSysExit).
+        exited: UserCodeCalledSysExit | None = None
+        try:
+            names = route_only(
+                registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
             )
+        except SystemExit as exc:
+            exited = UserCodeCalledSysExit.from_exit(exc)
+        if exited is not None:
+            raise exited
+        for hname in names:
+            try:
+                ds, ops, meta, skipped = transform_one(
+                    registry,
+                    hname,
+                    raw,
+                    ct,
+                    payload=shared,
+                    tracer=tracer,
+                    sandbox=sandbox,
+                    run_context=rc,
+                )
+            except SystemExit as exc:
+                exited = UserCodeCalledSysExit.from_exit(exc)
+            if exited is not None:
+                raise exited
             deliveries.extend(ds)
             for op in ops:
                 # Visible to subsequent handlers, in the JSON form the live sealed cache returns
@@ -776,9 +829,9 @@ class DryRunResult:
     # **PHI. Every consumer that prints, logs or serves this must pass it through
     # `messagefoundry.redaction.safe_error` first** (BACKLOG #1668). It is built unredacted on purpose:
     # a consumer that holds a `--show-phi` opt-in has to still have the raw text to honor it, so
-    # scrubbing here would close the leak by deleting the feature. Four producers feed it below
-    # (`exc.reason`, `parse error:`, the joined strict-validation errors, `router/handler error:`) and
-    # at least the last quotes a Router/Handler's own `raise` — `raise ValueError(f"bad MRN
+    # scrubbing here would close the leak by deleting the feature. Producers below include
+    # `exc.reason`, `parse error:`, the joined strict-validation errors, the strict-validation timeout
+    # and `router/handler error:`, and at least the last quotes a Router/Handler's own `raise` — `raise ValueError(f"bad MRN
     # {msg['PID-3']}")` is the commonest debugging idiom. The obligation lives here rather than in each
     # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
@@ -895,6 +948,47 @@ def _dry_run_raw(
     )
 
 
+def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
+    """Strict-validate ``text`` under the listener's timeout; the refusal text, or ``None`` if valid.
+
+    The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread`` and refuses
+    with ``strict-validation timed out after <N>s`` once the timeout
+    :func:`~messagefoundry.pipeline.ingress_guards.strict_validate_timeout` resolves passes. This
+    function is synchronous, so it validates **inline and measures**: when the validate took longer
+    than that timeout, the result is the listener's text word for word (the parity test compares the
+    two), whatever the validate returned or raised, since the listener had given up on it by then. A
+    validate inside the timeout reports as before: its own refusal, or its raise. With the backstop
+    disabled (``strict_timeout_s <= 0``) nothing times out.
+
+    **What inline loses against the listener, by design.** A slow fixture runs its full validate time
+    instead of being abandoned at the timeout, so a preview can take as long as hl7apy does, up to
+    the size and segment caps checked before the parse. And the listener's validates share the
+    default executor's workers with concurrent traffic, so a saturated executor can push a fast
+    validate past its timeout there; the preview validates one message at a time and does not model
+    that. The verdict matches; the wall clock and the concurrency do not."""
+    timeout = strict_validate_timeout(ic)
+    started = time.monotonic()
+    fault: Exception | None = None
+    try:
+        result = validate(text, expected_version=ic.validation.hl7_version)
+    except Exception as exc:
+        fault = exc
+    # Measured before a fault is re-raised: the listener had given up by then, so it says timed out.
+    if timeout is not None and time.monotonic() - started > timeout:
+        if fault is not None:
+            # The verdict is the timeout, so the fault is not raised, but it is not dropped silently
+            # either (CLAUDE.md section 6). The class only: a validate error can quote the message.
+            log.debug(
+                "dry-run strict validation raised %s after its timeout; reported as timed out",
+                type(fault).__name__,
+            )
+        return f"strict-validation timed out after {timeout}s"
+    if fault is not None:
+        raise fault
+    # On ``ok`` alone, as the listener refuses: a fault's text can be empty.
+    return None if result.ok else "; ".join(result.errors)[:200]
+
+
 @runs_author_code
 def dry_run(
     registry: Registry,
@@ -915,10 +1009,13 @@ def dry_run(
     accepted — the Test Bench and a programmatic caller hold text — and simply skips the charset guard,
     since there is nothing left to decode.
 
-    **Two live guards are deliberately not mirrored, and a preview can therefore differ from the engine
-    on exactly these two points** (rationale in :mod:`messagefoundry.pipeline.ingress_guards`):
-    the strict-validation **timeout** (mirroring it would force this function ``async``), and
-    **document detach** (``async`` and side-effecting, so there is no honest pure mirror).
+    Strict validation is measured against the connection's **timeout**: a validate that took longer
+    is an ``ERROR`` result carrying the listener's text (:func:`_strict_validation_error`). It is not
+    abandoned at the timeout as on the listener, so a slow fixture still takes its full validate time. **At least two
+    live guards are deliberately not mirrored**, so a preview can differ from the engine on them:
+    **document detach** (``async`` and side-effecting, so there is no honest pure mirror) and the
+    **declared-type magic-byte sniff** on a non-HL7 body (``check`` sends each fixture to every
+    inbound); the rationale for both is in :mod:`messagefoundry.pipeline.ingress_guards`.
 
     ``tracer`` (ADR 0072) is an optional observer threaded to the routing core so the traced dry-run
     (:func:`messagefoundry.pipeline.dryrun_trace.trace_dry_run`) can capture the Router/Handler execution;
@@ -965,18 +1062,21 @@ def dry_run(
 
     mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
 
-    if ic.validation.strict:
-        result = validate(text, expected_version=ic.validation.hl7_version)
-        if not result.ok:
-            return DryRunResult(
-                inbound=ic.name,
-                disposition=MessageStatus.ERROR,
-                raw=text,
-                message_type=mt,
-                control_id=cid,
-                summary=summ,
-                error="; ".join(result.errors)[:200],
-            )
+    # strict_validation_due keeps the listener's header-only downgrade for a streaming body over its
+    # threshold, so the preview never times a whole-body validate the engine does not run.
+    if (
+        strict_validation_due(ic, text)
+        and (refused := _strict_validation_error(text, ic)) is not None
+    ):
+        return DryRunResult(
+            inbound=ic.name,
+            disposition=MessageStatus.ERROR,
+            raw=text,
+            message_type=mt,
+            control_id=cid,
+            summary=summ,
+            error=refused,
+        )
 
     try:
         outcome = route_message(

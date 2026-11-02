@@ -1,20 +1,25 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The generic ODBC dialect takes its connection target from ``server`` alone (vault BACKLOG #2577).
+"""The generic ODBC dialect's keyword lists cover keywords only (vault BACKLOG #2577).
 
-``[egress].allowed_db`` is checked against the ``server`` setting, so ``server`` has to be the only
-setting that can tell the driver where to connect. The generic dialect also takes free driver
-keywords in ``odbc_params``, and the name of the keyword each credential is sent under. Those are the
-other places a keyword can come from, so this file pins all three:
+``[egress].allowed_db`` reads the host from the ``server`` setting, so the list is hand-chosen, no
+keyword is on it in order to name a host, and a file keyword's value is screened
+separately by spelling. The lists rely on at least a driver named on the escape list reading the
+``}}`` escape in a braced password, and the driver reading ``SERVER`` as its target
+(docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). The generic dialect also takes free driver keywords in ``odbc_params``, and the name of
+the keyword each credential is sent under. Those are the other places a keyword can come from, so
+this file pins all three:
 
 * ``odbc_params`` accepts a fixed list of keywords. Anything else is refused when the connection is
   built, with the keyword and the connection named. The list is an allowlist on purpose: every ODBC
   driver has its own spellings for a host, an address, a data source name or a socket, so a list of
   refused names would always trail the drivers.
 * ``odbc_user_key`` and ``odbc_password_key`` accept the credential keywords and nothing else.
-* Every value must be printable ASCII. An ``odbc_params`` value, the driver, the database and the
-  user name also refuse the characters that end a connection-string value. A password keeps the
-  ODBC escape, so it may hold any printable ASCII character.
+* Every value must be printable ASCII. An ``odbc_params`` value, the database and the user name are
+  sent without braces (BACKLOG #2705), so they refuse ``;``, ``{``, ``}`` and ``=``, and an empty,
+  blank or padded value, and ``None``. The driver name stays braced and refuses ``;``, ``{`` and
+  ``}``. A password is always braced with the ODBC escape for a driver on the escape list, and for
+  any other driver sent plain when it can be and refused when it cannot.
 * A keyword given twice is refused, and a file keyword must be a plain local path.
 
 Each refusal is paired with a control that must still build, and the control uses the same builder
@@ -135,13 +140,15 @@ def test_a_keyword_off_the_list_is_refused(keyword: str) -> None:
 # stand in for it. tests/test_keywrap.py builds it with a real key file.
 @pytest.mark.parametrize("keyword", sorted(_ODBC_PARAM_ALLOWLIST - {"sslkey"}))
 def test_every_listed_keyword_still_builds(keyword: str) -> None:
-    dsn = _build(odbc_params={keyword: "1"})
-    assert dsn.endswith(f"{keyword}={{1}};")
+    # sslmode takes a libpq mode for this psqlODBC driver (BACKLOG #2705); every other keyword "1".
+    value = "require" if keyword == "sslmode" else "1"
+    dsn = _build(odbc_params={keyword: value})
+    assert dsn.endswith(f"{keyword}={value};")
 
 
 @pytest.mark.parametrize("spelling", ["PORT", "Port", "port", "pOrT"])
 def test_a_listed_keyword_matches_in_any_case(spelling: str) -> None:
-    assert f"{spelling}={{5432}}" in _build(odbc_params={spelling: 5432})
+    assert f"{spelling}=5432;" in _build(odbc_params={spelling: 5432})
 
 
 def test_every_path_keyword_is_a_listed_keyword() -> None:
@@ -185,7 +192,7 @@ def test_a_keyword_given_twice_is_refused(params: dict[str, Any]) -> None:
     assert _CONNECTION in str(refused.value)
     # Control: either copy alone builds.
     for keyword, value in params.items():
-        assert f"{keyword}={{{value}}}" in _build(odbc_params={keyword: value})
+        assert f"{keyword}={value};" in _build(odbc_params={keyword: value})
 
 
 # --- the keyword each credential is sent under ---------------------------------------------------
@@ -210,20 +217,24 @@ def test_the_credential_keywords_drivers_use_still_build(user_key: str, password
     dsn = _build(
         username="svc", password="pw", odbc_user_key=user_key, odbc_password_key=password_key
     )
-    assert f"{user_key}={{svc}}" in dsn
-    assert f"{password_key}={{pw}}" in dsn
+    assert f"{user_key}=svc;" in dsn
+    # The default driver is psqlODBC, so the password is braced (BACKLOG #2705).
+    assert f"{password_key}={{pw}};" in dsn
 
 
 # --- values --------------------------------------------------------------------------------------
 
-# A value is sent inside braces. The first three are the characters that could end it early in a
-# driver that reads the braces differently from the ODBC rule. Then the control characters. The rest
+# A value is sent WITHOUT braces (BACKLOG #2705). The first four are the characters that could end
+# it early or start another keyword. Then the control characters. The rest
 # are not ASCII: a driver manager that converts the string for a narrow-interface driver can turn
 # such a character into an ASCII delimiter, and which ones depends on the platform and code page,
 # so every non-ASCII character is refused. The samples are a fullwidth form, a character whose low
 # byte is a delimiter, and an ordinary accented letter.
 _NON_ASCII = ["\uff1b", "\uff5d", "\u017d", "\u013b", "\u00e9"]
-_REFUSED_VALUE_CHARACTERS = [";", "{", "}", "\n", "\r", "\x00", "\x7f", *_NON_ASCII]
+# The two quote characters are refused too: on main they sat inside braces, and how a driver reads
+# one in a plain value is unmeasured. Red on the previous head, which sent them plain.
+_QUOTES = ['"', "'"]
+_REFUSED_VALUE_CHARACTERS = [";", "{", "}", "=", *_QUOTES, "\n", "\r", "\x00", "\x7f", *_NON_ASCII]
 
 
 @pytest.mark.parametrize("character", _REFUSED_VALUE_CHARACTERS)
@@ -238,14 +249,171 @@ def test_a_value_holding_a_connection_string_delimiter_is_refused(character: str
     assert _VALUE not in message
 
 
-@pytest.mark.parametrize("setting", ["odbc_driver", "database", "username"])
-@pytest.mark.parametrize("character", [";", "{", "}", "\n", *_NON_ASCII])
+@pytest.mark.parametrize(
+    ("setting", "character"),
+    [
+        (setting, character)
+        for setting in ("odbc_driver", "database", "username")
+        for character in [";", "{", "}", "=", *_QUOTES, "\n", *_NON_ASCII]
+        # The driver name stays braced, so `=` and the quotes are refused only in the values sent
+        # without braces.
+        if setting != "odbc_driver" or character not in ["=", *_QUOTES]
+    ],
+)
 def test_a_typed_setting_holding_a_delimiter_is_refused(setting: str, character: str) -> None:
     with pytest.raises(ValueError, match=f"DATABASE {setting} must hold only printable") as refused:
         _build(**{setting: f"{_VALUE}{character}{_VALUE}"})
     message = str(refused.value)
     assert _CONNECTION in message
     assert _VALUE not in message
+
+
+# --- values sent without braces (BACKLOG #2705) ---------------------------------------------------
+
+_PADDING = "must not be empty, blank, or start or end with a space"
+
+
+def test_the_built_psqlodbc_string_sends_every_checked_value_unbraced() -> None:
+    """psqlODBC did not honour ``SSLmode={verify-full}`` (2026-10-30 probe: it connected with no
+    TLS), kept braces on UID and DATABASE, and refused a braced port. Red before #2705. The
+    password alone stays braced: psqlODBC URL-decodes an unbraced one."""
+    dsn = _build(
+        database="results",
+        username="svc",
+        password="pw",
+        odbc_params={"port": 5432, "SSLmode": "verify-full"},
+    )
+    assert dsn == (
+        "DRIVER={PostgreSQL Unicode};SERVER=db.test;DATABASE=results;UID=svc;PWD={pw};"
+        "port=5432;SSLmode=verify-full;"
+    )
+
+
+@pytest.mark.parametrize("value", ["", " ", "  ", " verify-full", "verify-full "])
+def test_an_empty_blank_or_padded_odbc_params_value_is_refused(value: str) -> None:
+    """An unbraced empty ``sslmode`` is the driver's default, and libpq's default ``prefer`` falls
+    back to plaintext. The build refuses it; ``generic_odbc_tls_unenforced`` is left alone, since
+    no connection reaches the driver with such a value. A padded value may be trimmed by one
+    driver and kept by another. Red before #2705, which sent ``SSLmode={}``."""
+    with pytest.raises(ValueError, match=f"odbc_params value for 'sslmode' {_PADDING}") as refused:
+        _build(odbc_params={"SSLmode": value})
+    assert _CONNECTION in str(refused.value)
+    # The control: the same keyword with a plain value builds.
+    assert "SSLmode=verify-full;" in _build(odbc_params={"SSLmode": "verify-full"})
+
+
+@pytest.mark.parametrize("setting", ["database", "username"])
+@pytest.mark.parametrize("value", [" ", " name", "name "])
+def test_a_blank_or_padded_typed_setting_is_refused(setting: str, value: str) -> None:
+    with pytest.raises(ValueError, match=f"DATABASE {setting} {_PADDING}") as refused:
+        _build(**{setting: value})
+    assert _CONNECTION in str(refused.value)
+
+
+# --- the password (BACKLOG #2705) ------------------------------------------------------------------
+
+_ESCAPE_DRIVERS = [
+    # The bare section name RHEL registers psqlODBC under. Red on the previous head.
+    "PostgreSQL",
+    "postgresql",
+    "PostgreSQL Unicode",
+    "PostgreSQL ANSI",
+    "PostgreSQL ANSI(x64)",
+    "postgresql unicode",
+    "MySQL ODBC 9.1 Unicode Driver",
+    "MySQL ODBC 8.0 ANSI Driver",
+    "PostgreSQL Unicode(x64)",
+    "ODBC Driver 18 for SQL Server",
+]
+_OTHER_DRIVERS = [
+    # The legacy name: on Linux commonly a FreeTDS alias, which has not been measured.
+    "SQL Server",
+    "Microsoft Access Driver (*.mdb, *.accdb)",
+    "SQLite3 ODBC Driver",
+    "Oracle in OraClient19Home1",
+    "MariaDB ODBC 3.2 Driver",
+    # Another registered name that only folds to a measured one.
+    "PostgreSQL  Unicode",
+    # An older psqlODBC name on Windows, not on the list, and a near miss of the bare name.
+    "PostgreSQL35W",
+    "PostgreSQL(x64)",
+    # A vendor driver for a measured database, and a library path, are unmeasured.
+    "Devart ODBC Driver for PostgreSQL",
+    "CData ODBC Driver for MySQL",
+    "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so",
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
+]
+_NEEDS_BRACES = ["p}w", "p;w", "p{w", 'p"w', "p'w", " pw", "pw ", "a};DBQ=C:\\x.accdb;X=}"]
+
+
+@pytest.mark.parametrize("driver", _OTHER_DRIVERS)
+@pytest.mark.parametrize("password", ["pw", "p=w", "p w", "a+b%41c"])
+def test_a_password_with_no_delimiter_is_sent_unbraced_to_any_other_driver(
+    driver: str, password: str
+) -> None:
+    """ACE rejects any braced password, even one with no brace in it (2026-10-30 probe), so for a
+    driver off the escape list a password that needs no braces is sent without them."""
+    assert f"PWD={password};" in _build(odbc_driver=driver, username="svc", password=password)
+
+
+@pytest.mark.parametrize("driver", _ESCAPE_DRIVERS)
+@pytest.mark.parametrize("password", ["pw", "p=w", "p w", "a+b%41c", *_NEEDS_BRACES])
+def test_a_password_is_always_braced_for_a_driver_on_the_escape_list(
+    driver: str, password: str
+) -> None:
+    """psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space, ``%41`` an ``A``) and takes a
+    braced one literally, and psqlODBC and MySQL honoured the ``}}`` escape on 2026-10-30. So for a
+    driver on the list every password is braced, as main always did. Red on the previous head,
+    which sent ``pw`` and ``a+b%41c`` plain."""
+    escaped = "{" + password.replace("}", "}}") + "}"
+    assert f"PWD={escaped};" in _build(odbc_driver=driver, username="svc", password=password)
+
+
+def test_a_psqlodbc_password_holding_url_escapes_is_built_braced() -> None:
+    dsn = _build(username="svc", password="a+b%41c")
+    assert dsn == "DRIVER={PostgreSQL Unicode};SERVER=db.test;UID=svc;PWD={a+b%41c};"
+
+
+@pytest.mark.parametrize("driver", _OTHER_DRIVERS)
+@pytest.mark.parametrize("password", _NEEDS_BRACES)
+def test_a_password_needing_braces_is_refused_for_any_other_driver(
+    driver: str, password: str
+) -> None:
+    """ACE did not read the escape: ``PWD={a}};DBQ=...;X=}`` opened the file the password named
+    (2026-10-30 probe). An unmeasured driver is refused the same way, and the legacy ``SQL Server``
+    name with it. The refusal says only that the driver cannot carry the password."""
+    with pytest.raises(ValueError, match="password cannot be carried by this odbc_driver") as r:
+        _build(odbc_driver=driver, username="svc", password=password)
+    message = str(r.value)
+    assert _CONNECTION in message
+    assert password.strip() not in message
+    # Nothing about what the password holds.
+    assert "brace" not in message and "space" not in message and "';'" not in message
+
+
+# --- None is refused, never sent as text (BACKLOG #2705) ------------------------------------------
+
+
+@pytest.mark.parametrize("keyword", ["SSLmode", "PORT", "SSLCA"])
+def test_a_none_odbc_params_value_is_refused(keyword: str) -> None:
+    """``str(None)`` would send the four letters ``None``. Red on the previous head, which sent
+    ``SSLmode=None``."""
+    name = odbc_keyword_name(keyword)
+    with pytest.raises(ValueError, match=f"odbc_params value for '{name}' must not be None") as r:
+        _build(odbc_params={keyword: None})
+    assert _CONNECTION in str(r.value)
+
+
+def test_a_none_server_is_refused() -> None:
+    with pytest.raises(ValueError, match="DATABASE server must not be None") as refused:
+        _build(server=None)
+    assert _CONNECTION in str(refused.value)
+
+
+@pytest.mark.parametrize("setting", ["database", "username", "password"])
+def test_an_unset_typed_setting_is_left_out_not_sent_as_none(setting: str) -> None:
+    # The control: an unset optional setting is omitted, as it always was.
+    assert "None" not in _build(**{setting: None})
 
 
 @pytest.mark.parametrize("character", ["\n", "\x00", *_NON_ASCII])
@@ -258,13 +426,14 @@ def test_a_password_must_be_printable_ascii(character: str) -> None:
     assert "none of" not in message
 
 
-def test_a_password_may_hold_any_printable_ascii_character() -> None:
-    # A password cannot be restricted the way the other values are, so it keeps the ODBC escape:
-    # a closing brace is doubled, and the other delimiters sit inside the braces.
-    assert "PWD={p;w{d=1 x}}y}" in _build(username="svc", password="p;w{d=1 x}y")
+def test_a_password_may_hold_any_printable_ascii_character_for_a_measured_driver() -> None:
+    # For a driver measured to read the ODBC escape, a closing brace is doubled and the other
+    # delimiters sit inside the braces.
+    dsn = _build(odbc_driver="PostgreSQL Unicode", username="svc", password="p;w{d=1 x}y")
+    assert "PWD={p;w{d=1 x}}y}" in dsn
 
 
-@pytest.mark.parametrize("character", [";", "{", "}", "=", "\n", "\t", *_NON_ASCII])
+@pytest.mark.parametrize("character", [";", "{", "}", "=", *_QUOTES, "\n", "\t", *_NON_ASCII])
 def test_a_server_holding_a_delimiter_is_refused(character: str) -> None:
     with pytest.raises(ValueError, match="server must not contain") as refused:
         _build(server=f"db.test{character}x")
@@ -295,10 +464,75 @@ def test_a_file_keyword_must_be_a_plain_local_path(keyword: str, path: str) -> N
 
 @pytest.mark.parametrize(
     "value",
-    [r"C:\ProgramData\certs\root ca.crt", "/etc/ssl/certs/ca=1.pem", "TLSv1.2,TLSv1.3", 5432, True],
+    [r"C:\ProgramData\certs\root ca.crt", "/etc/ssl/certs/ca-1.pem", "TLSv1.2,TLSv1.3", 5432],
 )
 def test_an_ordinary_value_still_builds(value: object) -> None:
-    assert f"sslca={{{value}}}" in _build(odbc_params={"sslca": value})
+    # Sent without braces since BACKLOG #2705; an inner space is kept, as a driver reads it.
+    assert f"sslca={value};" in _build(odbc_params={"sslca": value})
+
+
+# --- booleans and the sslmode spelling (BACKLOG #2705) --------------------------------------------
+
+
+@pytest.mark.parametrize("keyword", ["SSLmode", "readonly", "sslca"])
+@pytest.mark.parametrize("value", [True, False])
+def test_a_boolean_odbc_params_value_is_refused(keyword: str, value: bool) -> None:
+    """``str(True)`` would send the text ``True``, which psqlODBC reads as ``disable``. Red on the
+    previous head, which sent it. A TOML ``true`` arrives as this same ``bool``."""
+    name = odbc_keyword_name(keyword)
+    with pytest.raises(ValueError, match=f"'{name}' must not be a boolean") as refused:
+        _build(odbc_params={keyword: value})
+    message = str(refused.value)
+    assert _CONNECTION in message
+    assert "driver's own spelling as a string" in message
+    # The control: the same keyword with a string spelling builds.
+    spelled = "require" if name == "sslmode" else "1"
+    assert f"{keyword}={spelled};" in _build(odbc_params={keyword: spelled})
+
+
+_LIBPQ_MODES = ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+# psqlODBC reads SSLmode by its first lower case byte, so each of these means disable to it, while
+# generic_odbc_tls_unenforced counts each as TLS addressed. `True` is the text a TOML `true` became.
+_UNREAD_MODES = ["Require", "VERIFY-FULL", "Verify-full", "REQUIRED", "on", "1", "True", "yes"]
+
+
+@pytest.mark.parametrize(
+    "driver", ["PostgreSQL Unicode", "PostgreSQL", "/usr/lib/psqlodbcw.so", "SQLite3 ODBC Driver"]
+)
+@pytest.mark.parametrize("spelling", ["SSLmode", "sslmode", "SSLMODE"])
+@pytest.mark.parametrize("mode", _UNREAD_MODES)
+def test_an_sslmode_off_the_libpq_spellings_is_refused(
+    driver: str, spelling: str, mode: str
+) -> None:
+    """Red on the previous head, which sent each of these. The keyword matches in any case; the
+    value must be one of libpq's six modes exactly, for every driver but MySQL Connector/ODBC."""
+    with pytest.raises(ValueError, match="'sslmode' must be one of disable, allow") as refused:
+        _build(odbc_driver=driver, odbc_params={spelling: mode})
+    message = str(refused.value)
+    assert _CONNECTION in message
+    assert "verify-full, in lower case" in message
+    assert f"={mode}" not in message
+
+
+@pytest.mark.parametrize("driver", ["PostgreSQL Unicode", "PostgreSQL", "/usr/lib/psqlodbcw.so"])
+@pytest.mark.parametrize("mode", _LIBPQ_MODES)
+def test_an_sslmode_in_the_libpq_spellings_builds(driver: str, mode: str) -> None:
+    assert f"SSLmode={mode};" in _build(odbc_driver=driver, odbc_params={"SSLmode": mode})
+
+
+def test_a_psqlodbc_sslmode_verify_full_builds() -> None:
+    dsn = _build(odbc_params={"SSLmode": "verify-full"})
+    assert dsn == "DRIVER={PostgreSQL Unicode};SERVER=db.test;SSLmode=verify-full;"
+
+
+@pytest.mark.parametrize("driver", ["MySQL ODBC 8.0 Unicode Driver", "mysql odbc 9.1 ansi driver"])
+@pytest.mark.parametrize(
+    "mode", ["DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY", "required"]
+)
+def test_a_mysql_driver_keeps_its_own_sslmode_spellings(driver: str, mode: str) -> None:
+    """MySQL Connector/ODBC sends the same keyword with its own values, so a MySQL driver name keeps
+    them. The control for the refusal above: same keyword, the rule chosen by the driver name."""
+    assert f"SSLMODE={mode};" in _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
 
 
 # --- the connector seams, and the documented example ---------------------------------------------
@@ -343,8 +577,8 @@ def _documented_source(odbc_params: dict[str, Any]) -> Source:
 
 _DOCUMENTED_PARAMS: dict[str, Any] = {"PORT": 5432, "SSLmode": "verify-full"}
 _DOCUMENTED_DSN = (
-    "DRIVER={PostgreSQL Unicode};SERVER=pg.test;DATABASE={results};UID={svc};PWD={pw};"
-    "PORT={5432};SSLmode={verify-full};"
+    "DRIVER={PostgreSQL Unicode};SERVER=pg.test;DATABASE=results;UID=svc;PWD={pw};"
+    "PORT=5432;SSLmode=verify-full;"
 )
 
 

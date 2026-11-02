@@ -35,6 +35,10 @@ from messagefoundry import netaddr  # noqa: E402
 from messagefoundry.transports import dicom as dicom_module  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource  # noqa: E402
 from messagefoundry.transports.mllp import _TLS_HANDSHAKE_TIMEOUT  # noqa: E402
+from messagefoundry.transports.receipt import (
+    IngressReceipt,  # noqa: E402
+    receipt_handler,  # noqa: E402
+)
 from tests._dicom_sample import make_sr_part10  # noqa: E402
 from tests.test_dicom_scp import (  # noqa: E402
     _SCP_AE,
@@ -62,12 +66,12 @@ async def _running_scp(
     """A started SCP whose handler commits into ``captured``. Stopped on the way out."""
     sink: list[bytes] = [] if captured is None else captured
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         sink.append(data)
-        return f"mid-{len(sink)}"
+        return IngressReceipt.accepted(f"mid-{len(sink)}")
 
     scp = _build_scp(sink, **settings)
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         yield scp
     finally:
@@ -413,13 +417,18 @@ async def test_a_handshake_that_does_not_finish_is_dropped_at_the_bound(
 
 def _send_a_handshake_slowly(port: int, *, gap: float, give_up: float) -> float | None:
     """Open a TLS record and feed it one byte every ``gap`` seconds, so the listener's handshake
-    always has a read pending and is never idle for longer than ``gap``. Returns the seconds until
-    the listener closed the connection, or ``None`` if it was still open at ``give_up``."""
+    always has a read pending and is never idle for longer than ``gap``. See :func:`_send_slowly`."""
+    # A TLS handshake record header announcing 512 bytes; far fewer are ever sent.
+    pending = b"\x16\x03\x01\x02\x00" + b"\x00" * 400
     sock = socket.create_connection(("127.0.0.1", port), timeout=gap)
+    return _send_slowly(sock, pending, give_up=give_up)
+
+
+def _send_slowly(sock: socket.socket, pending: bytes, *, give_up: float) -> float | None:
+    """Send ``pending`` one byte per timeout of ``sock``, then close it. Returns the seconds until
+    the listener closed the connection, or ``None`` if it was still open at ``give_up``."""
     started = time.monotonic()
     try:
-        # A TLS handshake record header announcing 512 bytes; far fewer are ever sent.
-        pending = b"\x16\x03\x01\x02\x00" + b"\x00" * 400
         for offset in range(len(pending)):
             if time.monotonic() - started > give_up:
                 return None
@@ -451,14 +460,14 @@ async def test_the_handshake_bound_is_a_deadline_for_the_whole_handshake(
 async def test_a_handshake_that_starts_late_but_inside_the_bound_completes(
     tmp_path: Path,
 ) -> None:
-    # The handshake is read in slices of _HANDSHAKE_POLL_SECONDS. A slice is a poll interval, not a
+    # The handshake is read in slices of _STOP_POLL_SECONDS. A slice is a poll interval, not a
     # bound: a peer that starts after several empty slices must still be served.
     async with _running_scp(_tls_settings(tmp_path)) as scp:
 
         def late_handshake() -> bool:
             raw = socket.create_connection(("127.0.0.1", scp.sockport), timeout=5)
             try:
-                time.sleep(dicom_module._HANDSHAKE_POLL_SECONDS * 3)
+                time.sleep(dicom_module._STOP_POLL_SECONDS * 3)
                 with _unverified_client_context().wrap_socket(raw) as tls:
                     return tls.version() is not None
             finally:
@@ -468,7 +477,9 @@ async def test_a_handshake_that_starts_late_but_inside_the_bound_completes(
 
 
 @pytest.mark.parametrize(
-    "cap", ["_MAX_PENDING_HANDSHAKES_PER_HOST", "_MAX_PENDING_HANDSHAKES"], ids=["host", "listener"]
+    "cap",
+    ["_MAX_PENDING_CONNECTIONS_PER_HOST", "_MAX_PENDING_CONNECTIONS"],
+    ids=["host", "listener"],
 )
 async def test_handshakes_in_flight_are_capped_and_the_slots_come_back(
     cap: str,
@@ -575,14 +586,14 @@ async def test_a_tls_association_still_stores_an_object(tmp_path: Path) -> None:
     settings = _tls_settings(tmp_path)
     scp = _build_scp(captured, **settings)
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         # Runs while the association is live: read the timeout on the socket it was handed.
         for assoc in scp._server.active_associations:
             timeouts.append(assoc.dul.socket.socket.gettimeout())
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         established, status = await asyncio.to_thread(
             _scu_cstore_tls, scp.sockport, make_sr_part10(), ca_file=str(settings["tls_cert_file"])
@@ -633,12 +644,12 @@ async def test_a_failed_handshake_on_the_scp_is_counted_and_logged(
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
     with caplog.at_level(logging.DEBUG, logger=_LOG):
-        await scp.start(handler)
+        await scp.start(receipt_handler(handler))
         try:
             port = scp.sockport
             # The control: a completed handshake is no failure.
@@ -681,13 +692,13 @@ async def test_a_restarted_scp_counts_a_failed_handshake_again(tmp_path: Path) -
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     await scp.stop()
-    await scp.start(handler)
+    await scp.start(receipt_handler(handler))
     try:
         await _plaintext_peer(scp.sockport)
         await _until(lambda: scp.tls_handshake_failures == 1)
@@ -703,12 +714,12 @@ async def test_a_failing_shutdown_is_retried_and_still_logs_what_was_held(
     captured: list[bytes] = []
     scp = _build_scp(captured, **_tls_settings(tmp_path))
 
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         captured.append(data)
-        return "mid-1"
+        return IngressReceipt.accepted("mid-1")
 
     with caplog.at_level(logging.DEBUG, logger=_LOG):
-        await scp.start(handler)
+        await scp.start(receipt_handler(handler))
         server = scp._server
         assert server is not None
         real_shutdown = server.shutdown
@@ -763,8 +774,8 @@ def test_the_doc_states_the_bounds_the_code_ships() -> None:
     assert f"The {_TLS_HANDSHAKE_TIMEOUT:g} second handshake bound" in doc
     assert f"per refused address per {window:g} seconds" in doc
     assert f"at most {ceiling} such lines per {window:g} seconds" in doc
-    listener_cap = dicom_module._MAX_PENDING_HANDSHAKES
-    host_cap = dicom_module._MAX_PENDING_HANDSHAKES_PER_HOST
+    listener_cap = dicom_module._MAX_PENDING_CONNECTIONS
+    host_cap = dicom_module._MAX_PENDING_CONNECTIONS_PER_HOST
     assert (
         f"at most {listener_cap} TLS handshakes at once, and at most {host_cap} from one peer"
         in doc
@@ -828,13 +839,13 @@ def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
 
 
 def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_against() -> None:
-    """The ``[dicom]`` extra must admit only the pynetdicom 3.0 line, from 3.0.4 up.
+    """The ``[dicom]`` extra must admit only pynetdicom 3.0.4, the release that was measured.
 
-    ``_admitting_server_class`` was read against pynetdicom 3.0.4. The routing guard above refuses a
-    release that left the hooks, but only when the listener starts. The cap in ``pyproject.toml``
-    stops a 3.1 or later at install time (vault BACKLOG #2713). RED when someone widens that cap or
-    lowers the floor. A 3.0.x patch above 3.0.4 is still admitted. Only the routing guard stands in
-    front of one, and it checks the routing alone. Before you change the versions below, re-read
+    ``_admitting_server_class`` was read against pynetdicom 3.0.4. The guards in ``transports/dicom.py``
+    refuse a release that left the hooks, but only when the listener starts, and they check names.
+    The read and send bounds rest on behaviour measured at 3.0.4, so the exact pin in
+    ``pyproject.toml`` stops any other release at install time (vault BACKLOG #2713, #2712). RED when
+    someone widens that pin. Before you change the versions below, re-read
     ``_admitting_server_class`` against the new release; the comment above the extra in
     ``pyproject.toml`` has the steps.
     """
@@ -861,9 +872,9 @@ def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_aga
     assert spec.contains(version("pynetdicom"), prereleases=True), (
         f"these tests ran on pynetdicom {version('pynetdicom')}, which [dicom] ({spec}) refuses"
     )
-    # 3.0.3 is the release below the one read. 3.1.0.dev0 is a real development release on PyPI, so
-    # pre-releases are checked too.
-    for unread in ("3.0.3", "3.1.0.dev0", "3.1.0", "4.0.0"):
+    # 3.0.3 is the release below the one read. 3.0.5 is the next patch, which nothing has measured.
+    # 3.1.0.dev0 is a real development release on PyPI, so pre-releases are checked too.
+    for unread in ("3.0.3", "3.0.5", "3.1.0.dev0", "3.1.0", "4.0.0"):
         assert not spec.contains(unread, prereleases=True), (
             f"[dicom] ({spec}) admits pynetdicom {unread}, which the admitting server was never "
             "read against"

@@ -32,6 +32,7 @@ from messagefoundry.store.crypto import MARKER_PREFIX, make_cipher
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import assert_replayed_routed_row_settles
+from tests._store_audit import no_operator_audit
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
@@ -248,7 +249,7 @@ async def test_replay_of_a_message_with_no_queue_rows_changes_nothing(store: Mes
     )
     assert await store.outbox_for(mid) == []  # the input class, asserted rather than assumed
 
-    assert await store.replay(mid) == 0
+    assert await store.replay(mid, audit=no_operator_audit) == 0
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.FILTERED.value
@@ -256,7 +257,7 @@ async def test_replay_of_a_message_with_no_queue_rows_changes_nothing(store: Mes
 
     # Control: a message that DOES have a row still replays, so the zero above is about this input.
     other = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB_A", "p")])
-    assert await store.replay(other) == 1
+    assert await store.replay(other, audit=no_operator_audit) == 1
     assert "replayed" in [e["event"] for e in await store.events_for(other)]
 
 
@@ -980,7 +981,8 @@ async def test_dead_letter_missing_inbounds_ingress_orphan_replays(store: Messag
     assert await store.dead_letter_missing_inbounds(set()) == 1
     assert await _claim_ingress(store, "in_a") is None  # a dead row is not claimable
 
-    assert await store.replay(mid) == 1  # the inbound is back; the operator replays
+    # the inbound is back; the operator replays
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     item = await _claim_ingress(store, "in_a")
     assert item is not None and item.message_id == mid and item.payload == RAW
     await store.route_handoff(
@@ -1006,7 +1008,7 @@ async def test_dead_letter_missing_inbounds_routed_orphan_replays(store: Message
     assert await store.dead_letter_missing_inbounds(set()) == 1
     assert await _claim_routed(store, "in_b") is None
 
-    assert await store.replay(mid) == 1
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     item = await _claim_routed(store, "in_b")
     assert item is not None and item.stage == Stage.ROUTED.value
     assert item.handler_name == "h" and item.payload == RAW
@@ -1038,7 +1040,8 @@ async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
 
-    assert await store.replay(mid) == 1  # only the dead routed row re-pended
+    # only the dead routed row re-pended
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     # The delivered outbound row stays DONE (not re-pended → not re-delivered).
     ob = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid)}
     assert ob == {"OB_A": OutboxStatus.DONE.value}
@@ -1228,7 +1231,7 @@ async def test_replay_of_ingress_dead_message_requeues_at_ingress(store: Message
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
-    assert await store.replay(mid) == 1
+    assert await store.replay(mid, audit=no_operator_audit) == 1
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.RECEIVED.value
@@ -1244,7 +1247,8 @@ async def test_replay_dead_ignores_ingress_rows(store: MessageStore) -> None:
     assert (
         await store.count_dead(allowed_channels=None) == 0
     )  # the dead ingress row is not in the DLQ view
-    assert await store.replay_dead() == 0  # ...and bulk replay leaves it alone
+    # ...and bulk replay leaves it alone
+    assert await store.replay_dead(audit=no_operator_audit) == 0
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value

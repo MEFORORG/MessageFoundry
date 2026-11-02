@@ -20,6 +20,9 @@ first: the planted secret is in ``str(exc)``. Each arm must then render it throu
 ``_ARMS`` holds at least the operator commands vault BACKLOG #2760 moved onto the renderer and
 the ones that already used it, except ``serve`` and ``supervise``, which start the engine. A new
 CLI arm that loads the whole settings file belongs in it.
+
+The URL refusal cases (vault BACKLOG #2850) go at the models instead of through an arm. Every arm
+prints a validator's message as written, so a message that quotes nothing is what they rest on.
 """
 
 from __future__ import annotations
@@ -30,11 +33,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from messagefoundry.__main__ import main
 from messagefoundry.config import security_edit
 from messagefoundry.config import settings as settings_module
+from messagefoundry.config.settings import BackupSettings, DrSettings
+from tests.test_settings_errors_echo_no_input import _renderings
 
 #: Synthetic, never a real credential, and deliberately low-entropy so the secret scanner does not
 #: read it as one (no allowlist entry needed). Short, so pydantic's middle abbreviation of a long
@@ -292,6 +297,82 @@ def test_a_json_caller_still_gets_a_json_error(
     assert code != 0
     error = str(json.loads(out)["error"])
     assert _CANARY not in error and _MESSAGE in error
+
+
+#: The path settings held to a refusal that quotes nothing: (model, field). Vault BACKLOG #2850.
+_PATH_FIELDS: list[tuple[type[BaseModel], str]] = [
+    (BackupSettings, "destination"),
+    (DrSettings, "seed_archive"),
+    (DrSettings, "seed_dir"),
+    (DrSettings, "restore_token"),
+]
+_each_path_field = pytest.mark.parametrize(
+    ("model", "field"), _PATH_FIELDS, ids=[field for _, field in _PATH_FIELDS]
+)
+
+#: Each value the URL refusal takes, with the canary where a URL can hold it. The last two put it in
+#: front of ``://``, where the refusal's detector matches it as a scheme, lowered: a test that plants
+#: it only in the userinfo or the query cannot tell quoting the scheme from quoting nothing.
+_CREDENTIAL_URLS = {
+    "userinfo": f"s3://key:{_CANARY}@bucket/x",
+    "signed-query": f"https://acct.blob.example/c?sig={_CANARY}",
+    "scheme-past-the-old-fixed-list": f"sftp://user:{_CANARY}@host/seed?sig={_CANARY}",
+    "before-the-separator": f"{_CANARY}://u@h",
+    "before-the-separator-upper-case": f"{_CANARY.upper()}://u@h",
+}
+
+
+def _refused(model: type[BaseModel], field: str, value: str) -> ValidationError:
+    """The refusal of ``value`` in ``field``, at the model, past ``load_settings`` and the CLI."""
+    with pytest.raises(ValidationError) as caught:
+        model(**{field: value})
+    return caught.value
+
+
+def _assert_quotes_no_canary(exc: ValidationError, field: str, expected: str) -> None:
+    """``expected`` is the refusal that fired, the only one, on ``field``: a case that stopped at
+    another validator proves nothing about this one. Then the canary is on no surface, compared
+    lower-cased because the detector lowers what it matches."""
+    errors = exc.errors()
+    assert [err["loc"] for err in errors] == [(field,)]
+    assert expected in errors[0]["msg"], errors
+    assert expected in settings_module.settings_error_detail(exc)
+    for text in _renderings(exc):
+        assert _CANARY not in text.lower(), text
+
+
+@_each_path_field
+@pytest.mark.parametrize("value", _CREDENTIAL_URLS.values(), ids=_CREDENTIAL_URLS)
+def test_a_url_refusal_quotes_no_part_of_the_value(
+    model: type[BaseModel], field: str, value: str
+) -> None:
+    """Vault BACKLOG #2850. ``settings_error_detail`` prints a validator's message as written, so a
+    refusal names the setting and the value is in none of the message, ``str(exc)`` or
+    ``exc.errors()``."""
+    _assert_quotes_no_canary(
+        _refused(model, field, value), field, f".{field} must be a LOCAL or UNC path, not a URL"
+    )
+
+
+@_each_path_field
+def test_a_url_refusal_is_the_same_text_whatever_the_url(
+    model: type[BaseModel], field: str
+) -> None:
+    """The canary is one token. One fixed message per field holds the refusal to quoting nothing of
+    any value, whatever part of it a later edit would pick."""
+    details = {
+        settings_module.settings_error_detail(_refused(model, field, value))
+        for value in _CREDENTIAL_URLS.values()
+    }
+    assert len(details) == 1, details
+
+
+def test_a_seed_dir_refused_as_not_absolute_quotes_no_part_of_the_value() -> None:
+    """``seed_dir``'s second refusal. A value with no ``://`` passes the URL refusal and reaches
+    ``_seed_dir_absolute``. No one-letter scheme here: ``os.path.isabs`` reads that as a Windows
+    drive path, so the value would load."""
+    exc = _refused(DrSettings, "seed_dir", f"user:{_CANARY}@host/seed")
+    _assert_quotes_no_canary(exc, "seed_dir", "[dr].seed_dir must be an absolute path, or omitted")
 
 
 @pytest.mark.parametrize("existed", [True, False], ids=["file-existed", "file-created"])

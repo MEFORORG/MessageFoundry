@@ -27,12 +27,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ConnectorType, ContentType, RetryPolicy
+from messagefoundry.config.models import (
+    BatchConfig,
+    ConnectorType,
+    ContentType,
+    InternalErrorPolicy,
+    RetryPolicy,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -50,9 +58,9 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 
 DEST = "OB_EPIC"
 DEST2 = "OB_EPIC_2"
@@ -305,6 +313,144 @@ async def test_delivery_item_retry_rehydrates_identically(store: MessageStore) -
     assert _obx5_5(col.deliveries[0]) == b64  # retry delivered the identical verbatim frame
 
 
+async def _store_doc_with_a_cr(store: MessageStore, line_end: str = "\r") -> str:
+    """A stored document holding a real CR (or ``line_end``). No payload can leave one since vault
+    BACKLOG #2809 (the detach refuses an escape, and a raw LF ends the segment), so this stands in
+    for store corruption or an engine bug. ``Message.set`` refuses it at every re-attach."""
+    b64 = _big_b64(600)
+    return await _store_doc(store, b64[:100] + line_end + b64[100:])
+
+
+def _with_a_bad_msh2(hl7: str) -> str:
+    """``hl7`` with an MSH-2 too short to name its separators: a payload-caused re-attach failure."""
+    return hl7.replace("|^~\\&|", "|^~\\|", 1)
+
+
+def _without_an_msh(hl7: str) -> str:
+    """``hl7`` with its MSH segment dropped, so it does not parse as HL7: a payload-caused failure."""
+    return hl7.split("\r", 1)[1]
+
+
+async def _outbox_rows(store: MessageStore, message_id: str) -> list[tuple[str, str]]:
+    return [(str(r["status"]), str(r["last_error"])) for r in await store.outbox_for(message_id)]
+
+
+@pytest.mark.parametrize("breaks", [_without_an_msh, _with_a_bad_msh2], ids=["no-parse", "msh2"])
+async def test_hydrate_a_reattach_the_payload_breaks_is_a_permanent_refusal(
+    store: MessageStore, breaks: Callable[[str], str]
+) -> None:
+    # Vault BACKLOG #2809 step 2: the same payload fails the same way on every attempt, so it must not
+    # be the retryable DeliveryError, nor escape as a bare ValueError to the internal-error arm.
+    ref = await _store_doc(store, _big_b64(600))
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    with pytest.raises(NegativeAckError) as ei:
+        await runner._hydrate_payload(breaks(_hl7_with_value(make_doc_ref(ref, "application/pdf"))))
+    assert ei.value.permanent is True
+    assert ei.value.code == "reattach"
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+@pytest.mark.parametrize("line_end", ["\r", "\n"], ids=["cr", "lf"])
+async def test_hydrate_a_stored_cr_or_lf_is_an_internal_error_not_a_refusal(
+    store: MessageStore, line_end: str
+) -> None:
+    # Vault BACKLOG #2809, the Lander's hold of 2026-11-01: a stored CR or LF is not the payload's, so
+    # it is neither the permanent refusal nor the retryable DeliveryError, but a plain ValueError
+    # for the outbound's internal-error policy.
+    ref = await _store_doc_with_a_cr(store, line_end)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    with pytest.raises(ValueError) as ei:
+        await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    assert type(ei.value) is ValueError
+    assert "occurrence 1 holds a CR or LF" in str(ei.value)
+
+
+async def test_a_non_hl7_payload_carrying_a_real_handle_is_never_delivered(
+    store: MessageStore,
+) -> None:
+    # ADR 0105: a handle never reaches the wire. A Handler can copy a real handle into a JSON body,
+    # which the re-attach cannot read, so the row must fail closed rather than deliver the handle
+    # unhydrated and be marked DONE (vault BACKLOG #2809).
+    ref = await _store_doc(store, _big_b64(600))
+    payload = '{"note": "' + make_doc_ref(ref, "application/pdf") + '"}'
+    await store.enqueue_message(
+        channel_id="c1", raw=payload, deliveries=[(DEST, payload)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+
+    with pytest.raises((NegativeAckError, DeliveryError)):
+        await runner._hydrate_payload(payload)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    await runner._process_delivery_item(DEST, item)
+
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DONE.value, 0) == 0
+
+
+@pytest.mark.parametrize("breaks", [_without_an_msh, _with_a_bad_msh2], ids=["no-parse", "msh2"])
+async def test_a_reattach_the_payload_breaks_dead_letters_the_row(
+    store: MessageStore, breaks: Callable[[str], str]
+) -> None:
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = breaks(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    mid = await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    # Under STOP the internal-error arm would halt the whole lane on this one message, which is how
+    # the pre-fix code handled it. A permanent refusal never reaches that arm.
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, retry_until = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is not _ItemOutcome.STOPPED
+    assert retry_until is None  # not re-pended for a retry that could never succeed
+    assert col.deliveries == []
+    ((status, last_error),) = await _outbox_rows(store, mid)
+    assert status == OutboxStatus.DEAD.value
+    # The permanent refusal, not the internal-error arm.
+    assert last_error.startswith("NegativeAckError: document re-attach failed:")
+
+
+@pytest.mark.parametrize("policy", [InternalErrorPolicy.STOP, InternalErrorPolicy.CONTINUE])
+async def test_a_stored_cr_takes_the_outbound_internal_error_policy(
+    store: MessageStore, policy: InternalErrorPolicy
+) -> None:
+    # Vault BACKLOG #2809, the Lander's hold of 2026-11-01: a stored CR or LF is store corruption or
+    # an engine bug, which is what STOP exists for, so STOP stops the lane and keeps the row, and the
+    # default CONTINUE dead-letters it on the internal-error arm.
+    ref = await _store_doc_with_a_cr(store)
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    mid = await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._internal_error[DEST] = policy
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, _ = await runner._process_delivery_item(DEST, item)
+
+    assert col.deliveries == []
+    ((status, last_error),) = await _outbox_rows(store, mid)
+    if policy is InternalErrorPolicy.STOP:
+        assert outcome is _ItemOutcome.STOPPED
+        assert status == OutboxStatus.PENDING.value  # kept for the operator, not dead-lettered
+    else:
+        assert outcome is not _ItemOutcome.STOPPED
+        assert status == OutboxStatus.DEAD.value
+        assert last_error.startswith("internal error: ValueError")  # the internal-error arm
+
+
 # --- batch path -----------------------------------------------------------------------------------
 
 
@@ -332,6 +478,186 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
     assert len(col.deliveries) == 1  # one BHS…BTS envelope
     members = split_batch(col.deliveries[0])
     assert [Message.parse(m).field("OBX-5.5") for m in members] == [a, b]  # both hydrated verbatim
+
+
+class _FramingCollector(_Collector):
+    """A collector that frames (defines ``check_frame``), so the batch takes the framing branch,
+    where re-attach refusals join the frame split's. It refuses nothing, and counts its checks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.checked = 0
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        self.checked += 1
+
+
+@pytest.mark.parametrize("framing", [False, True], ids=["no-frame", "frame"])
+async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, framing: bool
+) -> None:
+    # Vault BACKLOG #2809: the permanent re-attach refusal is the one member's, as a frame refusal
+    # is, so its healthy sibling still goes out in the envelope, on both branches of the batch.
+    from messagefoundry.parsing.split import split_batch
+
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    a = _big_b64(600)
+    ref_a, ref_bad = await _store_doc(store, a), await _store_doc(store, _big_b64(700))
+    sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
+    sk_bad = _with_a_bad_msh2(_hl7_with_value(make_doc_ref(ref_bad, "application/pdf")))
+    await store.enqueue_message(channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=100.0)
+    await store.enqueue_message(channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0)
+
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _FramingCollector() if framing else _Collector()
+    runner._destinations[DEST] = col
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert len(col.deliveries) == 1
+    assert [Message.parse(m).field("OBX-5.5") for m in split_batch(col.deliveries[0])] == [a]
+    if isinstance(col, _FramingCollector):
+        assert col.checked == 1  # only the survivor reached the frame split
+    stats = await store.stats()
+    assert stats.get(OutboxStatus.DEAD.value, 0) == 1
+    assert stats.get(OutboxStatus.DONE.value, 0) == 1
+    # The member's line names the re-attach as its reason, never a frame check that did not run.
+    (line,) = [r.getMessage() for r in caplog.records if "dead-lettered alone" in r.getMessage()]
+    assert "its document cannot be re-attached" in line and "code 'reattach'" in line
+    assert "frame" not in line
+
+
+def _engine_value_error(*_args: object, **_kwargs: object) -> str:
+    """Stands in for an engine bug in the re-attach: a ``ValueError`` the payload did not cause."""
+    raise ValueError("engine bug in the re-attach")
+
+
+async def test_an_engine_value_error_in_the_reattach_still_stops_a_stop_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #2809: only the failures the payload causes are permanent refusals. Any other
+    # ValueError is a possible engine fault, so it reaches the internal-error policy, and STOP stops
+    # the lane, as before the permanent refusal existed. Never dead-letters it row by row.
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+    monkeypatch.setattr(Message, "encode", _engine_value_error)
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, _ = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
+async def test_a_parser_fault_in_the_reattach_still_stops_a_stop_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # parse_or_refuse turns a parser fault into an HL7PeekError; the re-attach must not read that one
+    # as the payload's and dead-letter it (vault BACKLOG #2809).
+    from messagefoundry.parsing import _builtin_hl7
+
+    def _faulting_parse(*_args: object, **_kwargs: object) -> object:
+        raise IndexError("parser bug")
+
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    runner._destinations[DEST] = _Collector()
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+    monkeypatch.setattr(_builtin_hl7, "parse", _faulting_parse)
+
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    outcome, _ = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
+async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The batch twin: a member whose re-attach raises an engine ValueError is not refused alone; the
+    # whole batch takes the internal-error policy, and STOP stops the lane (vault BACKLOG #2809).
+    ref = await _store_doc(store, _big_b64(600))
+    skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
+    await store.enqueue_message(
+        channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+    runner._internal_error[DEST] = InternalErrorPolicy.STOP
+    monkeypatch.setattr(Message, "encode", _engine_value_error)
+
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert col.deliveries == []
+    assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
+@pytest.mark.parametrize("policy", [InternalErrorPolicy.STOP, InternalErrorPolicy.CONTINUE])
+async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_policy(
+    store: MessageStore, policy: InternalErrorPolicy
+) -> None:
+    # The batch twin of the stored-CR case (vault BACKLOG #2809): not the member's own refusal, so
+    # the whole batch takes the internal-error policy, sibling included. STOP stops the lane and
+    # re-pends both; CONTINUE dead-letters both on the internal-error arm (ADR 0105, Phase 1b).
+    a = _big_b64(600)
+    ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
+    sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
+    sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
+    mid_bad = await store.enqueue_message(
+        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=100.0
+    )
+    mid_a = await store.enqueue_message(
+        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0
+    )
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    col = _Collector()
+    runner._destinations[DEST] = col
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+    runner._internal_error[DEST] = policy
+
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+
+    assert col.deliveries == []
+    rows = await _outbox_rows(store, mid_bad) + await _outbox_rows(store, mid_a)
+    assert len(rows) == 2
+    if policy is InternalErrorPolicy.STOP:
+        assert outcome is _ItemOutcome.STOPPED
+        assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 2
+    else:
+        assert outcome is not _ItemOutcome.STOPPED
+        assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
+        assert all(err.startswith("internal error: ValueError") for _, err in rows)
 
 
 # --- end-to-end Shape A: doc present at ingress → detach → pass-through → delivery hydrates --------

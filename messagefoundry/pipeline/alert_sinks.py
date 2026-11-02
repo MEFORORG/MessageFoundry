@@ -454,6 +454,7 @@ def _refuse_webhook_revocation(
         ways_across=_WEBHOOK_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink, not a connection
+        declaration="[alerts].webhook_tls_revocation_attested",
     ).enforce_construction()
 
 
@@ -537,6 +538,7 @@ def _refuse_alert_smtp_revocation(
         ways_across=_ALERT_SMTP_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink and the security notifier, not a connection
+        declaration="[alerts].email_tls_revocation_attested",
     ).enforce_construction()
 
 
@@ -1168,8 +1170,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
-        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
+    def connection_error(
+        self,
+        name: str,
+        *,
+        kind: str,
+        detail: str | None = None,
+        error_class: str | None = None,
+    ) -> None:
+        # #46: an outbound lane went down. error_class is not sent: the event is unchanged. The shared _emit throttle keys on (type, connection), so a
         # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
         self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
 
@@ -1680,6 +1689,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # event type, so each detector routes and throttles on its own; the subject stands in for
         # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
         self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
+    def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
+        # BACKLOG #2614: the first start on a restored store revoked every session. The subject
+        # stands in for "connection". `last_audit_at` rides whole because the reason column
+        # redacts a date; both are times, an age and a count, never a row's content.
+        self._emit(
+            {
+                "type": "store_restored",
+                "connection": name,
+                "detail": detail,
+                "last_audit_at": last_audit_at,
+            }
+        )
 
     def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
         # vault BACKLOG #2742: the remote-debugging guard refused injected scripts.

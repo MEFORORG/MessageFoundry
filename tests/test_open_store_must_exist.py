@@ -223,7 +223,7 @@ async def test_read_only_open_refuses_every_write(tmp_path: Path) -> None:
     try:
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             await store.record_connection_event(
-                connection="IB_TEST", transport="mllp", direction="inbound", kind="probe"
+                connection="IB_TEST", transport="mllp", direction="inbound", kind="established"
             )
     finally:
         await store.close()

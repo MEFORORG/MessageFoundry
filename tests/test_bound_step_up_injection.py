@@ -42,6 +42,7 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings, StoreSe
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore, ResendKeyConflict
 from tests._admin_account import create_local_user_chosen
+from tests._store_audit import no_operator_audit
 
 PW = "a-strong-test-passphrase"
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -321,7 +322,7 @@ async def test_prior_resend_answers_only_a_repeat_of_the_same_request(engine: En
     )
     assert await engine.store.get_resend_record("k-reingress") is None  # control: unused
     outcome = await engine.store.reingress(
-        origin_message_id=mid, raw=ADT, idempotency_key="k-reingress"
+        origin_message_id=mid, raw=ADT, idempotency_key="k-reingress", audit=no_operator_audit
     )
     record = await engine.store.get_resend_record("k-reingress")
     assert record is not None and record.message_id == mid
