@@ -2253,11 +2253,17 @@ class _NoDictOwner:
     pass
 
 
+#: The ``__dict__`` getset of a builtin type, which reads only that type's instances. From 3.15 the
+#: getset a plain Python class keeps under ``__dict__`` reads any object's instance dict, so another
+#: Python class's no longer raises.
+_FOREIGN_DICT: Any = types.FunctionType.__dict__["__dict__"]
+
+
 class _ForeignDictError(Exception):
-    """Its class puts another class's ``__dict__`` getset under ``__dict__``, so reading the
+    """Its class puts another type's ``__dict__`` getset under ``__dict__``, so reading the
     instance dict through it raises ``TypeError``, and the scan fails closed on it."""
 
-    __dict__ = _NoDictOwner.__dict__["__dict__"]
+    __dict__ = _FOREIGN_DICT
 
     def __str__(self) -> str:
         return "h"
@@ -2291,12 +2297,37 @@ def test_a_foreign_dict_reader_still_fails_closed_rather_than_rendering() -> Non
     assert codec_safe_str(error) == redaction._HOLDER_TEXT
 
 
+class _PythonClassDictPrintsVars(Exception):
+    """Another Python class's ``__dict__`` getset under ``__dict__``, and a ``__str__`` printing
+    ``vars(self)``. Through 3.14 the read raises; from 3.15 it reads this instance's own dict."""
+
+    __dict__ = _NoDictOwner.__dict__["__dict__"]
+
+    def __str__(self) -> str:
+        return f"ctx {vars(self)!r}"
+
+
+def test_a_python_class_dict_reader_never_prints_a_codec_error_whichever_way_it_reads() -> None:
+    error = _PythonClassDictPrintsVars("bad")
+    error.payload = _encode_error()  # type: ignore[attr-defined]  # stored by the generic setattr
+    try:
+        printed = str(error)
+    except TypeError:  # through 3.14: its own str() raises, and the scan must fail closed
+        pass
+    else:  # from 3.15 its own str() prints the codec error, character and all
+        assert any(spelling in printed for spelling in _CHAR_SPELLINGS)
+    for text in (redaction.safe_exc(error), codec_safe_str(error)):
+        assert redaction._HOLDER_TEXT in text
+        for spelling in _CHAR_SPELLINGS:
+            assert spelling not in text
+
+
 @dataclasses.dataclass
 class _ForeignDictData:
     """A dataclass whose ``__dict__`` reader is another class's, so reading it raises."""
 
     value: int = 0
-    __dict__ = _NoDictOwner.__dict__["__dict__"]
+    __dict__ = _FOREIGN_DICT
 
 
 def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed(
@@ -2310,6 +2341,8 @@ def test_an_unreadable_object_only_the_added_pass_reaches_fails_closed(
     inner.payload = data  # type: ignore[attr-defined]
     holder = _PrintsInnerCause("bad")
     holder.__cause__ = inner
+    with pytest.raises(TypeError):  # control: its own reader raises
+        vars(data)
     scan = redaction._Scan(holder, charged_root=True)
     assert scan.nodes[id(data)][1:] == (None, "TypeError")  # marked unreadable
     assert id(holder) in scan.holds

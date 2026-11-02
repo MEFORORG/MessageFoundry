@@ -325,17 +325,22 @@ def test_no_live_schema_read_calls_a_qualified_multi_argument_unnest() -> None:
 
     assert _QUALIFIED_MULTI_UNNEST.search("FROM pg_catalog.unnest($1::text[], $2::text[]) AS q")
     assert not _QUALIFIED_MULTI_UNNEST.search("FROM pg_catalog.unnest($1::text[]) AS t(name)")
+    # server_schema_verify defines no SQL today; it stays in the walk so a constant added there is
+    # scanned too.
     modules = (postgres, server_schema_verify)
     texts = [
         (module.__name__, value)
         for module in modules
-        for value in vars(module).values()
-        if isinstance(value, str)
+        for key, value in vars(module).items()
+        if isinstance(value, str) and not key.startswith("__")
     ]
-    for module in modules:
-        read = [name for name, _ in texts if name == module.__name__]
-        assert len(read) > 5, f"{module.__name__}: no SQL constants read"
-    assert len(texts) > 10  # positive control: the walk below sees both modules' constants
+    # Positive control: the walk reads the Postgres store's SQL. A module's dunder strings are not
+    # SQL and are left out, because counting them made the control hold on a module with no SQL
+    # constant at all, and the count then moved with the interpreter (3.15 stopped setting
+    # __cached__).
+    select = re.compile(r"\bSELECT\b", re.IGNORECASE)
+    queries = [t for name, t in texts if name == postgres.__name__ and select.search(t)]
+    assert len(queries) > 5, f"{postgres.__name__}: no SQL constants read"
     offenders = [f"{name}: {text}" for name, text in texts if _QUALIFIED_MULTI_UNNEST.search(text)]
     assert offenders == [], offenders
     assert "ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))" in (

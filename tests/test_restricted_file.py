@@ -385,9 +385,16 @@ def test_posix_raises_and_leaves_nothing_when_the_mode_does_not_read_back(
     real_fstat = os.fstat
 
     class _Broad:
+        """The real status with a broader mode. Every other field reads through: code outside the
+        one under test calls ``os.fstat`` while the patch is in place, and pytest 9.2's own capture
+        reads ``st_size`` from it."""
+
         def __init__(self, real: os.stat_result) -> None:
+            self._real = real
             self.st_mode = stat.S_IFREG | 0o644
-            self.st_uid = real.st_uid
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
 
     monkeypatch.setattr(os, "fstat", lambda fd: _Broad(real_fstat(fd)))
     with pytest.raises(RestrictedFileError, match="owner alone"):
