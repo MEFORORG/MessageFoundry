@@ -6564,9 +6564,11 @@ a later start. `GET /security/posture` reads the live graph, so read that for th
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The
 `alert_instance` reason then cuts the whole sentence at 200 characters. A name late in a long list
-is therefore missing, and `[security]` switches come ahead of `alerts.security_signals`. Measured
-with every false-by-default `[security]` boolean set: 309 characters of names came ahead of it, and
-the alert read 19 loosenings, ending in `...`, without it. With 116 characters of names ahead of it
+is therefore missing, and at least some `[security]` switches come ahead of
+`alerts.security_signals`, so the cut can reach it. In one measured list of that shape, with many
+`[security]` booleans and hop loosenings set, 309 characters of names came ahead of it, and the
+alert's list ended in `...` without it. How many entries a list holds depends on the environment.
+With 116 characters of names ahead of it
 the stored reason still named it, and with 145 it did not. The count always includes it. The start's
 `config_loaded` row holds the whole list, and so does `GET /security/posture`, which narrows only
 the per-connection entries for a channel-scoped reader. Read one of those when the alert's list is
