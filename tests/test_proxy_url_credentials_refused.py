@@ -650,6 +650,8 @@ def _refused_at_build(build: Callable[[], object]) -> None:
         build()
     text = str(raised.value)
     assert "holds a user and a password" in text
+    # An attested connection reads this too, and the pair rule refuses the acceptance beside it.
+    assert "in place of any tls_hop_attested, never beside it" in text
     assert "connection 'OB_REST'" in text or "connection 'OB'" in text
     _assert_names_no_credential(raised.value)
 

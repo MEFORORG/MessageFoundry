@@ -1043,8 +1043,8 @@ _PROXY_URL_CREDENTIAL_REFUSED = (
     "web-proxy URL credentials: the proxy_url, the connection's own or one inherited from "
     "[egress], holds a user and a password; refused, with no escape. No declaration lifts a "
     "credential written in a proxy URL. Take it out of the URL. To log in to the proxy, set "
-    "proxy_user and proxy_password: a proxy off this machine then also takes cleartext_accepted "
-    "with a cleartext_reason"
+    "proxy_user and proxy_password: a proxy off this machine then takes cleartext_accepted with a "
+    "cleartext_reason, in place of any tls_hop_attested, never beside it"
 )
 
 
@@ -2285,8 +2285,10 @@ def proxy_auth_handler_from_settings(
         cell=_PROXY_CLEARTEXT_CREDENTIAL_CELL,
         message=(
             f"sends a {credential} over cleartext http to {proxy_host!r}; unlike the "
-            "destination's own credentials, this leg can be declared with cleartext_accepted and "
-            "a cleartext_reason; tls_hop_attested does not admit it"
+            "destination's own credentials, this leg can be declared not secure with "
+            "cleartext_accepted and a cleartext_reason, in place of any tls_hop_attested, never "
+            "beside it; tls_hop_attested does not admit it, and a leg held secure by a tunnel has "
+            "no route off this machine"
         ),
         attested=False,
         cleartext_accepted=cleartext_accepted,

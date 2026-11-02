@@ -277,10 +277,21 @@ def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None
     directly built ``Destination`` or ``OutboundConnection`` meets. Before, both built and the
     acceptance admitted the proxy login. On a cleartext body hop the disposition reads the
     attestation first, so that hop would cross with no acceptance record (decision
-    d20261031T213402506-5d928c keeps ``cleartext_accepted`` as the proxy route and gives
+    d20261101T062731002-a2d0f9 keeps ``cleartext_accepted`` as the proxy route and gives
     ``tls_hop_attested`` none). The refusal is the model's, so the target does not matter."""
     with pytest.raises(ValueError, match="opposite claims"):
         _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
+
+
+def test_the_proxy_login_refusal_does_not_steer_an_attested_connection_to_the_pair() -> None:
+    """An attested connection meets this refusal, so "add ``cleartext_accepted``" would send it into
+    the pair rule above. The text offers the acceptance only in place of the attestation, and says
+    a leg held secure by a tunnel has no route (decision d20261101T062731002-a2d0f9)."""
+    with pytest.raises(InsecureHopRefused) as refused:
+        _rest(_HTTPS_TARGET, attested=True, **_PROXY_LOGIN)
+    text = str(refused.value)
+    assert "in place of any tls_hop_attested, never beside it" in text
+    assert "held secure by a tunnel has no route off this machine" in text
 
 
 _FTP_ATTESTED: dict[str, Any] = {

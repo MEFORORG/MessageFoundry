@@ -1639,11 +1639,13 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
   turns that WARN back into a refusal.
 - **`tls_hop_attested` does not admit a proxy credential.** It keeps its other uses. A connection
   cannot hold it and `cleartext_accepted` together ([the pair rule](#attesting-a-hop-secure-tls_hop_attested)),
-  so an attested connection has no route to a `proxy_user` login on a proxy off this machine. Decision
-  d20261031T213402506-5d928c, taken under the owner's delegation of 2026-10-31, keeps it so: the
-  owner's 2026-10-05 ruling declined an unconditional refusal, and B462-R2 keeps `proxy_url` plus
-  `proxy_user`, so `cleartext_accepted` stays the declared route even at a site whose proxy leg
-  runs through a tunnel. A site that declares the tunnel with `tls_hop_attested` gets no route.
+  so an attested connection has no route to a `proxy_user` login on a proxy off this machine.
+  **A site holding its proxy leg secure by a tunnel has no sanctioned off-box route.**
+  `cleartext_accepted` says the hop is not secure, so declaring it for that hop misstates the hop,
+  and the engine cannot detect or stop that. A proxy on this machine still crosses, under B462-R2.
+  Decision d20261101T062731002-a2d0f9, taken under the owner's delegation of 2026-11-01, sets this
+  rule: the engine cannot see a tunnel, so honouring one in code would mean refusing every off-box
+  proxy, which the owner's 2026-10-05 ruling declined.
 - **No declaration lifts a credential written in a URL or the environment.** A user and password
   in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build. That
   holds at every `[security].enforcement` setting and for a proxy on this machine, and
