@@ -2887,6 +2887,8 @@ _CONFIG_BASELINE_WINDOW = 50
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
 #: So does an inline or released reload's row written after a later reload moved
 #: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest.
+#: The mark means more than baseline: on a clean ``config_loaded`` row it also keeps an open
+#: ``posture_loosened`` from resolving. ``security_signals.py`` spells it too, and a test pins that.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.

@@ -38,7 +38,6 @@ from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.pipeline import security_signals
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
-from messagefoundry.pipeline.engine import CONFIG_BASELINE_UNCHECKED_KEY
 from messagefoundry.pipeline.security_signals import (
     _DIRECTORY_LOCKED_DETAIL,
     MAX_SUBJECT_ALERTS,
@@ -1342,8 +1341,9 @@ async def test_a_stop_resolve_needs_no_live_read() -> None:
     assert sink.restored == ["posture:start@node:h-1"]
 
 
-def test_the_unchecked_mark_is_spelled_as_the_engine_spells_it() -> None:
-    assert security_signals._BASELINE_UNCHECKED == CONFIG_BASELINE_UNCHECKED_KEY
+def test_the_unchecked_mark_is_spelled_as_the_api_writes_it() -> None:
+    """The detector reads the mark off a ``config_loaded`` row, which the API writes."""
+    assert security_signals._BASELINE_UNCHECKED == app_module._BASELINE_UNCHECKED
 
 
 def test_the_posture_subject_names_the_process_where_several_share_the_store() -> None:
