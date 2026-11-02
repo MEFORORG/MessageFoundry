@@ -269,8 +269,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals` and its counts,
-`[api].trusted_proxies`,
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
+`security_window_seconds`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
 `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
 `[alerts].email_tls_revocation_attested`, `[alerts].webhook_tls_revocation_attested` and
@@ -848,8 +848,12 @@ count is above `0` (vault BACKLOG #2613).
   cannot see. Raising it is acceptable for a listener that ordinary load holds at a connection
   cap, which the `security_peer_refusals` row of [CONFIGURATION.md](CONFIGURATION.md) describes.
   It is one setting for every inbound listener, so on every listener a larger value delays the
-  refusal alert, and suppresses it outright for any burst below the raised threshold. Each
-  listener counts its own refusals; the `[alerts]`
+  refusal alert, and suppresses it outright for any burst below the raised threshold. To quiet
+  one listener instead, add an `[[alerts.rules]]` row with `event_type = "peer_refused_burst"`,
+  `connection = "inbound:IB_BUSY"` and `mute = true`. The rule's glob is matched against the
+  alert's subject, so `connection = "IB_BUSY"` never matches `inbound:IB_BUSY`, and that rule
+  loads with no warning. Neither rule is named as a loosening. Each listener counts its own
+  refusals; the `[alerts]`
   table of [CONFIGURATION.md](CONFIGURATION.md) says when alerts share a subject.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 

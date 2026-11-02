@@ -6540,9 +6540,16 @@ count is above `0`, is named in `GET /security/posture` and in the start's `conf
 With the layer off, every detector stops but the posture one, so that start still raises
 `posture_loosened` naming the switch. A later start that records no loosening raises the
 `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
-process and pages nobody. An unpinned cluster node's identity changes on every start, so that
-node raises the inverse for its own alert as it shuts down instead. That alert can stay open after
-shutdown, at least after a hard kill or a resolve that did not land: resolve it by hand with
+process and pages nobody. A row marked `superseded` or `baseline_unchecked` raises no inverse,
+even with an empty list: the list is read off the graph the start's snapshot took, and a reload
+may have replaced that graph. A start whose baseline read failed, or that took no digest, carries
+the same mark and raises none either. The alert stays open until a later start's unmarked row
+lists none.
+An unpinned cluster node's identity changes on every start, so that node raises the inverse for
+its own alert as it shuts down instead. That alert can stay open after shutdown, at least after a
+hard kill or a resolve that did not land. An alert also stays open when no later start comes back
+under its identity, at least after an engine shard is removed from the config or a pinned
+`[cluster].node_id` changes. In each of these cases, resolve it by hand with
 `POST /alerts/{alert_id}/resolve` or in the web console's alert list, which goes through the same
 scope check, so both need an account that is not channel-scoped and holds `monitoring:diagnose`. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
 records its loosenings as unknown, such as one whose config snapshot could not be taken.

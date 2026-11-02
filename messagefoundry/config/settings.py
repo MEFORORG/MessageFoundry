@@ -9969,7 +9969,8 @@ def _reminder_loosenings(
     return out
 
 
-#: The security-signal counts ``security_loosenings`` names at 0, each with the detector it turns off.
+#: The security-signal counts ``security_loosenings`` names, at 0 or above the default, each with
+#: the detector it loosens.
 _SECURITY_SIGNAL_COUNTS: Final = (
     ("security_signin_failures", "signin_failure_burst", "refused sign-ins from one address"),
     ("security_denials", "access_denied_burst", "refused requests by one account"),
@@ -10480,7 +10481,8 @@ def security_loosenings(
     # #2006 (a): a silent weakening keeps the cell at partial. _reminder_loosenings says what each
     # entry covers.
     out.extend(_reminder_loosenings(cert_monitor, secret_rotation, alerts))
-    # Vault BACKLOG #2613: the security-signal layer off, or a detector at 0, is a loosening too.
+    # Vault BACKLOG #2613: the security-signal layer off, or with it on a count at 0 or above its
+    # default, or a shorter window while any count is above 0, is a loosening too.
     out.extend(_security_signal_loosenings(alerts))
     # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
     # reconcile against, so 0 is not a weaker choice, it is the only meaningful one.

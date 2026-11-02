@@ -35,8 +35,10 @@ from messagefoundry.config.settings import (
     _security_signal_loosenings,
 )
 from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.pipeline import security_signals
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.engine import CONFIG_BASELINE_UNCHECKED_KEY
 from messagefoundry.pipeline.security_signals import (
     _DIRECTORY_LOCKED_DETAIL,
     MAX_SUBJECT_ALERTS,
@@ -1127,6 +1129,70 @@ def test_a_clean_start_raises_posture_restored_and_a_loosened_or_unread_one_does
     _start(det, [])
     assert sink.restored == ["posture:start"]
     assert [s for s, _n, _c, _d in sink.signals] == ["posture_loosened"]
+
+
+def test_a_clean_listed_start_a_reload_superseded_does_not_restore_a_loosened_posture() -> None:
+    """A pinned node starts loosened and raises. Its next start's snapshot is clean, but a reload
+    onto a loosened graph lands before the row is written. The row lists nothing, because it reads
+    the snapshot, and the engine is still running loosened."""
+    sink = _PostureSink()
+    subject = "posture:start@node:pinned-1"
+    first = SecuritySignalDetector(sink, _thresholds(), identity=lambda: "node:pinned-1")
+    _start(first, ["cleartext_accepted"])
+    assert [n for _s, n, _c, _d in sink.signals] == [subject]
+    second = SecuritySignalDetector(sink, _thresholds(), identity=lambda: "node:pinned-1")
+    second.observe(
+        "config_loaded",
+        "system",
+        None,
+        None,
+        json.dumps({"loosenings": [], "superseded": True, "baseline_unchecked": True}),
+    )
+    assert sink.restored == []
+    # The control: the next plain clean start, on that same subject, does resolve it.
+    third = SecuritySignalDetector(sink, _thresholds(), identity=lambda: "node:pinned-1")
+    _start(third, [])
+    assert sink.restored == [subject]
+
+
+@pytest.mark.parametrize(
+    "marks",
+    [
+        pytest.param({"superseded": True}, id="superseded"),
+        pytest.param(
+            {
+                "baseline_unchecked": True,
+                "degraded": True,
+                "failed_steps": ["start_swap_check"],
+            },
+            id="start_swap_check",
+        ),
+        pytest.param({"baseline_unchecked": True, "comparison": "read_failed"}, id="read_failed"),
+        pytest.param(
+            {"baseline_unchecked": True, "comparison": "no_start_digest"}, id="no_start_digest"
+        ),
+    ],
+)
+def test_a_marked_clean_start_restores_nothing(marks: dict[str, Any]) -> None:
+    sink = _PostureSink()
+    det = SecuritySignalDetector(sink, _thresholds())
+    det.observe("config_loaded", "system", None, None, json.dumps({"loosenings": [], **marks}))
+    assert sink.restored == []
+    assert sink.signals == []
+
+
+def test_a_mark_that_is_not_set_still_lets_a_clean_start_restore() -> None:
+    """What a plain clean start's row may carry: a comparison, no marks, and a degraded baseline's
+    outcome, which is not an unchecked one."""
+    sink = _PostureSink()
+    det = SecuritySignalDetector(sink, _thresholds())
+    detail = {"loosenings": [], "comparison": "degraded_baseline", "changed": None}
+    det.observe("config_loaded", "system", None, None, json.dumps(detail))
+    assert sink.restored == ["posture:start"]
+
+
+def test_the_unchecked_mark_is_spelled_as_the_engine_spells_it() -> None:
+    assert security_signals._BASELINE_UNCHECKED == CONFIG_BASELINE_UNCHECKED_KEY
 
 
 def test_the_posture_subject_names_the_process_where_several_share_the_store() -> None:

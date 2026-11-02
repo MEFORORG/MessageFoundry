@@ -1973,7 +1973,8 @@ The layer has two more detectors with no threshold. `log_level_debug` fires when
 sets DEBUG, and when a production instance refuses that request. `posture_loosened` fires when a start
 records a non-empty loosenings list in its `config_loaded` audit row. A site that loosens on purpose
 pages on every start; suppress it with an `[[alerts.rules]]` row for `posture_loosened`, which keeps
-the instance on the alert list. A later start that records an empty list resolves it, through the
+the instance on the alert list. A later start that records an empty list, in a row marked neither
+`superseded` nor `baseline_unchecked`, resolves it, through the
 `posture_restored` inverse, which pages nobody and no rule can name. Its key carries `@node:<id>` or
 `@shard:<id>` where several engine processes share the store, so one process's clean start never
 resolves another's; an unpinned cluster node's id changes on every start, so that node raises the

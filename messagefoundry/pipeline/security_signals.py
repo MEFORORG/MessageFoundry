@@ -113,6 +113,13 @@ _DENIAL_ACTIONS: Final = frozenset(
 #: imported from
 #: ``auth/``; a test pins it to ``DIRECTORY_LOCKED_REFUSAL_DETAIL``.
 _DIRECTORY_LOCKED_DETAIL: Final = json.dumps({"provider": "ad", "reason": "locked"}, sort_keys=True)
+#: ``CONFIG_BASELINE_UNCHECKED_KEY``, spelled here so this module need not import the engine; a test
+#: pins the two together.
+_BASELINE_UNCHECKED: Final = "baseline_unchecked"
+#: The marks on a start's ``config_loaded`` row that keep an empty loosenings list from resolving an
+#: open ``posture_loosened``. The list is read off the graph the start's snapshot took, so a reload
+#: that swapped the graph first leaves it empty while a loosened graph runs.
+_NOT_RESTORING_MARKS: Final = ("superseded", _BASELINE_UNCHECKED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,7 +433,8 @@ class SecuritySignalDetector:
             self._raise(LOG_LEVEL_DEBUG, "logging:debug", 1, f"{sentence} {actor or 'unknown'}")
 
     def _on_config_loaded(self, detail: str | None) -> None:
-        switches = _detail_of(detail).get("loosenings")
+        row = _detail_of(detail)
+        switches = row.get("loosenings")
         # None means the start could not read its list; that is no finding either way.
         if not isinstance(switches, list):
             return
@@ -437,7 +445,10 @@ class SecuritySignalDetector:
             identity = None
         subject = process_alert_subject("posture:start", identity)
         if not switches:
-            self._restore(subject)
+            # A marked row leaves the alert open, which the next unmarked clean start resolves. An
+            # unchecked mark from a failed baseline read saw no swap, and it waits all the same.
+            if not any(row.get(mark) for mark in _NOT_RESTORING_MARKS):
+                self._restore(subject)
             return
         names = _bounded(", ".join(str(s) for s in switches), _SWITCH_LIST_LIMIT)
         self._posture_raised = subject
