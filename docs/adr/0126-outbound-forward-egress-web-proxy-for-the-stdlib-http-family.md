@@ -81,7 +81,8 @@ proxy hop** is refused **regardless of the destination scheme** (an `https` dest
 authority (`refuse_cleartext_credential_hop`, ADR 0092): a production-PHI cleartext proxy hop is REFUSED
 (the blunt global escape is inert for prod-PHI), a non-prod PHI hop is refused unless the clamped escape
 downgrades it to a loud WARN, and an on-box loopback (a local `cntlm`), per-hop-attested, or synthetic
-proxy hop is allowed. The message names only the proxy **host** — never the URL, scheme, or credential.
+proxy hop is allowed. [Corrected 2026-11-01: a per-hop attestation no longer admits a proxy
+credential; see Amendment G.] The message names only the proxy **host** — never the URL, scheme, or credential.
 
 **`[egress].allowed_http` gate scope — the proxy host is OUT of scope.** The fail-closed allowlist gates
 the **destination** host (where PHI is sent), which is unchanged. The forward proxy is an operator-chosen

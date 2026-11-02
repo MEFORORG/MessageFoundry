@@ -1646,10 +1646,11 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
   Decision d20261101T062731002-a2d0f9, taken under the owner's delegation of 2026-11-01, sets this
   rule: the engine cannot see a tunnel, so honouring one in code would mean refusing every off-box
   proxy, which the owner's 2026-10-05 ruling declined.
-- **No declaration lifts a credential written in a URL or the environment.** A user and password
-  in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build. That
-  holds at every `[security].enforcement` setting and for a proxy on this machine, and
-  `static_credential_accepted` does not lift it. A credential in `HTTP_PROXY`, `HTTPS_PROXY` or the
+- **No declaration lifts a credential written in a URL or the environment.** A user, a password or
+  both in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build.
+  That holds at every `[security].enforcement` setting and for a proxy on this machine, and
+  `static_credential_accepted` does not lift it. A userinfo with nothing in it (`http://@host`,
+  `http://:@host`) holds no credential and is not refused for one. A credential in `HTTP_PROXY`, `HTTPS_PROXY` or the
   system proxy settings meets the send-time rule above.
 - **The alert webhook, the OIDC legs and the AI broker have no setting for this.** The send-time
   rule above is all that judges an environment proxy credential on them.
@@ -3523,9 +3524,12 @@ verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
 Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
 over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,
-#3230). It does not admit a forward-proxy login either; `cleartext_accepted` does, as
+#3230). It does not admit a forward-proxy login either.
+[`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) does, in place of this
+attestation and never beside it, because it says the hop is not secure. So a hop you hold secure
+has no route to a login on a proxy off this machine, as
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
-says.
+says of the declarations.
 
 Set it on the declaration that owns the hop:
 

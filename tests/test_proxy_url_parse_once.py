@@ -103,7 +103,7 @@ def _open_through(settings: Mapping[str, Any]) -> bool:
                 connection="OB",
             )
         except ValueError as exc:
-            if "2965" not in str(exc) and "holds a user and a password" not in str(exc):
+            if "2965" not in str(exc) and "holds a user or a password" not in str(exc):
                 raise
             return False
     assert config is not None
@@ -235,19 +235,21 @@ def test_userinfo_is_kept_in_the_rebuilt_url() -> None:
     assert read_like_urllib(rebuilt)[1:] == read_like_urllib(proxy)[1:]
     with (
         active_hop_posture(HopPosture(enforcing=False)),
-        pytest.raises(ValueError, match="holds a user and a password"),
+        pytest.raises(ValueError, match="holds a user or a password"),
     ):
         proxy_config_from_settings({"proxy_url": proxy}, dest_scheme="http", connection="OB")
 
 
-def test_a_user_with_no_password_is_kept_in_the_url_the_connector_dials() -> None:
-    """A user alone sends nothing, so it builds, and the rebuilt URL keeps it as written."""
+def test_a_user_with_no_password_is_parsed_as_written_and_fails_the_build() -> None:
+    """The parse keeps a userinfo as written. A user alone sends no header, but it may be a token,
+    and it would stay in the URL dialled, so the build refuses it (vault BACKLOG #3007)."""
     proxy = f"http://us%40er@{LISTED}:3128"
-    with active_hop_posture(HopPosture(enforcing=False)):
-        config = proxy_config_from_settings(
-            {"proxy_url": proxy}, dest_scheme="http", connection="OB"
-        )
-    assert config is not None and dict(config.proxies)["http"] == proxy
+    assert parse_proxy_url(proxy).url == proxy
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        pytest.raises(ValueError, match="holds a user or a password"),
+    ):
+        proxy_config_from_settings({"proxy_url": proxy}, dest_scheme="http", connection="OB")
 
 
 @pytest.mark.parametrize(

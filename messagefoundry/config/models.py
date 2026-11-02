@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
 # Re-exported: the enum moved to a stdlib-only leaf so `parsing/` can use it without loading this
@@ -807,9 +808,12 @@ class WindowsCredential(BaseModel):
         return cls.model_validate(data)
 
 
-class Destination(BaseModel):
+class Destination(_InputHidingModel):
     """An outbound connector endpoint. Each outbound connection queues independently
-    so a slow/failed one never blocks the others."""
+    so a slow/failed one never blocks the others.
+
+    Input-hiding because ``settings`` holds resolved secrets, and a refusal from a validator here
+    carries the whole input on the error."""
 
     name: str
     type: ConnectorType

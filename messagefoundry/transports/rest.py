@@ -1041,7 +1041,7 @@ _PROXY_CLEARTEXT_CREDENTIAL_CELL = "web-proxy cleartext credentials"
 #: text, naming no part of the URL, because the part it is about is a password.
 _PROXY_URL_CREDENTIAL_REFUSED = (
     "web-proxy URL credentials: the proxy_url, the connection's own or one inherited from "
-    "[egress], holds a user and a password; refused, with no escape. No declaration lifts a "
+    "[egress], holds a user or a password; refused, with no escape. No declaration lifts a "
     "credential written in a proxy URL. Take it out of the URL. To log in to the proxy, set "
     "proxy_user and proxy_password: a proxy off this machine then takes cleartext_accepted with a "
     "cleartext_reason, in place of any tls_hop_attested, never beside it"
@@ -2438,7 +2438,13 @@ def proxy_config_from_settings(
     # Rebuilt from the one parse the allow-list gate also reads, so what is dialled is what was
     # judged (vault BACKLOG #2965). It refuses every value on which urlsplit and urllib read another
     # host, so the loopback test in the proxy_user guard below judges the host urllib dials.
-    proxy_url = parse_proxy_url(proxy_url).url
+    address = parse_proxy_url(proxy_url)
+    # Half a credential, which urllib sends no header for, so the check above and the send-time rule
+    # both pass it, and the secret would stay in the URL dialled (vault BACKLOG #3007). Asked after
+    # the parse, so a value with no userinfo of its own keeps the parse's refusal for its shape.
+    if address.holds_credential:
+        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{_PROXY_URL_CREDENTIAL_REFUSED}")
+    proxy_url = address.url
     auth_header, digest = proxy_auth_handler_from_settings(
         s,
         proxy_url=proxy_url,

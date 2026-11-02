@@ -649,7 +649,7 @@ def _refused_at_build(build: Callable[[], object]) -> None:
     with pytest.raises(InsecureHopRefused) as raised:
         build()
     text = str(raised.value)
-    assert "holds a user and a password" in text
+    assert "holds a user or a password" in text
     # An attested connection reads this too, and the pair rule refuses the acceptance beside it.
     assert "in place of any tls_hop_attested, never beside it" in text
     assert "connection 'OB_REST'" in text or "connection 'OB'" in text
@@ -669,6 +669,35 @@ def test_a_credential_in_proxy_url_fails_the_build(proxy_url: str) -> None:
     """Every spelling the transport would send, and a loopback proxy, which a ``proxy_user``
     credential may reach with no declaration and a URL credential may not."""
     _refused_at_build(lambda: _rest(proxy_url=proxy_url))
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize(
+    "userinfo",
+    [
+        pytest.param(f":{_PASSWORD}", id="a-password-with-no-user"),
+        pytest.param(_USER, id="a-token-written-as-the-user"),
+        pytest.param(f"{_USER}:", id="a-user-with-an-empty-password"),
+    ],
+)
+def test_half_a_credential_in_proxy_url_fails_the_build(scheme: str, userinfo: str) -> None:
+    """urllib sends no header for these, so the send-time rule never sees them, and the secret would
+    stay in the URL the connector dials. A credential in the URL is refused whatever urllib makes
+    of it."""
+    _refused_at_build(lambda: _rest(proxy_url=f"{scheme}://{userinfo}@{_PROXY_HOST}"))
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param(f"http://@{_PROXY_HOST}", id="an-empty-userinfo"),
+        pytest.param(f"http://:@{_PROXY_HOST}", id="an-empty-user-and-password"),
+    ],
+)
+def test_control_a_userinfo_with_nothing_in_it_still_builds(written: str) -> None:
+    """The control for the test above: this refusal is about a credential, so a userinfo that holds
+    none stays as it was."""
+    _rest(proxy_url=written)
 
 
 def test_a_password_that_ends_the_authority_for_urlsplit_is_read_as_urllib_reads_it() -> None:
@@ -727,7 +756,7 @@ def test_the_other_http_connectors_refuse_it_too(factory: Callable[[], Connectio
 
 
 def test_a_fhir_lookup_refuses_it_too() -> None:
-    with pytest.raises(InsecureHopRefused, match="holds a user and a password"):
+    with pytest.raises(InsecureHopRefused, match="holds a user or a password"):
         FhirLookupExecutor(
             {"epic": {"url": _HTTPS_TARGET, "proxy_url": _CREDENTIALED}},
             egress=permitting({"proxy_url": _CREDENTIALED}),
@@ -808,7 +837,6 @@ def test_a_well_formed_credentialed_proxy_url_passes_the_parse_and_still_fails_t
     "proxy_url",
     [
         pytest.param(f"http://{_PROXY_HOST}", id="no-userinfo"),
-        pytest.param(f"http://{_USER}@{_PROXY_HOST}", id="a-user-with-no-password-sends-nothing"),
         pytest.param("default", id="default"),
     ],
 )

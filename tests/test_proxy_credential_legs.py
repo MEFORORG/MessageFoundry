@@ -45,6 +45,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config.models import ConnectorType, Destination
@@ -281,6 +282,52 @@ def test_a_directly_built_destination_refuses_attested_beside_accepted() -> None
     ``tls_hop_attested`` none). The refusal is the model's, so the target does not matter."""
     with pytest.raises(ValueError, match="opposite claims"):
         _rest(_HTTPS_TARGET, accepted=True, attested=True, **_PROXY_LOGIN)
+
+
+_SECRET_MARK = "SYNTHETIC-SECRET-MARK"
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        pytest.param(
+            {"cleartext_accepted": True, "cleartext_reason": "r", "tls_hop_attested": True}
+            | {"tls_hop_attested_reason": "r"},
+            id="typed-pair",
+        ),
+        pytest.param(
+            {
+                "cleartext_accepted": True,
+                "cleartext_reason": "r",
+                "settings": {"tls_hop_attested": True, "tls_hop_attested_reason": "r"},
+            },
+            id="settings-pair",
+        ),
+        pytest.param({"settings": {"tls_hop_attested": True}}, id="settings-flag-no-reason"),
+        pytest.param(
+            {"settings": {"tls_hop_attested": True, "tls_hop_attested_reason": "a\nb"}},
+            id="settings-reason-control-character",
+        ),
+        pytest.param({"settings": {"tls_hop_attested": "yes"}}, id="settings-flag-not-a-bool"),
+        pytest.param({"tls_hop_attested": True}, id="typed-flag-no-reason"),
+        pytest.param({"cleartext_accepted": True}, id="acceptance-no-reason"),
+        pytest.param({"tls_revocation_attested": True}, id="revocation-no-reason"),
+    ],
+)
+def test_a_destination_refusal_echoes_no_secret_from_its_settings(
+    declarations: dict[str, Any],
+) -> None:
+    """A model validator's refusal carries the whole input as its ``input``, and every rendering of
+    the error shows it, so a caller that logs one would log the secret beside it. The refusal's own
+    words stay, so the fault can still be read."""
+    kwargs = dict(declarations)
+    settings = {**kwargs.pop("settings", {}), "basic_password": _SECRET_MARK}
+    with pytest.raises(ValidationError) as refused:
+        Destination(name="OB", type=ConnectorType.REST, **kwargs, settings=settings)
+    exc = refused.value
+    for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
+        assert _SECRET_MARK not in rendered
+    assert exc.errors()[0]["msg"].startswith("Value error, ")
 
 
 def test_the_proxy_login_refusal_does_not_steer_an_attested_connection_to_the_pair() -> None:
