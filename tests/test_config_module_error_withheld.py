@@ -1589,8 +1589,8 @@ def test_a_gate_refuses_a_module_that_exits(
 def test_a_rebuilt_refusal_names_its_module_in_its_text_and_a_logged_traceback(
     tmp_path: Path, body: str
 ) -> None:
-    # What a logged start failure prints, and the str() the flag route's 409 and the reload WARNING
-    # read. The rebuilt refusal's traceback starts in the loader, so only its text can say which.
+    # The refusal's str(), and what a logging formatter prints for it. The rebuilt refusal's
+    # traceback starts in the loader, so only its text can say which module failed.
     _write(tmp_path, "feed.py", f"from messagefoundry import Http\n\n{body}")
     err = _load_error(tmp_path)
     logged = logging.Formatter().formatException((type(err), err, err.__traceback__))
@@ -1636,6 +1636,12 @@ _K = "[KeyError text withheld]"
         ("value'tls'x", "'tls'", f"value{_K}x"),
         # Text equal to a whole identifier is withheld: the two cannot be told apart.
         ("inbound 'tls': bad", "tls", f"inbound '{_K}': bad"),
+        # Any character an identifier cannot hold, so it cannot be part of one: withheld, run in or not.
+        ("xp@ss word!w0rd", "p@ss word!w0rd", f"x{_K}"),
+        ("xp@ss word!w0rdy", "p@ss word!w0rd", f"x{_K}y"),
+        ("Http_one two_x", "one two", f"Http_{_K}_x"),
+        # Only identifier characters, however long: run into a token, it stays.
+        ("Http-planted7f3aplanted-x", "planted7f3aplanted", "Http-planted7f3aplanted-x"),
     ],
 )
 def test_a_quotation_is_withheld_alone_and_kept_inside_a_token(
@@ -1644,11 +1650,22 @@ def test_a_quotation_is_withheld_alone_and_kept_inside_a_token(
     assert wiring._withhold_quotations(text, {quotation: "KeyError"}) == expected
 
 
-def test_a_shorter_quotation_overlapping_a_longer_one_leaves_none_of_the_longer() -> None:
+def test_overlapping_quotations_become_one_marker_with_no_head_or_tail_left() -> None:
     quoted = {"the port": "KeyError", "port=planted": "ValueError"}
-    assert wiring._withhold_quotations("the port=planted", quoted) == (
-        "the [ValueError text withheld]"
+    assert wiring._withhold_quotations("say the port=planted.", quoted) == (
+        "say [ValueError text withheld]."
     )
+    quoted = {"SECRETport": "KeyError", "port=plantedxxxxx": "ValueError"}
+    assert wiring._withhold_quotations("SECRETport=plantedxxxxx", quoted) == (
+        "[ValueError text withheld]"
+    )
+
+
+def test_overlap_is_judged_as_one_span_against_the_token_rule() -> None:
+    # Neither piece could stand alone, and together they are the whole token.
+    quoted = {"abcdefgh": "KeyError", "efghijkl": "ValueError"}
+    assert wiring._withhold_quotations("abcdefghijkl", quoted) == "[KeyError text withheld]"
+    assert wiring._withhold_quotations("xabcdefghijkl", quoted) == "xabcdefghijkl"
 
 
 def test_a_setting_name_equal_to_a_handled_exceptions_text_is_withheld_as_the_cheaper_failure(

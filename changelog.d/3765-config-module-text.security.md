@@ -11,10 +11,13 @@
   refusal is rebuilt as a plain `WiringError`: every note and its whole chain go, engine links
   included, and an `ImportError` cause stays only as a textless stand-in. A refusal with a note on
   it, or on anything it wraps, is rebuilt the same way. A slice of the text, text copied before
-  the raise, or text run into a longer token by a letter, a digit, `_` or `-`, is not caught: that
-  last is what keeps an argument such as `tls` from rewriting the connection name `IB_tls`. Text equal
-  to a whole identifier or word of the refusal, such as a connection named `tls` or the setting
-  `source_ip_allowlist`, is replaced there too. In a config module, at least the `tls_ca_pin`, `intake_auth`,
+  the raise, or text of any length made only of letters, digits, `_` and `-` with another such
+  character touching it, is not caught: that last is what keeps an argument such as `tls` from
+  rewriting the connection name `IB_tls`. Text with any other character in it, such as `'tls'` with
+  its quotes or a value of several words, is replaced wherever it appears. So is text equal to a whole
+  identifier or word of the refusal, such as a connection named `tls` or the setting
+  `source_ip_allowlist`, which loses that identifier or word. Quotations that overlap become one
+  marker. In a config module, at least the `tls_ca_pin`, `intake_auth`,
   `intake_auth_health`, `reply_on_timeout`, `reply_on_empty`, `reply_content_type`,
   `source_ip_allowlist`, `content_type` and `ws_password_type` refusals, an `intake_client_subjects`
   subject and an issuer that is not a DN no longer quote the value. An issuer key that does parse as a

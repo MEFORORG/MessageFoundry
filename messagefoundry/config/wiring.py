@@ -9889,48 +9889,57 @@ def _keeps_engine_wording(exc: BaseException) -> bool:
     return any(type(exc) is limit for limit in _RUNTIME_LIMITS) and raised_only_by_the_engine(exc)
 
 
-def _splits_a_token(text: str, at: int, quotation: str) -> bool:
-    """Whether ``quotation``, found in ``text`` at ``at``, is part of a longer token rather than
-    standing alone: an edge of it that is an identifier character, against another one in ``text``."""
-    following = at + len(quotation)
-    before = at > 0 and _is_identifier_character(text[at - 1])
-    after = following < len(text) and _is_identifier_character(text[following])
-    return (before and _is_identifier_character(quotation[0])) or (
-        after and _is_identifier_character(quotation[-1])
+def _is_identifier_character(character: str) -> bool:
+    return character.isalnum() or character in "_-"
+
+
+def _is_part_of_a_token(text: str, at: int, following: int) -> bool:
+    """Whether ``text[at:following]`` is made only of identifier characters, with another one
+    touching it in ``text``. Text with any other character in it cannot be part of an identifier."""
+    if not all(map(_is_identifier_character, text[at:following])):
+        return False
+    return (at > 0 and _is_identifier_character(text[at - 1])) or (
+        following < len(text) and _is_identifier_character(text[following])
     )
 
 
-def _is_identifier_character(character: str) -> bool:
-    return character.isalnum() or character in "_-"
+def _occurrences(text: str, quotation: str) -> Iterator[int]:
+    at = text.find(quotation)
+    while at != -1:
+        yield at
+        at = text.find(quotation, at + 1)
 
 
 def _withhold_quotations(text: str, quoted: Mapping[str, str]) -> str:
     """``text`` with each key of ``quoted`` replaced by a marker naming its value, a type.
 
-    The spans are chosen before anything is written, so a quotation cannot match inside a marker. No
-    regular expression: these patterns are a config module's text. Longest first over the whole text,
-    so a repr goes before the str inside it, and a shorter quotation overlapping a longer one cannot
-    leave the longer one's tail printed. A quotation that is only part of a longer token stays, or an
-    argument such as ``tls`` would rewrite the connection name ``IB_tls``. Standing alone it is
+    Every occurrence is found in the original text, so a quotation cannot match inside a marker. No
+    regular expression: these patterns are a config module's text. Occurrences that overlap become
+    one span with one marker, naming the type of the longest, so neither the head nor the tail of
+    either prints. A span made only of identifier characters that another one touches stays, or an
+    argument such as ``tls`` would rewrite the connection name ``IB_tls``. Any other span is
     replaced, even where it equals an identifier or a word of the refusal: nothing here can tell a
     connection named ``tls`` from a quoted value, and the marker is the failure to prefer."""
-    taken = bytearray(len(text))
-    spans: list[tuple[int, int, str]] = []
-    for quotation in sorted(quoted, key=len, reverse=True):
-        at = text.find(quotation)
-        while at != -1:
-            following = at + len(quotation)
-            if any(taken[at:following]) or _splits_a_token(text, at, quotation):
-                at = text.find(quotation, at + 1)
-                continue
-            taken[at:following] = b"\x01" * len(quotation)
-            spans.append((at, following, quoted[quotation]))
-            at = text.find(quotation, following)
+    spans: list[tuple[int, int, str, int]] = []
+    for at, following, kind in sorted(
+        (at, at + len(quotation), kind)
+        for quotation, kind in quoted.items()
+        for at in _occurrences(text, quotation)
+    ):
+        length = following - at
+        if spans and at < spans[-1][1]:
+            first, last, widest_kind, widest = spans[-1]
+            if length > widest:
+                widest_kind, widest = kind, length
+            spans[-1] = (first, max(last, following), widest_kind, widest)
+        else:
+            spans.append((at, following, kind, length))
     pieces: list[str] = []
     written = 0
-    for at, following, kind in sorted(spans):
-        pieces += [text[written:at], f"[{kind} text withheld]"]
-        written = following
+    for at, following, kind, _widest in spans:
+        if not _is_part_of_a_token(text, at, following):
+            pieces += [text[written:at], f"[{kind} text withheld]"]
+            written = following
     pieces.append(text[written:])
     return "".join(pieces)
 
@@ -9949,7 +9958,8 @@ def _rewritten_refusal(exc: BaseException) -> str | None:
 
     A template of ours around somebody else's text is not ours: ``f"{where}: {exc}"`` prints what
     ``int()`` or a library said, and either can quote the value it was given. A quotation in any
-    other shape, such as a slice of that text or that text run into a longer token, is not caught.
+    other shape, such as a slice of that text, or that text run into a longer token when it is made
+    only of identifier characters, is not caught.
     So the raise sites that wrap are still the place to convert a failure. A short quotation can
     also take a word of the engine's prose with it, which is the cheaper failure."""
     links = list(exception_chain(exc))
@@ -9977,7 +9987,8 @@ def _refusal_for(
     value; tests/test_config_module_error_withheld.py sweeps the factories for one, and reaches no
     refusal that sits behind another. What it was raised from that the engine did not word can hold
     a value: the whole text of such an exception is taken out of the refusal, and the chain goes. A
-    slice of that text, a copy made before the raise, or that text run into a longer token, stays. Only an exact ``WiringError`` whose
+    slice of that text, a copy made before the raise, or that text run into a longer token when it
+    is made only of identifier characters, stays. Only an exact ``WiringError`` whose
     arguments are text stands as raised: a subclass can write what prints through more methods than
     one, and ``check`` formats a refusal with an f-string, so any other is rebuilt plain.
 
@@ -10147,8 +10158,8 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
                 # spells `credential_password=env(...)`. `_exec_module` has already withheld a
                 # module's own text (vault BACKLOG #3249) and the whole text of a foreign exception
                 # an engine refusal wraps (vault BACKLOG #3765 item 1). It cannot reach at least a
-                # slice of that text, that text run into a longer token, or a value a raise site
-                # interpolates.
+                # slice of that text, identifier-shaped text run into a longer token, or a value a
+                # raise site interpolates.
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
