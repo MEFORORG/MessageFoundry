@@ -3253,8 +3253,9 @@ class RetentionSettings(_Section):
     # message bodies until purged, the third covers orphaned reference snapshots only, the fourth the
     # File source's `.processed` copies) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
-    # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override
-    # that lets an instance run with unbounded (keep-forever) retention. Operators write it as
+    # days, so only an explicit 0 trips the gate. Setting this true is the explicit override that
+    # lets an instance run with unbounded (keep-forever) retention; docs/SECURITY-LOOSENING.md says
+    # what each dial records. Operators write it as
     # [security].allow_keeping_phi_indefinitely; the [retention] spelling is refused at load. Off by
     # default. No instance is exempt: every instance carries patient data since BACKLOG #1279
     # (ADR 0186). See messagefoundry/__main__.py.
@@ -7508,7 +7509,7 @@ class SecuritySettings(_Section):
     block_unlisted_outbound: bool = (
         True  # deny-by-default egress; only allow-listed destinations send
     )
-    delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely (audited)
+    delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely; see SECURITY-LOOSENING.md
     allow_keeping_phi_indefinitely: bool = False
     # Per-tier acknowledgements for the retention windows the engine never auto-bounds (owner ruling
     # R4 (b), 2026-09-24; ASVS 14.2.7; BACKLOG #1967). On an enforcing instance `serve` refuses to start
@@ -10230,9 +10231,10 @@ def security_loosenings(
     output, rather than reporting a subset as if it were everything.
 
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
-    view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
-    a deliberate opt-out gives up; the posture GATES (which still refuse a production-PHI weakening) are
-    unchanged.
+    view (``GET /security/posture``, AC-5), so the two share one wording. They read at different points
+    of the start, so they can name different switches: docs/SECURITY-LOOSENING.md's retention entry
+    gives the case. This is advisory only — it names what a deliberate opt-out gives up; the posture
+    GATES (which still refuse a production-PHI weakening) are unchanged.
 
     ``audit_all_authorization_decisions`` CHANGED SIDES, and the old sentence is quoted here rather than
     deleted so nobody re-derives it. It read: *"``audit_all_authorization_decisions=false`` is the
@@ -10246,7 +10248,7 @@ def security_loosenings(
             (
                 "enforcement",
                 "[security].enforcement = warn — posture weakenings (cleartext/verify-off "
-                "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED + audited "
+                "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored",
             )
@@ -10391,7 +10393,8 @@ def security_loosenings(
         out.append(
             (
                 "delete_message_bodies_after_days",
-                "message bodies are kept indefinitely (a PHI instance still auto-bounds/refuses per posture)",
+                "message bodies are kept indefinitely (enforcement = enforce refuses an explicit 0 "
+                "unless allow_keeping_phi_indefinitely is set)",
             )
         )
     if sec.allow_keeping_phi_indefinitely:

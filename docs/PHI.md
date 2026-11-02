@@ -2118,8 +2118,11 @@ still default to `0`, but `serve` applies a posture gate on top of them:
   neither **refuses to start (exit code 2)**. Under `warn` it warns. A start under an acknowledgement
   writes a WARNING-level `AUDIT:` line naming the tier. For transform state the acknowledgement is the
   safe answer, not a window, until state has an eviction key that a read moves (#1188).
-- The explicit, **audited** opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
-  suppresses the auto-bound **and** downgrades the refusal to a loud audited warning.
+- The explicit opt-out is `[security].allow_keeping_phi_indefinitely = true`, which suppresses the
+  auto-bound **and**, under `enforce`, downgrades the refusal to a loud audited warning. Under `warn`
+  the gate writes no `AUDIT:` line for an auto-bounded window at `0`, with the switch or without it.
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--true--unbounded-phi-retention)
+  says what each record shows then.
 - A connection's own override of `0` (`messages_days` on an inbound, `dead_letter_days` on an
   outbound) meets its own gate when `serve` loads the graph. That gate is described under
   *Per-connection overrides* in [CONFIGURATION.md](CONFIGURATION.md#retention).
