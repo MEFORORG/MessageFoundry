@@ -12,7 +12,6 @@ import re
 import shutil
 import subprocess
 import sys
-import sysconfig
 import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -1202,27 +1201,32 @@ _TRAY_START_LOADS = frozenset({"messagefoundry", "messagefoundry.childenv", "mes
 # omits at least the modules a POSIX `make install` GENERATES into that directory. On 3.15 `traceback`
 # imports one of them, `_missing_stdlib_info`, so the probe charged it to the tray and went red on the
 # 3.15 canary's Linux leg (run 40504909930). The Windows build measured here ships no such file. Only
-# a top-level module whose file's directory resolves to sysconfig's `stdlib` directory counts, and
-# installers put packages in site-packages below it or in a venv's own `Lib`, so an installed
-# third-party module does not qualify. A file someone writes straight into the stdlib directory would.
-#
-# The directory is computed HERE and embedded as a literal: the child is the same interpreter
-# (`sys.executable`), and importing `sysconfig` in the child before the snapshot would hide whatever
-# it loads from the leaves' count.
-_STDLIB_DIR = os.path.normcase(os.path.realpath(sysconfig.get_path("stdlib")))
+# a top-level module whose file's directory resolves EXACTLY to the directory `os.py` was loaded from
+# counts. Installers put packages in site-packages below it or in a venv's own `Lib`, so an installed
+# third-party module does not qualify; a file someone writes straight into that directory would.
+# `os` is read in the child, where it is already loaded before the snapshot, so the filter adds no
+# import to the count, and it names the directory the running interpreter really uses, which on a
+# source-tree build is not sysconfig's install path.
+_CHILD_STDLIB_DIR = "os.path.dirname(os.__file__)"
 
 
 def _tray_leaf_probe(
-    plant: str = "", *, path_head: Path | None = None
+    plant: str = "", *, path_head: Path | None = None, stdlib_dir: Path | None = None
 ) -> tuple[set[str], set[str]]:
     """The `messagefoundry` modules, and the top-level modules outside the standard library, that a
-    fresh interpreter loads importing `_TRAY_START_LEAVES`. `plant` runs first, as a control."""
+    fresh interpreter loads importing `_TRAY_START_LEAVES`. `plant` runs first, as a control.
+
+    `stdlib_dir` replaces the directory the filter admits, so a control can test the filter against
+    a directory it owns."""
+    where = repr(str(stdlib_dir)) if stdlib_dir is not None else _CHILD_STDLIB_DIR
     code = (
         "import json, os, sys\n"
+        "def _canon(p):\n"
+        "    return os.path.normcase(os.path.realpath(p))\n"
+        f"stdlib_dir = _canon({where})\n"
         "def in_stdlib_dir(top):\n"
         "    f = getattr(sys.modules.get(top), '__file__', None)\n"
-        "    return bool(f) and (\n"
-        f"        os.path.normcase(os.path.realpath(os.path.dirname(f))) == {_STDLIB_DIR!r})\n"
+        "    return bool(f) and _canon(os.path.dirname(f)) == stdlib_dir\n"
         "before = set(sys.modules)\n"
         f"{plant}\n"
         f"for name in {_TRAY_START_LEAVES!r}:\n"
@@ -1253,13 +1257,31 @@ def test_the_tray_leaf_probe_sees_an_engine_import_and_a_third_party_one(tmp_pat
     assert other == {"mf_2822_third_party"}
 
 
-def test_the_tray_leaf_probe_admits_a_stdlib_file_the_name_list_omits() -> None:
+def test_the_tray_leaf_probe_admits_a_stdlib_file_the_name_list_omits(tmp_path: Path) -> None:
     """The stdlib-directory filter is live. `__hello__` stands in for `_missing_stdlib_info`:
-    `sys.stdlib_module_names` omits it, and its `__file__` names the stdlib directory. It is frozen on
-    a normal build, so that `__file__` is derived from `sys._stdlib_dir`, not read from disk."""
+    `sys.stdlib_module_names` omits it, and it sits beside `os.py`. Run again with the filter pointed
+    elsewhere, it is charged, so the first run's pass is the filter's and not a plant that never
+    arrived."""
     assert "__hello__" not in sys.stdlib_module_names, "control: pick another omitted stdlib file"
     _ours, other = _tray_leaf_probe("import __hello__")
     assert "__hello__" not in other, sorted(other)
+    _ours, other = _tray_leaf_probe("import __hello__", stdlib_dir=tmp_path)
+    assert "__hello__" in other, sorted(other)
+
+
+def test_the_tray_leaf_probe_admits_only_the_directory_itself_not_one_below_it(
+    tmp_path: Path,
+) -> None:
+    """An exact match, not a prefix: site-packages sits below the stdlib directory on at least a
+    POSIX or Windows base install, so a prefix match would admit every installed package."""
+    below = tmp_path / "site-packages"
+    below.mkdir()
+    (tmp_path / "mf_2822_beside.py").write_text("", encoding="utf-8")
+    (below / "mf_2822_below.py").write_text("", encoding="utf-8")
+    plant = f"sys.path.insert(0, {str(below)!r})\nimport mf_2822_beside, mf_2822_below"
+    _ours, other = _tray_leaf_probe(plant, path_head=tmp_path, stdlib_dir=tmp_path)
+    assert "mf_2822_beside" not in other, sorted(other)
+    assert "mf_2822_below" in other, sorted(other)
 
 
 # --- BACKLOG #1596: parsing/'s client carve-out, as one allowlist checked two ways -------------------

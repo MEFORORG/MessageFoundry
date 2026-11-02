@@ -194,16 +194,19 @@ jobs:
         if: steps.install.outcome == 'success' || steps.fallback.outcome == 'success'
         continue-on-error: true
         # At 50 minutes this step killed the windows-latest leg on run 40504909930. The cap, the
-        # worker-restart flag, the timing_quarantine exclusion and the tee are the same as in
-        # py314-latest-canary.yml's suite step, which says why and gives the measurements.
+        # worker-restart flag, the timing_quarantine exclusion, the tee and stop-commands are the same
+        # as in py314-latest-canary.yml's suite step, which says why and what each costs.
         timeout-minutes: 90
         run: |
           set -o pipefail
           STATUS=0
+          STOP="suite-$RANDOM$RANDOM"
+          echo "::stop-commands::$STOP"
           python -m pytest -q -n auto --dist loadfile --max-worker-restart=0 -p no:cacheprovider \
             -m 'not tooling and not timing_quarantine' \
             --ignore-glob='*messagefoundry-webconsole*' --continue-on-collection-errors \
             --timeout=120 2>&1 | tee -i suite.txt || STATUS=$?
+          echo "::$STOP::"
           echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 

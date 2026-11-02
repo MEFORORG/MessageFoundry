@@ -163,13 +163,16 @@ jobs:
       #   * Size. On merge-group run 41500538639 (2026-11-02) the required legs' `Tests (pytest)`
       #     steps took 36:12 (ubuntu), 41:47 (windows-2022) and 44:40 (windows-2025), and this
       #     canary's ubuntu leg took 44:58 on run 41243486028. Hence 90 minutes.
-      #   * The xdist hang ci.yml describes beside its own `--max-worker-restart=0`: a worker that dies
-      #     is replaced, the replacement never reports, and the controller waits for the step cap. No
-      #     per-test timeout is armed in the controller, so only that flag ends it. The selection also
-      #     leaves out `timing_quarantine` now, as the required legs do; those tests have their own
-      #     job in ci.yml.
-      # The output goes through tee under an explicit pipefail, so a run killed at the cap still shows
-      # how far it got, and pytest's own exit status still decides the step.
+      #   * The xdist worker-restart hang. ci.yml's note beside its own `--max-worker-restart=0` is the
+      #     source of record for it; the flag is copied here. Its cost, as there: one test past the
+      #     120s per-test cap kills its worker and ends the whole smoke with a partial count.
+      # The selection now matches the required legs, `timing_quarantine` excluded. That leaves the
+      # quarantined tests unmeasured on the canary interpreters: ci.yml's timing-quarantine job runs
+      # them on the pinned patch only.
+      # The output goes through tee so a run killed at the cap still shows how far it got. pipefail is
+      # set in the step as well as by the shell default, so a `shell:` change here cannot let tee's
+      # exit status stand in for pytest's. stop-commands keeps a `::error` line printed by a test from
+      # becoming an annotation on this run.
       - name: Engine suite smoke
         id: suite
         if: steps.install.outcome == 'success'
@@ -178,10 +181,13 @@ jobs:
         run: |
           set -o pipefail
           STATUS=0
+          STOP="suite-$RANDOM$RANDOM"
+          echo "::stop-commands::$STOP"
           python -m pytest -q -n auto --dist loadfile --max-worker-restart=0 -p no:cacheprovider \
             -m 'not tooling and not timing_quarantine' \
             --ignore-glob='*messagefoundry-webconsole*' --continue-on-collection-errors \
             --timeout=120 2>&1 | tee -i suite.txt || STATUS=$?
+          echo "::$STOP::"
           echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 
