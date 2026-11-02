@@ -631,8 +631,9 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     settings, and ``cadata=`` skips it without a word: measured, the lone block raises ``no start
     line``, and beside a plain block it would be dropped silently. Rewriting it as a plain block
     would drop a ``reject`` setting and so widen trust. ``openssl x509 -in <one cert> -out
-    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run. The label refuses
-    anywhere on a line, even outside a block, as in a comment.
+    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run. The full marker
+    ``-----BEGIN TRUSTED CERTIFICATE-----`` refuses anywhere on a line, even outside a block, as in
+    a comment.
 
     **Text the TLS library will not load refuses here** (BACKLOG #2025). The central preflight runs
     this and builds no context of its own to verify a peer with, so before this a reload passed a
@@ -688,9 +689,10 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         fresh = False
         if _PEM_TRUSTED in line:
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor {spec.path!r} names an OpenSSL trusted-certificate "
-                "label, even outside a block, as in a comment. The engine does not load such a "
-                "block. Remove a comment that names it. Re-export each certificate in such a block "
+                f"{spec.setting}: the trust anchor {spec.path!r} names the OpenSSL "
+                "trusted-certificate marker -----BEGIN TRUSTED CERTIFICATE-----, even outside a "
+                "block, as in a comment. The engine does not load such a block. Remove a comment "
+                "that names it. Re-export each certificate in such a block "
                 "as a plain CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> "
                 "converts one certificate per run"
             )
