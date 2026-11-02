@@ -325,8 +325,8 @@ def refuse_a_non_canonical_issuer(issuer: str, setting: str) -> None:
     canonical = canonical_dn(issuer)
     if canonical is None:
         raise ValueError(
-            f"{setting} issuer {issuer!r} is not an RFC 4514 distinguished name "
-            "(attr=value,...); name the issuing CA's DN"
+            f"{setting} issuer is not an RFC 4514 distinguished name "
+            "(value withheld; attr=value,...); name the issuing CA's DN"
         )
     if canonical != issuer:
         # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
@@ -2039,8 +2039,8 @@ class ApiSettings(_Section):
     def _cert_identities_can_match(cls, v: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
         """Refuse an entry that would silently match nothing (#2237)."""
         field = "[api].tls_client_cert_identities"
-        for issuer, names in v.items():
-            refuse_a_non_canonical_issuer(issuer, field)
+        for position, (issuer, names) in enumerate(v.items()):
+            refuse_a_non_canonical_issuer(issuer, f"{field} key {position}")
             if not names:
                 raise ValueError(f"{field} issuer {issuer!r} maps no certificate names")
             for name, target in names.items():

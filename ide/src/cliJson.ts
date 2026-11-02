@@ -35,9 +35,10 @@
 // A config module that fails at import is reported by `WiringError` as "error loading config
 // module <file>: <type> ..." without the text of what the author's code raised; `_module_failure`
 // in config/wiring.py is the rule (vault BACKLOG #3249). Unvetted fact-path text remains, at least
-// an exception raised inside the engine while the module ran, which keeps its text and can quote a
-// value where it wraps another exception, and the identifier an import or name error names. Every
-// command that imports config modules can print them, `connection upsert` and `remove` included.
+// a refusal a `raise` statement in the engine wrote while the module ran, which keeps its own text
+// but not the whole text of a foreign exception it wraps (vault BACKLOG #3765), and the identifier
+// an import or name error or a bad call argument names. Every command that imports config modules
+// can print them, `connection upsert` and `remove` included.
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {
