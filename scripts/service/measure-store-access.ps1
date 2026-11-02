@@ -679,12 +679,11 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "measure-store-access.ps1 installs a service and must run elevated."
 }
 if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
-# $AppExe stays as passed for gen-key and the installer. protect-key gets the file Start-Process ran:
-# the path under $PWD if it exists, else the command on PATH, which Process.Start would not do.
-$AppExeFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppExe)
-if (-not (Test-Path -LiteralPath $AppExeFile -PathType Leaf)) {
-    $AppExeFile = (Get-Command $AppExe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-}
+# $AppExe stays as passed for gen-key and the installer. protect-key gets the file Start-Process ran,
+# which Process.Start would not find: a bare name from PATH, never $PWD (measured on 5.1 and 7.6, as
+# & does for gen-key), and a path against $PWD.
+$AppExeFile = if ($AppExe -match '[\\/]') { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppExe) }
+              else { (Get-Command $AppExe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
 $Python = (Get-Command python).Source
 $Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
