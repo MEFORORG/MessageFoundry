@@ -531,29 +531,65 @@ function Stop-TheService {
     }
 }
 
+function Invoke-ChildProcess {
+    <#
+      Run one child to completion and return its exit code with its stdout and stderr text. The
+      child inherits this process's environment, which is how secrets reach it, never argv.
+
+      [Diagnostics.Process]::Start, not Start-Process. Under Windows PowerShell 5.1, which the CI
+      steps run, Start-Process -PassThru returns a Process holding no handle to the child, so a
+      child that exits before one is opened leaves ExitCode at $null (merge group run 41491909104,
+      on a probe that printed "screen passed"). Reading $p.Handle straight after Start-Process only
+      narrows that window: with the parent held 300 ms first, 5.1 read $null 20 times in 20.
+      Process.Start keeps the handle CreateProcess returned, and it avoids the native stderr merge
+      that aborts a 5.1 script under ErrorActionPreference=Stop.
+
+      Unlike Start-Process -Wait, this waits for the child alone, not its descendants. The callers'
+      children leave none behind: the probe runs in one process (provision's icacls runs are
+      subprocess.run, waited for), and the messagefoundry.exe launcher waits for its Python.
+
+      An exit code that still cannot be read throws, so it is never compared as if it were one.
+    #>
+    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        # Both pipes drain while the child runs, so neither can fill and stall it.
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $err = $p.StandardError.ReadToEndAsync()
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        $result = New-Object PSObject -Property @{ Code = $code; Out = $out.Result; Err = $err.Result }
+    } finally { $p.Dispose() }
+    if ($null -eq $code) {
+        throw "$FilePath exited, but no exit code could be read from it, so its outcome is unknown"
+    }
+    return $result
+}
+
 function Invoke-OperatorCli {
     <#
-      Run the Python probe as THIS identity. Start-Process with redirected files, because a native
-      stderr merge under Windows PowerShell 5.1 and ErrorActionPreference=Stop aborts the script.
-      Secrets reach the child through its inherited environment, never argv, and are cleared after.
+      Run the Python probe as THIS identity, through Invoke-ChildProcess. Secrets reach the child
+      through its inherited environment, never argv, and are cleared after.
     #>
     param([string[]]$Arguments, [hashtable]$Secrets)
-    $out = Join-Path $Work "cli.out.txt"
-    $err = Join-Path $Work "cli.err.txt"
     foreach ($k in $Secrets.Keys) { Set-Item -Path "Env:$k" -Value $Secrets[$k] }
     try {
         $quoted = @("`"$Probe`"") + ($Arguments | ForEach-Object { "`"$_`"" })
-        $p = Start-Process -FilePath $Python -ArgumentList ($quoted -join " ") -WorkingDirectory $RepoRoot `
-            -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
-        $code = $p.ExitCode
+        $c = Invoke-ChildProcess -FilePath $Python -Arguments ($quoted -join " ") -WorkingDirectory $RepoRoot
     } finally {
         foreach ($k in $Secrets.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
     }
-    $text = ((Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue) + "`n" +
-        (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)).Trim()
-    Write-Host "----- operator CLI ($($Arguments[0])) exit=$code -----"
+    $text = ($c.Out + "`n" + $c.Err).Trim()
+    Write-Host "----- operator CLI ($($Arguments[0])) exit=$($c.Code) -----"
     Write-Host $text
-    return New-Object PSObject -Property @{ Code = $code; Text = $text }
+    return New-Object PSObject -Property @{ Code = $c.Code; Text = $text }
 }
 
 function Start-TheService([string]$Phase) {
@@ -816,15 +852,12 @@ try {
     # user can read. So the key reaches it the way the service smoke passes its own: a DPAPI key
     # file that only the service's virtual account and administrators can read, which
     # docs/SERVICE.md lists first. protect-key makes it from the key in this process's environment,
-    # cleared after. Start-Process with redirected files, for the reason Invoke-OperatorCli gives.
+    # cleared after. Through Invoke-ChildProcess, for the reasons it gives.
     $StoreKeyFile = Join-Path $DataDir "store.key.dpapi"
     $env:MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
     try {
-        $protect = Start-Process -FilePath $AppExe `
-            -ArgumentList "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"" `
-            -RedirectStandardOutput (Join-Path $Work "protect-key.out.txt") `
-            -RedirectStandardError (Join-Path $Work "protect-key.err.txt") -NoNewWindow -Wait -PassThru
-        $protectCode = $protect.ExitCode
+        $protectCode = (Invoke-ChildProcess -FilePath $AppExe `
+            -Arguments "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"").Code
     } finally {
         Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY -ErrorAction SilentlyContinue
     }
