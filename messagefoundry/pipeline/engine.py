@@ -939,6 +939,10 @@ class Engine:
         # which has no route to write one. The API sets it, since the row builder lives there and the
         # engine never imports the API. None (embedding, tests) writes no row.
         self.convergence_reload_audit: Callable[[ReloadOutcome], Awaitable[None]] | None = None
+        # Vault BACKLOG #2613: runs once stop() has stopped the graph, with the store still open. The
+        # API sets it, for an unpinned cluster node's posture alert. None (embedding, tests) runs
+        # nothing.
+        self.on_graph_stopped: Callable[[], None] | None = None
         # vault BACKLOG #3109: the same for a convergence reload that raised, called with the fault,
         # the shared version it was converging on, and the set of rows already written for that
         # version. The runner retries that version every tick; the writer skips a row the set
@@ -4002,6 +4006,13 @@ class Engine:
         if self._intake_monitor is not None:
             await self._intake_monitor.stop()
             self._intake_monitor = None
+        # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
+        # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
+        if self.on_graph_stopped is not None:
+            try:
+                self.on_graph_stopped()
+            except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
+                log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
         # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
         # reported by the watch's last pass. That pass may write an audit row and raise an alert,
         # so it runs while the store is open, and ahead of the alert-state drain at the end.

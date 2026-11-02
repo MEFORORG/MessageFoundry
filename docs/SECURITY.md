@@ -6496,10 +6496,11 @@ export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `with
 `audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
 hidden row falls in the range read, so it cannot tell the reader that a lock happened.
 
-**Six audit signals also raise an operator alert (vault BACKLOG #2613).** A small rule layer
-(`messagefoundry/pipeline/security_signals.py`) watches the audit stream and raises one alert type
-per detector through the `[alerts]` notifier, or the log when no transport is set. It is on by
-default. What each one counts is stated once, in the `[alerts]` table of `docs/CONFIGURATION.md`.
+**Seven security signals also raise an operator alert (vault BACKLOG #2613).** A small rule
+layer (`messagefoundry/pipeline/security_signals.py`) watches the audit stream, and the listeners'
+peer refusals, and raises one alert type per detector through the `[alerts]` notifier, or the log
+when no transport is set. It is on by default. What each one counts is stated once, in the
+`[alerts]` table of `docs/CONFIGURATION.md`.
 
 | Alert | Setting | Subject |
 |---|---|---|
@@ -6507,8 +6508,9 @@ default. What each one counts is stated once, in the `[alerts]` table of `docs/C
 | `access_denied_burst` | `security_denials` | `account:<username>` |
 | `body_view_burst` | `security_body_views` | `account:<username>` |
 | `bulk_export` | `security_export_messages` | `account:<username>` |
+| `peer_refused_burst` | `security_peer_refusals` | `inbound:<name>` |
 | `log_level_debug` | none | `logging:debug` |
-| `posture_loosened` | none | `posture:start` |
+| `posture_loosened` | none | `posture:start`, plus `@node:<id>` or `@shard:<id>` where several engine processes share the store |
 
 The layer is an observer on the off-box audit tee, which at least `record_audit` and every
 in-transaction audit append call after their commit. So it adds no commit and no store read to the
@@ -6523,10 +6525,58 @@ sign-in detector counts `auth.login_failed`, which is written once per refused l
 lock state, and leaves out the withheld directory lock refusal, so its count does not reveal a lock.
 **An account lock raises no alert**, by the 2026-09-28 ruling above: the alert list is readable
 under `monitoring:diagnose`, and a lock alert there would show lock state to a reader the ruling
-withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
-`[alerts].security_signals = false`, or a threshold of `0`, is absent from
-`GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
+withholds it from.
+
+A listener's refusal of a peer at its source allowlist or a connection cap writes no audit row, and at most a
+`connection_event` row, only while capture is on. So at least the MLLP, raw-TCP, X12 and HTTP
+listeners and the DICOM server tell the layer directly, with the inbound's name and never the
+peer's address. Once a listener's burst raises, its refusals are not counted again for the window,
+or for five minutes when the window is longer. A refusal at a connection cap counts too, so a
+listener held full by ordinary load raises it as well.
+
+**Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
+a detector count of `0` or above its default, or a window shorter than its default while any
+count is above `0`, is named in `GET /security/posture` and in the start's `config_loaded` row.
+With the layer off, every detector stops but the posture one, so that start still raises
+`posture_loosened`. A later start that records no loosening raises the
+`posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
+process and pages nobody. A row marked `superseded` or `baseline_unchecked` raises no inverse,
+even with an empty list: the list is read off the graph the start's snapshot took, and a reload
+may have replaced that graph. A start whose baseline read failed, or that took no digest, carries
+the same mark and raises none either. The alert stays open until a later start's unmarked row
+lists none and the live posture reads clean, as the next paragraph says.
+An unpinned cluster node's identity changes on every start, so that node raises the inverse for
+its own alert once its graph has stopped during shutdown, with no live read. That alert can stay
+open after shutdown, at least after a hard kill, a stop that fails before its graph has stopped, or
+a resolve that did not land. An alert also stays open when no later start comes back
+under its identity, at least after an engine shard is removed from the config or a pinned
+`[cluster].node_id` changes. In each of these cases, resolve it by hand with
+`POST /alerts/{alert_id}/resolve` or in the web console's alert list, which goes through the same
+scope check, so both need an account that is not channel-scoped and holds `monitoring:diagnose`. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
 records its loosenings as unknown, such as one whose config snapshot could not be taken.
+
+**A resolved `posture_loosened` does not prove the engine runs clean.** A clean, unmarked row
+resolves the alert only after a read of the live posture, the reading `GET /security/posture` takes,
+names no loosening. A read that fails, that cannot see the graph, or that is still running at
+shutdown resolves nothing. So a reload that swaps the graph before the row commits leaves the alert
+open. The detector reads `config_loaded` rows and no `config_reload` row, so at least these go
+unseen. A reload whose swap lands after that read leaves the alert resolved while the loosened graph
+runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
+reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
+read that for the current posture.
+
+**`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
+count of every loosening, then their names, cut at 200 characters and ending in `...`. The
+`alert_instance` reason then cuts the whole sentence at 200 characters. A name late in a long list
+is therefore missing, and at least some `[security]` switches come ahead of
+`alerts.security_signals`, so the cut can reach it. In one measured list of that shape, with many
+`[security]` booleans and hop loosenings set, 309 characters of names came ahead of it, and the
+alert's list ended in `...` without it. How many entries a list holds depends on the environment.
+With 116 characters of names ahead of it
+the stored reason still named it, and with 145 it did not. The count always includes it. The start's
+`config_loaded` row holds the whole list, and so does `GET /security/posture`, which narrows only
+the per-connection entries for a channel-scoped reader. Read one of those when the alert's list is
+cut.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC
