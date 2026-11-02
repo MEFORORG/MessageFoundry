@@ -6,7 +6,8 @@ Its four quarantine arms (oversize, gunzip failure, content mismatch, scanner re
 drop to ``.error`` and logged a WARNING, and wrote nothing to the store, although the runner injects
 the connection-event sink on every source and the MLLP over-cap arm has always used it. An operator
 watching the console saw nothing when a partner's drop was quarantined. Each arm now emits one event
-whose reason never carries the file name.
+whose reason carries no exact copy of the file name. A scanner quoting it in another form is kept:
+``_QUOTED_FORMS`` pins that limit, which ``docs/PHI.md`` section 7 row 7 states.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -20,11 +21,23 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.redaction import safe_name
 from messagefoundry.transports.file import FileSource, ScanRejected, set_scan_hook
 
-# A partner-chosen name built from an MRN: it must reach neither the event nor its reason.
+# A partner-chosen name built from an MRN: an exact copy of it must not reach the reason.
 _NAME = "MRN123456789_ADT.hl7"
 _HL7 = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL1621|P|2.5.1\rPID|1||12345\r"
+
+# (form id, the file's name, how the scanner's message quotes it, the reason keeps that text)
+_QUOTED_FORMS: list[tuple[str, str, str, bool]] = [
+    ("exact", _NAME, _NAME, False),  # the control: this arm really does scrub
+    ("lower_case", _NAME, _NAME.lower(), True),
+    ("upper_case", _NAME, _NAME.upper(), True),
+    ("no_extension", _NAME, _NAME.removesuffix(".hl7"), True),
+    ("percent_encoded", "DOE JOHN.hl7", "DOE%20JOHN.hl7", True),
+    ("decomposed_unicode", "JOS\u00c9_ADT.hl7", "JOSE\u0301_ADT.hl7", True),
+    ("escaped_unicode", "JOS\u00c9_ADT.hl7", "JOS\\xc9_ADT.hl7", True),
+]
 
 
 class _Sink:
@@ -97,6 +110,44 @@ async def test_each_quarantine_arm_records_one_event_without_the_file_name(
     reason = sink.events[0][2]
     assert reason, "the event carries a reason"
     assert "MRN123456789" not in reason, f"the file name leaked into the reason: {reason!r}"
+
+
+@pytest.mark.parametrize(
+    ("name", "quoted", "kept"), [f[1:] for f in _QUOTED_FORMS], ids=[f[0] for f in _QUOTED_FORMS]
+)
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_the_scan_reject_reason_scrubs_only_an_exact_copy_of_the_name(
+    tmp_path: Path, name: str, quoted: str, kept: bool
+) -> None:
+    """Pins the limit ``docs/PHI.md`` section 7 row 7 states. A stronger scrub turns this red, and
+    that row must then change with it.
+
+    Mutation: make the replacement in ``safe_exc`` ignore case. Red: the two case rows."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / name).write_bytes(_HL7)
+    source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
+    sink = _Sink()
+    source.on_connection_event = sink
+
+    async def handler(_raw: bytes) -> str | None:
+        return None
+
+    def reject(_raw: bytes, _source: str) -> None:
+        raise ScanRejected(f"EICAR test signature in {quoted}")
+
+    source._handler = handler
+    source._prepare_subdirs()
+    set_scan_hook(reject)
+    await _settle(source)
+    await source._scan_once()
+
+    assert [k for k, _peer, _reason in sink.events] == ["file_scan_rejected"]
+    reason = sink.events[0][2]
+    assert reason is not None
+    assert (quoted in reason) is kept, f"unexpected reason: {ascii(reason)}"
+    if not kept:
+        assert safe_name(name) in reason, f"unexpected reason: {ascii(reason)}"
 
 
 async def test_a_failing_sink_never_stops_the_quarantine(tmp_path: Path) -> None:
