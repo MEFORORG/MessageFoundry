@@ -295,8 +295,10 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     # starts (BACKLOG #1459; measured on a live account root 2026-09-30).
     #
     # NOT IN $dxUntrusted, ON PURPOSE. On a box where Claude Code runs the statusLine under bash no
-    # fresh reading can exist, and the age refusal already turns an old one into UNKNOWN. On a box where
-    # it runs under some other shell the command may work, and a fresh reading it wrote is real.
+    # fresh reading can exist, and an old one reads UNKNOWN. On a box where it runs under some other
+    # shell the command may work, and a fresh reading it wrote is real. THE COST: an old reading that
+    # is stamped, with its reset ahead, also sets level_floor here, so the gate can HALT on a number
+    # that nothing on this root may be able to correct. ADR 0211 states it as a limit.
     if (Test-IsPowerShellSourceStatusLine $cmd) {
         $o.state = "WIRED_POWERSHELL_SOURCE"
         $o.line = "WIRED (ours) but the command is PowerShell source. Claude Code runs a statusLine under bash where Git Bash is installed, and bash cannot parse it, so pwsh never starts and nothing publishes. WAITING WILL NOT FIX THIS."

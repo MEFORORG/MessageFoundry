@@ -412,7 +412,10 @@ roster alias of the Lander.
 > it. So a flat account, live or not, goes stale after 20 minutes and reads UNKNOWN. `usage.ps1`
 > publishes such a reading as `level_floor` when its reset is ahead, its age plus the time to its reset
 > fits one 7-day window, and its provenance is trusted: the document and the window carry a verified
-> root stamp, and the root is wired here. At the 98 percent ceiling the provenance test does not apply,
+> root stamp, and the root's statusLine diagnosis is not on `usage.ps1`'s `$dxUntrusted` list. That does
+> not prove the root is wired here: the list leaves out at least `SETTINGS_UNREADABLE` and
+> `WIRED_POWERSHELL_SOURCE`, so a stamped stale reading holds a floor on those too, where a new reading
+> may never come. At the 98 percent ceiling the provenance test does not apply,
 > because a fresh reading there stops work on any provenance, and an equal reading does not refresh its
 > age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
 > window stamped with another root is still refused. The rung is then hit at the 90 percent level or the
@@ -451,6 +454,13 @@ roster alias of the Lander.
 >   and fresh or stale, because the reader refuses a document stamped with another root. The gate answers
 >   REVIEW until this root's next fire restores the stamp, so that mis-wire is an exception to "only a new
 >   reading clears it". Measured 2026-11-01 on a fresh 100.
+> - A moved reset defeats the rule, and this is the limit here that can CLEAR a stop rather than hold one.
+>   A reading with a later reset, or an earlier one that has not passed, counts as a new window and is
+>   restamped fresh, so after a re-login two sessions holding different resets replace each other on
+>   every fire: measured 80, 5, 80, 5, with four history rows. A frozen 5 replaces a published 100 the same
+>   way, and the rung then reads that fresh 5. The code before this amendment did this too, and more
+>   widely: measured 2026-11-01, its `five_hour` window read OK at 5 after a spent 100, with the same or an
+>   earlier reset. The same-reset case is what this amendment closes.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.

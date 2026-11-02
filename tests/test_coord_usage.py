@@ -673,6 +673,30 @@ def test_a_root_wired_elsewhere_gets_no_floor_and_a_wired_one_does(fake_home: Pa
 
 
 @pytest.mark.parametrize(
+    ("state_name", "settings"),
+    [
+        pytest.param("SETTINGS_UNREADABLE", "{ not json", id="settings-unreadable"),
+        pytest.param("WIRED_POWERSHELL_SOURCE", None, id="powershell-source"),
+    ],
+)
+def test_a_diagnosis_off_the_untrusted_list_keeps_a_floor_it_cannot_correct(
+    fake_home: Path, state_name: str, settings: str | None
+) -> None:
+    """ADR 0211 states this as a limit: neither state proves the root is wired here, and the floor
+    stands anyway. If either joins $dxUntrusted, this fails and that sentence has to go."""
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    publish(state, seven=95.0, age_min=75)
+    _stamp(state, pin)
+    command = _powershell_source_command(COLLECT, state)
+    text = settings or json.dumps({"statusLine": {"type": "command", "command": command}})
+    (pin / "settings.json").write_text(text, encoding="utf-8")
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == state_name, doc
+    assert doc["seven_day"]["level_floor"] == pytest.approx(95.0), doc
+
+
+@pytest.mark.parametrize(
     ("resets_in_min", "expected"),
     [
         pytest.param(9000, 95.0, id="fits-a-week"),
