@@ -984,7 +984,7 @@ SCRIPT_SITES: dict[str, Site] = {
         "named after the service's own images.",
     ),
     "scripts/service/measure-store-access.ps1": Site(
-        21,
+        17,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (data directory, NSSM "
         "directory, repo root, temp and its work directory), and a phase label the script itself "

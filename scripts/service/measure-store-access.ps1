@@ -531,29 +531,86 @@ function Stop-TheService {
     }
 }
 
+function Invoke-ChildProcess {
+    <#
+      Run one child to completion and return its exit code with its stdout and stderr text. The
+      child inherits this process's environment, which is how secrets reach it, never argv.
+
+      [Diagnostics.Process]::Start, not Start-Process. Under Windows PowerShell 5.1, which the CI
+      steps run, Start-Process -PassThru returns a Process holding no handle to the child, so a
+      child that exits before one is opened leaves ExitCode at $null (merge group run 41491909104,
+      on a probe that printed "screen passed"). Reading $p.Handle straight after Start-Process only
+      narrows that window: with the parent held 300 ms first, 5.1 read $null 20 times in 20.
+      Process.Start keeps the handle CreateProcess returned, and it avoids the native stderr merge
+      that aborts a 5.1 script under ErrorActionPreference=Stop.
+
+      Start-Process -Wait waited for the whole process tree. This waits for the child, and the reads
+      wait for every holder of the inherited pipes to close them. The callers' children leave no
+      descendant behind: the probe runs in one process (provision's icacls runs are subprocess.run,
+      waited for), and the messagefoundry.exe launcher waits for its Python. Neither wait is
+      bounded, as -Wait was not; the step's timeout-minutes bounds a hang. Stdin is closed, so a
+      prompt nobody expected reads end-of-file and fails instead of waiting.
+
+      Process.Start resolves a relative path against the process's current directory, which does
+      not follow Set-Location, so pass an absolute FilePath. The working directory is made a plain
+      file-system path here, and defaults to the current file-system location, as Start-Process's
+      did. The pipes are decoded as [Text.Encoding]::Default, which under 5.1 is the ANSI code page a
+      Windows Python writes to a pipe, as the Get-Content read of the old output files did.
+
+      An exit code that still cannot be read throws, with the output, so it is never compared as if
+      it were one. The pipe reads use GetResult(), a method, because PowerShell turns an exception
+      in a property getter such as Task.Result into $null, which would read as empty output. The
+      excerpt is cut here rather than by Get-Excerpt, so the function stands alone for its test.
+    #>
+    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory)
+    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    $psi.WorkingDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkingDirectory)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::Default
+    $psi.StandardErrorEncoding = [Text.Encoding]::Default
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $p.StandardInput.Close()
+        # Both pipes drain while the child runs, so neither can fill and stall it.
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $err = $p.StandardError.ReadToEndAsync()
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        $result = New-Object PSObject -Property @{
+            Code = $code; Out = $out.GetAwaiter().GetResult(); Err = $err.GetAwaiter().GetResult()
+        }
+    } finally { $p.Dispose() }
+    if ($null -eq $code) {
+        $text = (($result.Out + " " + $result.Err) -replace "\s+", " ").Trim()
+        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + "..." }
+        throw "$FilePath exited, but no exit code could be read from it, so its outcome is unknown. Output: $text"
+    }
+    return $result
+}
+
 function Invoke-OperatorCli {
     <#
-      Run the Python probe as THIS identity. Start-Process with redirected files, because a native
-      stderr merge under Windows PowerShell 5.1 and ErrorActionPreference=Stop aborts the script.
-      Secrets reach the child through its inherited environment, never argv, and are cleared after.
+      Run the Python probe as THIS identity, through Invoke-ChildProcess. Secrets reach the child
+      through its inherited environment, never argv, and are cleared after.
     #>
     param([string[]]$Arguments, [hashtable]$Secrets)
-    $out = Join-Path $Work "cli.out.txt"
-    $err = Join-Path $Work "cli.err.txt"
     foreach ($k in $Secrets.Keys) { Set-Item -Path "Env:$k" -Value $Secrets[$k] }
     try {
         $quoted = @("`"$Probe`"") + ($Arguments | ForEach-Object { "`"$_`"" })
-        $p = Start-Process -FilePath $Python -ArgumentList ($quoted -join " ") -WorkingDirectory $RepoRoot `
-            -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
-        $code = $p.ExitCode
+        $c = Invoke-ChildProcess -FilePath $Python -Arguments ($quoted -join " ") -WorkingDirectory $RepoRoot
     } finally {
         foreach ($k in $Secrets.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
     }
-    $text = ((Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue) + "`n" +
-        (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)).Trim()
-    Write-Host "----- operator CLI ($($Arguments[0])) exit=$code -----"
+    $text = ($c.Out + "`n" + $c.Err).Trim()
+    Write-Host "----- operator CLI ($($Arguments[0])) exit=$($c.Code) -----"
     Write-Host $text
-    return New-Object PSObject -Property @{ Code = $code; Text = $text }
+    return New-Object PSObject -Property @{ Code = $c.Code; Text = $text }
 }
 
 function Start-TheService([string]$Phase) {
@@ -622,6 +679,11 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "measure-store-access.ps1 installs a service and must run elevated."
 }
 if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
+# $AppExe stays as passed for gen-key and the installer. protect-key gets the file Start-Process ran:
+# a bare name from PATH, never $PWD (measured on 5.1 and 7.6, as & does for gen-key), and a path
+# against $PWD. Process.Start would search the process's own and current directories first.
+$AppExeFile = if ($AppExe -match '[\\/]') { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppExe) }
+              else { (Get-Command $AppExe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
 $Python = (Get-Command python).Source
 $Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
@@ -816,20 +878,19 @@ try {
     # user can read. So the key reaches it the way the service smoke passes its own: a DPAPI key
     # file that only the service's virtual account and administrators can read, which
     # docs/SERVICE.md lists first. protect-key makes it from the key in this process's environment,
-    # cleared after. Start-Process with redirected files, for the reason Invoke-OperatorCli gives.
+    # cleared after. Through Invoke-ChildProcess, for the reasons it gives.
     $StoreKeyFile = Join-Path $DataDir "store.key.dpapi"
     $env:MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
     try {
-        $protect = Start-Process -FilePath $AppExe `
-            -ArgumentList "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"" `
-            -RedirectStandardOutput (Join-Path $Work "protect-key.out.txt") `
-            -RedirectStandardError (Join-Path $Work "protect-key.err.txt") -NoNewWindow -Wait -PassThru
-        $protectCode = $protect.ExitCode
+        $protect = (Invoke-ChildProcess -FilePath $AppExeFile `
+            -Arguments "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"")
     } finally {
         Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY -ErrorAction SilentlyContinue
     }
-    if ($protectCode -ne 0 -or -not (Test-Path -LiteralPath $StoreKeyFile)) {
-        throw "protect-key could not write the store key file $StoreKeyFile (exit $protectCode)"
+    # The key comes from the environment, not --generate, so protect-key's stderr carries no key.
+    if ($protect.Code -ne 0 -or -not (Test-Path -LiteralPath $StoreKeyFile)) {
+        throw ("protect-key could not write the store key file $StoreKeyFile (exit $($protect.Code)): " +
+            (Get-Excerpt $protect.Err))
     }
     # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
     # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving is
