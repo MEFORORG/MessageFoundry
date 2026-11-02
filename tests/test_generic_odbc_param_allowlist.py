@@ -454,7 +454,7 @@ def test_a_server_holding_a_delimiter_is_refused(character: str) -> None:
     [
         r"\\files.test\share\ca.pem",
         "//files.test/share/ca.pem",
-        r" \\files.test\share\ca.pem",
+        r"\\files.test\share\root ca.pem",
         r"\??\UNC\files.test\share\ca.pem",
         r"\\?\UNC\files.test\share\ca.pem",
     ],
@@ -465,6 +465,31 @@ def test_a_file_keyword_must_be_a_plain_local_path(keyword: str, path: str) -> N
     message = str(refused.value)
     assert _CONNECTION in message
     assert "files.test" not in message
+
+
+@pytest.mark.parametrize("keyword", ["sslca", "SSLCAPATH", "sslcert", "SSLKEY"])
+def test_a_padded_share_spelling_is_refused_as_a_padded_value_first(
+    monkeypatch: pytest.MonkeyPatch, keyword: str
+) -> None:
+    """The padded-value rule refuses this at the build before the remote-path check runs, so nothing
+    walks or reads it. The remote-path check still refuses the same spelling when called directly.
+    The spellings of a share that reach that check through the build are in the test above."""
+
+    def never(*_args: object) -> bytes:
+        raise AssertionError("a refused value must not be walked or read")
+
+    path = r" \\files.test\share\ca.pem"
+    monkeypatch.setattr(database, "_path_verdict", never)
+    monkeypatch.setattr(database, "read_if_regular", never)
+    with pytest.raises(
+        ValueError, match="must not be empty, blank, or start or end with a space"
+    ) as refused:
+        _build(odbc_params={keyword: path})
+    message = str(refused.value)
+    assert _CONNECTION in message
+    assert "files.test" not in message
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        database._refuse_remote_paths({odbc_keyword_name(keyword): path}, connection=_CONNECTION)
 
 
 @pytest.mark.parametrize("verdict", [True, None])
@@ -483,34 +508,51 @@ def test_a_file_keyword_that_leads_off_the_host_or_cannot_be_cleared_is_refused(
     assert database.driver_file_spellings(sent) == ()
 
 
-def test_a_padded_spelling_the_walk_cannot_clear_is_read_as_before(
+def test_a_padded_spelling_the_walk_cannot_clear_is_read_by_the_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A padded spelling whose verdict is ``None``, beside a trimmed spelling whose verdict is
-    ``False``, is kept by ``driver_file_spellings``, and the build reads it and refuses the value
-    when that read fails. With the padded spelling's verdict ``True``, the build refuses the value.
-    Red with ``driver_file_spellings`` keeping only the spellings whose verdict is ``False``."""
+    ``False``, is kept by ``driver_file_spellings``, and a check given that value reads it and
+    refuses it when that read fails. With the padded spelling's verdict ``True``, the remote-path
+    check refuses it. The build refuses any padded value first and reads nothing, so those calls go
+    to the checks directly, and the trimmed spelling takes both refusals through the build. Red
+    with ``driver_file_spellings`` keeping only the spellings whose verdict is ``False``."""
     sent = r" C:\certs\ca.pem"
-    verdicts: dict[str, bool | None] = {sent: None, sent.strip(): False}
+    trimmed = sent.strip()
+    verdicts: dict[str, bool | None] = {sent: None, trimmed: False}
     monkeypatch.setattr(database, "_path_verdict", lambda p: verdicts[p])
-    assert database.driver_file_spellings(sent) == (sent, sent.strip())
+    assert database.driver_file_spellings(sent) == (sent, trimmed)
 
     read: list[str] = []
+    fails = {sent}
 
     def reading(path: str, _limit: int) -> bytes:
         read.append(path)
-        if path == sent:
+        if path in fails:
             raise PermissionError(5, "denied")  # what a walk stopped on, met again by the read
         return b"-----BEGIN CERTIFICATE-----\n"
 
     monkeypatch.setattr(database, "read_if_regular", reading)
     monkeypatch.setattr(os.path, "isdir", lambda _p: False)
-    with pytest.raises(ValueError, match="could not be read"):
+    with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
         _build(odbc_params={"sslca": sent})
+    assert read == []
+    with pytest.raises(ValueError, match="could not be read"):
+        database._refuse_encrypted_driver_ca({"sslca": sent}, connection=_CONNECTION)
     assert read == [sent]
+
+    read.clear()
+    fails.add(trimmed)
+    with pytest.raises(ValueError, match="could not be read"):
+        _build(odbc_params={"sslca": trimmed})
+    assert read == [trimmed]
+
     verdicts[sent] = True
     with pytest.raises(ValueError, match="must be a plain local path"):
-        _build(odbc_params={"sslca": sent})
+        database._refuse_remote_paths({"sslca": sent}, connection=_CONNECTION)
+    verdicts[trimmed] = True
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        _build(odbc_params={"sslca": trimmed})
 
 
 # The walk, against an injected file system, so every platform runs it. A drive answers its
@@ -700,12 +742,24 @@ def test_a_verdicts_map_without_the_keyword_raises(monkeypatch: pytest.MonkeyPat
         )
 
 
-@pytest.mark.parametrize("mode", ["disable", "DISABLED", "verify-full"])
+#: The driver whose own SSLMODE spellings the build accepts: ``DISABLED`` only reaches the
+#: remote-path check under it, since every other driver takes libpq's lower case spellings only.
+_MYSQL_DRIVER = "MySQL ODBC 8.0 Unicode Driver"
+
+
+@pytest.mark.parametrize(
+    ("driver", "mode"),
+    [
+        ("PostgreSQL Unicode", "disable"),
+        (_MYSQL_DRIVER, "DISABLED"),
+        ("PostgreSQL Unicode", "verify-full"),
+    ],
+)
 @pytest.mark.parametrize(
     ("keyword", "path"), [("sslca", r"Z:\certs\ca.pem"), ("sslcapath", r"Z:\certs")]
 )
 def test_a_ca_the_walk_finds_off_the_host_is_refused_in_every_mode(
-    monkeypatch: pytest.MonkeyPatch, mode: str, keyword: str, path: str
+    monkeypatch: pytest.MonkeyPatch, driver: str, mode: str, keyword: str, path: str
 ) -> None:
     """With TLS off the driver reads no CA, but an ``sslca`` or ``sslcapath`` on a mapped drive,
     which only the walk finds off the host, is refused all the same, as with TLS on and as a client
@@ -718,10 +772,29 @@ def test_a_ca_the_walk_finds_off_the_host_is_refused_in_every_mode(
     monkeypatch.setattr(database, "_path_verdict", lambda p: p.startswith("Z:"))
     monkeypatch.setattr(database, "read_if_regular", never)
     with pytest.raises(ValueError, match="must be a plain local path") as refused:
-        _build(odbc_params={"SSLmode": mode, keyword: path})
+        _build(odbc_driver=driver, odbc_params={"SSLmode": mode, keyword: path})
     assert "Z:" not in str(refused.value)
     with pytest.raises(ValueError, match="must be a plain local path"):
-        _build(odbc_params={"SSLmode": mode, "sslkey": r"Z:\certs\k.pem"})
+        _build(odbc_driver=driver, odbc_params={"SSLmode": mode, "sslkey": r"Z:\certs\k.pem"})
+
+
+@pytest.mark.parametrize(
+    ("keyword", "path"), [("sslca", r"Z:\certs\ca.pem"), ("sslcapath", r"Z:\certs")]
+)
+def test_a_mysql_mode_spelling_under_another_driver_is_refused_first(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, path: str
+) -> None:
+    """``DISABLED`` under a driver that is not MySQL's is refused by the SSL mode rule, inside the
+    keyword loop, so neither the walk nor any file check sees the path."""
+
+    def never(*_args: object) -> bytes:
+        raise AssertionError("a refused value must not be walked or read")
+
+    monkeypatch.setattr(database, "_path_verdict", never)
+    monkeypatch.setattr(database, "read_if_regular", never)
+    with pytest.raises(ValueError, match="must be one of disable, allow, prefer") as refused:
+        _build(odbc_params={"SSLmode": "DISABLED", keyword: path})
+    assert "Z:" not in str(refused.value)
 
 
 def test_a_ca_on_the_local_disk_still_builds_with_tls_off(
@@ -731,7 +804,7 @@ def test_a_ca_on_the_local_disk_still_builds_with_tls_off(
     monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
     monkeypatch.setattr(database, "read_if_regular", lambda *_a: b"-----BEGIN CERTIFICATE-----\n")
     ca = r"C:\certs\ca.pem"
-    assert f"sslca={{{ca}}}" in _build(odbc_params={"SSLmode": "disable", "sslca": ca})
+    assert f"sslca={ca};" in _build(odbc_params={"SSLmode": "disable", "sslca": ca})
 
 
 @pytest.mark.parametrize("keyword", ["sslca", "sslcapath"])
@@ -796,7 +869,7 @@ def test_a_link_to_a_local_file_still_builds(tmp_path: Path) -> None:
     target.write_text("x", encoding="ascii")
     _symlink_or_skip(str(target), tmp_path / "ca.pem")
     sent = str(tmp_path / "ca.pem")
-    assert f"sslca={{{sent}}}" in _build(odbc_params={"sslca": sent})
+    assert f"sslca={sent};" in _build(odbc_params={"sslca": sent})
 
 
 @pytest.mark.parametrize(

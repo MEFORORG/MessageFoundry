@@ -1826,9 +1826,9 @@ with a device prefix, such as a share spelling. That part is enforced on every p
 Windows the engine also runs a best-effort check of the path, and refuses the value when that
 check finds the path leads to another host, or cannot finish reading the trimmed path. Both
 refusals apply in every SSL mode. The check is defence in depth, not a guarantee. It misses at
-least: padded spellings; links to some object paths; paths that change after the build; the
-contents of an `SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The check does
-not change the value sent to the driver.
+least: links to some object paths; paths that change after the build; the contents of an
+`SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The check does not change the
+value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
