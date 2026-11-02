@@ -465,6 +465,13 @@ function Test-WindowResetPassed($w) {
     return [bool]($epoch -and $epoch -le [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
 }
 
+# A WINDOW WITH NO NUMBER HOLDS NO READING. `[double]$null` and `[double]""` are both 0, and a 0 reads OK
+# and clears the gate, so a missing percentage is refused before any cast. One definition, as above.
+function Test-WindowHasNumber($w) {
+    $v = $w.used_percentage
+    return -not ($null -eq $v -or $v -is [string] -or $v -is [bool])
+}
+
 # The band this reader calls "at the ceiling". A fresh reading here stops work on any provenance, so a
 # stale one with its reset ahead must too; see level_floor below. Get-DecisionCostRung holds its own 98.
 $CeilingPct = 98
@@ -489,6 +496,9 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     }
     if (Test-WindowResetPassed $w) {
         return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "no current reading: this window's reset has passed"; used_percentage = $null }
+    }
+    if (-not (Test-WindowHasNumber $w)) {
+        return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "no current reading: this window carries no percentage"; used_percentage = $null }
     }
     $age = Get-AgeMinutes $w.captured_at
     $pct = [double]$w.used_percentage
@@ -672,7 +682,7 @@ function Get-RootSummary([string]$Root) {
     # survey four lines later printed it as this root's own.
     $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
     $sevenGone = Test-WindowResetPassed $d.seven_day
-    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone) { [double]$d.seven_day.used_percentage } else { $null }
+    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone -and (Test-WindowHasNumber $d.seven_day)) { [double]$d.seven_day.used_percentage } else { $null }
     # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
     # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
     # six-hour-old reading rendered as "[seen 0 min ago]".

@@ -720,6 +720,15 @@ def _confirm_refused_case(state: Path, case: str) -> None:
         _session_fire(state, seven)
     elif case == "counter-fell":
         _session_fire(state, seven, api_ms=500)
+    elif case == "counter-fell-and-came-back":
+        _session_fire(state, seven, api_ms=500)
+        _session_fire(state, seven, api_ms=1000)
+    elif case == "two-processes-on-one-id":
+        for api_ms in (7000, 5000, 7000, 5000, 7000):
+            _session_fire(state, seven, api_ms=api_ms)
+        _age_window(state, 25)
+        for api_ms in (5000, 7000):
+            _session_fire(state, seven, api_ms=api_ms)
     elif case == "lower-number":
         _session_fire(state, {**seven, "used_percentage": 30.0}, api_ms=2000)
     elif case == "unreadable-mark":
@@ -748,6 +757,8 @@ def _confirm_refused_case(state: Path, case: str) -> None:
         "another-sessions-counter",
         "no-counter",
         "counter-fell",
+        "counter-fell-and-came-back",
+        "two-processes-on-one-id",
         "lower-number",
         "unreadable-mark",
         "missing-mark",
@@ -846,18 +857,19 @@ def test_two_sessions_keep_their_own_marks(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "session",
     [
-        pytest.param("../escaped", id="relative-forward"),
-        pytest.param("..\\escaped", id="relative-back"),
+        pytest.param("a/../../escaped", id="interior-forward"),
+        pytest.param("a\\..\\..\\escaped", id="interior-back"),
+        pytest.param("a:stream", id="alternate-stream"),
         pytest.param("..", id="parent"),
-        pytest.param("C:\\escaped", id="absolute"),
         pytest.param("name.with.dots", id="dots"),
-        pytest.param("name\n", id="trailing-newline"),
         pytest.param("x" * 129, id="too-long"),
     ],
 )
 def test_a_session_id_that_is_not_a_plain_name_writes_no_mark(tmp_path: Path, session: str) -> None:
     """The id comes from a JSON payload and names a file. An id that is not a plain name is refused
-    rather than cleaned up, because two ids cleaned to one name would share a mark."""
+    rather than cleaned up, because two ids cleaned to one name would share a mark. The file name is
+    prefixed, so an id must hold an interior segment to climb out; each case here does write a file with
+    the test removed."""
     state = tmp_path / "root" / "mefor-usage"
     state.mkdir(parents=True)
     seven = window(40.0, 280000)
@@ -910,6 +922,61 @@ def test_a_published_window_with_no_number_is_not_a_reading_of_zero(
 
     _session_fire(tmp_path, seven, api_ms=2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == 0, latest(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [pytest.param(None, id="absent"), pytest.param("", id="blank")],
+)
+def test_the_reader_does_not_turn_a_window_with_no_number_into_a_zero(
+    tmp_path: Path, missing: str | None
+) -> None:
+    """Fresh, stamped and with its reset ahead, so nothing but the number is wrong. A 0 here would read
+    OK and clear the gate. The survey prints no number either."""
+    publish(tmp_path, seven=40.0)
+    doc = latest(tmp_path)
+    if missing is None:
+        del doc["seven_day"]["used_percentage"]
+    else:
+        doc["seven_day"]["used_percentage"] = missing
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    code, got = read(tmp_path)
+    assert code == UNKNOWN and got["state"] == "UNKNOWN", got
+    assert got["seven_day"]["used_percentage"] is None, got
+    assert "carries no percentage" in got["seven_day"]["reason"], got
+
+
+def test_the_survey_prints_no_number_for_a_window_with_none(fake_home: Path) -> None:
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    publish(state, seven=40.0)
+    doc = latest(state)
+    del doc["seven_day"]["used_percentage"]
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _, got, _ = reader("-Json", "-AllRoots", pin=pin, home=fake_home)
+    row = next(r for r in got["roots"] if r["root"].endswith(".claude-account-1"))
+    assert row["seven"] is None, row
+
+
+def test_a_blank_percentage_in_a_payload_is_no_reading(tmp_path: Path) -> None:
+    """An absent window is carried, and a blank one is absent: [double]"" would have published a 0."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven)
+    _session_fire(tmp_path, {**window(0.0, 290000), "used_percentage": ""})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(40.0)
+    assert len(history(tmp_path)) == 1, history(tmp_path)
+
+
+def test_the_collector_and_the_hook_agree_on_what_a_number_is() -> None:
+    """Two copies of one rule in two files that must each survive the other, so drift goes red here."""
+    hook = ROOT / "scripts" / "hooks" / "usage-headroom-inject.ps1"
+    body = re.compile(r"^function Get-Finite\(\$Value\) \{$.*?^\}$", re.M | re.S)
+    copies = []
+    for path in (COLLECT, hook):
+        found = body.search(path.read_text(encoding="utf-8"))
+        assert found, f"no Get-Finite in {path}"
+        copies.append(found.group())
+    assert copies[0] == copies[1]
 
 
 def test_a_session_of_another_root_cannot_confirm_this_roots_reading(tmp_path: Path) -> None:

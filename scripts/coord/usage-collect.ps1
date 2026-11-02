@@ -131,7 +131,8 @@ function Write-AtomicText([string]$Path, [string]$Text) {
 }
 
 # A number out of JSON, or $null. `$null -as [double]` and `"" -as [double]` are both 0 in PowerShell
-# (measured 2026-11-02), and a missing value is neither a rise nor a reading of 0.
+# (measured 2026-11-02), and a missing value is neither a rise nor a reading of 0. The spawn hook holds
+# the same function, because each must survive without the other; tests/test_coord_usage.py pins them.
 function Get-Finite($Value) {
     if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $null }
     $d = $Value -as [double]
@@ -146,8 +147,12 @@ function Get-Finite($Value) {
 #
 # ONE MARK FILE PER SESSION, BECAUSE THE COUNTER IS PER SESSION AND A SHARED FILE CANNOT HOLD IT. Every
 # session on a root fires here, unlocked, so with one file a session could write back the older counter
-# of another that had just risen, and that session's next idle repeat would read as a rise. A session's
-# file has only that session's fires as writers.
+# of another that had just risen, and that session's next idle repeat would read as a rise.
+#
+# A MARK ONLY EVER RISES. Two processes can share one id, through a resume in a second terminal, and if a
+# lower counter were written back they would read each other's counters as a rise on every idle fire. So
+# a counter that fell writes nothing. A session whose counter really restarted then goes stale until it
+# passes its old mark, which is the safe side.
 #
 # THE ID COMES FROM THE PAYLOAD AND NAMES A FILE, so anything but a plain name is refused rather than
 # cleaned up: it could leave this directory, and two ids cleaned to one name would share a mark.
@@ -165,8 +170,8 @@ function Test-SessionCalledApi([string]$Dir, $Payload) {
     $path = Join-Path $markDir "mark-$sid.json"
     $prev = $null
     try { $prev = Get-Finite (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).api_ms } catch { }
-    # Only a change writes, so a mark changes once per API call.
-    if ($null -ne $prev -and $prev -eq $ms) { return $false }
+    # Only a rise writes, so a mark changes once per API call.
+    if ($null -ne $prev -and $ms -le $prev) { return $false }
     $written = $false
     try {
         [void][System.IO.Directory]::CreateDirectory($markDir)
@@ -180,7 +185,7 @@ function Test-SessionCalledApi([string]$Dir, $Payload) {
         }
         $written = Write-AtomicText $path (@{ api_ms = $ms } | ConvertTo-Json -Compress)
     } catch { }
-    return ($written -and $null -ne $prev -and $ms -gt $prev)
+    return ($written -and $null -ne $prev)
 }
 
 function Format-Reset([object]$EpochSeconds) {
@@ -240,10 +245,10 @@ try {
     # must not share a representation.
     function Get-Window($w) {
         if ($null -eq $w) { return $null }
-        $pct = $w.used_percentage
+        $pct = Get-Finite $w.used_percentage
         if ($null -eq $pct) { return $null }
         return [ordered]@{
-            used_percentage = [double]$pct
+            used_percentage = $pct
             resets_at_epoch = $w.resets_at
             resets_at       = Format-Reset $w.resets_at
         }

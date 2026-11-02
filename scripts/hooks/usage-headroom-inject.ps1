@@ -133,8 +133,10 @@
 
       A HIGH READING ALWAYS PRINTS IN FULL. That means a WARN, CRITICAL or UNAVAILABLE verdict, a window
       line marked WARN or CRITICAL, or any percentage at 85 or more, which is usage.ps1's WARN
-      threshold. The last two cover a high number under an UNKNOWN verdict: the Steward fallback is
-      ungraded, and the reader downgrades a WARN to UNKNOWN on a root it does not trust.
+      threshold. The last two cover a high number under an UNKNOWN verdict. At least three routes reach
+      one: the Steward fallback is ungraded, the reader downgrades a WARN to UNKNOWN on a root it does
+      not trust, and a stale floor below the ceiling reads UNKNOWN on a root it does, while the gate may
+      be halting on that number.
 
       THE STATE IS ADVICE THAT EXPIRES. The key is the session id, the agent id and the config root,
       because a Manager and its subagents share a session id. That the harness sends `agent_id` inside
@@ -264,8 +266,7 @@ function Get-ChangeKey([string]$Text) {
 
 # WARN, CRITICAL and UNAVAILABLE print in full every time, and so does any block that names a WARN or
 # CRITICAL window or shows a percentage at 85 or more. The last two catch a high reading under an
-# UNKNOWN verdict: the Steward fallback is ungraded, and usage.ps1 can downgrade a WARN to UNKNOWN on
-# a root it does not trust. 85 is usage.ps1's own WARN threshold.
+# UNKNOWN verdict; the header names the routes to one. 85 is usage.ps1's own WARN threshold.
 function Test-AlwaysFull([string]$Text, [string]$Verdict) {
     if ($Verdict -in @("WARN", "CRITICAL", "UNAVAILABLE")) { return $true }
     if ($Text -cmatch "\b(WARN|CRITICAL) --") { return $true }

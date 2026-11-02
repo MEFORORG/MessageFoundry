@@ -410,11 +410,12 @@ roster alias of the Lander.
 > The payload carries no time of its own, so an idle session's cached number looks like a live flat one.
 > Restamping an equal reading let one idle terminal keep a frozen number fresh, and the rung read OK on
 > it. So an equal reading refreshes the age only when the session reporting it has just called the API:
-> `cost.total_api_duration_ms` rose since that session's last fire and that rise was written to its own
-> mark file (`live-marks/mark-<session>.json`), the reset is the same and still ahead, and the session is
+> `cost.total_api_duration_ms` rose past that session's mark and the rise was written to its own mark
+> file (`live-marks/mark-<session>.json`), the reset is the same and still ahead, and the session is
 > pinned to this root or unpinned. A mark is per session because a shared file, written unlocked, could
-> put back another session's older counter, and a mark that cannot be written proves nothing, so neither
-> reads as a rise on an idle repeat. A pool nobody has called for 20
+> put back another session's older counter. It only ever rises, because two processes can share one
+> session id. A mark that cannot be written proves nothing. So none of these reads as a rise on an idle
+> repeat. A pool nobody has called for 20
 > minutes goes stale and reads UNKNOWN, so a healthy live flat account stays fresh and an idle one does
 > not. The statusLine docs list the counter, as read on 2026-11-01. No real payload on this box was checked
 > for it; with no counter, nothing refreshes and the account goes stale as before. Whether a call that failed
