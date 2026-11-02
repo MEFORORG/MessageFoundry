@@ -5,7 +5,7 @@
 An inbound ``messages_days = 0`` or an outbound ``dead_letter_days = 0`` keeps that connection's PHI
 bodies forever. The ``serve`` gate read only the global windows, so the override needed no
 acknowledgement and wrote no AUDIT line. The overrides live in the graph, so a registry guard judges
-them: refuse under enforce, warn under warn, AUDIT once acknowledged.
+them: refuse under enforce unless acknowledged, and otherwise pass the graph and write an AUDIT line.
 """
 
 from __future__ import annotations
@@ -25,11 +25,16 @@ from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
     auto_bounded_windows,
+    judge_keep_forever_overrides,
     keep_forever_overrides,
-    make_retention_override_guard,
 )
-from messagefoundry.config.settings import EgressSettings, StoreBackend
-from messagefoundry.config.wiring import Registry, WiringError, load_config
+from messagefoundry.config.settings import (
+    EgressSettings,
+    RetentionSettings,
+    SecuritySettings,
+    StoreBackend,
+)
+from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.engine import Engine
 from tests._phi_gate_provisions import (
@@ -37,36 +42,18 @@ from tests._phi_gate_provisions import (
     setenv_declared_egress,
     setenv_verified_log_forwarding,
 )
+from tests._retention_override_graph import override_graph as _graph
+from tests._retention_override_graph import override_guard
 from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
+from tests.test_security_posture_defaults import _pairs
 
 _LOG = logging.getLogger("tests.retention_override_gate")
 _ACK = "[security].allow_keeping_phi_indefinitely"
-
-
-def _graph(cfg: Path, *, inbound_days: int | None, outbound_days: int | None) -> Registry:
-    """A two-connection graph; ``None`` leaves that connection's override unset (inherit)."""
-    cfg.mkdir()
-    ib = "" if inbound_days is None else f", messages_days={inbound_days}"
-    ob = "" if outbound_days is None else f", dead_letter_days={outbound_days}"
-    (cfg / "feed.py").write_text(
-        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
-        f"inbound('IB_FEED', MLLP(port=2611), router='r'{ib})\n"
-        f"outbound('OB_FEED', MLLP(host='127.0.0.1', port=2612){ob})\n"
-        "@router('r')\n"
-        "def route(msg):\n"
-        "    return ['h']\n"
-        "@handler('h')\n"
-        "def handle(msg):\n"
-        "    return Send('OB_FEED', msg)\n",
-        encoding="utf-8",
-    )
-    return load_config(cfg)
+_BODY_SWITCH = "delete_message_bodies_after_days"
 
 
 def _guard(*, acknowledged: bool, enforcing: bool) -> Callable[[Registry], None]:
-    return make_retention_override_guard(
-        acknowledged=acknowledged, enforcing=enforcing, env_name="prod", log=_LOG
-    )
+    return override_guard(_LOG, acknowledged=acknowledged, enforcing=enforcing)
 
 
 def _guard_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -103,16 +90,21 @@ def test_enforce_refuses_an_unacknowledged_override_and_names_the_connection(
     assert f"{_ACK}=true" in str(exc.value)
 
 
-def test_warn_enforcement_warns_instead_of_refusing(
+def test_warn_enforcement_audits_instead_of_refusing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # Owner ruling 2026-11-01: this arm keeps those bodies forever, so it leaves an AUDIT record even
+    # though nobody acknowledged anything. It still passes the graph.
     registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=0)
     capsys.readouterr()
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
         _guard(acknowledged=False, enforcing=False)(registry)
     (record,) = _guard_records(caplog)
     text = record.getMessage()
-    assert "IB_FEED" in text and "OB_FEED" in text and not text.startswith("AUDIT:")
+    assert record.levelno == logging.WARNING and text.startswith("AUDIT:")
+    assert "IB_FEED" in text and "OB_FEED" in text
+    # It must not read as the acknowledged line: no switch was set here.
+    assert "[security].enforcement = warn" in text and f"{_ACK}=true;" not in text
     # The remedy names the switch and says how far it reaches.
     assert f"{_ACK}=true" in text and "covers the whole instance" in text
     # Only the auto-bounded windows lose a default, and the remedy names each of them.
@@ -141,14 +133,149 @@ def test_an_acknowledged_override_loads_and_is_audited_by_name(
     assert f"warning: {text}" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (True, False), (False, False)]
+)
+def test_the_audit_line_is_written_each_time_the_guard_passes_a_graph(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool, enforcing: bool
+) -> None:
+    # The cadence is the same in every arm that passes the graph: one line per pass, with no memory
+    # of an earlier one. The engine's dry-run path is driven below.
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    guard = _guard(acknowledged=acknowledged, enforcing=enforcing)
+    with caplog.at_level(logging.WARNING, logger=_LOG.name):
+        guard(registry)
+        guard(registry)
+    lines = [r.getMessage() for r in _guard_records(caplog)]
+    assert len(lines) == 2 and all(line.startswith("AUDIT:") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (True, False), (False, True), (False, False)]
+)
 def test_a_graph_with_no_keep_forever_override_is_silent(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool, enforcing: bool
 ) -> None:
     registry = _graph(tmp_path / "cfg", inbound_days=7, outbound_days=None)
     with caplog.at_level(logging.WARNING, logger=_LOG.name):
-        _guard(acknowledged=acknowledged, enforcing=True)(registry)
+        _guard(acknowledged=acknowledged, enforcing=enforcing)(registry)
     assert _guard_records(caplog) == []
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_the_audit_line_names_no_environment_when_none_is_active(
+    tmp_path: Path, acknowledged: bool
+) -> None:
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=False, env_name=None
+    )
+    assert verdict.report is not None and "(environment" not in verdict.report
+
+
+def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:
+    # Under warn a global 0 passes the start gate. Inheriting it keeps the bodies forever with the
+    # line gone, so removing the override is the remedy only where the global window is bounded.
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=False, enforcing=False, env_name="prod"
+    )
+    assert verdict.report is not None
+    assert "inherit the global window where that window is bounded" in verdict.report
+
+
+@pytest.mark.parametrize("enforcing", [True, False])
+def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
+    tmp_path: Path, enforcing: bool
+) -> None:
+    # Both arms that give the remedy. The AUDIT line under warn is written on a reload too, and an
+    # operator who reads it there must not expect a reload to pick the switch up.
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=False, enforcing=enforcing, env_name="prod"
+    )
+    remedy = verdict.refusal if enforcing else verdict.report
+    assert remedy is not None
+    assert "which reads that switch only when it starts, so a reload does not" in remedy
+    # A bare "(audited)" is false of the global windows this switch also reaches. The docs guard
+    # in tests/test_security_doc_drift.py drives the gate this sentence describes.
+    assert "(audited)" not in remedy
+    assert "an engine writes an AUDIT line naming these connections" in remedy
+    # The imperative carries its own reason, or a reader on enforce has none to bound a window.
+    assert "Set each of them to an explicit number of days first, or" in remedy
+    assert "AUDIT line for such a window at 0 only under enforcement = enforce" in remedy
+
+
+@pytest.mark.parametrize(
+    ("authored", "early_names_body", "folded_days"),
+    [
+        # What the entry exists to say: the gate leaves the window unbounded, nobody typed 0.
+        ("security.allow_keeping_phi_indefinitely = true\n", False, 0),
+        (f"security.{_BODY_SWITCH} = 0\n", True, 0),
+        # Controls: the switch alone does not name the window, and neither does the dial.
+        (
+            f"security.allow_keeping_phi_indefinitely = true\nsecurity.{_BODY_SWITCH} = 30\n",
+            False,
+            30,
+        ),
+        ("", False, 30),
+    ],
+    ids=["switch-window-unset", "explicit-zero", "switch-window-bounded", "neither"],
+)
+def test_the_two_readings_of_the_list_differ_as_the_retention_entry_says(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    authored: str,
+    early_names_body: bool,
+    folded_days: int,
+) -> None:
+    """The real ``serve`` runs, so its own order is what is read: warning, gate, then the fold.
+
+    The ``SECURITY-LOOSENING.md`` retention entry states the result, and
+    ``tests/test_security_doc_drift.py`` reads that prose. A ``SecuritySettings`` built by hand
+    cannot show it: it never passes the fold, where an unset window under the switch becomes a 0
+    nobody wrote. Only the app and uvicorn are replaced. The later reading is the registry on the
+    ``[security]`` view ``serve`` hands the app, every other section at its default, and not the
+    posture route itself. Only ``warn`` is run, because the fold reads no dial."""
+    rc, handed = _run_secure_serve(
+        tmp_path, monkeypatch, f'security.enforcement = "warn"\n{authored}'
+    )
+    assert rc == 0
+
+    # `serve` configures logging itself, so the line is read off stdout rather than from caplog.
+    (early,) = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "posture loosened from the secure defaults" in line
+    ]
+    # Each entry prints as `name (risk)`, so a name inside another entry's risk does not count.
+    assert (f"{_BODY_SWITCH} (" in early) is early_names_body
+    switch_set = "allow_keeping_phi_indefinitely" in authored
+    assert ("allow_keeping_phi_indefinitely (" in early) is switch_set
+
+    security = handed["security_settings"]
+    retention = handed["retention_settings"]
+    assert isinstance(security, SecuritySettings)
+    assert isinstance(retention, RetentionSettings)
+    assert security.delete_message_bodies_after_days == folded_days
+    folded = dict(_pairs(sec=security))
+    assert (_BODY_SWITCH in folded) is (folded_days == 0)
+    assert ("allow_keeping_phi_indefinitely" in folded) is switch_set
+    if folded_days == 0:
+        # True here too, where the gate neither bounded the window nor refused the start.
+        assert "auto-bound" not in folded[_BODY_SWITCH]
+    # Really unbounded under the switch, so the absence just below hides something.
+    for field in ("dead_letter_days", "reference_snapshot_days", "processed_archive_days"):
+        assert (getattr(retention, field) == 0) is switch_set
+    text = " ".join(f"{name} {risk}" for name, risk in folded.items())
+    assert not [w.field for w in auto_bounded_windows() if w.field in text]
+
+
+def test_a_warn_only_tier_switch_does_name_its_window() -> None:
+    # Why the docs say "auto-bounded" where they say the list names no other window.
+    tier = _pairs(sec=SecuritySettings(allow_keeping_app_logs_indefinitely=True))
+    assert "app_log_days" in " ".join(risk for _name, risk in tier)
 
 
 def test_chained_guards_run_in_order_and_the_first_refusal_wins() -> None:
@@ -201,6 +328,29 @@ async def test_the_engine_reload_path_runs_the_guard(tmp_path: Path) -> None:
         await eng.stop()
 
 
+@pytest.mark.parametrize("acknowledged", [True, False])
+async def test_a_dry_run_reload_writes_the_audit_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, acknowledged: bool
+) -> None:
+    # The docs say a dry-run reload counts. Nothing goes live, which is why the line says the gate
+    # passed the graph and never that the graph is running.
+    cfg = tmp_path / "cfg"
+    _graph(cfg, inbound_days=0, outbound_days=None)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(acknowledged=acknowledged, enforcing=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger=_LOG.name):
+            await eng.reload_detail(cfg, dry_run=True)
+    finally:
+        await eng.stop()
+    (record,) = _guard_records(caplog)
+    assert record.getMessage().startswith("AUDIT:") and "IB_FEED" in record.getMessage()
+
+
 def _served_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: str
 ) -> Callable[[Registry], None]:
@@ -234,6 +384,18 @@ def test_serve_reads_the_acknowledgement_into_the_guard(
 ) -> None:
     guard = _served_guard(tmp_path, monkeypatch, "security.allow_keeping_phi_indefinitely = true\n")
     guard(_graph(tmp_path / "cfg", inbound_days=0, outbound_days=0))
+
+
+@_SERVE_PROVISIONS
+def test_serve_under_warn_hands_over_a_guard_that_audits_and_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    guard = _served_guard(tmp_path, monkeypatch, 'security.enforcement = "warn"\n')
+    registry = _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
+    capsys.readouterr()
+    guard(registry)
+    (line,) = [ln for ln in capsys.readouterr().err.splitlines() if "IB_FEED" in ln]
+    assert line.startswith("warning: AUDIT:")
 
 
 @_SERVE_PROVISIONS
@@ -368,10 +530,10 @@ def test_check_refuses_the_graph_the_guard_refuses_in_the_guards_words(
 
 
 @pytest.mark.parametrize(
-    ("switch", "written"),
+    ("switch", "arm"),
     [
-        ("security.allow_keeping_phi_indefinitely = true\n", "audit record: the retention gate"),
-        ('security.enforcement = "warn"\n', "a per-connection retention override keeps"),
+        ("security.allow_keeping_phi_indefinitely = true\n", f"{_ACK}=true;"),
+        ('security.enforcement = "warn"\n', "[security].enforcement = warn"),
     ],
 )
 def test_check_passes_and_carries_what_the_guard_would_write(
@@ -380,7 +542,7 @@ def test_check_passes_and_carries_what_the_guard_would_write(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
     switch: str,
-    written: str,
+    arm: str,
 ) -> None:
     _clear_posture_env(monkeypatch)
     _graph(tmp_path / "cfg", inbound_days=0, outbound_days=None)
@@ -391,11 +553,12 @@ def test_check_passes_and_carries_what_the_guard_would_write(
 
     assert leg.ok and not leg.skipped
     assert leg.detail.startswith(
-        f"the retention override guard would pass this graph and report: {written}"
+        "the retention override guard would pass this graph and report: audit record: the "
+        "retention gate"
     )
     # check relabels the guard's AUDIT line, so its own output never reads as an audited load.
     assert "AUDIT:" not in leg.detail
-    assert "IB_FEED" in leg.detail
+    assert "IB_FEED" in leg.detail and arm in leg.detail
     # The leg reports what the guard would write. It writes no AUDIT line or warning of its own.
     assert "AUDIT:" not in capsys.readouterr().err
     assert not [r for r in caplog.records if "retention" in r.getMessage()]
@@ -546,5 +709,5 @@ def test_the_supervise_guard_passes_what_an_engine_shard_would_load(
     guard = _supervise_guard(tmp_path, monkeypatch, switch)
     capsys.readouterr()
     guard(registry)
-    # Refusal only: the warning and the AUDIT line are each engine shard's to write.
+    # Refusal only: the AUDIT line is each engine shard's to write.
     assert capsys.readouterr().err == ""

@@ -1167,8 +1167,10 @@ only on a non-enforcing instance — which the shipped gate
 (`evaluate_retention_gate` in
 [`retention_classification.py`](../messagefoundry/config/retention_classification.py)) refutes; an
 *unset* window has not refused since the auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
-derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
-suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
+derive PHI. The opt-out is `[security].allow_keeping_phi_indefinitely = true`, which suppresses the
+auto-bound as well as the refusal.
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--true--unbounded-phi-retention)
+says what each record shows on either dial. **Thirty days is the engine's floor against an
 accidentally unbounded window, not your retention policy — set each window to the number your site
 actually requires.** See [PHI.md §8](PHI.md#8-retention--purge).
 
@@ -1227,16 +1229,22 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
 >
-> **An override of `0` needs the same acknowledgement as a global `0`** (BACKLOG #2368). It keeps that
-> connection's PHI bodies forever, whatever the global window says. The overrides live in the graph, so
-> `serve` checks them when it loads the graph, at least at startup and on every config reload:
+> **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
+> #2368). It keeps that connection's PHI bodies forever, whatever the global window says. The
+> overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
+> and on every config reload:
 >
 > - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
 >   graph and names each connection. At startup the engine does not start. On a reload the running
 >   graph stays.
-> - Without it, under `warn`, the engine logs a warning naming each connection and loads the graph.
-> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection,
->   each time it passes one. A dry-run reload counts.
+> - Without it, under `warn`, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming
+>   each connection, with the remedy (owner ruling 2026-11-01). The graph loads with no
+>   acknowledgement, and those bodies are kept forever.
+> - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection.
+>
+> The gate writes its `AUDIT:` line each time it passes such a graph. A dry-run reload counts, and
+> each engine shard writes its own. The startup gate for the global body windows differs: it writes
+> its `AUDIT:` line only under `enforce`.
 >
 > **That switch is not scoped to one connection.** It also turns off the 30-day default for each
 > unset window that carries one (those named in the posture paragraph above), and it acknowledges
@@ -1247,8 +1255,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a
 > required check, `retention-overrides`, so a graph an enforcing engine would refuse fails the check
 > in the same words. `supervise` reads it once before it starts an engine shard, and refuses to start
-> the fleet on a graph each engine shard would refuse. Neither writes the warning or the `AUDIT:`
-> line; those belong to the engine that loads the graph.
+> the fleet on a graph each engine shard would refuse. Neither writes the `AUDIT:` line; that belongs
+> to the engine that loads the graph.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are
@@ -1957,18 +1965,31 @@ path, no git commit and no message content.
 | `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). **The same gate also requires a reminder recipient (BACKLOG #2008, ASVS 6.4.5).** Host and sender are enough for the per-user notices, which are addressed to each account. The credential reminders (`initial_credential_expiring`, `cert_expiry`, `secret_rotation`) go to the `[alerts]` notifier instead, and that is built only from `webhook_url`, or from `email_smtp_host` + `email_from` + at least one `email_to`. So when any reminder can fire (`[auth].initial_password_expiry_hours`, `[cert_monitor].warn_days` or `[secret_rotation].warn_days` above `0`; the last since BACKLOG #2227) and neither recipient is set, `serve` refuses under `enforce` and warns under `warn`. Setting this flag `false` waives that check too, with an audit line saying the reminders reach only the log. |
 | `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. |
 | `rules` | list | `[]` | ordered `[[alerts.rules]]` table array — per-event severity, transport routing, thresholds, suppression, cooldown (see below). Empty = today's behaviour (every event → every transport at `warning`). |
-| `security_signals` | bool | `true` | the security-signal rule layer over the audit stream (vault BACKLOG #2613). `false` switches off all six detectors below, the DEBUG and posture ones included. With no transport configured, the signals reach the log at `WARNING`, as every alert does |
-| `security_window_seconds` | num | 300 | the sliding window the four counting detectors use. Must be finite and above 0 |
+| `security_signals` | bool | `true` | the security-signal rule layer over the audit stream (vault BACKLOG #2613). `false` switches off every detector below but the posture one, and is a loosening, so the next start raises `posture_loosened`, whose list of names can be cut before this one ([SECURITY.md](SECURITY.md#audit-1)). With no transport configured, the signals reach the log at `WARNING`, as every alert does |
+| `security_window_seconds` | num | 300 | the sliding window the five counting detectors use. Must be finite and above 0 |
 | `security_signin_failures` | int | 20 | raise `signin_failure_burst` when one client address has this many refused sign-ins (`auth.login_failed`) inside the window. A directory sign-in refused by a live lock is not counted: its row is withheld from readers without `users:manage`. Keyed `signin:<address>`, never the typed username. `0` = off |
 | `security_denials` | int | 20 | raise `access_denied_burst` when one account has this many `auth.permission_denied`, `auth.channel_denied` and `auth.mfa_denied` rows inside the window. Keyed `account:<username>`. `0` = off |
 | `security_body_views` | int | 100 | raise `body_view_burst` when one account reads this many stored bodies inside the window: `message_body_view` and `attachment_download` rows, an `outbound.read` that returned a payload, and a `response.read` that returned reply bodies. `0` = off |
 | `security_export_messages` | int | 5000 | raise `bulk_export` when one account's `messages_export` calls select this many messages in total inside the window. `0` = off |
+| `security_peer_refusals` | int | 100 | raise `peer_refused_burst` when one inbound listener (at least MLLP, raw TCP, X12, HTTP and the DICOM server) refuses this many connections at its `source_ip_allowlist` or a connection cap inside the window, counted whether or not connection-event capture is on. One sender retrying counts once per attempt. Keyed `inbound:<name>`, never the peer's address, which the throttled refusal log line names for an allowlist or per-host refusal. Once raised, that listener's refusals are not counted for the window, or for 300 s when the window is longer. A cap refusal counts too, so a listener held full by ordinary load raises it as well. At most `100000`. `0` = off |
+
+`security_signals = false`, and with the layer on a count of `0` or above its default, or a
+`security_window_seconds` below its default while any count is above `0`, is a loosening:
+`GET /security/posture` names it, as `alerts.<setting>`.
 
 The layer has two more detectors with no threshold. `log_level_debug` fires when `PATCH /logging/level`
 sets DEBUG, and when a production instance refuses that request. `posture_loosened` fires when a start
 records a non-empty loosenings list in its `config_loaded` audit row. A site that loosens on purpose
 pages on every start; suppress it with an `[[alerts.rules]]` row for `posture_loosened`, which keeps
-the instance on the alert list. Neither of these two resolves itself: an operator resolves it.
+the instance on the alert list. A later start that records an empty list, in a row marked neither
+`superseded` nor `baseline_unchecked`, resolves it once a live posture read is clean too, through the
+`posture_restored` inverse, which pages nobody and no rule can name. Its key carries `@node:<id>` or
+`@shard:<id>` where several engine processes share the store, so one process's clean start never
+resolves another's; an unpinned cluster node's id changes on every start, so that node raises the
+inverse for its own alert as it shuts down. When that alert can still stay open, and how to
+resolve it by hand, is in [SECURITY.md](SECURITY.md#audit-1).
+`log_level_debug` does not resolve itself, and neither do the counting detectors: an operator
+resolves them.
 Past five subjects alerting from one counting detector inside one window, later ones share a
 `<prefix>:*` subject. An account lock raises no alert: the lock rows are withheld from readers
 without `users:manage`, and the alert list is readable under `monitoring:diagnose`.
@@ -1982,7 +2003,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `remote_debug_refused`, `sandbox_worker_refused`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `store_restored`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `remote_debug_refused`, `sandbox_worker_refused`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `store_restored`, `update_available`, and the seven security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `peer_refused_burst`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
@@ -3114,14 +3135,16 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 — byte-identical to the former production-PHI refusal
 ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)).
 
-> **Two acknowledged exceptions — `enforcement = enforce` is not the whole answer.** The No-loosen rule
+> **Acknowledged exceptions — `enforcement = enforce` is not the whole answer.** The No-loosen rule
 > ships with exactly two dedicated second-acknowledgment switches ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md);
 > [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) invariant 1), each of which drops **one** strict-enforcement
 > refusal to a loud, audited warning that starts:
 > `allow_unencrypted_phi_under_strict_enforcement` (keyless PHI at rest) and
 > `allow_single_factor_admin_when_exposed` (single-factor sign-in on an exposed instance) — both rows below.
+> The retention switches (`allow_keeping_phi_indefinitely`, each `allow_keeping_<tier>_indefinitely`)
+> start under `enforce` too, outside those two — rows below.
 > Separately, `enforcement = warn` downgrades **every** PHI serve-gate refusal at once. So confirming
-> `enforcement = enforce` is necessary but **not sufficient**: read those three values before recording
+> `enforcement = enforce` is necessary but **not sufficient**: read at least those values before recording
 > a posture. Each is reported by `security_loosenings()` on `GET /security/posture`, so none is silent.
 
 | key | type | default | meaning |
@@ -3153,15 +3176,15 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `sign_out_after_idle_minutes` | int | `30` | session idle timeout |
 | `max_session_hours` | int | `12` | session absolute lifetime |
 | `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. Leaving it unset applies `true`, because the internal `[egress]` field defaults to deny too (see [`[egress]`](#egress)). `serve` still reads whether you **wrote** it, because its [`[egress]`](#egress) startup gate treats unset and written `true` differently |
-| `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
-| `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention. It covers the whole instance, and every connection's own keep-forever override too: see *Per-connection overrides* under [`[retention]`](#retention) |
+| `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely ([what each record shows](SECURITY-LOOSENING.md#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--true--unbounded-phi-retention)). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
+| `allow_keeping_phi_indefinitely` | bool | `false` | escape: unbounded PHI retention ([what each record shows](SECURITY-LOOSENING.md#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--true--unbounded-phi-retention)). It covers the whole instance, and every connection's own keep-forever override too: see *Per-connection overrides* under [`[retention]`](#retention) |
 | `allow_keeping_transform_state_indefinitely` | bool | `false` | the acknowledgement for `[retention].state_max_age_days = 0` (BACKLOG #1967). Without it or a window, an enforcing instance refuses to start. With it, the start writes a WARNING-level `AUDIT:` line naming the tier. A **loosening**. See the tier table under [`[retention]`](#retention) |
 | `allow_keeping_search_presets_indefinitely` | bool | `false` | the same, for `[retention].search_preset_days = 0` |
 | `allow_keeping_app_logs_indefinitely` | bool | `false` | the same, for `[retention].app_log_days = 0` while `[logging].log_dir` is set |
 | `allow_keeping_backup_archives_indefinitely` | bool | `false` | the same, for `[backup].retention_keep = 0` while `[backup].destination` is set |
 | `audit_all_authorization_decisions` | bool | `true` | ePHI access is **always** audited regardless of this switch; this adds full *authorization-decision* tracing on top. **On by default since BACKLOG #1277** (2026-09-02), which reversed the scoped `false` [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md) §5 recorded on 2026-07-17: the flooding that default guarded against was attributed to console polling, and the console never reaches the gate. Setting it `false` narrows the trail to the state-changing surface, leaves every authenticated read unrecorded, and is reported as a **loosening**. Cost of `true`: one `auth.permission_granted` row per authenticated request on each `require()`-gated route, and **nothing prunes it** — `[retention].audit_days` is reserved and unenforced, so [`[retention]`](#retention) `audit_log_warn_rows` warns as the table grows, on by default. "Always audited" is about **coverage**, not about how hard those rows are to alter afterwards: the audit chain is only cryptographically tamper-*evident* on a **keyed** store, and its verify does not catch a truncated tail — see [`[integrity]`](#integrity) |
 | `handles_real_patient_data` | | | **→ REMOVED** ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)) — **every instance carries patient data** and the PHI gates apply unconditionally. Setting it is refused at load, with a message naming the per-gate switch to reach for instead. It turned off nineteen start-up gates on one line, each of which already had its own named, audited, separately-reported switch: `allow_unencrypted_phi`, `block_unlisted_outbound`, `allow_keeping_phi_indefinitely`, `allow_single_factor_admin_when_exposed`, `allow_unverified_alert_smtp_tls`, `[alerts].security_notifications_required`, a per-connection `cleartext_accepted`, a per-connection `tls_revocation_attested` with its mandatory reason (settable since [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md); audited at construction, and listed by `security_loosenings()` and `messagefoundry check`), the process-wide `MEFOR_TLS_REVOCATION_ATTESTED`, or the `enforcement` dial below. |
-| `enforcement` | `enforce` \| `warn` | `enforce` | the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) escape-clamp key ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 2). `enforce` (default) **refuses** every PHI serve-gate violation and shuts every blunt escape-clamp — byte-identical to the former production-tier behaviour; `warn` logs + audits + continues and honours the escapes (a loud, audited loosening, named by `security_loosenings()`). **Decoupled from `production_instance`** (env `MEFOR_SECURITY_ENFORCEMENT`) |
+| `enforcement` | `enforce` \| `warn` | `enforce` | the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) escape-clamp key ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 2). `enforce` (default) **refuses** every PHI serve-gate violation and shuts every blunt escape-clamp — byte-identical to the former production-tier behaviour; `warn` logs + continues and honours the escapes (a loud loosening, named by `security_loosenings()`, whose list the start's best-effort `config_loaded` audit row records). A gate's own `AUDIT:` line is per gate: at least the global body-window gate in [`[retention]`](#retention) writes none at `warn`. **Decoupled from `production_instance`** (env `MEFOR_SECURITY_ENFORCEMENT`) |
 | `production_instance` | bool | *derived* | production-tier posture (was `[ai].production`). Derived from the environment name when unset (`prod` → yes; `dev`/`staging` → no). **Informational since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)** — drives the AI data-scope ceiling, the DEBUG-log refusal, and reporting, **not** the serve-gate refuse/warn dial (that is `enforcement`) |
 
 > **The Default column is the *field* default — for one row that is not what an
@@ -3173,7 +3196,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 >
 > | Row | Reads as | Internal field with `[security]` absent | What an unconfigured PHI instance actually does |
 > |---|---|---|---|
-> | `delete_message_bodies_after_days` | `30` | `retention.messages_days = 0` | the [`[retention]`](#retention) gate defaults each *unset* window to 30 days on a PHI instance under **both** enforcement dials; an **explicit** `0` refuses to start (exit 2) under `enforce` and warns under `warn`. There is no synthetic instance left to exempt ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); the audited keep-forever opt-out is `[security].allow_keeping_phi_indefinitely`. This cell previously had the refuse / auto-bound split backwards |
+> | `delete_message_bodies_after_days` | `30` | `retention.messages_days = 0` | the [`[retention]`](#retention) gate defaults each *unset* window to 30 days on a PHI instance under **both** enforcement dials; an **explicit** `0` refuses to start (exit 2) under `enforce` and warns under `warn`. There is no synthetic instance left to exempt ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); the keep-forever opt-out is `[security].allow_keeping_phi_indefinitely`. This cell previously had the refuse / auto-bound split backwards |
 >
 > It is not a silent fail-open. Unless `[security].allow_keeping_phi_indefinitely` is set, an unset
 > window is bounded at 30 days, and an explicit `0` is refused under `enforce` and warned under

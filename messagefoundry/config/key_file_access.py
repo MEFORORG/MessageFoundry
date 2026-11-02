@@ -219,8 +219,8 @@ def make_connection_key_file_preflight(
     has not yet applied, so the check and the swap use one read. A dry-run reload skips it, which
     is acceptable because a dry run starts no connection. The file checks run in a worker thread,
     off the event loop. Under ``enforce`` a problem raises ``WiringError``: a first load fails the start, and a reload or a DR activation is refused with
-    the running graph kept. Under ``warn`` it writes the reason to the logger AND to stderr, as the
-    retention override guard does, and passes the graph.
+    the running graph kept. Under ``warn`` it writes the reason to the logger AND to stderr, the two
+    places the retention override guard writes its line, and passes the graph.
 
     The engine runs it after the engine-shard filter, so an engine shard judges its own inbound
     connections and every outbound one. ``supervise`` judges the whole graph before it starts any."""

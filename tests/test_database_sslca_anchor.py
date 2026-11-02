@@ -23,7 +23,8 @@ import stat
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -33,6 +34,7 @@ from messagefoundry.auth.trust_anchors import (
     AUDIT_ACTION,
     ENCRYPTION_HEADER_SCOPE,
     PRIVATE_KEY_SCOPE,
+    AnchorSettingRefused,
     TrustAnchorError,
 )
 from messagefoundry.config import wiring
@@ -425,9 +427,11 @@ def test_a_pipe_swapped_in_after_the_stat_is_opened_without_waiting(
 def test_a_value_that_can_name_another_host_is_never_opened(
     remote: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The lane check runs before the build at a start, and the build refuses a remote spelling,
-    so the spec must not stat or open it first: on Windows that would dial the host over SMB. Red
-    with the remote screen taken out of ``driver_file_spellings``."""
+    """The lane check runs before the build at a start, so the spec must not stat or open a remote
+    spelling first: on Windows that would dial the host over SMB. It refuses it loudly, as a
+    refused setting, rather than returning no spec (BACKLOG #2705), so a value that turns remote
+    after the build cannot skip the check with no row. Red with the remote screen taken out of
+    ``driver_file_spellings``, and red with the refusal back to a silent ``None``."""
 
     touched: list[object] = []
 
@@ -438,8 +442,79 @@ def test_a_value_that_can_name_another_host_is_never_opened(
     with monkeypatch.context() as patched:
         patched.setattr(os.path, "exists", recording)
         patched.setattr(os.path, "isdir", lambda _p: False)
-        spec = ta.lane_anchor_spec("outbound", _OUT, _settings(remote))
-    assert touched == [] and spec is None
+        with pytest.raises(ValueError, match="must be a plain local path") as refused:
+            ta.lane_anchor_spec("outbound", _OUT, _settings(remote))
+    assert touched == []
+    assert "db-ca.invalid" not in str(refused.value)
+
+
+async def test_a_refused_sslca_names_the_setting_the_operator_set(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A DATABASE lane takes no ``tls_ca_file``, so its refusal names ``odbc_params sslca``, and never
+    the value. Through the real lane check, a start and a passive standby's line, and the setting a
+    reload refusal carries. It still refuses: the check raises ``AnchorSettingRefused`` and writes
+    no row. Red with these lines back on ``tls_ca_pin or tls_ca_file``. The control: a lane whose
+    CA is a ``tls_ca_file`` keeps that name."""
+    settings = _settings("//files.invalid/share/ca.pem")
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    with pytest.raises(AnchorSettingRefused, match="must be a plain local path") as refused:
+        await check("outbound", _OUT, settings)
+    assert await _rows(store, f"outbound:{_OUT}") == []
+
+    line = wiring_runner._lane_anchor_line("outbound", _OUT, settings, refused.value, passive=False)
+    assert str(line) == (
+        f"outbound connection '{_OUT}': its odbc_params sslca setting was refused. Fix the setting, "
+        "then reload and start the connection; the server log says why"
+    )
+    assert line.setting == f"outbound connection '{_OUT}' odbc_params sslca"
+    passive = wiring_runner._lane_anchor_line(
+        "outbound", _OUT, settings, refused.value, passive=True
+    )
+    assert "its odbc_params sslca setting was refused on this passive DR" in str(passive)
+    assert "files.invalid" not in str(line) and "files.invalid" not in str(passive)
+
+    async def refusing(*_args: object, **_kwargs: object) -> None:
+        raise AnchorSettingRefused("refused")
+
+    reloading = SimpleNamespace(
+        _lane_anchor_check=check,
+        _reload_anchor_lanes=lambda *_a: [("outbound", _OUT, settings)],
+        _check_lane_anchor=refusing,
+    )
+    with pytest.raises(wiring.WiringError) as reload_refused:
+        await wiring_runner.RegistryRunner._check_reload_lane_anchors(
+            cast(Any, reloading), Registry(), Registry(), []
+        )
+    cause = reload_refused.value.__cause__
+    assert isinstance(cause, TrustAnchorError)
+    assert cause.setting == f"outbound connection '{_OUT}' odbc_params sslca"
+
+    plain = {"tls_ca_file": str(_ca(tmp_path)), "tls_ca_pin": ""}
+    assert wiring_runner._refused_setting_keys(plain) == "tls_ca_pin or tls_ca_file"
+    assert "tls_ca_pin or tls_ca_file setting was refused" in str(
+        wiring_runner._lane_anchor_line("outbound", _OUT, plain, refused.value, passive=False)
+    )
+
+
+def test_a_ca_that_leads_off_the_host_after_the_build_is_refused_not_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2705: a local CA the build cleared, whose path later leads to another host (a link
+    swapped in), must not leave the lane check with no spec and no row. It is refused as a
+    setting, and nothing is opened. Red with ``database_ca_anchor_spec`` back on a silent ``None``.
+    It is refused under TLS off too, as the build refuses it in every mode: red with the TLS-off
+    return ahead of the judgement. The control: a local CA under TLS off, which the driver never
+    reads, still has no spec."""
+    ca = _ca(tmp_path)
+    off = {**_settings(ca), "odbc_params": {"SSLMODE": "DISABLED", "SSLCA": str(ca)}}
+    assert ta.lane_anchor_spec("outbound", _OUT, _settings(ca)) is not None
+    assert ta.lane_anchor_spec("outbound", _OUT, off) is None
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        ta.lane_anchor_spec("outbound", _OUT, _settings(ca))
+    with pytest.raises(ValueError, match="must be a plain local path"):
+        ta.lane_anchor_spec("outbound", _OUT, off)
 
 
 def test_a_device_named_as_sslca_is_refused_unread(tmp_path: Path) -> None:

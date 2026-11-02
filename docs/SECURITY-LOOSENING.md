@@ -9,15 +9,21 @@
 
 **Two invariants hold no matter what you set here** ([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5, the *No-loosen rule*):
 
-1. **A PHI weakening under strict enforcement is still refused — with two explicitly-acknowledged
+1. **A PHI weakening under strict enforcement is still refused — with explicitly-acknowledged
    exceptions.** No `[security]` value — and no `--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS` escape —
    can start a **PHI instance at `enforcement = enforce`** (the default) with a **cleartext off-box bind, no
-   auth, open egress, or unbounded PHI retention**. Those four still fail closed (`serve` exits 2),
-   unconditionally. At the default this is **byte-identical to the former production-PHI refusal** — [ADR
+   auth, or open egress**. Those three still fail closed (`serve` exits 2), unconditionally.
+   At the default this is **byte-identical to the former production-PHI refusal** — [ADR
    0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 2) re-keyed the
    refuse/warn dial off the *derived* `production` tier and onto the *explicit* `enforcement` level;
-   `enforcement = warn` reproduces the historical non-production warn-and-start (a loud, audited loosening —
-   see the `enforcement = warn` deviation below). **Two of these controls may be lifted while staying at
+   `enforcement = warn` reproduces the historical non-production warn-and-start (a loud loosening —
+   see the `enforcement = warn` deviation below). **Unbounded PHI retention** on a classified window
+   ([PHI.md](PHI.md) section 2 lists what no window reaches) fails closed the same way until a dedicated
+   retention switch lifts it at `enforce`:
+   [`allow_keeping_phi_indefinitely = true`](#delete_message_bodies_after_days--0--allow_keeping_phi_indefinitely--true--unbounded-phi-retention)
+   for the auto-bounded windows, and each
+   [`allow_keeping_<tier>_indefinitely`](#allow_keeping_tier_indefinitely--true--one-retention-tier-with-no-window)
+   for its one tier. **At least two other controls may be lifted while staying at
    `enforce`, but only behind a dedicated acknowledgment switch that does nothing else** (the No-loosen
    carve-out, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5 as amended, [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)):
    `allow_single_factor_admin_when_exposed` (single-factor sign-in at exposure) and
@@ -204,7 +210,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `allow_keeping_app_logs_indefinitely` | `false` |
 | | `allow_keeping_backup_archives_indefinitely` | `false` |
 | | `audit_all_authorization_decisions` | `true` (see note) |
-| Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
+| Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud loosening) |
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
@@ -238,6 +244,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
+| | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`, the window only while any count is above `0`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
@@ -268,7 +275,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
+`security_window_seconds`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
 `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
 `[alerts].email_tls_revocation_attested`, `[alerts].webhook_tls_revocation_attested` and
@@ -309,7 +317,11 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
 **decoupled** from `production_instance` — a PHI *staging* box is now strict by default too. `enforcement`
-gates every "still refused" clause below; `enforcement = warn` downgrades them all to loud, audited warnings.
+gates every "still refused" clause below; `enforcement = warn` downgrades them all to loud warnings. The
+dial itself is named by `security_loosenings()`, whose list the start's `config_loaded` audit row records.
+That row is best-effort: at least some of those rows record no list, such as a start whose snapshot step
+failed, and a failed write logs an ERROR and the start goes on. A gate's own `AUDIT:` line is per gate: at
+least the global body-window retention gate writes none at `warn`, as its entry below says.
 
 `production_instance` defaults to the value **derived from the active environment name** (`dev` →
 non-prod, `staging` → non-prod, `prod` → prod); a custom-named environment must declare it or `serve`
@@ -509,7 +521,19 @@ false premise.
 - **What you lose:** PHI message bodies accumulate at rest without bound (data-minimization failure).
 - **When acceptable:** a documented retention requirement that genuinely needs keep-forever, accepted in
   writing.
-- **Compensating controls:** a bounded window (e.g. 30 days); a startup **AUDIT** line records the override.
+- **Compensating controls:** a bounded window (e.g. 30 days). Under `enforcement = enforce`, a startup
+  **AUDIT** line records the override. Under `enforcement = warn` the gate writes no **AUDIT** line for it:
+  with no opt-out it prints a plain `warning:` line to stderr, and with `allow_keeping_phi_indefinitely = true`
+  it prints nothing about the window. At least `security_loosenings()` still carries it, and what that names
+  depends on when it is read. The start's posture warning runs before the gate, on the settings as written: it names the
+  switch, and `delete_message_bodies_after_days` only on an explicit `0`. `serve` then folds the effective
+  window back into `[security]`, so at least `GET /security/posture` and the list the start's
+  [best-effort](#the-switches) `config_loaded` audit row records read the effective value: with the switch set
+  and that window unset, they name `delete_message_bodies_after_days` too, though nobody wrote `0`.
+  `messagefoundry security show` runs no gate and reads the file as written, so it does not.
+  `security_loosenings()` does not read the other auto-bounded windows: at least `dead_letter_days`,
+  `reference_snapshot_days` and `processed_archive_days` can stay at `0` with no entry in any
+  `security_loosenings()` reading.
 - **Still refused:** a **PHI** instance whose PHI-body window is set **explicitly to `0`** refuses under
   **strict enforcement** (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true`
   (which downgrades the refusal to a loud audited warning). This bullet used to say the 30-day auto-bound of
@@ -555,9 +579,10 @@ false premise.
   MessageFoundry normally **refuses to start**. Every account with no second factor enrolled,
   Administrators included, would then sign in over the network with a single factor. The one
   exception is an OIDC sign-in that carries an amr/acr claim checked while
-  `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud, audited warning** (the same
-  warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
-  single-factor while staying at `enforce`.
+  `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud warning with a startup
+  AUDIT line** (the warn-and-start `enforcement = warn` takes, scoped to this one control, plus that line,
+  which this gate does not write under `enforcement = warn`), so the instance boots single-factor while
+  staying at `enforce`.
 - **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means
   `[api].tls_terminated_upstream` or a set `[api].trusted_proxies` — the bind-and-proxy posture,
   **independent of the browser console**. The
@@ -666,7 +691,7 @@ is refused, so an opt-out does nothing and is not reported.
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
-  off-box bind, open-egress, and single-factor-at-exposure refusals downgrade to loud audited warnings,
+  off-box bind, open-egress, and single-factor-at-exposure refusals downgrade to loud warnings,
   and an explicitly-zeroed PHI retention window warns rather than refusing. (The 30-day auto-bound of an
   **unset** window is not part of this dial — it applies under `enforce` too.) Named once by
   `security_loosenings()` and in `GET /security/posture`.
@@ -674,8 +699,10 @@ is refused, so an opt-out does nothing and is not reported.
   encryption / egress / retention paths are exercised, not first met in production) but is deliberately run at
   warn severity during bring-up; or a custom PHI-loopback env. A stock production instance never needs it (it
   is `enforce`-equivalent already).
-- **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
-  **AUDIT** line + posture view keep the deviation visible.
+- **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings, the
+  posture view and the start's best-effort `config_loaded` audit row keep the deviation visible. A startup
+  **AUDIT** line is a gate's own, and not every gate writes one at `warn`: [*The switches*](#the-switches)
+  says so.
 - **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
   loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
@@ -826,6 +853,36 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Reversible:** yes. Remove the rule or narrow its `event_type`, and restart. Giving it a transport
   is not enough on its own: `mute = true` sends nothing whatever `transports` holds, and an
   `escalate` tier with `transports = []` overrides the base rule once it is reached.
+
+### `[alerts].security_signals = false`, or a detector looser than its default — a security signal raises no alert, or a later one
+Named as `alerts.security_signals`, or, with the layer on, as `alerts.security_signin_failures`,
+`alerts.security_denials`, `alerts.security_body_views`, `alerts.security_export_messages`,
+`alerts.security_peer_refusals` or `alerts.security_window_seconds`, the window only while any
+count is above `0` (vault BACKLOG #2613).
+- **What you lose:** the alert, or an early one. Refused sign-ins, refused requests, stored-body
+  reads and exports still leave audit rows. A refused connection leaves no audit row, and on some
+  paths no log line or `connection_event` row either, so this detector may be its only record.
+  With the layer off a DEBUG log level raises no alert either. The `[alerts]` table of
+  [CONFIGURATION.md](CONFIGURATION.md) says what each detector counts.
+- **What stays:** the posture detector. With the layer off it still runs, so a start that records
+  its loosenings raises `posture_loosened`. Its list of names can be cut before this one, as
+  [SECURITY.md](SECURITY.md#audit-1) states, and the start's `config_loaded` row holds them all.
+- **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns. It
+  does not see refused connections, and with the layer off nothing counts them, so a site that
+  turns the layer off accepts losing that alert. With the layer on, a SIEM on the audit stream is
+  no reason to zero or raise `security_peer_refusals`, since that detector covers what the SIEM
+  cannot see. Raising it is acceptable for a listener that ordinary load holds at a connection
+  cap, which the `security_peer_refusals` row of [CONFIGURATION.md](CONFIGURATION.md) describes.
+  It is one setting for every inbound listener, so on every listener a larger value delays the
+  refusal alert, and suppresses it outright for any burst below the raised threshold. To quiet
+  one listener instead, add an `[[alerts.rules]]` row with `event_type = "peer_refused_burst"`,
+  `connection = "inbound:IB_BUSY"` and `mute = true`. The rule's glob is matched against the
+  alert's subject, so `connection = "IB_BUSY"` never matches `inbound:IB_BUSY`, and that rule
+  loads with no warning. Neither rule is named as a loosening. A muted listener still takes one
+  of the five subjects a window can name, and past those five its alert's subject is `inbound:*`,
+  which that rule does not match, so it pages. Each listener counts its own refusals; the `[alerts]`
+  table of [CONFIGURATION.md](CONFIGURATION.md) says when alerts share a subject.
+- **Reversible:** yes. Remove the line, or set the default, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a
