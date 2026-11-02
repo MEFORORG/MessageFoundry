@@ -17,10 +17,11 @@
   in it, such as `'tls'` with its quotes or a value of several words, is replaced wherever it appears;
   text under three characters is not replaced at all, so `p@x` goes and `p@` prints. A chain of more
   than 1024 exceptions is not read to its end, so that refusal's whole text is withheld and the module
-  is refused. Text of three characters or more equal to a whole
-  identifier or word of the refusal, such as a connection named `tls` or the setting
-  `source_ip_allowlist`, which loses that identifier or word. Quotations that overlap become one
-  marker. In a config module, at least the `tls_ca_pin`, `intake_auth`,
+  is refused. Text of three characters or more that equals a whole identifier or word of the
+  refusal, such as a connection named `tls` or the setting `source_ip_allowlist`, is replaced too,
+  so the refusal loses that identifier or word. Quotations that overlap or touch become one marker
+  and are judged as one text, so two values side by side, or one value twice, go like one value. In
+  a config module, at least the `tls_ca_pin`, `intake_auth`,
   `intake_auth_health`, `reply_on_timeout`, `reply_on_empty`, `reply_content_type`,
   `source_ip_allowlist`, `content_type` and `ws_password_type` refusals, an `intake_client_subjects`
   subject and an issuer that is not a DN no longer quote the value. An issuer key that does parse as a
@@ -29,11 +30,17 @@
   repeated keyword now reads `TypeError at line N naming 'keyword'`, when the source line spells
   that keyword. A config module that raises a `BaseException` that is not an `Exception` is now
   refused as a failed module, with no text, and a `SystemExit` of any class is refused the same way
-  on every thread, with nothing it was raised from. On the main thread, an exact
-  `KeyboardInterrupt` stops the load as a new, bare `KeyboardInterrupt` that carries none of the original's arguments, notes or chain; on any other
-  thread, where no signal can arrive, it is refused like the rest. The loader's read of a failed
-  module's exception runs the module's code, so a real Ctrl-C can land in it. On the main thread an
-  interrupt there stops the load the same way, with no exception chained to it. Any other fault in
+  on every thread, with nothing it was raised from. An exact `KeyboardInterrupt` on the main thread
+  with Python's own SIGINT handler in force, where it cannot be told from Ctrl-C, stops the load as
+  a new, bare `KeyboardInterrupt` that carries none of the original's arguments, notes or chain, and
+  one WARNING line names the file that was loading and quotes nothing of the exception. Anywhere else
+  no signal can raise it, so it is refused like the rest: on any other thread, and under another
+  handler, which includes `serve`'s load in the API lifespan because uvicorn holds SIGINT there. So a
+  module that raises one there fails the start with its refusal, and a real Ctrl-C there only asks
+  the server to exit. `serve`'s earlier load, which runs when the environment file is missing, is on
+  Python's handler and stops with that line. The loader's read of a failed module's exception runs
+  the module's code, so a real Ctrl-C can land in it, and an interrupt there is judged the same way,
+  with no exception chained to it. Any other fault in
   that read is absorbed and that module is refused, a `SystemExit` of any class on every thread
   included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
   no output on a module that failed. An exact `WiringError` also stands only while its arguments

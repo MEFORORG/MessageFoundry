@@ -42,6 +42,7 @@ import logging
 import math
 import os
 import re
+import signal
 import sys
 import threading
 import tokenize
@@ -9669,9 +9670,9 @@ def _module_failure(
 
     Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
     withheld diagnostic: :func:`_read_fault` says what happens to one. The module is refused, which
-    ends a load, and a ``validate`` run goes on to its next module, unless the fault is an interrupt,
-    which ends either. Call this outside any handler of ``exc``, so an interrupt leaving through
-    here does not carry ``exc`` as its context."""
+    ends a load, and a ``validate`` run goes on to its next module, unless :func:`_is_a_signal`
+    passes the fault, which ends either. Call this outside any handler of ``exc``, so an interrupt
+    leaving through here does not carry ``exc`` as its context."""
     fault: BaseException | None = None
     try:
         detail = _failure_detail(path.parent.resolve(), path.name, exc, source_of=source_of)
@@ -9686,8 +9687,22 @@ def _module_failure(
 def _is_a_signal(exc: BaseException) -> bool:
     """Whether ``exc`` can be what Ctrl-C raised. A subclass is not what a signal raises, and Python
     delivers a signal only to the main thread, so on any other, such as a reload's worker, an
-    interrupt is code, and one leaving there would stop the event loop."""
-    return type(exc) is KeyboardInterrupt and threading.current_thread() is threading.main_thread()
+    interrupt is code, and one leaving there would stop the event loop.
+
+    Only Python's own handler turns a signal into this exception, so under any other it is code too.
+    uvicorn holds SIGINT for the whole lifespan, where ``serve``'s first load runs, and a Ctrl-C
+    there only sets a flag on the server. A handler that raises one itself, as asyncio's does at a
+    second Ctrl-C, reads as code, and refusing the module ends that load as well.
+
+    The state is read here because a traceback cannot answer: an interrupt that stopped on a ``raise``
+    is code, but ``signal.default_int_handler()`` called from a module stops on a call, as a real
+    signal does. With Python's handler in force, what passes this can be either, so
+    :func:`_exec_module` logs which module was loading."""
+    return (
+        type(exc) is KeyboardInterrupt
+        and threading.current_thread() is threading.main_thread()
+        and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    )
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -9915,12 +9930,13 @@ def _withhold_quotations(text: str, quoted: Mapping[str, str]) -> str:
     """``text`` with each key of ``quoted`` replaced by a marker naming its value, a type.
 
     Every occurrence is found in the original text, so a quotation cannot match inside a marker. No
-    regular expression: these patterns are a config module's text. Occurrences that overlap become
-    one span with one marker, naming the type of the longest, so neither the head nor the tail of
-    either prints. A span made only of identifier characters that another one touches stays, or an
-    argument such as ``tls`` would rewrite the connection name ``IB_tls``. Any other span is
-    replaced, even where it equals an identifier or a word of the refusal: nothing here can tell a
-    connection named ``tls`` from a quoted value, and the marker is the failure to prefer."""
+    regular expression: these patterns are a config module's text. Occurrences that overlap or touch
+    become one span with one marker, naming the type of the longest, so neither the head nor the tail
+    of either prints, and two side by side do not each pass for part of a token. A span made only of
+    identifier characters that another one touches stays, or an argument such as ``tls`` would
+    rewrite the connection name ``IB_tls``. Any other span is replaced, even where it equals an
+    identifier or a word of the refusal: nothing here can tell a connection named ``tls`` from a
+    quoted value, and the marker is the failure to prefer."""
     spans: list[tuple[int, int, str, int]] = []
     for at, following, kind in sorted(
         (at, at + len(quotation), kind)
@@ -9928,7 +9944,7 @@ def _withhold_quotations(text: str, quoted: Mapping[str, str]) -> str:
         for at in _occurrences(text, quotation)
     ):
         length = following - at
-        if spans and at < spans[-1][1]:
+        if spans and at <= spans[-1][1]:
             first, last, widest_kind, widest = spans[-1]
             if length > widest:
                 widest_kind, widest = kind, length
@@ -10045,11 +10061,10 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     failing module, by its real type, because ``isinstance`` would run a ``__class__`` of the
     module's own. The exit code is not quoted, since it may be the author's text.
 
-    On the main thread, a ``KeyboardInterrupt`` stops the load, whatever is on it. A real interrupt
-    raised during a handler has a context, and code raising one looks the same, so neither can be
-    judged by what it carries; refusing one would make Ctrl-C a config error. What leaves is a new,
-    bare one, so the original's arguments, notes and chain stay behind. :func:`_is_a_signal` says
-    which ones those are, and any other is refused."""
+    A ``KeyboardInterrupt`` that :func:`_is_a_signal` passes stops the load, whatever is on it. A real
+    interrupt raised during a handler has a context, and code raising one looks the same, so neither
+    can be judged by what it carries; refusing one would make Ctrl-C a config error. What leaves is a
+    new, bare one, so the original's arguments, notes and chain stay behind. Any other is refused."""
     failure: BaseException | None = None
     try:
         helpers.run(module, path)
@@ -10093,6 +10108,15 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         # print it again from there.
         helpers.unregister(mod_name, module)
         refusal = _refusal_for(path, failure, helpers.source_of)
+    except KeyboardInterrupt:
+        # The stop is bare, and it can be a module's own raise, so this is all that says where it
+        # happened. The file and a fixed sentence, never the original's text.
+        _logger.warning(
+            "config module %s: a KeyboardInterrupt stopped the load here, from Ctrl-C or from "
+            "code the module ran",
+            path.name,
+        )
+        raise
     finally:
         # Whatever this module queued -- a failure part-way included, or a read of it importing a
         # helper -- is never drained by the next module, whose diagnostic would then name the wrong

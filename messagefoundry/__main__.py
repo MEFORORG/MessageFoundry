@@ -43,9 +43,10 @@ from messagefoundry.remotedebug import (
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
-# open a store or read a service TOML use these. The rest below runs on every command or is the
-# logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
-__lazy_modules__ = ["sqlite3", "tomllib"]
+# open a store or read a service TOML use the first two, and only a command's refusal reads the
+# third. The rest below runs on every command or is the logging chain, so it stays eager. The heavy
+# import is deferred in config/__init__.py.
+__lazy_modules__ = ["sqlite3", "tomllib", "messagefoundry.exception_origin"]
 
 # E402 on each import below: they follow the install call above on purpose.
 import argparse  # noqa: E402

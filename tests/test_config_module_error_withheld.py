@@ -28,9 +28,11 @@ from types import ModuleType
 
 import httpx
 import pytest
+import uvicorn
 
 import messagefoundry
 from messagefoundry.__main__ import main
+from messagefoundry.api import create_managed_app
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config, validate_config
@@ -1112,6 +1114,7 @@ def test_no_loader_frame_on_a_refusal_holds_the_withheld_original(tmp_path: Path
     assert _frames_holding(_load_error(tmp_path), ValueError) == []
 
 
+@pytest.mark.usefixtures("sigint_raises")
 def test_no_loader_frame_on_an_interrupt_holds_the_original(tmp_path: Path) -> None:
     _write(tmp_path, "feed.py", f"raise KeyboardInterrupt({NEEDLE!r})\n")
     with pytest.raises(KeyboardInterrupt) as ei:
@@ -1321,6 +1324,12 @@ def _assert_bare(exc: BaseException) -> None:
     assert exc.__cause__ is None and exc.__context__ is None
 
 
+def _assert_one_line_names_the_module(caplog: pytest.LogCaptureFixture) -> None:
+    (line,) = [r.getMessage() for r in caplog.records if "stopped the load" in r.getMessage()]
+    assert "feed.py" in line
+    assert NEEDLE not in caplog.text
+
+
 def _load_on_a_worker(d: Path) -> BaseException | None:
     def outcome() -> BaseException | None:
         try:
@@ -1352,12 +1361,71 @@ def sigint_raises() -> Iterator[None]:
     ],
     ids=["bare", "with-text", "from", "in-handler", "with-note"],
 )
-def test_an_interrupt_stops_the_load_with_nothing_on_it(tmp_path: Path, body: str) -> None:
-    # On the main thread code cannot be told from a signal, so all of these stop, with no text.
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_stops_the_load_with_nothing_on_it(
+    tmp_path: Path, body: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # With Python's own handler in force, code cannot be told from a signal, so all of these stop,
+    # with no text. The one line says which module was loading, and quotes nothing of the exception.
     _write(tmp_path, "feed.py", body)
-    with pytest.raises(KeyboardInterrupt) as ei:
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"),
+        pytest.raises(KeyboardInterrupt) as ei,
+    ):
         load_config(tmp_path)
     _assert_bare(ei.value)
+    _assert_one_line_names_the_module(caplog)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_with_another_handler_in_force_is_a_refused_module(tmp_path: Path) -> None:
+    # Only Python's own handler turns a signal into this exception, so under any other it is code.
+    _write(tmp_path, "feed.py", f"raise KeyboardInterrupt({NEEDLE!r})\n")
+    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    try:
+        err = _load_error(tmp_path)
+    except KeyboardInterrupt:
+        pytest.fail("the interrupt left the load as a Ctrl-C")  # one left alone ends the whole run
+    assert NEEDLE not in str(err) and "KeyboardInterrupt at line 1" in str(err)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_in_serves_lifespan_load_is_a_refused_module(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # uvicorn holds SIGINT for the whole lifespan, so a real Ctrl-C here only sets a flag on the
+    # server and no KeyboardInterrupt ever reaches the load. So this one is code, and the start has
+    # to say which module failed. Through the real server on the main thread, as `serve` runs it.
+    config = tmp_path / "config"
+    config.mkdir()
+    _write(
+        config,
+        "feed.py",
+        "import pathlib\nimport signal\nimport threading\n\n"
+        "pathlib.Path(__file__).with_name('load.txt').write_text(\n"
+        "    f'{signal.getsignal(signal.SIGINT)!r} '\n"
+        "    f'{threading.current_thread() is threading.main_thread()}'\n"
+        ")\n"
+        f"raise KeyboardInterrupt({NEEDLE!r})\n",
+    )
+    app = create_managed_app(
+        db_path=tmp_path / "store.db",
+        config_dir=config,
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_config=None))
+    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(SystemExit) as ei:
+        try:
+            server.run()
+        except KeyboardInterrupt:  # one left alone ends the whole run
+            pytest.fail("the interrupt left the server as a Ctrl-C")
+    held, on_main = (config / "load.txt").read_text(encoding="utf-8").rsplit(" ", 1)
+    assert "Server.handle_exit" in held and on_main == "True"
+    assert ei.value.code and not server.started  # how uvicorn ends a failed start
+    assert f"{_NAMED}KeyboardInterrupt at line" in caplog.text
+    assert NEEDLE not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1412,14 +1480,22 @@ def fails_in_the_read(
 )
 @pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_in_the_loaders_read_stops_the_load(
-    tmp_path: Path, fails_in_the_read: Callable[[str], Path], fault: str
+    tmp_path: Path,
+    fails_in_the_read: Callable[[str], Path],
+    fault: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # Reading a failed module runs code, so an interrupt can land in that read. It is Ctrl-C, not a
-    # config error, and it leaves as a new, bare one with no module exception on it.
+    # config error, and it leaves as a new, bare one with no module exception on it. One line says
+    # which module, however many of the loader's guards it left through.
     fails_in_the_read(fault)
-    with pytest.raises(KeyboardInterrupt) as ei:
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"),
+        pytest.raises(KeyboardInterrupt) as ei,
+    ):
         load_config(tmp_path)
     _assert_bare(ei.value)
+    _assert_one_line_names_the_module(caplog)
 
 
 @pytest.mark.parametrize(
@@ -1662,6 +1738,23 @@ def test_overlapping_quotations_become_one_marker_with_no_head_or_tail_left() ->
     assert wiring._withhold_quotations("SECRETport=plantedxxxxx", quoted) == (
         "[ValueError text withheld]"
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x: secretpart1secretpart2", "x: [KeyError text withheld]"),
+        ("x: secretpart1secretpart1", "x: [KeyError text withheld]"),
+        ("x: secretpart1secretpart2secretpart1", "x: [KeyError text withheld]"),
+        # The control: the same pair run into a longer token is still judged by the token rule.
+        ("IB_secretpart1secretpart2", "IB_secretpart1secretpart2"),
+    ],
+    ids=["two-side-by-side", "one-repeated", "three-in-a-row", "inside-a-token"],
+)
+def test_quotations_that_touch_are_judged_as_one_span(text: str, expected: str) -> None:
+    # Taken apart, each would look like part of a token only because its neighbour touches it.
+    quoted = {"secretpart1": "KeyError", "secretpart2": "ValueError"}
+    assert wiring._withhold_quotations(text, quoted) == expected
 
 
 @pytest.mark.timeout(20)
