@@ -1186,7 +1186,11 @@ def test_a_mark_that_is_not_set_still_lets_a_clean_start_restore() -> None:
     outcome, which is not an unchecked one."""
     sink = _PostureSink()
     det = SecuritySignalDetector(sink, _thresholds())
-    detail = {"loosenings": [], "comparison": "degraded_baseline", "changed": None}
+    detail: dict[str, Any] = {
+        "loosenings": [],
+        "comparison": "degraded_baseline",
+        "changed": None,
+    }
     det.observe("config_loaded", "system", None, None, json.dumps(detail))
     assert sink.restored == ["posture:start"]
 
