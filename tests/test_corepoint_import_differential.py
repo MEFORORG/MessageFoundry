@@ -291,7 +291,7 @@ _MARK_FIELD = "    wrapped_off: tuple[object, ...] = ()\n"
 _LIFTED_FIELD = "    lifted: bool = False\n"
 # On a Try left with no Catch by a switched-off one, why; on a branch adopted across a step that
 # runs nothing but is no label, ``True``.
-_REFUSED_FIELDS = '    refused: str = ""\n    across: bool = False\n'
+_REFUSED_FIELDS = '    refused: str = ""\n    across: bool = False\n    unrun: bool = False\n'
 _COUNT_ARM = "                if _renders_as_branch(step.kind, branch.kind):\n"
 _ARM_NOTE = "        note = _comment_text(branch.detail)\n"
 _LAST_ELSE = (
@@ -385,10 +385,19 @@ def _wrapped(step: Step, mark: tuple[object, ...]) -> Step:
     return replace(step, wrapped_off=mark)
 
 
-def _turned_off(step: Step) -> tuple[Step, list[Step]]:
+def _main_inlined(step: Control, branch: Control) -> bool:
+    # A branch of this construct main ran at the construct's own level: one it could not render
+    # as an arm, and one it orphaned where this tree adopts it across a step.
+    return branch.across or not (
+        step.kind in ("if", "case") or (step.kind == "try" and branch.kind == "except")
+    )
+
+
+def _turned_off(step: Step, top: bool = True) -> tuple[Step, list[Step]]:
     # ``step`` with what the operator switched off taken out of the code, and the orphans to
     # place after it. A branch whose marker was switched off, or adopted by a construct that
     # was, has nothing to continue; in a Try, neither has any Catch after a switched-off one.
+    # ``top`` is False under a branch, whose own branches main rendered nowhere.
     if not isinstance(step, Control) or step.kind == "disabled":
         return step, []
     if step.wrapped_off:
@@ -396,14 +405,15 @@ def _turned_off(step: Step) -> tuple[Step, list[Step]]:
         after: list[Step] = []
         for b in step.branches:
             if not b.wrapped_off:
-                after.extend(_orphaned(b, whose))
+                after.extend(_orphaned(b, whose, top and _main_inlined(step, b)))
         return replace(step, branches=tuple(b for b in step.branches if b.wrapped_off)), after
     kept: list[Control] = []
     after = []
     shut = refused = ""
     for b in step.branches:
         if b.wrapped_off:
-            after.extend(_orphaned(b, "its marker is in a @Disabled " + b.wrapped_off[0]))
+            said = "its marker is in a @Disabled " + b.wrapped_off[0]
+            after.extend(_orphaned(b, said, top and _main_inlined(step, b)))
             if step.kind == "try" and b.kind == "except" and not shut:
                 shut = "a {} before it on this {} is in a @Disabled {}".format(
                     b.source_verb, step.source_verb, b.wrapped_off[0]
@@ -412,9 +422,9 @@ def _turned_off(step: Step) -> tuple[Step, list[Step]]:
                     refused = "its {} is in a @Disabled {}".format(b.source_verb, b.wrapped_off[0])
             continue
         if shut:
-            after.extend(_orphaned(b, shut))
+            after.extend(_orphaned(b, shut, top and _main_inlined(step, b)))
             continue
-        b, below = _turned_off(b)
+        b, below = _turned_off(b, False)
         kept.append(b)
         after.extend(below)
     if step.kind in _LOOP_KINDS:
@@ -444,7 +454,10 @@ def _unbranch(steps: tuple[Step, ...]) -> tuple[Step, ...]:
             for b in step.branches:
                 said = "a branch of the " + b.source_verb + " it is written in, "
                 said += "which no construct continues"
-                strays = [replace(c, detail="; ".join(filter(None, (said, c.detail)))) for c in b.branches]
+                strays = [
+                    replace(c, detail="; ".join(filter(None, (said, c.detail))), unrun=True)
+                    for c in b.branches
+                ]
                 arms.append(replace(b, body=_unbranch((*b.body, *strays)), branches=()))
             step = replace(step, body=_unbranch(step.body), branches=tuple(arms))
         out.append(step)
@@ -459,12 +472,53 @@ def _all_wrapped(step: Step) -> bool:
     return all(_all_wrapped(s) for s in step.body) and all(map(_all_wrapped, step.branches))
 
 
-def _orphaned(branch: Control, why: str) -> list[Step]:
+def _orphaned(branch: Control, why: str, inlined: bool) -> list[Step]:
+    # ``inlined`` is whether main ran this branch's body live; if not, it refuses nothing here.
     if _all_wrapped(branch):
         return [branch]
     note = why + "; " + branch.detail if branch.detail else why
-    head, after = _turned_off(replace(branch, wrapped_off=(), detail=note))
+    head, after = _turned_off(
+        replace(branch, wrapped_off=(), detail=note, unrun=not inlined), False
+    )
     return [head, *after]
+
+
+def _refusals_main_reached(steps: tuple[Step, ...]) -> Iterator[Control]:
+    # Each refused send on the path main ran, in source order: not under a dead condition or a
+    # loop, and not in an arm. Nested orphans and strays main inlined are on that path.
+    for step in steps:
+        if not isinstance(step, Control) or step.kind == "disabled" or step.unrun:
+            continue
+        if step.kind == "send" and step.refusal:
+            yield step
+        if step.kind not in ("if", "for", "while", "send", "clone", "create", "break", "exit"):
+            yield from _refusals_main_reached(step.body)
+        for arm in step.branches:
+            if _main_inlined(step, arm):
+                yield from _refusals_main_reached(arm.body)
+
+
+def _kept_raise(ctrl: Control, pad: str) -> list[str]:
+    # A dead branch whose body main ran live keeps that body's refusal live, at its own position.
+    # An orphan stands alone; an adopted arm has no line of its own, so it follows its chain.
+    if ctrl.kind in _BRANCH_PARENT:
+        dead = [ctrl]
+    elif ctrl.kind in ("if", "case"):
+        dead = [arm for arm in ctrl.branches if arm.across]
+    else:
+        dead = []
+    out = []
+    for arm in dead:
+        for send in _refusals_main_reached((arm,)):
+            to = "to " + json.loads(send.args[0]) if send.args else "(no destination named)"
+            said = "Corepoint import: " + send.source_verb + " " + to + ": " + send.refusal
+            out.append(
+                pad + "# TODO: Corepoint " + arm.source_verb + " never runs, but its "
+                + send.source_verb + " " + _comment_text(to)
+                + " is refused, so the handler stops here — hand-finish"
+            )
+            out.append(pad + "raise NotImplementedError(" + _lit(said) + ")")
+    return out
 
 
 def _off_list(steps: list[Step] | tuple[Step, ...]) -> tuple[Step, ...]:
@@ -525,7 +579,8 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     (
         _STRAY_TAIL,
         "    deeper = 1 if ctrl.kind in _BRANCH_PARENT else 0\n"
-        "    out.extend(_stray_branches(ctrl, indent + deeper, in_loop=in_loop))\n",
+        "    out.extend(_stray_branches(ctrl, indent + deeper, in_loop=in_loop))\n"
+        '    out.extend(_kept_raise(ctrl, "    " * indent))\n',
     ),
     # BACKLOG #2685: a branch with no construct renders its body under a dead placeholder.
     (
@@ -3790,7 +3845,9 @@ def _added_live_code(was: str, now: str) -> list[str]:
     in ``was`` at all is new code. Neither may appear, past :data:`_DEAD_LINE`. A line under a
     dead opener (:data:`_NEVER`) never runs, so it is read in neither: a send the amendment
     renders dead where main never rendered it adds nothing, and a line main ran dead is no
-    counterpart for one that runs."""
+    counterpart for one that runs. The one exception is a refusal a dead branch keeps (owner
+    ruling 2026-11-01): it stands at the branch's level, which is shallower than main's copy when
+    a ``try`` held that copy, so it is matched only to a copy ``was`` runs on the live path."""
 
     def indents(src: str) -> dict[str, list[int]]:
         found: dict[str, list[int]] = {}
@@ -3803,13 +3860,21 @@ def _added_live_code(was: str, now: str) -> list[str]:
     # Matched as multisets, one line of ``was`` to each line of ``now``, shallowest first: a
     # line that surfaces beside an identical one already at that indent is still new there.
     before = indents(was)
+    was_lines = _code_lines(was)
+    live_refusals = Counter(
+        line.strip()
+        for line, rank in zip(was_lines, _path_ranks(was_lines), strict=True)
+        if rank == "live" and _REFUSAL.match(line)
+    )
     added: list[str] = []
     for text, now_at in indents(now).items():
         if _DEAD_LINE.match(text):
             continue
         was_at = before.get(text, [])
         added.extend(
-            f"{' ' * at}{text}" for k, at in enumerate(now_at) if k >= len(was_at) or was_at[k] > at
+            f"{' ' * at}{text}"
+            for k, at in enumerate(now_at)
+            if k >= live_refusals[text] and (k >= len(was_at) or was_at[k] > at)
         )
     return added
 
@@ -4157,3 +4222,92 @@ def test_the_head_never_fails_open_where_step1_did_not(chunk: int) -> None:
 def test_the_d26545d6f_high_repros_do_not_fail_open(shape: Shape) -> None:
     """Named separately so the Lander's HIGH on PR 1900 stays visible in a test id."""
     assert _violations(shape) == []
+
+
+# --- a dead branch keeps a refusal main raised (owner ruling 2026-11-01) ---------------------------
+
+#: Over the drawn lists below: the fewest whose handler main sends to ERROR and whose head keeps a
+#: refusal for a dead branch, the fewest that keep one and deliver with it taken out, and the
+#: fewest where main does not raise and the head holds a dead branch. About half of what was
+#: measured 2026-11-01 over 1500 lists (900, 678 and 321).
+_KEPT_FLOOR = 450
+_FAILS_OPEN_FLOOR = 340
+_DEAD_NO_RAISE_FLOOR = 160
+_KEPT_COMMENT = re.compile(
+    r"^\s*# TODO: Corepoint \S+ never runs, but its .*\n\s*raise Not.*\n", re.M
+)
+
+
+def _dead_branch_lists() -> list[str]:
+    """Lists of orphans, branches adopted across a step, and what may hold them, with no raising
+    write in them and nothing switched off: a raise here is a refusal, on every message."""
+    rng = random.Random(_SEED)
+    send, write = _line("MsgSend %ADT [OB_X]"), _line("ItemClear %ADT/PID-19")
+    refused = _line(_leaf_data(SendS(_OUT, "OB_R"), "%ADT") or "")
+    between = ('<Line Data="MsgLog %ADT"/>', "<Line/>", write, "")
+
+    def drawn(depth: int) -> str:
+        out = ""
+        for _ in range(rng.randint(1, 4)):
+            pick = rng.random() if depth else 1.0
+            inner = drawn(depth - 1) if depth else ""
+            if pick < 0.3:
+                out += _line(rng.choice(("Else", "ElseIf (y)", "Catch", 'Matching "M"')), inner)
+            elif pick < 0.45:
+                arm = _line(rng.choice(("Else", "ElseIf (y)")), drawn(depth - 1))
+                out += f'<Line Data="If (x)"><List>{inner}</List></Line>'
+                out += rng.choice(between) + arm
+            elif pick < 0.55:
+                out += f'<Block Data="Section"><List>{inner}</List></Block>'
+            elif pick < 0.7:
+                out += f"<Try><List>{inner}</List></Try>"
+            elif pick < 0.78:
+                arm = _line('Matching "M"', drawn(depth - 1))
+                out += f'<Case Data="ChooseFrom (a)"><List>{inner}</List></Case>'
+                out += rng.choice(between) + arm
+            elif pick < 0.85:
+                out += f'<Line Data="ForEach %ADT/OBX $o"><List>{inner}</List></Line>'
+            else:
+                out += rng.choice((send, write, send, write, send, write, send, refused))
+        return out
+
+    return [drawn(2) for _ in range(1500)]
+
+
+def _raises(src: str, where: Path) -> bool:
+    """Whether the handler ``src`` holds raises on :data:`_INPUT`: the message goes to ERROR."""
+    registry = Registry()
+    namespace: dict[str, Any] = {"__name__": "mefor_differential_generated"}
+    with _loading(read_config_snapshot(where, strict=False), registry):
+        exec(compile(src, _GENERATED, "exec"), namespace)
+    try:
+        registry.handlers["t"](Message.parse(_INPUT))
+    except NotImplementedError:
+        return True
+    return False
+
+
+def test_the_head_goes_to_error_on_exactly_the_lists_main_does(tmp_path: Path) -> None:
+    """The owner's ruling of 2026-11-01, by execution. With no write that can raise in play, main
+    raises on a list exactly where the head does, over lists that orphan and adopt across a step
+    at every depth: never a delivery where main refused, nor an ERROR main did not make. The
+    control: with the kept refusals taken out of the head's module, it delivers on the lists they
+    are kept for, which is the fail-open this repairs, so the check is not blind."""
+    differ: list[str] = []
+    kept = dead_no_raise = fails_open = 0
+    for xml in _dead_branch_lists():
+        was, now = _generate(step1_scan_skips, xml)[0], _generate(head, xml)[0]
+        if not was or not now:
+            continue
+        main_raises = _raises(was, tmp_path)
+        if main_raises != _raises(now, tmp_path):
+            differ.append(f"main raises: {main_raises}: {xml}")
+        if _KEPT_COMMENT.search(now):
+            kept += main_raises
+            without = _KEPT_COMMENT.sub("", now)
+            fails_open += main_raises and not _raises(without, tmp_path)
+        elif "this branch never runs" in now and not main_raises:
+            dead_no_raise += 1
+    assert not differ, "\n".join(differ[:5]) + f"\n... {len(differ)} in all"
+    assert kept >= _KEPT_FLOOR and dead_no_raise >= _DEAD_NO_RAISE_FLOOR
+    assert fails_open >= _FAILS_OPEN_FLOOR

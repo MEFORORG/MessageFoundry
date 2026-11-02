@@ -842,8 +842,9 @@ longer stops there: the steps after it run, and every send the handler collected
 or after it, delivers. A message main sent to ERROR or to a `Catch` there may be delivered, or
 FILTERED. At least these reach it: a switched-off step in a `try` body or after it; a `Catch`
 whose body is wholly switched off, which now catches a raise where main's body raised again; and
-a branch adopted across a step that runs nothing, or left an orphan, whose body main ran live at
-the handler's own level. The scan skips a disabled wrapper too, so a handle switched off there no
+a write in a branch adopted across a step that runs nothing, or left an orphan, whose body main
+ran live at the handler's own level. A refused send in such a branch is the exception: the next
+paragraph keeps its raise. The scan skips a disabled wrapper too, so a handle switched off there no
 longer counts: a send main refused because a copy or a second handle in the wrapper left `msg`
 uncertain now delivers, and a write main left as a TODO now maps. That is what the operator
 switched off, and it is a change of behaviour, not a quieter form of main's. "Never quieter than
@@ -851,13 +852,28 @@ main" in §2(b.4) bounds that amendment. The differential guard loads this amend
 first, written apart from the head (a tuple mark, a look-back adoption, one switch-off function),
 and bounds §2(b.4) against the tree it loads onto.
 
+**A dead branch keeps the refusal main raised (owner ruling 2026-11-01, *"Keep the raise"*).** An
+orphan or a branch adopted across a step stays dead, but where main ran its body live and a send
+in that body was refused, the send's own refusal also renders live at the branch's position, so
+the message still goes to ERROR and the handler's other sends do not deliver. An orphan's stands
+after its placeholder; an adopted arm's stands after the chain, since a chain has no line between
+its arms, and only steps that run nothing stood between the arm and its construct. A `try` around
+either re-raises it past its handlers. It reads the path main ran: a `<Block>`, a call, an
+unmodelled element, a `Try` body, a `ChooseFrom`'s steps before its first arm, and nested orphans
+and strays. It reads nothing under a condition or a loop, which were dead on main; nothing in a
+branch main never ran, such as an arm main adopted that this pass closes, or a branch of a branch;
+and nothing `@Disabled` in the body, which the operator switched off. A position that is itself
+dead, an orphan in an `If` say, keeps its refusal dead there too, as main's was. Each refused send
+keeps its own line, as on main, so a hand-finish that deletes one meets the next.
+
 Two tests bound this amendment against a baseline, and the baseline is not origin/main: it is the
 vendored step 1 tree with only this amendment's scan half loaded, so it lacks the label amendment
 of §2(b.4) (BACKLOG #2632) that main carries. A send in a `<Block>` label, which main refuses and
 that tree delivers, is therefore left out of the second test's battery. One test reads code lines
 by depth, and it reads the guard's own re-implementation of this amendment, not the head: against
 that tree, the re-implementation adds no code line outside a dead placeholder, moves none
-shallower, and adds no closing send, on the battery and the raw draw. The head is held to that
+shallower, and adds no closing send, on the battery and the raw draw, past a kept refusal, which
+may stand shallower than main's copy in a `try` but only matches a copy main ran live. The head is held to that
 re-implementation byte for byte on the battery's shapes, not on the raw draw. The other reads each line that writes a field, sends, or refuses a send as dead, in an `except`, or
 live, by the nearest opener that is not dead, and holds the head to no line more live than the
 baseline over every list of a battery of disabled wrappers, refused sends and branches of branches
@@ -868,7 +884,9 @@ finds lists more live than the baseline; against this one it finds none. That is
 battery, not a proof. It reads nesting, not raises: a line after a step that raised on main
 scores as live as one after a step that did not, so it cannot see any change the paragraph above
 lists, and both bounds load the scan half into their baseline, so neither sees the scan change.
-Nor does it read which `Catch` a raise reaches; the nested-`Try` tests hold that.
+Nor does it read which `Catch` a raise reaches; the nested-`Try` tests hold that. A third test
+runs both trees on lists of orphans and branches adopted across a step, with no write that can
+raise and nothing switched off, and holds the head to raising on exactly the lists main raises on.
 
 At least these limits remain:
 
@@ -876,11 +894,17 @@ At least these limits remain:
   gives a construct that cannot continue it, an element whose tag is not modelled, the steps after
   a bare marker standing at the handler's own level or in a `<Block>` body, and the steps after a
   bare marker adopted by a nested construct written directly before it.
-- A switched-off or dead step that raised on main, a refused send among them, no longer stops
-  the handler, so its other sends, before that step and after it, deliver; and the scan change
-  delivers some sends main refused, as the paragraph above says. No test bounds either. This
-  reaches lists with no `@Disabled` anywhere, through an orphan or a branch adopted across a
-  step that runs nothing, whose body main ran live.
+- A switched-off step that raised on main, a refused send among them, no longer stops the
+  handler, so its other sends, before that step and after it, deliver; and the scan change
+  delivers some sends main refused, as the paragraphs above say. No test bounds either. That holds
+  for a `@Disabled` step in a dead branch's body too.
+- A raise that depends on the message is not kept, because the import cannot know it. A write in
+  a dead branch that would have raised on main, such as a clear of a segment this message lacks,
+  no longer stops the handler, so its other sends deliver. The same holds for a refused send in a
+  `Catch` in that body, which ran only if the `Try` raised. This reaches lists with no `@Disabled` anywhere.
+  One test pins the write. The other way round, a kept refusal raises where a write before it in
+  a `Try` on main raised first and a `Catch` took that raise: a message main delivered goes to
+  ERROR, the fail-closed direction, and no test bounds it.
 
 ## 3. Acceptance criteria
 

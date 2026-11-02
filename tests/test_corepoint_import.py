@@ -3807,3 +3807,171 @@ def test_a_branch_adopted_across_a_msglog_is_dead_and_counted_unmapped() -> None
     assert _enclosing(handler, "OB_E").lstrip().startswith("elif False:")
     assert "a step stands between it and its If" in _enclosing(handler, "OB_E")
     assert sorted(_count_steps(_handler_steps(body), in_loop=False)[1]) == ["Else", "MsgLog"]
+
+
+def _line_arm(data: str, body: str) -> str:
+    """A branch ``<Line>`` carrying its own body in a ``<List>``."""
+    return f'<Line Data="{data.replace(chr(34), "&quot;")}"><List>{body}</List></Line>'
+
+
+# --- a dead branch keeps a refusal main raised (owner ruling 2026-11-01) --------------------------
+#
+# Main ran an orphan's body live, and a branch adopted across a step was an orphan on main. A send
+# refused there raised, so the message went to ERROR. Dead, neither raises: the handler's other
+# sends would deliver. The refusal stays, at the branch's own position.
+
+_KEPT = "never runs, but its"
+_DEAD_ORPHANS = {
+    "else": _line_arm("Else", _SEND_OUT),
+    "elseif": _line_arm("ElseIf (y)", _SEND_OUT),
+    "catch": _line_arm("Catch", _SEND_OUT),
+    "matching": _line_arm('Matching "M"', _SEND_OUT),
+    "in-a-block": _line_arm("Else", f'<Block Data="Section"><List>{_SEND_OUT}</List></Block>'),
+    "in-a-try": _line_arm("Else", f"<Try><List>{_SEND_OUT}</List></Try>"),
+    "in-a-choosefrom": _line_arm(
+        "Else", f'<Case Data="ChooseFrom (a)"><List>{_SEND_OUT}</List></Case>'
+    ),
+    "in-an-orphan": _line_arm("Else", _CLEAR + _line_arm("Catch", _SEND_OUT)),
+    "after-a-write": _line_arm("Else", _CLEAR + _SEND_OUT),
+}
+_ACROSS = {
+    "msglog": '<Line Data="MsgLog %ADT"/>',
+    "empty-line": "<Line/>",
+    "disabled-statement": '<Line Data="ItemClear %ADT/PID-4" Disabled="1"/>',
+    "disabled-wrapper": f'<List Disabled="1">{_CLEAR}</List>',
+}
+_ADOPTED_PAIRS = {
+    "if-else": ('<Line Data="If (x)"><List/></Line>', "Else"),
+    "if-elseif": ('<Line Data="If (x)"><List/></Line>', "ElseIf (y)"),
+    "case-matching": ('<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M"'),
+}
+
+
+@pytest.mark.parametrize("shape", _DEAD_ORPHANS)
+def test_a_dead_orphan_that_refused_a_send_on_main_goes_to_error(
+    shape: str, tmp_path: Path
+) -> None:
+    """The handler raises, so nothing delivers: not the send before the orphan, nor the one after.
+    The send's own refusal stays under the placeholder too, for the hand-finish."""
+    body = _SEND_INPUT + _DEAD_ORPHANS[shape] + _SEND_INPUT
+    handler = _handler_body(_handler_source(body))
+    assert _KEPT in handler
+    raised = [line for line in handler.splitlines() if line.startswith("    raise Not")]
+    assert len(raised) == 1 and "MsgSend to OB_R" in raised[0]
+    with pytest.raises(NotImplementedError, match="MsgSend to OB_R"):
+        _run_handler(tmp_path, body)
+
+
+@pytest.mark.parametrize("across", _ACROSS)
+@pytest.mark.parametrize("pair", _ADOPTED_PAIRS)
+def test_a_branch_adopted_across_a_step_that_refused_a_send_on_main_goes_to_error(
+    pair: str, across: str, tmp_path: Path
+) -> None:
+    """The arm stays dead and the refusal follows its chain, since a chain has no line between its
+    arms. The steps before it and after it do not deliver."""
+    construct, branch = _ADOPTED_PAIRS[pair]
+    arm = _line_arm(branch, _SEND_OUT)
+    body = _SEND_INPUT + construct + _ACROSS[across] + arm + _SEND_INPUT
+    handler = _handler_body(_handler_source(body))
+    assert "a step stands between it and its" in handler
+    # The send's own refusal, dead in its arm, and the one the arm keeps, at the chain's level.
+    raises = [line for line in handler.splitlines() if "raise NotImplementedError(" in line]
+    assert [len(line) - len(line.lstrip()) for line in raises] == [8, 4]
+    with pytest.raises(NotImplementedError, match="MsgSend to OB_R"):
+        _run_handler(tmp_path, body)
+
+
+@pytest.mark.parametrize(
+    "dead",
+    [
+        _line_arm("Else", _SEND_OUT),
+        '<Line Data="If (x)"><List/></Line><Line Data="MsgLog %ADT"/>'
+        + _line_arm("Else", _SEND_OUT),
+    ],
+    ids=["orphan", "adopted-across"],
+)
+def test_no_catch_takes_the_refusal_a_dead_branch_keeps(dead: str, tmp_path: Path) -> None:
+    """A Catch around it would run its body in place of the ERROR, as it would for the send's own
+    refusal on main: every ``try`` re-raises it past its handlers."""
+    body = f"<Try><List>{dead}</List></Try>" + _line_arm("Catch", _SEND_INPUT)
+    with pytest.raises(NotImplementedError, match="MsgSend to OB_R"):
+        _run_handler(tmp_path, body)
+
+
+def test_a_dead_branch_keeps_each_refusal_its_body_made_on_main() -> None:
+    """Main held one ``raise`` per refused send, so a hand-finish that deletes one meets the next."""
+    other = _role_send("other-handle", "%OUT", "OB_S")
+    handler = _handler_body(_handler_source(_line_arm("Else", _SEND_OUT + other)))
+    raised = [line for line in handler.splitlines() if line.startswith("    raise Not")]
+    assert ["OB_R" in raised[0], "OB_S" in raised[1], len(raised)] == [True, True, 2]
+
+
+def test_an_adopted_across_branch_of_a_switched_off_construct_keeps_its_refusal(
+    tmp_path: Path,
+) -> None:
+    """Closed for its switched-off construct, it is an orphan here. Main orphaned it for the step
+    between them and ran its body, so it refused there, and still does."""
+    body = (
+        '<List Disabled="1"><Line Data="If (x)"><List/></Line></List>'
+        '<Line Data="MsgLog %ADT"/>' + _line_arm("Else", _SEND_OUT)
+    )
+    with pytest.raises(NotImplementedError, match="MsgSend to OB_R"):
+        _run_handler(tmp_path, body)
+
+
+_NOT_RAISED_ON_MAIN = {
+    # Dead on main: under a condition or a loop in the body, or in a Catch no raise reached.
+    "under-an-if": _line_arm("Else", f'<Line Data="If (a)"><List>{_SEND_OUT}</List></Line>'),
+    "under-a-loop": _line_arm(
+        "Else", f'<Line Data="ForEach %ADT/OBX $o"><List>{_SEND_OUT}</List></Line>'
+    ),
+    "in-a-catch": _line_arm("Else", "<Try><List/></Try>" + _line_arm("Catch", _SEND_OUT)),
+    # An arm main adopted, so a dead arm there.
+    "adopted-with-nothing-between": '<Line Data="If (x)"><List/></Line>'
+    + _line_arm("Else", _SEND_OUT),
+    # An orphan standing where nothing runs.
+    "in-an-if": '<Line Data="If (x)"><List>' + _line_arm("Else", _SEND_OUT) + "</List></Line>",
+    "in-a-loop": '<Line Data="ForEach %ADT/OBX $o"><List>'
+    + _line_arm("Else", _SEND_OUT)
+    + "</List></Line>",
+    # A branch of a branch, which no render emitted.
+    "branch-of-a-branch": '<Line Data="If (x)"><List/></Line><Line Data="Else"><List>'
+    '<Line Data="Else"/>' + _SEND_OUT + "</List></Line>",
+    # A dead arm on main, closed here by its switched-off marker or construct.
+    "marker-switched-off": '<Line Data="If (x)"><List>'
+    f'<List Disabled="1"><Line Data="Else"/></List>{_SEND_OUT}</List></Line>',
+    "construct-switched-off": '<List Disabled="1"><Line Data="If (x)"><List/></Line></List>'
+    + _line_arm("Else", _SEND_OUT),
+    # Switched off by the operator in the dead body.
+    "disabled-statement": _line_arm(
+        "Else", _SEND_OUT.replace('<Line Data="', '<Line Disabled="1" Data="')
+    ),
+    "disabled-wrapper": _line_arm("Else", f'<List Disabled="1">{_SEND_OUT}</List>'),
+}
+
+
+@pytest.mark.parametrize("shape", _NOT_RAISED_ON_MAIN)
+def test_a_dead_branch_whose_body_raised_nothing_on_main_keeps_no_refusal(
+    shape: str, tmp_path: Path
+) -> None:
+    """The control: the refusal stands in for a raise main made, and for nothing else. No message
+    goes to ERROR for a branch main did not run, and the send after it delivers. A refused send
+    a Catch holds ran only if the ``Try`` raised, which is the message's doing. An orphan under a
+    dead construct may keep its refusal, which is dead with it, as main's was."""
+    body = _NOT_RAISED_ON_MAIN[shape] + _SEND_INPUT
+    handler = _handler_body(_handler_source(body))
+    assert not [line for line in handler.splitlines() if line.startswith("    raise ")]
+    sent = _run_handler(tmp_path, body)
+    assert isinstance(sent, list) and [send.to for send in sent] == ["OB_IN"]
+
+
+def test_a_write_that_raises_only_on_some_messages_is_a_limit_of_the_kept_refusal(
+    tmp_path: Path,
+) -> None:
+    """Pins the limit ADR 0086 (c.2) names. Whether a write in a dead body would have raised depends
+    on the message, so no refusal is kept for it: the send after it delivers where main's raise
+    sent this message to ERROR. If this starts failing, that limit moved: update the ADR."""
+    body = _line_arm("Else", '<Line Data="ItemClear %ADT/ZZZ-1"/>') + _SEND_INPUT
+    assert _KEPT not in _handler_source(body)
+    sent = _run_handler(tmp_path, body)
+    assert isinstance(sent, list) and [send.to for send in sent] == ["OB_IN"]

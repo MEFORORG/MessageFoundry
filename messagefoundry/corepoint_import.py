@@ -299,6 +299,10 @@ class Control:
     # (:func:`_adopt_branch`). Main orphaned it and counted it unmapped, so the count still does:
     # whether Corepoint continues the construct across that step is not known (BACKLOG #2685).
     adopted_across: bool = False
+    # A branch :func:`_switch_off_control` or :func:`_lift_control` left with no construct, whose
+    # body main never ran: it was a dead arm there, or a branch of a branch no render emitted. It
+    # is dead here as it was there, so no refusal stands in for a raise in it (:func:`_kept_refusal`).
+    never_ran: bool = False
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -1677,7 +1681,8 @@ def _adopt_branch(steps: list[Step], produced: list[Step], *, hollow: bool) -> b
         if _opens_a_branch(branch) or branch.branches or branch.kind == "except":
             return False
         # Main orphaned it here and ran its body live. A dead arm here, still counted unmapped,
-        # as main counted it. A raise main's live body made is gone with it (ADR 0086 (c.2)).
+        # as main counted it. A refused send in that body still stops the handler, at the end of
+        # the chain (:func:`_kept_refusal`, ADR 0086 (c.2)).
         branch = replace(branch, adopted_across=True)
     steps[-1] = replace(previous, branches=(*previous.branches, branch))
     return True
@@ -1937,25 +1942,32 @@ def _switch_off(steps: Iterable[Step]) -> tuple[Step, ...]:
     return tuple(out)
 
 
-def _switch_off_control(ctrl: Control) -> tuple[Control, list[Step]]:
+def _switch_off_control(ctrl: Control, *, rendered: bool = True) -> tuple[Control, list[Step]]:
     """``ctrl`` with what was switched off taken out of the code, and the steps to place after
     it: each branch that fails closed (:func:`_switch_off`). The one closing rule.
 
     A switched-off ``ctrl`` keeps its own content, which renders commented out with it; a branch
     adopted from outside its wrapper has no construct left to continue. A branch lifted out of a
-    loop is marked so: a ``LoopExit`` in it no longer names a loop around it."""
+    loop is marked so: a ``LoopExit`` in it no longer names a loop around it.
+
+    ``rendered`` says whether main rendered the branches of ``ctrl``. It rendered none of a
+    branch's own. Of a construct's, it ran only those it inlined live: a stray, and one adopted
+    here across a step it orphaned at. Each other it closes here was a dead arm on main, so it is
+    marked :attr:`Control.never_ran`."""
     kept: list[Control] = []
     after: list[Step] = []
     closing = catch_off = ""
     for branch in ctrl.branches:
+        ran = rendered and _main_inlined(ctrl, branch)
         if ctrl.off is not None:
             if branch.off is not None:
                 kept.append(branch)
             else:
                 why = f"its {ctrl.source_verb} is in a @Disabled {ctrl.off.source}"
-                after.extend(_closed(branch, why))
+                after.extend(_closed(branch, why, ran=ran))
         elif branch.off is not None:
-            after.extend(_closed(branch, f"its marker is in a @Disabled {branch.off.source}"))
+            why = f"its marker is in a @Disabled {branch.off.source}"
+            after.extend(_closed(branch, why, ran=ran))
             if ctrl.kind == "try" and _renders_as_branch(ctrl.kind, branch.kind) and not closing:
                 closing = (
                     f"a {branch.source_verb} before it on this {ctrl.source_verb} is in a "
@@ -1966,9 +1978,9 @@ def _switch_off_control(ctrl: Control) -> tuple[Control, list[Step]]:
                 if not any(_renders_as_branch(ctrl.kind, b.kind) for b in kept):
                     catch_off = f"its {branch.source_verb} is in a @Disabled {branch.off.source}"
         elif closing:
-            after.extend(_closed(branch, closing))
+            after.extend(_closed(branch, closing, ran=ran))
         else:
-            live, nested = _switch_off_control(branch)
+            live, nested = _switch_off_control(branch, rendered=False)
             kept.append(live)
             after.extend(nested)
     if ctrl.kind in _LOOP_KINDS:
@@ -1977,14 +1989,16 @@ def _switch_off_control(ctrl: Control) -> tuple[Control, list[Step]]:
     return replace(ctrl, body=body, branches=tuple(kept), catch_off=catch_off), after
 
 
-def _closed(branch: Control, why: str) -> list[Step]:
+def _closed(branch: Control, why: str, *, ran: bool) -> list[Step]:
     """``branch`` taken off its construct: an orphan that never runs, its marker counted unmapped
     and ``why`` leading its label, then whatever fails closed under it. A switched-off branch
-    with nothing live anywhere under it is just a disabled step."""
+    with nothing live anywhere under it is just a disabled step. ``ran`` says whether main ran
+    its body live (:attr:`Control.never_ran`)."""
     if _wholly_off(branch):
         return [branch]
     detail = _led_by(why, branch.detail)
-    orphan, after = _switch_off_control(replace(branch, off=None, detail=detail))
+    orphan = replace(branch, off=None, detail=detail, never_ran=not ran)
+    orphan, after = _switch_off_control(orphan, rendered=False)
     return [orphan, *after]
 
 
@@ -2008,7 +2022,9 @@ def _lift_control(ctrl: Control) -> Control:
     branches = []
     for branch in ctrl.branches:
         why = f"a branch of the {branch.source_verb} it is written in, which no construct continues"
-        lifted = (replace(b, detail=_led_by(why, b.detail)) for b in branch.branches)
+        lifted = (
+            replace(b, detail=_led_by(why, b.detail), never_ran=True) for b in branch.branches
+        )
         body = _lift_branch_branches((*branch.body, *lifted))
         branches.append(replace(branch, body=body, branches=()))
     return replace(ctrl, body=_lift_branch_branches(ctrl.body), branches=tuple(branches))
@@ -2853,7 +2869,76 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     # own level they would run for every message (BACKLOG #2685).
     tail = indent + 1 if ctrl.kind in _BRANCH_PARENT else indent
     out.extend(_stray_branches(ctrl, tail, in_loop=in_loop))
+    out.extend(_kept_refusal(ctrl, indent))
     return out
+
+
+def _kept_refusal(ctrl: Control, indent: int) -> list[str]:
+    """The live ``raise`` for a dead branch whose body main ran live and which refused a send there
+    (owner ruling 2026-11-01, ADR 0086 (c.2)).
+
+    Main inlined an orphan's body at the orphan's own level, and a branch adopted across a step
+    was an orphan on main. Under a dead placeholder neither raises, so the handler would go on to
+    deliver its other sends where main sent the message to ERROR. So each send's own refusal stays
+    where the branch stands: after an orphan's placeholder, or after the chain that adopted the
+    branch, since an ``if`` chain has no line between its arms. An enclosing ``try`` re-raises it
+    past its handlers, as it does the send's own (:func:`_raises_a_refusal` reads that send in the
+    dead body). A branch main ran no body of is left alone, and so is a ``@Disabled`` step in the
+    body. Each refusal gets its line, as on main: a hand-finish that deletes one meets the next."""
+    branches: tuple[Control, ...] = ()
+    if ctrl.kind in _BRANCH_PARENT:
+        branches = (ctrl,)
+    elif ctrl.kind in ("if", "case"):
+        branches = tuple(b for b in ctrl.branches if b.adopted_across)
+    pad = "    " * indent
+    out: list[str] = []
+    for branch in branches:
+        for refused in _refused_where_main_ran(branch):
+            out.append(
+                f"{pad}# TODO: Corepoint {branch.source_verb} never runs, but its "
+                f"{refused.source_verb} {_comment_text(_refused_destination(refused))} is "
+                f"refused, so the handler stops here — hand-finish"
+            )
+            out.append(_refusal_line(refused, pad))
+    return out
+
+
+def _refused_destination(send: Control) -> str:
+    """Where a refused ``MsgSend`` was going, as its refusal and its comment say it."""
+    return f"to {json.loads(send.args[0])}" if send.args else "(no destination named)"
+
+
+def _refusal_line(send: Control, pad: str) -> str:
+    """The ``raise`` a refused ``MsgSend`` renders as (see :func:`_send_refusal`)."""
+    message = f"Corepoint import: {send.source_verb} {_refused_destination(send)}: {send.refusal}"
+    return f"{pad}raise NotImplementedError({_lit(message)})"
+
+
+def _refused_where_main_ran(ctrl: Control) -> Iterator[Control]:
+    """Each refused ``MsgSend`` on the path main ran live through ``ctrl``, in source order.
+
+    Main's render ran a ``<Block>``, a call, an unmodelled element, a ``Try`` body, a
+    ``ChooseFrom``'s steps before its first arm, and an orphan, at the level they stand on; it
+    inlined a stray branch and an orphan at that level too. A condition or a loop was dead, so a
+    refused send under one raised nothing there. A ``Catch`` body ran only if the ``Try`` raised,
+    which depends on the message and is not read here; nor is any other raise that does."""
+    if ctrl.kind == "disabled" or ctrl.never_ran:
+        return
+    if _is_refused_send(ctrl):
+        yield ctrl
+    inlined = [b.body for b in ctrl.branches if _main_inlined(ctrl, b)]
+    if ctrl.kind in _BRANCH_PARENT or ctrl.kind in ("block", "call", "unknown", "try", "case"):
+        inlined.insert(0, ctrl.body)
+    for body in inlined:
+        for step in body:
+            if isinstance(step, Control):
+                yield from _refused_where_main_ran(step)
+
+
+def _main_inlined(ctrl: Control, branch: Control) -> bool:
+    """Whether main ran ``branch`` at the level of ``ctrl``: one it could not render as an arm, and
+    one it orphaned where this tree adopts it across a step."""
+    return branch.adopted_across or not _renders_as_branch(ctrl.kind, branch.kind)
 
 
 def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
@@ -2891,12 +2976,11 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
             # Reaching this line is a loud ERROR (dead-letter), never a delivery (BACKLOG #313). The
             # outbound stays declared for the hand-finish; ``check`` reports it unreferenced until then,
             # which is accurate: nothing sends to it yet.
-            dest = f"to {json.loads(ctrl.args[0])}" if ctrl.args else "(no destination named)"
-            message = _lit(f"Corepoint import: {ctrl.source_verb} {dest}: {ctrl.refusal}")
+            dest = _refused_destination(ctrl)
             return [
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} {_comment_text(dest)} — hand-finish: "
                 f"{_comment_text(ctrl.refusal)} ({label})",
-                f"{pad}raise NotImplementedError({message})",
+                _refusal_line(ctrl, pad),
             ]
         if not ctrl.args:
             return [
