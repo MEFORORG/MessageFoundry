@@ -441,9 +441,10 @@ roster alias of the Lander.
 > itself and hits at the rung. The spawn hook prints a floor's number as "at least". On a floor it can
 > also print the cause note and the Steward's fallback, as it does on UNKNOWN, but neither is on every
 > floor: the cause note prints for a Desktop or SDK session or a wiring fault, and the fallback for a
-> Desktop or SDK session only. So a halted Desktop session is told why and that it cannot refresh the
-> file, and a terminal session on a correctly wired root gets the number with neither note. The window's
-> own state stays UNKNOWN, which is what the
+> Desktop or SDK session only. So a halted Desktop session on a correctly wired root is told why and that
+> it cannot refresh the file. On a wiring fault that note replaces the publisher note, so the session is
+> told about the wiring instead. A terminal session on a correctly wired root gets the number with neither
+> note. The window's own state stays UNKNOWN, which is what the
 > gate reads below the rung, so the verdict cannot clear anything.
 >
 > **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale
@@ -486,15 +487,20 @@ roster alias of the Lander.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.
-> - A numeric string in `used_percentage` reads UNKNOWN, so the gate answers REVIEW, where a "99" read
->   CRITICAL and HIT before this amendment; the collector drops such a payload as an absent window. That is
->   decided, not missed. Only a writer other than the collector produces one: client 2.1.308 builds the
->   field with `Math.min` (read in the binary on 2026-11-02, not run), the docs show numbers, no test
->   fixture sends a numeric string, and the collector writes a double. REVIEW stops an unreviewed spawn
->   without clearing one. It does move a "99" from HALT to REVIEW, and a client that started sending
->   strings would read UNKNOWN until this changed.
+> - One wrong high reading binds until the reset, up to a week. The highest reading in a period binds and
+>   a reading over 100 stays a number, so every true lower reading for that reset is refused, the window
+>   goes stale, and its floor keeps the gate at HALT. This fails closed.
 > - If usage ever does fall inside a period, the kept reading stops being refreshed and goes stale in
 >   20 minutes. The gate then answers REVIEW below the rung and HALT at it, until the reset.
+>
+> **A numeric string in `used_percentage` is decided, so it is not on that list.** One already in
+> `latest.json` reads UNKNOWN, so the gate answers REVIEW, where a "99" read CRITICAL and HIT before this
+> amendment. That stops an unreviewed spawn and clears nothing, at the cost of moving a "99" from HALT to
+> REVIEW. A fire carrying one is dropped as an absent window, so a published lower reading stands until the
+> 20-minute age limit, and the gate can clear on it until then. No route to that exists today: client
+> 2.1.308 builds the field with `Math.min` (read in the binary on 2026-11-02, not run), the docs show
+> numbers, no test fixture modelling a real payload sends a numeric string, and the collector writes a
+> double.
 >
 > **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
 > with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.

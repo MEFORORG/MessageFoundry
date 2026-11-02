@@ -429,7 +429,9 @@ function Get-Rate($CurrentResetEpoch) {
             if ($null -eq $observed) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
             $age = Get-AgeMinutes $r.at
-            if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
+            # Bounded both ways, like the reading's own age: a row ahead of the clock would become the
+            # newest row and could turn the rate negative, which clears a burn.
+            if ($null -eq $age -or $age -gt $RateWindowMinutes -or $age -lt -2) { continue }
             $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
         }
     } catch { return $null }
@@ -492,8 +494,10 @@ function Get-Percentage($Value) {
 #
 # A NUMERIC STRING IS REFUSED TOO, ON PURPOSE, THOUGH A "99" READ CRITICAL BEFORE THIS CHECK. Only a writer
 # other than the collector produces one: the client builds the field with Math.min, and the collector
-# writes a [double]. Such a document reads UNKNOWN, so the gate answers REVIEW, which stops an unreviewed
-# spawn and clears nothing. Decided on PR 2705, and ADR 0211 records it.
+# writes a [double]. One already in latest.json reads UNKNOWN, so the gate answers REVIEW, which stops an
+# unreviewed spawn and clears nothing. A fire carrying one is dropped as an absent window, so a published
+# lower reading stands until the 20-minute age limit; no route to that exists today. Decided on PR 2705,
+# and ADR 0211 records it.
 function Test-WindowHasNumber($w) {
     return ($null -ne (Get-Percentage $w.used_percentage))
 }

@@ -1064,6 +1064,28 @@ def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) ->
     assert code == CRITICAL and doc["seven_day"]["used_percentage"] == pytest.approx(104.0), doc
 
 
+def test_a_future_dated_history_row_is_skipped(tmp_path: Path) -> None:
+    """One row ahead of the clock became the newest row, turned the rate negative and cleared a burn. The
+    tolerance is the reader's own two minutes, and the row inside it is the control."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=40.0, seven_epoch=epoch)
+
+    def rows(points: list[tuple[float, float]]) -> tuple[int, dict[str, Any]]:
+        write_history(tmp_path, points, epoch)
+        return read(tmp_path)
+
+    good = [(60.0, 30.0), (30.0, 40.0)]
+    want_code, want = rows(good)
+    assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), want
+
+    got_code, got = rows([*good, (-5.0, 20.0)])
+    assert got_code == want_code, got
+    assert got["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), got
+
+    _, kept = rows([*good, (-1.0, 41.0)])
+    assert kept["seven_day"]["rate_pct_per_hr"] == pytest.approx(11.0, abs=0.5), kept
+
+
 @pytest.mark.parametrize(
     "bad",
     [
