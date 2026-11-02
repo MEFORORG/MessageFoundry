@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The one domain-shape rule (vault BACKLOG #2843).
+"""The one domain-shape rule (vault BACKLOG #2843), and the UPN suffix compare form beside it.
 
 The mail address check in ``transports/email.py`` (``envelope_address_problem``),
 ``[egress].allowed_recipient_domains``, ``[security].organization_domains`` and
 ``[security].external_link_allowlist`` all call :func:`domain_shape_problem`. Each caller keeps
 its own normalisation and its own matching, and says what they are in its own docstring.
+``config/settings.py`` and ``auth/oidc/claims.py`` both call :func:`upn_suffix_key`, which is a
+separate rule: a UPN suffix need not have a domain's shape.
 
 **Neutral and stdlib-only**, so ``config/`` and ``transports/`` can both import it without a cycle:
 ``transports/email.py`` already imports ``config.settings``, so the rule cannot live in either.
@@ -18,7 +20,13 @@ from __future__ import annotations
 import ipaddress
 import string
 
-__all__ = ["MAX_MAIL_ADDRESS", "MAX_MAIL_DOMAIN", "domain_shape_problem", "is_canonical_ipv4"]
+__all__ = [
+    "MAX_MAIL_ADDRESS",
+    "MAX_MAIL_DOMAIN",
+    "domain_shape_problem",
+    "is_canonical_ipv4",
+    "upn_suffix_key",
+]
 
 #: The characters a hostname-shaped domain may hold, in either case.
 _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
@@ -79,3 +87,19 @@ def is_canonical_ipv4(text: str) -> bool:
         return str(ipaddress.IPv4Address(text)) == text
     except ValueError:
         return False
+
+
+def upn_suffix_key(suffix: str) -> str:
+    """The form both sides of the OIDC username suffix check compare a UPN suffix in (BACKLOG #3765).
+
+    ASCII white space is stripped. Then an ASCII suffix is lower-cased, and a suffix holding any
+    non-ASCII character is kept as written, because ``str.lower()`` is not a fold it can trust: it
+    turns the Kelvin sign into an ASCII ``k``, so a claim could pass as a suffix the allow-list
+    names and the claim does not. A plain ``strip()`` would do the same with a no-break space.
+    Equal keys imply equal ``str.strip().lower()`` results, so this accepts no pair that form
+    refused.
+
+    The UPN rule, not the domain shape above: :func:`domain_shape_problem` refuses a non-ASCII
+    domain, and a UPN suffix may hold one."""
+    suffix = suffix.strip(string.whitespace)
+    return suffix.lower() if suffix.isascii() else suffix

@@ -123,6 +123,7 @@ ROUTES: dict[str, tuple[str, str]] = {
     "PATCH /users/{user_id}": (ADMINISTRATOR_ONLY, "users:manage"),
     "DELETE /users/{user_id}": (ADMINISTRATOR_ONLY, "users:manage"),
     "DELETE /users/{user_id}/sessions": (ADMINISTRATOR_ONLY, "users:manage"),
+    "DELETE /sessions": (ADMINISTRATOR_ONLY, "users:manage"),
     "PUT /users/{user_id}/roles": (ADMINISTRATOR_ONLY, "users:manage"),
     "POST /users/{user_id}/reset-password": (ADMINISTRATOR_ONLY, "users:manage"),
     "POST /users/{user_id}/reset-mfa": (ADMINISTRATOR_ONLY, "users:manage"),

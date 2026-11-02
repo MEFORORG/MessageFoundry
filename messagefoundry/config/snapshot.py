@@ -68,16 +68,32 @@ class ConfigDirMissing(FileNotFoundError):
 #: (161) and ERROR_FILENAME_EXCED_RANGE (206). Python maps the first to EINVAL, not ENOENT.
 _INVALID_NAME_WINERRORS: frozenset[int] = frozenset({123, 161, 206})
 
+#: The Windows errors that say a network path or share cannot be reached, so nothing is known about
+#: what is there: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67). Python maps both to ENOENT, so
+#: each arrives as a ``FileNotFoundError``. ERROR_PATH_NOT_FOUND (3) and ERROR_INVALID_DRIVE (15) map
+#: the same way and stay absence, so a drive letter this process does not have reads as missing,
+#: even where it is mapped in another session.
+_UNREACHABLE_WINERRORS: frozenset[int] = frozenset({53, 67})
+
+
+def _is_absent(exc: OSError) -> bool:
+    """Whether ``exc`` says nothing is at the path, as against saying the path cannot be reached."""
+    unreachable = getattr(exc, "winerror", None) in _UNREACHABLE_WINERRORS
+    return not unreachable and isinstance(exc, FileNotFoundError)
+
 
 def is_missing_directory(exc: OSError) -> bool:
     """Whether ``exc``, raised resolving or listing a directory, says no directory can be opened by
     that path: nothing by that name, a file rather than a directory, a name or whole path too long
     for the filesystem (ENAMETOOLONG, or Windows error 206), or a name Windows refuses, such as
     ``sub?``. ``Path.is_dir`` answers ``False`` for all of them, so a caller that lists the
-    directory instead reports them as missing too (vault BACKLOG #2596). Any other error, such as
-    access denied, is not a missing directory."""
+    directory instead reports them as missing too (vault BACKLOG #2596). Any other error is not a
+    missing directory: at least access denied, and a share Windows cannot reach (errors 53 and 67),
+    which is a fault in reaching the folder and says nothing about what it holds, though
+    ``Path.is_dir`` answers ``False`` for that too."""
     return (
-        isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        _is_absent(exc)
+        or isinstance(exc, NotADirectoryError)
         or exc.errno == errno.ENAMETOOLONG
         or getattr(exc, "winerror", None) in _INVALID_NAME_WINERRORS
     )
@@ -96,6 +112,11 @@ def config_py_files(directory: Path) -> list[Path]:
 
 
 def _covered_name(folder: str, name: str) -> bool:
+    """Whether a snapshot reads ``name`` from ``folder``. For the directory itself (``.``) that is
+    :func:`config_py_files`'s rule for one name: the suffix in the case the platform's glob matches
+    it, and not dot-named."""
+    if folder == ".":
+        return os.path.normcase(name).endswith(".py") and not name.startswith(".")
     if folder == CODESETS_DIR_NAME:
         return is_code_set_name(name)
     return Path(name).suffix.lower() == ".toml"
@@ -249,18 +270,22 @@ class ConfigSnapshot:
 def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapshot:
     """Read every file a load of ``directory`` reads, once, into a :class:`ConfigSnapshot`.
 
-    The config modules (:func:`config_py_files`), ``connections.toml`` (or the candidate an edit is
-    validating), each table in ``codesets/``
+    The config modules, by :func:`_covered_name`, which gives the list a load digests and runs (of
+    the reads a load makes, only its trust check lists by :func:`config_py_files`),
+    ``connections.toml`` (or the candidate an edit is validating), each table in ``codesets/``
     (:func:`~messagefoundry.config.code_sets.is_code_set_name`), and each ``environments/*.toml``,
     which the fingerprint covers and the loader never reads. Only regular
     files, following links, are read: a link is read through, and its target's bytes are what a
     load would run. Never a ``__pycache__`` file.
 
-    With ``strict`` a fault raises: :class:`ConfigDirMissing` when ``directory`` is not a directory,
-    and the ``OSError`` when a folder cannot be listed or a file cannot be stat'ed or read. Without
-    it, a missing directory reads as an empty snapshot and each fault is recorded in
-    :attr:`ConfigSnapshot.unreadable` instead. A file removed between the listing and the read is
-    gone, not unreadable, unless ``strict``."""
+    With ``strict`` a fault raises: :class:`ConfigDirMissing` when ``directory`` is not a directory
+    at its first listing, and the ``OSError`` when a folder cannot be listed or a file cannot be
+    stat'ed or read. A directory removed after that listing raises nothing and reads as the files
+    still found, down to none. Without ``strict``, a missing directory reads as an empty snapshot
+    and each fault is recorded in :attr:`ConfigSnapshot.unreadable` instead. A file removed before
+    its stat is dropped, with or without ``strict``. One removed after its stat raises with
+    ``strict``, and without it is gone, not unreadable. A share Windows reports as unreachable is a
+    fault in each case, not a missing folder or a removed file (:func:`is_missing_directory`)."""
     # Lazy: connections_file imports the loader, which imports this module.
     from messagefoundry.config.connections_file import connections_file_path
 
@@ -272,13 +297,12 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
         if strict:
             raise
         return ConfigSnapshot(directory=Path(os.path.abspath(base)), files={})
-    candidates: list[tuple[str, Path]] = []
-    if "." in listable:
-        candidates += [(path.name, path) for path in config_py_files(base)]
-    candidates.append((CONNECTIONS_REL, connections_file_path(base)))
-    for folder in _FOLDERS:
+    candidates: list[tuple[str, Path]] = [(CONNECTIONS_REL, connections_file_path(base))]
+    for folder in (".", *_FOLDERS):
         if folder not in listable:
             continue
+        # Listed here and not by config_py_files, whose glob swallows a listing error, so a share
+        # lost at this moment would leave every module out with nothing raised or recorded.
         try:
             names = sorted(entry.name for entry in os.scandir(base / folder))
         except OSError as exc:
@@ -289,7 +313,7 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
             unreadable.add(folder)
             continue
         candidates += [
-            (f"{folder}/{name}", base / folder / name)
+            (name if folder == "." else f"{folder}/{name}", base / folder / name)
             for name in names
             if _covered_name(folder, name)
         ]
@@ -300,15 +324,13 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
             # one: Path.is_file would answer False and the file would drop out unremarked.
             if not _is_file(path):
                 continue
-            data = path.read_bytes()
-        except FileNotFoundError:
+            data = _read(path)
+        except OSError as exc:
             if strict:
                 raise
-            continue  # removed since the listing: gone, as _is_file judges a gone path
-        except OSError:
-            if strict:
-                raise
-            unreadable.add(rel)
+            # Absent means removed since the listing: gone, as _is_file judges a gone path.
+            if not _is_absent(exc):
+                unreadable.add(rel)
             continue
         files[rel] = data
     return ConfigSnapshot(
@@ -373,5 +395,20 @@ def _is_file(path: Path) -> bool:
     dangling link, or a file removed since the listing) is not a file."""
     try:
         return stat.S_ISREG(path.stat().st_mode)
-    except FileNotFoundError:
-        return False
+    except OSError as exc:
+        if _is_absent(exc):
+            return False
+        raise
+
+
+def _read(path: Path) -> bytes:
+    """The bytes of ``path``, which :func:`_is_file` just accepted. ``open`` reports the C runtime's
+    errno and no Windows error, so a share lost since the stat fails as a plain file-not-found. A
+    second stat tells them apart: it raises the Windows error for a lost share and absence for a
+    file removed since. One that finds the file there means the read failed and the file is not
+    gone, so that raises as a fault too."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError as exc:
+        path.stat()
+        raise OSError(errno.EIO, "a config file that exists could not be read", str(path)) from exc

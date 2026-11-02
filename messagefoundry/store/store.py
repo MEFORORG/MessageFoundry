@@ -96,6 +96,7 @@ from messagefoundry.config.settings import (
     AlertSeverity,
     StoreBackend,
 )
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
@@ -6191,6 +6192,46 @@ def forget_store_salt(path: Path) -> bool:
     switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
     refuses while another connection holds the file. After the delete, the main file is re-read with
     no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+
+    def drop(conn: sqlite3.Connection) -> bool:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+        ).fetchone()
+        return exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+
+    def gone(proof: sqlite3.Connection) -> bool:
+        return not (
+            proof.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+            ).fetchone()[0]
+            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+        )
+
+    return _write_closed_store(
+        path,
+        drop,
+        gone,
+        what="its store salt cannot be dropped",
+        proof_failed="still holds a store salt after it was dropped",
+    )
+
+
+def _write_closed_store[T](
+    path: Path,
+    write: Callable[[sqlite3.Connection], T],
+    prove: Callable[[sqlite3.Connection], bool],
+    *,
+    what: str,
+    proof_failed: str,
+) -> T:
+    """Run ``write`` on a CLOSED SQLite store file and prove it landed in the MAIN FILE, for
+    :func:`forget_store_salt` and :func:`write_restore_marker`.
+
+    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it,
+    and which SQLite refuses while another connection holds the file; ``write`` then runs in
+    autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
+    answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
+    file, so a change left in a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
@@ -6198,29 +6239,112 @@ def forget_store_salt(path: Path) -> bool:
         if mode != "delete":
             raise sqlite3.OperationalError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
-                "connection holds it, so its store salt cannot be dropped"
+                f"connection holds it, so {what}"
             )
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-        ).fetchone()
-        removed = exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+        result = write(conn)
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
         raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
-        left = (
-            proof.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-            ).fetchone()[0]
-            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
-        )
+        proven = prove(proof)
     finally:
         proof.close()
-    if left:
-        raise sqlite3.OperationalError(f"{path} still holds a store salt after it was dropped")
-    return removed
+    if not proven:
+        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+    return result
+
+
+def finite_or_none(value: object) -> float | None:
+    """``value`` as a finite float, or ``None`` for anything else (BACKLOG #2614). For a time read
+    from an archive, which a plaintext archive on a keyless box does not authenticate: a text,
+    infinite or NaN value is "not known", never a traceback."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def newest_audit_time(path: Path) -> float | None:
+    """The ``ts`` of the newest audit row in a CLOSED SQLite store file, or ``None`` when it has no
+    audit table or no numeric row (BACKLOG #2614). Read-only. The restore prints it, because every
+    account change made after it on the source is missing from the restored store."""
+    conn = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'"
+        ).fetchone():
+            return None
+        row = conn.execute(
+            "SELECT MAX(ts) FROM audit_log WHERE typeof(ts) IN ('real', 'integer')"
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else finite_or_none(row[0])
+
+
+def write_restore_marker(
+    path: Path,
+    *,
+    archive_sha256: str,
+    archive_created_at: float | None,
+    last_audit_at: float | None,
+    restored_at: float,
+) -> int:
+    """Mark a CLOSED SQLite store file as placed by ``restore`` and not yet recorded (BACKLOG #2614),
+    and end every session it holds. Returns how many sessions it ended.
+
+    The marker is a row in the store itself, not a file beside it, because the store is what an
+    operator moves: a store copied or renamed after the restore keeps its marker, and the first
+    engine start on it, wherever it lands, still records the restore and ends every session. One
+    row only; a second restore of the same file replaces it.
+
+    The sessions are ended here too, in the same transaction as the marker, because a revoke
+    needs no key: so no path that honours a session without consuming the marker, such as an
+    older build started on the file, gets the archive's sessions back. The first start still
+    raises every account's session epoch, which needs the key, and adds this count to its own.
+
+    It is proven in the main file as :func:`forget_store_salt`'s drop is, through
+    :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
+    naming this archive, raises ``sqlite3.OperationalError``."""
+
+    def mark(conn: sqlite3.Connection) -> int:
+        # Autocommit statements, not one transaction: the file is the restore's staged copy,
+        # and a failure between them discards it whole, so no half-written file is ever placed.
+        conn.executescript(_RESTORE_MARKER_DDL)
+        revoked = 0
+        # An archive an earlier build wrote may have no sessions table, or one from before the
+        # seal column (BACKLOG #2592). The column is added here first, as the first open's
+        # migration adds it, so such a file's sessions are ended by the same revoke as a current
+        # one's, which blanks the seal: the CLI notice reports this count as ended.
+        columns = {str(r[1]) for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if columns and "seal" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
+            columns.add("seal")
+        if "revoked_at" in columns:
+            revoked = conn.execute(
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL",
+                (restored_at,),
+            ).rowcount
+        conn.execute(
+            "INSERT OR REPLACE INTO restore_marker (id, archive_sha256, archive_created_at,"
+            " last_audit_at, restored_at, sessions_revoked) VALUES (1, ?, ?, ?, ?, ?)",
+            (archive_sha256, archive_created_at, last_audit_at, restored_at, revoked),
+        )
+        return revoked
+
+    def marked(proof: sqlite3.Connection) -> bool:
+        row = proof.execute("SELECT archive_sha256 FROM restore_marker WHERE id = 1").fetchone()
+        return row is not None and row[0] == archive_sha256
+
+    return _write_closed_store(
+        path,
+        mark,
+        marked,
+        what="its restore marker cannot be written",
+        proof_failed="holds no restore marker after it was written",
+    )
 
 
 def _secure_file(path: Path) -> None:
@@ -6853,6 +6977,26 @@ _SQLITE_APPROVAL_TOMBSTONE = (
 _SQLITE_APPROVAL_TOMBSTONE_RESEAL = (
     "UPDATE pending_approvals SET seal = ? WHERE id = ? AND status = 'rejected' AND seal = ?"
 )
+
+
+#: The audit action of a restore recorded at the first engine start after it (BACKLOG #2614).
+STORE_RESTORED_ACTION: Final = "store_restored"
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreRecord:
+    """What :meth:`MessageStore.consume_restore_record` found and did at the first engine start
+    after a ``messagefoundry restore`` (BACKLOG #2614). PHI-free: a hash, three times and a count.
+
+    ``archive_created_at`` is when the archive was taken, from its manifest, and
+    ``last_audit_at`` the time of the newest audit row it carried; each is ``None`` when the
+    archive did not say. ``sessions_revoked`` is how many sessions the start ended."""
+
+    archive_sha256: str
+    archive_created_at: float | None
+    last_audit_at: float | None
+    restored_at: float
+    sessions_revoked: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -7673,6 +7817,23 @@ _LAST_RECEIVED_SQL: Final[str] = (
     " FROM ch WHERE channel_id IS NOT NULL"
 )
 
+#: A restore the engine has not yet recorded (BACKLOG #2614). ``messagefoundry restore`` writes the
+#: one row into the store it places (:func:`write_restore_marker`), and the first engine start
+#: after it consumes the row (:meth:`MessageStore.consume_restore_record`). Its own constant because
+#: the restore writes it into an archive's store, which an earlier build may have written without
+#: this table. The schema script repeats it verbatim, so that script stays one literal; a test in
+#: ``tests/test_b2614_restore_record.py`` pins the two equal. Non-secret: a hash, times, a count.
+_RESTORE_MARKER_DDL: Final = """
+CREATE TABLE IF NOT EXISTS restore_marker (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    archive_sha256     TEXT NOT NULL,     -- the .mfbak file the restore read, hex
+    archive_created_at REAL,              -- the archive manifest's created_utc; NULL when absent
+    last_audit_at      REAL,              -- the newest audit row the archive held; NULL for none
+    restored_at        REAL NOT NULL,
+    sessions_revoked   INTEGER NOT NULL DEFAULT 0  -- sessions the restore itself ended in the file
+);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id           TEXT PRIMARY KEY,
@@ -8315,6 +8476,17 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     fingerprint   TEXT NOT NULL,      -- sealed keyed-MAC cell (#3472) / DEK key-id — one-way, NOT the value
     tracked_since TEXT NOT NULL,      -- ISO YYYY-MM-DD first observed (tracked-since age floor)
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
+);
+
+-- BACKLOG #2614: the restore marker. The same text as _RESTORE_MARKER_DDL, which a test pins;
+-- spelled here too, so this script stays one literal the BEGIN guard can read.
+CREATE TABLE IF NOT EXISTS restore_marker (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    archive_sha256     TEXT NOT NULL,     -- the .mfbak file the restore read, hex
+    archive_created_at REAL,              -- the archive manifest's created_utc; NULL when absent
+    last_audit_at      REAL,              -- the newest audit row the archive held; NULL for none
+    restored_at        REAL NOT NULL,
+    sessions_revoked   INTEGER NOT NULL DEFAULT 0  -- sessions the restore itself ended in the file
 );
 """
 
@@ -13508,7 +13680,7 @@ class MessageStore:
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset) — the message-level
         recovery path. **Two modes, by whether anything is stuck:**
@@ -13644,7 +13816,7 @@ class MessageStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's **stored transformed body** to an ALTERNATE outbound ``to`` (ADR 0090,
@@ -13887,7 +14059,7 @@ class MessageStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-enter an EDITED body onto the
@@ -14070,7 +14242,7 @@ class MessageStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue **dead-lettered outbound deliveries** only (optionally scoped to a channel/
         destination): set them back to ``pending`` with attempts reset, revert each affected message
@@ -14650,6 +14822,7 @@ class MessageStore:
         if now is None:
             now = time.time()
         connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        check_connection_event_kind(kind)
         # Bound to (connection, ts, kind) — the row's insert-time-known identity; connection_event.id is
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
@@ -17699,6 +17872,108 @@ class MessageStore:
                 )
             row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
+        :meth:`AuthStore.revoke_all_sessions`."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            revoked = await self._revoke_all_sessions_in_txn(except_token_hash, now)
+            await self._commit()
+        return revoked
+
+    async def _revoke_all_sessions_in_txn(self, except_token_hash: str | None, now: float) -> int:
+        """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
+
+        Every account's epoch is raised first, as :meth:`revoke_user_sessions` raises one, then
+        one sweep ends the rows and the kept row is re-sealed under its own account's new epoch.
+
+        The first statement is a write, which takes SQLite's write lock even when it matches no
+        row, so the reads below run under it: another process (an engine shard, or the engine
+        beside ``admin-revoke-sessions``) committing between a read and the first update would
+        otherwise fail the upgrade from a stale snapshot, which the busy timeout does not retry."""
+        await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
+        cur = await self._db.execute("SELECT id FROM users ORDER BY id")
+        for row in await cur.fetchall():
+            await self._bump_session_epoch(str(row[0]))
+        # Spelled at the call, not built from a constant, so the BEGIN guard in
+        # `tests/test_writer_txn_is_the_only_begin.py` can read it.
+        cur = await self._db.execute(
+            "UPDATE sessions SET revoked_at=?, seal='' WHERE revoked_at IS NULL"
+            " AND (? IS NULL OR token_hash != ?)",
+            (now, except_token_hash, except_token_hash),
+        )
+        revoked = int(cur.rowcount)
+        if except_token_hash is None:
+            return revoked
+        kept = await self._db.execute(
+            "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
+        )
+        owner = await kept.fetchone()
+        if owner is not None:
+            epoch = await self._session_epoch(str(owner[0]))
+            await self._write_session(except_token_hash, lambda s: replace(s, user_epoch=epoch))
+        return revoked
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Record a restore once: revoke every session, append ``store_restored`` and delete the
+        marker, in one writer transaction (BACKLOG #2614). See
+        :meth:`AuthStore.consume_restore_record`.
+
+        One transaction, so a start that dies part-way leaves the marker for the next start: the
+        sessions are not ended without the row that says why, and the row is never written twice.
+
+        Its first statement is a write, which takes SQLite's write lock even when it matches no
+        row, so the marker is read under that lock. Two processes starting together on one
+        restored file then queue on the lock, and the second finds the marker gone, rather than
+        both reading it and one failing its upgrade from a stale snapshot."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
+            cur = await self._db.execute(
+                "SELECT archive_sha256, archive_created_at, last_audit_at, restored_at,"
+                " sessions_revoked FROM restore_marker WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await self._commit()
+                return None
+            record = RestoreRecord(
+                archive_sha256=str(row[0]),
+                archive_created_at=finite_or_none(row[1]),
+                last_audit_at=finite_or_none(row[2]),
+                restored_at=now if (at := finite_or_none(row[3])) is None else at,
+                sessions_revoked=int(row[4] or 0)
+                + await self._revoke_all_sessions_in_txn(None, now),
+            )
+            audit = AuditAppend(
+                action=STORE_RESTORED_ACTION,
+                actor="system",
+                detail=json.dumps(
+                    {
+                        "archive_sha256": record.archive_sha256,
+                        "archive_created_at": record.archive_created_at,
+                        # Clamped at zero, as the alert's age is: an archive dated after the
+                        # restore says the backup host's clock led, not that it was taken later.
+                        "archive_age_seconds": (
+                            None
+                            if record.archive_created_at is None
+                            else max(0, round(record.restored_at - record.archive_created_at))
+                        ),
+                        "last_audit_at": record.last_audit_at,
+                        "restored_at": record.restored_at,
+                        "sessions_revoked": record.sessions_revoked,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            appended = await self._append_audits((audit,), now=now)
+            await self._db.execute("DELETE FROM restore_marker")
+            await self._commit()
+        tee_audits((audit,), appended, ts=now)
+        return record
 
     async def _session_epoch(self, user_id: str) -> int:
         """The account's session epoch, read on the writer connection inside the caller's

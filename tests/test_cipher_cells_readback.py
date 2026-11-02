@@ -106,7 +106,7 @@ async def _populate(store: MessageStore) -> None:
         connection="IB_SYNTH",
         transport="mllp",
         direction="inbound",
-        kind="error",
+        kind="framing_error",
         reason="SYNTH-CONN-REASON",
     )
     await store.upsert_alert_instance(

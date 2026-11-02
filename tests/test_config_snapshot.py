@@ -28,23 +28,31 @@ import subprocess
 import sys
 import tokenize
 from pathlib import Path, PurePath
-from types import CodeType
+from types import CodeType, SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from messagefoundry.config import wiring
-from messagefoundry.config.fingerprint import config_fingerprint
+from messagefoundry.config.fingerprint import (
+    UNREADABLE_FILES_KEY,
+    config_fingerprint,
+    config_fingerprint_detail,
+    digest_coverage,
+)
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.snapshot import (
     ConfigDirMissing,
     ConfigSnapshot,
     NotInSnapshot,
     config_py_files,
+    is_missing_directory,
     read_config_snapshot,
 )
 from messagefoundry.config.wiring import WiringError, load_config, load_snapshot, validate_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
+from messagefoundry.pipeline.engine import ConfigDirUnreadable, Engine
 from messagefoundry.pipeline.sandbox import (
     SandboxError,
     SandboxMode,
@@ -577,3 +585,254 @@ def test_serve_s_value_reader_parses_the_snapshot_or_answers_none(
     )
     assert outside.from_snapshot(snapshot) is None
     assert outside() == {"host": "outside"}
+
+
+# --- vault BACKLOG #3535: a share Windows cannot reach is a fault, not a missing path ------------
+
+
+def _share_fault(winerror: int = 53) -> OSError:
+    """The error Windows raises for a share it cannot reach, which Python on Windows maps to a
+    ``FileNotFoundError``. POSIX ignores the code and builds a plain ``OSError``, which would
+    pass on the old code, so there the same error is built by hand."""
+    fault = OSError(None, "share unreachable", None, winerror)
+    if not isinstance(fault, FileNotFoundError):
+        fault = FileNotFoundError(2, "share unreachable")
+        fault.winerror = winerror  # type: ignore[attr-defined]
+    return fault
+
+
+def _lost_share(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    *,
+    winerror: int = 53,
+    after: int = 0,
+    answers_is_dir: bool = False,
+) -> None:
+    """Make every listing of ``path`` past the first ``after`` raise :func:`_share_fault`, and
+    ``Path.is_dir`` of it answer ``False``, as both do for a real share that cannot be reached
+    (measured on ``\\\\127.0.0.1\\nosuchshare``). ``answers_is_dir`` leaves ``is_dir`` alone, for a
+    share lost between the two calls."""
+    real_scandir, real_is_dir = os.scandir, Path.is_dir
+    listings = 0
+
+    def scandir(target: Any) -> Any:
+        nonlocal listings
+        if Path(target) == path:
+            listings += 1
+            if listings > after:
+                raise _share_fault(winerror)
+        return real_scandir(target)
+
+    def is_dir(self: Path, **kwargs: Any) -> bool:
+        return self != path and real_is_dir(self, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    if not answers_is_dir:
+        monkeypatch.setattr(Path, "is_dir", is_dir)
+
+
+def _config(directory: Path) -> Path:
+    """A config directory holding one module, one code set and one value file."""
+    (directory / "codesets").mkdir(parents=True)
+    (directory / "environments").mkdir()
+    (directory / "graph.py").write_text(_graph("V1"), encoding="utf-8")
+    (directory / "codesets" / "diets.csv").write_text("key,value\na,b\n", encoding="utf-8")
+    (directory / "environments" / "dev.toml").write_bytes(b'host = "dev"\n')
+    return directory
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+def test_a_share_fault_is_not_a_missing_directory(winerror: int) -> None:
+    assert not is_missing_directory(_share_fault(winerror))
+    assert is_missing_directory(FileNotFoundError(2, "no such file"))  # the control
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows maps these codes")
+@pytest.mark.parametrize("winerror", [2, 3, 15])
+def test_the_other_windows_errors_python_maps_to_not_found_stay_missing(winerror: int) -> None:
+    fault = _share_fault(winerror)
+    assert isinstance(fault, FileNotFoundError) and is_missing_directory(fault)
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+@pytest.mark.parametrize("folder", [".", "codesets", "environments"])
+def test_a_strict_read_refuses_a_lost_share_rather_than_read_it_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str, winerror: int
+) -> None:
+    """A digest that gates a load must not go on without the folder. Nor is the base a missing
+    directory: only that is ``ConfigDirMissing``, which a reload answers as ``not_found``."""
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg / folder, winerror=winerror)
+    with pytest.raises(OSError) as refused:
+        read_config_snapshot(cfg, strict=True)
+    assert not isinstance(refused.value, ConfigDirMissing)
+
+
+@pytest.mark.parametrize("after", [0, 1], ids=["first-listing", "second-listing"])
+@pytest.mark.parametrize("folder", [".", "codesets", "environments"])
+def test_a_lax_read_names_a_folder_on_a_lost_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str, after: int
+) -> None:
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg / folder, after=after)
+    assert read_config_snapshot(cfg, strict=False).unreadable == (folder,)
+
+
+@pytest.mark.parametrize("folder", [".", "codesets", "environments"])
+def test_a_share_lost_after_the_first_listing_refuses_a_strict_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    """The base's own second listing included, where a glob would raise nothing, and the modules
+    would drop out of a digest that gates."""
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg / folder, after=1)
+    with pytest.raises(OSError):
+        read_config_snapshot(cfg, strict=True)
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+def test_a_module_whose_stat_meets_a_lost_share_is_not_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """A stat raising the mapped error read as a file that is gone, so a strict read left the module
+    out and raised nothing."""
+    cfg = _config(tmp_path / "cfg")
+    real = Path.stat
+
+    def stat(self: Path, **kwargs: Any) -> os.stat_result:
+        if self.name == "graph.py":
+            raise _share_fault(winerror)
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    with pytest.raises(OSError):
+        read_config_snapshot(cfg, strict=True)
+    snapshot = read_config_snapshot(cfg, strict=False)
+    assert snapshot.unreadable == ("graph.py",) and "graph.py" not in snapshot.files
+
+
+def test_a_module_whose_read_meets_a_lost_share_is_not_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``open`` carries no Windows error (measured on ``\\\\127.0.0.1\\nosuchshare``), so a share
+    lost after the stat fails as a plain file-not-found; the second stat tells it from a file
+    removed since, which is ``test_a_file_removed_mid_digest_is_gone_not_unreadable``."""
+    cfg = _config(tmp_path / "cfg")
+    real_stat, real_read = Path.stat, Path.read_bytes
+    lost = False
+
+    def stat(self: Path, **kwargs: Any) -> os.stat_result:
+        if self.name == "graph.py" and lost:
+            raise _share_fault(67)
+        return real_stat(self, **kwargs)
+
+    def read_bytes(self: Path) -> bytes:
+        nonlocal lost
+        if self.name == "graph.py":
+            lost = True
+            raise FileNotFoundError(2, "No such file", str(self))
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    assert read_config_snapshot(cfg, strict=False).unreadable == ("graph.py",)
+
+
+def test_a_load_refuses_a_code_set_folder_on_a_lost_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It loaded without its tables before, and a graph that asks for one fails only at run time."""
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg / "codesets")
+    with pytest.raises(WiringError, match="could not read codesets"):
+        load_config(cfg)
+
+
+def test_validate_config_reports_a_code_set_folder_on_a_lost_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg / "codesets")
+    assert "could not read codesets" in [d.message for d in validate_config(cfg)]
+
+
+def test_a_load_goes_on_past_a_value_folder_on_a_lost_share_and_the_digest_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config load reads no file in ``environments/``, so this folder alone refuses no load. A
+    value provider reads that folder itself, and is not what this pins. The digest is partial, so
+    it compares only with a digest that left out the same folder."""
+    cfg = _config(tmp_path / "cfg")
+    whole = digest_coverage(config_fingerprint_detail(cfg))
+    _lost_share(monkeypatch, cfg / "environments")
+    assert load_config(cfg).config_snapshot is not None
+    detail = config_fingerprint_detail(cfg)
+    assert detail[UNREADABLE_FILES_KEY] == ["environments"]
+    partial = digest_coverage(detail)
+    assert whole is not None and whole[1] == ()
+    assert partial is not None and partial[1] == ("environments",)
+
+
+def test_a_load_refuses_a_base_directory_on_a_lost_share_rather_than_run_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The base still answers ``is_dir`` here, so only the read can refuse. It read as an empty
+    bundle before, and with ``allow_empty`` that returned an empty graph."""
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg, answers_is_dir=True)
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(cfg, allow_empty=True)
+
+
+def test_a_lax_load_of_a_base_that_stops_answering_is_dir_still_answers_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.is_dir`` answers ``False`` for a lost share, so ``read_trusted_snapshot`` still calls
+    the base missing, as it always has: it refuses, under a reason that does not name the share."""
+    cfg = _config(tmp_path / "cfg")
+
+    def losing(directory: Path, *, strict: bool) -> ConfigSnapshot:
+        _lost_share(monkeypatch, cfg)
+        return read_config_snapshot(directory, strict=strict)
+
+    monkeypatch.setattr(wiring, "read_config_snapshot", losing)
+    with pytest.raises(ConfigDirMissing):
+        load_config(cfg, allow_empty=True)
+
+
+def test_the_code_digest_of_a_base_directory_on_a_lost_share_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not the digest of no modules, which a sandbox worker's own digest could then be held to."""
+    cfg = _config(tmp_path / "cfg")
+    assert wiring.config_code_digest(cfg) is not None  # the control
+    _lost_share(monkeypatch, cfg)
+    assert wiring.config_code_digest(cfg) is None
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+def test_the_engine_refuses_a_reload_target_on_a_lost_share_as_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """``ConfigDirUnreadable``, which a reload route answers as 422 ``unreadable``. It answered
+    404 ``not_found``, as if nothing were there."""
+    cfg = _config(tmp_path / "cfg")
+    engine = cast(Engine, SimpleNamespace(_resolve_reload_target=Path))
+    _lost_share(monkeypatch, cfg, winerror=winerror)
+    with pytest.raises(ConfigDirUnreadable):
+        Engine._existing_reload_target_blocking(engine, cfg)
+
+
+@pytest.mark.parametrize("folder", ["codesets", "environments"])
+def test_the_engine_takes_no_gating_digest_of_a_bundle_on_a_lost_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    """Both of the engine's strict reads answer ``None``, which a release refuses as
+    ``digest_unavailable``. Before, each went on without the folder."""
+    cfg = _config(tmp_path / "cfg")
+    assert Engine._content_digest_blocking(cfg) is not None  # the control
+    assert Engine._reload_snapshot_blocking(cfg) is not None  # the control
+    _lost_share(monkeypatch, cfg / folder)
+    assert Engine._content_digest_blocking(cfg) is None
+    assert Engine._reload_snapshot_blocking(cfg) is None

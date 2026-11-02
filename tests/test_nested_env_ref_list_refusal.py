@@ -206,83 +206,210 @@ def test_a_reference_one_level_deeper_in_an_item_is_refused_too() -> None:
     assert SENTINEL not in str(excinfo.value)
 
 
+#: The refusal every ``env()`` default holding a reference gets when it is made (BACKLOG #2519).
+DEFAULT_REFUSAL = "has an env() reference inside its default="
+
+
+@pytest.mark.parametrize("target", sorted(LIST_SETTINGS))
 @pytest.mark.parametrize("shape", sorted(NESTED_SHAPES))
-def test_a_reference_inside_a_whole_setting_env_default_is_refused_too(shape: str) -> None:
-    """``resolve_env_settings`` returns a default unchanged, so a list default holding a reference
-    would reach the connector the same way a list item written directly does."""
-    whole = messagefoundry.env("capture_list", default=["x-a", NESTED_SHAPES[shape]()])
+def test_a_reference_past_the_defaults_scan_depth_is_refused_by_the_factory(
+    shape: str, target: tuple[str, str]
+) -> None:
+    """``EnvRef``'s scan stops at ``_MAX_ENVREF_SCAN_DEPTH``, so a marker one list past it builds a
+    reference. The factory's walk starts one level further in, at each item, and sees it, on every
+    list setting. That is why the walk stayed when the first-link refusal moved into ``EnvRef``."""
+    factory, setting = target
+    deep: Any = NESTED_SHAPES[shape]()
+    for _ in range(wiring._MAX_ENVREF_SCAN_DEPTH + 1):
+        deep = [deep]
+    assert not wiring._contains_envref(deep), "the premise: EnvRef's scan does not reach this"
+    assert wiring._contains_envref(deep[0]), "the premise: the factory's walk does"
+    whole = messagefoundry.env("whole_list", default=deep)
     with pytest.raises(WiringError) as excinfo:
-        # Rest() annotates this setting `list[str] | None`, yet the wiring layer resolves a whole
-        # env() here (the TOML test below shows it). The annotation is narrower than the behaviour.
-        messagefoundry.Rest(url="https://example.invalid/x", capture_response_headers=whole)  # type: ignore[arg-type]
-    assert "capture_response_headers env() default item 1" in str(excinfo.value)
-    assert SENTINEL not in str(excinfo.value)
+        LIST_SETTINGS[target](whole)
+    message = str(excinfo.value)
+    assert f"{factory} {setting} env() default item 0" in message, message
+    assert SENTINEL not in message, message
 
 
-#: An ``env()`` used as another ``env()``'s default, in both spellings of the INNER one: an
-#: ``EnvRef``, and the raw marker table. Code-first can write either. The file loader leaves an inner
-#: marker raw, but its type check refuses that shape before any factory runs (see the TOML test).
-#: The inner key is ``inner_list`` and the outer one ``outer_list``; the control below sets only the
-#: inner one, to show it is never read.
-NESTED_DEFAULTS: dict[str, Callable[[list[Any]], Any]] = {
-    "EnvRef": lambda items: messagefoundry.env(
-        "outer_list", default=messagefoundry.env("inner_list", default=items)
-    ),
-    "raw marker": lambda items: messagefoundry.env(
-        "outer_list", default={"env": "inner_list", "default": items}
+# --- a reference inside an env() default (BACKLOG #2519) ---------------------
+
+
+def _past_the_refusal(default: Any) -> EnvRef:
+    """A reference carrying ``default``, forged past ``EnvRef``'s refusal. It is frozen, so only
+    ``object.__setattr__`` can do this, which is how the hazard stays measurable."""
+    ref = messagefoundry.env("outer_list")
+    object.__setattr__(ref, "default", default)
+    return ref
+
+
+#: A reference in a default, in every position it was measured reaching the connector from. Each
+#: carries the sentinel, so the no-echo check can fail in each.
+DEFAULTS_HOLDING_A_REFERENCE: dict[str, Callable[[], Any]] = {
+    "EnvRef": NESTED_SHAPES["code-first"],
+    "marker": NESTED_SHAPES["connections.toml"],
+    "marker-with-a-list": lambda: {"env": "inner", "default": ["static.example.invalid", SENTINEL]},
+    "EnvRef-in-a-table": lambda: {"X-Key": NESTED_SHAPES["code-first"]()},
+    "marker-in-a-table": lambda: {"X-Key": NESTED_SHAPES["connections.toml"]()},
+    "EnvRef-as-a-table-key": lambda: {NESTED_SHAPES["code-first"](): "static"},
+    "EnvRef-in-a-list": lambda: ["x", NESTED_SHAPES["code-first"]()],
+    "marker-in-a-list": lambda: ["x", NESTED_SHAPES["connections.toml"]()],
+}
+
+#: Every route that makes a reference from a key and a default.
+CONSTRUCTION_ROUTES: dict[str, Callable[[str, Any], Any]] = {
+    "env": lambda key, default: messagefoundry.env(key, default=default),
+    "EnvRef": lambda key, default: EnvRef(key=key, default=default),
+    "parse_env_setting": lambda key, default: wiring.parse_env_setting(
+        {"env": key, "default": default}
     ),
 }
 
 
-@pytest.mark.parametrize("default_shape", sorted(NESTED_DEFAULTS))
-def test_a_nested_env_default_never_resolves_even_with_a_static_list(default_shape: str) -> None:
-    """Positive control for the refusal below, driven into a real sink. ``resolve_env_settings``
-    resolves one link, so with the outer key unset the INNER reference arrives unresolved -- even
-    with the inner key set -- and Rest's proxy-bypass list reads it as empty. That is why a chain with
-    a clean static list is refused too: its fallback link never works, so no version of it is clean."""
-    nested = NESTED_DEFAULTS[default_shape](["bypass.example.invalid"])
-    resolved = resolve_env_settings(
-        {"proxy_no_proxy": nested}, {"inner_list": ["set.example.invalid"]}
+@pytest.mark.parametrize("route", sorted(CONSTRUCTION_ROUTES))
+@pytest.mark.parametrize("default", sorted(DEFAULTS_HOLDING_A_REFERENCE))
+def test_a_reference_inside_a_default_is_refused_when_it_is_made(default: str, route: str) -> None:
+    """Each route names the outer key and withholds the default."""
+    with pytest.raises(WiringError) as excinfo:
+        CONSTRUCTION_ROUTES[route]("outer", DEFAULTS_HOLDING_A_REFERENCE[default]())
+    message = str(excinfo.value)
+    assert f"env reference 'outer' {DEFAULT_REFUSAL}" in message, message
+    assert SENTINEL not in message, message
+
+
+def test_the_reported_code_first_shape_is_refused_at_load(tmp_path: pathlib.Path) -> None:
+    """The row's own example, through a real config module: the raise is an import-time load error."""
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Rest, env, outbound\n"
+        'outbound("OB_ACME", Rest(url="https://example.invalid/x", bearer_token=env("tok", '
+        f'default=env("tok2", default="{SENTINEL}"))))\n',
+        encoding="utf-8",
     )
-    assert resolved["proxy_no_proxy"] is nested.default
+    with pytest.raises(WiringError) as excinfo:
+        wiring.load_config(tmp_path)
+    assert f"env reference 'tok' {DEFAULT_REFUSAL}" in str(excinfo.value), str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
+@pytest.mark.parametrize("spelling", ["env", "marker"])
+def test_a_reference_valued_default_would_reach_the_connector_unresolved(spelling: str) -> None:
+    """Positive control for the refusal, driven into a real sink. ``resolve_env_settings`` resolves
+    one link, so with the outer key unset the INNER reference arrives unresolved -- even with the
+    inner key set -- and Rest's proxy-bypass list reads it as empty. That is why a chain with a clean
+    static list is refused too: its fallback link never works, so no version of it is clean."""
+    items = ["bypass.example.invalid"]
+    inner: Any = (
+        messagefoundry.env("inner_list", default=items)
+        if spelling == "env"
+        else {"env": "inner_list", "default": items}
+    )
+    forged = _past_the_refusal(inner)
+    resolved = resolve_env_settings(
+        {"proxy_no_proxy": forged}, {"inner_list": ["set.example.invalid"]}
+    )
+    assert resolved["proxy_no_proxy"] is inner
     assert _normalize_no_proxy(resolved["proxy_no_proxy"]) == ()
 
 
 @pytest.mark.parametrize("target", sorted(LIST_SETTINGS))
+def test_a_default_turned_into_a_reference_after_it_was_made_is_refused_by_the_factory(
+    target: tuple[str, str],
+) -> None:
+    """``EnvRef`` reads the default once. A table it took as clean can become a marker afterwards,
+    and only the factory reads it again."""
+    factory, setting = target
+    default: dict[str, Any] = {}
+    whole = messagefoundry.env("whole_list", default=default)
+    default.update({"env": "inner", "default": [SENTINEL]})
+    with pytest.raises(WiringError) as excinfo:
+        LIST_SETTINGS[target](whole)
+    message = str(excinfo.value)
+    assert f"{factory} {setting} env() default may not be" in message, message
+    assert "with a static default" in message, message
+    assert SENTINEL not in message, message
+
+
 @pytest.mark.parametrize(
-    "items",
+    "marker",
     [
-        pytest.param(lambda: ["static.example.invalid", SENTINEL], id="static-items"),
-        pytest.param(lambda: ["x", NESTED_SHAPES["code-first"]()], id="EnvRef-item"),
-        pytest.param(lambda: ["x", NESTED_SHAPES["connections.toml"]()], id="marker-item"),
+        pytest.param({"env": {"env": "inner", "default": SENTINEL}}, id="key"),
+        pytest.param({"env": "outer", "cast": {"env": "inner", "default": SENTINEL}}, id="cast"),
     ],
 )
-@pytest.mark.parametrize("default_shape", sorted(NESTED_DEFAULTS))
-def test_an_env_used_as_another_envs_default_is_refused(
-    default_shape: str, items: Callable[[], list[Any]], target: tuple[str, str]
+def test_a_reference_in_the_key_or_cast_slot_is_named_by_type(marker: dict[str, Any]) -> None:
+    """The same chain with its table one slot over. A refusal that printed the slot would carry the
+    default the refusal above withholds."""
+    with pytest.raises(WiringError) as excinfo:
+        wiring.parse_env_setting(marker)
+    assert "dict" in str(excinfo.value), str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
+
+
+def test_a_cast_that_is_not_text_says_so() -> None:
+    """Type names of TOML scalars are valid cast names, so "unknown cast int" would contradict the
+    list of casts printed beside it."""
+    with pytest.raises(WiringError, match="it must be a string, got int"):
+        wiring.parse_env_setting({"env": "t", "cast": 5})
+
+
+def test_a_label_names_a_table_in_the_key_slot_by_type() -> None:
+    label = wiring._envref_label({"env": {"env": "inner", "default": SENTINEL}})
+    assert label == "env(<dict>)"
+
+
+def test_a_reference_inside_a_table_default_would_reach_the_partner() -> None:
+    """Positive control for the table shape: nothing reads inside a resolved default, so the header
+    value holds the marker, default included, wherever the whole-table key is unset."""
+    forged = _past_the_refusal({"X-Key": {"env": "inner", "default": SENTINEL}})
+    resolved = resolve_env_settings({"headers": forged}, {"inner": "set"})
+    assert SENTINEL in str(resolved["headers"]["X-Key"])
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(
+            lambda: messagefoundry.env("outer", default=messagefoundry.env("inner"), cast=bool),
+            id="code-first",
+        ),
+        pytest.param(
+            lambda: wiring.parse_env_setting(
+                {"env": "outer", "cast": "bool", "default": {"env": "inner"}}
+            ),
+            id="connections.toml",
+        ),
+    ],
+)
+def test_a_bool_cast_chain_hears_the_chain_refusal_not_the_boolean_one(
+    make: Callable[[], Any],
 ) -> None:
-    """The remainder of BACKLOG #1820. Every variant carries the sentinel, so the no-echo check
-    below can fail in each one; the static case carries it as a plain item."""
-    factory, setting = target
+    """Ahead of the bool read: a reference is not a bad boolean, and "not a boolean" would send the
+    author looking for the wrong fix."""
     with pytest.raises(WiringError) as excinfo:
-        LIST_SETTINGS[target](NESTED_DEFAULTS[default_shape](items()))
-    message = str(excinfo.value)
-    assert f"{factory} {setting} env() default may not itself be" in message, message
-    assert SENTINEL not in message, message
+        make()
+    assert DEFAULT_REFUSAL in str(excinfo.value), str(excinfo.value)
+    assert "not a boolean" not in str(excinfo.value), str(excinfo.value)
 
 
-def test_an_item_and_a_chain_on_one_factory_are_both_named_with_their_own_remedy() -> None:
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(
+            lambda: {"default": messagefoundry.env("inner")},
+            id="reference-in-the-default",
+        ),
+        pytest.param(lambda: {"default": "maybe", "cast": bool}, id="unreadable-bool-default"),
+    ],
+)
+def test_a_directly_built_reference_names_a_table_key_by_type(
+    fields: Callable[[], dict[str, Any]],
+) -> None:
+    """``env()`` lowers its key and ``parse_env_setting`` checks it, so only a direct ``EnvRef`` can
+    hold a table there. A refusal that printed the key would carry the default it withholds."""
     with pytest.raises(WiringError) as excinfo:
-        messagefoundry.Rest(
-            url="https://example.invalid/x",
-            capture_response_headers=["x-a", NESTED_SHAPES["code-first"]()],
-            proxy_no_proxy=NESTED_DEFAULTS["EnvRef"](["np.example.invalid"]),
-        )
-    message = str(excinfo.value)
-    assert "Rest capture_response_headers item 1 may not be an env() reference" in message, message
-    assert "Rest proxy_no_proxy env() default may not itself be" in message, message
-    assert "static list default instead" in message, message
-    assert SENTINEL not in message, message
+        EnvRef(key={"env": "inner", "default": SENTINEL}, **fields())  # type: ignore[arg-type]
+    assert "env reference <dict> " in str(excinfo.value), str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value), str(excinfo.value)
 
 
 def test_a_self_referential_default_is_refused_at_the_first_link() -> None:
@@ -291,14 +418,44 @@ def test_a_self_referential_default_is_refused_at_the_first_link() -> None:
     loop: dict[str, Any] = {"env": "loop", "default": [SENTINEL]}
     loop["default"].append(loop)
     with pytest.raises(WiringError) as excinfo:
-        messagefoundry.Rest(
-            url="https://example.invalid/x",
-            # A whole-setting env() here is resolved by the wiring layer; see the test above.
-            capture_response_headers=messagefoundry.env("outer_list", default=loop),  # type: ignore[arg-type]
-        )
+        messagefoundry.env("outer_list", default=loop)
     message = str(excinfo.value)
-    assert "capture_response_headers env() default may not itself be" in message, message
+    assert DEFAULT_REFUSAL in message, message
     assert SENTINEL not in message, message
+
+
+@pytest.mark.parametrize(
+    "table", [{"env": "prod"}, {"env": "prod", "default": "x"}, {"env": "prod", "cast": "str"}]
+)
+def test_a_table_that_reads_as_a_reference_is_refused_in_a_default_by_decision(
+    table: dict[str, str],
+) -> None:
+    """A real header table named ``env`` is refused here. TOML cannot tell it from the chain shape,
+    so the message says so, and the same table written directly stays legal in code."""
+    with pytest.raises(WiringError) as excinfo:
+        messagefoundry.env("h", default=table)
+    assert "counts as a reference" in str(excinfo.value), str(excinfo.value)
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={"env": "prod"})
+    assert spec.settings["headers"] == {"env": "prod"}
+
+
+@pytest.mark.parametrize(
+    "default",
+    [
+        pytest.param("static", id="scalar"),
+        pytest.param(5, id="int"),
+        pytest.param(None, id="none"),
+        pytest.param(["a", "b"], id="list"),
+        pytest.param({"Accept": "application/fhir+json"}, id="table"),
+        pytest.param({"env": "prod", "not_an_envref_key": 1}, id="near-miss-table"),
+        pytest.param({"X": {"env": "prod", "not_an_envref_key": 1}}, id="near-miss-nested"),
+    ],
+)
+def test_a_static_default_still_builds_and_resolves(default: Any) -> None:
+    """Over-widening control. It resolves to the default with the key unset."""
+    ref = messagefoundry.env("key", default=default)
+    assert ref.default == default
+    assert resolve_env_settings({"s": ref}, {})["s"] == default
 
 
 _OUTBOUND_HEAD = (
@@ -345,23 +502,81 @@ def test_the_toml_surface_refuses_a_list_item(
     assert SENTINEL not in str(excinfo.value), str(excinfo.value)
 
 
+def _toml_refusal(tmp_path: pathlib.Path, body: str) -> str:
+    """The refusal ``body`` gets from the file loader, checked for what every one must hold."""
+    with pytest.raises(WiringError) as excinfo:
+        load_connections_file(_write(tmp_path, body), Registry())
+    message = str(excinfo.value)
+    assert "connection 'OB_ACME'" in message, message
+    assert SENTINEL not in message, message
+    return message
+
+
 @pytest.mark.parametrize(("head", "setting"), _TOML_LIST_TARGETS)
-def test_the_toml_surface_refuses_a_nested_env_default_before_the_factory(
+def test_the_toml_surface_refuses_a_nested_env_default_when_it_decodes_it(
     tmp_path: pathlib.Path, head: str, setting: str
 ) -> None:
-    """The file spelling of the nested shape never reaches the factory guard. The loader's type
-    check refuses the outer default first, because the inner marker arrives as a raw table where the
-    annotation wants an array. This pins that, and that its message withholds the sentinel too."""
-    path = _write(
+    """The file spelling of the nested shape never reaches the factory guard or the type check:
+    ``parse_env_setting`` constructs the ``EnvRef``, which refuses it, and ``_build_spec`` adds the
+    connection and the setting."""
+    message = _toml_refusal(
         tmp_path,
         f'{head}{setting} = {{ env = "outer_list", default = '
         f'{{ env = "inner_list", default = ["{_static(setting)}", {TOML_MARKER}] }} }}\n',
     )
-    with pytest.raises(WiringError) as excinfo:
-        load_connections_file(path, Registry())
-    message = str(excinfo.value)
-    assert f"'{setting}' env() default must be an array, got a table" in message, message
-    assert SENTINEL not in message, message
+    assert f"'{setting}': env reference 'outer_list' {DEFAULT_REFUSAL}" in message, message
+
+
+#: ``headers`` is the control-bearing TOML target: it alone passes the type check with a table
+#: default, so these fail before the refusal. ``bearer_token`` and its kin are refused by that check
+#: already, and would pass with no fix at all.
+_TOML_HEADERS_HEADS = [
+    pytest.param(_OUTBOUND_HEAD.format(transport="rest"), id="rest"),
+    pytest.param(_SOAP_HEAD, id="soap"),
+]
+
+
+@pytest.mark.parametrize("head", _TOML_HEADERS_HEADS)
+@pytest.mark.parametrize(
+    "default",
+    [
+        pytest.param(TOML_MARKER, id="default-is-a-marker"),
+        pytest.param(f"{{ X-Key = {TOML_MARKER} }}", id="table-default-holds-a-marker"),
+    ],
+)
+def test_the_toml_surface_refuses_a_reference_in_a_headers_default(
+    tmp_path: pathlib.Path, head: str, default: str
+) -> None:
+    message = _toml_refusal(
+        tmp_path, f'{head}headers = {{ env = "all_headers", default = {default} }}\n'
+    )
+    assert f"'headers': env reference 'all_headers' {DEFAULT_REFUSAL}" in message, message
+
+
+@pytest.mark.parametrize("head", _TOML_HEADERS_HEADS)
+def test_the_toml_spelling_of_a_header_named_env_in_a_default_is_refused(
+    tmp_path: pathlib.Path, head: str
+) -> None:
+    """The decision pinned above, in the spelling that forces it."""
+    message = _toml_refusal(
+        tmp_path, f'{head}headers = {{ env = "all_headers", default = {{ env = "prod" }} }}\n'
+    )
+    assert "counts as a reference" in message, message
+
+
+@pytest.mark.parametrize("head", _TOML_HEADERS_HEADS)
+def test_a_toml_headers_env_with_a_static_table_default_still_loads(
+    tmp_path: pathlib.Path, head: str
+) -> None:
+    """Over-widening control on the surface the refusal runs on."""
+    path = _write(
+        tmp_path,
+        f'{head}headers = {{ env = "all_headers", default = {{ Accept = "text/xml" }} }}\n',
+    )
+    registry = Registry()
+    load_connections_file(path, registry)
+    settings = registry.outbound["OB_ACME"].spec.settings
+    assert resolve_env_settings(settings, {})["headers"] == {"Accept": "text/xml"}
 
 
 # --- over-widening controls --------------------------------------------------
@@ -458,7 +673,6 @@ def test_an_env_ref_standing_for_one_of_a_tables_lists_is_refused(
             lambda: messagefoundry.env("whole_table", default={PARTNER_CA: [SENTINEL]}),
             id="static-default",
         ),
-        pytest.param(lambda: NESTED_DEFAULTS["EnvRef"]([SENTINEL]), id="nested-default"),
     ],
 )
 @pytest.mark.parametrize("target", sorted(TABLE_OF_LIST_SETTINGS))
