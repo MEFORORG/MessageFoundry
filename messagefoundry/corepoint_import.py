@@ -299,9 +299,9 @@ class Control:
     # (:func:`_adopt_branch`). Main orphaned it and counted it unmapped, so the count still does:
     # whether Corepoint continues the construct across that step is not known (BACKLOG #2685).
     adopted_across: bool = False
-    # A branch :func:`_switch_off_control` or :func:`_lift_control` left with no construct, whose
-    # body main never ran: it was a dead arm there, or a branch of a branch no render emitted. It
-    # is dead here as it was there, so no refusal stands in for a raise in it (:func:`_kept_refusal`).
+    # A branch whose body main never ran, set by :func:`_switch_off_control`: a dead arm there, or a
+    # branch of a branch no render emitted. It is dead here as it was there, so no refusal stands
+    # in for a raise in it (:func:`_kept_refusal`). :func:`_lift_control` keeps it on what it lifts.
     never_ran: bool = False
 
 
@@ -1952,8 +1952,8 @@ def _switch_off_control(ctrl: Control, *, rendered: bool = True) -> tuple[Contro
 
     ``rendered`` says whether main rendered the branches of ``ctrl``. It rendered none of a
     branch's own. Of a construct's, it ran only those it inlined live: a stray, and one adopted
-    here across a step it orphaned at. Each other it closes here was a dead arm on main, so it is
-    marked :attr:`Control.never_ran`."""
+    here across a step it orphaned at. Each other was a dead arm on main, closed here or not, so
+    it is marked :attr:`Control.never_ran`."""
     kept: list[Control] = []
     after: list[Step] = []
     closing = catch_off = ""
@@ -1981,7 +1981,7 @@ def _switch_off_control(ctrl: Control, *, rendered: bool = True) -> tuple[Contro
             after.extend(_closed(branch, closing, ran=ran))
         else:
             live, nested = _switch_off_control(branch, rendered=False)
-            kept.append(live)
+            kept.append(replace(live, never_ran=not ran))
             after.extend(nested)
     if ctrl.kind in _LOOP_KINDS:
         after = [replace(s, out_of_loop=True) if isinstance(s, Control) else s for s in after]
@@ -2022,9 +2022,7 @@ def _lift_control(ctrl: Control) -> Control:
     branches = []
     for branch in ctrl.branches:
         why = f"a branch of the {branch.source_verb} it is written in, which no construct continues"
-        lifted = (
-            replace(b, detail=_led_by(why, b.detail), never_ran=True) for b in branch.branches
-        )
+        lifted = (replace(b, detail=_led_by(why, b.detail)) for b in branch.branches)
         body = _lift_branch_branches((*branch.body, *lifted))
         branches.append(replace(branch, body=body, branches=()))
     return replace(ctrl, body=_lift_branch_branches(ctrl.body), branches=tuple(branches))
@@ -2873,6 +2871,11 @@ def _generate_control(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]
     return out
 
 
+# The kinds whose body main did not run: a condition and a loop were dead, and the rest render
+# no body at all (:func:`_generate_construct`).
+_BODY_NEVER_RAN = frozenset({"if", "for", "while", "send", "clone", "create", "break", "exit"})
+
+
 def _kept_refusal(ctrl: Control, indent: int) -> list[str]:
     """The live ``raise`` for a dead branch whose body main ran live and which refused a send there
     (owner ruling 2026-11-01, ADR 0086 (c.2)).
@@ -2919,15 +2922,16 @@ def _refused_where_main_ran(ctrl: Control) -> Iterator[Control]:
 
     Main's render ran a ``<Block>``, a call, an unmodelled element, a ``Try`` body, a
     ``ChooseFrom``'s steps before its first arm, and an orphan, at the level they stand on; it
-    inlined a stray branch and an orphan at that level too. A condition or a loop was dead, so a
-    refused send under one raised nothing there. A ``Catch`` body ran only if the ``Try`` raised,
-    which depends on the message and is not read here; nor is any other raise that does."""
+    inlined a stray branch and an orphan at that level too. A body it did not run is named in
+    :data:`_BODY_NEVER_RAN`, so a kind added later is read rather than dropped, which fails
+    closed. A ``Catch`` body ran only if the ``Try`` raised, which depends on the message and is
+    not read here; nor is any other raise that does."""
     if ctrl.kind == "disabled" or ctrl.never_ran:
         return
     if _is_refused_send(ctrl):
         yield ctrl
-    inlined = [b.body for b in ctrl.branches if _main_inlined(ctrl, b)]
-    if ctrl.kind in _BRANCH_PARENT or ctrl.kind in ("block", "call", "unknown", "try", "case"):
+    inlined = [b.body for b in ctrl.branches if not b.never_ran and _main_inlined(ctrl, b)]
+    if ctrl.kind not in _BODY_NEVER_RAN:
         inlined.insert(0, ctrl.body)
     for body in inlined:
         for step in body:

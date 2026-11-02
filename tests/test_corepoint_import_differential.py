@@ -425,7 +425,7 @@ def _turned_off(step: Step, top: bool = True) -> tuple[Step, list[Step]]:
             after.extend(_orphaned(b, shut, top and _main_inlined(step, b)))
             continue
         b, below = _turned_off(b, False)
-        kept.append(b)
+        kept.append(replace(b, unrun=not (top and _main_inlined(step, b))))
         after.extend(below)
     if step.kind in _LOOP_KINDS:
         # Lifted out of its loop: a LoopExit in it named that loop, not one around it.
@@ -455,7 +455,7 @@ def _unbranch(steps: tuple[Step, ...]) -> tuple[Step, ...]:
                 said = "a branch of the " + b.source_verb + " it is written in, "
                 said += "which no construct continues"
                 strays = [
-                    replace(c, detail="; ".join(filter(None, (said, c.detail))), unrun=True)
+                    replace(c, detail="; ".join(filter(None, (said, c.detail))))
                     for c in b.branches
                 ]
                 arms.append(replace(b, body=_unbranch((*b.body, *strays)), branches=()))
@@ -494,7 +494,7 @@ def _refusals_main_reached(steps: tuple[Step, ...]) -> Iterator[Control]:
         if step.kind not in ("if", "for", "while", "send", "clone", "create", "break", "exit"):
             yield from _refusals_main_reached(step.body)
         for arm in step.branches:
-            if _main_inlined(step, arm):
+            if _main_inlined(step, arm) and not arm.unrun:
                 yield from _refusals_main_reached(arm.body)
 
 
@@ -4233,14 +4233,16 @@ def test_the_d26545d6f_high_repros_do_not_fail_open(shape: Shape) -> None:
 _KEPT_FLOOR = 450
 _FAILS_OPEN_FLOOR = 340
 _DEAD_NO_RAISE_FLOOR = 160
+_KEPT_UNDER_WRAPPERS_FLOOR = 100
 _KEPT_COMMENT = re.compile(
     r"^\s*# TODO: Corepoint \S+ never runs, but its .*\n\s*raise Not.*\n", re.M
 )
 
 
-def _dead_branch_lists() -> list[str]:
+def _dead_branch_lists(switched_off: bool = False) -> list[str]:
     """Lists of orphans, branches adopted across a step, and what may hold them, with no raising
-    write in them and nothing switched off: a raise here is a refusal, on every message."""
+    write in them: a raise here is a refusal, on every message. ``switched_off`` draws disabled
+    wrappers among them too."""
     rng = random.Random(_SEED)
     send, write = _line("MsgSend %ADT [OB_X]"), _line("ItemClear %ADT/PID-19")
     refused = _line(_leaf_data(SendS(_OUT, "OB_R"), "%ADT") or "")
@@ -4251,7 +4253,11 @@ def _dead_branch_lists() -> list[str]:
         for _ in range(rng.randint(1, 4)):
             pick = rng.random() if depth else 1.0
             inner = drawn(depth - 1) if depth else ""
-            if pick < 0.3:
+            if switched_off and depth and rng.random() < 0.25:
+                out += f'<List Disabled="1">{inner}</List>'
+            elif switched_off and not depth and rng.random() < 0.25:
+                out += '<List Disabled="1">' + _line(rng.choice(("Else", "Catch"))) + "</List>"
+            elif pick < 0.3:
                 out += _line(rng.choice(("Else", "ElseIf (y)", "Catch", 'Matching "M"')), inner)
             elif pick < 0.45:
                 arm = _line(rng.choice(("Else", "ElseIf (y)")), drawn(depth - 1))
@@ -4287,12 +4293,14 @@ def _raises(src: str, where: Path) -> bool:
     return False
 
 
-def test_the_head_goes_to_error_on_exactly_the_lists_main_does(tmp_path: Path) -> None:
-    """The owner's ruling of 2026-11-01, by execution. With no write that can raise in play, main
-    raises on a list exactly where the head does, over lists that orphan and adopt across a step
-    at every depth: never a delivery where main refused, nor an ERROR main did not make. The
-    control: with the kept refusals taken out of the head's module, it delivers on the lists they
-    are kept for, which is the fail-open this repairs, so the check is not blind."""
+def test_the_head_goes_to_error_on_exactly_the_lists_the_baseline_does(tmp_path: Path) -> None:
+    """The owner's ruling of 2026-11-01, by execution, against the vendored tree with the scan half
+    alone, whose render inlines an orphan as main's does. With no write that can raise in play, it
+    raises on a list exactly where the head does, over a battery that orphans and adopts across
+    a step at every depth: never a delivery where it refused, nor an ERROR it did not make. The
+    battery holds no wrapper (the next test), call, unmodelled element or stray; the unit tests
+    name those. The control: with the kept refusals taken out of the head's module, it delivers on
+    the lists they are kept for, which is the fail-open this repairs, so the check is not blind."""
     differ: list[str] = []
     kept = dead_no_raise = fails_open = 0
     for xml in _dead_branch_lists():
@@ -4311,3 +4319,23 @@ def test_the_head_goes_to_error_on_exactly_the_lists_main_does(tmp_path: Path) -
     assert not differ, "\n".join(differ[:5]) + f"\n... {len(differ)} in all"
     assert kept >= _KEPT_FLOOR and dead_no_raise >= _DEAD_NO_RAISE_FLOOR
     assert fails_open >= _FAILS_OPEN_FLOOR
+
+
+def test_the_head_makes_no_error_the_baseline_does_not_under_a_disabled_wrapper(
+    tmp_path: Path,
+) -> None:
+    """The other half under a disabled wrapper, where only this half holds: a refused send
+    switched off no longer raises, as ADR 0086 (c.2) says, but no kept refusal may raise on a list
+    the baseline delivers. A branch closed by a wrapper was a dead arm on main, and so was a
+    branch of it. The control: the battery does keep refusals."""
+    extra: list[str] = []
+    kept = 0
+    for xml in _dead_branch_lists(switched_off=True):
+        was, now = _generate(step1_scan_skips, xml)[0], _generate(head, xml)[0]
+        if not was or not now:
+            continue
+        kept += bool(_KEPT_COMMENT.search(now))
+        if _raises(now, tmp_path) and not _raises(was, tmp_path):
+            extra.append(xml)
+    assert not extra, "\n".join(extra[:5]) + f"\n... {len(extra)} in all"
+    assert kept >= _KEPT_UNDER_WRAPPERS_FLOOR

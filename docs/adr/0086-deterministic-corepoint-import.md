@@ -885,8 +885,11 @@ battery, not a proof. It reads nesting, not raises: a line after a step that rai
 scores as live as one after a step that did not, so it cannot see any change the paragraph above
 lists, and both bounds load the scan half into their baseline, so neither sees the scan change.
 Nor does it read which `Catch` a raise reaches; the nested-`Try` tests hold that. A third test
-runs both trees on lists of orphans and branches adopted across a step, with no write that can
-raise and nothing switched off, and holds the head to raising on exactly the lists main raises on.
+runs the head and that same baseline, whose render inlines an orphan as main's does, on a battery
+of orphans and branches adopted across a step, with no write that can raise and no disabled
+wrapper, and holds the head to raising on exactly the lists the baseline raises on. Under disabled
+wrappers a fourth holds one half: the head raises on no list the baseline delivers. Neither battery
+draws a call, an unmodelled element or a stray; unit tests name those.
 
 At least these limits remain:
 

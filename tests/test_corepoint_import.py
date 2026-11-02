@@ -3833,6 +3833,11 @@ _DEAD_ORPHANS = {
     ),
     "in-an-orphan": _line_arm("Else", _CLEAR + _line_arm("Catch", _SEND_OUT)),
     "after-a-write": _line_arm("Else", _CLEAR + _SEND_OUT),
+    # An orphan's own branches were strays main inlined, with a live marker or a switched-off one.
+    "in-its-own-branch": _line_arm("Catch", '<Line Data="Else"/>' + _SEND_OUT),
+    "in-its-own-switched-off-branch": _line_arm(
+        "Catch", f'<List Disabled="1"><Line Data="Else"/></List>{_SEND_OUT}'
+    ),
 }
 _ACROSS = {
     "msglog": '<Line Data="MsgLog %ADT"/>',
@@ -3937,11 +3942,21 @@ _NOT_RAISED_ON_MAIN = {
     # A branch of a branch, which no render emitted.
     "branch-of-a-branch": '<Line Data="If (x)"><List/></Line><Line Data="Else"><List>'
     '<Line Data="Else"/>' + _SEND_OUT + "</List></Line>",
+    "branch-of-an-orphans-own-branch": _line_arm(
+        "Else", _line_arm("Else", '<Line Data="Else"/>' + _SEND_OUT)
+    ),
     # A dead arm on main, closed here by its switched-off marker or construct.
     "marker-switched-off": '<Line Data="If (x)"><List>'
     f'<List Disabled="1"><Line Data="Else"/></List>{_SEND_OUT}</List></Line>',
     "construct-switched-off": '<List Disabled="1"><Line Data="If (x)"><List/></Line></List>'
     + _line_arm("Else", _SEND_OUT),
+    # A branch of a branch under a stray a switched-off Catch closes, and a switched-off marker
+    # in an adopted arm's own list: no render emitted what either held.
+    "branch-of-a-stray-a-catch-closes": '<Try><List><List Disabled="1"><Line Data="Catch"/></List>'
+    + _line_arm("Else", '<Line Data="Else"/>' + _SEND_OUT)
+    + "</List></Try>",
+    "marker-switched-off-in-an-adopted-arm": '<Line Data="If (x)"><List/></Line>'
+    + _line_arm("Else", f'<List Disabled="1"><Line Data="Else"/></List>{_SEND_OUT}'),
     # Switched off by the operator in the dead body.
     "disabled-statement": _line_arm(
         "Else", _SEND_OUT.replace('<Line Data="', '<Line Disabled="1" Data="')
