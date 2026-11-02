@@ -199,7 +199,9 @@ for ($i = 0; $i -lt 5; $i++) {
     $psi.FileName = $cmd; $psi.Arguments = '/c exit 3'; $psi.UseShellExecute = $false
     $q = [System.Diagnostics.Process]::Start($psi)
     Start-Sleep -Milliseconds 300
-    if ($q.WaitForExit(5000) -and $q.ExitCode -eq 3) { $kept++ }
+    # Unbounded: $q owns its handle, so no stranger can stand in; _run's launch timeout bounds it.
+    $q.WaitForExit()
+    if ($q.ExitCode -eq 3) { $kept++ }
 }
 "lost=$lost kept=$kept"
 """
