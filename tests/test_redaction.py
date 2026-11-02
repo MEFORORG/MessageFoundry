@@ -284,7 +284,7 @@ def _interleaved_growth(
     **Paired rounds in a drawn order, not two blocks (BACKLOG #3721).** In blocks every small sample
     came first, so a slow spell that ended during the test landed on the small side alone and
     deflated the ratio. Each round here takes a small and a large sample, which goes first drawn from
-    an unseeded generator, the rule ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py``
+    an unseeded generator, the rule ``_growth_between`` in ``tests/_growth.py``
     measured against a co-tenant with a fixed rhythm. Rounds past ``large_reps`` take a small sample
     alone, so the small side always has three. A spell covering every sample of one side still moves
     the ratio; nothing that keeps a minimum per side can cancel that."""
