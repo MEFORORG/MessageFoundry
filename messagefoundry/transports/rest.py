@@ -950,8 +950,10 @@ def cleartext_acceptance_from_settings(
     """``(cleartext_accepted, cleartext_reason, connection)`` off an ``env()``-resolved settings mapping.
 
     ADR 0153's pair is a **top-level outbound key**, but the deep settings-driven seams — the forward-proxy
-    credential chain and the ``FhirLookup`` read executor — receive only a settings mapping, exactly as
-    they already do for ``tls_hop_attested``. The HTTP Digest, OAuth2 and SMART token seams read it
+    credential chain and the ``FhirLookup`` read executor — receive only a settings mapping. The
+    executor reads ``tls_hop_attested`` from its mapping too. The proxy credential chain reads this
+    pair alone, because ``tls_hop_attested`` does not admit a proxy credential (vault BACKLOG #3007).
+    The HTTP Digest, OAuth2 and SMART token seams read it
     too, through :func:`hop_declarations_from_settings`, but only for its strict flag check and the
     connection name: no declaration lets their credential cross cleartext http off this machine
     (vault BACKLOG #3533 item 4).
@@ -1092,8 +1094,9 @@ def refuse_cleartext_credential_hop(
     **Nothing lifts it but a loopback host** (vault BACKLOG #3533 item 4, owner ruling 2026-10-26).
     Not ``tls_hop_attested``, not an ADR 0153 ``cleartext_accepted`` declaration, not the posture.
     ADR 0153 build note 3 once let ``cleartext_accepted`` reach these hops with a WARN; its dated
-    amendment records why that went. At least the forward-proxy credential is still judged by
-    the declarations; see :func:`proxy_auth_handler_from_settings`. SMTP AUTH over cleartext is
+    amendment records why that went. The forward-proxy credential is judged apart: a
+    ``cleartext_accepted`` declaration with a reason lifts its refusal and ``tls_hop_attested`` does
+    not; see :func:`proxy_auth_handler_from_settings`. SMTP AUTH over cleartext is
     refused outright in ``transports.email``.
 
     A URL that names no host raises ``ValueError`` (:func:`_hop_guard_host`, BACKLOG #1924)."""

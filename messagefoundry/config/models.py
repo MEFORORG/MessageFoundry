@@ -312,7 +312,8 @@ def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
     """Read and load-validate the insecure-hop attestation pair out of a resolved settings mapping
     (BACKLOG #1666), for the carriers that have no :class:`Source`/:class:`Destination` model to hold
     it: the ``db_lookup`` executor, the SQL-backed reference source and the ``FhirLookup`` read
-    executor.
+    executor. :class:`Destination`'s own validator runs it on its settings too, because at least the
+    anonymous-FTP guard reads the attestation there, where ``_dest_config`` mirrors the typed field.
 
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
     mapping read in front of it, so these carriers cannot drift from the modelled ones or each other.
