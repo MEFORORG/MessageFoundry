@@ -389,10 +389,14 @@ roster alias of the Lander.
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
 > `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its
-> 90-minute rate window. It also needs the oldest of them to be at least 30 minutes old, unless two
-> ticks or more moved, so that one tick is not read as a burn. So a slow or flat burn reads as no rate,
-> and the 90 percent level decides. A timed row was tried and refused: an idle session's rows measure
-> nothing, because they say only that a cached number has not changed.
+> 90-minute rate window. So a burn with one row in that window reads as no rate, and the 90 percent level
+> decides. A timed row was tried and refused: an idle session's rows measure nothing, because they say
+> only that a cached number has not changed.
+>
+> **The rate runs from the oldest row to the newest row, with no minimum span.** So a burn that stopped
+> keeps reading as a burn until its rows leave the window, and one tick seconds apart reads as a fast burn.
+> Either can stop work on a pool that has room, and a false stop is the safe direction. The highest
+> percentage is taken as the level reached, so a low row cannot turn the rate negative.
 >
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
 > percentage, so no one session's reading is the truth; each is a valid floor. Against a published
@@ -451,15 +455,15 @@ roster alias of the Lander.
 > reading. A fresh 70 percent with 45 minutes to empty hits; the same reading once stale answers REVIEW.
 > From 90 to 97 percent the opposite applies: the rung is hit even where the rate a fresher reading had
 > would have cleared it, because the window resets first. That departs from the rate-governs rule for
-> stale readings only.
+> stale readings and for readings dated after now.
 >
 > **A reading dated after now can stop work and cannot clear it.** It reads UNKNOWN, because nothing proves
 > when it was taken, so OK and WARN cannot come from it. But a small backward clock step dates a real
-> reading ahead, so it keeps a `level_floor` at its number on any provenance, unless its reset has passed,
-> and a projection to run out before the reset stays CRITICAL. Any distance ahead counts, with no
-> tolerance: the collector stamps before it writes, and the reader opens the document before it reads the
-> clock. A history row dated ahead counts as just now, and the highest percentage is taken as the newest
-> row, so a low row cannot turn the rate negative and a real one is not lost.
+> reading ahead, so it keeps a `level_floor` at its number on any provenance, unless its reset has passed.
+> A projection to run out before the reset stays CRITICAL, and with no reset any projection does. Any
+> distance ahead counts, with no tolerance: the collector stamps before it writes, and the reader opens the
+> document before it reads the clock. A history row dated ahead stays in the rate at its own date. When the
+> gate halts on such a reading, its reason and the spawn hook's line say the machine's clock looks wrong.
 >
 > The rule has at least these limits, all of them open:
 >
@@ -469,9 +473,10 @@ roster alias of the Lander.
 >   published window. `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its
 >   level is not graded. Its history row can still feed a rate, because with no current reset the rate
 >   skips its reset filter.
-> - With no published reset ahead, there is no floor at all: a reading with no reset is taken whatever
+> - With no published reset ahead, the collector holds no floor: a reading with no reset is taken whatever
 >   its value, and an equal one refreshes the age, until a reading brings a reset. Below the rung the gate
->   answers REVIEW for it.
+>   answers REVIEW for it, unless a burn is projected. A reading dated after now still sets the reader's
+>   own `level_floor`.
 > - Refusing a reading with no reset while the published reset is ahead drops true evidence too. A real
 >   99 over a published 89 cannot raise the number, so the rung does not hit on it until a reading that
 >   carries a reset arrives.

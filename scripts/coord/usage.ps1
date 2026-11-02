@@ -28,9 +28,8 @@
       2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the window's state is UNKNOWN. Not
          an extrapolation, not a last-known value dressed up as current. A level_floor at the ceiling
          still sets CRITICAL, as "at least this"; below the ceiling a floor is only a lower bound, so the
-         verdict stays UNKNOWN. Below two samples in the current window, or one tick under
-         -MinRateSpanMinutes, there is no rate and no projection, and the percentage bands still grade the
-         reading.
+         verdict stays UNKNOWN. Below two samples in the current window there is no rate and no
+         projection, and the percentage bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -52,11 +51,12 @@
         0  OK
         10 WARN        -- high, or projected to exhaust before reset with slack, on a fresh reading only
         11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling, fresh or as a
-                          stale level_floor
+                          stale level_floor. A reading dated after now reaches this too: at the ceiling,
+                          projected to exhaust before reset, or projected at all with no reset time
         20 UNKNOWN     -- no data, stale data with no level_floor at the ceiling, a window whose reset has
-                          passed, or a reading this root may not trust. A level_floor below the ceiling
-                          reads UNKNOWN too, because the number is only a lower bound; the gate reads
-                          level_floor for itself
+                          passed, a reading dated after now with none of the above, or a reading this root
+                          may not trust. A level_floor below the ceiling reads UNKNOWN too, because the
+                          number is only a lower bound; the gate reads level_floor for itself
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
     FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
@@ -104,12 +104,6 @@ param(
     [int]$MaxAgeMinutes = 20,
     # Rate is measured over at most this much recent history.
     [int]$RateWindowMinutes = 90,
-    # And over at least this much, unless two ticks or more moved. The weekly prints whole numbers, so
-    # over a few minutes one tick is quantisation, not a burn: over 4 minutes it reads as 15 percent an
-    # hour and would fire the rung on its own. watch.py's BURN_MIN_SPAN says the same, and its note says
-    # to retune its 4 minutes for the weekly before it is used. Several ticks are a real burn however
-    # short the span, and the first half hour of one is when a stop matters most.
-    [ValidateRange(1, [int]::MaxValue)][int]$MinRateSpanMinutes = 30,
     # One line per config root on this box. A SURVEY, NEVER A MERGE: these are different accounts with
     # different 7d pools, so summing, averaging or taking a worst-of across them would rebuild
     # the exact lie the per-root publish path removes.
@@ -411,11 +405,11 @@ function Get-AgeMinutes($v) {
     return [math]::Round(($nowUtc - $t).TotalMinutes, 1)
 }
 
-# ONE TEST OF THE FUTURE, FOR A READING AND FOR A HISTORY ROW: dated after now, at any distance. This
-# compares the instants, because an age is rounded and a stamp seconds ahead rounds to 0. There is no
-# tolerance, because a real stamp needs none: the collector stamps before it writes, this script opens the
-# document before it reads the clock, and both use this box's clock. So a reading dated ahead means the
-# clock stepped back or the stamp is wrong. What each does about it is at Get-WindowReport and Get-Rate.
+# DATED AFTER NOW, at any distance. This compares the instants, because an age is rounded and a stamp
+# seconds ahead rounds to 0. There is no tolerance, because a real stamp needs none: the collector stamps
+# before it writes, this script opens the document before it reads the clock, and both use this box's
+# clock. So a reading dated ahead means the clock stepped back or the stamp is wrong. Get-WindowReport
+# says what such a reading does.
 function Test-DatedAfterNow($v) {
     $t = ConvertTo-UtcDateTime $v
     return [bool]($null -ne $t -and $t -gt $nowUtc)
@@ -438,30 +432,28 @@ function Get-Rate($CurrentResetEpoch) {
             $observed = Get-Percentage $r.seven_day
             if ($null -eq $observed) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
-            # A ROW AHEAD OF THE CLOCK COUNTS AS JUST NOW. After a backward clock step it is usually a real
-            # row, and dropping it understates the rate, and that understated rate governs, not the level.
-            # So its age is clamped to 0 and it stays in the rate.
             $age = Get-AgeMinutes $r.at
-            if (Test-DatedAfterNow $r.at) { $age = 0.0 }
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
             $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
         }
     } catch { return $null }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
     $oldest = $rows | Sort-Object AgeMin -Descending | Select-Object -First 1
-    # THE HIGHEST PERCENTAGE IS THE NEWEST. Usage does not fall inside a window, and a clamped row's date
-    # says nothing, so a low row ahead of the clock cannot turn the rate negative and clear a burn.
-    $newest = $rows | Sort-Object Pct -Descending | Select-Object -First 1
-    # THE SPAN RUNS TO NOW, NOT TO THE NEWEST ROW. Rows land only on a move, so the flat time since the
-    # last one is in no row, and ending the span there would keep a stopped burn reading as a live one.
-    $spanH = $oldest.AgeMin / 60.0
+    # THE SPAN RUNS FROM THE OLDEST ROW TO THE NEWEST ROW, ON RAW AGES, AND THERE IS NO MINIMUM. So a burn
+    # that stopped keeps reading as a burn until its rows leave the window, and one tick seconds apart
+    # reads as a fast burn. Both can stop work on a pool that has room, and a false stop is the safe
+    # direction. A row dated after now has a negative age and stays in the span: dropping it, or clamping
+    # it to 0, lost or understated a rate that stopped work on a real burn.
+    $newestRow = $rows | Sort-Object AgeMin | Select-Object -First 1
+    $spanH = ($oldest.AgeMin - $newestRow.AgeMin) / 60.0
     if ($spanH -le 0) { return $null }
-    $delta = $newest.Pct - $oldest.Pct
-    if ($oldest.AgeMin -lt $MinRateSpanMinutes -and $delta -lt 2) { return $null }
+    # THE HIGHEST PERCENTAGE IS THE LEVEL IT REACHED. Usage does not fall inside a window, and a row's date
+    # can be wrong, so a low row ahead of the clock cannot turn the rate negative and clear a burn.
+    $delta = ($rows | Sort-Object Pct -Descending | Select-Object -First 1).Pct - $oldest.Pct
     return [pscustomobject]@{
         PctPerHour = [math]::Round($delta / $spanH, 2)
         Samples    = $rows.Count
-        SpanMin    = [math]::Round($oldest.AgeMin, 1)
+        SpanMin    = [math]::Round($oldest.AgeMin - $newestRow.AgeMin, 1)
     }
 }
 
@@ -635,12 +627,17 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # dates a real reading ahead, and a stop must not lapse on one. So it keeps a level_floor at its number
     # on any provenance, with no test of its reset, as a fresh reading's level hit stands on any
     # provenance. A projection to run out before the reset stays CRITICAL, because the rate behind it may
-    # be real and the gate needs the state to read it. At the ceiling the floor sets that verdict.
+    # be real and the gate needs the state to read it, and with no reset any projection does, because a
+    # missing reset must not loosen the rung. At the ceiling the floor sets that verdict.
     if (Test-DatedAfterNow $w.captured_at) {
         $future = "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it"
         $o.dated_ahead = $true
         $o.level_floor = $pct
-        if ($o.state -eq "CRITICAL" -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason); $future" }
+        if ($null -eq $minsToReset -and $null -ne $o.minutes_to_empty -and $pct -lt $CeilingPct) {
+            $o.state = "CRITICAL"
+            $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, with no reset time; $future"
+        }
+        elseif ($o.state -eq "CRITICAL" -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason); $future" }
         else {
             $o.state = "UNKNOWN"
             $o.reason = $future

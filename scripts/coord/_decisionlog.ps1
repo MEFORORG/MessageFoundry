@@ -864,6 +864,10 @@ function Get-DecisionCostRung {
       cannot clear work. That includes a level hit below the ceiling with no trusted provenance, which
       goes from HIT to UNKNOWN when it goes stale. A ceiling hit with its reset ahead does not.
 
+      A READING DATED AFTER NOW IS HIT BY THE SAME ROUTES, AND ITS REASON SAYS THE CLOCK LOOKS WRONG.
+      usage.ps1 gives it a level_floor at its number on any provenance unless its reset has passed, and
+      a projection stays CRITICAL with its rate, so the rate branch below can hit too.
+
       UNKNOWN when the reading is missing, stale and not a floor at the rung, refused, past its reset (it
       describes a window that is gone, so it neither clears nor halts), below the rung with no reset
       time (it cannot prove which window it belongs to), or usage.ps1 calls it UNKNOWN overall (its
@@ -918,7 +922,12 @@ function Get-DecisionCostRung {
         return (New-DecisionRung 'UNKNOWN' "the weekly window's reset has passed, so this reading describes a window that is gone")
     }
     $floor = Get-DecisionJsonValue $week 'level_floor'
+    $clock = "This reading is dated in the future, so this machine's clock looks wrong. Fix the clock; a reading dated now replaces this one"
+    $ahead = Get-DecisionJsonValue $week 'dated_ahead'
     if ($null -ne $floor -and ([double]$floor -ge 98 -or [double]$floor -ge $lv.HoldAt)) {
+        if ($ahead -eq $true) {
+            return (New-DecisionRung 'HIT' "weekly at least $floor%. $clock; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
+        }
         return (New-DecisionRung 'HIT' "weekly at least $floor%, a stale reading whose reset is still ahead, so that level stands; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
     }
     if ($null -eq $week -or $null -eq $pct -or $weekState -notin @('OK', 'WARN', 'CRITICAL')) {
@@ -946,7 +955,10 @@ function Get-DecisionCostRung {
     }
     # A HIT stands whatever the overall state: halting on a reading that may be another root's
     # costs a deferral, while dropping it to UNKNOWN would let a session at the ceiling act.
-    if ($rung.State -eq 'HIT') { return $rung }
+    if ($rung.State -eq 'HIT') {
+        if ($ahead -eq $true) { return (New-DecisionRung 'HIT' "$($rung.Reason). $clock") }
+        return $rung
+    }
     # A reading with no reset cannot prove which window it belongs to, so it may be last week's. A
     # missing reset must not loosen the rung, which is why this comes after the HIT above.
     if ($null -eq $toReset) {

@@ -1469,9 +1469,10 @@ obtained, and its advice is *treat headroom as unknown*; `UNAVAILABLE` means a m
 and it is zero-spendable-forever. Folding the second into the first understates a known fact and leaves a
 caller waiting for a reading that is never coming. It is not `CRITICAL` either — that says commit now
 because a live pool is running out, which is not an account that has none.
-`UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable,
-future-dated or past its window's reset — a percentage is never extrapolated from a dead publisher, and every number is printed
-with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
+`UNKNOWN` is a real answer here and is returned when the reading is stale, undateable, dated after now
+or past its window's reset. The exceptions are in `usage.ps1`'s header: at least a stale or dated-ahead
+number at the ceiling, and a burn projected beside a dated-ahead reading, return `CRITICAL`. A percentage
+is never extrapolated from a dead publisher, and every number is printed with its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
 stamped with a config root other than the one it sits under is **refused** rather than reported as this
 session's headroom, and when there is no data at all the message diagnoses *which* state this root is in
 — not wired, wired to publish somewhere else, wired but naming a collector that is gone, someone else's

@@ -717,7 +717,10 @@ function Format-Window($w) {
     # A FLOOR PRINTS ITS NUMBER: the reader says the window has reached at least this, and the gate may be
     # halting on it. A bare UNKNOWN here would hide the one fact that explains the halt.
     if ($null -ne $w.level_floor -and $null -ne $w.used_percentage) {
-        $line = "$label at least {0:0.0}% used   [confirmed {1} min ago; a stale reading whose reset is still ahead]" -f ([double]$w.level_floor), $w.reading_age_min
+        $line = if ($w.dated_ahead -eq $true) {
+            "$label at least {0:0.0}% used   [dated {1} min in the future: this machine's clock looks wrong, so fix the clock]" -f ([double]$w.level_floor), [math]::Abs([double]$w.reading_age_min)
+        }
+        else { "$label at least {0:0.0}% used   [confirmed {1} min ago; a stale reading whose reset is still ahead]" -f ([double]$w.level_floor), $w.reading_age_min }
         if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
             $m = [int]$w.minutes_to_reset
             $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))

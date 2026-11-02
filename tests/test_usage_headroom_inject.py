@@ -332,6 +332,16 @@ def test_a_floor_prints_its_number_and_the_verdict_it_sets(
     assert re.search(r"confirmed \d+(\.\d+)? min ago", ctx), ctx
 
 
+def test_a_floor_dated_after_now_says_the_clock_looks_wrong(tmp_path: Path) -> None:
+    """The gate may be halting on it, and "a stale reading" would send the seat to wait for a fire."""
+    state = tmp_path / "s"
+    collect(state, reading(seven=99.0))
+    age_document(state, minutes=-1)
+    ctx = context_of(state)
+    assert "at least 99.0%" in ctx and "clock looks wrong" in ctx, ctx
+    assert "a stale reading" not in ctx, ctx
+
+
 def test_a_live_session_repeating_a_spent_reading_prints_it_as_current(tmp_path: Path) -> None:
     """The counter rose, so the session has just called the API and the old age is gone."""
     state = tmp_path / "s"

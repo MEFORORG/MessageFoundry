@@ -1151,23 +1151,50 @@ def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("ahead_pct", "rate"),
+    ("ahead_pct", "highest"),
     [
-        pytest.param(20.0, 10.0, id="a-low-row-cannot-turn-the-rate-negative"),
-        pytest.param(50.0, 20.0, id="a-high-row-stays-in-the-rate"),
+        pytest.param(20.0, 40.0, id="a-low-row-cannot-turn-the-rate-negative"),
+        pytest.param(50.0, 50.0, id="a-high-row-stays-in-the-rate"),
     ],
 )
 @pytest.mark.parametrize("minutes_ahead", [5.0, 1.0], ids=["five-minutes", "one-minute"])
-def test_a_history_row_dated_after_now_counts_as_just_now(
-    tmp_path: Path, minutes_ahead: float, ahead_pct: float, rate: float
+def test_a_history_row_dated_after_now_stays_in_the_rate(
+    tmp_path: Path, minutes_ahead: float, ahead_pct: float, highest: float
 ) -> None:
-    """Beside a fresh reading, which is what a live confirmation leaves after a backward clock step.
-    Dropped, a real row understates the rate; taken as newest, a low one turns it negative and clears."""
+    """Beside a fresh reading, which is what a live confirmation leaves after a backward clock step. The
+    span keeps the row's own date, and the highest percentage is the level reached."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=50.0, seven_epoch=epoch)
     write_history(tmp_path, [(60.0, 30.0), (30.0, 40.0), (-minutes_ahead, ahead_pct)], epoch)
     _, doc = read(tmp_path)
+    rate = (highest - 30.0) / ((60.0 + minutes_ahead) / 60.0)
     assert doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, abs=0.5), doc
+
+
+def test_rows_all_dated_after_now_still_give_a_rate(tmp_path: Path) -> None:
+    """Clamping both to 0 left no span and no rate, so a burn read OK where main stops."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=70.0, seven_epoch=epoch)
+    write_history(tmp_path, [(-1.0, 40.0), (-16.0, 70.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(120, abs=1), (
+        doc
+    )
+
+
+def test_a_burn_dated_after_now_with_no_reset_stays_critical(tmp_path: Path) -> None:
+    """No reset to run out before, so the band alone would clear the rate, and the floor of 70 sits below
+    the rung. A missing reset must not loosen the rung."""
+    publish(tmp_path, seven=70.0, age_min=-1)
+    doc = latest(tmp_path)
+    del doc["seven_day"]["resets_at_epoch"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    now = int(time.time())
+    write_history(tmp_path, [(15.0, 40.0), (-1.0, 70.0)], now)
+    code, got = read(tmp_path)
+    assert code == CRITICAL and got["seven_day"]["state"] == "CRITICAL", got
+    assert got["seven_day"]["minutes_to_empty"] is not None, got
+    assert "FUTURE" in got["seven_day"]["reason"] and got["seven_day"]["dated_ahead"] is True, got
 
 
 @pytest.mark.parametrize(
@@ -1199,7 +1226,7 @@ def test_a_history_row_with_no_number_is_skipped(tmp_path: Path, bad: Any) -> No
     good: list[tuple[float, Any]] = [(60, 30.0), (30, 40.0)]
     rows(good)
     want_code, want = read(tmp_path)
-    assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), want
+    assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=0.5), want
     rows([(80, bad), *good, (1, bad)])
     got_code, got = read(tmp_path)
     assert got_code == want_code, got
@@ -1371,42 +1398,53 @@ def test_a_high_but_stable_reading_is_not_critical(tmp_path: Path) -> None:
     assert d["seven_day"]["minutes_to_empty"] is None, "a flat rate cannot project exhaustion"
 
 
-def test_a_burn_that_stopped_does_not_read_as_a_live_one(tmp_path: Path) -> None:
-    """Rows land only on a move, so the flat time since the last one is in no row. Ended at the
-    newest row, this span is a minute, and the rate reads 60 percent an hour on a stopped pool."""
-    epoch = int(time.time()) + 280000
-    publish(tmp_path, seven=50.0, seven_epoch=epoch)
-    write_history(tmp_path, [(85, 49.0), (84, 50.0)], epoch)
+def test_a_burn_that_stopped_still_reads_as_a_burn_until_its_rows_age_out(tmp_path: Path) -> None:
+    """The span ends at the newest row, so the flat time since then does not dilute the rate. It can
+    stop work on a pool that has room, and a false stop is the safe direction. Ending the span at now
+    let a real burn read as clear: a fresh 80 with rows at 85 and 70 minutes ago and 60 minutes to the
+    reset. The rows here are that case."""
+    epoch = int(time.time()) + 3600
+    publish(tmp_path, seven=80.0, seven_epoch=epoch)
+    write_history(tmp_path, [(85, 55.0), (70, 80.0)], epoch)
 
-    _, d = read(tmp_path)
-    assert 0 < d["seven_day"]["rate_pct_per_hr"] < 1, d
+    code, d = read(tmp_path)
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(100.0, abs=0.5), d
+    assert d["seven_day"]["minutes_to_empty"] == pytest.approx(12.0, abs=1), d
 
 
-def test_one_tick_over_a_few_minutes_is_not_a_rate(tmp_path: Path) -> None:
-    """The weekly prints whole numbers. Over 4 minutes one point reads as 15 percent an hour, which
-    is 56 minutes to empty at 86 percent: inside the rung, on a single tick."""
+@pytest.mark.parametrize(
+    ("older", "newer", "rate"),
+    [
+        pytest.param((4.0, 85.0), (0.1, 86.0), 15.4, id="over-four-minutes"),
+        pytest.param((0.5, 85.0), (0.02, 86.0), 120.0, id="seconds-apart"),
+    ],
+)
+def test_one_tick_is_a_rate_however_close_the_rows(
+    tmp_path: Path, older: tuple[float, float], newer: tuple[float, float], rate: float
+) -> None:
+    """The weekly prints whole numbers, so a tick can be quantisation, and this can stop work on a pool
+    that has room. A false stop is the safe direction, and a minimum span read a real burn as clear."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=86.0, seven_epoch=epoch)
-    write_history(tmp_path, [(4.0, 85.0), (0.1, 86.0)], epoch)
+    write_history(tmp_path, [older, newer], epoch)
     code, d = read(tmp_path)
-    assert code == WARN, d
-    assert d["seven_day"]["rate_pct_per_hr"] is None, d
-    assert d["seven_day"]["minutes_to_empty"] is None, d
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, rel=0.15), d
 
 
-def test_a_fast_burn_is_a_rate_inside_the_minimum_span(tmp_path: Path) -> None:
-    """Only one tick is quantisation. 40 to 84 in 25 minutes is the burn a stop exists for, and the
-    floor alone would grade it clear at the rung."""
+def test_a_fast_burn_is_a_rate(tmp_path: Path) -> None:
+    """40 to 84 in 25 minutes is the burn a stop exists for, and the level alone would grade it clear."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=84.0, seven_epoch=epoch)
     write_history(tmp_path, [(25, 40.0), (15, 60.0), (5, 80.0), (0.5, 84.0)], epoch)
     code, d = read(tmp_path)
     assert code == CRITICAL, d
-    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(105.6, abs=2), d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(107.8, abs=2), d
 
 
-def test_a_tick_over_more_than_the_minimum_span_is_a_rate(tmp_path: Path) -> None:
-    """The control: the same two percentages, far enough apart to mean something."""
+def test_a_tick_over_half_an_hour_is_a_small_rate(tmp_path: Path) -> None:
+    """The same two percentages, further apart, are a smaller rate."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=86.0, seven_epoch=epoch)
     write_history(tmp_path, [(31.0, 85.0), (0.1, 86.0)], epoch)

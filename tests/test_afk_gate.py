@@ -708,10 +708,10 @@ def test_a_window_with_no_number_cannot_clear_the_gate(
     ("pct", "wired", "expected", "reason"),
     [
         pytest.param(40, True, REVIEW, "FUTURE", id="below-the-rung"),
-        pytest.param(99, True, HALT, "at least", id="ceiling"),
-        pytest.param(99, False, HALT, "at least", id="ceiling-unwired"),
-        pytest.param(92, True, HALT, "at least", id="at-the-rung"),
-        pytest.param(92, False, HALT, "at least", id="at-the-rung-unwired"),
+        pytest.param(99, True, HALT, "clock looks wrong", id="ceiling"),
+        pytest.param(99, False, HALT, "clock looks wrong", id="ceiling-unwired"),
+        pytest.param(92, True, HALT, "clock looks wrong", id="at-the-rung"),
+        pytest.param(92, False, HALT, "clock looks wrong", id="at-the-rung-unwired"),
     ],
 )
 def test_a_reading_dated_after_now_stops_work_and_cannot_clear_it(
@@ -735,19 +735,7 @@ def test_a_reading_dated_after_now_stops_work_and_cannot_clear_it(
     assert code == expected and reason in why(doc), why(doc)
 
 
-def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(
-    sb: Sandbox, tmp_path: Path
-) -> None:
-    """What a live confirmation leaves after a backward clock step. Dropping the row left no rate, so a
-    70 burning out in minutes read as clear; main kept the row and HALTed."""
-    root = tmp_path / "config-root"
-    root.mkdir()
-    state = root / "mefor-usage"
-    env = {"CLAUDE_CONFIG_DIR": str(root)}
-    _wire(sb, root, tmp_path, env)
-    resets = int(ago().timestamp()) + 14400
-    assert _fire(sb, state, {"used_percentage": 70, "resets_at": resets}, env).returncode == 0
-    rows = [(ago(minutes=15), 40), (ago(minutes=-1), 70)]
+def _set_rows(state: Path, rows: list[tuple[datetime, int]], resets: int | None) -> None:
     (state / "history.jsonl").write_text(
         "".join(
             json.dumps(
@@ -762,6 +750,68 @@ def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(
         ),
         encoding="utf-8",
     )
+
+
+def test_a_burn_dated_after_now_with_no_reset_halts_and_names_the_clock(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """70 one minute ahead, burning, no reset. Main graded it fresh and HALTed on the rate."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    seven = {"used_percentage": 70, "resets_at": int(ago().timestamp()) + 14400}
+    assert _fire(sb, state, seven, env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=-1).isoformat().replace("+00:00", "Z")
+    del published["seven_day"]["resets_at_epoch"]
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    _set_rows(state, [(ago(minutes=15), 40), (ago(minutes=-1), 70)], None)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == HALT and "Projected to run out" in why(doc), why(doc)
+    assert "clock looks wrong" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    ("rows", "minutes_to_reset"),
+    [
+        pytest.param([(85, 55), (70, 80)], 60, id="span-ends-at-the-newest-row"),
+        pytest.param([(0.5, 79), (0.02, 80)], 240, id="one-tick-seconds-apart"),
+    ],
+)
+def test_a_real_burn_halts_however_the_rows_lie(
+    sb: Sandbox, tmp_path: Path, rows: list[tuple[float, int]], minutes_to_reset: int
+) -> None:
+    """Both of these are main's HALT. A span run to now, and a minimum span, each read them as clear."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + minutes_to_reset * 60
+    seven = {"used_percentage": 80, "resets_at": resets}
+    assert _fire(sb, state, seven, env).returncode == 0
+    _set_rows(state, [(ago(minutes=m), pct) for m, pct in rows], resets)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == HALT and "Projected to run out" in why(doc), why(doc)
+
+
+def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """What a live confirmation leaves after a backward clock step. The row is real, main kept it and
+    HALTed, and this reading is fresh, so its reason says nothing about the clock."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + 14400
+    assert _fire(sb, state, {"used_percentage": 70, "resets_at": resets}, env).returncode == 0
+    _set_rows(state, [(ago(minutes=15), 40), (ago(minutes=-1), 70)], resets)
     seed_vault(sb, calibrated("manager"))
     code, doc = _real_gate(sb, env)
     assert code == HALT and "Projected to run out" in why(doc), why(doc)
