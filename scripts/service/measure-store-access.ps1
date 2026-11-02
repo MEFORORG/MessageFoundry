@@ -548,26 +548,35 @@ function Invoke-ChildProcess {
       wait for every holder of the inherited pipes to close them. The callers' children leave no
       descendant behind: the probe runs in one process (provision's icacls runs are subprocess.run,
       waited for), and the messagefoundry.exe launcher waits for its Python. Neither wait is
-      bounded, as -Wait was not; the step's timeout-minutes bounds a hang.
+      bounded, as -Wait was not; the step's timeout-minutes bounds a hang. Stdin is closed, so a
+      prompt nobody expected reads end-of-file and fails instead of waiting.
 
       Process.Start resolves a relative path against the process's current directory, which does
-      not follow Set-Location, so pass an absolute FilePath. The working directory defaults to the
-      PowerShell location, as Start-Process's did.
+      not follow Set-Location, so pass an absolute FilePath. The working directory is made a plain
+      file-system path here, and defaults to the current file-system location, as Start-Process's
+      did. The pipes are decoded as [Text.Encoding]::Default, which under 5.1 is the ANSI code page a
+      Windows Python writes to a pipe, as the Get-Content read of the old output files did.
 
       An exit code that still cannot be read throws, with the output, so it is never compared as if
       it were one. The pipe reads use GetResult(), a method, because PowerShell turns an exception
-      in a property getter such as Task.Result into $null, which would read as empty output.
+      in a property getter such as Task.Result into $null, which would read as empty output. The
+      excerpt is cut here rather than by Get-Excerpt, so the function stands alone for its test.
     #>
-    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory = $PWD.ProviderPath)
+    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory)
+    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
     $psi.Arguments = $Arguments
-    $psi.WorkingDirectory = $WorkingDirectory
+    $psi.WorkingDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkingDirectory)
     $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::Default
+    $psi.StandardErrorEncoding = [Text.Encoding]::Default
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
+        $p.StandardInput.Close()
         # Both pipes drain while the child runs, so neither can fill and stall it.
         $out = $p.StandardOutput.ReadToEndAsync()
         $err = $p.StandardError.ReadToEndAsync()
@@ -578,7 +587,7 @@ function Invoke-ChildProcess {
         }
     } finally { $p.Dispose() }
     if ($null -eq $code) {
-        $text = ($result.Out + "`n" + $result.Err).Trim()
+        $text = (($result.Out + " " + $result.Err) -replace "\s+", " ").Trim()
         if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + "..." }
         throw "$FilePath exited, but no exit code could be read from it, so its outcome is unknown. Output: $text"
     }
@@ -669,8 +678,11 @@ $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.Wind
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "measure-store-access.ps1 installs a service and must run elevated."
 }
-# Resolved to a full path here, because Invoke-ChildProcess resolves a relative one differently.
-$AppExe = (Get-Command $(if ($AppExe) { $AppExe } else { "messagefoundry" }) -ErrorAction Stop).Source
+# A full path, because Invoke-ChildProcess resolves a relative one against the process's directory,
+# not $PWD. A path is resolved literally, as -DataDir is; only a bare name is looked up as a command.
+$AppExe = if (-not $AppExe) { (Get-Command messagefoundry -ErrorAction Stop).Source }
+          elseif ($AppExe -match '[\\/]') { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppExe) }
+          else { (Get-Command $AppExe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
 $Python = (Get-Command python).Source
 $Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
