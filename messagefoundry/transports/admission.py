@@ -14,6 +14,10 @@ refusal (vault BACKLOG #2606). This module holds those controls once.
   so the four socket listeners and the DICOM server share one.
 * :class:`FrameClock` is the frame deadline: the bound on one frame from its first byte to its last.
   The MLLP, raw-TCP and X12 read loops all run it (vault BACKLOG #2847 moved MLLP onto it).
+* :func:`notify_refusal` tells the refusal observers, at least the security-signal layer's burst
+  detector (vault BACKLOG #2613), that a listener refused a peer at its allowlist or a cap. The
+  ``connection_event`` capture an operator can switch off is not that path, so the alert does not
+  depend on it.
 
 Everything here runs before ingress, so no message is read, persisted or acknowledged by it. The
 ACK-on-receipt and count-and-log invariants are untouched: a refused connection has delivered
@@ -29,6 +33,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from messagefoundry.netaddr import peer_ip_allowed
@@ -40,6 +45,10 @@ __all__ = [
     "ListenerAdmission",
     "Refusal",
     "RefusalLog",
+    "RefusalObserver",
+    "add_refusal_observer",
+    "notify_refusal",
+    "remove_refusal_observer",
 ]
 
 logger = logging.getLogger(__name__)
@@ -52,6 +61,55 @@ REFUSAL_LOG_WINDOW_SECONDS = 60.0
 #: The most refusal lines one listener writes per window over every address together. The
 #: per-address bound alone would still let many addresses earn a line each.
 REFUSAL_LOG_MAX_PER_WINDOW = 20
+
+#: A synchronous callable told the inbound connection's name each time a listener refuses a peer at
+#: its source allowlist or a connection cap (vault BACKLOG #2613). Never the peer's address: the
+#: refusal log line names that, throttled.
+RefusalObserver = Callable[[str], None]
+
+#: The observers this process has registered. A tuple, rebound whole on each change, so a call
+#: iterates a snapshot and needs no lock: the DICOM server refuses from its own threads.
+_REFUSAL_OBSERVERS: tuple[RefusalObserver, ...] = ()
+#: When a refusal-observer failure may next be logged; see :func:`notify_refusal`.
+_OBSERVER_FAILURE_LOG_AFTER = 0.0
+
+
+def add_refusal_observer(observer: RefusalObserver) -> None:
+    """Tell ``observer`` about each peer refusal a listener in this process makes."""
+    global _REFUSAL_OBSERVERS
+    _REFUSAL_OBSERVERS = (*_REFUSAL_OBSERVERS, observer)
+
+
+def remove_refusal_observer(observer: RefusalObserver) -> None:
+    """Undo one :func:`add_refusal_observer`; a no-op when ``observer`` is not registered."""
+    global _REFUSAL_OBSERVERS
+    remaining = list(_REFUSAL_OBSERVERS)
+    if observer in remaining:
+        remaining.remove(observer)
+    _REFUSAL_OBSERVERS = tuple(remaining)
+
+
+def notify_refusal(connection: str) -> None:
+    """Tell every refusal observer that the inbound ``connection`` refused a peer.
+
+    It runs on the accept path, so an observer fault goes no further: the refusal is already
+    decided. A fault is logged at WARNING at most once per :data:`REFUSAL_LOG_WINDOW_SECONDS`: a
+    peer that can trigger a refusal must not be able to fill the log, and a broken security
+    observer must not go silent after one early fault either."""
+    global _OBSERVER_FAILURE_LOG_AFTER
+    for observer in _REFUSAL_OBSERVERS:
+        try:
+            observer(connection)
+        except Exception as exc:  # noqa: BLE001 - the refusal stands; an observer is best-effort
+            now = time.monotonic()
+            if now >= _OBSERVER_FAILURE_LOG_AFTER:
+                _OBSERVER_FAILURE_LOG_AFTER = now + REFUSAL_LOG_WINDOW_SECONDS
+                logger.warning(
+                    "a refusal observer failed (%s); further failures are logged at most once "
+                    "every %gs",
+                    type(exc).__name__,
+                    REFUSAL_LOG_WINDOW_SECONDS,
+                )
 
 
 class RefusalLog:
@@ -132,11 +190,15 @@ class ListenerAdmission:
         self,
         *,
         transport: str,
+        name: str,
         max_connections: int | None,
         max_connections_per_host: int | None,
         source_ip_allowlist: list[str] | None,
     ) -> None:
         self.transport = transport
+        #: The inbound connection's name, for :func:`notify_refusal`. Required, so a new listener
+        #: cannot leave it out and have its refusals counted under another listener's subject.
+        self.name = name
         self.max_connections = max_connections
         self.max_connections_per_host = max_connections_per_host
         self.source_ip_allowlist = source_ip_allowlist
@@ -157,10 +219,18 @@ class ListenerAdmission:
         self._epoch = 0
 
     def check(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
-        """Decide whether to admit this connection. Logs a refusal, throttled; emits no event."""
+        """Decide whether to admit this connection. Logs a refusal, throttled; emits no event.
+
+        Every refusal but the stopping one is passed to :func:`notify_refusal`."""
         if self.stopping:
             logger.debug("%s connection refused: the listener is stopping", self.transport)
             return _STOPPING
+        refusal = self._refusal(writer, peer_host)
+        if refusal is not None:
+            notify_refusal(self.name)
+        return refusal
+
+    def _refusal(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
         if self.source_ip_allowlist is not None:
             peer = writer.get_extra_info("peername")
             if not peer_ip_allowed(peer, self.source_ip_allowlist):

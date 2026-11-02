@@ -48,6 +48,7 @@ from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink, config_changed_detail
+from messagefoundry.pipeline.security_signals import SecuritySignalDetector
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
@@ -55,8 +56,21 @@ from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
 from tests.test_config_fingerprint import _unlistable, _unreadable
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
+from tests.test_security_signals import _PostureSink, _thresholds
 
 _ACTIONS = ("config_loaded", "config_reload")
+
+
+def _restores_posture(row: dict[str, Any]) -> bool:
+    """Whether the security-signal detector would resolve an open ``posture_loosened`` on this real
+    row, were its list empty. The row's marks are what the writer wrote. The list is emptied
+    because this graph's own list is not, and a non-empty list restores nothing anyway."""
+    sink = _PostureSink()
+    detail = json.dumps({**row, "loosenings": []})
+    SecuritySignalDetector(sink, _thresholds()).observe(
+        "config_loaded", "system", None, None, detail
+    )
+    return bool(sink.restored)
 
 
 @pytest.fixture
@@ -350,12 +364,14 @@ async def test_a_restart_after_a_failed_read_still_alerts_against_the_older_base
         failed = await _start(tmp_path, cfg)
     assert failed[-1]["comparison"] == "read_failed"
     assert failed[-1]["baseline_unchecked"] is True
+    assert not _restores_posture(failed[-1])
     assert alerts == [], "control: the failed read raised nothing"
     rows = await _start(tmp_path, cfg)  # the SAME changed bytes, with a working read
     assert len(alerts) == 1
     assert alerts[0]["previous_fingerprint"] == before
     assert alerts[0]["fingerprint"] == config_fingerprint(cfg)
     assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is True
+    assert _restores_posture(rows[-1]), "control: a real row with no mark does restore"
 
 
 async def test_a_start_that_took_no_digest_is_passed_over_too(
@@ -375,6 +391,7 @@ async def test_a_start_that_took_no_digest_is_passed_over_too(
         failed = await _start(tmp_path, cfg)
     assert failed[-1]["comparison"] == "no_start_digest"
     assert failed[-1]["baseline_unchecked"] is True
+    assert not _restores_posture(failed[-1])
     rows = await _start(tmp_path, cfg)
     assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
     assert rows[-1]["comparison"] == "compared"
@@ -576,6 +593,7 @@ async def test_a_swap_check_that_faults_never_blocks_the_start(
     assert row["baseline_unchecked"] is True
     assert isinstance(row["loosenings"], list) and row["loosenings"]
     assert "superseded" not in row, "a check that faulted saw no reload"
+    assert not _restores_posture(row), "a swap it cannot rule out vouches for no posture"
 
 
 def _add_a_connection_pair(cfg: Path, tmp_path: Path) -> None:
@@ -653,6 +671,7 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     assert isinstance(row["loosenings"], list), "the start's own list, not None"
     assert "cleartext_accepted" not in row["loosenings"], "read off the start's graph"
     assert alerts == []
+    assert not _restores_posture(row), "the live graph may be the loosened one"
 
     monkeypatch.setattr(Engine, "start", real_start)
     rows = await _start(tmp_path, cfg)
