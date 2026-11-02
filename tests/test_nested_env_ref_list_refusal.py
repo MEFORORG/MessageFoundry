@@ -152,15 +152,15 @@ def test_the_leak_this_refusal_exists_to_stop_is_real(shape: str) -> None:
     assert any(SENTINEL in address for address in _as_recipients(resolved["recipients"]))
 
 
-def test_an_existing_validator_would_echo_the_default_so_the_refusal_must_run_first() -> None:
-    """Ordering control. ``Http``'s subject-prefix check quotes unqualified items, so if it ran
-    before the list refusal, its OWN message would carry the default."""
+def test_the_subject_check_behind_the_refusal_does_not_echo_the_default_either() -> None:
+    """``Http``'s subject-prefix check counts unqualified items and quotes none (vault BACKLOG
+    #3765), so its OWN message carries no default even if it ran before the list refusal."""
     spec = _http_subjects({PARTNER_CA: ["CN:partner.example"]})
     settings = dict(spec.settings)
     settings["intake_client_subjects"] = {PARTNER_CA: [NESTED_SHAPES["connections.toml"]()]}
-    with pytest.raises(WiringError) as excinfo:
+    with pytest.raises(WiringError, match="must be qualified") as excinfo:
         wiring._validate_intake_auth(settings)
-    assert SENTINEL in str(excinfo.value)
+    assert SENTINEL not in str(excinfo.value)
 
 
 # --- the refusal, both spellings, every list-valued setting ------------------

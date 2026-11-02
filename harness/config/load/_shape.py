@@ -37,6 +37,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from harness.config._refusal import prints_its_refusal
 from messagefoundry.parsing.message import Message, RawMessage
 
 # Transform cost modes.
@@ -115,6 +116,7 @@ class Shape:
         return self.sink_host, self.sink_port + (index % self.sink_ports)
 
 
+@prints_its_refusal
 def load_shape() -> Shape:
     transform = os.environ.get("MEFOR_LOAD_TRANSFORM", EDIT).strip().lower() or EDIT
     if transform not in _TRANSFORMS:

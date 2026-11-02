@@ -1251,8 +1251,9 @@ class FileSource(SourceConnector):
         A quarantined file never became a received message, so there is no disposition to record; it
         was preserved in ``.error`` and logged. What was missing is a STORE record an operator watching
         the console can see, which the MLLP over-cap arm has always written (``frame_oversize``). The
-        reason carries a size, a content type or a scrubbed codec or scanner message, and never the
-        file name, which a partner may build from an MRN.
+        reason carries a size, a content type or a codec or scanner message. ``safe_exc`` swaps only an
+        exact copy of the file name, which a partner may build from an MRN, so a scanner quoting it in
+        another form keeps it: ``docs/PHI.md`` section 7 row 7 says which forms.
 
         An emit problem must never wedge the poll loop (pure observer). A no-op when the runner has not
         injected the sink. No ``peer_host``: a directory has no peer, so the column stays ``NULL``,
