@@ -3833,6 +3833,10 @@ _DEAD_ORPHANS = {
     ),
     "in-an-orphan": _line_arm("Else", _CLEAR + _line_arm("Catch", _SEND_OUT)),
     "after-a-write": _line_arm("Else", _CLEAR + _SEND_OUT),
+    "in-a-call": _line_arm(
+        "Else", f'<Call Data="ActionListCall &quot;Sub&quot;"><List>{_SEND_OUT}</List></Call>'
+    ),
+    "in-an-unmodelled-element": _line_arm("Else", f"<Switch><List>{_SEND_OUT}</List></Switch>"),
     # An orphan's own branches were strays main inlined, with a live marker or a switched-off one.
     "in-its-own-branch": _line_arm("Catch", '<Line Data="Else"/>' + _SEND_OUT),
     "in-its-own-switched-off-branch": _line_arm(

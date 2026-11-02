@@ -866,7 +866,7 @@ and nothing `@Disabled` in the body, which the operator switched off. A position
 dead, an orphan in an `If` say, keeps its refusal dead there too, as main's was. Each refused send
 keeps its own line, as on main, so a hand-finish that deletes one meets the next.
 
-Two tests bound this amendment against a baseline, and the baseline is not origin/main: it is the
+At least four tests bound this amendment against a baseline, and the baseline is not origin/main: it is the
 vendored step 1 tree with only this amendment's scan half loaded, so it lacks the label amendment
 of §2(b.4) (BACKLOG #2632) that main carries. A send in a `<Block>` label, which main refuses and
 that tree delivers, is therefore left out of the second test's battery. One test reads code lines
@@ -874,7 +874,7 @@ by depth, and it reads the guard's own re-implementation of this amendment, not 
 that tree, the re-implementation adds no code line outside a dead placeholder, moves none
 shallower, and adds no closing send, on the battery and the raw draw, past a kept refusal, which
 may stand shallower than main's copy in a `try` but only matches a copy main ran live. The head is held to that
-re-implementation byte for byte on the battery's shapes, not on the raw draw. The other reads each line that writes a field, sends, or refuses a send as dead, in an `except`, or
+re-implementation byte for byte on the battery's shapes, not on the raw draw. A second reads each line that writes a field, sends, or refuses a send as dead, in an `except`, or
 live, by the nearest opener that is not dead, and holds the head to no line more live than the
 baseline over every list of a battery of disabled wrappers, refused sends and branches of branches
 among them, with the review rounds' repros. It holds the closing `return` to the destinations the
