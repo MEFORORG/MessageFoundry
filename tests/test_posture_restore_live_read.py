@@ -21,6 +21,11 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.security_signals import (
+    POSTURE_READ_TASK_NAME,
+    install_security_signals,
+)
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store.store import MessageStore
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
 from tests.test_start_config_change_alert import _add_a_cleartext_hop
@@ -100,17 +105,14 @@ async def _serve(tmp_path: Path, cfg: Path, seen: dict[str, Any] | None = None) 
         m.setattr(Engine, "start", _start_and_share)
         async with app.router.lifespan_context(app):
             engine: Engine = app.state.engine
-            # Only the read's own task can be pending here; a bounded wait, never a fixed sleep.
+            # A bounded wait on the read's own task, never a fixed sleep. Each test holds its own
+            # evidence that the read ran, so a task that was never started cannot pass here.
             for _ in range(200):
-                pending = [
-                    t
-                    for t in asyncio.all_tasks()
-                    if getattr(t.get_coro(), "__name__", "") == "_resolve_if_clean"
-                ]
+                pending = [t for t in asyncio.all_tasks() if t.get_name() == POSTURE_READ_TASK_NAME]
                 if not pending:
-                    break
+                    return engine
                 await asyncio.wait(pending, timeout=0.05)
-            return engine
+            pytest.fail("the live posture read did not finish")
 
 
 async def test_a_plain_clean_start_with_a_clean_live_read_resolves(
@@ -141,15 +143,18 @@ async def test_a_live_read_that_faults_leaves_the_alert_open(
     tmp_path: Path, cfg: Path, restored: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real = app_module._posture_loosenings
+    faults: list[int] = []
 
     def _faults_when_live(*args: Any, **kwargs: Any) -> tuple[list[tuple[str, str]], str | None]:
         if kwargs.get("graph") is None:
+            faults.append(1)
             raise RuntimeError("synthetic posture fault")
         return [], real(*args, **kwargs)[1]
 
     monkeypatch.setattr(app_module, "_posture_loosenings", _faults_when_live)
     await _serve(tmp_path, cfg)
     assert restored == []
+    assert faults == [1], "control: the read ran, and this fault is why nothing resolved"
 
 
 async def test_a_live_read_that_cannot_see_the_graph_is_not_a_clean_one(
@@ -166,3 +171,35 @@ async def test_a_live_read_that_cannot_see_the_graph_is_not_a_clean_one(
         registry_runner = None
 
     assert not await app_module._live_posture_is_clean(object(), _NoRunner())  # type: ignore[arg-type]
+
+
+async def test_an_unpinned_nodes_inverse_lands_after_the_graph_and_before_the_store_closes(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real teardown order. The start's own loosenings raise the alert, and only the flag that
+    says this process's identity changes on every start is forced, since a real cluster node needs
+    a server store."""
+    order: list[str] = []
+    real_install = install_security_signals
+
+    def _unpinned(*args: Any, **kwargs: Any) -> Any:
+        return real_install(*args, **{**kwargs, "resolve_on_stop": True})
+
+    real_stop, real_close = RegistryRunner.stop, MessageStore.close
+
+    async def _stop(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        await real_stop(self, *args, **kwargs)
+        order.append("graph stopped")
+
+    async def _close(self: MessageStore) -> Any:
+        order.append("store closes")
+        return await real_close(self)
+
+    monkeypatch.setattr(app_module, "install_security_signals", _unpinned)
+    monkeypatch.setattr(RegistryRunner, "stop", _stop)
+    monkeypatch.setattr(MessageStore, "close", _close)
+    monkeypatch.setattr(
+        LoggingAlertSink, "posture_restored", lambda self, name: order.append("inverse")
+    )
+    await _serve(tmp_path, cfg)
+    assert order.index("graph stopped") < order.index("inverse") < order.index("store closes")

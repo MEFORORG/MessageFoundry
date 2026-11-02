@@ -6546,8 +6546,9 @@ may have replaced that graph. A start whose baseline read failed, or that took n
 the same mark and raises none either. The alert stays open until a later start's unmarked row
 lists none and the live posture reads clean, as the next paragraph says.
 An unpinned cluster node's identity changes on every start, so that node raises the inverse for
-its own alert as it shuts down instead. That alert can stay open after shutdown, at least after a
-hard kill or a resolve that did not land. An alert also stays open when no later start comes back
+its own alert once its graph has stopped during shutdown, with no live read. That alert can stay
+open after shutdown, at least after a hard kill, a stop that fails before its graph has stopped, or
+a resolve that did not land. An alert also stays open when no later start comes back
 under its identity, at least after an engine shard is removed from the config or a pinned
 `[cluster].node_id` changes. In each of these cases, resolve it by hand with
 `POST /alerts/{alert_id}/resolve` or in the web console's alert list, which goes through the same

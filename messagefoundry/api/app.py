@@ -1576,8 +1576,9 @@ def _managed_teardown_steps(
                 "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
             )
         )
-    # Before engine.stop(): on an unpinned cluster node the removal raises its posture alert's
-    # inverse, and engine.stop() gives that write a bounded chance before the store closes.
+    # This takes the observers off. An unpinned cluster node's posture inverse is not raised here,
+    # with the graph still serving: engine.stop() raises it through Engine.on_graph_stopped, and
+    # gives that write a bounded chance before the store closes.
     steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
     steps.append(
         _TeardownStep(
@@ -3165,11 +3166,15 @@ def _install_security_signals(
     return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
     itself a loosening, and the posture detector, the one it leaves running, is what reports it.
     The posture subject names this engine process, and an unpinned cluster node, whose id changes
-    on every start, raises the inverse for its own posture alert as it shuts down. A clean start
+    on every start, raises the inverse for its own posture alert once its graph has stopped, through
+    :attr:`Engine.on_graph_stopped`, while the store is open. A clean start
     row resolves the alert only on a clean :func:`_live_posture_is_clean` reading off ``state``."""
 
     async def _live_clean() -> bool:
         return await _live_posture_is_clean(state, engine)
+
+    def _after_the_graph_stops(release: Callable[[], None]) -> None:
+        engine.on_graph_stopped = release
 
     return install_security_signals(
         sink,
@@ -3179,6 +3184,7 @@ def _install_security_signals(
         resolve_on_stop=engine.coordinator.is_clustered()
         and not (cluster_settings is not None and cluster_settings.node_id),
         live_posture_clean=_live_clean,
+        defer_release=_after_the_graph_stops,
     )
 
 

@@ -1503,9 +1503,10 @@ class LoggingAlertSink:
 
     def posture_restored(self, name: str) -> None:
         # The inverse (auto-resolve) event; no page, so DEBUG: the start logged its posture.
-        # Raised by a clean start, or by an unpinned cluster node as it shuts down: either way the
-        # loosened posture no longer runs under this subject.
-        log.debug("ALERT posture_restored: %r no loosened posture runs under this subject", name)
+        # Raised by a clean start whose live posture read named no loosening, or by an unpinned
+        # cluster node once its graph has stopped. A reload after that read is not seen, so this
+        # says the alert was cleared, not that the engine runs clean; docs/SECURITY.md says why.
+        log.debug("ALERT posture_restored: %r the open posture alert is cleared", name)
 
     def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
         # The guard usually logs one WARNING for each refusal, with the script's file name, but

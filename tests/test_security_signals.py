@@ -1355,6 +1355,24 @@ def test_the_posture_subject_names_the_process_where_several_share_the_store() -
     assert sink.restored == ["posture:start@node:a"]
 
 
+def test_an_identity_fault_on_a_clean_row_restores_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken() -> str | None:
+        raise RuntimeError(_LEAK_TOKEN)
+
+    sink = _PostureSink()
+    _start(SecuritySignalDetector(sink, _thresholds()), ["security.allow_x"])
+    assert [n for _s, n, _c, _d in sink.signals] == ["posture:start"]  # the open bare alert
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.security_signals"):
+        _start(SecuritySignalDetector(sink, _thresholds(), identity=broken), [])
+    assert sink.restored == []
+    assert "RuntimeError" in caplog.text and _LEAK_TOKEN not in caplog.text
+    # The control: the same row with an identity it can read, none for a lone engine, resolves it.
+    _start(SecuritySignalDetector(sink, _thresholds()), [])
+    assert sink.restored == ["posture:start"]
+
+
 def test_an_identity_fault_still_raises_under_the_bare_subject() -> None:
     def broken() -> str | None:
         raise RuntimeError("coordinator down")
@@ -1421,6 +1439,7 @@ async def test_the_lifespan_wiring_names_the_process_and_resolves_only_an_unpinn
         ClusterSettings(node_id=node_id),
         object(),  # no clean row here, so nothing reads the state
     )
+    hook = getattr(engine, "on_graph_stopped", None)
     try:
         cast(Any, audit_tee).emit_audit_tee(
             action="config_loaded",
@@ -1436,6 +1455,10 @@ async def test_the_lifespan_wiring_names_the_process_and_resolves_only_an_unpinn
         remove()
     subject = "posture:start@node:h-1" if clustered else "posture:start"
     assert [(s, n) for s, n, _c, _d in sink.signals] == [("posture_loosened", subject)]
+    assert sink.restored == []  # the remover does not: the graph is still serving
+    assert (hook is not None) == resolved_at_stop
+    if hook is not None:
+        hook()
     assert sink.restored == ([subject] if resolved_at_stop else [])
 
 

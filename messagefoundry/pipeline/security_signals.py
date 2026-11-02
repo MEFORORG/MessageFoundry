@@ -61,6 +61,7 @@ from messagefoundry.transports.admission import add_refusal_observer, remove_ref
 __all__ = [
     "MAX_SUBJECTS",
     "MAX_SUBJECT_ALERTS",
+    "POSTURE_READ_TASK_NAME",
     "SECURITY_SIGNAL_TYPES",
     "SecuritySignalDetector",
     "SecuritySignalThresholds",
@@ -120,6 +121,8 @@ _BASELINE_UNCHECKED: Final = "baseline_unchecked"
 #: open ``posture_loosened``. The list is read off the graph the start's snapshot took, so a reload
 #: that swapped the graph first leaves it empty while a loosened graph runs.
 _NOT_RESTORING_MARKS: Final = ("superseded", _BASELINE_UNCHECKED)
+#: The name of the task that reads the live posture for a clean start row.
+POSTURE_READ_TASK_NAME: Final = "security-signals-posture-read"
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +449,8 @@ class SecuritySignalDetector:
             identity = self._identity()
         except Exception as exc:  # noqa: BLE001 - fail toward raising: the bare subject still pages
             log.warning("the engine identity could not be read: %s", type(exc).__name__)
+            if not switches:
+                return  # a process that cannot name itself resolves no alert: it may not be its own
             identity = None
         subject = process_alert_subject("posture:start", identity)
         if not switches:
@@ -510,6 +515,7 @@ def install_security_signals(
     identity: Callable[[], str | None] = lambda: None,
     resolve_on_stop: bool = False,
     live_posture_clean: Callable[[], Awaitable[bool]] | None = None,
+    defer_release: Callable[[Callable[[], None]], None] | None = None,
 ) -> Callable[[], None]:
     """Register a :class:`SecuritySignalDetector` on the audit tee, and on the listeners' refusal
     observers while it counts refusals; returns the function that removes it.
@@ -527,6 +533,9 @@ def install_security_signals(
     False, or a read still running at removal, nothing is resolved. The read runs as its own task,
     since it may leave the loop and this observer runs on the audit writer's path. The stop-time
     inverse takes no read: ``resolve_on_stop`` names a subject no later start can come back to.
+
+    ``defer_release`` takes that stop-time inverse instead of the remover, for a caller that can run
+    it once the graph has stopped: until then the loosened graph is still serving.
 
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
     onto ``loop``, so the detector's state and the sink are only touched from one thread."""
@@ -556,7 +565,9 @@ def install_security_signals(
     def _verify_clean(resolve: Callable[[], None]) -> None:
         if live_posture_clean is None or removed:
             return
-        read = loop.create_task(_resolve_if_clean(live_posture_clean, resolve))
+        read = loop.create_task(
+            _resolve_if_clean(live_posture_clean, resolve), name=POSTURE_READ_TASK_NAME
+        )
         reads.add(read)
         read.add_done_callback(reads.discard)
 
@@ -595,6 +606,9 @@ def install_security_signals(
     if detector.counts_refusals:
         add_refusal_observer(_refused)
 
+    if resolve_on_stop and defer_release is not None:
+        defer_release(detector.release)
+
     def _remove() -> None:
         nonlocal removed
         removed = True
@@ -602,7 +616,7 @@ def install_security_signals(
             read.cancel()
         remove_audit_observer(_observe)
         remove_refusal_observer(_refused)
-        if resolve_on_stop:
+        if resolve_on_stop and defer_release is None:
             detector.release()
 
     return _remove
