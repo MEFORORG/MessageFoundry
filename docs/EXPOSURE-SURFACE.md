@@ -78,7 +78,7 @@ before you rely on it.
 
 A host firewall is the layer under all of this.
 [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) lists ports for some of these hops.
-It says to mirror each outbound firewall rule with its allow-list entry.
+It says which outbound firewall rules to mirror with an allow-list entry.
 
 ## At startup, `serve` guards stop the engine and a listener guard fails one Connection
 

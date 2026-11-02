@@ -358,7 +358,7 @@ def open_mode(app_state: object) -> bool:
 
     The one spelling of the check (vault BACKLOG #3216). The request gates and the posture all ask
     here, so they cannot drift apart. Both halves are read every time: a service beside the flag
-    still requires sign-in, and no service without the flag fails closed (503). A gate that has
+    still requires sign-in, and no service without the flag fails closed. A gate that has
     already found no service reads it once more here; that is the price of one spelling."""
     return getattr(app_state, "auth", None) is None and bool(
         getattr(app_state, "allow_no_auth", False)

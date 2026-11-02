@@ -56,6 +56,15 @@ this line.**
   part-selected mark, so a ticked box and an unticked one can look alike. A selection when no row
   can be taken shows that mark, and a click clears it. Typing a filter or flipping Flagged only
   judges the box again at once. (`BACKLOG #2623`)
+- **A refused start, stop or restart on the dashboard redirects back with a notice.** A 409 or a
+  503 from the per-name control routes used to show as raw JSON. (BACKLOG #3746)
+- **A released config reload shows each thing it left undone in its own banner.** The approvals
+  page now matches the configuration page there. It drops the raw `restart_required` row when a
+  banner says the names or the list is empty, and any other value stays in the facts. Its facts
+  gain `routers`, `handlers`, `running` and `dry_run`. The restart banner on both pages says the
+  list is not complete, and points at the section "Outbound TLS trust anchor" of docs/SECURITY.md
+  in the MessageFoundry repository, at the paragraph "What a reload's restart_required list
+  covers". (vault BACKLOG #3746)
 
 ### Security
 

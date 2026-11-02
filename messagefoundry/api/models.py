@@ -661,14 +661,8 @@ class ReloadResult(BaseModel):
     old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015).
     ``None`` means **not checked**: a dry run skips the settings preflight, so it cannot say.
 
-    An empty list is narrower than "no restart needed". It means no anchor this field covers
-    changed, including when none is configured. It covers only the engine process that answered:
-    another engine shard, or a cluster node that converges on the reload, reports its own anchors
-    only in its own log, as the audit row names no node. It never lists at least the dialling
-    settings CAs (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``,
-    ``[logging].forward_tls_ca_file``): their hops load the file by path and record no fingerprint
-    to compare with. A changed one can still need a restart or a rebuild of the connections that
-    use it; ``docs/SECURITY.md`` says which."""
+    An empty list is narrower than "no restart needed": ``docs/SECURITY.md``, *What a reload's
+    ``restart_required`` list covers*, says what it leaves out."""
 
     inbound: int
     outbound: int
