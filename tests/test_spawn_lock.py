@@ -16,6 +16,7 @@ indirection that bypassed the patch would leave that test passing while proving 
 from __future__ import annotations
 
 import ast
+import itertools
 import os
 import shutil
 import signal
@@ -552,6 +553,8 @@ def _scripted(
     monkeypatch.setattr(
         _spawn_lock, "_interpreter_version", lambda binary, kwargs: "7.9.9 on .NET 99"
     )
+    # Fake crashes must not advance the real count a later warning in this worker prints.
+    monkeypatch.setattr(_spawn_lock, "_CRASHES", itertools.count(1))
     return calls
 
 
@@ -675,7 +678,9 @@ def test_a_real_segfault_reads_as_the_crash_the_retry_is_for(tmp_path: Path) -> 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH")
 def test_the_version_probe_reads_pwsh_and_dotnet() -> None:
     """The warning's version is the one diagnostic #2746 asks for, so the real probe runs once."""
-    version = _spawn_lock._interpreter_version("pwsh", {})
+    # Held on the shared side like any single launch, so a racer storm cannot starve it.
+    with single_spawn():
+        version = _spawn_lock._interpreter_version("pwsh", {})
     assert " on .NET" in version, version
 
 
@@ -712,7 +717,11 @@ def test_a_caller_stdin_stream_is_not_replayed(
     calls = _scripted(monkeypatch, (_SEGV, "", ""))
     payload = tmp_path / "in.txt"
     payload.write_text("{}", encoding="utf-8")
-    with payload.open(encoding="utf-8") as stream, _no_crash_warning():
+    # Not replayed, but still warned about and counted: it is the same crash.
+    with (
+        payload.open(encoding="utf-8") as stream,
+        pytest.warns(NativeCrashWarning, match="NOT retried"),
+    ):
         proc = run_retrying_a_native_crash(_PWSH, stdin=stream, capture_output=True, text=True)
     assert len(calls) == 1
     assert proc.returncode == _SEGV
@@ -727,6 +736,22 @@ def test_every_retried_crash_is_numbered(monkeypatch: pytest.MonkeyPatch) -> Non
         run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
     messages = [str(w.message) for w in seen]
     assert len(set(messages)) == 2, messages
+
+
+def test_the_version_probe_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe that cannot decode its output, or returns none, is reported, not raised."""
+
+    def undecodable(*args: object, **kwargs: object) -> None:
+        raise UnicodeDecodeError("utf-8", b"\x81", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(subprocess, "run", undecodable)
+    assert _spawn_lock._interpreter_version("pwsh", {}).startswith("unreadable")
+
+    def no_stdout(cmd: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, None, None)
+
+    monkeypatch.setattr(subprocess, "run", no_stdout)
+    assert _spawn_lock._interpreter_version("pwsh", {}).startswith("unreadable")
 
 
 def test_a_signed_ntstatus_reads_as_the_same_crash() -> None:

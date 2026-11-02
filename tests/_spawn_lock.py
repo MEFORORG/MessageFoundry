@@ -99,6 +99,7 @@ sufficient -- and reaping a live holder only drops us back to the unsynchronised
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -221,6 +222,9 @@ _BURST_DRAIN_S: Final = 15.0
 #: A reader entry older than this is treated as abandoned. The longest legitimate hold is one gate
 #: launch at ``GATE_TIMEOUT_S`` (45s) plus process overhead, so 120s cannot reap a live holder that is
 #: behaving; if it ever does, the effect is that a storm starts beside it, which is today's behaviour.
+#: A native-crash retry (``run_retrying_a_native_crash``) can hold one ticket across two launches
+#: and a version probe, so a hold that crashed late CAN outlast this and be reaped; that is the
+#: same fail-open, on a path only a crash takes.
 _READER_STALE_S: Final = 120.0
 
 #: A turnstile older than this is treated as abandoned. The longest legitimate storm is bounded by
@@ -503,14 +507,15 @@ _CRASH_SIGNALS: Final = frozenset(
     if hasattr(signal, n)
 )
 
-#: The Windows face of the same events, one NTSTATUS per POSIX signal above that Windows has a
-#: native counterpart for. Windows reports the status as the exit code, which Python returns
-#: unsigned. A .NET stack overflow ALSO prints ``Stack overflow.`` to stderr, so the empty-streams
+#: The Windows face of the same events: the NTSTATUS a silent native crash exits with, which
+#: Python returns unsigned. Mapped to a signal where one corresponds; the stack overflow and the
+#: heap corruption have none. A .NET stack overflow ALSO prints ``Stack overflow.`` to stderr, so the empty-streams
 #: condition already excludes the managed one and only a silent native one qualifies.
 _WINDOWS_CRASH_STATUS: Final = {
     0xC0000005: "STATUS_ACCESS_VIOLATION",  # SIGSEGV
     0xC00000FD: "STATUS_STACK_OVERFLOW",
-    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",  # fail-fast, how a native abort ends
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",  # SIGABRT: fail-fast, how a native abort ends
+    0xC0000374: "STATUS_HEAP_CORRUPTION",
     0xC000001D: "STATUS_ILLEGAL_INSTRUCTION",  # SIGILL
     0xC0000094: "STATUS_INTEGER_DIVIDE_BY_ZERO",  # SIGFPE
 }
@@ -524,7 +529,7 @@ class NativeCrashWarning(UserWarning):
     """A launch died natively, with no output, and was retried once. Visible in pytest's summary."""
 
 
-class NativeCrashTwice(Exception):  # noqa: N818 -- the name is the message a reader greps for
+class NativeCrashTwice(Exception):
     """The retried launch died natively too.
 
     NOT an ``AssertionError``, so a ``pytest.raises(AssertionError)`` around a launch that is meant
@@ -565,7 +570,7 @@ def _interpreter_version(binary: str, kwargs: dict[str, Any]) -> str:
     so a bare ``pwsh`` resolves to the same binary that crashed. NOT CACHED: a probe that itself
     crashes would otherwise label every later crash in the process ``unreadable``.
     """
-    name = _binary_name(binary)
+    name = _binary_name(str(binary))
     if name not in _LOCKED_INTERPRETERS:
         return f"not read ({name} is not pwsh)"
     probe = (
@@ -576,19 +581,20 @@ def _interpreter_version(binary: str, kwargs: dict[str, Any]) -> str:
         out = subprocess.run(
             [binary, "-NoProfile", "-NonInteractive", "-Command", probe],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=15,
             env=kwargs.get("env"),
             cwd=kwargs.get("cwd"),
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
         return f"unreadable ({type(exc).__name__})"
-    return out.stdout.strip() or f"unreadable (exit {out.returncode}, no output)"
+    return (out.stdout or "").strip() or f"unreadable (exit {out.returncode}, no output)"
 
 
 def run_retrying_a_native_crash(
-    cmd: Sequence[str], **kwargs: Any
+    cmd: Sequence[str], *, _warn_depth: int = 2, **kwargs: Any
 ) -> subprocess.CompletedProcess[str]:
     """``subprocess.run``, launched ONCE MORE if the child crashed natively -- BACKLOG #2746.
 
@@ -625,24 +631,34 @@ def run_retrying_a_native_crash(
 
     ``check=True`` is applied to the launch that is kept, so a crash is retried before it can raise
     ``CalledProcessError``. A caller-supplied ``stdin`` stream is not retried, since the first launch
-    may have consumed it; ``input=`` is replayed as given. ``subprocess.run`` is looked up at call
+    may have consumed it, but the crash is still warned about and counted; ``input=`` is replayed
+    as given. ``_warn_depth`` points the warning at the test, past ``run_single``. ``subprocess.run`` is looked up at call
     time, as ``run_single`` explains.
     """
     check = bool(kwargs.pop("check", False))
     first = subprocess.run(cmd, **kwargs)
     crash = _native_crash(first)
-    if crash is None or kwargs.get("stdin") not in (None, subprocess.PIPE, subprocess.DEVNULL):
+    if crash is None:
         return _checked(first, check)
-    shown = subprocess.list2cmdline(list(cmd))
-    version = _interpreter_version(cmd[0], kwargs)
+    replayable = kwargs.get("stdin") in (None, subprocess.PIPE, subprocess.DEVNULL)
+    args = [str(a) for a in cmd]
+    shown = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+    version = _interpreter_version(args[0], kwargs)
     warnings.warn(
         NativeCrashWarning(
             f"NATIVE CRASH #{next(_CRASHES)} in this process: {shown} died on {crash} with stdout "
-            f"and stderr both empty; interpreter {version}. Retrying ONCE. This is not a test "
-            "failure, and the CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
+            f"and stderr both empty; interpreter {version}. "
+            + (
+                "Retrying ONCE."
+                if replayable
+                else "NOT retried: its stdin stream cannot be replayed."
+            )
+            + " This is not a test failure, and the CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
         ),
-        stacklevel=2,
+        stacklevel=_warn_depth,
     )
+    if not replayable:
+        return _checked(first, check)
     second = subprocess.run(cmd, **kwargs)
     again = _native_crash(second)
     if again is not None:
@@ -690,4 +706,4 @@ def run_single(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess
             "disables this module. Call subprocess.run directly."
         )
     with single_spawn():
-        return run_retrying_a_native_crash(cmd, **kwargs)
+        return run_retrying_a_native_crash(cmd, _warn_depth=3, **kwargs)
