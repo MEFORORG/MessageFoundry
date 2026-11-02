@@ -689,11 +689,12 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         fresh = False
         if _PEM_TRUSTED in line:
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor {spec.path!r} names the OpenSSL "
-                "trusted-certificate BEGIN marker, even outside a block, as in a comment. The "
-                "engine does not load such a block. Remove a comment that names it. Re-export "
-                "each certificate in such a block as a plain CERTIFICATE block; openssl x509 -in "
-                "<one cert> -out <plain.pem> converts one certificate per run"
+                f"{spec.setting}: the trust anchor {spec.path!r} names the trusted-certificate "
+                "BEGIN marker, even outside a block, as in a comment. Converting such a block "
+                "discards its trust settings, so confirm the CA should be trusted without them. "
+                "The engine does not load such a block. Remove a comment that names the marker, "
+                "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
+                "CERTIFICATE block per run"
             )
         if line.startswith(_PEM_BEGIN):
             blocks += 1
