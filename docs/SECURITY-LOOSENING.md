@@ -852,8 +852,9 @@ count is above `0` (vault BACKLOG #2613).
   one listener instead, add an `[[alerts.rules]]` row with `event_type = "peer_refused_burst"`,
   `connection = "inbound:IB_BUSY"` and `mute = true`. The rule's glob is matched against the
   alert's subject, so `connection = "IB_BUSY"` never matches `inbound:IB_BUSY`, and that rule
-  loads with no warning. Neither rule is named as a loosening. Each listener counts its own
-  refusals; the `[alerts]`
+  loads with no warning. Neither rule is named as a loosening. A muted listener still takes one
+  of the five subjects a window can name, and past those five its alert's subject is `inbound:*`,
+  which that rule does not match, so it pages. Each listener counts its own refusals; the `[alerts]`
   table of [CONFIGURATION.md](CONFIGURATION.md) says when alerts share a subject.
 - **Reversible:** yes. Remove the line, or set the default, and restart.
 

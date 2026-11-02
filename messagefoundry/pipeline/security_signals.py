@@ -482,7 +482,7 @@ class SecuritySignalDetector:
         Every failure is logged, at once. A refused connection has no audit row and may have no
         other record, so a throttled line here could be the last trace of a lost alert. A windowed
         detector starts its subject again at each raise, failed or not, so a line takes a threshold
-        of events rather than one. A line carries the alert type and the sink exception's type
+        of events, which is one event only at a count of 1. A line carries the alert type and the sink exception's type
         name only, never the exception's message, which a sink may build from the alert's subject
         or detail."""
         try:
