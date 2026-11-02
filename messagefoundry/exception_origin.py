@@ -41,9 +41,9 @@ from typing import Any, Final
 __all__ = [
     "ExceptionChainTooLong",
     "exception_chain",
+    "raise_statement_file",
     "raised_by_the_engine",
     "raised_only_by_the_engine",
-    "raised_outside_the_engine",
     "worded_by_the_engine",
 ]
 
@@ -124,12 +124,15 @@ def raised_by_the_engine(exc: BaseException) -> bool:
     return bool(entries) and _in_the_engine(entries[-1])
 
 
-def raised_outside_the_engine(exc: BaseException) -> bool:
-    """Whether the innermost frame of ``exc``'s traceback stopped on a ``raise`` statement in code
-    that is not this package's. A signal Python's own handler turned into an exception stops on a
-    call or a loop instruction, so this can prove code and can never prove a signal."""
+def raise_statement_file(exc: BaseException) -> str | None:
+    """The compiled file name of the ``raise`` statement the innermost frame of ``exc``'s traceback
+    stopped on, or ``None`` when it stopped on anything else. A signal that Python's own handler
+    turned into an exception does not stop on a ``raise``, so a file here can prove code and ``None``
+    can never prove a signal."""
     entries = _entries(exc)
-    return bool(entries) and _stopped_on_a_raise(entries[-1]) and not _in_the_engine(entries[-1])
+    if not entries or not _stopped_on_a_raise(entries[-1]):
+        return None
+    return entries[-1].tb_frame.f_code.co_filename
 
 
 def raised_only_by_the_engine(exc: BaseException) -> bool:

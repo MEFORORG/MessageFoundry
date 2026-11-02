@@ -48,7 +48,7 @@ import tokenize
 import traceback
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache
@@ -107,8 +107,8 @@ from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME
 from messagefoundry.exception_origin import (
     exception_chain,
+    raise_statement_file,
     raised_only_by_the_engine,
-    raised_outside_the_engine,
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
@@ -9685,29 +9685,41 @@ def _module_failure(
     return f"error loading config module {path.name}: {detail} ({_WITHHELD})"
 
 
-def _is_a_signal(exc: BaseException) -> bool:
-    """Whether ``exc`` can be what Ctrl-C raised. A subclass is not what a signal raises, and Python
-    delivers a signal only to the main thread, so on any other, such as a reload's worker, an
-    interrupt is code, and one leaving there would stop the event loop.
+def _is_a_signal(exc: BaseException, path: Path) -> bool:
+    """Whether ``exc``, which ``path`` or something it ran raised, can be what Ctrl-C raised. A
+    subclass is not what a signal raises, and Python delivers a signal only to the main thread, so
+    on any other, such as a reload's worker, an interrupt is code, and one leaving there would stop
+    the event loop.
 
     Under any handler but Python's own it is treated as code too, whether or not a signal raised it.
     uvicorn holds SIGINT for the whole lifespan, where ``serve`` loads its graph, and a Ctrl-C there
     only sets a flag on the server. A handler can also raise one itself, as asyncio's does at a second
     Ctrl-C: that module is refused, which ends a load, and ``validate`` goes on to its next module.
 
-    Under Python's own handler, one that stopped on a ``raise`` statement outside the engine is code,
-    because that handler stops on a call or a loop instruction. The engine's own is
-    :func:`_read_fault` passing a real one on. That is as far as a frame goes: a module calling
-    ``signal.default_int_handler()`` or throwing one into a generator stops as a real signal does,
-    and the handler in force is read here, after the module ran, so a module can have put Python's
-    back. What passes this can still be code, so :func:`_exec_module` logs which module was
-    loading."""
-    return (
-        type(exc) is KeyboardInterrupt
-        and threading.current_thread() is threading.main_thread()
-        and getsignal(SIGINT) is default_int_handler
-        and not raised_outside_the_engine(exc)
-    )
+    Under Python's own handler, one that stopped on a ``raise`` statement in a config file is code,
+    because a signal does not stop on a ``raise``. Only a config file: ``asyncio.run`` raises one
+    for a real Ctrl-C, after it puts that handler back. A frame goes no further. At least a module
+    calling ``signal.default_int_handler()`` or throwing one into a generator stops as a real signal
+    does, and the handler in force is read here, after the module ran, so a module can have put
+    Python's back. What passes this can still be code, so :func:`_exec_module` logs the module.
+
+    These reads can run a module's code: ``getsignal`` reads a handler's ``__class__``, and a
+    traceback entry can be built by hand. This runs outside the loader's other guards, so what such
+    a read raises would leave the loader as raised. A fault here means no, and the module is refused."""
+    try:
+        return (
+            type(exc) is KeyboardInterrupt
+            and threading.current_thread() is threading.main_thread()
+            and getsignal(SIGINT) is default_int_handler
+            and not _raised_in_the_config_dir(exc, path)
+        )
+    except BaseException:  # noqa: BLE001 - see the docstring; the type alone reaches the refusal
+        return False
+
+
+def _raised_in_the_config_dir(exc: BaseException, path: Path) -> bool:
+    file = raise_statement_file(exc)
+    return file is not None and _in_dir(file, path.parent.resolve())
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -9720,7 +9732,7 @@ def _read_fault(path: Path, fault: BaseException) -> None:
     on every thread: the module has failed, and ``SystemExit(0)`` leaving here would end ``validate``
     or ``check`` with exit 0 and no output. It is logged: the file and the fault's type, never its
     text, which is the module's, so ``exc_info`` stays off too."""
-    if _is_a_signal(fault):
+    if _is_a_signal(fault, path):
         raise KeyboardInterrupt
     _logger.warning(
         "config module %s: reading its failure raised %s, so the diagnostic is reduced",
@@ -10088,7 +10100,7 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
                 f"error loading config module {path.name}: it, or a helper it loads, called "
                 "sys.exit() at import, which config code may not do"
             )
-        elif not _is_a_signal(failure):
+        elif not _is_a_signal(failure, path):
             leaving = WiringError(_module_failure(path, failure, helpers.source_of))
         del failure
         raise leaving
@@ -10115,12 +10127,14 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         refusal = _refusal_for(path, failure, helpers.source_of)
     except KeyboardInterrupt:
         # The stop is bare, and it can be code the module ran, so this is all that says where it
-        # happened. The file and a fixed sentence, never the original's text.
-        _logger.warning(
-            "config module %s: a KeyboardInterrupt stopped the load here, from Ctrl-C or from "
-            "code the module ran",
-            path.name,
-        )
+        # happened. The file and a fixed sentence, never the original's text. A module can have
+        # added a log handler, and what that raises must not replace the stop.
+        with suppress(BaseException):
+            _logger.warning(
+                "config module %s: a KeyboardInterrupt stopped the load here, from Ctrl-C or from "
+                "code the module ran",
+                path.name,
+            )
         raise
     finally:
         # Whatever this module queued -- a failure part-way included, or a read of it importing a

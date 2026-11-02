@@ -1379,8 +1379,12 @@ def sigint_raises() -> Iterator[None]:
         f"try:\n    raise ValueError({NEEDLE!r})\n"
         f"except ValueError:\n    {_thrown('KeyboardInterrupt()')}\n",
         f"e = KeyboardInterrupt()\ne.add_note({NEEDLE!r})\n{_thrown('e')}\n",
+        # A real signal: asyncio's handler cancels the task, and the runner raises one in its file.
+        "import asyncio\nimport signal\n\n\nasync def main():\n"
+        "    signal.raise_signal(signal.SIGINT)\n    await asyncio.sleep(30)\n\n\n"
+        "asyncio.run(main())\n",
     ],
-    ids=["handler-called", "with-text", "from", "in-handler", "with-note"],
+    ids=["handler-called", "with-text", "from", "in-handler", "with-note", "asyncio-run"],
 )
 @pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_no_frame_can_tell_from_a_signal_stops_the_load(
@@ -1406,7 +1410,7 @@ def test_an_interrupt_no_frame_can_tell_from_a_signal_stops_the_load(
 def test_a_raise_statement_is_a_refused_module_under_pythons_handler(
     tmp_path: Path, body: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Python's handler stops on a call or a loop instruction, never on a `raise`, so this is code.
+    # A signal does not stop on a `raise`, so this is code.
     _write(tmp_path, "feed.py", body)
     assert "KeyboardInterrupt at line" in str(_refusal_with_no_stop(tmp_path, caplog))
 
@@ -1477,15 +1481,48 @@ def test_an_interrupt_in_serves_lifespan_load_is_a_refused_module(
 
 @pytest.mark.parametrize(
     "body",
-    ["raise KeyboardInterrupt\n", f"raise KeyboardInterrupt({NEEDLE!r})\n"],
+    [_thrown("KeyboardInterrupt()"), _thrown(f"KeyboardInterrupt({NEEDLE!r})")],
     ids=["bare", "with-text"],
 )
+@pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_off_the_main_thread_is_a_refused_module(tmp_path: Path, body: str) -> None:
     # No signal reaches a reload's worker thread, and one leaving it would stop the event loop.
+    # Thrown, and under Python's handler, so only the thread can say.
     _write(tmp_path, "feed.py", body)
     left = _load_on_a_worker(tmp_path)
     assert isinstance(left, WiringError), repr(left)
     assert NEEDLE not in str(left) and "KeyboardInterrupt at line 1" in str(left)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_fault_judging_an_interrupt_refuses_the_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A module's handler can run in that read. Outside the loader's other guards, SystemExit(0)
+    # leaving here would end `validate` or `check` with exit 0 on a module that failed.
+    def faults(_signum: int) -> None:
+        raise SystemExit(0)
+
+    monkeypatch.setattr(wiring, "getsignal", faults)
+    _write(tmp_path, "feed.py", _thrown(f"KeyboardInterrupt({NEEDLE!r})"))
+    assert "KeyboardInterrupt at line 1" in str(_refusal_with_no_stop(tmp_path, caplog))
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_log_handler_that_faults_does_not_replace_the_stop(tmp_path: Path) -> None:
+    class Faults(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            raise SystemExit(0)
+
+    logger = logging.getLogger("messagefoundry.config.wiring")
+    handler = Faults()
+    logger.addHandler(handler)
+    _write(tmp_path, "feed.py", _thrown("KeyboardInterrupt()"))
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            load_config(tmp_path)
+    finally:
+        logger.removeHandler(handler)
 
 
 #: Places the loader reads a failed module's exception under one guard: the withheld diagnostic, on
@@ -1647,11 +1684,12 @@ def test_a_gate_refuses_a_refusal_rewritten_to_exit_when_it_is_read(
 
 
 @pytest.mark.parametrize("stop", ["KeyboardInterrupt", "SystemExit"], ids=["interrupt", "exit"])
+@pytest.mark.usefixtures("sigint_raises")
 def test_a_stop_in_the_loaders_read_off_the_main_thread_is_absorbed(
     tmp_path: Path, fails_in_the_read: Callable[[str], Path], stop: str
 ) -> None:
     # No signal reaches a reload's worker, so a stop there is code, and it would end the event loop.
-    fails_in_the_read(f"raise {stop}({NEEDLE!r})")
+    fails_in_the_read(_thrown(f"{stop}({NEEDLE!r})"))
     left = _load_on_a_worker(tmp_path)
     assert isinstance(left, WiringError), repr(left)
     assert NEEDLE not in str(left)
