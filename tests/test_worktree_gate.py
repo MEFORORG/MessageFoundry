@@ -109,9 +109,15 @@ def run_gate(
     distinguishes that from a real regression at the moment it fires, so a lander must choose between
     rerunning until green and reporting the queue blocked.
 
-    **THIS DOES NOT RETRY, DELIBERATELY.** The item names rerun-until-green as *manufacturing* a green
-    rather than earning one. A retry inside the harness is the same act one level down, with the
+    **A TIMEOUT IS NOT RETRIED, DELIBERATELY.** The item names rerun-until-green as *manufacturing* a
+    green rather than earning one. A retry inside the harness is the same act one level down, with the
     evidence hidden inside a passing test. Labelling costs nothing and hides nothing.
+
+    **ONE NARROWER CASE IS LAUNCHED ONCE MORE (BACKLOG #2746).** ``run_single`` relaunches a gate that
+    died on a native crash with both streams empty -- SIGSEGV on the ubuntu leg -- exactly once. The
+    crash is not hidden: a retried one leaves a numbered ``NativeCrashWarning`` in pytest's summary,
+    and a second crash fails the test. ``tests/_spawn_lock.py``'s ``run_retrying_a_native_crash``
+    says why that differs from rerun-until-green. So a green gate test may have launched pwsh twice.
     """
     raw = payload if isinstance(payload, str) else json.dumps(payload)
     try:

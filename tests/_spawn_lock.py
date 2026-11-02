@@ -599,9 +599,11 @@ def run_retrying_a_native_crash(
     """``subprocess.run``, launched ONCE MORE if the child crashed natively -- BACKLOG #2746.
 
     THE FAILURE. ``pwsh`` on the ubuntu harness leg dies on SIGSEGV with stdout and stderr both
-    empty, in tests that change nothing about it; the row counts at least six, across different
-    tests and unrelated pull requests, each passing on a rerun. The test's own assertion then reports
-    ``exited -11`` as if the script under test had failed, when it said nothing at all.
+    empty, in tests that change nothing about it. The row records at least six native crashes
+    across different tests and unrelated pull requests; two of them were aborts that printed to
+    stderr, which this helper deliberately does not retry, and the row does not record a rerun
+    result for every one. The test's own assertion then reports ``exited -11`` as if the script
+    under test had failed, when it said nothing at all.
 
     THE CONDITION IS NARROW ON PURPOSE, and each limb excludes something. A crash signal (or its
     Windows NTSTATUS) and not any non-zero exit, so a real failure -- exit 1 -- is returned at once.
@@ -618,6 +620,8 @@ def run_retrying_a_native_crash(
     trap: a retry wrapper that prints a plausible cause onto a leg where it was never measured turns
     a true observation into an invented mechanism. A retried crash still leaves a numbered
     :class:`NativeCrashWarning` in pytest's summary, so the retry hides the red, not the evidence.
+    The warning is issued AFTER the second launch, so under ``-W error`` the retry still runs and
+    the warning then fails the test by name; nothing in pyproject.toml or ci.yml sets that today.
     That is the difference from ``run_gate``'s "THIS DOES NOT RETRY" in ``test_worktree_gate.py``,
     which is about a launch TIMEOUT (#1304) and still holds for one: a timeout is never retried here.
 
@@ -641,33 +645,33 @@ def run_retrying_a_native_crash(
     if crash is None:
         return _checked(first, check)
     replayable = kwargs.get("stdin") in (None, subprocess.PIPE, subprocess.DEVNULL)
+    # The second launch runs BEFORE anything is warned, so a warnings-as-errors filter can fail
+    # the test only after the retry has run, never in place of it.
+    second = subprocess.run(cmd, **kwargs) if replayable else None
+    again = _native_crash(second) if replayable else None
     args = [str(a) for a in cmd]
     shown = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
     version = _interpreter_version(args[0], kwargs)
-    warnings.warn(
-        NativeCrashWarning(
-            f"NATIVE CRASH #{next(_CRASHES)} in this process: {shown} died on {crash} with stdout "
-            f"and stderr both empty; interpreter {version}. "
-            + (
-                "Retrying ONCE."
-                if replayable
-                else "NOT retried: its stdin stream cannot be replayed."
-            )
-            + " This is not a test failure, and the CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
-        ),
-        stacklevel=_warn_depth,
+    crashed = (
+        f"NATIVE CRASH #{next(_CRASHES)} in this process: {shown} died on {crash} with stdout "
+        f"and stderr both empty; interpreter {version}."
     )
-    if not replayable:
-        return _checked(first, check)
-    second = subprocess.run(cmd, **kwargs)
-    again = _native_crash(second)
+    unknown = "The CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
     if again is not None:
         raise NativeCrashTwice(
-            f"NATIVE CRASH TWICE: {shown} died on {crash}, then on {again} when retried, with no "
-            f"output either time; interpreter {version}. No test assertion ran on it, and the "
-            "CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
+            f"NATIVE CRASH TWICE: {crashed} Launched once more, it died again on {again}, with no "
+            f"output. No test assertion ran on either launch. {unknown}"
         )
-    return _checked(second, check)
+    outcome = (
+        "Launched once more; that launch did not crash, and its result is the one the test "
+        "checks. The crash itself is not a test failure."
+        if replayable
+        else "NOT launched again: its stdin stream cannot be replayed, so the test receives this "
+        "crash as its result and will report it as a failure. That failure is this native crash, "
+        "not an assertion about the script."
+    )
+    warnings.warn(NativeCrashWarning(f"{crashed} {outcome} {unknown}"), stacklevel=_warn_depth)
+    return _checked(second if replayable else first, check)
 
 
 def _checked(proc: Any, check: bool) -> subprocess.CompletedProcess[str]:

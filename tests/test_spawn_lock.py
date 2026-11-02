@@ -627,16 +627,38 @@ def test_a_death_with_output_a_kill_or_unread_streams_is_not_retried(
 def test_a_second_crash_fails_and_says_twice(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once, never more: a crash that repeats is a finding, so it fails rather than retrying again."""
     calls = _scripted(monkeypatch, (_SEGV, "", ""), (_SEGV, "", ""), (0, "", ""))
-    with (
-        pytest.warns(NativeCrashWarning),
-        pytest.raises(NativeCrashTwice, match="NATIVE CRASH TWICE") as failed,
-    ):
+    with pytest.raises(NativeCrashTwice, match="NATIVE CRASH TWICE") as failed:
         run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
     assert len(calls) == 2, "a third launch was made"
     # Not an AssertionError: a pytest.raises(AssertionError) around a launch meant to fail
     # would otherwise swallow two crashes as the failure it expected.
     assert not isinstance(failed.value, AssertionError)
     assert "NOT ESTABLISHED" in str(failed.value)
+
+
+def test_warnings_as_errors_still_lets_the_retry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under ``-W error`` the warning is an exception. It is issued AFTER the second launch, so the
+    retry still runs and the test then fails on the named crash, never in place of the retry."""
+    calls = _scripted(monkeypatch, (_SEGV, "", ""), (0, "ok", ""))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", NativeCrashWarning)
+        with pytest.raises(NativeCrashWarning, match="did not crash"):
+            run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
+    assert len(calls) == 2, "the warning fired before the retry could run"
+
+
+def test_the_retried_warning_does_not_call_the_crash_a_pass_or_a_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The replayed branch says the crash is not a test failure; the unreplayable branch, whose
+    crash the test does receive, must not say that."""
+    _scripted(monkeypatch, (_SEGV, "", ""))
+    with (
+        Path(__file__).open(encoding="utf-8") as stream,
+        pytest.warns(NativeCrashWarning) as seen,
+    ):
+        run_retrying_a_native_crash(_PWSH, stdin=stream, capture_output=True, text=True)
+    assert "is not a test failure" not in str(seen[0].message)
 
 
 def test_run_single_takes_the_retry(lock_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -665,10 +687,7 @@ def test_a_real_segfault_reads_as_the_crash_the_retry_is_for(tmp_path: Path) -> 
         "open(sys.argv[1], 'a').write('ran\\n')\n"
         "os.kill(os.getpid(), signal.SIGSEGV)\n"
     )
-    with (
-        pytest.warns(NativeCrashWarning, match="SIGSEGV"),
-        pytest.raises(NativeCrashTwice),
-    ):
+    with pytest.raises(NativeCrashTwice, match="SIGSEGV"):
         run_retrying_a_native_crash(
             [sys.executable, "-c", child, str(count)], capture_output=True, text=True, timeout=60
         )
@@ -720,7 +739,7 @@ def test_a_caller_stdin_stream_is_not_replayed(
     # Not replayed, but still warned about and counted: it is the same crash.
     with (
         payload.open(encoding="utf-8") as stream,
-        pytest.warns(NativeCrashWarning, match="NOT retried"),
+        pytest.warns(NativeCrashWarning, match="will report it as a failure"),
     ):
         proc = run_retrying_a_native_crash(_PWSH, stdin=stream, capture_output=True, text=True)
     assert len(calls) == 1
