@@ -2607,9 +2607,10 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   `validate_config`, which `messagefoundry check` runs, would report a config directory on such a
   share as absent. A value file read from disk would read as absent there too, so an `env()`
   reference with a default would take that default, with no refusal;
-- a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
-  out what it cannot read, so it can be partial, and the backup records what it left out as
-  `config_unreadable_files`;
+- a DR backup bundle's config digest is a separate, ordinary read, not the digest above, and it
+  can be partial. `include_config` under
+  [`[backup]`](CONFIGURATION.md#backup--scheduled-dr-backup--restore-verify) says what the backup
+  records of that, and what it does not;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a repeat after an edit files a second hold and leaves the first pending. The first is refused
