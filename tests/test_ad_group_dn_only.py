@@ -43,7 +43,7 @@ from tests._ad_group_map_store_contract import (
     assert_group_map_keys_at_width_store,
 )
 from tests._admin_account import create_local_user_chosen
-from tests.test_log_redaction_secret_domain import _growth_between
+from tests._growth import _growth_between
 
 PW = "Sup3rSecret!!"
 
