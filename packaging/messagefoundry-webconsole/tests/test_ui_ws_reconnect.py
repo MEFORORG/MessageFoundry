@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -32,42 +34,35 @@ _NODE = shutil.which("node")
 #: its own: ``setTimeout`` only pushes onto ``timers``, ``setInterval`` is a no-op, ``fetch`` never
 #: resolves, and "flush" swaps the due list out (``const due = timers; timers = [];``) before running
 #: it, so a timer that re-arms lands in the NEXT flush. So once the cold start below is paid, a run
-#: that outlives this bound is app.js spinning synchronously -- the hang this file must still fail
-#: on -- or node itself stalling again, which this bound cannot tell apart. Locally a run takes about
-#: 0.05 s.
+#: that outlives this bound is app.js looping -- synchronously or through a microtask chain, the hang
+#: this file must still fail on -- or node itself stalling again, which this bound cannot tell
+#: apart. Locally a run takes about 0.05 s.
 _RUN_TIMEOUT_S = 60
 
-#: The bound on the job's FIRST harness run, kept apart from the run bound above. On windows-2025
-#: under xdist the first node launch of the web console job has stalled past 60 s twice (merge-queue
-#: evictions, BACKLOG #4773): run 41141529043 lost the first of this file's four launches and run
-#: 41490064678 the first two; every later launch in both jobs, the same harness over the same app.js,
-#: passed. No other file in this suite starts node. So the cost is a first-launch one -- an
-#: inference, since the logs carry no per-launch timing, and it may be node.exe or the first read of
-#: the script files, so the warm-up runs the real harness over the real app.js. Unlike the
-#: never-returning pwsh launch BACKLOG #1304 records, this stall ended, so a longer bound on the cold
-#: start alone absorbs it. Run 41490064678 puts it over 120 s and under about 180 s.
+#: The bound on the module's FIRST harness run, kept apart from the run bound above. On windows-2025
+#: under xdist the first node launch of the web console job has stalled past 60 s twice: run
+#: 41141529043 lost the first of this file's four launches and run 41490064678 the first two; every
+#: later launch in both jobs, the same harness over the same app.js, passed. At this commit no other
+#: file in this suite starts node. So the cost reads as a first-launch one -- an inference, since the
+#: logs carry no per-launch timing, and it may be node.exe or the first read of the script files, so
+#: the warm-up runs the real harness over the real app.js. Concurrent load, the cause BACKLOG #1304
+#: measured for pwsh launches, is not ruled out; there the launch never returned, here the later
+#: launches did. If one stall spanned both of run 41490064678's killed launches, it ran over 120 s
+#: and under about 180 s; that is an inference too. The warm-up warns with its time when it runs
+#: past _COLD_START_WARN_S, so the next occurrence leaves a measurement.
 _COLD_START_TIMEOUT_S = 240
+_COLD_START_WARN_S = 10
 
 pytestmark = [
     pytest.mark.skipif(_NODE is None, reason="node is not installed"),
-    # The cold start is charged to the setup of the module's first test. Under the per-test
-    # --timeout (120 on the Windows CI tiers, 60 on ubuntu and in pyproject), pytest-timeout's
-    # thread method would kill the worker before the cold-start bound fires, losing the
-    # TimeoutExpired that names the stalled command. One cold start plus one run, plus 60 s of slack,
-    # lets each subprocess bound fire first. A cold start past the step's faulthandler_timeout (150 s
-    # on Windows) writes a stack dump to the log that is not a failure: the dump does not end the run.
+    # The cold start is charged to the setup of the module's first test. Under the CI tiers'
+    # per-test --timeout, which today sits below this marker, pytest-timeout's thread method would
+    # kill the worker before the cold-start bound fires, losing the TimeoutExpired that names the
+    # stalled command. One cold start plus one run, plus 60 s of slack, lets each subprocess bound
+    # fire first. A cold start past the step's faulthandler_timeout writes a stack dump to the log;
+    # the dump does not end the run, so on its own it is not a failure.
     pytest.mark.timeout(_COLD_START_TIMEOUT_S + _RUN_TIMEOUT_S + 60),
 ]
-
-
-def _node(*args: str, timeout: int) -> str:
-    """Run node with ``args`` under ``timeout`` s; return stdout, failing on a non-zero exit."""
-    assert _NODE is not None
-    proc = subprocess.run(
-        [_NODE, *args], capture_output=True, text=True, timeout=timeout, check=False
-    )
-    assert proc.returncode == 0, proc.stderr
-    return proc.stdout
 
 
 #: Loads app.js against just enough of a browser for the [data-poll] feature, then runs a scenario:
@@ -131,8 +126,16 @@ console.log(JSON.stringify(out));
 
 
 def _run(scenario: list[str], harness: Path, timeout: int = _RUN_TIMEOUT_S) -> list[int]:
-    out = _node(str(harness), str(_APP_JS), json.dumps(scenario), timeout=timeout)
-    counts: list[int] = json.loads(out.strip().splitlines()[-1])
+    assert _NODE is not None
+    proc = subprocess.run(
+        [_NODE, str(harness), str(_APP_JS), json.dumps(scenario)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    counts: list[int] = json.loads(proc.stdout.strip().splitlines()[-1])
     return counts
 
 
@@ -143,7 +146,11 @@ def harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path.write_text(_HARNESS, encoding="utf-8")
     # The same argv shape every test uses, so whatever the cold cost is, this run pays it. An empty
     # scenario still loads app.js, so a spin at load fails here, at the cold-start bound.
+    started = time.monotonic()
     assert _run([], path, timeout=_COLD_START_TIMEOUT_S) == []
+    elapsed = time.monotonic() - started
+    if elapsed > _COLD_START_WARN_S:
+        warnings.warn(f"node cold start took {elapsed:.1f} s", stacklevel=1)
     return path
 
 
