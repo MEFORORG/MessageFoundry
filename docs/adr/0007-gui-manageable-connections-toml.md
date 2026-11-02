@@ -232,8 +232,9 @@ it could reach only its own copy.
    cluster node toggles like any other: the store is the one thing the nodes share.
 6. **A toggle still writes `connection_flag_set`**, with its actor and client, in the same transaction
    as the flag. If the row fails the flag does not change, and the route answers **503**. A commit
-   whose answer was lost answers 503 too, and then both may have landed. The row
-   carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
+   whose answer was lost answers 503 too, and then both may have landed. So does a write the store
+   leaves unanswered past the engine's 10-second bound, and a commit cut off there may land after
+   the 503. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
    Left on that list, a row with no digest would read as a degraded baseline and the next start would
    compare nothing.
 7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering

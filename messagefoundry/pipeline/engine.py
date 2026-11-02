@@ -145,6 +145,15 @@ log = logging.getLogger(__name__)
 #: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
 _ALERT_STATE_DRAIN_SECONDS = 5.0
 
+#: How long a connection flag toggle waits for the store (BACKLOG #2623). A write normally takes
+#: milliseconds, so this is a stuck or saturated store. Well under the API's 120 s request deadline
+#: (``api/request_timeout.py``), so the caller hears the toggle's own refusal and the console shows
+#: its page, not the deadline's JSON. It bounds the store call and nothing before it: the auth gate
+#: writes first, so a store stopped outright can still meet that deadline there. The refusal comes
+#: once the store call has unwound, which a stalled store can stretch past this, by
+#: ``_ROLLBACK_TIMEOUT`` on SQLite. Read at call time.
+CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS = 10.0
+
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
 #: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
@@ -218,8 +227,10 @@ class ConfigRefusedBeforeApprovalCheck(WiringError):
 class ConnectionFlagNotRecorded(Exception):
     """A flag toggle the store did not confirm (BACKLOG #2623). The flag and its audit row are one
     transaction, so they land together or not at all, and a failed statement leaves neither. A
-    commit whose answer was lost may have landed both, so nothing here says which. The API answers
-    503: the store, not the request, is at fault."""
+    commit whose answer was lost may have landed both, and one cut off at
+    :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS` may land after this is raised, so nothing here
+    says which. A row that lands that way is in the audit chain but not the off-box tee
+    (``store.store.AuditedWrite``). The API answers 503: the store, not the request, is at fault."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2498,7 +2509,8 @@ class Engine:
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
         no such connection: the name has to be a real one, because the store would take any text.
-        Raises :class:`ConnectionFlagNotRecorded` when the store did not confirm the write."""
+        Raises :class:`ConnectionFlagNotRecorded` when the store did not confirm the write within
+        :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner
@@ -2524,10 +2536,24 @@ class Engine:
             ),
             client=client,
         )
+        bound = CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS
+        deadline = asyncio.timeout(bound)
         try:
-            await self.store.set_connection_flag(name, direction, flagged=flagged, audit=audit)
+            async with deadline:
+                await self.store.set_connection_flag(name, direction, flagged=flagged, audit=audit)
         except Exception as exc:
-            log.error("the store did not confirm a connection flag change: %s", safe_exc(exc))
+            if deadline.expired():
+                # Cancelling the wait does not stop a commit already handed to the store.
+                log.error(
+                    "the store did not confirm a connection flag change within %g s (%s %s), and "
+                    "it may still land: %s",
+                    bound,
+                    direction,
+                    name,
+                    safe_exc(exc),
+                )
+            else:
+                log.error("the store did not confirm a connection flag change: %s", safe_exc(exc))
             raise ConnectionFlagNotRecorded(
                 "the store did not confirm this toggle, so the flag may or may not have changed. "
                 "Read it before you repeat the toggle. If this keeps failing, the engine log names "

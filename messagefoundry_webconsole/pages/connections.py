@@ -590,10 +590,11 @@ def flag_rejected(name: str, detail: str) -> Markup:
 
 
 def flag_not_recorded(name: str, detail: str) -> Markup:
-    """Shown when the store did not confirm a flag toggle (BACKLOG #2623). The flag and its audit row
-    land together or not at all, and a lost commit answer may have landed both. Its own page,
-    because :func:`flag_rejected`'s hint names a fix for another refusal. Both ``name`` and
-    ``detail`` are escaped."""
+    """Shown when the store did not confirm a flag toggle (BACKLOG #2623).
+    ``pipeline.engine.ConnectionFlagNotRecorded`` says what that leaves unknown. A read showing the
+    old value does not settle it, but a click then asks for the same value, so a late landing does
+    no harm. Its own page, because :func:`flag_rejected`'s hint names a fix for another refusal. Both
+    ``name`` and ``detail`` are escaped."""
     body = el(
         "div",
         el("h1", "Flag change not confirmed"),
@@ -601,10 +602,11 @@ def flag_not_recorded(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The store did not confirm the change, and it may still have landed. So read the flag "
-            "on Connections first. If it shows what you asked for, the change landed, and clicking "
-            "it again would undo that. If it does not, click it once. If Connections says the "
-            "flags could not be read, wait until it can.",
+            "The store did not confirm the change, and it may have landed or may still land. So "
+            "read the flag on Connections first. If it shows what you asked for, the change "
+            "landed, and clicking it again would undo that. If it does not, click it once, which "
+            "asks for the same change. If Connections says the flags could not be read, wait "
+            "until it can.",
             class_="muted",
         ),
         el("p", el("a", "Back to Connections", href="/ui")),

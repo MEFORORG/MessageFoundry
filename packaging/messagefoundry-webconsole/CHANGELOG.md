@@ -45,8 +45,9 @@ this line.**
   no toggle, Flagged only hides no row, select-all under it takes no such row, and a notice above
   the table says why. (`BACKLOG #2623`)
 - **The page for a toggle the store did not confirm no longer says the flag did not change.** The
-  change may still have landed, so it sends the operator to read the flag first, and it no longer
-  says to try again. Its heading is now "Flag change not confirmed". (`BACKLOG #2623`)
+  change may have landed or may still land, so it sends the operator to read the flag first, and it
+  no longer says to try again. Its heading is now "Flag change not confirmed". A flag write the store
+  leaves unanswered past the engine's 10-second bound reaches this page too. (`BACKLOG #2623`)
 - **Corrected: the two connection filters are not purely presentational.** Select-all skips a row
   either one hides, so both shape a bulk action's target set. For Flagged only, which reads the
   store, the owner accepted that on 2026-11-01 (ADR 0007). (`BACKLOG #2623`)

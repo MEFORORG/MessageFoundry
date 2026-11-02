@@ -31,8 +31,11 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
+from messagefoundry.store.store import MessageStore
 from tests._operator_audit_atomic_contract import AppendFailed, failing_append
 
+#: Where the engine reads the toggle's bound, at call time.
+BOUND = "messagefoundry.pipeline.engine.CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS"
 #: Counts each run of a config module's top-level code: the probe the row's two findings came from.
 RUNS_ENV = "MEFOR_TEST_FLAG_MODULE_RUNS"
 
@@ -450,6 +453,56 @@ async def test_a_failed_row_changes_no_flag_and_names_the_store(
     assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
     assert isinstance(refused.value.__cause__, AppendFailed)
     assert "the store did not confirm a connection flag change" in caplog.text
+
+
+async def test_a_store_that_never_answers_gets_the_refusal_within_the_bound(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hung store is refused at the bound, as the type the route answers 503 for, so the console
+    can show its page. RED without the bound: the toggle waits on the store, and here on the test's
+    own guard, as a real caller would wait on the 120 s request deadline."""
+
+    async def _hung(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(BOUND, 0.05)
+    monkeypatch.setattr(engine.store, "set_connection_flag", _hung)
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.engine"),
+        pytest.raises(ConnectionFlagNotRecorded, match="may or may not have changed"),
+    ):
+        async with asyncio.timeout(5):
+            await _flag(engine, "OB_TOML", "outbound")
+    assert "within 0.05 s (outbound OB_TOML)" in caplog.text
+
+
+@pytest.mark.parametrize("landed", [False, True], ids=["before-commit", "after-commit"])
+async def test_a_refusal_at_the_bound_cannot_say_whether_the_write_landed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, landed: bool
+) -> None:
+    """Why the refusal and its page say neither. The store goes silent either side of its commit,
+    the operator gets the same refusal, and only the second has the flag and its row. The writer is
+    free again in both, so the toggle the page sends the operator to can land."""
+    store = engine.store
+    assert isinstance(store, MessageStore)
+    commit = store._commit
+
+    async def _silent() -> None:
+        if landed:
+            await commit()
+        await asyncio.Event().wait()
+
+    with monkeypatch.context() as hung:
+        # Long enough for the real commit of the second case, and over before the closing toggle.
+        hung.setattr(BOUND, 0.5)
+        hung.setattr(store, "_commit", _silent)
+        with pytest.raises(ConnectionFlagNotRecorded, match="may or may not have changed"):
+            async with asyncio.timeout(5):
+                await _flag(engine, "OB_TOML", "outbound")
+    assert await store.list_connection_flags() == ({("OB_TOML", "outbound")} if landed else set())
+    assert len(await store.list_audit(action="connection_flag_set")) == int(landed)
+    await _flag(engine, "OB_CODE", "outbound")
+    assert ("OB_CODE", "outbound") in await store.list_connection_flags()
 
 
 # --- What no longer holds the flag ---------------------------------------------------------------

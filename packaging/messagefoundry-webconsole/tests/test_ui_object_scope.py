@@ -10,6 +10,7 @@ tests check that it does. ``tests/test_object_scope_flag_and_alert_rules.py`` co
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -19,7 +20,9 @@ from fastapi import HTTPException
 from messagefoundry.api.models import ConnectionRow
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AlertRule, AlertsSettings
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole.pages import connections as connection_pages
 
@@ -137,6 +140,43 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_store_did_not_confirm(
     assert "clicking it again would undo that" in r.text
     assert "Flag not changed" not in r.text
     assert "try again" not in r.text.lower()
+
+
+async def test_ui_flag_shows_the_not_confirmed_page_for_a_store_that_never_answers(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2623: a flag write the store never answers reaches the operator as the typed page,
+    with the real engine path under the route. RED without the bound: the POST sits on the store
+    until the request deadline answers JSON in the page's place. A commit cut off at the bound may
+    still land, so the page must not read as nothing having happened."""
+
+    async def _hung(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.engine.CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS", 0.05
+    )
+    monkeypatch.setattr(engine.store, "set_connection_flag", _hung)
+    graph = Registry()
+    graph.add_inbound(
+        InboundConnection("IB_A", ConnectionSpec(ConnectorType.MLLP, {"port": 2579}), router="r")
+    )
+    graph.add_router("r", lambda m: [])
+    engine.add_registry(graph)
+    service = await auth_service(engine)
+    await provision(service, "dep", [Role.DEPLOYMENT.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "dep")
+        async with asyncio.timeout(5):
+            r = await c.post(
+                "/ui/connections/IB_A/flag",
+                data={"direction": "inbound", "flagged": "true"},
+                headers=SAME_ORIGIN,
+            )
+    assert r.status_code == 200, r.text[:300]
+    assert "Flag change not confirmed" in r.text
+    assert "the flag may or may not have changed" in r.text
+    assert "may still land" in r.text
 
 
 async def test_ui_flag_gives_another_503_no_not_confirmed_page(
