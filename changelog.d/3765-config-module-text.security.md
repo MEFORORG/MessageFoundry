@@ -17,10 +17,9 @@
   subject and an issuer that is not a DN no longer quote the value. A call with an unexpected or
   repeated keyword now reads `TypeError at line N naming 'keyword'`, when the source line spells
   that keyword. A config module that raises a `BaseException` that is not an `Exception` is now
-  refused as a failed module, with no text, with two exceptions. A `SystemExit` the module raises
-  directly is unchanged here, on any thread, and still leaves with its text and whatever it was
-  raised from. On the main thread, an exact `KeyboardInterrupt` stops the load as a new, bare
-  `KeyboardInterrupt` that carries none of the original's arguments, notes or chain; on any other
+  refused as a failed module, with no text, and a `SystemExit` of any class is refused the same way
+  on every thread, with nothing it was raised from. On the main thread, an exact
+  `KeyboardInterrupt` stops the load as a new, bare `KeyboardInterrupt` that carries none of the original's arguments, notes or chain; on any other
   thread, where no signal can arrive, it is refused like the rest. The loader's read of a failed
   module's exception runs the module's code, so a real Ctrl-C can land in it. On the main thread an
   interrupt there stops the load the same way, with no exception chained to it. Any other fault in
@@ -39,8 +38,7 @@
   one that puts text on a refusal's traceback with `gen.throw`, or by assigning `__traceback__`
   before a bare `raise`; one that changes a refusal's class while the loader reads it, or patches
   `WiringError` itself; one that builds a class whose name holds a value; one that compiles code
-  under an engine file name to forge a frame; a `SystemExit` raised while the loader reads a helper
-  left to its `ImportError` guard, which leaves as raised; the frames on an interrupt's traceback,
+  under an engine file name to forge a frame; the frames on an interrupt's traceback,
   which still hold the withheld exception; and the traceback of a refusal, whose module frames hold
   that module's globals. That traceback is kept, because a logged start failure reads it to name the
   module and line, and because the loader's own frames on it would still reach those values through

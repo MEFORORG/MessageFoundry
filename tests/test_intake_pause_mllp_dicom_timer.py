@@ -37,6 +37,7 @@ from messagefoundry.store import MessageStore
 from messagefoundry.transports import timer as timer_mod
 from messagefoundry.transports.base import IntakeGate
 from messagefoundry.transports.mllp import CR, EB, MLLPSource, frame
+from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from messagefoundry.transports.timer import TimerSource
 
 #: Long enough that a source which ignored the gate would have read, fired or handled everything.
@@ -304,10 +305,10 @@ def _store_once(port: int, data: bytes, *, calling_ae: str = "MODALITY1") -> _Ou
 
 
 def _capture(captured: list[bytes]) -> Callable[[bytes], Any]:
-    async def handler(data: bytes) -> str | None:
+    async def handler(data: bytes) -> IngressReceipt:
         # Mimics the runner's receipt handler: durably "commit", then return the message id.
         captured.append(data)
-        return f"mid-{len(captured)}"
+        return IngressReceipt.accepted(f"mid-{len(captured)}")
 
     return handler
 
@@ -317,7 +318,7 @@ async def test_a_paused_scp_refuses_a_new_association_as_busy_retry_later() -> N
     captured: list[bytes] = []
     scp = _scp()
     scp.intake_gate = _held()
-    await scp.start(_capture(captured))
+    await scp.start(receipt_handler(_capture(captured)))
     try:
         outcome = await asyncio.to_thread(_store_once, scp.sockport, _object())
         assert outcome.established is False
@@ -334,7 +335,7 @@ async def test_an_object_refused_during_a_pause_is_committed_when_resent_after_r
     scp = _scp()
     gate = _held(DISK_REASON)
     scp.intake_gate = gate
-    await scp.start(_capture(captured))
+    await scp.start(receipt_handler(_capture(captured)))
     try:
         data = _object()
         refused = await asyncio.to_thread(_store_once, scp.sockport, data)
@@ -353,7 +354,7 @@ async def test_an_association_accepted_before_a_pause_finishes_normally() -> Non
     scp = _scp()
     gate = IntakeGate()
     scp.intake_gate = gate
-    await scp.start(_capture(captured))
+    await scp.start(receipt_handler(_capture(captured)))
     associated, go = threading.Event(), threading.Event()
     data = _object()
 
@@ -390,7 +391,7 @@ async def test_a_gate_injected_after_start_is_honoured() -> None:
     _dicom_deps()
     captured: list[bytes] = []
     scp = _scp()
-    await scp.start(_capture(captured))
+    await scp.start(receipt_handler(_capture(captured)))
     try:
         scp.intake_gate = _held()
         outcome = await asyncio.to_thread(_store_once, scp.sockport, _object())
@@ -404,7 +405,7 @@ async def test_a_peer_refused_anyway_gets_its_permanent_refusal_during_a_pause()
     _dicom_deps()
     scp = _scp(calling_ae_allowlist=["MODALITY1"])
     scp.intake_gate = _held()
-    await scp.start(_capture([]))
+    await scp.start(receipt_handler(_capture([])))
     try:
         outcome = await asyncio.to_thread(
             _store_once, scp.sockport, _object(), calling_ae="STRANGER"
@@ -428,7 +429,7 @@ async def test_a_refusal_that_fails_aborts_rather_than_accepts(
     captured: list[bytes] = []
     scp = _scp()
     scp.intake_gate = _held()
-    await scp.start(_capture(captured))
+    await scp.start(receipt_handler(_capture(captured)))
     try:
         outcome = await asyncio.to_thread(_store_once, scp.sockport, _object())
         assert outcome.established is False, "a failed refusal let the association in"

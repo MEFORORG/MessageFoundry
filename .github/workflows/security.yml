@@ -160,7 +160,7 @@ jobs:
           # use the runner's passwordless sudo to read it from the runner process's memory. What
           # bounds the token is the workflow's `permissions:` block, read-only contents.
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Check the lockfile is in sync with pyproject (DEP-1)
@@ -380,7 +380,7 @@ jobs:
           # to do. Fixed at the source rather than leaning on this file's artipacked entry in
           # .github/zizmor.yml, which that config's own header asks for.
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Install pip-audit (hash-pinned, from the CI toolchain lock)
@@ -527,7 +527,7 @@ jobs:
         with:
           # Nothing in this job pushes or uploads the tree, so the git credential has no work to do.
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Set up Node
@@ -561,7 +561,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Set up Node
@@ -683,7 +683,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Generate the Windows-resolved engine SBOM (license-complete, hash-locked core runtime)
@@ -932,7 +932,7 @@ jobs:
     # `# nosec`) fails the build instead of merging unnoticed.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Scan source for insecure patterns
@@ -1127,7 +1127,7 @@ jobs:
     # HARD-FAILING: the first run was 0 findings; a new match for any rule now fails the build.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Run the MessageFoundry rules
@@ -1229,7 +1229,7 @@ jobs:
     # or a stale inventory entry — fails the build, so the inventory can't silently drift (WP-L3-02).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Diff crypto call sites against the inventory
@@ -1248,7 +1248,7 @@ jobs:
     # secret here, and locally from a git-ignored scripts/security/scan-tokens.local.txt.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Scan the tracked tree for forbidden content
@@ -1402,7 +1402,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Scan source for insecure patterns
@@ -1643,7 +1643,7 @@ jobs:
           # indifferent to depth, so the only cost of hoisting it is a slower clone. That is why
           # these three group cleanly.
           fetch-depth: 0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
       - name: Set up Node

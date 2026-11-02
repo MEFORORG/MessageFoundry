@@ -19,13 +19,14 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from starlette.types import Message, Receive, Scope, Send
 
-from messagefoundry.api import create_app
+from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.api.client_networks import DENIAL_HEADER, DENIAL_MARKER
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
@@ -179,9 +180,14 @@ async def test_a_network_denial_is_a_403_carrying_the_floor_and_the_marker(
 # --- the fallback: a server without the extension is refused exactly as before -----------------
 
 
-async def test_without_the_extension_every_refusal_is_still_a_bare_close(engine: Engine) -> None:
+async def test_without_the_extension_every_refusal_is_still_a_bare_close(
+    engine: Engine, tmp_path: Path
+) -> None:
     """The negative arm. A server that does not offer ``websocket.http.response`` cannot carry a
     denial response, so the refusal must degrade to the bare close and never to an accept."""
+    managed = create_managed_app(
+        db_path=tmp_path / "managed.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
     netapp = create_app(
         engine, security_settings=SecuritySettings(allowed_client_networks=["10.0.0.0/8"])
     )
@@ -191,6 +197,7 @@ async def test_without_the_extension_every_refusal_is_still_a_bare_close(engine:
     engineless.state.engine = None
     for app, client, code in (
         (create_app(engine), ("127.0.0.1", 1), 1008),
+        (managed, ("127.0.0.1", 5), 1008),  # never started: the refusal needs no lifespan
         (netapp, ("192.168.9.9", 2), 1008),
         (capped, ("127.0.0.1", 3), 1013),
         (engineless, ("127.0.0.1", 4), 1011),

@@ -92,6 +92,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     narrow_to_approved_suites,
 )
+from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -185,10 +186,16 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
+from messagefoundry.store.schema_verify import IndexShape, SchemaShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
+)
+from messagefoundry.store.server_schema_verify import (
+    declared_schema,
+    key_column,
+    refuse_short_schema,
 )
 from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
@@ -254,6 +261,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RestoreRecord,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -1224,13 +1232,101 @@ _SCHEMA.append(
 # function. Same contract, same caveat.
 # 7 (BACKLOG #1726): the same function builds ix_messages_received. Same contract. This bump is the
 # only thing that moves the hash for it, since _SCHEMA is unchanged.
-_MIGRATION_REV = 7
+# 8 (BACKLOG #1720): the same function's catalog reads are scoped to current_schema(), and the open
+# now checks the live schema before it writes the marker. _SCHEMA is unchanged, so this bump is the
+# only thing that sends a store marked by an earlier build through both once.
+_MIGRATION_REV = 8
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
 # timeout=inf, for the reason its FIFO covering-index comment gives: an existing store's first build
 # scans the whole table.
 _RECEIVED_INDEX_DDL = "CREATE INDEX IF NOT EXISTS ix_messages_received ON messages(received_at, id)"
+
+# The other indexes _migrate_lease_columns builds, as constants so the live-schema check below reads
+# the same text the migration runs (BACKLOG #1720). Its comments there say why each is built there and
+# not in _SCHEMA.
+_BODY_REF_INDEX_DDL = "CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)"
+_LEASE_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_queue_lease ON queue(lease_expires_at) WHERE status='inflight'"
+)
+_FIFO_IN_SEQ_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_queue_fifo_in_seq ON queue(stage, channel_id, status, seq)"
+)
+_FIFO_OUT_SEQ_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq"
+    " ON queue(stage, destination_name, status, seq)"
+)
+#: What the live-schema check expects: the batch, then every index the migration builds. The
+#: migration's columns are in the batch's CREATE TABLE statements already, so it adds none here.
+_MIGRATION_INDEX_DDL: Final = (
+    _BODY_REF_INDEX_DDL,
+    _LEASE_INDEX_DDL,
+    _FIFO_IN_SEQ_INDEX_DDL,
+    _FIFO_OUT_SEQ_INDEX_DDL,
+    _RECEIVED_INDEX_DDL,
+)
+
+# The live shape, read on the schema transaction's own connection after the batch (BACKLOG #1720).
+# Each name is resolved the way the batch's unqualified DDL resolved it: a table through the search
+# path, and an index in the namespace of the table it is declared on, which is where CREATE INDEX IF
+# NOT EXISTS looked for it. The relkind is read too, so a name held by another kind of relation is
+# named as such. Every name travels as a bound array, never spliced.
+_LIVE_COLUMNS_SQL = (
+    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col"
+    " FROM pg_catalog.unnest($1::text[]) AS t(name)"
+    " LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(t.name)"
+    " LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0"
+    " AND NOT a.attisdropped AND c.relkind IN ('r', 'p')"
+)
+# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC. pg_get_indexdef with a column
+# number prints that key column alone: its name, or the expression. The two arrays are zipped with
+# ROWS FROM and one unnest each: the parser rewrites a multi-argument unnest in FROM into that form
+# only when the name is unqualified, so pg_catalog.unnest($1, $2) finds no such function.
+_LIVE_INDEXES_SQL = (
+    "SELECT q.name AS idx, c.relkind::text AS kind, t.relname::text AS tbl,"
+    " i.indisunique AS uniq, (i.indpred IS NOT NULL) AS partial,"
+    " (i.indisvalid AND i.indisready) AS usable, am.amname::text AS method,"
+    " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
+    "   || CASE WHEN (i.indoption[k - 1]::int & 1) = 1 THEN ' DESC' ELSE '' END"
+    "   FROM pg_catalog.generate_series(1, i.indnkeyatts::int) AS k ORDER BY k) AS cols"
+    " FROM ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))"
+    " AS q(name, tbl)"
+    " LEFT JOIN pg_catalog.pg_class c ON c.relname = q.name AND c.relnamespace ="
+    "   (SELECT w.relnamespace FROM pg_catalog.pg_class w"
+    "    WHERE w.oid = pg_catalog.to_regclass(q.tbl))"
+    " LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid"
+    " LEFT JOIN pg_catalog.pg_class t ON t.oid = i.indrelid"
+    " LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
+)
+_CURRENT_SCHEMA_SQL = "SELECT pg_catalog.current_schema()::text AS schema_name"
+_RELKINDS: Final = MappingProxyType(
+    {
+        "r": "table",
+        "p": "partitioned table",
+        "i": "index",
+        "I": "partitioned index",
+        "v": "view",
+        "m": "materialized view",
+        "S": "sequence",
+        "c": "composite type",
+        "f": "foreign table",
+        "t": "TOAST table",
+    }
+)
+
+
+def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str | None:
+    """``label`` for a relkind in ``wanted``, the relkind's own name otherwise, and ``None`` where
+    no relation holds the name."""
+    if kind is None:
+        return None
+    return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
+
+
+def _declared_schema() -> SchemaShape:
+    """What the live-schema check expects: the batch, then every index the migration builds."""
+    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL))
 
 
 def _schema_hash() -> str:
@@ -1297,6 +1393,12 @@ _PG_REVOKE_USER_SESSIONS_SQL: Final = (
 #: ``except_token_hash`` clause, renumbered from ``$1``. Keep the two in step.
 _PG_COUNT_USER_SESSIONS_SQL: Final = (
     "SELECT COUNT(*) FROM sessions WHERE user_id=$1 AND revoked_at IS NULL"
+    " AND ($2::text IS NULL OR token_hash != $2)"
+)
+#: Every account's sweep at once, but for an optional kept session, for ``revoke_all_sessions``
+#: (BACKLOG #2614).
+_PG_REVOKE_ALL_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=$1, seal='' WHERE revoked_at IS NULL"
     " AND ($2::text IS NULL OR token_hash != $2)"
 )
 #: Whether the account holds at least one passkey.
@@ -2047,6 +2149,11 @@ class PostgresStore:
                     for statement in _SCHEMA:
                         await conn.execute(statement)
                     await self._migrate_lease_columns(conn)
+                    # BACKLOG #1720: before the marker, never after it. Every guarded CREATE above
+                    # skips a name that is already taken, whatever holds it, so only a read of the
+                    # live catalog can say the batch built what the marker is about to record. A
+                    # refusal rolls this transaction back, marker and batch together.
+                    await self._verify_live_schema(conn)
                     await conn.execute(
                         "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, $1, $2)"
                         " ON CONFLICT (id) DO UPDATE"
@@ -2166,6 +2273,57 @@ class PostgresStore:
         row = await conn.fetchrow("SELECT schema_hash FROM schema_meta WHERE id = 1")
         return bool(row is not None and row["schema_hash"] == expected)
 
+    async def _verify_live_schema(self, conn: Any) -> None:
+        """Refuse the open when the live schema lacks a table, column or index the batch and the
+        migration declare (BACKLOG #1720). Runs inside the schema transaction, before the marker.
+
+        Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
+        are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
+        what is not. Reads only."""
+        expected = _declared_schema()
+        column_rows = [
+            (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"])
+            for r in await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
+        ]
+        names = sorted(expected.named_indexes)
+        tables = [expected.named_indexes[name].table for name in names]
+        taken: dict[str, str] = {}
+        unusable: dict[str, str] = {}
+        indexes: dict[str, IndexShape] = {}
+        for r in await conn.fetch(_LIVE_INDEXES_SQL, names, tables):
+            kind = _relkind_label(r["kind"], ("i", "I"), "index")
+            if kind is None:
+                continue  # nothing holds the name: the compare reports the index missing
+            if kind != "index":
+                taken[r["idx"]] = kind
+                continue
+            # A failed CREATE INDEX CONCURRENTLY leaves an invalid index under the name, and the
+            # batch builds btree only (the DDL reader refuses USING), so either one serves nothing.
+            if not r["usable"]:
+                unusable[r["idx"]] = "invalid: a build that never finished"
+            elif r["method"] != "btree":
+                unusable[r["idx"]] = f"a {r['method']} index, not btree"
+            indexes[r["idx"]] = IndexShape(
+                str(r["tbl"]),
+                tuple(key_column(str(col)) for col in r["cols"]),
+                bool(r["uniq"]),
+                bool(r["partial"]),
+            )
+        # The schema the batch's unqualified DDL resolved into, for the refusal to name: with
+        # [store].db_schema unset that is the search path's first schema, which the settings omit.
+        schema_rows = await conn.fetch(_CURRENT_SCHEMA_SQL)
+        schema = schema_rows[0]["schema_name"] if schema_rows else None
+        refuse_short_schema(
+            self.backend.value,
+            self._settings.database,
+            expected,
+            column_rows,
+            indexes,
+            taken,
+            unusable,
+            schema=None if schema is None else str(schema),
+        )
+
     async def _migrate_lease_columns(self, conn: Any) -> None:
         """Track B Step 2: add the lease columns to a pre-existing Step-1 ``queue`` table, but ONLY if
         they are actually missing. ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` is a no-op on an
@@ -2176,12 +2334,17 @@ class PostgresStore:
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
         would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
         builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
-        ix_messages_received), which the _SCHEMA loop cannot give per statement."""
+        ix_messages_received), which the _SCHEMA loop cannot give per statement.
+
+        Every catalog read here is scoped to ``current_schema()``, the schema the unqualified DDL
+        resolves into (BACKLOG #1720). Unscoped, a second store in another schema of the same database
+        answered for this one: its column made the guard skip an ADD this schema still needed, and
+        the live-schema check then refused the open for a column the migration never added."""
         present = {
             r["column_name"]
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
-                " WHERE table_name='queue' AND column_name = ANY($1::text[])",
+                " WHERE table_schema = current_schema() AND table_name='queue' AND column_name = ANY($1::text[])",
                 ["owner", "lease_expires_at", "body_ref"],
             )
         }
@@ -2194,13 +2357,10 @@ class PostgresStore:
         if "body_ref" not in present:
             await conn.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
         # The deref index, created AFTER body_ref is guaranteed present (like ix_queue_lease above).
-        await conn.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
+        await conn.execute(_BODY_REF_INDEX_DDL)
         # The reclaim sweep scans inflight rows by lease expiry (reclaim_expired_leases). Partial:
         # only inflight rows carry a lease, so the index needn't cover the pending/terminal majority.
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_queue_lease ON queue(lease_expires_at)"
-            " WHERE status='inflight'"
-        )
+        await conn.execute(_LEASE_INDEX_DDL)
         # FIFO covering-index rename (ADR 0060). ADR 0059 re-keyed the per-lane FIFO indexes to trail in
         # `seq` but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
         # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
@@ -2213,22 +2373,15 @@ class PostgresStore:
         # SERVER side, but asyncpg ALSO imposes a client cancel that a large first-upgrade rebuild would
         # trip → txn abort → startup crash-loop. Idempotent (IF NOT EXISTS / IF EXISTS); correctness-
         # neutral (the claim orders by seq and names no index, ADR 0059) — pure speed restoration.
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_queue_fifo_in_seq ON queue(stage, channel_id, status, seq)",
-            timeout=float("inf"),
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq"
-            " ON queue(stage, destination_name, status, seq)",
-            timeout=float("inf"),
-        )
+        await conn.execute(_FIFO_IN_SEQ_INDEX_DDL, timeout=float("inf"))
+        await conn.execute(_FIFO_OUT_SEQ_INDEX_DDL, timeout=float("inf"))
         await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
         await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
         await conn.execute(_RECEIVED_INDEX_DDL, timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='sessions' AND column_name='reauth_at'"
+            " WHERE table_schema = current_schema() AND table_name='sessions' AND column_name='reauth_at'"
         )
         if not sessions_has_reauth:
             await conn.execute("ALTER TABLE sessions ADD COLUMN reauth_at DOUBLE PRECISION")
@@ -2237,7 +2390,8 @@ class PostgresStore:
         users_cols = {
             r["column_name"]
             for r in await conn.fetch(
-                "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name='users'"
             )
         }
         # Federated (issuer, sub) identity keying (BACKLOG #1015): NULL on existing rows = "not yet
@@ -2298,7 +2452,7 @@ class PostgresStore:
             await conn.execute("UPDATE users SET notify_email = email WHERE email IS NOT NULL")
         sessions_has_mfa = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
+            " WHERE table_schema = current_schema() AND table_name='sessions' AND column_name='mfa_verified_at'"
         )
         if not sessions_has_mfa:
             await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
@@ -2306,7 +2460,7 @@ class PostgresStore:
         # above; pre-existing rows get NULL, which takes the non-federated step-up.
         sessions_has_mechanism = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='sessions' AND column_name='auth_mechanism'"
+            " WHERE table_schema = current_schema() AND table_name='sessions' AND column_name='auth_mechanism'"
         )
         if not sessions_has_mechanism:
             await conn.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
@@ -2317,7 +2471,7 @@ class PostgresStore:
             r["column_name"]
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
-                " WHERE table_name='response' AND column_name = ANY($1::text[])",
+                " WHERE table_schema = current_schema() AND table_name='response' AND column_name = ANY($1::text[])",
                 ["kind", "ack_code", "ack_phase", "resp_headers"],
             )
         }
@@ -2342,7 +2496,7 @@ class PostgresStore:
         # pre-existing DB. information_schema-gated like the others; NULL on existing rows = never pruned.
         messages_has_pruned = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='messages' AND column_name='documents_pruned'"
+            " WHERE table_schema = current_schema() AND table_name='messages' AND column_name='documents_pruned'"
         )
         if not messages_has_pruned:
             await conn.execute("ALTER TABLE messages ADD COLUMN documents_pruned DOUBLE PRECISION")
@@ -2350,7 +2504,7 @@ class PostgresStore:
         # gated like the others; NULL on existing built-in rows = resolves from code (byte-identical).
         roles_has_perms = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name='roles' AND column_name='permissions'"
+            " WHERE table_schema = current_schema() AND table_name='roles' AND column_name='permissions'"
         )
         if not roles_has_perms:
             await conn.execute("ALTER TABLE roles ADD COLUMN permissions TEXT")
@@ -5833,6 +5987,7 @@ class PostgresStore:
         if now is None:
             now = time.time()
         connection, kind, reason = ev["connection"], ev["kind"], ev["reason"]
+        check_connection_event_kind(kind)
         # Bound to (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
@@ -7127,7 +7282,7 @@ class PostgresStore:
         message_id: str,
         now: float | None = None,
         *,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
@@ -7220,7 +7375,7 @@ class PostgresStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[ResendOutcome] | None = None,
+        audit: OperatorAudit[ResendOutcome],
         actor: str | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
@@ -7429,7 +7584,7 @@ class PostgresStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
-        audit: OperatorAudit[ReingressOutcome] | None = None,
+        audit: OperatorAudit[ReingressOutcome],
         actor: str | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
@@ -7587,7 +7742,7 @@ class PostgresStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue dead-lettered **outbound** deliveries only (optionally scoped): set them back to
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
@@ -10474,6 +10629,36 @@ class PostgresStore:
         return int(
             await self._fetchval(_PG_COUNT_USER_SESSIONS_SQL, user_id, except_token_hash) or 0
         )
+
+    async def revoke_all_sessions(
+        self, *, except_token_hash: str | None = None, now: float | None = None
+    ) -> int:
+        """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
+        :meth:`AuthStore.revoke_all_sessions`.
+
+        Raises the session epoch of at most the accounts its read of the account list returns,
+        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
+        what it may miss."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
+                await self._bump_session_epoch(conn, str(row["id"]))
+            status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
+            if except_token_hash is not None:
+                owner = await conn.fetchval(
+                    "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
+                )
+                if owner is not None:
+                    epoch = await self._session_epoch(conn, str(owner))
+                    await self._write_session(
+                        conn, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                    )
+        return _rowcount(status)
+
+    async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
+        """Always ``None``: ``restore`` places only a SQLite store, and a Postgres database's
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        return None
 
     async def enforce_session_cap(
         self,

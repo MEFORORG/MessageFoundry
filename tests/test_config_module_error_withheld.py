@@ -1503,6 +1503,72 @@ def test_a_stop_in_the_loaders_read_off_the_main_thread_is_absorbed(
     assert left.__cause__ is None and left.__context__ is None
 
 
+_MODULE_EXITS = [
+    f"raise SystemExit({NEEDLE!r})\n",
+    f"class Quit(SystemExit):\n    pass\n\nraise Quit({NEEDLE!r})\n",
+    f"try:\n    raise ValueError({NEEDLE!r})\nexcept ValueError:\n    raise SystemExit(0)\n",
+    f"raise SystemExit(0) from ValueError({NEEDLE!r})\n",
+]
+_MODULE_EXIT_IDS = ["text", "subclass", "in-a-handler", "from-a-cause"]
+
+
+def _assert_refused_as_an_exit(err: BaseException | None) -> None:
+    assert isinstance(err, WiringError), repr(err)
+    assert "sys.exit()" in str(err) and NEEDLE not in str(err)
+    assert err.__cause__ is None and err.__context__ is None
+
+
+@pytest.mark.parametrize("body", _MODULE_EXITS, ids=_MODULE_EXIT_IDS)
+def test_a_module_exit_is_refused_with_nothing_of_the_module_on_it(
+    tmp_path: Path, body: str
+) -> None:
+    # The merge of the loader's exit refusal with its withholding: neither the text nor what the
+    # exit was raised from reaches the refusal, on either thread.
+    _write(tmp_path, "feed.py", body)
+    _assert_refused_as_an_exit(_load_error(tmp_path))
+    _assert_refused_as_an_exit(_load_on_a_worker(tmp_path))
+
+
+def test_a_class_answering_as_an_exit_is_judged_by_its_real_type(tmp_path: Path) -> None:
+    # `except SystemExit` matches the real type, and reading a __class__ would run the module's code.
+    body = f"class Liar(BaseException):\n    __class__ = SystemExit\n\nraise Liar({NEEDLE!r})\n"
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    assert "sys.exit()" not in str(err) and NEEDLE not in str(err)
+    assert "Liar" in str(err)
+
+
+def test_an_exit_in_the_read_of_a_helper_left_to_its_guard_is_refused(tmp_path: Path) -> None:
+    # That read sits behind no guard of its own, so the exit leaves through the module's run.
+    helper = (
+        "class Bad(ImportError):\n"
+        "    @property\n"
+        "    def name(self):\n"
+        "        raise SystemExit(0)\n\n"
+        f"raise Bad({NEEDLE!r})\n"
+    )
+    _write(tmp_path, "_optional.py", helper)
+    guarded = (
+        "def later():\n    try:\n        import _optional\n    except ImportError:\n        pass\n"
+    )
+    _write(tmp_path, "feed.py", guarded)
+    _assert_refused_as_an_exit(_load_error(tmp_path))
+
+
+@pytest.mark.parametrize("code", ["sys.exit(0)", f"sys.exit({NEEDLE!r})"], ids=["zero", "text"])
+@pytest.mark.parametrize("command", ["validate", "check"])
+def test_a_gate_refuses_a_module_that_exits(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, code: str
+) -> None:
+    _write(tmp_path, "feed.py", f"import sys\n\n{code}\n")
+    extra = ["--no-lint"] if command == "check" else []
+    assert main([command, "--config", str(tmp_path), *extra]) != 0
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "feed.py" in output and "sys.exit()" in output
+    assert NEEDLE not in output
+
+
 def test_the_frame_rule_holds_under_an_unnormalized_import_path() -> None:
     # A code object keeps the sys.path entry's spelling, so a normalized prefix would miss it.
     root = _ENGINE_DIR.parent

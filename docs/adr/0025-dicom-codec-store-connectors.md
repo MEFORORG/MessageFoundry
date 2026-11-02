@@ -564,6 +564,10 @@ dicomweb = ["dicomweb-client"]
 > unchanged. So is `pydicom>=3,<4` where it appears: that is pynetdicom's own requirement. The
 > comment above the `[dicom]` extra in [pyproject.toml](../../pyproject.toml) is the source of
 > record for the current range, the reason for each cap, and the steps to raise the pynetdicom one.
+>
+> **CORRECTED 2026-10-30:** `pynetdicom` is now pinned exactly, `pynetdicom==3.0.4` (vault BACKLOG
+> #2712), so a 3.0.x patch release is excluded too. The same pyproject.toml comment says why, and
+> the steps to move the pin.
 
 Follow DEP-1 ([CLAUDE.md](../../CLAUDE.md) §7, memory `depadd-relock-gotcha`). **Dep-vet CLEARED all three
 (coordinator, 2026-06-20)** with these locked outcomes: **`pydicom` = MIT AND BSD-3-Clause** (MIT code + vendored

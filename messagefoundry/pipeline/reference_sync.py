@@ -302,7 +302,7 @@ async def _load_database_source(
             settings.get("pool_max", 5), knob="pool_max", transport="DATABASE reference source"
         ),
         autocommit=True,
-        login_timeout=_login_timeout(settings, "DATABASE reference source", dialect="sqlserver"),
+        login_timeout=_login_timeout(settings, "DATABASE reference source"),
     )
     try:
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")

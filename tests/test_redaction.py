@@ -3551,3 +3551,25 @@ def test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed(
     the module docstring. ``raises`` keeps an unrelated error from passing as the expected failure.
     The day a change makes the shape worse, nothing here moves -- that is the cost of accepting it."""
     assert _FRAGMENT_IDENTIFIER not in bounded(_fragment_then_msh_past_the_window())
+
+
+def test_a_server_schema_refusal_keeps_its_first_difference_through_the_shortest_cut() -> None:
+    """BACKLOG #1720. ``safe_exc`` keeps 200 characters of a message and ``provision-schema`` 500, so
+    the remedy, which is the same every time, goes last, and so does the place, whose length is the
+    operator's. A long difference the compare writes for one of this build's indexes fits the
+    shortest cut. It lives here, not in the server-gated #1720 suite, so that suite imports no
+    module the ``serverdb`` path gate does not admit."""
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
+
+    first = (
+        "index 'ix_queue_fifo_in_seq' was never built: the name is taken by a partitioned table"
+        " (expected on queue(stage, channel_id, status, seq))"
+    )
+    exc = ServerSchemaMismatchError(
+        "sqlserver", "mf_test", [first, "table 'x' is missing column 'y'"]
+    )
+    assert first in safe_exc(exc, limit=200)
+    assert first in str(exc)[:200]
+    # Control: the earlier layout, remedy first, loses the difference at the same cut.
+    remedy_first = "x" * 446 + " Differences: " + first
+    assert first not in safe_exc(RuntimeError(remedy_first), limit=200)

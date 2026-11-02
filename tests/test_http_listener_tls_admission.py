@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.transports import http_listener as http_module
+from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from tests.test_mllp_tls import _close_raw, _closed_by_listener, _Events, _until
 from tests.test_tls_handshake_failures import _client_hello, _pinned_client, _plaintext_peer
 from tests.test_tls_handshake_failures import _http_tls_source as _tls_source
@@ -34,9 +35,9 @@ class _Intake:
     def __init__(self) -> None:
         self.received: list[bytes] = []
 
-    async def __call__(self, raw: bytes) -> str:
+    async def __call__(self, raw: bytes) -> IngressReceipt:
         self.received.append(raw)
-        return f"m{len(self.received)}"
+        return IngressReceipt.accepted(f"m{len(self.received)}")
 
 
 async def _https_post(port: int, cert: str, *, client_key: Path | None = None) -> int | None:
@@ -81,7 +82,7 @@ async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout
     events = _Events()
     source.on_connection_event = events
     intake = _Intake()
-    await source.start(intake)
+    await source.start(receipt_handler(intake))
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
@@ -104,7 +105,7 @@ async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout
     # The same listener, restarted with the real bound, still serves a real TLS client. Restarted
     # rather than reused so that client never races the 0.3 s bound set above.
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
-    await source.start(intake)
+    await source.start(receipt_handler(intake))
     try:
         assert await _https_post(source.sockport, cert) == 202
     finally:
@@ -127,7 +128,7 @@ async def test_an_unhandshaken_socket_spends_a_connection_slot(
     source, _cert_path = _tls_source(tmp_path, **caps)
     events = _Events()
     source.on_connection_event = events
-    await source.start(_Intake())
+    await source.start(receipt_handler(_Intake()))
     try:
         _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
         w2: asyncio.StreamWriter | None = None
@@ -162,7 +163,7 @@ async def test_a_peer_outside_the_allowlist_is_refused_before_any_tls_byte(
     source, _cert_path = _tls_source(tmp_path, source_ip_allowlist=["10.0.0.1"])
     events = _Events()
     source.on_connection_event = events
-    await source.start(_Intake())
+    await source.start(receipt_handler(_Intake()))
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
@@ -190,7 +191,7 @@ async def test_stop_closes_a_socket_still_in_its_handshake(
     at once. The bound is pinned far above the shutdown grace, so only stop() can close it."""
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, _cert_path = _tls_source(tmp_path)
-    await source.start(_Intake())
+    await source.start(receipt_handler(_Intake()))
     stopped = False
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
@@ -232,7 +233,7 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
         return ok
 
     monkeypatch.setattr(source, "_start_tls", finish_then_stop)
-    await source.start(intake)
+    await source.start(receipt_handler(intake))
     try:
         assert await _https_post(source.sockport, cert) is None  # closed with no response
         await _until(lambda: source._admission.active == 0, "the slot was not released")
@@ -252,7 +253,7 @@ async def test_a_listener_running_its_own_handshake_does_not_count_twice(tmp_pat
     source._tls_failures.watch(source._ssl)  # as a loop-run start() left it
     events = _Events()
     source.on_connection_event = events
-    await source.start(_Intake())
+    await source.start(receipt_handler(_Intake()))
     try:
         assert source._ssl.sslobject_class is ssl.SSLObject
         await _plaintext_peer(source.sockport)
@@ -285,7 +286,7 @@ async def test_mtls_subject_reads_the_certificate_after_either_handshake(
         intake_client_subjects={"CN=127.0.0.1": [subject]},
     )
     intake = _Intake()
-    await source.start(intake)
+    await source.start(receipt_handler(intake))
     try:
         assert source._upgrade_tls is (runner == "listener")
         assert await _https_post(source.sockport, cert, client_key=tmp_path / "k.pem") == status
@@ -306,7 +307,7 @@ def test_the_handshake_bound_on_uvloop(tmp_path: Path, monkeypatch: pytest.Monke
     async def scenario() -> None:
         source, cert = _tls_source(tmp_path)
         intake = _Intake()
-        await source.start(intake)
+        await source.start(receipt_handler(intake))
         try:
             assert source._upgrade_tls is False
             reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
@@ -318,7 +319,7 @@ def test_the_handshake_bound_on_uvloop(tmp_path: Path, monkeypatch: pytest.Monke
             await asyncio.wait_for(source.stop(), timeout=10.0)
         # Restored first, so the real client never races the shortened bound.
         monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
-        await source.start(intake)
+        await source.start(receipt_handler(intake))
         try:
             assert await _https_post(source.sockport, cert) == 202
         finally:

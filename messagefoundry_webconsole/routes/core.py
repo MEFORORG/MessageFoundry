@@ -850,6 +850,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui", response_class=HTMLResponse)
     async def ui_dashboard(
         request: Request,
+        m: str = Query("", max_length=32),
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
@@ -857,7 +858,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # BACKLOG #1152: the landing page is where a fresh operator forms the impression that RBAC
         # is broken, so it is where the unprovisioned state gets a sentence. Read off the identity,
         # never off `not rows` — an estate with no connections configured yet is a different empty.
-        return HTMLResponse(pages.dashboard(rows, unprovisioned=identity.has_no_channels))
+        return HTMLResponse(pages.dashboard(rows, unprovisioned=identity.has_no_channels, notice=m))
 
     @app.get("/ui/connections", response_class=HTMLResponse)
     async def ui_connections(
@@ -1233,7 +1234,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         assert_same_origin(request)
         # ADR 0150: the console mounts IN-PROCESS on the engine's own app, so this Request is the
         # BROWSER's — forwarding it attributes the row to the operator's host, not the engine.
-        await action(name, engine=engine, identity=identity, request=request)
+        try:
+            await action(name, engine=engine, identity=identity, request=request)
+        except HTTPException as exc:
+            # An escaping HTTPException renders as application/json inside the HTML console. A
+            # refused control keeps the redirect, with a notice (vault BACKLOG #3746).
+            code = pages.control_notice_code(
+                exc.status_code, restart=action is core.restart_connection
+            )
+            if code is None:
+                raise
+            return RedirectResponse(f"/ui?m={code}", status_code=303)
         return RedirectResponse("/ui", status_code=303)
 
     @app.post("/ui/connections/{name}/start")

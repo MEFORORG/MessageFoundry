@@ -185,6 +185,11 @@ class _SqlStore:
     async def _fetchone(self, sql: str, params: tuple[object, ...]) -> object:
         return await self._server.run(sql, str(params[1]) if len(params) > 1 else "")
 
+    async def _fetchone_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> object:
+        return await self._fetchone(sql, params)  # the claim; no driver timeout is modelled here
+
     async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
         node = str(params[1] if "leader_lease" in sql else params[-1])
         result = await self._server.run(sql, node)

@@ -32,7 +32,9 @@ class _RecordingSink:
     def connection_restored(self, name: str) -> None: ...
     def connection_started(self, name: str) -> None: ...
 
-    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+    def connection_error(
+        self, name: str, *, kind: str, detail: str | None = None, error_class: str | None = None
+    ) -> None:
         self.errors.append((name, kind, detail))
 
 

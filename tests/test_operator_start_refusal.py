@@ -126,6 +126,7 @@ async def test_a_gate_refused_operator_start_answers_409_and_is_audited(
             "action": action,
             "role": "source",
             "running": False,
+            "refused": True,
         }
         rr = engine.registry_runner
         assert rr is not None and not rr.inbound_running("IB_DOWN")

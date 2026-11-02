@@ -39,6 +39,7 @@ from messagefoundry.store.base import (
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import prove, reproving_transport
+from tests._store_audit import no_operator_audit
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # A transformed outbound body, distinct from the raw, so a test can prove resend ships the TRANSFORMED
@@ -88,7 +89,9 @@ async def _rows_to(store: MessageStore, mid: str, dest: str) -> list[dict[str, o
 async def test_resend_creates_pending_tail_row_on_origin(store: MessageStore) -> None:
     mid = await _seed(store)
     before = {r["id"] for r in await store.outbox_for(mid)}
-    outcome = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    outcome = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert outcome.status == "resent"
     assert outcome.to_destination == "OB2" and outcome.from_destination == "OB1"
 
@@ -119,7 +122,7 @@ async def test_resend_reopens_processed_to_routed(store: MessageStore) -> None:
     await _deliver_all(store, mid)
     msg = await store.get_message(mid)
     assert msg is not None and msg["status"] == MessageStatus.PROCESSED.value
-    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit)
     msg = await store.get_message(mid)
     assert msg is not None and msg["status"] == MessageStatus.ROUTED.value
     # and the finalizer re-drives it PROCESSED once the resend row delivers
@@ -134,8 +137,12 @@ async def test_resend_reopens_processed_to_routed(store: MessageStore) -> None:
 
 async def test_resend_same_key_is_duplicate_no_second_row(store: MessageStore) -> None:
     mid = await _seed(store)
-    first = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
-    second = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    first = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
+    second = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert first.status == "resent" and second.status == "duplicate"
     assert second.outbox_id == first.outbox_id  # reports the prior outcome
     assert len(await _rows_to(store, mid, "OB2")) == 1  # exactly ONE row, never a double-send
@@ -145,8 +152,12 @@ async def test_resend_new_key_is_a_genuine_second_resend(store: MessageStore) ->
     mid = await _seed(store)
     # source=OB1 pins the copy to the original delivery (after the first resend the message also has an
     # OB2 row, so an unqualified source would be genuinely ambiguous — the caller names it).
-    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", from_="OB1")
-    out2 = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k2", from_="OB1")
+    await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", from_="OB1", audit=no_operator_audit
+    )
+    out2 = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k2", from_="OB1", audit=no_operator_audit
+    )
     assert out2.status == "resent"
     assert len(await _rows_to(store, mid, "OB2")) == 2  # a new key IS a second resend
 
@@ -157,22 +168,30 @@ async def test_resend_key_reused_across_messages_is_a_conflict(store: MessageSto
     # report the unrelated first outcome) — it raises a conflict (the API maps it to 409).
     m1 = await _seed(store)
     m2 = await _seed(store)  # a distinct message (fresh uuid)
-    first = await store.resend_to(message_id=m1, to="OB2", idempotency_key="k1")
+    first = await store.resend_to(
+        message_id=m1, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert first.status == "resent"
     with pytest.raises(ResendKeyConflict):
-        await store.resend_to(message_id=m2, to="OB2", idempotency_key="k1")
+        await store.resend_to(
+            message_id=m2, to="OB2", idempotency_key="k1", audit=no_operator_audit
+        )
     assert await _rows_to(store, m2, "OB2") == []  # m2 was NOT silently dropped
 
 
 async def test_resend_key_reused_for_different_target_is_a_conflict(store: MessageStore) -> None:
     # Same key, same message, but a DIFFERENT alternate target -> conflict (not an idempotent no-op).
     mid = await _seed(store)
-    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit)
     with pytest.raises(ResendKeyConflict):
-        await store.resend_to(message_id=mid, to="OB3", idempotency_key="k1")
+        await store.resend_to(
+            message_id=mid, to="OB3", idempotency_key="k1", audit=no_operator_audit
+        )
     assert await _rows_to(store, mid, "OB3") == []
     # the genuine repeat (same message, same target, same key) is STILL an idempotent duplicate
-    dup = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    dup = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert dup.status == "duplicate" and len(await _rows_to(store, mid, "OB2")) == 1
 
 
@@ -186,7 +205,9 @@ async def test_resend_retention_nulled_source_is_rejected(store: MessageStore) -
     purged = await store.purge_message_bodies(older_than=9_999_999_999.0)
     assert purged == 1  # the delivered body is nulled in place
     with pytest.raises(ResendSourceEmpty):
-        await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+        await store.resend_to(
+            message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+        )
     # nothing was created and no partial mutation
     assert await _rows_to(store, mid, "OB2") == []
 
@@ -196,7 +217,9 @@ async def test_resend_no_delivered_body_is_not_found(store: MessageStore) -> Non
         channel_id="in1", raw=ADT, status=MessageStatus.ERROR, error="parse boom"
     )
     with pytest.raises(ResendSourceNotFound):
-        await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+        await store.resend_to(
+            message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+        )
 
 
 async def test_resend_from_a_dead_source_is_allowed(store: MessageStore) -> None:
@@ -209,7 +232,9 @@ async def test_resend_from_a_dead_source_is_allowed(store: MessageStore) -> None
     await store.mark_failed(str(src["id"]), "permanent AR", RetryPolicy(max_attempts=0))
     src_after = (await _rows_to(store, mid, "OB1"))[0]
     assert src_after["status"] == OutboxStatus.DEAD.value
-    out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    out = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+    )
     assert out.status == "resent" and out.from_destination == "OB1"
     payloads = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(mid)}
     assert (
@@ -221,9 +246,13 @@ async def test_resend_ambiguous_source_requires_from(store: MessageStore) -> Non
     b1, b3 = TRANSFORMED, TRANSFORMED.replace("sent", "other")
     mid = await _seed(store, deliveries=[("OB1", b1), ("OB3", b3)])
     with pytest.raises(ResendSourceAmbiguous):
-        await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+        await store.resend_to(
+            message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit
+        )
     # naming the source resolves it, and ships THAT source's body
-    out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k2", from_="OB3")
+    out = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k2", from_="OB3", audit=no_operator_audit
+    )
     assert out.status == "resent" and out.from_destination == "OB3"
     payloads = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(mid)}
     assert payloads["OB2"] == b3
@@ -242,7 +271,9 @@ async def test_resend_derefs_a_shared_body(store: MessageStore) -> None:
         src = await cur.fetchone()
         assert src is not None
     assert src["body_ref"] is not None and src["payload"] not in ("", TRANSFORMED)
-    out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", from_="OB1")
+    out = await store.resend_to(
+        message_id=mid, to="OB2", idempotency_key="k1", from_="OB1", audit=no_operator_audit
+    )
     assert out.status == "resent"
     payloads = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(mid)}
     assert payloads["OB2"] == TRANSFORMED  # non-empty, deref'd body
@@ -250,7 +281,7 @@ async def test_resend_derefs_a_shared_body(store: MessageStore) -> None:
 
 async def test_resend_event_carries_no_body(store: MessageStore) -> None:
     mid = await _seed(store)
-    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", audit=no_operator_audit)
     details = [str(e["detail"] or "") for e in await store.events_for(mid)]
     assert any("resend OB1->OB2" in d for d in details)  # the resent event exists
     # never the body: no HL7 segment marker from the transformed payload leaks into an event detail

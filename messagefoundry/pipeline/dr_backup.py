@@ -56,13 +56,13 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.last_resort import run_guarded
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import Store
@@ -322,6 +322,45 @@ class RestoreResult:
     key_id: str | None
     config_dir: str | None
     config_files: int
+    #: BACKLOG #2614: the SHA-256 of the archive bytes this restore read, the archive's own
+    #: ``created_utc`` as epoch seconds, and the newest audit row it held; each time ``None`` when
+    #: the archive did not say. The restore writes them into the store's restore marker.
+    archive_sha256: str
+    archive_created_at: float | None = None
+    last_audit_at: float | None = None
+    #: How many open sessions the restore ended in the store it placed (BACKLOG #2614).
+    sessions_revoked: int = 0
+
+
+class _HashingReader:
+    """A read-only view of ``raw`` that hashes every byte it hands out (BACKLOG #2614). The restore
+    reads the archive through it, so the hash it records is of the bytes it decrypted, not of a
+    second read that a replaced file could answer differently."""
+
+    def __init__(self, raw: io.BufferedReader) -> None:
+        import hashlib
+
+        self._raw = raw
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self.digest.update(data)
+        return data
+
+
+def _manifest_time(manifest: dict[str, object]) -> float | None:
+    """The archive's ``created_utc`` as epoch seconds, or ``None`` when it is absent or not the
+    ``YYYY-MM-DDTHH:MM:SSZ`` the backup writes (BACKLOG #2614)."""
+    import calendar
+
+    value = manifest.get("created_utc")
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return None
 
 
 class BackupRunner:
@@ -2826,6 +2865,11 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+#: sqlite3's own default. Nothing else writes a snapshot these checks open, the backup's own or an
+#: extracted one, so it never waits.
+_SNAPSHOT_BUSY_TIMEOUT = 5.0
+
+
 def _count_tables(db_path: Path) -> dict[str, int]:
     """Row counts for EVERY table in ``db_path``'s own schema, via a plain read-only sqlite3
     connection (no engine store). The table set is DERIVED from ``sqlite_master`` at count time
@@ -2851,10 +2895,11 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
     ``sqlite_%`` names are excluded: they are sqlite's own bookkeeping (e.g. ``sqlite_sequence`` for
     an ``AUTOINCREMENT`` column), not store data, and are not guaranteed to exist at all until some
-    other operation (a first autoincrement insert, an ``ANALYZE``) creates them."""
-    import sqlite3
+    other operation (a first autoincrement insert, an ``ANALYZE``) creates them.
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    Opened through :func:`connect_readonly`, so a ``#`` or ``?`` in the staging path cannot cut the
+    URI and count an empty stand-in (BACKLOG #2186)."""
+    conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         names = sorted(
             r[0]
@@ -2876,10 +2921,9 @@ def _count_tables(db_path: Path) -> dict[str, int]:
 
 
 def _integrity_check(db_path: Path) -> tuple[bool, str]:
-    """``PRAGMA integrity_check`` on a snapshot via a plain read-only sqlite3 connection."""
-    import sqlite3
-
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    """``PRAGMA integrity_check`` on a snapshot, opened through :func:`connect_readonly`, so a ``#``
+    or ``?`` in the staging path cannot cut the URI and check an empty stand-in (BACKLOG #2186)."""
+    conn = connect_readonly(db_path, busy_timeout=_SNAPSHOT_BUSY_TIMEOUT)
     try:
         results = [str(r[0]) for r in conn.execute("PRAGMA integrity_check")]
     finally:
@@ -3016,10 +3060,6 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
-#: sqlite3's own default. Nothing else writes the extracted snapshot, so it never waits.
-_SNAPSHOT_BUSY_TIMEOUT = 5.0
-
-
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> tuple[str, str, int]:
@@ -3048,8 +3088,6 @@ def _decrypt_check(
     store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
     this pass reads anything.
     """
-    import sqlite3
-
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
     first_blob: str | None = None
@@ -3284,6 +3322,67 @@ _DECRYPT_REFUSAL = (
 )
 
 
+#: What a restore undoes, said once for the refusal and the CLI summary (BACKLOG #2614).
+REAPPLY_NOTICE = (
+    "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
+    "delete, role change and reset made after its newest audit row must be re-applied by hand."
+)
+
+
+def restored_accounts_notice(sessions_revoked: int) -> str:
+    """The CLI summary's whole notice: what to re-apply, and what the restore already did. Worded
+    from the count the restore's own revoke returned, so it never claims more than it ended."""
+    return (
+        f"{REAPPLY_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
+        "placed, and the first engine start on this store ends every session again and records "
+        "the restore."
+    )
+
+
+#: How far ahead of this host's clock an archive's date may be before it counts as undated: a
+#: backup host whose clock leads by a little is ordinary, one a day ahead is not (BACKLOG #2614).
+_ARCHIVE_CLOCK_SKEW_SECONDS = 3600.0
+
+
+def _refuse_an_old_archive(
+    *,
+    archive_created_at: float | None,
+    last_audit_at: float | None,
+    max_age_seconds: float,
+    now: float,
+) -> None:
+    """Refuse an archive taken more than ``max_age_seconds`` before ``now``, or one that does not
+    say when it was taken (BACKLOG #2614). A restore undoes every account change made after the
+    archive, so the older it is the more an operator must re-apply, and the refusal names the
+    time after which that is so. The caller words how to override it; the CLI's
+    ``--allow-old-archive`` skips this check."""
+    newest = utc_or_unknown(last_audit_at)
+    kind = "age"
+    if archive_created_at is None:
+        taken = "the archive does not say when it was taken"
+        kind = "age_undated"
+    elif archive_created_at > now + _ARCHIVE_CLOCK_SKEW_SECONDS:
+        # A date in the future says the backup host's clock was wrong, so the age is not known.
+        taken = (
+            f"the archive says it was taken {utc_or_unknown(archive_created_at)}, after now, so "
+            "its age is not known"
+        )
+        kind = "age_undated"
+    else:
+        age = now - archive_created_at
+        if age <= max_age_seconds:
+            return
+        taken = (
+            f"the archive was taken {utc_or_unknown(archive_created_at)}, "
+            f"{age / 86400:.1f} days ago, past the {max_age_seconds / 86400:g}-day limit"
+        )
+    raise BackupError(
+        kind,
+        f"{taken}. Its newest audit row is {newest}. A restore of it would bring the accounts back "
+        f"as they were then. {REAPPLY_NOTICE} Nothing was written.",
+    )
+
+
 def _codec_refusal(exc: BackupCodecError) -> BackupError:
     """Translate a ``.mfbak`` codec failure into the restore path's refusal — the single seam, so both
     the header read and the decrypt word it once and order the arms once.
@@ -3305,9 +3404,14 @@ async def run_restore(
     dest_store_path: str | Path,
     store_settings: object,
     config_dest: str | Path | None = None,
+    max_age_seconds: float | None = None,
 ) -> RestoreResult:
     """Restore a ``.mfbak`` archive's store member to ``dest_store_path`` (ADR 0049's missing half; the
     primitive ADR 0048's cold seed consumes).
+
+    ``max_age_seconds`` refuses an archive taken longer ago than that, or one whose manifest does
+    not say when, before anything is written (BACKLOG #2614). ``None`` checks no age: the
+    ``restore`` CLI passes its limit unless the operator gave ``--allow-old-archive``.
 
     Resolves the store's decrypt-capable keyring exactly as :func:`run_restore_verify` does (active +
     retired, AC-5 "incl. retired keys"), then decrypts the archive ONCE and verifies the extracted
@@ -3342,6 +3446,7 @@ async def run_restore(
         dest_store_path=Path(dest_store_path),
         config_dest=Path(config_dest) if config_dest is not None else None,
         keys=keys,
+        max_age_seconds=max_age_seconds,
     )
 
 
@@ -3351,10 +3456,13 @@ def _restore_blocking(
     dest_store_path: Path,
     config_dest: Path | None,
     keys: list[bytes],
+    max_age_seconds: float | None,
 ) -> RestoreResult:
     """The off-loop half of :func:`run_restore`: refuse -> decrypt -> extract -> verify -> place. Raises
     :class:`BackupError` with the failing ``kind`` (``archive``/``destination``/``verify``/``restore``,
-    and ``cleanup`` for the one failure that follows a whole restore -- see below).
+    ``age`` for an archive past ``max_age_seconds`` and ``age_undated`` for one whose age is not
+    known (BACKLOG #2614), and ``cleanup`` for the one
+    failure that follows a whole restore -- see below).
 
     It runs the verify's checks itself rather than calling :func:`_verify_archive_blocking` first, for
     two reasons. A .mfbak archive is the size of the store, so a verify pass followed by a restore pass
@@ -3380,7 +3488,12 @@ def _restore_blocking(
     store and bundle intact."""
     import sqlite3
 
-    from messagefoundry.store.store import _secure_file, forget_store_salt
+    from messagefoundry.store.store import (
+        _secure_file,
+        forget_store_salt,
+        newest_audit_time,
+        write_restore_marker,
+    )
 
     if not Path(archive_path).is_file():
         raise BackupError("archive", f"no archive at {archive_path}")
@@ -3456,7 +3569,8 @@ def _restore_blocking(
         ) as tmp:
             staging = Path(tmp)
             tar_path = staging / "archive.tar"
-            with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as dst:
+                src = _HashingReader(raw_src)
                 _secure_file(tar_path)
                 if match_key is not None:
                     # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome
@@ -3473,7 +3587,10 @@ def _restore_blocking(
                     # _MAX_RESTORE_PLAINTEXT_BYTES.
                     try:
                         decrypt_stream(
-                            src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
+                            cast(BinaryIO, src),
+                            dst,
+                            match_key,
+                            max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES,
                         )
                     except BackupCodecError as exc:
                         raise _codec_refusal(exc) from exc
@@ -3538,6 +3655,20 @@ def _restore_blocking(
                 raise BackupError("restore", f"archive has no {_STORE_MEMBER} member to restore")
 
             row_counts = _verify_extracted_store(snap, manifest)
+            # BACKLOG #2614: when the archive was taken, and its newest audit row, read from the
+            # checked bytes. Both feed the age refusal, the restore marker and the summary.
+            archive_created_at = _manifest_time(manifest)
+            try:
+                last_audit_at = newest_audit_time(snap)
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
+            if max_age_seconds is not None:
+                _refuse_an_old_archive(
+                    archive_created_at=archive_created_at,
+                    last_audit_at=last_audit_at,
+                    max_age_seconds=max_age_seconds,
+                    now=time.time(),
+                )
             # ADR 0196 (C+): the restored store must not seal a single value under the archive's data
             # sub-key. That key's persisted count is the archive's, which may trail the key's real use
             # -- the primary kept sealing after the backup, and the ADR 0048 cold seed can run beside
@@ -3551,6 +3682,23 @@ def _restore_blocking(
             if dropped and "store_salt" in row_counts:
                 # The counts were taken to check the archive; the summary reports the placed store.
                 row_counts = {**row_counts, "store_salt": 0}
+            # BACKLOG #2614: the archive's accounts, password hashes, roles, factors and sessions
+            # come back as they were. Mark the store so its first engine start ends every session
+            # and records the restore (`MessageStore.consume_restore_record`). Written after the
+            # checks, like the salt drop, so the bytes checked are the archive's; the marker is
+            # this restore's own row.
+            archive_sha256 = src.digest.hexdigest()
+            try:
+                sessions_revoked = write_restore_marker(
+                    snap,
+                    archive_sha256=archive_sha256,
+                    archive_created_at=archive_created_at,
+                    last_audit_at=last_audit_at,
+                    restored_at=time.time(),
+                )
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
+            row_counts = {**row_counts, "restore_marker": 1}
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -3608,6 +3756,10 @@ def _restore_blocking(
         key_id=key_id,
         config_dir=str(config_dest) if config_dest is not None else None,
         config_files=config_files,
+        archive_sha256=archive_sha256,
+        archive_created_at=archive_created_at,
+        last_audit_at=last_audit_at,
+        sessions_revoked=sessions_revoked,
     )
 
 
