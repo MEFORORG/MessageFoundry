@@ -155,4 +155,11 @@ def test_the_poll_test_admits_mysql_scalar_insert_on_the_generic_dialect_only() 
         DatabasePoll(server="sql.example.com", database="MFDB", poll_statement=poll)
     with pytest.raises(ValueError, match="found a 'INSERT' keyword"):
         _build_raw(poll)
+    generic = _build_raw(
+        poll,
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.0 Unicode Driver",
+        odbc_params={"SSLMODE": "VERIFY_IDENTITY"},
+    )
+    assert isinstance(generic, DatabaseSource)
     assert database._read_only_poll_refusal(poll, dialect="generic") is None

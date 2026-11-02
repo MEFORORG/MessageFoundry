@@ -481,6 +481,8 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
         # Numeric literals of every T-SQL shape, none of them glued to a word.
         "SELECT 0x1F AS b, 0x AS e, 1e5 AS f, 1.5E-3 AS g, 12. AS h, $12.50 AS m FROM t",
         "SELECT TOP 10 x$1 FROM t WHERE n IN (1,2,3)",
+        # A T-SQL name may put a digit straight after its sigil; it is one name, not a glued number.
+        "SELECT * FROM #1tmp JOIN ##2g ON 1=1 WHERE @1x = 1",
         # Comments are skipped wherever they sit, and T-SQL block comments nest.
         "SELECT 1; -- trailing note",
         "SELECT /* nested /* deep */ still */ 1",
@@ -528,9 +530,9 @@ _GLUED_LITERAL_BYPASSES = [
 def test_function_form_exemption_needs_the_paren_right_after_the_keyword(
     stmt: str, dialect: str
 ) -> None:
-    """Red mutation: compare the next token's kind and text only, not its position, and the quoted and
-    commented shapes pass on the generic dialect."""
-    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+    """Red mutation: test the next surviving token instead of the next raw character, and the quoted
+    and commented shapes pass on the generic dialect."""
+    with pytest.raises(DbLookupError, match="found a '(INSERT|TRUNCATE)' keyword"):
         database._require_read_only(stmt, dialect=dialect)
 
 

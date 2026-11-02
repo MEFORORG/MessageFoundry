@@ -1514,8 +1514,10 @@ def _build_connection(
 
 
 # One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
-# `#delete` reads as one identifier rather than as the `DELETE` keyword.
-_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
+# `#delete` reads as one identifier rather than as the `DELETE` keyword. After a sigil a digit may come
+# first (`#1tmp`, `@1x`), as T-SQL's identifier rules allow, so such a name is one word too and its
+# digit never reaches the number scan below.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*|[@#]{1,2}[0-9][A-Za-z0-9_$#@]*")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
@@ -1543,9 +1545,14 @@ _SQL_WRITE_KEYWORDS = frozenset(
 # Keywords that are also ordinary scalar FUNCTIONS in a dialect the generic ODBC path can reach, so a
 # `(` IMMEDIATELY after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)`
 # and `TRUNCATE(n,d)`, and by default MySQL wants no space between a built-in's name and its `(`.
-# SQL Server has neither function, so the exemption is the generic dialect's only. "Immediately" is
-# the raw text, not the next surviving token: a quoted identifier or a comment between the keyword
-# and the `(` is dropped by the scan, and `INSERT [patients](mrn) VALUES (1)` must not read as a call.
+# Only `dialect='generic'` gets the exemption; the SQL Server preset, which has neither function,
+# never does. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
+# Server driver), so the exemption there rests on this premise, read from the documented T-SQL
+# grammar and not run against a server: no T-SQL statement puts a `(` straight after `INSERT` or
+# `TRUNCATE`. `INSERT` takes `TOP (n)`, `INTO` or a target name first, and `TRUNCATE` takes `TABLE`.
+# "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
+# between the keyword and the `(` is dropped by the scan, and `INSERT [patients](mrn) VALUES (1)`
+# must not read as a call.
 # `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL, the exact shape
 # this gate exists to refuse.
 _SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
@@ -1555,17 +1562,17 @@ _SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
 # it at the first character that cannot continue it and needs no space before the next token, so
 # `SELECT 1e1INTO copy` is `1e1` then `INTO`. :func:`_scan_sql_tokens` refuses any literal glued to a
 # word character, wherever this pattern's boundary falls, so the gate does not rest on matching a
-# lexer it cannot run.
+# lexer it cannot run. "A word character" there is any Unicode letter or digit or one of `_$#@`, a
+# superset of what `_SQL_WORD_RE` continues a word with, so widening that pattern cannot open a gap.
 _SQL_NUMBER_RE = re.compile(r"0[xX][0-9A-Fa-f]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
 
 
 class _SqlToken(NamedTuple):
     """One token of :func:`_scan_sql_tokens`: ``kind`` is ``"word"`` (text upper-cased), ``"number"``
-    or ``"other"`` (one character, ``;`` included); ``start``/``end`` index the raw statement."""
+    or ``"other"`` (one character, ``;`` included); ``end`` indexes the raw statement just past it."""
 
     kind: str
     text: str
-    start: int
     end: int
 
 
@@ -1588,8 +1595,10 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
     cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a numeric
     literal with a word character glued to its end (:data:`_SQL_NUMBER_RE`): SQL Server reads
-    ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``, and no legitimate
-    read needs that spelling. ``subject`` names whose statement it is in that refusal."""
+    ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``. That refusal
+    also catches valid reads, at least an Oracle ``1.5f``, a MySQL name that starts with a digit
+    (``2024_orders``), a MySQL ``0b101`` and a ``:1st`` placeholder; it fails closed on purpose.
+    ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
     tokens: list[_SqlToken] = []
     i, n = 0, len(statement)
@@ -1628,20 +1637,20 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
                     break
                 i += 1
             continue
-        num = _SQL_NUMBER_RE.match(statement, i)
+        num = _SQL_NUMBER_RE.match(statement, i) if "0" <= ch <= "9" else None
         if num:
             end = num.end()
             if end < n and (statement[end].isalnum() or statement[end] in "_$#@"):
                 raise DbLookupError(f"{refusal}; a number runs into a word")
-            tokens.append(_SqlToken("number", num.group(0), i, end))
+            tokens.append(_SqlToken("number", num.group(0), end))
             i = end
             continue
         m = _SQL_WORD_RE.match(statement, i)
         if m:
-            tokens.append(_SqlToken("word", m.group(0).upper(), i, m.end()))
+            tokens.append(_SqlToken("word", m.group(0).upper(), m.end()))
             i = m.end()
             continue
-        tokens.append(_SqlToken("other", ch, i, i + 1))
+        tokens.append(_SqlToken("other", ch, i + 1))
         i += 1
     return tokens
 
@@ -1682,11 +1691,11 @@ def _require_read_only(
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
     tokens = _scan_sql_tokens(statement, subject=subject)
-    if not tokens or tokens[0][:2] not in (("word", "SELECT"), ("word", "WITH")):
+    if not tokens or tokens[0].kind != "word" or tokens[0].text not in ("SELECT", "WITH"):
         raise DbLookupError(refusal)
     function_forms = dialect == "generic"
     last = len(tokens) - 1
-    for index, (kind, text, _start, end) in enumerate(tokens):
+    for index, (kind, text, end) in enumerate(tokens):
         if kind != "word":
             # A ';' is tolerated only as the final token (a statement terminator); anything after one
             # is a second statement, whatever that statement starts with.
@@ -1698,8 +1707,7 @@ def _require_read_only(
         if (
             function_forms
             and text in _SQL_FUNCTION_FORM_KEYWORDS
-            and index != last
-            and tokens[index + 1] == ("other", "(", end, end + 1)
+            and statement.startswith("(", end)
         ):
             continue  # a scalar function call that shares the keyword's name, not a statement
         raise DbLookupError(f"{refusal}; found a '{text}' keyword")
@@ -2952,7 +2960,9 @@ def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> st
     the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
-    ``poll_max_rows`` is; its docstring says what it refuses. A locking ``FOR UPDATE`` read is refused
+    ``poll_max_rows`` is; its docstring says what it refuses. ``dialect`` is the poll's own, so a
+    ``generic`` poll admits MySQL's scalar ``INSERT(...)``/``TRUNCATE(...)``, which ``db_lookup``,
+    always on the SQL Server preset, refuses. A locking ``FOR UPDATE`` read is refused
     with the rest (``UPDATE`` is a keyword), and on this autocommit connection its lock ends with the
     statement, so refusing it loses nothing. **It reads the statement's shape only**, so at least a
     ``SELECT`` that calls a function which writes, and a T-SQL second statement with no ``;`` whose
