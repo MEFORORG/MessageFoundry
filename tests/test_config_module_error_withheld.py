@@ -14,6 +14,7 @@ Every planted string is assembled at run time, so no committed literal looks lik
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import signal
@@ -1383,14 +1384,27 @@ def sigint_raises() -> Iterator[None]:
         "import asyncio\nimport signal\n\n\nasync def main():\n"
         "    signal.raise_signal(signal.SIGINT)\n    await asyncio.sleep(30)\n\n\n"
         "asyncio.run(main())\n",
+        # The second raises in asyncio's handler, and the run puts Python's back as it leaves. Sent
+        # in a loop for the reason test_a_real_interrupt_inside_a_handler_stops_the_load gives.
+        "import asyncio\nimport signal\n\n\nasync def main():\n"
+        "    while True:\n        signal.raise_signal(signal.SIGINT)\n\n\n"
+        "asyncio.run(main())\n",
     ],
-    ids=["handler-called", "with-text", "from", "in-handler", "with-note", "asyncio-run"],
+    ids=[
+        "handler-called",
+        "with-text",
+        "from",
+        "in-handler",
+        "with-note",
+        "asyncio-run",
+        "asyncio-run-second-ctrl-c",
+    ],
 )
 @pytest.mark.usefixtures("sigint_raises")
 def test_an_interrupt_no_frame_can_tell_from_a_signal_stops_the_load(
     tmp_path: Path, body: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # None of these stops on a `raise` statement, so each looks as a real signal does.
+    # None of these stops on a `raise` statement in a config file, so each looks as a signal does.
     _write(tmp_path, "feed.py", body)
     _assert_the_load_stops(tmp_path, caplog)
 
@@ -1423,6 +1437,28 @@ def test_an_interrupt_with_another_handler_in_force_is_a_refused_module(
     _write(tmp_path, "feed.py", _thrown(f"KeyboardInterrupt({NEEDLE!r})"))
     signal.signal(signal.SIGINT, lambda _signum, _frame: None)
     assert "KeyboardInterrupt at line 1" in str(_refusal_with_no_stop(tmp_path, caplog))
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_handler_raising_one_is_a_refused_module_while_it_is_in_force(tmp_path: Path) -> None:
+    # A runner around the load holds SIGINT, so its handler is still in force at the read. The first
+    # signal only cancels the runner's task, which is why the runner raises one of its own at the end.
+    # Sent in a loop for the reason test_a_real_interrupt_inside_a_handler_stops_the_load gives.
+    _write(
+        tmp_path,
+        "feed.py",
+        "import signal\n\nwhile True:\n    signal.raise_signal(signal.SIGINT)\n",
+    )
+    _write(tmp_path, "later.py", "raise ValueError\n")
+    messages: list[str] = []
+
+    async def validate() -> None:
+        messages.extend(_messages(tmp_path))
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(validate())
+    (refused, later) = messages
+    assert "KeyboardInterrupt at line 4" in refused and "later.py" in later
 
 
 @pytest.mark.usefixtures("sigint_raises")
@@ -1634,13 +1670,14 @@ def test_no_exit_leaves_the_loaders_read(
 
 def _assert_a_gate_refuses_feed(
     d: Path, capsys: pytest.CaptureFixture[str], command: str, expected: str
-) -> None:
+) -> str:
     # The file and the refusal, because an empty graph alone also exits non-zero.
     extra = ["--no-lint"] if command == "check" else []
     assert main([command, "--config", str(d), *extra]) != 0
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert "feed.py" in output and expected in output
+    return output
 
 
 @pytest.mark.parametrize("command", ["validate", "check"])
@@ -1652,6 +1689,124 @@ def test_a_gate_refuses_a_module_whose_read_exits_zero(
 ) -> None:
     fails_in_the_read("raise SystemExit(0)")
     _assert_a_gate_refuses_feed(tmp_path, capsys, command, "withheld")
+
+
+#: A log handler a module added: the loader's WARNING about a read that faulted runs its ``emit``.
+_LOG_HANDLER = (
+    "import logging\nimport pathlib\n\n"
+    "class Faults(logging.Handler):\n"
+    "    def emit(self, record):\n"
+    "        pathlib.Path(__file__).with_name('emitted.txt').touch()\n"
+    "        {raises}\n\n"
+    "logging.getLogger('messagefoundry.config.wiring').addHandler(Faults())\n\n"
+)
+
+
+@pytest.fixture
+def faults_in_the_warning(
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path]
+) -> Iterator[Callable[[str], None]]:
+    """Writes a module whose read faults, with a log handler that runs ``raises`` in the WARNING."""
+
+    def write(raises: str) -> None:
+        path = fails_in_the_read("raise ValueError('the read')")
+        body = path.read_text(encoding="utf-8")
+        path.write_text(_LOG_HANDLER.format(raises=raises) + body, encoding="utf-8")
+
+    logger = logging.getLogger("messagefoundry.config.wiring")
+    held = list(logger.handlers)
+    yield write
+    logger.handlers[:] = held
+    # The control: with no WARNING reaching the handler, every assertion here would pass unfixed.
+    assert (tmp_path / "emitted.txt").exists()
+
+
+@pytest.mark.parametrize("raises", ["raise SystemExit(0)", f"raise ValueError({NEEDLE!r})"])
+@pytest.mark.parametrize("command", ["validate", "check"])
+def test_a_gate_refuses_a_module_whose_log_handler_faults_in_the_read(
+    tmp_path: Path,
+    faults_in_the_warning: Callable[[str], None],
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    raises: str,
+) -> None:
+    # Left to leave, SystemExit(0) would end `validate` or `check` with exit 0 and no output.
+    faults_in_the_warning(raises)
+    assert NEEDLE not in _assert_a_gate_refuses_feed(tmp_path, capsys, command, "withheld")
+
+
+@pytest.mark.parametrize(
+    "raises",
+    [
+        "raise SystemExit(0)",
+        _thrown(f"KeyboardInterrupt({NEEDLE!r})"),
+        f"raise KeyboardInterrupt({NEEDLE!r})",
+        f"raise ValueError({NEEDLE!r})",
+    ],
+    ids=["exit", "thrown-interrupt", "raised-interrupt", "exception"],
+)
+@pytest.mark.usefixtures("sigint_raises")
+def test_no_fault_of_a_log_handler_leaves_a_workers_load(
+    tmp_path: Path, faults_in_the_warning: Callable[[str], None], raises: str
+) -> None:
+    faults_in_the_warning(raises)
+    left = _load_on_a_worker(tmp_path)
+    assert isinstance(left, WiringError), repr(left)
+    assert NEEDLE not in str(left) and "withheld" in str(left)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_in_a_log_handler_is_judged_as_ctrl_c(
+    tmp_path: Path, faults_in_the_warning: Callable[[str], None]
+) -> None:
+    # A real Ctrl-C can land in the WARNING too, so absorbing all of them would lose one. Not through
+    # _assert_the_load_stops: the handler runs in the stop's own line too, and that line is suppressed.
+    faults_in_the_warning(_thrown(f"KeyboardInterrupt({NEEDLE!r})"))
+    with pytest.raises(KeyboardInterrupt) as ei:
+        load_config(tmp_path)
+    _assert_bare(ei.value)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_real_interrupt_at_the_judgement_of_a_log_handlers_fault_chains_nothing(
+    tmp_path: Path,
+    faults_in_the_warning: Callable[[str], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Python checks for a signal on entering a call, which is ahead of _is_a_signal's own guard.
+    judge = wiring._is_a_signal
+
+    def interrupted(exc: BaseException, path: Path) -> bool:
+        if NEEDLE in str(exc):
+            raise KeyboardInterrupt
+        return judge(exc, path)
+
+    monkeypatch.setattr(wiring, "_is_a_signal", interrupted)
+    faults_in_the_warning(f"raise ValueError({NEEDLE!r})")
+    with pytest.raises(KeyboardInterrupt) as ei:
+        load_config(tmp_path)
+    _assert_bare(ei.value)
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_a_raise_of_an_interrupt_in_a_log_handler_is_a_refused_module(
+    tmp_path: Path,
+    faults_in_the_warning: Callable[[str], None],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    faults_in_the_warning(f"raise KeyboardInterrupt({NEEDLE!r})")
+    assert "withheld" in str(_refusal_with_no_stop(tmp_path, caplog))
+
+
+@pytest.mark.usefixtures("sigint_raises")
+def test_an_interrupt_in_a_log_handler_under_another_handler_is_a_refused_module(
+    tmp_path: Path,
+    faults_in_the_warning: Callable[[str], None],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    faults_in_the_warning(_thrown(f"KeyboardInterrupt({NEEDLE!r})"))
+    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    assert "withheld" in str(_refusal_with_no_stop(tmp_path, caplog))
 
 
 @pytest.mark.parametrize(

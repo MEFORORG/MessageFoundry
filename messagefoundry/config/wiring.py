@@ -9671,8 +9671,8 @@ def _module_failure(
 
     Reading ``exc`` can run its own code, and a fault there leaves the type alone, which is still a
     withheld diagnostic: :func:`_read_fault` says what happens to one. The module is refused, which
-    ends a load, and a ``validate`` run goes on to its next module, unless :func:`_is_a_signal`
-    passes the fault, which ends either. Call this outside any handler of ``exc``, so an interrupt
+    ends a load, and a ``validate`` run goes on to its next module, unless :func:`_read_fault`
+    stops the load, which ends either. Call this outside any handler of ``exc``, so an interrupt
     leaving through here does not carry ``exc`` as its context."""
     fault: BaseException | None = None
     try:
@@ -9693,15 +9693,17 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
 
     Under any handler but Python's own it is treated as code too, whether or not a signal raised it.
     uvicorn holds SIGINT for the whole lifespan, where ``serve`` loads its graph, and a Ctrl-C there
-    only sets a flag on the server. A handler can also raise one itself, as asyncio's does at a second
-    Ctrl-C: that module is refused, which ends a load, and ``validate`` goes on to its next module.
+    only sets a flag on the server. A handler can also raise one itself: while it is in force at this
+    read, that module is refused, which ends a load, and ``validate`` goes on to its next module.
+    asyncio's does at a second Ctrl-C, but that is refused only under a runner around the load: a
+    module's own ``asyncio.run`` has put Python's handler back by now, so that one stops the load.
 
     Under Python's own handler, one that stopped on a ``raise`` statement in a config file is code,
     because a signal does not stop on a ``raise``. Only a config file: ``asyncio.run`` raises one
-    for a real Ctrl-C, after it puts that handler back. A frame goes no further. At least a module
-    calling ``signal.default_int_handler()`` or throwing one into a generator stops as a real signal
-    does, and the handler in force is read here, after the module ran, so a module can have put
-    Python's back. What passes this can still be code, so :func:`_exec_module` logs the module.
+    for a real Ctrl-C, and puts that handler back as it leaves. A frame goes no further. At least a
+    module calling ``signal.default_int_handler()`` or throwing one into a generator stops as a real
+    signal does, and the handler in force is read here, after the module ran, so a module can have
+    put Python's back. What passes this can still be code, so :func:`_exec_module` logs the module.
 
     These reads can run a module's code: ``getsignal`` reads a handler's ``__class__``, and a
     traceback entry can be built by hand. This runs outside the loader's other guards, so what such
@@ -9731,14 +9733,25 @@ def _read_fault(path: Path, fault: BaseException) -> None:
     by the rule :func:`_run_author_code` gives. Anything else is absorbed, ``SystemExit`` included
     on every thread: the module has failed, and ``SystemExit(0)`` leaving here would end ``validate``
     or ``check`` with exit 0 and no output. It is logged: the file and the fault's type, never its
-    text, which is the module's, so ``exc_info`` stays off too."""
+    text, which is the module's, so ``exc_info`` stays off too.
+
+    That line runs any log handler the module added, so it is the same kind of read: what it raises
+    is judged by the same rule, and the line is lost rather than the refusal."""
     if _is_a_signal(fault, path):
         raise KeyboardInterrupt
-    _logger.warning(
-        "config module %s: reading its failure raised %s, so the diagnostic is reduced",
-        safe_name(path.name),
-        _type_name(fault),
-    )
+    logging_fault: BaseException | None = None
+    try:
+        _logger.warning(
+            "config module %s: reading its failure raised %s, so the diagnostic is reduced",
+            safe_name(path.name),
+            _type_name(fault),
+        )
+    except BaseException as caught:  # noqa: BLE001 - judged after the handler, for what it chains
+        logging_fault = caught
+    # A real Ctrl-C can land on entering _is_a_signal, ahead of its guard, and in the handler above
+    # it would chain what this caught, which can hold the module's text.
+    if logging_fault is not None and _is_a_signal(logging_fault, path):
+        raise KeyboardInterrupt
 
 
 def _type_name(exc: BaseException) -> str:

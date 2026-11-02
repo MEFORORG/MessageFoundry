@@ -11,9 +11,10 @@
   refusal is rebuilt as a plain `WiringError`: every note and its whole chain go, engine links
   included, and an `ImportError` cause stays only as a textless stand-in. A refusal with a note on
   it, or on anything it wraps, is rebuilt the same way. A slice of the text, text copied before
-  the raise, or text of any length made only of letters, digits, `_` and `-` with another such
-  character touching it, is not caught: that last is what keeps an argument such as `tls` from
-  rewriting the connection name `IB_tls`. Text of three characters or more with any other character
+  the raise, or text of any length made only of letters, digits, `_` and `-` with such a character
+  from outside the quoted text touching it, is not caught: that last is what keeps an argument such
+  as `tls` from rewriting the connection name `IB_tls`. Text of three characters or more with any
+  other character
   in it, such as `'tls'` with its quotes or a value of several words, is replaced wherever it appears;
   text under three characters is not replaced at all, so `p@x` goes and `p@` prints. A chain of more
   than 1024 exceptions is not read to its end, so that refusal's whole text is withheld and the module
@@ -39,17 +40,23 @@
   is refused like the rest. So a `raise KeyboardInterrupt` in a config file is normally a failed
   module, and so is one under another handler, which includes `serve`'s load in the API lifespan:
   uvicorn holds SIGINT there, so a real Ctrl-C only asks the server to exit. A handler that raises
-  one itself, as asyncio's does at a second Ctrl-C, is refused the same way, and `validate` then
-  goes on to its next module. What that entry does not show cannot be told from Ctrl-C and stops the
-  load with that line: at least a module that calls `signal.default_int_handler()`, throws one into
-  a generator, clears the traceback before a bare `raise`, or has a library raise one. A module can
+  one itself is refused the same way while it is still in force when the loader judges it, and
+  `validate` then goes on to its next module. asyncio's does so at a second Ctrl-C, but that is
+  refused only under a runner around the load: a module's own `asyncio.run` puts Python's handler
+  back as it leaves, so that one stops the load. What that entry does not show cannot be told from
+  Ctrl-C and stops the load with that line: at least a module that calls
+  `signal.default_int_handler()`, throws one into a generator, clears the traceback before a bare
+  `raise`, or has a library raise one. A module can
   also put Python's handler back first, even under uvicorn. A fault in that judgement refuses the
   module. The loader's read of a failed module's exception
   runs the module's code, so a real Ctrl-C can land in it, and an interrupt there is judged the same
   way, with no exception chained to it. Any other fault in
   that read is absorbed and that module is refused, a `SystemExit` of any class on every thread
   included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
-  no output on a module that failed. An exact `WiringError` also stands only while its arguments
+  no output on a module that failed. The WARNING that reports such a fault runs any log handler the
+  module added, so what that handler raises is treated the same way. At least a faulting handler,
+  or logging a module turned off, loses that WARNING and the line that names the module at a stop,
+  so their absence proves nothing. An exact `WiringError` also stands only while its arguments
   are exact text, because a caller's `str()` of an object there would run the module's code past
   that guard. An exception's text counts as engine wording only when its frame is in the package's
   own files, so a module that sets `__name__` to look like the engine is withheld, and so is
