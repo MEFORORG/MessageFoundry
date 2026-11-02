@@ -221,7 +221,8 @@ def test_run_single_still_honours_a_patched_subprocess_run(
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH")
 def test_run_single_returns_what_subprocess_run_returns(lock_root: Path) -> None:
-    """The wrapper must be transparent -- it adds a lock, not a behaviour change."""
+    """The wrapper must be transparent -- it adds a lock, and a launch only changes when it
+    crashes natively (BACKLOG #2746), which a healthy pwsh does not."""
     proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "Write-Output ok"],
         capture_output=True,
@@ -295,10 +296,11 @@ def test_the_storm_counts_are_unchanged() -> None:
 
 
 #: The ``subprocess`` entry points that start a process. ``run_single`` wraps only ``run``, but a
-#: bare ``check_output`` of pwsh starves in a storm exactly as a bare ``run`` does.
+#: bare ``check_output`` of pwsh starves in a storm exactly as a bare ``run`` does. The
+#: native-crash retry launches without the lock (BACKLOG #2746), so it counts as bare too.
 _LAUNCHERS = frozenset(
     f"subprocess.{f}" for f in ("run", "Popen", "call", "check_call", "check_output")
-)
+) | {"run_retrying_a_native_crash", "_spawn_lock.run_retrying_a_native_crash"}
 
 
 def _is_pwsh_list(node: ast.expr | None) -> bool:
@@ -311,8 +313,7 @@ def _is_pwsh_list(node: ast.expr | None) -> bool:
     head = node.elts[0]
     if not isinstance(head, ast.Constant):
         return False
-    binary = str(head.value).replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
-    return binary in _spawn_lock._LOCKED_INTERPRETERS
+    return _spawn_lock._binary_name(str(head.value)) in _spawn_lock._LOCKED_INTERPRETERS
 
 
 def _unwrapped_pwsh_launches(source: str) -> list[int]:
@@ -405,8 +406,9 @@ def test_the_unwrapped_launch_finder_sees_every_shape_it_claims_to() -> None:
         "def f(ex):\n"
         "    ex.submit(lambda: subprocess.run(['pwsh', '-c', 'x']))\n"  # 18: inside a lambda
         "    subprocess.check_output(args=[r'C:\\\\ps\\\\pwsh.EXE', '-c', 'x'])\n"  # 19: keyword, path
+        "    run_retrying_a_native_crash(['pwsh', '-c', 'x'])\n"  # 20: retry, no lock
     )
-    assert _unwrapped_pwsh_launches(source) == [3, 6, 8, 18, 19]
+    assert _unwrapped_pwsh_launches(source) == [3, 6, 8, 18, 19, 20]
 
 
 @pytest.mark.parametrize("name", ["test_coord_usage.py", "test_announce_hook.py"])
@@ -547,7 +549,9 @@ def _scripted(
         return subprocess.CompletedProcess(cmd, rc, out, err)
 
     monkeypatch.setattr(subprocess, "run", fake)
-    monkeypatch.setattr(_spawn_lock, "_interpreter_version", lambda binary: "7.9.9 on .NET 99")
+    monkeypatch.setattr(
+        _spawn_lock, "_interpreter_version", lambda binary, kwargs: "7.9.9 on .NET 99"
+    )
     return calls
 
 
@@ -626,7 +630,9 @@ def test_a_second_crash_fails_and_says_twice(monkeypatch: pytest.MonkeyPatch) ->
     ):
         run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
     assert len(calls) == 2, "a third launch was made"
-    assert isinstance(failed.value, AssertionError), "pytest must report it as a failure"
+    # Not an AssertionError: a pytest.raises(AssertionError) around a launch meant to fail
+    # would otherwise swallow two crashes as the failure it expected.
+    assert not isinstance(failed.value, AssertionError)
     assert "NOT ESTABLISHED" in str(failed.value)
 
 
@@ -669,9 +675,61 @@ def test_a_real_segfault_reads_as_the_crash_the_retry_is_for(tmp_path: Path) -> 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH")
 def test_the_version_probe_reads_pwsh_and_dotnet() -> None:
     """The warning's version is the one diagnostic #2746 asks for, so the real probe runs once."""
-    version = _spawn_lock._interpreter_version("pwsh")
+    version = _spawn_lock._interpreter_version("pwsh", {})
     assert " on .NET" in version, version
 
 
-def test_the_version_probe_does_not_launch_a_non_interpreter() -> None:
-    assert _spawn_lock._interpreter_version(sys.executable).startswith("not read")
+def test_the_version_probe_does_not_launch_a_non_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured by the launch, not by the text: a probe that ran and then said "not read" passes a
+    text check."""
+
+    def launched(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the version probe launched a process for a non-interpreter")
+
+    monkeypatch.setattr(subprocess, "run", launched)
+    assert _spawn_lock._interpreter_version(sys.executable, {}).startswith("not read")
+
+
+def test_check_true_is_applied_after_the_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``check=True`` must not raise on the crash before the retry can run, and must still raise on
+    a real failure of the launch that is kept."""
+    calls = _scripted(monkeypatch, (_SEGV, "", ""), (0, "ok", ""))
+    with pytest.warns(NativeCrashWarning):
+        proc = run_retrying_a_native_crash(_PWSH, capture_output=True, text=True, check=True)
+    assert (len(calls), proc.stdout) == (2, "ok")
+
+    _scripted(monkeypatch, (1, "", "boom"))
+    with pytest.raises(subprocess.CalledProcessError):
+        run_retrying_a_native_crash(_PWSH, capture_output=True, text=True, check=True)
+
+
+def test_a_caller_stdin_stream_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The first launch may have consumed a caller's stream, so a second would read something else."""
+    calls = _scripted(monkeypatch, (_SEGV, "", ""))
+    payload = tmp_path / "in.txt"
+    payload.write_text("{}", encoding="utf-8")
+    with payload.open(encoding="utf-8") as stream, _no_crash_warning():
+        proc = run_retrying_a_native_crash(_PWSH, stdin=stream, capture_output=True, text=True)
+    assert len(calls) == 1
+    assert proc.returncode == _SEGV
+
+
+def test_every_retried_crash_is_numbered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pytest folds identical warnings into one, so two crashes of the same command must still read
+    as two in the summary -- #2746 counts them."""
+    _scripted(monkeypatch, (_SEGV, "", ""), (0, "", ""), (_SEGV, "", ""), (0, "", ""))
+    with pytest.warns(NativeCrashWarning) as seen:
+        run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
+        run_retrying_a_native_crash(_PWSH, capture_output=True, text=True)
+    messages = [str(w.message) for w in seen]
+    assert len(set(messages)) == 2, messages
+
+
+def test_a_signed_ntstatus_reads_as_the_same_crash() -> None:
+    """Python reports a Windows status unsigned, but a fake or a wrapper may hand it back signed."""
+    signed = _ACCESS_VIOLATION - (1 << 32)
+    assert _spawn_lock._native_crash(subprocess.CompletedProcess(_PWSH, signed, "", ""))

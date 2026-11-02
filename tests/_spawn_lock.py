@@ -81,6 +81,8 @@ LAND. No lock directory, a saturated wait, a stale entry reaped while its owner 
 ``OSError`` on any filesystem call -- each one proceeds WITHOUT the lock. The worst case is the
 unsynchronised run we have now; there is no path here that blocks a test forever or fails one. That
 mirrors ``tests/conftest.py``'s per-process slot, which states the same rule: "It never fails a run."
+The rule is the LOCK's. The native-crash retry under ``run_single`` (BACKLOG #2746) fails a test
+on purpose when a launch crashes twice; see ``run_retrying_a_native_crash``.
 
 THE LOCK IS SCOPED TO ONE PYTEST RUN, NOT TO THE MACHINE, and the difference only matters off CI.
 ``xdist`` generates one ``testrunuid`` per run (``workermanage.py``) and exports it into every worker
@@ -96,7 +98,6 @@ sufficient -- and reaping a live holder only drops us back to the unsynchronised
 
 from __future__ import annotations
 
-import functools
 import os
 import shutil
 import signal
@@ -502,22 +503,34 @@ _CRASH_SIGNALS: Final = frozenset(
     if hasattr(signal, n)
 )
 
-#: The Windows face of the same event. Windows reports an NTSTATUS exit code, which Python returns
-#: unsigned, rather than a negative signal number. These two are the access violation and the stack
-#: overflow; a .NET stack overflow ALSO prints ``Stack overflow.`` to stderr, so the empty-streams
-#: condition below already excludes the managed one and only a silent native one qualifies.
+#: The Windows face of the same events, one NTSTATUS per POSIX signal above that Windows has a
+#: native counterpart for. Windows reports the status as the exit code, which Python returns
+#: unsigned. A .NET stack overflow ALSO prints ``Stack overflow.`` to stderr, so the empty-streams
+#: condition already excludes the managed one and only a silent native one qualifies.
 _WINDOWS_CRASH_STATUS: Final = {
-    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC0000005: "STATUS_ACCESS_VIOLATION",  # SIGSEGV
     0xC00000FD: "STATUS_STACK_OVERFLOW",
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",  # fail-fast, how a native abort ends
+    0xC000001D: "STATUS_ILLEGAL_INSTRUCTION",  # SIGILL
+    0xC0000094: "STATUS_INTEGER_DIVIDE_BY_ZERO",  # SIGFPE
 }
+
+#: Numbers each retried crash in this process, so pytest's warning summary, which folds identical
+#: warnings into one, shows every occurrence and #2746's count can be read off it.
+_CRASHES = count(1)
 
 
 class NativeCrashWarning(UserWarning):
     """A launch died natively, with no output, and was retried once. Visible in pytest's summary."""
 
 
-class NativeCrashTwice(AssertionError):
-    """The retried launch died natively too. An AssertionError so pytest reports it as a failure."""
+class NativeCrashTwice(Exception):  # noqa: N818 -- the name is the message a reader greps for
+    """The retried launch died natively too.
+
+    NOT an ``AssertionError``, so a ``pytest.raises(AssertionError)`` around a launch that is meant
+    to fail cannot swallow two crashes as the failure it expected. Any other exception still fails
+    the test.
+    """
 
 
 def _native_crash(proc: object) -> str | None:
@@ -537,17 +550,20 @@ def _native_crash(proc: object) -> str | None:
     rc = proc.returncode
     if rc < 0 and -rc in _CRASH_SIGNALS:
         return f"{signal.Signals(-rc).name} (returncode {rc})"
-    status = _WINDOWS_CRASH_STATUS.get(rc & 0xFFFFFFFF) if rc > 0 else None
-    return f"{status} (returncode {rc:#x})" if status else None
+    # The mask reads a status Python reported signed the same as one it reported unsigned; a POSIX
+    # negative masks to a value no status in the table has.
+    status = _WINDOWS_CRASH_STATUS.get(rc & 0xFFFFFFFF)
+    return f"{status} (returncode {rc & 0xFFFFFFFF:#x})" if status else None
 
 
-@functools.cache
-def _interpreter_version(binary: str) -> str:
+def _interpreter_version(binary: str, kwargs: dict[str, Any]) -> str:
     """The ``pwsh`` and .NET versions, read for the crash warning; text rather than a raise.
 
     #2746's first closing step asks for both, and nothing on the runner records them. A SECOND
     launch, so it runs only on the crash path, and its own failure is reported rather than raised:
-    a diagnostic must never be what fails the run. Cached: it cannot change within a process.
+    a diagnostic must never be what fails the run. It takes the crashed launch's ``env`` and ``cwd``,
+    so a bare ``pwsh`` resolves to the same binary that crashed. NOT CACHED: a probe that itself
+    crashes would otherwise label every later crash in the process ``unreadable``.
     """
     name = _binary_name(binary)
     if name not in _LOCKED_INTERPRETERS:
@@ -562,7 +578,9 @@ def _interpreter_version(binary: str) -> str:
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=15,
+            env=kwargs.get("env"),
+            cwd=kwargs.get("cwd"),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return f"unreadable ({type(exc).__name__})"
@@ -577,7 +595,7 @@ def run_retrying_a_native_crash(
     THE FAILURE. ``pwsh`` on the ubuntu harness leg dies on SIGSEGV with stdout and stderr both
     empty, in tests that change nothing about it; the row counts at least six, across different
     tests and unrelated pull requests, each passing on a rerun. The test's own assertion then reports
-    ``exited -11`` as if the guard under test had failed. It had not: it never ran.
+    ``exited -11`` as if the script under test had failed, when it said nothing at all.
 
     THE CONDITION IS NARROW ON PURPOSE, and each limb excludes something. A crash signal (or its
     Windows NTSTATUS) and not any non-zero exit, so a real failure -- exit 1 -- is returned at once.
@@ -585,35 +603,47 @@ def run_retrying_a_native_crash(
     overflow.`` or an unhandled-exception abort, stays the caller's to read. Once, never more: a
     second crash raises :class:`NativeCrashTwice`, because a crash that repeats is a finding.
 
+    EMPTY STREAMS DO NOT SHOW THE SCRIPT NEVER RAN. An allow-path script prints nothing, so a crash
+    on exit after its side effects looks the same as a crash at startup. A launch whose effects are
+    not idempotent may therefore see them twice; the test then fails on that count, beside the
+    warning that names the crash, which is a red, not a false green.
+
     THE CAUSE IS NOT ESTABLISHED, and the warning says so rather than naming one. #1260 records the
     trap: a retry wrapper that prints a plausible cause onto a leg where it was never measured turns
-    a true observation into an invented mechanism. A retried crash still leaves a
+    a true observation into an invented mechanism. A retried crash still leaves a numbered
     :class:`NativeCrashWarning` in pytest's summary, so the retry hides the red, not the evidence.
+    That is the difference from ``run_gate``'s "THIS DOES NOT RETRY" in ``test_worktree_gate.py``,
+    which is about a launch TIMEOUT (#1304) and still holds for one: a timeout is never retried here.
+
+    THE HOLD CAN LENGTHEN. Under ``run_single`` a crash adds a version probe (15s at most) and a
+    second launch to the shared-lock hold and to the test's pytest clock. A hold past
+    ``_READER_STALE_S`` is reaped and fails open, as the module docstring says.
 
     NO CRASH DUMP IS REQUESTED on the retry. ``DOTNET_DbgEnableMiniDump`` would write one, but
     nothing on the leg uploads it, so collecting it needs a workflow change this helper does not
     make; the dump stays #2746's first closing step.
 
-    A caller-supplied ``stdin`` stream is not retried, since the first launch may have consumed it;
-    ``input=`` is replayed as given. ``subprocess.run`` is looked up at call time, as ``run_single``
-    explains.
+    ``check=True`` is applied to the launch that is kept, so a crash is retried before it can raise
+    ``CalledProcessError``. A caller-supplied ``stdin`` stream is not retried, since the first launch
+    may have consumed it; ``input=`` is replayed as given. ``subprocess.run`` is looked up at call
+    time, as ``run_single`` explains.
     """
-    first = cast("subprocess.CompletedProcess[str]", subprocess.run(cmd, **kwargs))
-    replayable = kwargs.get("stdin") in (None, subprocess.PIPE, subprocess.DEVNULL)
+    check = bool(kwargs.pop("check", False))
+    first = subprocess.run(cmd, **kwargs)
     crash = _native_crash(first)
-    if crash is None or not replayable:
-        return first
+    if crash is None or kwargs.get("stdin") not in (None, subprocess.PIPE, subprocess.DEVNULL):
+        return _checked(first, check)
     shown = subprocess.list2cmdline(list(cmd))
-    version = _interpreter_version(cmd[0])
+    version = _interpreter_version(cmd[0], kwargs)
     warnings.warn(
         NativeCrashWarning(
-            f"NATIVE CRASH: {shown} died on {crash} with stdout and stderr both empty, so it never "
-            f"reported anything; interpreter {version}. Retrying ONCE. This is not a test failure, "
-            "and the CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
+            f"NATIVE CRASH #{next(_CRASHES)} in this process: {shown} died on {crash} with stdout "
+            f"and stderr both empty; interpreter {version}. Retrying ONCE. This is not a test "
+            "failure, and the CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
         ),
         stacklevel=2,
     )
-    second = cast("subprocess.CompletedProcess[str]", subprocess.run(cmd, **kwargs))
+    second = subprocess.run(cmd, **kwargs)
     again = _native_crash(second)
     if again is not None:
         raise NativeCrashTwice(
@@ -621,7 +651,14 @@ def run_retrying_a_native_crash(
             f"output either time; interpreter {version}. No test assertion ran on it, and the "
             "CAUSE IS NOT ESTABLISHED (BACKLOG #2746)."
         )
-    return second
+    return _checked(second, check)
+
+
+def _checked(proc: Any, check: bool) -> subprocess.CompletedProcess[str]:
+    """Apply the caller's ``check=True`` to the launch that is kept. A fake's return passes as is."""
+    if check and isinstance(proc, subprocess.CompletedProcess):
+        proc.check_returncode()
+    return cast("subprocess.CompletedProcess[str]", proc)
 
 
 def run_single(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
