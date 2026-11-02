@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import errno
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -55,7 +56,7 @@ from functools import cache
 from pathlib import Path
 from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
-from typing import Any, Final, Literal, NamedTuple, TypeIs
+from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
@@ -96,7 +97,13 @@ from messagefoundry.config.models import (
     require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
-from messagefoundry.config.snapshot import ConfigSnapshot, config_py_files, read_config_snapshot
+from messagefoundry.config.snapshot import (
+    ConfigDirMissing,
+    ConfigSnapshot,
+    config_py_files,
+    is_missing_directory,
+    read_config_snapshot,
+)
 from messagefoundry.connection_names import (
     CONNECTION_NAME_PATTERN,
     fhir_lookup_record_name,
@@ -112,7 +119,7 @@ from messagefoundry.exception_origin import (
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.redaction import _BUILTIN_EXC_RENDERS, _class_attribute, safe_name
+from messagefoundry.redaction import _BUILTIN_EXC_RENDERS, _class_attribute, safe_exc, safe_name
 from messagefoundry.secretscrub import (
     _QUERY_NAME_SEPARATORS,
     _QUERY_NOT_CREDENTIAL_TAILS,
@@ -8600,41 +8607,102 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     """Read the config directory a load runs, after its trust check: the one read of it.
 
     Refuses a missing directory (:class:`~messagefoundry.config.fingerprint.ConfigDirMissing`), a
-    source :func:`_assert_safe_config_source` refuses, and a file the load needs but cannot read
-    (``WiringError``). A file only the fingerprint covers (``environments/*.toml``) that cannot be
-    read is left out and named in :attr:`ConfigSnapshot.unreadable`, as the observational
+    source :func:`_assert_safe_config_source` refuses, and a directory or file the load needs but
+    cannot read (``WiringError``). A file only the fingerprint covers (``environments/*.toml``) that
+    cannot be read is left out and named in :attr:`ConfigSnapshot.unreadable`, as the observational
     fingerprint names it. With ``strict``, any file or folder it cannot read raises its
     ``OSError`` instead, so the snapshot's digest covers every file the fingerprint names: the
     digest a dual-control release checks. Blocking."""
     directory = Path(directory)
     # Fail loudly on a missing/typo'd dir: Path.glob() on a nonexistent dir yields nothing, so the
     # engine would otherwise start with an empty graph — a silently dead interface (review M-24).
-    if not directory.is_dir():
-        # ConfigDirMissing, a FileNotFoundError: a reload maps only it to not_found, so a directory
-        # moved away after the reload's own check still answers as missing (BACKLOG #3157).
-        from messagefoundry.config.snapshot import ConfigDirMissing
-
-        raise ConfigDirMissing(f"config directory not found: {directory}")
-    _assert_safe_config_source(directory)
+    _require_config_dir(directory, strict=strict)
+    try:
+        _assert_safe_config_source(directory)
+    except OSError as exc:
+        # Its walk raises what it cannot list, and a path it could not vet must not load. Outside
+        # strict that is a refusal, not a raw error, which a reload would answer as a 500.
+        if strict:
+            raise
+        raise WiringError(
+            f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(exc)}"
+        ) from exc
     snapshot = read_config_snapshot(directory, strict=strict)
-    if not strict and not snapshot.files and not directory.is_dir():
-        # A lax read reads a vanished directory as an empty one; a load must not run that as an
-        # empty graph, so it still answers as missing (BACKLOG #3157).
-        from messagefoundry.config.snapshot import ConfigDirMissing
-
-        raise ConfigDirMissing(f"config directory not found: {directory}")
+    # Before the directory is judged again, so that judging it cannot replace a fault this read
+    # recorded with a different answer.
     _require_loadable(snapshot)
+    if not strict and not snapshot.files:
+        # A lax read reads a vanished directory as an empty one; a load must not run that as an
+        # empty graph. Judged again: missing if it is gone, refused if it cannot be read (BACKLOG
+        # #3157).
+        _require_config_dir(directory, strict=False)
     return snapshot
+
+
+def _require_config_dir(directory: Path, *, strict: bool) -> None:
+    """Raise unless ``directory`` can be listed.
+
+    :class:`~messagefoundry.config.fingerprint.ConfigDirMissing` when no directory can be opened by
+    that path (:func:`~messagefoundry.config.fingerprint.is_missing_directory`), or by a name
+    ``os.scandir`` refuses outright. A reload maps only that to not_found, so a directory moved
+    away after the reload's own check still answers as missing (BACKLOG #3157). Any other fault
+    is refused by :func:`_refuse_config_dir`. Listed, not ``is_dir``, which answers ``False`` for a
+    share Windows cannot reach or a parent this account cannot traverse, and so would call either
+    one missing. A directory that lists while ``is_dir`` says no is a fault too, because
+    :func:`_assert_safe_config_source` vets nothing where ``is_dir`` says no, and what follows this
+    check runs the directory's modules."""
+    try:
+        with os.scandir(directory):
+            pass
+    except ValueError as exc:
+        # An embedded NUL, which is_dir answered False for.
+        _logger.warning(
+            "config directory %s cannot be opened: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(safe_exc(exc)),
+        )
+    except OSError as exc:
+        if not is_missing_directory(exc):
+            _refuse_config_dir(directory, exc, strict=strict)
+    else:
+        if directory.is_dir():
+            return
+        _refuse_config_dir(
+            directory,
+            PermissionError(
+                errno.EACCES, "config directory lists but is not vetted", str(directory)
+            ),
+            strict=strict,
+        )
+    # Outside the handler, so the error it replaces does not ride __context__.
+    raise ConfigDirMissing(f"config directory not found: {directory}")
+
+
+def _refuse_config_dir(directory: Path, fault: OSError, *, strict: bool) -> NoReturn:
+    """Raise ``fault`` with ``strict``, whose caller logs it, and otherwise log it and raise the
+    refusal a lax read's unlistable ``.`` gets."""
+    if strict:
+        raise fault
+    _logger.warning(
+        "config directory %s could not be read: %s",
+        scrub_log_argument(str(directory)),
+        scrub_log_argument(safe_exc(fault)),
+    )
+    raise _unreadable_source(directory, (".",)) from fault
 
 
 def _require_loadable(snapshot: ConfigSnapshot) -> None:
     """Refuse a snapshot missing a file a load would read: it cannot run bytes it does not have."""
     missing = snapshot.unreadable_loaded
     if missing:
-        raise WiringError(
-            f"refusing to load config from {snapshot.directory}: could not read "
-            f"{', '.join(missing)}; see the engine log and docs/SERVICE.md for required permissions"
-        )
+        raise _unreadable_source(snapshot.directory, missing)
+
+
+def _unreadable_source(directory: Path, unreadable: Sequence[str]) -> WiringError:
+    return WiringError(
+        f"refusing to load config from {directory}: could not read "
+        f"{', '.join(unreadable)}; see the engine log and docs/SERVICE.md for required permissions"
+    )
 
 
 def load_config(
@@ -10174,13 +10242,15 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     :meth:`Registry.graph_problems`, shared with :meth:`Registry.validate`.
     """
     directory = Path(directory)
-    if not directory.is_dir():  # fail loudly, not silently empty (review M-24)
-        return [Diagnostic(message=f"config directory not found: {directory}", file=str(directory))]
     try:
+        # Fail loudly, not silently empty (review M-24), by load_config's own first check.
+        _require_config_dir(directory, strict=False)
         # Same trust boundary as load_config: never execute Python from an unsafe source (review low-11).
         _assert_safe_config_source(directory)
-    except WiringError as exc:
+    except (ConfigDirMissing, WiringError) as exc:
         return [Diagnostic(message=str(exc), file=str(directory))]
+    except OSError as exc:
+        return [Diagnostic(message=safe_exc(exc), file=str(directory))]
     # One read, as load_config's, so the modules, tables and connections it reports on are one
     # set of bytes (vault BACKLOG #2596). A file it needs but cannot read is a diagnostic.
     snapshot = read_config_snapshot(directory, strict=False)

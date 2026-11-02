@@ -61,6 +61,7 @@ from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
+from tests._share_fault import _share_fault
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
 from tests.test_trust_anchors import _block, _FaultyAuditStore, _judged_clean
 
@@ -1761,6 +1762,59 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
         )
     assert await engine.store.list_pending_approvals(now=0.0, limit=10) == []
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
+    """Fail every listing of ``cfg`` past the next one, which is the reload's target check, as a
+    share Windows cannot reach fails, and answer ``Path.is_dir`` of it ``False``, as both do for a
+    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory."""
+    real_scandir, real_is_dir = os.scandir, Path.is_dir
+    listings = 0
+
+    def _scandir(path: Any) -> Any:
+        nonlocal listings
+        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
+            listings += 1
+            if listings > 1:
+                raise _share_fault()
+        return real_scandir(path)
+
+    def _is_dir(self: Path, **kwargs: Any) -> bool:
+        return self.resolve() != cfg and real_is_dir(self, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    monkeypatch.setattr(Path, "is_dir", _is_dir)
+
+
+async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_inline(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ungated reload's strict read fails, so the load reads the directory itself and refuses."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        _lose_after_one_listing(monkeypatch, (tmp_path / "cfg").resolve())
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+
+
+async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release has no digest to check, so it is refused before anything runs."""
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: _lose_after_one_listing(monkeypatch, (tmp_path / "cfg").resolve()),
+    )
+    monkeypatch.undo()
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
 
 
 async def test_a_file_added_during_the_load_is_not_released_with_it(

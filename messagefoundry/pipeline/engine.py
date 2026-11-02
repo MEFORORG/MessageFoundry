@@ -3375,8 +3375,9 @@ class Engine:
         (missing dir; a ``FileNotFoundError`` subclass, which the callers map to not_found),
         ``ConfigDirUnreadable`` (a dir that cannot be resolved),
         ``ConfigDigestMismatch`` (not the approved bytes), ``ConfigDigestUnavailable``
-        (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / an
-        environment value file this reload could not read) — the caller maps these to HTTP errors.
+        (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / a
+        config directory or environment value file this reload could not read) — the caller maps
+        these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
