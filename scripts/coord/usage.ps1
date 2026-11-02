@@ -22,10 +22,12 @@
     FOUR HONESTY RULES, because a usage tool that is confidently wrong is worse than no usage tool --
     it converts "I should check" into "I already know".
 
-      1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed to
-         change. An unchanged reading does not refresh it; usage-collect.ps1 says why.
-      2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the answer is UNKNOWN. Not an
-         extrapolation, not a last-known value dressed up as current. Below two samples in the current
+      1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was last confirmed:
+         it changed, or a session that had just called the API reported it. An idle session's repeat
+         does not count; usage-collect.ps1 says why.
+      2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the window's state is UNKNOWN. Not
+         an extrapolation, not a last-known value dressed up as current. A number that holds a
+         level_floor at a band still sets that band's exit code, as "at least this". Below two samples in the current
          window, or one tick under -MinRateSpanMinutes, there is no rate and no projection, and the
          percentage bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
@@ -47,10 +49,12 @@
 
     EXIT CODES, so a coordinator can branch without parsing prose:
         0  OK
-        10 WARN        -- high, or projected to exhaust before reset with slack
-        11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling
-        20 UNKNOWN     -- no data, stale data, a window whose reset has passed, or a reading this root
-                          may not trust
+        10 WARN        -- high, or projected to exhaust before reset with slack. A stale reading counts
+                          as high only through a level_floor, because it has reached at least that
+        11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling, fresh or as a
+                          stale level_floor
+        20 UNKNOWN     -- no data, stale data below those, a window whose reset has passed, or a reading
+                          this root may not trust
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
     FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
@@ -596,6 +600,15 @@ if ($seven.Contains('level_floor') -and $seven.level_floor -lt $CeilingPct -and 
     $seven.level_floor = $null
 }
 
+# A FLOOR GRADES THE VERDICT, AND LEAVES THE WINDOW'S STATE AT UNKNOWN. The number has reached at least
+# that, so the exit code and the advice must say so: a spent pool with an unchanged reading is still
+# CRITICAL. The window stays UNKNOWN because nothing fresh backs a rate or a clear, and that is what
+# Get-DecisionCostRung reads below the rung, so this cannot loosen the gate. 85 is the WARN band below.
+if ($null -ne $seven.level_floor) {
+    if ($seven.level_floor -ge $CeilingPct) { $overall = "CRITICAL" }
+    elseif ($seven.level_floor -ge 85) { $overall = "WARN" }
+}
+
 # A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The
 # diagnosis used to reach the prose only, so a root the script itself called mis-wired still exited 0
 # and reported state=OK beside statusline_state=WIRED_ELSEWHERE in one document. An explicit -StateDir
@@ -722,7 +735,7 @@ function Show-Window($o) {
     }
     $colour = switch ($o.state) { "CRITICAL" { "Red" } "WARN" { "Yellow" } "UNKNOWN" { "DarkGray" } default { "Green" } }
     $reset = if ($null -ne $o.minutes_to_reset) { "resets in {0}h{1:00}m" -f [math]::Floor($o.minutes_to_reset / 60), ($o.minutes_to_reset % 60) } else { "reset unknown" }
-    Write-Host ("  {0,-14} {1,5:0.0}%  {2}   [seen {3} min ago]" -f $o.label, $o.used_percentage, $reset, $o.reading_age_min) -ForegroundColor $colour
+    Write-Host ("  {0,-14} {1,5:0.0}%  {2}   [confirmed {3} min ago]" -f $o.label, $o.used_percentage, $reset, $o.reading_age_min) -ForegroundColor $colour
     if ($null -ne $o.rate_pct_per_hr) {
         $proj = if ($null -ne $o.projected_at_reset) { ", ~{0}% by reset" -f $o.projected_at_reset } else { "" }
         Write-Host ("                 {0:+0.0;-0.0;0.0} %/hr{1}" -f $o.rate_pct_per_hr, $proj) -ForegroundColor DarkGray
@@ -755,7 +768,7 @@ if ($dx.state -in $dxUntrusted) {
 # warnings and the operator saw no cause and no fix.
 elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN" -and -not (Test-WindowResetPassed $doc.seven_day)) {
     Write-Host ""
-    Write-Host "  WARNING -- nothing fresh has published here, and the wiring says why:" -ForegroundColor Yellow
+    Write-Host "  WARNING -- this reading has not been confirmed lately, and the wiring may be why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
     foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
 }
@@ -779,8 +792,8 @@ elseif ($dx.state -eq "WIRED_HERE" -and $seven.state -eq "UNKNOWN" -and -not (Te
     $collClause = if ($dx.wired_collector) { " and the collector it names exists" } else { "" }
     Write-Host ""
     Write-Host "  WARNING -- this root is wired correctly$collClause," -ForegroundColor Yellow
-    Write-Host "  yet nothing fresh has published here. Three causes, and this cannot tell them apart:" -ForegroundColor Yellow
-    Write-Host "    - the percentage has not changed for that long; an unchanged reading keeps its old age, or" -ForegroundColor DarkGray
+    Write-Host "  yet this reading has not been confirmed lately. At least these causes, and this cannot tell them apart:" -ForegroundColor Yellow
+    Write-Host "    - no session here has called the API for that long, and an idle session's repeat keeps the old age, or" -ForegroundColor DarkGray
     Write-Host "    - no session has STARTED here since it was wired (settings are read at session start), or" -ForegroundColor DarkGray
     Write-Host "    - the statusLine is configured but never runs. It is part of the terminal UI's render" -ForegroundColor DarkGray
     Write-Host "      tree, so check whether your client shows a status bar at all; a line beginning" -ForegroundColor DarkGray
@@ -814,10 +827,10 @@ if ($survey) {
             # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
             # throws ("Cannot convert null to type System.ConsoleColor"), measured.
             if ($s.stale) {
-                Write-Host ("    {0,-46} {1}   [STALE -- seen {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
+                Write-Host ("    {0,-46} {1}   [STALE -- confirmed {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
             }
             else {
-                Write-Host ("    {0,-46} {1}   [seen {2} min ago]{3}" -f $s.root, $v, $s.age_min, $mark)
+                Write-Host ("    {0,-46} {1}   [confirmed {2} min ago]{3}" -f $s.root, $v, $s.age_min, $mark)
             }
             if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
         }

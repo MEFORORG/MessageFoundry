@@ -55,9 +55,9 @@
     source first, which is the same shape as `claude agents --json` returning an empty list and
     exit 0 against a config root that does not exist.
 
-    EVERY NUMBER CARRIES ITS AGE. The collector publishes at statusLine granularity, so a reading can
-    be up to about fifteen minutes old while still looking plausible. A percentage printed with no
-    age beside it invites a decision on data that has already expired.
+    EVERY NUMBER CARRIES ITS AGE, counted from the last time it was confirmed: it changed, or a session
+    that had just called the API reported it. A percentage printed with no age beside it invites a
+    decision on data that has already expired.
 
     IT NEVER BLOCKS. There is no deny path here at all. A separate gate decides whether a launch may
     proceed; this one only makes sure the session can see what it is about to spend. Every error
@@ -316,9 +316,9 @@ $HEAD = "[usage headroom, read at the spawn point from the file the statusLine c
         "publishes. No API call was made and nothing polled; this is the file, at the one moment it " +
         "changes a decision.]"
 
-$AGE_NOTE = "Ages are part of the reading. The collector publishes at statusLine granularity, so a " +
-            "number can be up to about 15 min old and still look current; anything past $MaxAgeMinutes min " +
-            "is reported UNKNOWN rather than projected from."
+$AGE_NOTE = "Ages are part of the reading, counted from the last time the number changed or a session " +
+            "that had just called the API reported it; an idle session's repeat does not count. Anything " +
+            "past $MaxAgeMinutes min is not projected from: it reads UNKNOWN, or 'at least' where it still holds as a floor."
 
 # WHY AN UNKNOWN WILL NOT CLEAR ON ITS OWN (BACKLOG #1459). A bare "UNKNOWN" hid two causes that
 # waiting cannot fix, and a session told only "UNKNOWN" waits for a number that cannot arrive. ONE
@@ -712,12 +712,22 @@ if (-not $j.seven_day) {
 
 function Format-Window($w) {
     $label = "  7d "
+    # A FLOOR PRINTS ITS NUMBER: the reader says the window has reached at least this, and the gate may be
+    # halting on it. A bare UNKNOWN here would hide the one fact that explains the halt.
+    if ($null -ne $w.level_floor -and $null -ne $w.used_percentage) {
+        $line = "$label at least {0:0.0}% used   [confirmed {1} min ago; a stale reading whose reset is still ahead]" -f ([double]$w.level_floor), $w.reading_age_min
+        if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
+            $m = [int]$w.minutes_to_reset
+            $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))
+        }
+        return $line
+    }
     if ([string]$w.state -eq "UNKNOWN" -or $null -eq $w.used_percentage) {
         return "$label UNKNOWN -- " + (Get-Folded $w.reason)
     }
     # THE AGE IS NOT AN ORNAMENT ON THE PERCENTAGE, so it is printed in the same clause and never
     # dropped when it is null: an undated number is worth less than no number.
-    $age = if ($null -ne $w.reading_age_min) { "read {0} min ago" -f $w.reading_age_min } else { "age UNKNOWN" }
+    $age = if ($null -ne $w.reading_age_min) { "confirmed {0} min ago" -f $w.reading_age_min } else { "age UNKNOWN" }
     $line = "$label {0,5:0.0}% used   [{1}]" -f ([double]$w.used_percentage), $age
     if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
         $m = [int]$w.minutes_to_reset

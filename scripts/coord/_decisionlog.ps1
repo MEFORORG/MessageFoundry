@@ -852,8 +852,9 @@ function Get-DecisionCostRung {
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
 
-      ONLY A LEVEL OR CEILING HIT SURVIVES AGE, AND ONLY ON A level_floor. An equal reading does not
-      refresh its age, so a flat pool goes stale, and a spent one cannot rise. usage.ps1 publishes
+      ONLY A LEVEL OR CEILING HIT SURVIVES AGE, AND ONLY ON A level_floor. An equal reading refreshes
+      its age only from a session that has just called the API, so an idle pool goes stale, and a spent
+      one cannot rise. usage.ps1 publishes
       level_floor on a stale reading with its reset ahead and inside one 7-day window, and with trusted
       provenance unless it is at the ceiling. Such a reading has reached at least that level, unless
       the reset has moved or usage did fall, so at the level or the ceiling it is HIT. A rate hit does

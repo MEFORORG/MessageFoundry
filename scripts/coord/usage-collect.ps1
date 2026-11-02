@@ -130,6 +130,33 @@ function Write-AtomicText([string]$Path, [string]$Text) {
     return $false
 }
 
+# DID THIS SESSION CALL THE API SINCE ITS LAST FIRE? cost.total_api_duration_ms only rises when it did,
+# and rate_limits arrives on an API response, so a rise is the one thing in the payload that tells a live
+# session's reading from an idle one's cached number. The mark is per session, because the counter is.
+# A session with no mark, a payload with no counter, or an unreadable file proves nothing: false, which
+# leaves the age counting. A lost write costs one refresh, for the same reason.
+function Test-SessionCalledApi([string]$Dir, $Payload) {
+    $sid = [string]$Payload.session_id
+    $counter = $Payload.cost.total_api_duration_ms
+    if (-not $sid -or $null -eq $counter) { return $false }
+    $ms = $counter -as [double]
+    if ($null -eq $ms) { return $false }
+    $path = Join-Path $Dir "live-marks.json"
+    $marks = @{}
+    try {
+        $doc = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($prop in $doc.PSObject.Properties) { $marks[$prop.Name] = $prop.Value }
+    } catch { }
+    $prev = if ($marks.ContainsKey($sid)) { $marks[$sid].api_ms -as [double] } else { $null }
+    if ($null -ne $prev -and $prev -eq $ms) { return $false }
+    $marks[$sid] = [pscustomobject]@{ api_ms = $ms; at = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+    $kept = [ordered]@{}
+    # Only a rise writes, so this file changes once per API call. The newest 32 sessions are plenty.
+    foreach ($e in ($marks.GetEnumerator() | Sort-Object { [long]$_.Value.at } -Descending | Select-Object -First 32)) { $kept[$e.Key] = $e.Value }
+    Write-AtomicText $path ($kept | ConvertTo-Json -Depth 3) | Out-Null
+    return ($null -ne $prev -and $ms -gt $prev)
+}
+
 function Format-Reset([object]$EpochSeconds) {
     if ($null -eq $EpochSeconds) { return $null }
     try { return [System.DateTimeOffset]::FromUnixTimeSeconds([long]$EpochSeconds).ToLocalTime().ToString("o") } catch { return $null }
@@ -242,12 +269,14 @@ try {
     # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
     # row can still be read: with no current reset, usage.ps1's rate skips its reset filter.
     #
-    # AN EQUAL READING IS REFUSED TOO, SO THE AGE COUNTS FROM THE LAST CHANGE. The payload carries no
-    # time of its own, so an idle session's cached number looks exactly like a live flat one. Restamping
-    # it let one idle terminal keep a frozen number fresh while sessions that never publish burned the
-    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. On the
-    # conditions at level_floor in usage.ps1, the number still stands as a floor, and the gate's rung
-    # reads it as a HIT at the level or the ceiling.
+    # AN EQUAL READING IS REFUSED TOO. The payload carries no time of its own, so an idle session's
+    # cached number looks like a live flat one. Restamping it let one idle terminal keep a frozen number
+    # fresh while sessions that never publish burned the pool, and the rung read OK on it. So the age
+    # counts from the last confirmation: the number changed, or a session of this root that has just
+    # called the API (Test-SessionCalledApi) reports the same number for the same running reset. That
+    # refreshes the age and nothing else. Past that, a flat account goes stale. On the conditions at
+    # level_floor in usage.ps1, the number still stands as a floor, and the gate's rung reads it as a
+    # HIT at the level or the ceiling.
     #
     # A READING WITH NO READABLE RESET CANNOT PROVE WHICH WINDOW IT BELONGS TO. So while the published
     # reset is still ahead it is refused, higher or not. Taken bare, it would wipe the reset this rule
@@ -262,6 +291,8 @@ try {
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
     $keepPublished = -not $seven
+    $calledApi = Test-SessionCalledApi $StateDir $p
+    $confirmed = $false
     $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
     $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
     if ($seven -and $published -and (-not $publishedRoot -or $publishedRoot -eq "unset" -or $publishedRoot -ieq $ownRoot)) {
@@ -273,13 +304,19 @@ try {
             ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
+        $confirmed = $calledApi -and ($stampEnv -eq "unset" -or $stampEnv -ieq $ownRoot) -and
+            $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and
+            $seven.used_percentage -eq ($published.used_percentage -as [double])
     }
 
     # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new
     # timestamp tells the burn-rate calculation that consumption had stopped -- the one lie that matters
     # in a tool built to warn about consumption. A refused lower one would also read as a falling rate.
     $freshSeven = $null
-    if ($keepPublished) { $seven = $published }
+    if ($keepPublished) {
+        $seven = $published
+        if ($confirmed) { $seven | Add-Member -NotePropertyName captured_at -NotePropertyValue $now -Force }
+    }
     else {
         $freshSeven = $seven.used_percentage
         $seven.captured_at = $now

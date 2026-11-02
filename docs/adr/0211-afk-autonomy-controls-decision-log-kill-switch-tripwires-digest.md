@@ -406,23 +406,32 @@ roster alias of the Lander.
 > prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
 > missing reset must not loosen the rung.
 >
-> **The age therefore counts from the last change, and only a level or ceiling hit survives age.** The
-> payload carries no time of its own, so an idle session's cached number looks like a live flat one.
+> **The age therefore counts from the last confirmation, and only a level or ceiling hit survives age.**
+> The payload carries no time of its own, so an idle session's cached number looks like a live flat one.
 > Restamping an equal reading let one idle terminal keep a frozen number fresh, and the rung read OK on
-> it. So a flat account, live or not, goes stale after 20 minutes and reads UNKNOWN. `usage.ps1`
+> it. So an equal reading refreshes the age only when the session reporting it has just called the API:
+> `cost.total_api_duration_ms` rose since that session's last fire (`live-marks.json`), the reset is the
+> same and still ahead, and the session is pinned to this root or unpinned. A pool nobody has called for 20
+> minutes goes stale and reads UNKNOWN, so a healthy live flat account stays fresh and an idle one does
+> not. The statusLine docs list the counter, as read on 2026-11-01. No real payload on this box was checked
+> for it; with no counter, nothing refreshes and the account goes stale as before. Whether a call that failed
+> still moves the counter is also unmeasured; such a call could confirm the old number. `usage.ps1`
 > publishes such a reading as `level_floor` when its reset is ahead, its age plus the time to its reset
 > fits one 7-day window, and its provenance is trusted: the document and the window carry a verified
 > root stamp, and the root's statusLine diagnosis is not on `usage.ps1`'s `$dxUntrusted` list. That does
 > not prove the root is wired here: the list leaves out at least `SETTINGS_UNREADABLE` and
 > `WIRED_POWERSHELL_SOURCE`, so a stamped stale reading holds a floor on those too, where a new reading
 > may never come. At the 98 percent ceiling the provenance test does not apply,
-> because a fresh reading there stops work on any provenance, and an equal reading does not refresh its
-> age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
+> because a fresh reading there stops work on any provenance, and an idle session's equal reading does
+> not refresh its age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
 > window stamped with another root is still refused. The rung is then hit at the 90 percent level or the
 > ceiling. Every other stale reading answers REVIEW at any level, including at least a future-dated one,
 > an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
 > fresh 95 with no rate on such a root is hit, and the same reading once stale answers REVIEW. A Desktop
-> session on a root holding such a floor gets HALT, which narrows the gap this section names.
+> session on a root holding such a floor gets HALT, which narrows the gap this section names. A floor also
+> sets `usage.ps1`'s verdict and exit code, CRITICAL (11) at the ceiling and WARN (10) from 85 percent, and
+> the spawn hook prints its number as "at least". The window's own state stays UNKNOWN, which is what the
+> gate reads below the rung, so the verdict cannot clear anything.
 >
 > **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale
 > reading. A fresh 70 percent with 45 minutes to empty hits; the same reading once stale answers REVIEW.

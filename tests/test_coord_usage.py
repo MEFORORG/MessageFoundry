@@ -660,6 +660,135 @@ def test_the_ceiling_floor_keeps_the_other_bounds(tmp_path: Path) -> None:
     assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "another root's window"
 
 
+def _age_window(state: Path, minutes: float) -> None:
+    doc = latest(state)
+    doc["seven_day"]["captured_at"] = _minutes_ago(minutes)
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _session_fire(
+    state: Path, seven: dict[str, Any], session: str = "S", api_ms: float | None = None
+) -> None:
+    payload: dict[str, Any] = {"session_id": session, "rate_limits": {"seven_day": seven}}
+    if api_ms is not None:
+        payload["cost"] = {"total_api_duration_ms": api_ms}
+    collect(state, payload)
+
+
+def test_a_session_that_called_the_api_confirms_an_equal_reading(tmp_path: Path) -> None:
+    """A healthy live flat account stays fresh. An idle session's repeat, the same counter, does not."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+
+    _session_fire(tmp_path, seven, api_ms=1000)
+    code, doc = read(tmp_path)
+    assert code == UNKNOWN and doc["seven_day"]["reading_age_min"] >= 24, "control: an idle repeat"
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    code, doc = read(tmp_path)
+    assert code == 0 and doc["seven_day"]["reading_age_min"] < 5, doc
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(40.0)
+    assert len(history(tmp_path)) == 1, "a confirmation is not a new observation of a moved number"
+
+
+def _confirm_refused_case(state: Path, case: str) -> None:
+    """Drive one fire that must leave the age counting; the window starts 25 minutes old at 40."""
+    seven = window(40.0, 280000)
+    _session_fire(state, seven, api_ms=1000)
+    _age_window(state, 25)
+    if case == "first-fire-of-a-session":
+        _session_fire(state, seven, session="T", api_ms=5000)
+    elif case == "another-sessions-counter":
+        _session_fire(state, seven, session="T", api_ms=1000)
+        _session_fire(state, seven, session="U", api_ms=2000)
+    elif case == "no-counter":
+        _session_fire(state, seven)
+    elif case == "counter-fell":
+        _session_fire(state, seven, api_ms=500)
+    elif case == "lower-number":
+        _session_fire(state, {**seven, "used_percentage": 30.0}, api_ms=2000)
+    elif case == "unreadable-marks":
+        (state / "live-marks.json").write_text("{ not json", encoding="utf-8")
+        _session_fire(state, seven, api_ms=2000)
+    else:
+        raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "first-fire-of-a-session",
+        "another-sessions-counter",
+        "no-counter",
+        "counter-fell",
+        "lower-number",
+        "unreadable-marks",
+    ],
+)
+def test_nothing_else_confirms_an_equal_reading(tmp_path: Path, case: str) -> None:
+    _confirm_refused_case(tmp_path, case)
+    code, doc = read(tmp_path)
+    assert code == UNKNOWN and doc["seven_day"]["reading_age_min"] >= 24, doc
+
+
+def test_a_session_of_another_root_cannot_confirm_this_roots_reading(tmp_path: Path) -> None:
+    root = tmp_path / "this-root"
+    state = root / "mefor-usage"
+    state.mkdir(parents=True)
+    seven = window(40.0, 280000)
+    _session_fire(state, seven, api_ms=1000)
+    _age_window(state, 25)
+    payload = {
+        "session_id": "S",
+        "cost": {"total_api_duration_ms": 2000},
+        "rate_limits": {"seven_day": seven},
+    }
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(COLLECT), "-StateDir", str(state)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(tmp_path / "other-root"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert datetime.now(UTC) - captured_at(state) > timedelta(minutes=24)
+
+
+def test_a_gone_window_cannot_be_confirmed(tmp_path: Path) -> None:
+    seven = window(40.0, -300)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert datetime.now(UTC) - captured_at(tmp_path) > timedelta(minutes=24)
+
+
+@pytest.mark.parametrize(
+    ("pct", "stamped", "code", "state"),
+    [
+        pytest.param(100.0, False, 11, "CRITICAL", id="spent-unstamped"),
+        pytest.param(98.0, True, 11, "CRITICAL", id="ceiling-stamped"),
+        pytest.param(90.0, True, 10, "WARN", id="high-stamped"),
+        pytest.param(85.0, True, 10, "WARN", id="warn-band-stamped"),
+        pytest.param(84.9, True, UNKNOWN, "UNKNOWN", id="below-the-band"),
+        pytest.param(90.0, False, UNKNOWN, "UNKNOWN", id="high-with-no-floor"),
+    ],
+)
+def test_a_floor_sets_the_exit_code_and_the_window_stays_unknown(
+    tmp_path: Path, pct: float, stamped: bool, code: int, state: str
+) -> None:
+    """The header promises exit 11 at the ceiling. The window's own state stays UNKNOWN because that is
+    what the gate reads below the rung; test_afk_gate holds the gate to it."""
+    publish(tmp_path, seven=pct, age_min=25)
+    if stamped:
+        _stamp(tmp_path, tmp_path.parent)
+    got, doc = read(tmp_path)
+    assert (got, doc["state"]) == (code, state), doc
+    assert doc["seven_day"]["state"] == "UNKNOWN", doc
+
+
 def test_a_root_wired_elsewhere_gets_no_floor_and_a_wired_one_does(fake_home: Path) -> None:
     pin = fake_home / ".claude-account-1"
     publish(pin / "mefor-usage", seven=95.0, age_min=75)

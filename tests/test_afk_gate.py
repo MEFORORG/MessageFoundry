@@ -648,6 +648,28 @@ def test_a_stop_at_the_ceiling_does_not_decay_on_the_default_root(
         assert code == expected, why(doc)
 
 
+def test_a_floor_below_the_rung_raises_the_verdict_and_cannot_clear_the_gate(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """usage.ps1 now answers WARN on a stale 87 with a floor. The gate must still say REVIEW: a stale
+    number below the rung clears nothing, and a WARN read as a current grade would."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    seven = {"used_percentage": 87, "resets_at": int(ago().timestamp()) + 200000}
+    assert _fire(sb, state, seven, env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=25).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    reader = sb.run(COORD / "usage.ps1", "-Json", **env)
+    assert json.loads(reader.stdout)["state"] == "WARN", reader.stdout
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW, why(doc)
+
+
 def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
     sb: Sandbox, tmp_path: Path
 ) -> None:

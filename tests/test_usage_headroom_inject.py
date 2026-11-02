@@ -14,8 +14,7 @@ The properties worth pinning are the ones that would rot silently:
 * **A failed read is UNKNOWN, and UNKNOWN is still injected.** Missing, stale, unreadable, refused, or
   a reader that never ran at all -- each says which, and none of them go quiet. Silence would leave a
   session with no reading and no sign that a reading was attempted.
-* **Every percentage carries its age.** The collector publishes at statusLine granularity, so a number
-  can be a quarter of an hour old and still look current.
+* **Every percentage carries its age,** counted from the last time it was confirmed.
 * **It costs no model call and it does not poll.** A waiting session is the most expensive state in
   the system; buying delivery with a poll costs more than the warning saves.
 * **It never blocks a spawn**, and it fires on the spawn tools only.
@@ -242,7 +241,7 @@ def test_every_percentage_it_prints_carries_an_age(tmp_path: Path) -> None:
     percent_lines = [ln for ln in ctx.splitlines() if re.search(r"\d+(\.\d+)?%", ln)]
     assert percent_lines, f"no percentage was printed at all: {ctx}"
     for line in percent_lines:
-        assert re.search(r"read \d+(\.\d+)? min ago|age UNKNOWN", line), (
+        assert re.search(r"confirmed \d+(\.\d+)? min ago|age UNKNOWN", line), (
             f"a percentage was printed with no age beside it: {line!r}"
         )
 
@@ -315,6 +314,56 @@ def test_a_stale_reading_is_unknown_and_the_threshold_is_stated(tmp_path: Path) 
     assert re.search(r"reading is \d+(\.\d+)? min old \(max 20\)", ctx), (
         f"a stale reading must name its age AND the threshold that condemned it: {ctx}"
     )
+
+
+@pytest.mark.parametrize(
+    ("pct", "verdict"),
+    [pytest.param(100.0, "CRITICAL", id="spent"), pytest.param(99.0, "CRITICAL", id="ceiling")],
+)
+def test_a_floor_prints_its_number_and_the_verdict_it_sets(
+    tmp_path: Path, pct: float, verdict: str
+) -> None:
+    """An unchanged number on a spent pool. A bare "7d UNKNOWN" would hide what the gate halts on."""
+    state = tmp_path / "s"
+    collect(state, reading(seven=pct))
+    age_document(state, minutes=25)
+    ctx = context_of(state)
+    assert f"verdict: {verdict}" in ctx and f"at least {pct:.1f}%" in ctx, ctx
+    assert re.search(r"confirmed \d+(\.\d+)? min ago", ctx), ctx
+
+
+def test_a_live_session_repeating_a_spent_reading_prints_it_as_current(tmp_path: Path) -> None:
+    """The counter rose, so the session has just called the API and the old age is gone."""
+    state = tmp_path / "s"
+    seven = window(100.0, 200000)
+
+    def fire(api_ms: int) -> None:
+        cost = {"total_api_duration_ms": api_ms}
+        collect(state, {"session_id": "S", "cost": cost, "rate_limits": {"seven_day": seven}})
+
+    fire(1000)
+    age_document(state, minutes=25)
+    fire(2000)
+    ctx = context_of(state)
+    assert (
+        "verdict: CRITICAL" in ctx
+        and "100.0% used" in ctx
+        and "at least" not in ctx.split("Ages")[0]
+    ), ctx
+
+
+def test_a_floor_below_the_warn_band_still_prints_its_number(tmp_path: Path) -> None:
+    state = tmp_path / "s"
+    collect(state, reading(seven=70.0))
+    age_document(state, minutes=25)
+    p = state / "latest.json"
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    root = str(state.parent)
+    doc["published_by"]["config_root_env"] = root
+    doc["seven_day"]["config_root_env"] = root
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    ctx = context_of(state)
+    assert "verdict: UNKNOWN" in ctx and "at least 70.0%" in ctx, ctx
 
 
 def test_an_unreadable_source_says_so_rather_than_going_quiet(tmp_path: Path) -> None:
@@ -980,7 +1029,17 @@ def test_a_repeat_prints_one_short_line_and_a_change_prints_the_block(tmp_path: 
     of firings with the repeat check off, which must both print in full, so the assertion can see a
     repeated block and is not merely failing on a parameter the old hook lacked."""
     state, dedup = tmp_path / "state", tmp_path / "dedup"
-    collect(state, reading(seven=42.0))
+    # ONE RESET, PINNED. reading() recomputes it from the clock, so a later fire names a later reset,
+    # which the collector takes as a new window. That once let a falling number land here unnoticed,
+    # and kept a burn rate out of the verdict. The rate is not under test here, so its rows go.
+    reset = int(time.time()) + 200000
+
+    def fire(pct: float, resets_at: int = reset) -> None:
+        seven = {"used_percentage": pct, "resets_at": resets_at}
+        collect(state, {"session_id": "fixture", "rate_limits": {"seven_day": seven}})
+        (state / "history.jsonl").unlink(missing_ok=True)
+
+    fire(42.0)
     for _ in range(2):
         assert is_full(dedup_context(state, None)), (
             "control: with no -DedupDir every firing is full"
@@ -994,19 +1053,24 @@ def test_a_repeat_prints_one_short_line_and_a_change_prints_the_block(tmp_path: 
     assert len(again.encode()) < 100, again
 
     # Still OK, but the number moved from the 40s to the 50s, so the block prints again.
-    collect(state, reading(seven=55.0))
+    fire(55.0)
     moved = dedup_context(state, dedup)
     assert is_full(moved) and "55.0%" in moved, moved
     assert is_repeat(dedup_context(state, dedup), "OK")
 
     # A WORSE state is never hidden: OK to WARN prints in full, and so does every WARN after it.
-    collect(state, reading(seven=90.0))
+    fire(90.0)
     for _ in range(2):
         warn = dedup_context(state, dedup)
         assert is_full(warn) and "verdict: WARN" in warn, warn
 
-    # Back to an OK this session saw before WARN: the last thing it saw was WARN, so it is a change.
-    collect(state, reading(seven=55.0))
+    # Inside one reset the highest reading binds, so a lower number on it changes nothing.
+    fire(55.0)
+    assert "verdict: WARN" in dedup_context(state, dedup)
+
+    # Back to an OK this session saw before WARN, on a new window this time: the last thing it saw was
+    # WARN, so it is a change.
+    fire(55.0, reset + 100000)
     assert is_full(dedup_context(state, dedup))
 
     # Another session, or a subagent inside this one, has seen nothing, so it gets the block.
