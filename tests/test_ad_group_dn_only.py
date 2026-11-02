@@ -309,8 +309,11 @@ _MAX_LINEAR_RATIO = 8.0
 def _attempt_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
     """One attempt, read by the shared growth instrument with the collector off.
 
-    :func:`_growth_between` times both sizes in equal windows, in an order drawn per round, so a
-    stretch of runner contention lands on both sizes rather than on one phase of the attempt."""
+    :func:`_growth_between` repeats the small call until it covers as much input as one large
+    call, and draws the order per round, so a stretch of runner contention lands on both sizes
+    rather than on a run of one. For a quadratic judge the large call still takes about four times
+    the small block; that docstring says the bias left raises the ratio, the way the control
+    needs."""
     was_enabled = gc.isenabled()
     gc.disable()
     try:
@@ -334,11 +337,16 @@ def _scaling_ratio(
     slows both sizes alike, so the ratio still tells linear from quadratic.
 
     Noise moves a ratio both ways, so each side takes up to three attempts, keeps its best and
-    stops at the first that clears the line. A linear check keeps the lowest: a preemption during
-    the large phase cannot fake a curve. The quadratic control, ``expect_quadratic``, keeps the
-    highest: a preemption during the small phase depresses the ratio, and CI measured a quadratic
-    parser at 6.2 to 8.0 while the lowest of three was kept (BACKLOG #3452). Noise does make a
-    quadratic parser look linear on one attempt; it does not on all three."""
+    stops at the first that clears the line. A linear check keeps the lowest, so contention that
+    slows the large input cannot fake a curve. The quadratic control, ``expect_quadratic``, keeps
+    the highest, so contention that slows the small input cannot hide one. The earlier form timed
+    3 large runs and then 7 small ones of about 1.6 ms, a window of about 11 ms that one stretch of
+    contention could cover whole, and CI read the control at 6.2 to 8.0 while it kept the lowest
+    of three (BACKLOG #3452).
+
+    What that buys and costs: the control shows this instrument reads a quadratic parser as
+    quadratic. It does not show that the linear check, which stops at its first attempt under the
+    line, catches one on every run; a depressed first attempt could let one through once."""
     small, large = make(k), make(4 * k)
     keep, cleared = (max, operator.gt) if expect_quadratic else (min, operator.lt)
     ratio = 0.0 if expect_quadratic else math.inf
@@ -366,9 +374,9 @@ def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
     """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
 
     This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
-    start at each separator. Its work grows with the square of the length. At ``k`` = 4,000 the
-    small phase takes tens of milliseconds, long enough that one scheduler blip does not halve
-    it; at 1,000 it took under 2 ms (BACKLOG #3452)."""
+    start at each separator. Its work grows with the square of the length. At ``k`` = 4,000 one
+    small call takes tens of milliseconds; at 1,000 it took under 2 ms, and all seven small runs
+    fit inside one stretch of contention (BACKLOG #3452)."""
 
     def quadratic(text: str) -> None:
         for end in range(100, len(text) + 1, 100):
@@ -386,6 +394,7 @@ def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...])
     taken: list[float] = []
 
     def read(judge: Callable[[str], object], small: str, large: str) -> float:
+        assert len(taken) < len(readings), f"more than {len(readings)} attempts"
         taken.append(next(pending))
         return taken[-1]
 
@@ -408,12 +417,28 @@ def test_the_quadratic_control_fails_when_the_check_sees_linear_scaling(
 
 
 def test_the_quadratic_control_keeps_its_highest_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The mirror of the linear check's aggregation (BACKLOG #3452): one attempt depressed by a
-    blip in its small phase must not fail the control when the next one clears the line, and the
-    control stops measuring once one has."""
+    """The mirror of the linear check's aggregation (BACKLOG #3452): one attempt depressed by
+    contention on the small input must not fail the control when the next one clears the line,
+    and the control stops measuring once one has."""
     taken = _stub_attempts(monkeypatch, (6.2, 15.8, 4.0))
     test_the_linear_time_check_fails_a_quadratic_parser()
     assert taken == [6.2, 15.8]
+
+
+@pytest.mark.parametrize(
+    ("attempts", "kept", "spent"),
+    [((9.0, 3.9, 20.0), 3.9, 2), ((9.0, 12.0, 10.0), 9.0, 3)],
+    ids=["clears", "never-clears"],
+)
+def test_the_linear_check_keeps_its_lowest_attempt(
+    monkeypatch: pytest.MonkeyPatch, attempts: tuple[float, ...], kept: float, spent: int
+) -> None:
+    """The branch the control no longer runs (BACKLOG #3452): the linear check keeps the lowest
+    attempt and stops at the first under the line, and one that never gets under it reads over
+    the line, so the linear test fails it."""
+    taken = _stub_attempts(monkeypatch, attempts)
+    ratio = _scaling_ratio(canonical_group_dn, _PATHOLOGICAL_DNS["many-rdns"][0], 4_000)
+    assert (ratio, taken) == (kept, list(attempts[:spent]))
 
 
 def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFixture) -> None:
