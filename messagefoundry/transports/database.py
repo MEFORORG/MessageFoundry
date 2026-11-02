@@ -1545,7 +1545,8 @@ _SQL_WRITE_KEYWORDS = frozenset(
 
 # Keywords that are also ordinary scalar FUNCTIONS in a dialect the generic ODBC path can reach, so a
 # `(` IMMEDIATELY after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)`
-# and `TRUNCATE(n,d)`, and by default MySQL wants no space between a built-in's name and its `(`.
+# and `TRUNCATE(n,d)`. Requiring the `(` right after the name, with no space, is this gate's own
+# fail-closed choice, not a MySQL rule: MySQL accepts `TRUNCATE (1.2, 2)`, and the gate refuses it.
 # Only `dialect='generic'` gets the exemption. The SQL Server preset never does: SQL Server has no
 # native function of either name, and an ODBC scalar escape (`{fn TRUNCATE(x, 2)}`), which its
 # driver does translate, is refused with the rest, failing closed. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL

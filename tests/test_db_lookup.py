@@ -506,7 +506,7 @@ _FUNCTION_FORM_BYPASSES = [
     "SELECT 1 INSERT/**/(mrn) VALUES (1)",
     "SELECT 1 INSERT--x\n(mrn) VALUES (1)",
     "SELECT 1 TRUNCATE [patients](x)",
-    # Whitespace is not "immediately": MySQL's default also wants the `(` against the name.
+    # Whitespace is not "immediately". MySQL would accept a space; the gate refuses it, failing closed.
     "SELECT 1 INSERT (mrn) VALUES (1)",
 ]
 

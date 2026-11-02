@@ -165,11 +165,12 @@ def test_the_poll_test_admits_mysql_scalar_insert_on_the_generic_dialect_only() 
     assert database._read_only_poll_refusal(poll, dialect="generic") is None
 
 
-def test_an_env_dialect_defers_the_poll_test_to_the_build() -> None:
-    """A dialect that is not a literal is not guessed at declaration; the build tests the statement
-    with the resolved dialect.
+def test_an_env_dialect_poll_is_tested_as_generic_when_declared() -> None:
+    """A dialect that is not a literal is tested as ``generic`` at declaration, the permissive
+    superset: it admits MySQL's scalar ``INSERT()``, which the build re-tests with the resolved
+    dialect, and still refuses every write, as origin/main did with its single test.
 
-    Red mutation: test an unresolved dialect as sqlserver at declaration and this raises."""
+    Red mutation: skip the declaration test for a non-literal dialect and the UPDATE poll declares."""
     from messagefoundry.config.wiring import env
 
     poll = "SELECT id, INSERT(payload, 1, 0, 'x') AS payload FROM mf_inbox"
@@ -180,3 +181,11 @@ def test_an_env_dialect_defers_the_poll_test_to_the_build() -> None:
         mark_statement=_MARK,
     )
     assert spec.settings["poll_statement"] == poll
+    with pytest.raises(WiringError) as info:
+        DatabasePoll(
+            server="sql.example.com",
+            poll_statement="UPDATE mf_inbox SET status='CLAIMED' WHERE status='NEW'",
+            dialect=env("DB_DIALECT"),  # type: ignore[arg-type]
+            mark_statement=_MARK,
+        )
+    _assert_refusal_text(str(info.value))
