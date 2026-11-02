@@ -2272,6 +2272,8 @@ class _ForeignDictError(Exception):
 def test_an_unreadable_dict_withholds_its_own_element_not_the_whole_argument() -> None:
     # Review of vault BACKLOG #3340: the large-__dict__ check read the reader outside the try,
     # so its TypeError ended the scan and the whole argument was withheld, not one element.
+    with pytest.raises(TypeError):  # control: its own reader raises
+        vars(_ForeignDictError())
     record = _record("got %s", ([_ForeignDictError(), _encode_error()],))
     RedactionFilter().filter(record)
     out = record.getMessage()
@@ -2324,7 +2326,7 @@ def test_a_python_class_dict_reader_never_prints_a_codec_error_whichever_way_it_
 
 @dataclasses.dataclass
 class _ForeignDictData:
-    """A dataclass whose ``__dict__`` reader is another class's, so reading it raises."""
+    """A dataclass whose ``__dict__`` reader is another type's, so reading it raises."""
 
     value: int = 0
     __dict__ = _FOREIGN_DICT
