@@ -1180,7 +1180,10 @@ def test_a_code_set_rename_and_remove_ride_out_a_momentary_hold(
     path = _code_set(tmp_path)
     real_replace = os.replace
     real_unlink = Path.unlink
-    refusals = [_Held(restricted_file.WINERROR_SHARING_VIOLATION) for _ in range(2)]
+    refusals = [
+        _Held(restricted_file.WINERROR_SHARING_VIOLATION),
+        _Held(restricted_file.WINERROR_SHARING_VIOLATION),
+    ]
 
     def held_replace(src: Any, dst: Any) -> None:
         if len(refusals) == 2:

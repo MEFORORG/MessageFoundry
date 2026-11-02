@@ -2609,8 +2609,8 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   reference with a default would take that default, with no refusal;
 - a DR backup bundle's config digest is a separate, ordinary read, not the digest above, and it
   can be partial. `include_config` under
-  [`[backup]`](CONFIGURATION.md#backup--scheduled-dr-backup--restore-verify) says what the backup
-  records of that, and what it does not;
+  [`[backup]`](CONFIGURATION.md#backup--scheduled-dr-backup--restore-verify) gives at least part
+  of what the backup records of that, and of what it does not;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a repeat after an edit files a second hold and leaves the first pending. The first is refused
