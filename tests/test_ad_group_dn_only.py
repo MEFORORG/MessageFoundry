@@ -329,8 +329,9 @@ def _scaling_ratio(judge: Callable[[str], object], make: Callable[[int], str], k
     50,000-character linear pass that takes milliseconds locally (BACKLOG #2610). A slow runner
     slows both sizes alike, so the ratio still tells linear from quadratic.
 
-    Each size keeps its fastest timing, and a ratio over the line is measured again, up to three
-    attempts, so one preemption cannot fake a curve. The linear tests and their quadratic control
+    Each size keeps its fastest sample, where a small sample is a block of calls (see
+    :func:`_attempt_ratio`). A ratio over the line is measured again, up to three attempts, so one
+    preemption cannot fake a curve. The linear tests and their quadratic control
     run this one rule. A parser fails the linear check only if every attempt reads over the line,
     so that is what the control must show for a quadratic one.
 
