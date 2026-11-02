@@ -218,6 +218,7 @@ import asyncio
 import contextlib
 import errno
 import hashlib
+import io
 import json
 import logging
 import os
@@ -504,8 +505,8 @@ _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: literals; ``tests/test_trust_anchors.py`` compares the two exactly. Public because the refusals
 #: in ``pki`` and ``transports.database`` that use :func:`has_encryption_header_bytes` quote it too.
 ENCRYPTION_HEADER_SCOPE = (
-    "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
-    "its PEM text, even outside a block, as in a comment"
+    'names an encryption header ("Proc-Type:" or "DEK-Info:", in any case) somewhere after the '
+    "first -----BEGIN in its PEM text, even outside a block, as in a comment"
 )
 #: The tail of every private-key PEM label OpenSSL writes, lower-cased: ``PRIVATE KEY``,
 #: ``ENCRYPTED PRIVATE KEY``, ``RSA PRIVATE KEY``, ``EC PRIVATE KEY`` and the rest (BACKLOG #3745).
@@ -609,9 +610,16 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     block from ``cafile=``. Stripping it anywhere else would trust a certificate ``cafile=`` never
     loaded. ``tests/test_trust_anchor_byte_binding.py`` holds the shapes against ``cafile=``.
 
-    Every line from ``-----BEGIN`` to ``-----END`` is kept exactly. A non-ASCII byte there refuses,
-    as ``cafile=`` refuses it (``PEM lib``). The text is derived from ``data`` alone and nothing here
-    opens a file, which is the point.
+    A line ends at an LF alone, as in OpenSSL's reader, so a lone CR does not end one, and dropping
+    a line never shows OpenSSL a block hidden behind a CR. A line holding ``-----BEGIN `` anywhere
+    opens a block for this rule, since OpenSSL finds a BEGIN mid-line in a long line, and the block
+    runs to the next line starting ``-----END``. The exception is a lone BEGIN straight behind a
+    byte-order mark this keeps, which hides that block as above. Every line of a block is kept
+    exactly, so a non-ASCII byte there refuses. That is stricter than ``cafile=`` in at least two
+    shapes. Measured, ``cafile=`` loads a block whose first line after the BEGIN holds no base64
+    byte, and a file with a comment that holds a BEGIN and a non-ASCII line under it. Both refuse
+    here. Further down a block, ``cafile=`` refuses a non-ASCII line too (``PEM lib``). The text is
+    derived from ``data`` alone and nothing here opens a file, which is the point.
 
     **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
     string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
@@ -665,13 +673,14 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     ``EC PRIVATE KEY``, passed every check and sat in a file the engine reads as public trust
     material. :func:`has_private_key_label` says what it matches; it reads the raw bytes, so a
     non-ASCII line the load never sees is checked here. A legacy-encrypted key is refused by the
-    header check first, with that check's text."""
+    header check first, with that check's text. Both checks run ahead of the non-ASCII refusal, so
+    a block that holds a non-ASCII byte as well still names the header or the key."""
     kept: list[bytes] = []
 
     inside = False
     blocks = 0
     fresh = True  # the first line, or the line after an END line: where OpenSSL drops a BOM
-    for raw in data.splitlines(keepends=True):
+    for raw in io.BytesIO(data):  # splits at LF alone; bytes.splitlines also splits at a lone CR
         line = raw[len(_UTF8_BOM) :] if fresh and raw.startswith(_UTF8_BOM) else raw
         fresh = False
         if line.startswith(_PEM_TRUSTED):
@@ -682,26 +691,23 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
                 "certificate per run"
             )
         if line.startswith(_PEM_BEGIN):
-            inside = True
             blocks += 1
+        # Any BEGIN, rather than a model of OpenSSL's 254-byte pieces, so this errs towards a
+        # refusal. A BEGIN straight behind a mark does not count: a mark still here hides it.
+        opens = _PEM_BEGIN in line.removeprefix(_UTF8_BOM + _PEM_BEGIN)
+        inside = inside or opens
         if inside or line.isascii():
             kept.append(line)
         if line.startswith(_PEM_END):
-            inside = False
+            inside = opens  # an END and a BEGIN on one line: OpenSSL may read the BEGIN past 254
             fresh = True
     if not blocks:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust"
         )
-    try:
-        text = b"".join(kept).decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
-            "block, so it is not a readable certificate"
-        ) from exc
-    if has_encryption_header(text):
+    joined = b"".join(kept)
+    if has_encryption_header_bytes(joined):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
             "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
@@ -711,6 +717,13 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "or export the CA certificate as a plain CERTIFICATE block"
         )
     _refuse_a_private_key(data, spec)
+    try:
+        text = joined.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
+            "block, or on a line with a -----BEGIN in it, so it is not a readable certificate"
+        ) from exc
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
