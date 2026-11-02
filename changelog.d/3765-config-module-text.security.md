@@ -13,8 +13,11 @@
   it, or on anything it wraps, is rebuilt the same way. A slice of the text, text copied before
   the raise, or text of any length made only of letters, digits, `_` and `-` with another such
   character touching it, is not caught: that last is what keeps an argument such as `tls` from
-  rewriting the connection name `IB_tls`. Text with any other character in it, such as `'tls'` with
-  its quotes or a value of several words, is replaced wherever it appears. So is text equal to a whole
+  rewriting the connection name `IB_tls`. Text of three characters or more with any other character
+  in it, such as `'tls'` with its quotes or a value of several words, is replaced wherever it appears;
+  text under three characters is not replaced at all, so `p@x` goes and `p@` prints. A chain of more
+  than 1024 exceptions is not read to its end, so that refusal's whole text is withheld and the module
+  is refused. Text of three characters or more equal to a whole
   identifier or word of the refusal, such as a connection named `tls` or the setting
   `source_ip_allowlist`, which loses that identifier or word. Quotations that overlap become one
   marker. In a config module, at least the `tls_ca_pin`, `intake_auth`,

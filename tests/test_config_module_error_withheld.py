@@ -35,11 +35,14 @@ from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config, validate_config
 from messagefoundry.exception_origin import (
+    ExceptionChainTooLong,
+    exception_chain,
     raised_by_the_engine,
     raised_only_by_the_engine,
     worded_by_the_engine,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.privilege_probes import excused_failure
 
 #: Assembled at run time: the text a config module raises, which must never be echoed.
 NEEDLE = "-".join(["planted", "module", "text", "7f3a"])
@@ -1659,6 +1662,48 @@ def test_overlapping_quotations_become_one_marker_with_no_head_or_tail_left() ->
     assert wiring._withhold_quotations("SECRETport=plantedxxxxx", quoted) == (
         "[ValueError text withheld]"
     )
+
+
+@pytest.mark.timeout(20)
+def test_a_chain_with_no_end_ends_the_walk_and_the_module_is_refused(tmp_path: Path) -> None:
+    # A `reason` property returning a new exception on every read would keep the walk going forever,
+    # with memory growing. What was read is not the whole chain, so the whole refusal is withheld.
+    body = (
+        "from messagefoundry import Http\n\n"
+        "class Endless(Exception):\n"
+        "    @property\n"
+        "    def reason(self):\n"
+        f"        return Endless({NEEDLE!r})\n\n"
+        f"try:\n    raise Endless({NEEDLE!r})\nexcept Endless:\n    {_REFUSED_FACTORY}\n"
+    )
+    _write(tmp_path, "feed.py", body)
+    err = _load_error(tmp_path)
+    assert str(err).startswith(_NAMED) and "withheld" in str(err)
+    assert NEEDLE not in str(err)
+    assert err.__cause__ is None and err.__context__ is None
+
+
+def test_the_chain_walk_reads_a_long_real_chain_and_refuses_past_its_limit() -> None:
+    def chained(length: int) -> Exception:
+        exc = Exception()
+        for _ in range(length - 1):
+            outer = Exception()
+            outer.__cause__ = exc
+            exc = outer
+        return exc
+
+    assert len(list(exception_chain(chained(1024)))) == 1024
+    with pytest.raises(ExceptionChainTooLong):
+        list(exception_chain(chained(1025)))
+
+
+def test_a_chain_not_read_to_its_end_excuses_nothing_in_a_privilege_probe() -> None:
+    exc = ConnectionError()
+    for _ in range(1025):
+        outer = ConnectionError()
+        outer.__cause__ = exc
+        exc = outer
+    assert not excused_failure(exc)
 
 
 def test_overlap_is_judged_as_one_span_against_the_token_rule() -> None:

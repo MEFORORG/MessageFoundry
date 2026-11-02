@@ -39,6 +39,7 @@ from types import TracebackType
 from typing import Any, Final
 
 __all__ = [
+    "ExceptionChainTooLong",
     "exception_chain",
     "raised_by_the_engine",
     "raised_only_by_the_engine",
@@ -57,17 +58,30 @@ _ENGINE_DIR: Final = os.path.dirname(__file__) + os.sep
 #: Third-party code shipped inside the package. A ``raise`` there is not the engine's wording.
 _VENDORED_DIR: Final = f"{_ENGINE_DIR}_vendor{os.sep}"
 
+#: Far past any real chain. A class's ``reason`` property can return a new exception on every read,
+#: and with no limit a walk of that never ends.
+_CHAIN_LIMIT: Final = 1024
+
+
+class ExceptionChainTooLong(Exception):
+    """:func:`exception_chain` passed :data:`_CHAIN_LIMIT` links, so what it read is not all there is."""
+
 
 def exception_chain(exc: BaseException) -> Iterator[BaseException]:
     """``exc`` and at least these it wraps: its cause and context, an exception group's members, and
     the exceptions urllib3 and requests keep in ``args``, ``reason`` and ``original_error``. Each is
-    visited once."""
+    visited once.
+
+    Past :data:`_CHAIN_LIMIT` links this raises :class:`ExceptionChainTooLong` rather than stop
+    quietly, because a caller judging the chain would judge the part it saw as the whole of it."""
     seen: set[int] = set()
     todo: list[BaseException] = [exc]
     while todo:
         e = todo.pop()
         if id(e) in seen:
             continue
+        if len(seen) >= _CHAIN_LIMIT:
+            raise ExceptionChainTooLong
         seen.add(id(e))
         yield e
         inner: list[object] = [e.__cause__, e.__context__, *e.args]

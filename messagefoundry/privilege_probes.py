@@ -41,7 +41,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
-from messagefoundry.exception_origin import exception_chain, raised_by_the_engine
+from messagefoundry.exception_origin import (
+    ExceptionChainTooLong,
+    exception_chain,
+    raised_by_the_engine,
+)
 from messagefoundry.privilege_check import vault_admin_paths
 from messagefoundry.transports.bounded_read import TruncatedResponseError
 
@@ -134,7 +138,10 @@ def excused_failure(exc: BaseException) -> bool:
     (:func:`~messagefoundry.privilege_check.vault_preflight_outcome`)."""
     if _is_forbidden(exc):
         return True
-    chain = list(exception_chain(exc))
+    try:
+        chain = list(exception_chain(exc))
+    except ExceptionChainTooLong:  # a chain not read to its end excuses nothing
+        return False
     if any(_is_ssl(e, "SSLError") and not _is_ssl(e, "SSLEOFError") for e in chain):
         return False
     if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror, TruncatedResponseError)):

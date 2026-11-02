@@ -7197,8 +7197,9 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
     A code-first author may pass the bare string (``content_type="x12"``) rather than the enum member;
     coerce it here, at the one shared inbound boundary, so a raw string can't flow into the pipeline and
     blow up later as ``'str' object has no attribute 'value'`` deep in dry-run. An unrecognized value
-    fails loud as a :class:`WiringError` naming the connection and the allowed values — the same loud
-    failure the ``connections.toml`` loader already gives. A member passed in is returned unchanged."""
+    fails loud as a :class:`WiringError` naming the connection and the allowed values, and not quoting
+    the value. The ``connections.toml`` loader's own failure for this key (``connections_file._enum``)
+    is as loud and does quote it. A member passed in is returned unchanged."""
     if isinstance(content_type, ContentType):
         return content_type
     # Tested rather than caught: the enum's error quotes the value, and it would ride the chain.
