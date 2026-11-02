@@ -685,6 +685,7 @@ class X12Source(SourceConnector):
             max_connections=self.max_connections,
             max_connections_per_host=self.max_connections_per_host,
             source_ip_allowlist=self.source_ip_allowlist,
+            name=config.name or "",
         )
         # Live client writers + handler tasks so stop()/reload can actively close connections (H-2).
         self._clients: set[asyncio.StreamWriter] = set()

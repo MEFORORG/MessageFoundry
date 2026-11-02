@@ -875,6 +875,7 @@ class HttpSource(SourceConnector):
             max_connections=self.max_connections,
             max_connections_per_host=self.max_connections_per_host,
             source_ip_allowlist=self.source_ip_allowlist,
+            name=config.name or "",
         )
         # Live client writers + handler tasks so stop()/reload can actively close established
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).

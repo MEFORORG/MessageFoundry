@@ -1521,7 +1521,7 @@ def _managed_teardown_steps(
     background: Sequence[asyncio.Future[None]],
     upload_retention_runner: UploadRetentionRunner | None,
     security_notifier: SecurityEventNotifier | None,
-    remove_security_signals: Callable[[], None] | None,
+    remove_security_signals: Callable[[], None],
     notifier: NotifierAlertSink | None,
 ) -> list[_TeardownStep]:
     """The managed lifespan's shutdown steps, in order, each optional one left out when its part
@@ -1576,10 +1576,9 @@ def _managed_teardown_steps(
                 "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
             )
         )
-    if remove_security_signals is not None:
-        steps.append(
-            _TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals))
-        )
+    # Before engine.stop(): on an unpinned cluster node the removal raises its posture alert's
+    # inverse, and engine.stop() gives that write a bounded chance before the store closes.
+    steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
     steps.append(
         _TeardownStep(
             "engine.stop()",
@@ -3153,6 +3152,27 @@ def _raise_config_changed(
         )
     except Exception as exc:  # noqa: BLE001 - an alert failure must not change the start
         _log.warning("the config_changed alert could not be raised: %s", safe_exc(exc))
+
+
+def _install_security_signals(
+    engine: Engine,
+    sink: AlertSink,
+    alerts_settings: AlertsSettings | None,
+    cluster_settings: ClusterSettings | None,
+) -> Callable[[], None]:
+    """Install the security-signal layer for the managed lifespan (vault BACKLOG #2613) and
+    return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
+    itself a loosening, and the posture detector, the one it leaves running, is what reports it.
+    The posture subject names this engine process, and an unpinned cluster node, whose id changes
+    on every start, raises the inverse for its own posture alert as it shuts down."""
+    return install_security_signals(
+        sink,
+        SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
+        asyncio.get_running_loop(),
+        identity=lambda: engine.instance_identity,
+        resolve_on_stop=engine.coordinator.is_clustered()
+        and not (cluster_settings is not None and cluster_settings.node_id),
+    )
 
 
 async def _record_a_restore(store: Store, sink: AlertSink) -> None:
@@ -12265,15 +12285,8 @@ def create_managed_app(
         # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
-        signal_settings = alerts_settings or AlertsSettings()
-        remove_security_signals = (
-            install_security_signals(
-                notifier or LoggingAlertSink(),
-                SecuritySignalThresholds.from_settings(signal_settings),
-                asyncio.get_running_loop(),
-            )
-            if signal_settings.security_signals
-            else None
+        remove_security_signals = _install_security_signals(
+            engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings
         )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise

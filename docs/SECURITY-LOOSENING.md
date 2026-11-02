@@ -238,6 +238,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
+| | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`, the window only while any count is above `0`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
@@ -268,7 +269,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
+`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals` and its counts,
+`[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
 `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
 `[alerts].email_tls_revocation_attested`, `[alerts].webhook_tls_revocation_attested` and
@@ -826,6 +828,30 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Reversible:** yes. Remove the rule or narrow its `event_type`, and restart. Giving it a transport
   is not enough on its own: `mute = true` sends nothing whatever `transports` holds, and an
   `escalate` tier with `transports = []` overrides the base rule once it is reached.
+
+### `[alerts].security_signals = false`, or a detector looser than its default — a security signal raises no alert, or a later one
+Named as `alerts.security_signals`, or, with the layer on, as `alerts.security_signin_failures`,
+`alerts.security_denials`, `alerts.security_body_views`, `alerts.security_export_messages`,
+`alerts.security_peer_refusals` or `alerts.security_window_seconds`, the window only while any
+count is above `0` (vault BACKLOG #2613).
+- **What you lose:** the alert, or an early one. Refused sign-ins, refused requests, stored-body
+  reads and exports still leave audit rows. A refused connection leaves no audit row, and on some
+  paths no log line or `connection_event` row either, so this detector may be its only record.
+  With the layer off a DEBUG log level raises no alert either. The `[alerts]` table of
+  [CONFIGURATION.md](CONFIGURATION.md) says what each detector counts.
+- **What stays:** the posture detector. With the layer off it still runs, so a start that records
+  its loosenings raises `posture_loosened` naming this one.
+- **When acceptable:** a SIEM already reads the audit stream and pages on the same patterns. It
+  does not see refused connections, and with the layer off nothing counts them, so a site that
+  turns the layer off accepts losing that alert. With the layer on, a SIEM on the audit stream is
+  no reason to zero or raise `security_peer_refusals`, since that detector covers what the SIEM
+  cannot see. Raising it is acceptable for a listener that ordinary load holds at a connection
+  cap, which the `security_peer_refusals` row of [CONFIGURATION.md](CONFIGURATION.md) describes.
+  It is one setting for every inbound listener, so on every listener a larger value delays the
+  refusal alert, and suppresses it outright for any burst below the raised threshold. Each
+  listener counts its own refusals; the `[alerts]`
+  table of [CONFIGURATION.md](CONFIGURATION.md) says when alerts share a subject.
+- **Reversible:** yes. Remove the line, or set the default, and restart.
 
 ### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
 > **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a
