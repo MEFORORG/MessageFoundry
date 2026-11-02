@@ -359,7 +359,8 @@ within 20 minutes and before it resets. Only with no rate is 80 percent the back
 there says there is no room. `usage.ps1` skips its check of the statusLine's wiring when it reads
 CRITICAL overall, so a CRITICAL reading the gate grades below the rung is UNKNOWN. A reader that
 does not finish within 30 seconds is UNKNOWN. A window graded HIT stays HIT whatever
-`usage.ps1` reads overall, because downgrading a hit would fail open.
+`usage.ps1` reads overall, because downgrading a hit would fail open. That covers one reading's
+overall state, not its age; the 2026-10-31 amendment below says which hits survive age.
 
 At the rung the answer is HALT. A 5-hour reading `usage.ps1` calls UNKNOWN, or an overall UNKNOWN
 below the rung, answers REVIEW, not HALT:
@@ -411,10 +412,14 @@ roster alias of the Lander.
 > it. So a flat account, live or not, goes stale after 20 minutes and reads UNKNOWN. `usage.ps1`
 > publishes such a reading as `level_floor` when its reset is ahead, its age plus the time to its reset
 > fits one 7-day window, and its provenance is trusted: the document and the window carry a verified
-> root stamp, and the root is wired here. The rung is then hit at the 90 percent level or the 98 percent
+> root stamp, and the root is wired here. At the 98 percent ceiling the provenance test does not apply,
+> because a fresh reading there stops work on any provenance, and an equal reading does not refresh its
+> age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
+> window stamped with another root is still refused. The rung is then hit at the 90 percent level or the
 > ceiling. Every other stale reading answers REVIEW at any level, including at least a future-dated one,
-> an undateable one, a stale one with no reset, and one with no verified stamp. A Desktop session on a
-> root holding such a floor gets HALT, which narrows the gap this section names.
+> an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
+> fresh 95 with no rate on such a root is hit, and the same reading once stale answers REVIEW. A Desktop
+> session on a root holding such a floor gets HALT, which narrows the gap this section names.
 >
 > **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale
 > reading. A fresh 70 percent with 45 minutes to empty hits; the same reading once stale answers REVIEW.
@@ -437,8 +442,11 @@ roster alias of the Lander.
 >   99 over a published 89 cannot raise the number, so the rung does not hit on it until a reading that
 >   carries a reset arrives.
 > - A `level_floor` holds only while the published reset is right. After a re-login or a moved reset, a
->   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. Only a
->   new reading clears it, and only an interactive terminal session on that root publishes one.
+>   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. At the
+>   ceiling only a new reading clears it, and only an interactive terminal session on that root publishes
+>   one. Such a floor needs no verified stamp, so on an unpinned root that number may not be this
+>   account's. Below the ceiling a floor also ends when one unpinned fire rewrites the document's stamp,
+>   because the fire is refused but the document is still rewritten; the gate then answers REVIEW.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.

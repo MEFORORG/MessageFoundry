@@ -457,6 +457,10 @@ function Test-WindowResetPassed($w) {
     return [bool]($epoch -and $epoch -le [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
 }
 
+# The band this reader calls "at the ceiling". A fresh reading here stops work on any provenance, so a
+# stale one with its reset ahead must too; see level_floor below. Get-DecisionCostRung holds its own 98.
+$CeilingPct = 98
+
 function Get-WindowReport($w, [string]$ReadRoot) {
     $Label = "weekly (7d)"
     if (-not $w) {
@@ -496,8 +500,9 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         projected_at_reset = $null
         minutes_to_empty = $null
         # Set only on a reading past -MaxAgeMinutes with its reset ahead and inside one 7-day window, and
-        # with trusted provenance. Usage does not fall inside a reset period, so such a reading says the
-        # window has reached at least this level, unless the reset has moved or usage did fall.
+        # with trusted provenance unless it is at the ceiling. Usage does not fall inside a reset period,
+        # so such a reading says the window has reached at least this level, unless the reset has moved
+        # or usage did fall.
         # Get-DecisionCostRung halts on it at the level or the ceiling, and nothing else reads it.
         # At least a future date, an undateable reading and one with no reset set nothing.
         level_floor      = $null
@@ -522,9 +527,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         else { "reading is $age min old (max $MaxAgeMinutes)" }
         # A window lasts 10080 minutes, so a reading older than that before its reset cannot belong to
         # that reset. The one minute is the rounding of the two values added here. An unstamped window
-        # cannot be tied to this account; the document's stamp and the wiring are tested below.
+        # cannot be tied to this account, which counts only below the ceiling; the document's stamp and
+        # the wiring are tested below. A window stamped with another root returned above.
         $fitsAWeek = $null -ne $minsToReset -and ($age + $minsToReset) -le 10081
-        if ($age -gt $MaxAgeMinutes -and $fitsAWeek -and $wEnv -and $wEnv -ne "unset") { $o.level_floor = $pct }
+        $stamped = $wEnv -and $wEnv -ne "unset"
+        if ($age -gt $MaxAgeMinutes -and $fitsAWeek -and ($stamped -or $pct -ge $CeilingPct)) { $o.level_floor = $pct }
         return $o
     }
 
@@ -543,7 +550,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     }
 
     # Bands. The question is not "is the number big" but "does it run out before it resets".
-    if ($pct -ge 98) { $o.state = "CRITICAL"; $o.reason = "at the ceiling" }
+    if ($pct -ge $CeilingPct) { $o.state = "CRITICAL"; $o.reason = "at the ceiling" }
     elseif ($null -ne $o.minutes_to_empty -and $null -ne $minsToReset -and $o.minutes_to_empty -lt $minsToReset) {
         $o.state = "CRITICAL"
         $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, $($minsToReset - $o.minutes_to_empty) min before this window resets"
@@ -575,11 +582,15 @@ $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "
 
 $overall = $seven.state
 
-# A FLOOR NEEDS TRUSTED PROVENANCE. It can hold a seat at HALT until the reset, which is too long a
-# deferral on a number this reader cannot tie to this account. So a document with no verified stamp, or
-# a root it does not trust, gets no floor and stays UNKNOWN. An explicit -StateDir is exempt from the
-# wiring half, as it is from the verdict below: the operator named the directory.
-if ($seven.Contains('level_floor') -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
+# BELOW THE CEILING, A FLOOR NEEDS TRUSTED PROVENANCE. It can hold a seat at HALT until the reset, which
+# is too long a deferral on a number this reader cannot tie to this account. So a document with no
+# verified stamp, or a root it does not trust, gets no floor and stays UNKNOWN. An explicit -StateDir is
+# exempt from the wiring half, as it is from the verdict below: the operator named the directory.
+#
+# AT THE CEILING IT DOES NOT. A fresh reading there is a stop on any provenance, and an equal reading
+# does not refresh the age, so this test would turn that stop into REVIEW 21 minutes later with nothing
+# changed. A document or window stamped with another root was refused above and never gets here.
+if ($seven.Contains('level_floor') -and $seven.level_floor -lt $CeilingPct -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
     $seven.level_floor = $null
 }
 

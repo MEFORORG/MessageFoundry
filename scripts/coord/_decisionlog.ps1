@@ -855,18 +855,20 @@ function Get-DecisionCostRung {
       ONLY A LEVEL OR CEILING HIT SURVIVES AGE, AND ONLY ON A level_floor. An equal reading does not
       refresh its age, so a flat pool goes stale, and a spent one cannot rise. usage.ps1 publishes
       level_floor on a stale reading with its reset ahead and inside one 7-day window, and with trusted
-      provenance. Such a reading has reached at least that level, unless the reset has moved or usage
-      did fall, so at the level or the ceiling it is HIT. A rate hit does not survive: nothing is
-      projected from a stale reading, so it has no rate. The level then decides, even where a fresher
-      reading's rate would have cleared it, and a reading the rate would have hit below the level goes
-      to UNKNOWN. Every other stale reading is UNKNOWN, because a stale number cannot clear work.
+      provenance unless it is at the ceiling. Such a reading has reached at least that level, unless
+      the reset has moved or usage did fall, so at the level or the ceiling it is HIT. A rate hit does
+      not survive: nothing is projected from a stale reading, so it has no rate. The level then decides,
+      even where a fresher reading's rate would have cleared it, and a reading the rate would have hit
+      below the level goes to UNKNOWN. Every other stale reading is UNKNOWN, because a stale number
+      cannot clear work. That includes a level hit below the ceiling with no trusted provenance, which
+      goes from HIT to UNKNOWN when it goes stale. A ceiling hit with its reset ahead does not.
 
       UNKNOWN when the reading is missing, stale and not a floor at the rung, refused, past its reset (it
       describes a window that is gone, so it neither clears nor halts), below the rung with no reset
       time (it cannot prove which window it belongs to), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
-      window's own state does not), unless the window grades HIT: a hit is never downgraded, since
-      that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
+      window's own state does not), unless the window grades HIT: the overall state never downgrades
+      a hit, since that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
       CRITICAL reading that this grades below the rung is UNKNOWN too: it may be another root's. A
       reader that does not finish within -TimeoutSeconds is UNKNOWN. A Desktop session that runs no
       statusLine reads UNKNOWN here unless its root holds a level_floor at the rung; the Steward's

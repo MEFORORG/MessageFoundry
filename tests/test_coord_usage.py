@@ -624,6 +624,42 @@ def test_a_stale_reading_with_unverified_provenance_is_no_floor(
     assert read(tmp_path)[1]["seven_day"]["level_floor"] is None
 
 
+@pytest.mark.parametrize(
+    ("pct", "expected"),
+    [
+        pytest.param(97.9, None, id="just-below-the-ceiling"),
+        pytest.param(98.0, 98.0, id="the-ceiling"),
+        pytest.param(100.0, 100.0, id="spent"),
+    ],
+)
+def test_at_the_ceiling_unverified_provenance_still_leaves_a_floor(
+    tmp_path: Path, pct: float, expected: float | None
+) -> None:
+    """A fresh reading at the ceiling stops work on any provenance, and an equal reading does not
+    refresh its age, so without this the stop would decay on an unchanged number."""
+    publish(tmp_path, seven=pct, age_min=21)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] == expected
+
+
+def test_the_ceiling_floor_keeps_the_other_bounds(tmp_path: Path) -> None:
+    """Provenance is the only test the ceiling drops. A fresh, future-dated, gone or over-long
+    reading still sets nothing, and a window stamped with another root is still refused."""
+    publish(tmp_path, seven=100.0)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "fresh"
+    publish(tmp_path, seven=100.0, age_min=-120)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "future-dated"
+    publish(tmp_path, seven=100.0, age_min=75, seven_epoch=int(time.time()) + 10050 * 60)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "does not fit a week"
+    publish(tmp_path, seven=100.0, age_min=75, seven_epoch=int(time.time()) - 60)
+    assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "reset passed"
+
+    publish(tmp_path, seven=100.0, age_min=75)
+    doc = latest(tmp_path)
+    doc["seven_day"]["config_root_env"] = str(tmp_path.parent / "another-root")
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "another root's window"
+
+
 def test_a_root_wired_elsewhere_gets_no_floor_and_a_wired_one_does(fake_home: Path) -> None:
     pin = fake_home / ".claude-account-1"
     publish(pin / "mefor-usage", seven=95.0, age_min=75)

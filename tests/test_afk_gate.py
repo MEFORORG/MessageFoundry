@@ -564,8 +564,7 @@ def test_a_flat_full_pool_held_past_the_age_limit_halts_through_the_real_scripts
     sb: Sandbox, tmp_path: Path
 ) -> None:
     """A spent pool cannot rise, so an equal reading never refreshes its age, and this state is
-    certain. It used to fall to REVIEW until the reset. On a root wired elsewhere the same reading
-    has no trusted provenance, so it stays at REVIEW."""
+    certain. It used to fall to REVIEW until the reset."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
@@ -582,12 +581,71 @@ def test_a_flat_full_pool_held_past_the_age_limit_halts_through_the_real_scripts
     fire()  # the idle session
 
     seed_vault(sb, calibrated("manager"))
-    assert _real_gate(sb, env)[0] == REVIEW, "control: unwired, the floor does not apply"
-
     _wire(sb, root, tmp_path, env)
     code, doc = _real_gate(sb, env)
     # "at least" is the stale floor's own reason. A fresh 100 would also HALT, on the ceiling.
     assert code == HALT and "at least" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    ("first_fire", "second_fire", "wired"),
+    [
+        pytest.param("unpinned", "unpinned", True, id="unpinned-collector"),
+        pytest.param("pinned", "unpinned", True, id="one-unpinned-fire-over-a-pinned-reading"),
+        pytest.param("pinned", "pinned", False, id="root-not-wired"),
+        pytest.param("unpinned", "unpinned", False, id="unpinned-and-not-wired"),
+    ],
+)
+def test_a_stop_at_the_ceiling_does_not_decay_on_an_unchanged_reading(
+    sb: Sandbox, tmp_path: Path, first_fire: str, second_fire: str, wired: bool
+) -> None:
+    """A fresh 100 HALTs on any provenance, because a hit stands whatever usage.ps1 reads overall.
+    An equal reading does not refresh its age, so the same number goes stale in 21 minutes with
+    nothing changed. It used to read REVIEW from there on any root it could not verify."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    reader_env = {"CLAUDE_CONFIG_DIR": str(root)}
+    fire_env = {"pinned": reader_env, "unpinned": {"CLAUDE_CONFIG_DIR": ""}}
+    seven = {"used_percentage": 100, "resets_at": int(ago().timestamp()) + 200000}
+    if wired:
+        _wire(sb, root, tmp_path, reader_env)
+    seed_vault(sb, calibrated("manager"))
+
+    assert _fire(sb, state, seven, fire_env[first_fire]).returncode == 0
+    code, doc = _real_gate(sb, reader_env)
+    assert code == HALT and "At the ceiling" in why(doc), why(doc)
+
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=21).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    assert _fire(sb, state, seven, fire_env[second_fire]).returncode == 0  # the idle session
+
+    code, doc = _real_gate(sb, reader_env)
+    assert code == HALT and "at least" in why(doc), why(doc)
+
+
+def test_a_stop_at_the_ceiling_does_not_decay_on_the_default_root(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """No pin anywhere: the reader names the root from the home directory and the collector stamps
+    ``unset``, which is what a default root's latest.json holds. The 95 is the control: below the
+    ceiling, with nothing to tie the number to this account, the stale reading stays at REVIEW."""
+    home = tmp_path / "home"
+    state = home / ".claude" / "mefor-usage"
+    state.mkdir(parents=True)
+    env = {"CLAUDE_CONFIG_DIR": "", "USERPROFILE": str(home), "HOME": str(home)}
+    seed_vault(sb, calibrated("manager"))
+    for pct, expected in ((95, REVIEW), (100, HALT)):
+        (state / "latest.json").unlink(missing_ok=True)
+        seven = {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 200000}
+        assert _fire(sb, state, seven, env).returncode == 0
+        published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+        assert published["published_by"]["config_root_env"] == "unset"
+        published["seven_day"]["captured_at"] = ago(minutes=21).isoformat().replace("+00:00", "Z")
+        (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+        code, doc = _real_gate(sb, env)
+        assert code == expected, why(doc)
 
 
 def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
