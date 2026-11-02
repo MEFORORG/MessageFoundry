@@ -1,25 +1,8 @@
-# The pool behind a re-measure of the windows-2025 `Tests (pytest)` row of step_margin_baseline.toml, measured 2026-11-02 UTC.
-# Every ci.yml run with event merge_group, pull_request, push or workflow_dispatch created 2026-10-26T00:00:00Z..2026-11-02T18:28:24Z UTC,
-# listed per event in 12-hour slices; jobs read with ?filter=all on 2026-11-02 between about 19:29Z and 19:34Z UTC.
-# It closes at the second before pull_request run 41500903043, which was in progress when listed; every run in the pool
-# had finished. A later re-run of a run in the window adds an attempt this pool does not hold.
-# One line per windows-2025 engine job execution (every attempt), or one no-job line for a run without that job.
-# step_conclusion is the API's, except three values this file adds: no-job (the run has no such job), no-step (the
-# job holds no such step) and unfinished (the step started and never ended: run 40558206270, whose job was cancelled
-# 71:00 after it started with the step still in progress, so the 55:00 step cap never ended it).
-# step_s is the step's completed_at minus started_at, in seconds. keep says whether the line is a row of the pool.
-# job_s and setup_s serve the job-cap re-derivation; the row check reads neither. They are taken from STEP stamps, the
-# first step's start to the last step's end, and to the Tests step's start: on runs created about 2026-11-01T09:00Z
-# the API reports some run and job stamps an hour late, created_at among them, while the step stamps are right. The
-# created_at column keeps the API's value, which the window filter read; the runs it shifts are 41287785200, 41288555635,
-# 41288556823, 41288558135, 41289217735, 41290266818 and 41290943841. job_s is empty where no step ended or one never
-# did, and setup_s is empty for a skipped step.
-# At least these changes land inside the window. From PR 2639 (merged 2026-10-29T23:04:08Z) the timing-quarantine tests leave
-# this step, and a LOW margin is only a warning on merge_group, so gate_conclusion reads success there below 1.30x.
-# From PR 2653 (merged 2026-10-30T15:10:02Z) pull_request warns down to 1.20x. A run takes these from its own tree.
-# NO ROW BINDS THIS FILE YET. The 55:00 `step_timeout` in ci.yml is under 1.30x this pool's worst passing row, so
-# the row cannot land without the cap, and the cap is the owner's (BACKLOG #3515). The row that does bind it states
-# the counts this file reproduces, and says whether the leg is censored at 55:00.
+# The pool behind the windows-2025 `Tests (pytest)` row of step_margin_baseline.toml, measured 2026-11-02 UTC.
+# The row's `source` states the pool, its window, its filter and the counts this file reproduces. The column
+# rules are stated once, in the header of step_margin_pool_windows-2022_2026-11-02.tsv, the same collection's
+# other leg. This leg has no-job and no-step lines and no unfinished line; its one no-step line is run
+# 40558202548, whose job was cancelled before any step ran.
 run_id	event	created_at	job_id	attempt	step_conclusion	step_s	step_clock	job_conclusion	gate_conclusion	keep	job_s	setup_s
 40348432327	pull_request	2026-10-26T15:20:56Z	121661744786	1	success	2371	39:31	success	success	row	2420	43
 40348825613	pull_request	2026-10-26T15:23:23Z	121663226290	1	failure	2179	36:19	failure	success	no-row	2221	37

@@ -881,10 +881,24 @@ jobs:
       # The 24:48 low is same-suite runner variance, not a smaller suite: three consecutive push-to-main
       # runs inside 2h42m gave windows-2025 34:15 / 24:48 / 34:29 while windows-2022 held a 1:00 band.
       #
-      # RE-DERIVE IF a windows-2025 `Tests (pytest)` STEP is ever seen above 40:00, or if any Windows
-      # `test` JOB is ever seen above 50:00 -- those are the triggers, not a calendar reminder. Both are
-      # the 1.2x decay point of their cap (55:00 / 1.2 = 45:50, floored to 40:00 for margin against the
-      # measured drift; 66:00 / 1.2 = 55:00, floored to 50:00). The OLD trigger of 28:00 is retired
+      # THE TWO WINDOWS ROWS WERE RE-DERIVED 2026-11-02, TO 71:00 / JOB 78:00, ONE VALUE FOR BOTH LEGS
+      # (BACKLOG #3515, owner ruling of 2026-11-02). The pools, their n and the windows-2022 censoring
+      # live ONCE, in each leg's row of scripts/ci/step_margin_baseline.toml and the pool files beside
+      # it; this note carries the sizing. ceil_minute(1.35 x 52:01) = ceil(70.22) = 71:00, from the
+      # windows-2025 row. The windows-2022 row, 45:22, gives 62:00 but is censored at 55:00, so both
+      # legs take the larger value, as they took one value before. THE JOB CAP follows the overhead rule
+      # below on this pool: the web console now runs in its own job, so the overhead is the larger of the
+      # worst same-row overhead (2:54 windows-2022, 3:07 windows-2025) and the worst setup (4:08,
+      # windows-2022), and 71 + ceil_minute(1.5 x 4:08) = 71 + 7 = 78. Nesting: 4:08 + 71:00 = 75:08 <
+      # 78:00, gap 2:52. The 2026-08 tables in this note carried 55/66 and are kept for their pool. The
+      # owner ruled on the same day that the sizing rule takes no growth term; the suite is split or
+      # sped up instead.
+      #
+      # RE-DERIVE IF a windows-2025 `Tests (pytest)` STEP is ever seen above 50:00, or if any Windows
+      # `test` JOB is ever seen above 60:00 -- those are the triggers, not a calendar reminder. Both are
+      # the 1.2x decay point of their cap, floored as before (71:00 / 1.2 = 59:10, floored to 50:00 for
+      # margin against the measured drift; 78:00 / 1.2 = 65:00, floored to 60:00). Until 2026-11-02 they
+      # were 40:00 and 50:00, from the 55:00 and 66:00 caps. The OLD trigger of 28:00 is retired
       # because it was already universally exceeded: 58 of 59 passing steps on the day pool cleared it and
       # the median itself sat above it, so it had become a permanently-tripped alarm, which is
       # indistinguishable from no alarm at all.
@@ -2876,8 +2890,8 @@ jobs:
           # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
           # is only the wall -- this sentence named the wall until they were split.
           U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":58,"step_timeout":46,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":23,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":11,"webconsole_step_timeout":15,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":14,"webconsole_step_timeout":19,"webconsole_job_timeout":27,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":78,"step_timeout":71,"webconsole_margin_cap":11,"webconsole_step_timeout":15,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":78,"step_timeout":71,"webconsole_margin_cap":14,"webconsole_step_timeout":19,"webconsole_job_timeout":27,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
