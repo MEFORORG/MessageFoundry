@@ -798,6 +798,8 @@ def test_the_reload_result_page_says_what_the_reload_left_undone() -> None:
     assert "Restart the engine" not in clean and "follow-on step failed" not in clean
     restart = render(restart_required=["[auth].ad_tls_ca_cert_file"])
     assert "Restart the engine" in restart and "[auth].ad_tls_ca_cert_file" in restart
+    assert "This list is not complete" in restart  # vault BACKLOG #3746
+    assert "docs/SECURITY.md in the MessageFoundry repository, at the paragraph" in restart
     degraded = render(degraded=True, failures=["reference_sync"])
     assert "follow-on step failed: reference_sync" in degraded
     assert "Restart the engine" not in render(restart_required=None)  # a dry run did not check

@@ -292,6 +292,8 @@ def _reload_shortfall(
         sentences.append(
             "Restart the engine to apply a changed trust anchor. This reload checked the new file "
             "but does not load it, so the engine still trusts the old CA for: "
-            f"{', '.join(restart_required)}."
+            f"{', '.join(restart_required)}. This list is not complete: see the section "
+            '"Outbound TLS trust anchor" of docs/SECURITY.md in the MessageFoundry repository, at '
+            'the paragraph "What a reload\'s restart_required list covers".'
         )
     return sentences

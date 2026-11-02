@@ -290,7 +290,7 @@ class TrustAnchorError(Exception):
     ``setting`` names what was refused the way :attr:`AnchorSpec.setting` does, such as
     ``inbound connection 'IB_X' tls_ca_file``, with no path: the pin's setting where the pin did
     not parse. The audited check sets it (:func:`_preflight_one`), and so does a reload's lane
-    check (:func:`refused_connection_anchor`). ``None`` where the raiser did not know it. A caller
+    check (:func:`connection_anchor_failure`). ``None`` where the raiser did not know it. A caller
     that may not show the refusal's own text, such as a DR activation's abort, shows this instead
     (vault BACKLOG #3498).
 
@@ -323,7 +323,8 @@ def explicit_cause[E: BaseException](exc: BaseException, kind: type[E]) -> E | N
 
     An implicit ``__context__`` is not followed: an unrelated error raised while a refusal was
     being handled would then lose its own text. A cycle ends the walk. The DR activation's abort
-    and the API's reload and connection-test routes share it (vault BACKLOG #3498)."""
+    and the API's reload, connection-test and connection-control routes share it (vault BACKLOG
+    #3498, #3746)."""
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
@@ -2112,9 +2113,11 @@ class _Baseline(NamedTuple):
 async def _last_fingerprint(store: Store, label: str) -> _Baseline:
     """The most-recently audited fingerprint for ``label``, with the digest it is in, or ``None`` if
     this anchor has never been observed. Reads the ``auth.trust_anchor`` audit rows
-    (most-recent-first), a page at a time, and reads the first matching label's row. Each page ends
-    at the oldest timestamp of the one before, inclusively, so a row at that instant is read twice
-    and never skipped.
+    (most-recent-first), a page at a time, and reads the first matching label's row. Each page
+    starts below the ``id`` the one before ended on, the store's keyset cursor, so no row's ``ts``
+    is read (vault BACKLOG #3746): a page all at one instant, or one ending in a malformed ``ts``,
+    cannot cost the baseline. At least :data:`_FINGERPRINT_PAGES` and a newest row for the label
+    with no text fingerprint still end the look-back early, each read as a first observation.
 
     A row with no ``algorithm`` was written before BACKLOG #3425 and is :data:`UNMARKED_DIGEST`. A
     row naming a digest this release does not compile in is skipped, with one WARNING per call,
@@ -2136,10 +2139,12 @@ async def _last_fingerprint(store: Store, label: str) -> _Baseline:
 async def _last_readable_fingerprint(
     store: Store, label: str, skipped: set[str]
 ) -> Fingerprint | None:
-    until: float | None = None
+    before_id: int | None = None
     for _page in range(_FINGERPRINT_PAGES):
         try:
-            rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+            rows = await store.list_audit(
+                action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, before_id=before_id
+            )
         except _STORE_CALL_DEFECTS:
             raise
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
@@ -2162,10 +2167,7 @@ async def _last_readable_fingerprint(
             return Fingerprint(algorithm, fp) if isinstance(fp, str) else None
         if len(rows) < _FINGERPRINT_PAGE:
             return None
-        oldest = float(rows[-1]["ts"])
-        if until is not None and oldest >= until:
-            return None  # a whole page at one instant: nothing older can be reached this way
-        until = oldest
+        before_id = rows[-1]["id"]
     return None
 
 
@@ -2486,8 +2488,8 @@ def anchor_store_refusal(exc: AnchorStoreUnavailable) -> WiringError:
     """A trust-anchor check the store stopped, as the ``WiringError`` a reload refuses with
     (BACKLOG #3091). Its cause is ``exc``, so the reload routes audit
     ``reason="store_unavailable"`` rather than ``trust_anchor``. Raise it ``from exc``. The
-    settings preflight calls it; the connection checks reach it through
-    :func:`refused_connection_anchor`."""
+    settings preflight and a connection test's check call it; the reload's connection checks
+    reach it through :func:`connection_anchor_failure`."""
     from messagefoundry.config.wiring import WiringError
 
     error = WiringError(f"a trust anchor could not be checked: {exc}")
@@ -2495,12 +2497,12 @@ def anchor_store_refusal(exc: AnchorStoreUnavailable) -> WiringError:
     return error
 
 
-def refused_connection_anchor(exc: Exception, *, setting: str | None = None) -> WiringError:
-    """A connection CA refusal as the ``WiringError`` a reload answers with 422 (BACKLOG #2183).
+def connection_anchor_failure(exc: Exception, *, setting: str | None = None) -> WiringError:
+    """A connection CA check that failed, as the ``WiringError`` a reload raises (BACKLOG #2183).
 
-    Its cause is always a :class:`TrustAnchorError`, so the reload routes audit
-    ``reason="trust_anchor"``. Any other exception, such as a ``ValueError`` for a blank
-    ``tls_ca_pin``, is wrapped in one first, keeping its text. The one exception is
+    A refusal's cause is always a :class:`TrustAnchorError`, so the reload routes audit
+    ``reason="trust_anchor"`` and answer 422. Any other exception, such as a ``ValueError`` for a
+    blank ``tls_ca_pin``, is wrapped in one first, keeping its text. The one exception is
     :class:`AnchorStoreUnavailable`, which is not a refusal: it is answered by
     :func:`anchor_store_refusal`, so the routes audit ``reason="store_unavailable"`` (BACKLOG
     #3091). Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry
@@ -2527,7 +2529,7 @@ def refused_connection_anchor(exc: Exception, *, setting: str | None = None) -> 
 def make_registry_anchor_preflight(store: Store, *, enforcing: bool) -> RegistryAnchorPreflight:
     """The engine's ``registry_preflight`` for ``serve``: the audited check over a graph's
     per-connection CAs (:func:`registry_anchor_specs`), at the first load and at every real reload.
-    A refusal is re-raised as ``WiringError`` (:func:`refused_connection_anchor`), which the reload
+    A refusal is re-raised as ``WiringError`` (:func:`connection_anchor_failure`), which the reload
     route answers with 422 and the first load with a refused start. Dormant when no connection names
     a CA it checks.
 
@@ -2551,7 +2553,7 @@ def make_registry_anchor_preflight(store: Store, *, enforcing: bool) -> Registry
             if store_fault is not None:
                 raise store_fault
         except (TrustAnchorError, AnchorStoreUnavailable, ValueError) as exc:
-            error = refused_connection_anchor(exc)
+            error = connection_anchor_failure(exc)
             raise error from error.__cause__
 
     return preflight
