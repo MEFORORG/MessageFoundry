@@ -31,45 +31,43 @@ _NODE = shutil.which("node")
 #: The bound on ONE harness run, which is what catches a reconnect hang. The harness cannot loop on
 #: its own: ``setTimeout`` only pushes onto ``timers``, ``setInterval`` is a no-op, ``fetch`` never
 #: resolves, and "flush" swaps the due list out (``const due = timers; timers = [];``) before running
-#: it, so a timer that re-arms lands in the NEXT flush. A run that outlives this bound is therefore
-#: app.js spinning synchronously, which is the hang this file must still fail on. Locally a run takes
-#: about 0.05 s.
+#: it, so a timer that re-arms lands in the NEXT flush. So once the cold start below is paid, a run
+#: that outlives this bound is app.js spinning synchronously -- the hang this file must still fail
+#: on -- or node itself stalling again, which this bound cannot tell apart. Locally a run takes about
+#: 0.05 s.
 _RUN_TIMEOUT_S = 60
 
-#: The bound on the FIRST node launch of the job, kept apart from the run bound above. On
-#: windows-2025 under xdist the first launch of the image's node.exe has stalled past 60 s twice
-#: (merge-queue evictions, BACKLOG #4773): run 41141529043 lost the first of this file's four
-#: launches and run 41490064678 the first two; every later launch in both jobs, the same harness
-#: over the same app.js, passed. No other file in this suite starts node. So the stall is node's
-#: first launch, not app.js -- an inference, since the logs carry no per-launch timing. Unlike the
-#: never-returning pwsh launch BACKLOG #1304 records, this stall ended, so a longer bound on the
-#: cold start alone absorbs it. Run 41490064678 puts it over 120 s and under about 180 s.
+#: The bound on the job's FIRST harness run, kept apart from the run bound above. On windows-2025
+#: under xdist the first node launch of the web console job has stalled past 60 s twice (merge-queue
+#: evictions, BACKLOG #4773): run 41141529043 lost the first of this file's four launches and run
+#: 41490064678 the first two; every later launch in both jobs, the same harness over the same app.js,
+#: passed. No other file in this suite starts node. So the cost is a first-launch one -- an
+#: inference, since the logs carry no per-launch timing, and it may be node.exe or the first read of
+#: the script files, so the warm-up runs the real harness over the real app.js. Unlike the
+#: never-returning pwsh launch BACKLOG #1304 records, this stall ended, so a longer bound on the cold
+#: start alone absorbs it. Run 41490064678 puts it over 120 s and under about 180 s.
 _COLD_START_TIMEOUT_S = 240
 
 pytestmark = [
     pytest.mark.skipif(_NODE is None, reason="node is not installed"),
-    # The cold start is charged to the first test's setup, so the CI tier's --timeout=120 (60 in
-    # pyproject) would kill the worker through --timeout-method=thread with no test named. One cold
-    # start plus one run, plus 60 s of slack, lets each subprocess bound fire first and name its
-    # command.
+    # The cold start is charged to the setup of the module's first test. Under the per-test
+    # --timeout (120 on the Windows CI tiers, 60 on ubuntu and in pyproject), pytest-timeout's
+    # thread method would kill the worker before the cold-start bound fires, losing the
+    # TimeoutExpired that names the stalled command. One cold start plus one run, plus 60 s of slack,
+    # lets each subprocess bound fire first. A cold start past the step's faulthandler_timeout (150 s
+    # on Windows) writes a stack dump to the log that is not a failure: the dump does not end the run.
     pytest.mark.timeout(_COLD_START_TIMEOUT_S + _RUN_TIMEOUT_S + 60),
 ]
 
 
 def _node(*args: str, timeout: int) -> str:
-    """Run node with ``args`` under ``timeout`` seconds; return its stdout, failing on a non-zero exit."""
+    """Run node with ``args`` under ``timeout`` s; return stdout, failing on a non-zero exit."""
     assert _NODE is not None
     proc = subprocess.run(
         [_NODE, *args], capture_output=True, text=True, timeout=timeout, check=False
     )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _node_started() -> None:
-    """Pay node's cold-start cost once, outside the harness's own bound."""
-    _node("-e", "0", timeout=_COLD_START_TIMEOUT_S)
 
 
 #: Loads app.js against just enough of a browser for the [data-poll] feature, then runs a scenario:
@@ -132,38 +130,47 @@ console.log(JSON.stringify(out));
 """
 
 
-def _run(scenario: list[str], tmp_path: Path) -> list[int]:
-    harness = tmp_path / "harness.js"
-    harness.write_text(_HARNESS, encoding="utf-8")
-    out = _node(str(harness), str(_APP_JS), json.dumps(scenario), timeout=_RUN_TIMEOUT_S)
+def _run(scenario: list[str], harness: Path, timeout: int = _RUN_TIMEOUT_S) -> list[int]:
+    out = _node(str(harness), str(_APP_JS), json.dumps(scenario), timeout=timeout)
     counts: list[int] = json.loads(out.strip().splitlines()[-1])
     return counts
 
 
-def test_a_dropped_socket_is_reopened(tmp_path: Path) -> None:
+@pytest.fixture(scope="module")
+def harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Write the harness once and pay the first-launch cost on it, outside the run bound."""
+    path = tmp_path_factory.mktemp("ws_reconnect") / "harness.js"
+    path.write_text(_HARNESS, encoding="utf-8")
+    # The same argv shape every test uses, so whatever the cold cost is, this run pays it. An empty
+    # scenario still loads app.js, so a spin at load fails here, at the cold-start bound.
+    assert _run([], path, timeout=_COLD_START_TIMEOUT_S) == []
+    return path
+
+
+def test_a_dropped_socket_is_reopened(harness: Path) -> None:
     # One socket at load; it opens, the server closes it (a rotation), and a new one follows.
-    counts = _run(["open", "close", "flush"], tmp_path)
+    counts = _run(["open", "close", "flush"], harness)
     assert counts == [1, 1, 2]
 
 
-def test_a_session_that_really_ended_stops_after_the_budget(tmp_path: Path) -> None:
+def test_a_session_that_really_ended_stops_after_the_budget(harness: Path) -> None:
     # Handshakes that never open (a revoked session is refused at the handshake): 1 + 3 retries, then
     # nothing, however long the page stays up.
     steps = ["close", "flush"] * 6
-    counts = _run(steps, tmp_path)
+    counts = _run(steps, harness)
     assert counts[-1] == 4, counts
 
 
-def test_the_budget_refills_only_after_a_socket_stayed_up(tmp_path: Path) -> None:
+def test_the_budget_refills_only_after_a_socket_stayed_up(harness: Path) -> None:
     # Two rotations far apart each get a reconnect, because the socket in between lived 60 s.
     stable = ["open", "advance:60000", "close", "flush"]
-    counts = _run(stable * 5, tmp_path)
+    counts = _run(stable * 5, harness)
     assert counts[-1] == 6, counts
 
 
-def test_a_socket_that_opens_and_drops_at_once_does_not_refill_the_budget(tmp_path: Path) -> None:
+def test_a_socket_that_opens_and_drops_at_once_does_not_refill_the_budget(harness: Path) -> None:
     # Accepted then closed within a second, over and over: the "opened" flag alone must not reset the
     # budget, or a server that accepts and immediately closes would be reconnected forever.
     flapping = ["open", "advance:500", "close", "flush"]
-    counts = _run(flapping * 6, tmp_path)
+    counts = _run(flapping * 6, harness)
     assert counts[-1] == 4, counts
