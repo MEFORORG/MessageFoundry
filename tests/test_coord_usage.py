@@ -584,44 +584,59 @@ def test_a_future_dated_reading_is_refused_rather_than_treated_as_fresh(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("pct", "minutes_ahead"),
+    ("pct", "minutes_ahead", "code"),
     [
-        pytest.param(50.0, 1.0, id="one-minute-ahead"),
-        pytest.param(50.0, 0.5, id="thirty-seconds-ahead"),
-        pytest.param(99.0, 1.0, id="at-the-ceiling"),
+        pytest.param(99.0, 1.0, CRITICAL, id="ceiling-one-minute-ahead"),
+        pytest.param(99.0, 0.5, CRITICAL, id="ceiling-thirty-seconds-ahead"),
+        pytest.param(99.0, 120.0, CRITICAL, id="ceiling-two-hours-ahead"),
+        pytest.param(92.0, 1.0, UNKNOWN, id="at-the-gates-level"),
+        pytest.param(50.0, 1.0, UNKNOWN, id="below-the-rung"),
     ],
 )
-def test_a_reading_dated_after_now_is_unknown_and_nothing_rates_from_it(
-    tmp_path: Path, pct: float, minutes_ahead: float
+def test_a_reading_dated_after_now_is_unknown_and_keeps_its_floor(
+    tmp_path: Path, pct: float, minutes_ahead: float, code: int
 ) -> None:
-    """The rule the history rows follow, so a small backward clock step cannot leave a fresh reading
-    beside a rate that lost its newest row: that read OK at 10 percent an hour. The control is the same
-    numbers just behind the clock, a real burn, with a reset near enough for the rate to decide."""
-    epoch = int(time.time()) + 14400
-
-    def answer(minutes_ago: float) -> tuple[int, dict[str, Any]]:
-        publish(tmp_path, seven=pct, age_min=minutes_ago, seven_epoch=epoch)
-        write_history(tmp_path, [(60, 30.0), (30, 40.0), (minutes_ago, pct)], epoch)
-        return read(tmp_path)
-
-    code, doc = answer(0.1)
-    assert code == CRITICAL and doc["seven_day"]["rate_pct_per_hr"] > 15, doc
-
-    code, doc = answer(-minutes_ahead)
-    assert code == UNKNOWN and doc["state"] == "UNKNOWN", doc
+    """It is not fresh, so its own state is UNKNOWN and nothing clears on it. But a small backward clock
+    step dates a real reading ahead, and a stop must not lapse on one, so its number stands as a floor. No
+    stamp here: a fresh reading's level hit stands on any provenance, so this does too."""
+    publish(tmp_path, seven=pct, age_min=-minutes_ahead)
+    got, doc = read(tmp_path)
+    assert got == code, doc
     window_doc = doc["seven_day"]
-    assert "FUTURE" in window_doc["reason"], doc
-    assert window_doc["rate_pct_per_hr"] is None and window_doc["level_floor"] is None, doc
+    assert window_doc["state"] == "UNKNOWN" and "FUTURE" in window_doc["reason"], doc
+    assert window_doc["level_floor"] == pct, doc
+    assert window_doc["rate_pct_per_hr"] is None, doc
+
+
+def test_a_reading_dated_after_now_with_no_reset_keeps_its_floor(tmp_path: Path) -> None:
+    """A fresh reading at the rung hits with no reset, because a missing reset must not loosen the rung."""
+    publish(tmp_path, seven=99.0, age_min=-1)
+    doc = latest(tmp_path)
+    del doc["seven_day"]["resets_at_epoch"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] == 99.0
+
+
+def test_a_burn_dated_after_now_stays_critical_and_never_reads_ok(tmp_path: Path) -> None:
+    """The reviewer's case: 30, 40, then 50 one minute ahead, with a reset near enough for the rate to
+    decide. Dropping the row read OK at 10 percent an hour."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=50.0, age_min=-1, seven_epoch=epoch)
+    write_history(tmp_path, [(60, 30.0), (30, 40.0), (-1, 50.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
+    assert doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=0.5), doc
+    assert doc["seven_day"]["level_floor"] == 50.0 and "FUTURE" in doc["seven_day"]["reason"], doc
 
 
 def test_a_stale_reading_with_its_reset_ahead_is_a_floor_and_nothing_else_is(
     tmp_path: Path,
 ) -> None:
     """The gate may HALT on level_floor, so only a reading that was once true and whose window is
-    still running may carry it. A future date, or no reset to prove the window, proves nothing."""
+    still running may carry it. No reset proves no window, for a reading that is only stale. A reading
+    dated after now keeps one: test_a_reading_dated_after_now_is_unknown_and_keeps_its_floor."""
     assert _floor(tmp_path, seven=95.0, age_min=75) == pytest.approx(95.0)
     assert _floor(tmp_path, seven=95.0) is None, "a fresh reading is no floor"
-    assert _floor(tmp_path, seven=95.0, age_min=-120) is None, "a future date proves nothing"
 
     publish(tmp_path, seven=95.0, age_min=75)
     _stamp(tmp_path, tmp_path.parent)
@@ -674,16 +689,16 @@ def test_at_the_ceiling_unverified_provenance_still_leaves_a_floor(
 
 
 def test_the_ceiling_floor_keeps_the_other_bounds(tmp_path: Path) -> None:
-    """Provenance is the only test the ceiling drops. A fresh, future-dated, gone or over-long
-    reading still sets nothing, and a window stamped with another root is still refused."""
+    """Provenance is the only test the ceiling drops. A fresh, gone or over-long reading still sets
+    nothing, and a window stamped with another root is still refused."""
     publish(tmp_path, seven=100.0)
     assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "fresh"
-    publish(tmp_path, seven=100.0, age_min=-120)
-    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "future-dated"
     publish(tmp_path, seven=100.0, age_min=75, seven_epoch=int(time.time()) + 10050 * 60)
     assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "does not fit a week"
     publish(tmp_path, seven=100.0, age_min=75, seven_epoch=int(time.time()) - 60)
     assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "reset passed"
+    publish(tmp_path, seven=100.0, age_min=-1, seven_epoch=int(time.time()) - 60)
+    assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "dated ahead, reset passed"
 
     publish(tmp_path, seven=100.0, age_min=75)
     doc = latest(tmp_path)
@@ -1136,33 +1151,23 @@ def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    "minutes_ahead",
+    ("ahead_pct", "rate"),
     [
-        pytest.param(5.0, id="past-the-readers-tolerance"),
-        pytest.param(1.0, id="inside-the-readers-tolerance"),
-        pytest.param(0.5, id="thirty-seconds"),
+        pytest.param(20.0, 10.0, id="a-low-row-cannot-turn-the-rate-negative"),
+        pytest.param(50.0, 20.0, id="a-high-row-stays-in-the-rate"),
     ],
 )
-def test_a_history_row_dated_after_now_is_skipped(tmp_path: Path, minutes_ahead: float) -> None:
-    """One row ahead of the clock became the newest row, turned the rate negative and cleared a burn, at
-    any distance ahead. A row just behind the clock is the control."""
+@pytest.mark.parametrize("minutes_ahead", [5.0, 1.0], ids=["five-minutes", "one-minute"])
+def test_a_history_row_dated_after_now_counts_as_just_now(
+    tmp_path: Path, minutes_ahead: float, ahead_pct: float, rate: float
+) -> None:
+    """Beside a fresh reading, which is what a live confirmation leaves after a backward clock step.
+    Dropped, a real row understates the rate; taken as newest, a low one turns it negative and clears."""
     epoch = int(time.time()) + 280000
-    publish(tmp_path, seven=40.0, seven_epoch=epoch)
-
-    def rows(points: list[tuple[float, float]]) -> tuple[int, dict[str, Any]]:
-        write_history(tmp_path, points, epoch)
-        return read(tmp_path)
-
-    good = [(60.0, 30.0), (30.0, 40.0)]
-    want_code, want = rows(good)
-    assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), want
-
-    got_code, got = rows([*good, (-minutes_ahead, 20.0)])
-    assert got_code == want_code, got
-    assert got["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.0, abs=0.5), got
-
-    _, kept = rows([*good, (0.1, 41.0)])
-    assert kept["seven_day"]["rate_pct_per_hr"] == pytest.approx(11.0, abs=0.5), kept
+    publish(tmp_path, seven=50.0, seven_epoch=epoch)
+    write_history(tmp_path, [(60.0, 30.0), (30.0, 40.0), (-minutes_ahead, ahead_pct)], epoch)
+    _, doc = read(tmp_path)
+    assert doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, abs=0.5), doc
 
 
 @pytest.mark.parametrize(

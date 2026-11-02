@@ -411,12 +411,11 @@ function Get-AgeMinutes($v) {
     return [math]::Round(($nowUtc - $t).TotalMinutes, 1)
 }
 
-# ONE FUTURE RULE, FOR A READING AND FOR A HISTORY ROW: nothing dated after now is current, at any
-# distance. This compares the instants, because an age is rounded and a stamp seconds ahead rounds to 0.
-# There is no tolerance, because a real stamp needs none: the collector stamps before it writes, this
-# script opens the document before it reads the clock, and both use this box's clock. So a reading dated
-# ahead means the clock stepped back or the stamp is wrong, and it grades UNKNOWN. A history row a fire
-# appends after that clock read is skipped too, and it belongs to a reading this run did not open.
+# ONE TEST OF THE FUTURE, FOR A READING AND FOR A HISTORY ROW: dated after now, at any distance. This
+# compares the instants, because an age is rounded and a stamp seconds ahead rounds to 0. There is no
+# tolerance, because a real stamp needs none: the collector stamps before it writes, this script opens the
+# document before it reads the clock, and both use this box's clock. So a reading dated ahead means the
+# clock stepped back or the stamp is wrong. What each does about it is at Get-WindowReport and Get-Rate.
 function Test-DatedAfterNow($v) {
     $t = ConvertTo-UtcDateTime $v
     return [bool]($null -ne $t -and $t -gt $nowUtc)
@@ -439,21 +438,20 @@ function Get-Rate($CurrentResetEpoch) {
             $observed = Get-Percentage $r.seven_day
             if ($null -eq $observed) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
-            # A row ahead of the clock would become the newest row and could turn the rate negative, which
-            # clears a burn. After a backward clock step this also skips real rows until the clock catches
-            # up. If two or more older rows remain, the rate comes from those and can be understated, and
-            # that understated rate governs, not the level. With fewer than two there is no rate and the
-            # level decides. A reading dated ahead is UNKNOWN, so this needs a reading stamped after the
-            # step, at least a live session confirming the same number.
-            if (Test-DatedAfterNow $r.at) { continue }
+            # A ROW AHEAD OF THE CLOCK COUNTS AS JUST NOW. After a backward clock step it is usually a real
+            # row, and dropping it understates the rate, and that understated rate governs, not the level.
+            # So its age is clamped to 0 and it stays in the rate.
             $age = Get-AgeMinutes $r.at
+            if (Test-DatedAfterNow $r.at) { $age = 0.0 }
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
             $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
         }
     } catch { return $null }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
     $oldest = $rows | Sort-Object AgeMin -Descending | Select-Object -First 1
-    $newest = $rows | Sort-Object AgeMin | Select-Object -First 1
+    # THE HIGHEST PERCENTAGE IS THE NEWEST. Usage does not fall inside a window, and a clamped row's date
+    # says nothing, so a low row ahead of the clock cannot turn the rate negative and clear a burn.
+    $newest = $rows | Sort-Object Pct -Descending | Select-Object -First 1
     # THE SPAN RUNS TO NOW, NOT TO THE NEWEST ROW. Rows land only on a move, so the flat time since the
     # last one is in no row, and ending the span there would keep a stopped burn reading as a live one.
     $spanH = $oldest.AgeMin / 60.0
@@ -570,8 +568,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # or usage did fall. Past -MaxAgeMinutes means nothing confirmed the number: an idle session's
         # repeat does not refresh its age, and a live session's does only once its mark is written.
         # Get-DecisionCostRung halts on it at the level or the ceiling. The verdict below reads it at the
-        # ceiling, and the spawn hook prints it. At least a future date, an undateable reading and one with no reset set nothing.
+        # ceiling, and the spawn hook prints it. A reading dated after now sets it too, on its own terms
+        # below. At least an undateable reading and a stale one with no reset set nothing.
         level_floor      = $null
+        # So the provenance test below can leave such a reading's floor alone.
+        dated_ahead      = $false
         state            = "OK"
         reason           = ""
     }
@@ -581,12 +582,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # The lower bound is not defensive tidying. An age is a subtraction of two clocks, and any bug or skew
     # that makes it negative would pass an `age -gt max` test unconditionally -- the staleness guard would
     # then be permanently disarmed while looking present. Bound it BOTH ways so a nonsensical age is
-    # reported as nonsense rather than silently accepted as fresh. Test-DatedAfterNow is that lower bound.
-    $future = Test-DatedAfterNow $w.captured_at
-    if ($null -eq $age -or $age -gt $MaxAgeMinutes -or $future) {
+    # reported as nonsense rather than silently accepted as fresh. Test-DatedAfterNow is that lower bound,
+    # and the end of this function says what such a reading does.
+    if ($null -eq $age -or $age -gt $MaxAgeMinutes) {
         $o.state = "UNKNOWN"
         $o.reason = if ($null -eq $age) { "reading is undateable" }
-        elseif ($future) { "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it" }
         # NO CAUSAL CLAIM. This used to read "-- no live session is publishing", which nothing here
         # checks and which is often false: a session may be publishing perfectly well, into another
         # root. The mis-wire warning printed above the numbers names that case; this line states the
@@ -629,6 +629,26 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     elseif ($null -ne $o.projected_at_reset -and $o.projected_at_reset -ge 95) {
         $o.state = "WARN"; $o.reason = "projected to reach $($o.projected_at_reset)% by reset"
     }
+
+    # A READING DATED AFTER NOW CAN STOP WORK AND CANNOT CLEAR IT. Nothing proves when it was taken, so it
+    # is not fresh: it reads UNKNOWN, and OK or WARN cannot come from it. But a small backward clock step
+    # dates a real reading ahead, and a stop must not lapse on one. So it keeps a level_floor at its number
+    # on any provenance, with no test of its reset, as a fresh reading's level hit stands on any
+    # provenance. A projection to run out before the reset stays CRITICAL, because the rate behind it may
+    # be real and the gate needs the state to read it. At the ceiling the floor sets that verdict.
+    if (Test-DatedAfterNow $w.captured_at) {
+        $future = "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it"
+        $o.dated_ahead = $true
+        $o.level_floor = $pct
+        if ($o.state -eq "CRITICAL" -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason); $future" }
+        else {
+            $o.state = "UNKNOWN"
+            $o.reason = $future
+            $o.rate_pct_per_hr = $null
+            $o.projected_at_reset = $null
+            $o.minutes_to_empty = $null
+        }
+    }
     return $o
 }
 
@@ -658,7 +678,7 @@ $overall = $seven.state
 # equal reading does not refresh the age, so this test would turn that stop into REVIEW 21 minutes later
 # with nothing changed. A document or window stamped with another root was refused above and never gets
 # here.
-if ($seven.Contains('level_floor') -and $seven.level_floor -lt $CeilingPct -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
+if ($seven.Contains('level_floor') -and -not $seven.dated_ahead -and $seven.level_floor -lt $CeilingPct -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
     $seven.level_floor = $null
 }
 

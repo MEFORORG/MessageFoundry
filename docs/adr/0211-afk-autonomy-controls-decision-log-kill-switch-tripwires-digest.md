@@ -432,7 +432,7 @@ roster alias of the Lander.
 > because a fresh reading there stops work on any provenance, and an idle session's equal reading does
 > not refresh its age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
 > window stamped with another root is still refused. The rung is then hit at the 90 percent level or the
-> ceiling. Every other stale reading answers REVIEW at any level, including at least a future-dated one,
+> ceiling. Every other stale reading answers REVIEW at any level, including at least
 > an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
 > fresh 95 with no rate on such a root is hit, and the same reading once stale answers REVIEW. A Desktop
 > session on a root holding such a floor gets HALT, which narrows the gap this section names. A floor at
@@ -452,6 +452,14 @@ roster alias of the Lander.
 > From 90 to 97 percent the opposite applies: the rung is hit even where the rate a fresher reading had
 > would have cleared it, because the window resets first. That departs from the rate-governs rule for
 > stale readings only.
+>
+> **A reading dated after now can stop work and cannot clear it.** It reads UNKNOWN, because nothing proves
+> when it was taken, so OK and WARN cannot come from it. But a small backward clock step dates a real
+> reading ahead, so it keeps a `level_floor` at its number on any provenance, unless its reset has passed,
+> and a projection to run out before the reset stays CRITICAL. Any distance ahead counts, with no
+> tolerance: the collector stamps before it writes, and the reader opens the document before it reads the
+> clock. A history row dated ahead counts as just now, and the highest percentage is taken as the newest
+> row, so a low row cannot turn the rate negative and a real one is not lost.
 >
 > The rule has at least these limits, all of them open:
 >
@@ -477,7 +485,8 @@ roster alias of the Lander.
 >   and fresh or stale, because the reader refuses a document stamped with another root. The gate answers
 >   REVIEW until this root's next fire restores the stamp, so that mis-wire is an exception to "only a new
 >   reading clears it". Measured 2026-11-01 on a fresh 100.
-> - A moved reset defeats the rule, and this is the limit here that can CLEAR a stop rather than hold one.
+> - A moved reset defeats the rule. It is one of at least three limits here that can CLEAR a stop rather
+>   than hold one; the unlocked read and write and the dropped fire below are two others.
 >   A reading with a later reset, or an earlier one that has not passed, counts as a new window and is
 >   restamped fresh, so after a re-login two sessions holding different resets replace each other on
 >   every fire: measured 80, 5, 80, 5, with four history rows. A frozen 5 replaces a published 100 the same
@@ -485,10 +494,11 @@ roster alias of the Lander.
 >   widely: measured 2026-11-01, its `five_hour` window read OK at 5 after a spent 100, with the same or an
 >   earlier reset. The same-reset case is what this amendment closes.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
-> - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
->   next live reading corrects it.
+> - The read and the write are not locked, so a concurrent publisher can still land a lower number, and
+>   the gate can clear on it. The next live reading corrects it.
 > - A fire whose percentage cannot be read is dropped as an absent window, at least NaN, "99%", a negative
->   or an object, so a published lower reading stands for up to 20 minutes.
+>   or an object, so a published lower reading stands for up to 20 minutes, and the gate can clear on it
+>   until then.
 > - One wrong high reading binds until the reset, up to a week. The highest reading in a period binds and
 >   a reading over 100 stays a number, so every true lower reading for that reset is refused and the
 >   window goes stale. Its floor then keeps the gate at HALT only at the ceiling, or at the rung with

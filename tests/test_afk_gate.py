@@ -704,21 +704,67 @@ def test_a_window_with_no_number_cannot_clear_the_gate(
     assert code == REVIEW, why(doc)
 
 
-def test_a_reading_dated_after_now_cannot_clear_the_gate(sb: Sandbox, tmp_path: Path) -> None:
-    """Fresh by every other test. One minute ahead of the clock used to read as a current 40."""
+@pytest.mark.parametrize(
+    ("pct", "wired", "expected", "reason"),
+    [
+        pytest.param(40, True, REVIEW, "FUTURE", id="below-the-rung"),
+        pytest.param(99, True, HALT, "at least", id="ceiling"),
+        pytest.param(99, False, HALT, "at least", id="ceiling-unwired"),
+        pytest.param(92, True, HALT, "at least", id="at-the-rung"),
+        pytest.param(92, False, HALT, "at least", id="at-the-rung-unwired"),
+    ],
+)
+def test_a_reading_dated_after_now_stops_work_and_cannot_clear_it(
+    sb: Sandbox, tmp_path: Path, pct: int, wired: bool, expected: int, reason: str
+) -> None:
+    """Fresh by every other test. Main graded these fresh, and a fresh hit stands on any provenance, so
+    each HALT here is main's. Below the rung it answers REVIEW, where it used to read as a current 40."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
     env = {"CLAUDE_CONFIG_DIR": str(root)}
-    _wire(sb, root, tmp_path, env)
-    seven = {"used_percentage": 40, "resets_at": int(ago().timestamp()) + 200000}
+    if wired:
+        _wire(sb, root, tmp_path, env)
+    seven = {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 200000}
     assert _fire(sb, state, seven, env).returncode == 0
     published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
     published["seven_day"]["captured_at"] = ago(minutes=-1).isoformat().replace("+00:00", "Z")
     (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
     seed_vault(sb, calibrated("manager"))
     code, doc = _real_gate(sb, env)
-    assert code == REVIEW and "FUTURE" in why(doc), why(doc)
+    assert code == expected and reason in why(doc), why(doc)
+
+
+def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """What a live confirmation leaves after a backward clock step. Dropping the row left no rate, so a
+    70 burning out in minutes read as clear; main kept the row and HALTed."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + 14400
+    assert _fire(sb, state, {"used_percentage": 70, "resets_at": resets}, env).returncode == 0
+    rows = [(ago(minutes=15), 40), (ago(minutes=-1), 70)]
+    (state / "history.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "at": at.isoformat().replace("+00:00", "Z"),
+                    "seven_day": pct,
+                    "seven_reset": resets,
+                }
+            )
+            + "\n"
+            for at, pct in rows
+        ),
+        encoding="utf-8",
+    )
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == HALT and "Projected to run out" in why(doc), why(doc)
 
 
 def test_a_numeric_string_from_a_fire_halts_at_the_ceiling(sb: Sandbox, tmp_path: Path) -> None:
