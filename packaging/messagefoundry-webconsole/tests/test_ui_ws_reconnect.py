@@ -162,10 +162,12 @@ def harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
         )
         outcome = "ok" if proc.returncode == 0 else f"exit {proc.returncode}"
     except subprocess.TimeoutExpired:
-        outcome = f"timed out at {_COLD_START_TIMEOUT_S} s"
+        outcome = "still running at the bound, killed; the real cost is longer"
+    except OSError as exc:
+        outcome = f"launch failed: {exc!r}"
     elapsed = time.monotonic() - started
     if outcome != "ok" or elapsed > _COLD_START_WARN_S:
-        warnings.warn(f"node cold start took {elapsed:.1f} s: {outcome}", stacklevel=1)
+        warnings.warn(f"node warm-up ended after {elapsed:.1f} s: {outcome}", stacklevel=1)
     return path
 
 
