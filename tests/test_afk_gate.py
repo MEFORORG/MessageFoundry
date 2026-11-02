@@ -97,20 +97,20 @@ def reversal(decision: dict[str, Any], at: datetime, by: str = "lander") -> dict
     return rec("outcome", at=at, seat=by, ref=decision["id"], outcome="reversed", note="PR 9")
 
 
-def usage(pct: float | None = 40.0, **five: Any) -> dict[str, Any]:
-    """usage.ps1 -Json's shape for a fresh 5-hour reading, with no burn rate unless given one."""
+def usage(pct: float | None = 40.0, **seven: Any) -> dict[str, Any]:
+    """usage.ps1 -Json's shape for a fresh weekly reading, with no burn rate unless given one."""
     window = {
-        "label": "session (5h)",
+        "label": "weekly (7d)",
         "used_percentage": pct,
         "reading_age_min": 1.0,
-        "minutes_to_reset": 120,
+        "minutes_to_reset": 3000,
         "rate_pct_per_hr": None,
         "minutes_to_empty": None,
         "state": "OK",
         "reason": "",
     }
-    window.update(five)
-    return {"state": window["state"], "exit_code": 0, "five_hour": window, "seven_day": {}}
+    window.update(seven)
+    return {"state": window["state"], "exit_code": 0, "seven_day": window}
 
 
 @pytest.fixture
@@ -222,9 +222,9 @@ def test_gate_needs_an_item_and_refuses_a_malformed_builds_on(sb: Sandbox) -> No
 
 
 def test_the_level_backstop_halts_before_anything_is_read(sb: Sandbox) -> None:
-    """With no burn rate, the 5-hour level at the start-nothing rung (80, STEWARD.md section 3)."""
+    """With no burn rate, the weekly level at the start-nothing rung (90, owner ruling 2026-10-31)."""
     seed_vault(sb, calibrated("manager"))
-    write_fake_usage(_usage_path(sb), usage(80.0))
+    write_fake_usage(_usage_path(sb), usage(90.0))
     sb.set_state(calls=[])
     code, doc = gate(sb)
     assert (code, doc["result"]) == (HALT, "HALT"), why(doc)
@@ -233,18 +233,49 @@ def test_the_level_backstop_halts_before_anything_is_read(sb: Sandbox) -> None:
 
 def test_below_the_level_with_no_rate_does_not_halt(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
-    write_fake_usage(_usage_path(sb), usage(79.9))
+    write_fake_usage(_usage_path(sb), usage(89.9))
     assert gate(sb)[0] == NO_REVIEW
 
 
-def test_a_projected_cutoff_inside_twenty_minutes_halts(sb: Sandbox) -> None:
+@pytest.mark.parametrize(
+    ("to_empty", "to_reset", "expected"),
+    [
+        pytest.param(60, 90, HALT, id="at-sixty-minutes"),
+        pytest.param(61, 90, REVIEW, id="just-past-sixty-minutes"),
+        pytest.param(45, 45, NO_REVIEW, id="resets-as-it-runs-out"),
+    ],
+)
+def test_the_rate_limb_is_inside_sixty_minutes_and_before_the_reset(
+    sb: Sandbox, to_empty: int, to_reset: int, expected: int
+) -> None:
+    """The first limb of the owner's rung of 2026-10-31, on both its edges. Below the level
+    backstop and the ceiling, so only the projection can decide. usage.ps1 grades any run-out
+    before the reset CRITICAL, so past the hour that reading is REVIEW, not a clear path."""
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),
-        usage(50.0, rate_pct_per_hr=200.0, minutes_to_empty=15, minutes_to_reset=90),
+        usage(
+            50.0,
+            state="CRITICAL" if to_empty < to_reset else "OK",
+            rate_pct_per_hr=50.0,
+            minutes_to_empty=to_empty,
+            minutes_to_reset=to_reset,
+        ),
     )
     code, doc = gate(sb)
-    assert code == HALT and "run out in about 15 min" in why(doc)
+    assert code == expected, why(doc)
+    if expected == HALT:
+        assert f"run out in about {to_empty} min" in why(doc)
+
+
+@pytest.mark.parametrize("rate", [0.0, -1.0], ids=["flat", "falling"])
+def test_a_rate_of_zero_or_below_counts_as_no_rate(sb: Sandbox, rate: float) -> None:
+    """It must not lift the 90 percent backstop: usage does not fall inside a reset period, so such
+    a rate comes from sessions reporting cached readings. watch.py treats it the same way."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(92.0, state="WARN", rate_pct_per_hr=rate))
+    code, doc = gate(sb)
+    assert code == HALT and "the level is the backstop" in why(doc), why(doc)
 
 
 def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
@@ -252,7 +283,7 @@ def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),
-        usage(90.0, state="WARN", rate_pct_per_hr=2.0, minutes_to_empty=300, minutes_to_reset=30),
+        usage(92.0, state="WARN", rate_pct_per_hr=2.0, minutes_to_empty=300, minutes_to_reset=30),
     )
     code, doc = gate(sb)
     assert code == NO_REVIEW, why(doc)
@@ -270,13 +301,63 @@ def test_a_window_at_the_ceiling_halts_whatever_the_rate(sb: Sandbox) -> None:
 
 
 def test_a_critical_reading_below_the_rung_is_unknown(sb: Sandbox) -> None:
-    """usage.ps1 skips its statusLine trust check at CRITICAL overall, here from the weekly window."""
+    """usage.ps1 skips its statusLine trust check at CRITICAL overall, here for a burn that runs out
+    before the reset but outside the hour."""
     seed_vault(sb, calibrated("manager"))
-    doc = usage(40.0)
-    doc.update(state="CRITICAL", statusline_state="WIRED_ELSEWHERE")
+    doc = usage(40.0, state="CRITICAL", rate_pct_per_hr=10.0, minutes_to_empty=360)
+    doc.update(statusline_state="WIRED_ELSEWHERE")
     write_fake_usage(_usage_path(sb), doc, code=11)
     code, out = gate(sb)
     assert code == REVIEW and "may be another root's" in why(out)
+
+
+@pytest.mark.parametrize(
+    "pct",
+    [pytest.param(92.0, id="above-the-level"), pytest.param(99.0, id="at-the-ceiling")],
+)
+def test_a_reading_whose_reset_has_passed_neither_clears_nor_halts(sb: Sandbox, pct: float) -> None:
+    """The window it describes is gone, so its level says nothing about this one. The stand-in is
+    the shape usage.ps1 no longer emits: the rung must hold on its own."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(pct, rate_pct_per_hr=2.0, minutes_to_empty=240, minutes_to_reset=-5),
+    )
+    code, doc = gate(sb)
+    assert code == REVIEW and "reset has passed" in why(doc), why(doc)
+
+
+def test_a_floor_past_its_reset_neither_clears_nor_halts(sb: Sandbox) -> None:
+    """The guard runs before the floor, so the rung holds this limb on its own too."""
+    seed_vault(sb, calibrated("manager"))
+    stale = usage(99.0, state="UNKNOWN", level_floor=99.0, minutes_to_reset=-5, reason="old")
+    write_fake_usage(_usage_path(sb), stale, code=20)
+    code, doc = gate(sb)
+    assert code == REVIEW and "reset has passed" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({}, id="no-rate"),
+        pytest.param({"rate_pct_per_hr": 2.0, "minutes_to_empty": 1500}, id="rate-off-the-rung"),
+    ],
+)
+def test_a_reading_below_the_rung_with_no_reset_cannot_clear(
+    sb: Sandbox, fields: dict[str, Any]
+) -> None:
+    """It cannot prove which window it belongs to, so it may be last week's number."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(40.0, minutes_to_reset=None, **fields))
+    code, doc = gate(sb)
+    assert code == REVIEW and "no reset time" in why(doc), why(doc)
+
+
+def test_a_reading_at_the_rung_with_no_reset_still_halts(sb: Sandbox) -> None:
+    """The control: a missing reset must not loosen the rung in either direction."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(95.0, state="WARN", minutes_to_reset=None))
+    assert gate(sb)[0] == HALT
 
 
 def test_an_unknown_cost_reading_reviews_rather_than_halts(sb: Sandbox) -> None:
@@ -297,10 +378,10 @@ def test_a_reading_usage_calls_unknown_overall_is_unknown_here(sb: Sandbox) -> N
 
 
 def test_a_hit_stands_when_usage_reads_unknown_overall(sb: Sandbox) -> None:
-    """An OK 5-hour window past the level backstop, under usage.ps1's refusal of a statusLine
+    """An OK weekly window past the level backstop, under usage.ps1's refusal of a statusLine
     wired elsewhere: downgrading that hit to UNKNOWN would let a session at the rung act."""
     seed_vault(sb, calibrated("manager"))
-    doc = usage(82.0)
+    doc = usage(92.0)
     doc.update(state="UNKNOWN", statusline_state="WIRED_ELSEWHERE")
     write_fake_usage(_usage_path(sb), doc, code=20)
     code, out = gate(sb)
@@ -324,18 +405,37 @@ def test_the_thresholds_file_moves_the_rung(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), usage(75.0))
     _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [90, 94, 97]}}), encoding="utf-8")
-    assert gate(sb)[0] == NO_REVIEW, "a weekly-only file moved the 5-hour rung"
-    _thresholds(sb).write_text(json.dumps({"levels": {"5-hour": [70, 80, 90]}}), encoding="utf-8")
+    assert gate(sb)[0] == NO_REVIEW, "control: at the live file's level, 75 is below the rung"
+    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [70, 80, 90]}}), encoding="utf-8")
     code, doc = gate(sb)
     assert code == HALT and str(_thresholds(sb)) in why(doc)
+
+
+def test_the_thresholds_file_moves_the_minutes_clause(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(
+            50.0, state="CRITICAL", rate_pct_per_hr=50.0, minutes_to_empty=45, minutes_to_reset=90
+        ),
+    )
+    assert gate(sb)[0] == HALT, "control: 45 minutes is inside the default 60"
+    _thresholds(sb).write_text(json.dumps({"minutes": [20, 10, 5]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "does not reach the rung" in why(doc), why(doc)
 
 
 @pytest.mark.parametrize(
     "body",
     [
         pytest.param("{not json", id="unreadable"),
-        pytest.param(json.dumps({"levels": {"5-hour": [80, 86]}}), id="two-numbers"),
+        pytest.param(json.dumps({"levels": {"weekly": [80, 86]}}), id="two-numbers"),
         pytest.param(json.dumps({"levels": {"5h": [80, 86, 92]}}), id="unknown-window"),
+        pytest.param(json.dumps({"levels": {"5-hour": [80, 86, 92]}}), id="retired-window"),
+        pytest.param(
+            json.dumps({"levels": {"weekly": [90, 94, 97], "5-hour": [80, 86, 92]}}),
+            id="retired-window-beside-weekly",
+        ),
     ],
 )
 def test_a_malformed_thresholds_file_reviews(sb: Sandbox, body: str) -> None:
@@ -359,8 +459,7 @@ def test_the_real_usage_reader_feeds_the_rung(
     payload = {
         "session_id": "fixture",
         "rate_limits": {
-            "five_hour": {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 4800},
-            "seven_day": {"used_percentage": 10, "resets_at": int(ago().timestamp()) + 200000},
+            "seven_day": {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 200000},
         },
     }
     collect = sb.run(
@@ -375,6 +474,218 @@ def test_the_real_usage_reader_feeds_the_rung(
     real = sb.repo / "scripts" / "coord" / "usage.ps1"
     code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
     assert code == expected, why(doc)
+
+
+def _fire(
+    sb: Sandbox, state: Path, seven: dict[str, Any], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """One statusLine fire through the real collector."""
+    payload = json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}})
+    return sb.run(COORD / "usage-collect.ps1", "-StateDir", str(state), stdin=payload, **env)
+
+
+def _wire(sb: Sandbox, root: Path, home: Path, env: dict[str, str]) -> None:
+    """Wire ``root``'s statusLine with the real installer, so the reader trusts it."""
+    proc = sb.run(
+        COORD / "install-usage-statusline.ps1",
+        "-ConfigDir",
+        str(root),
+        "-HomeDir",
+        str(home),
+        "-CollectorPath",
+        str(COORD / "usage-collect.ps1"),
+        **env,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+
+
+def _real_gate(sb: Sandbox, env: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    real = sb.repo / "scripts" / "coord" / "usage.ps1"
+    return gate(sb, "-UsageScript", str(real), item="1", **env)
+
+
+def _stale(pct: float, **over: Any) -> dict[str, Any]:
+    """usage.ps1 -Json's shape for a reading past the age limit, with its reset still ahead."""
+    fields: dict[str, Any] = {
+        "state": "UNKNOWN",
+        "reading_age_min": 25.0,
+        "reason": "reading is 25 min old (max 20)",
+        "level_floor": pct,
+    }
+    return usage(pct, **{**fields, **over})
+
+
+@pytest.mark.parametrize("pct", [90.0, 98.0, 100.0], ids=["at-the-level", "ceiling", "spent"])
+def test_a_stale_reading_at_the_rung_still_halts(sb: Sandbox, pct: float) -> None:
+    """A stale reading whose reset is ahead proves at least that level: usage does not fall inside
+    a reset period. So age alone blocks clearing, not a hit."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(pct), code=20)
+    code, doc = gate(sb)
+    assert code == HALT and "at least" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    ("hold", "pct", "expected"),
+    [
+        pytest.param(70, 75.0, HALT, id="level-moved-down"),
+        pytest.param(95, 92.0, REVIEW, id="level-moved-up"),
+        pytest.param(99, 98.0, HALT, id="ceiling-under-a-higher-level"),
+    ],
+)
+def test_the_stale_floor_reads_the_level_and_the_ceiling_separately(
+    sb: Sandbox, hold: int, pct: float, expected: int
+) -> None:
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(pct), code=20)
+    _thresholds(sb).write_text(
+        json.dumps({"levels": {"weekly": [hold, 99, 100]}}), encoding="utf-8"
+    )
+    code, doc = gate(sb)
+    assert code == expected, why(doc)
+
+
+def test_a_stale_reading_below_the_rung_does_not_clear(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(89.9), code=20)
+    code, doc = gate(sb)
+    assert code == REVIEW and "25 min old" in why(doc), why(doc)
+
+
+def test_a_percentage_with_no_floor_proves_nothing(sb: Sandbox) -> None:
+    """A future-dated or undateable reading also carries a number, and the reader marks no floor."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), _stale(99.0, level_floor=None, reason="dated in the FUTURE"))
+    code, doc = gate(sb)
+    assert code == REVIEW and "FUTURE" in why(doc), why(doc)
+
+
+def test_a_flat_full_pool_held_past_the_age_limit_halts_through_the_real_scripts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """A spent pool cannot rise, so an equal reading never refreshes its age, and this state is
+    certain. It used to fall to REVIEW until the reset."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    seven = {"used_percentage": 100, "resets_at": int(ago().timestamp()) + 200000}
+
+    def fire() -> None:
+        assert _fire(sb, state, seven, env).returncode == 0
+
+    fire()
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=25).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    fire()  # the idle session
+
+    seed_vault(sb, calibrated("manager"))
+    _wire(sb, root, tmp_path, env)
+    code, doc = _real_gate(sb, env)
+    # "at least" is the stale floor's own reason. A fresh 100 would also HALT, on the ceiling.
+    assert code == HALT and "at least" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    ("first_fire", "second_fire", "wired"),
+    [
+        pytest.param("unpinned", "unpinned", True, id="unpinned-collector"),
+        pytest.param("pinned", "unpinned", True, id="one-unpinned-fire-over-a-pinned-reading"),
+        pytest.param("pinned", "pinned", False, id="root-not-wired"),
+        pytest.param("unpinned", "unpinned", False, id="unpinned-and-not-wired"),
+    ],
+)
+def test_a_stop_at_the_ceiling_does_not_decay_on_an_unchanged_reading(
+    sb: Sandbox, tmp_path: Path, first_fire: str, second_fire: str, wired: bool
+) -> None:
+    """A fresh 100 HALTs on any provenance, because a hit stands whatever usage.ps1 reads overall.
+    An equal reading does not refresh its age, so the same number goes stale in 21 minutes with
+    nothing changed. It used to read REVIEW from there on any root it could not verify."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    reader_env = {"CLAUDE_CONFIG_DIR": str(root)}
+    fire_env = {"pinned": reader_env, "unpinned": {"CLAUDE_CONFIG_DIR": ""}}
+    seven = {"used_percentage": 100, "resets_at": int(ago().timestamp()) + 200000}
+    if wired:
+        _wire(sb, root, tmp_path, reader_env)
+    seed_vault(sb, calibrated("manager"))
+
+    assert _fire(sb, state, seven, fire_env[first_fire]).returncode == 0
+    code, doc = _real_gate(sb, reader_env)
+    assert code == HALT and "At the ceiling" in why(doc), why(doc)
+
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=21).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    assert _fire(sb, state, seven, fire_env[second_fire]).returncode == 0  # the idle session
+
+    code, doc = _real_gate(sb, reader_env)
+    assert code == HALT and "at least" in why(doc), why(doc)
+
+
+def test_a_stop_at_the_ceiling_does_not_decay_on_the_default_root(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """No pin anywhere: the reader names the root from the home directory and the collector stamps
+    ``unset``, which is what a default root's latest.json holds. The 95 is the control: below the
+    ceiling, with nothing to tie the number to this account, the stale reading stays at REVIEW."""
+    home = tmp_path / "home"
+    state = home / ".claude" / "mefor-usage"
+    state.mkdir(parents=True)
+    env = {"CLAUDE_CONFIG_DIR": "", "USERPROFILE": str(home), "HOME": str(home)}
+    seed_vault(sb, calibrated("manager"))
+    for pct, expected in ((95, REVIEW), (100, HALT)):
+        (state / "latest.json").unlink(missing_ok=True)
+        seven = {"used_percentage": pct, "resets_at": int(ago().timestamp()) + 200000}
+        assert _fire(sb, state, seven, env).returncode == 0
+        published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+        assert published["published_by"]["config_root_env"] == "unset"
+        published["seven_day"]["captured_at"] = ago(minutes=21).isoformat().replace("+00:00", "Z")
+        (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+        code, doc = _real_gate(sb, env)
+        assert code == expected, why(doc)
+
+
+def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """The collector takes it, because no reset is ahead to protect. It used to clear the rung: a
+    40 that cannot say which window it belongs to, on a pool that may be spent."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    gone = {"used_percentage": 95, "resets_at": int(ago().timestamp()) - 300}
+    assert _fire(sb, state, gone, env).returncode == 0
+    assert _fire(sb, state, {"used_percentage": 40}, env).returncode == 0
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW and "no reset time" in why(doc), why(doc)
+
+
+def test_the_real_reader_sends_a_passed_reset_to_review_not_halt(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """Last week's 99 percent, published with last week's reset. It used to HALT a refilled pool."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    seven = {"used_percentage": 99, "resets_at": int(ago().timestamp()) - 300}
+    collect = sb.run(
+        COORD / "usage-collect.ps1",
+        "-StateDir",
+        str(root / "mefor-usage"),
+        stdin=json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}}),
+        **env,
+    )
+    assert collect.returncode == 0, collect.stderr
+    seed_vault(sb, calibrated("manager"))
+    real = sb.repo / "scripts" / "coord" / "usage.ps1"
+    code, doc = gate(sb, "-UsageScript", str(real), item="1", **env)
+    assert code == REVIEW and "reset has passed" in why(doc), why(doc)
 
 
 # --- the reversal budget (plan 4.5) and the item rule ----------------------------------------

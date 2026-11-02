@@ -359,7 +359,8 @@ within 20 minutes and before it resets. Only with no rate is 80 percent the back
 there says there is no room. `usage.ps1` skips its check of the statusLine's wiring when it reads
 CRITICAL overall, so a CRITICAL reading the gate grades below the rung is UNKNOWN. A reader that
 does not finish within 30 seconds is UNKNOWN. A window graded HIT stays HIT whatever
-`usage.ps1` reads overall, because downgrading a hit would fail open.
+`usage.ps1` reads overall, because downgrading a hit would fail open. That covers one reading's
+overall state, not its age; the 2026-10-31 amendment below says which hits survive age.
 
 At the rung the answer is HALT. A 5-hour reading `usage.ps1` calls UNKNOWN, or an overall UNKNOWN
 below the rung, answers REVIEW, not HALT:
@@ -369,6 +370,99 @@ such a session, is **not read**. Reading it would mean a third copy of `watch.py
 a Desktop session at the rung gets REVIEW, not HALT; that gap is open. The Lander is exempt from
 HALT and from the rung entirely, as STEWARD.md 3e exempts it from all three states, and so is a
 roster alias of the Lander.
+
+> **Amendment (2026-10-31): the rung moves to the weekly window.** Anthropic removed the five-hour
+> limit, and the owner ruled the same day that the weekly window now carries the stop. That replaces
+> the 2026-08-14 ruling the section above leans on, that a weekly rung stops nobody. Where this note
+> and the section above differ, this note wins; the rest of the section stands.
+>
+> The gate reads the `seven_day` window of `usage.ps1 -Json`, the only window that reader now
+> publishes. The burn rate still governs: the rung is hit when the rate is above zero, the window is
+> projected to run out within 60 minutes, and that falls before it resets. With no rate, the level is
+> the backstop at 90 percent, the weekly HOLD level of the owner's ruling of 2026-09-17. At 98 percent
+> or more the rung is hit whatever the rate. A reading with a rate but no reset time still counts as
+> before the reset, because a missing reset must not loosen the rung.
+> `Get-DecisionRungLevels` holds the two defaults, and `thresholds.json` overrides them through
+> `levels.weekly` and `minutes`. Any other key under `levels`, `5-hour` included, is an unknown window
+> and throws, so the gate fails closed to REVIEW. The later rungs stay 10 and 5 minutes, so the
+> Steward's minutes default is (60, 10, 5), though the gate reads only the first.
+>
+> **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
+> `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its
+> 90-minute rate window. It also needs the oldest of them to be at least 30 minutes old, unless two
+> ticks or more moved, so that one tick is not read as a burn. So a slow or flat burn reads as no rate,
+> and the 90 percent level decides. A timed row was tried and refused: an idle session's rows measure
+> nothing, because they say only that a cached number has not changed.
+>
+> **The highest reading in a reset period binds.** An idle session keeps reporting its cached
+> percentage, so no one session's reading is the truth; each is a valid floor. Against a published
+> window of this root's, the collector therefore refuses a reading with the same reset that is not
+> higher, and a reading whose reset is earlier than the published one and has already passed. A refused
+> reading reaches neither `latest.json` nor the history. Any other reset is a new window and replaces
+> the value in either direction. A reading with no readable reset is refused while the published reset
+> is ahead, higher or not, because it cannot prove which window it belongs to.
+>
+> **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot
+> prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
+> missing reset must not loosen the rung.
+>
+> **The age therefore counts from the last change, and only a level or ceiling hit survives age.** The
+> payload carries no time of its own, so an idle session's cached number looks like a live flat one.
+> Restamping an equal reading let one idle terminal keep a frozen number fresh, and the rung read OK on
+> it. So a flat account, live or not, goes stale after 20 minutes and reads UNKNOWN. `usage.ps1`
+> publishes such a reading as `level_floor` when its reset is ahead, its age plus the time to its reset
+> fits one 7-day window, and its provenance is trusted: the document and the window carry a verified
+> root stamp, and the root is wired here. At the 98 percent ceiling the provenance test does not apply,
+> because a fresh reading there stops work on any provenance, and an equal reading does not refresh its
+> age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
+> window stamped with another root is still refused. The rung is then hit at the 90 percent level or the
+> ceiling. Every other stale reading answers REVIEW at any level, including at least a future-dated one,
+> an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
+> fresh 95 with no rate on such a root is hit, and the same reading once stale answers REVIEW. A Desktop
+> session on a root holding such a floor gets HALT, which narrows the gap this section names.
+>
+> **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale
+> reading. A fresh 70 percent with 45 minutes to empty hits; the same reading once stale answers REVIEW.
+> From 90 to 97 percent the opposite applies: the rung is hit even where the rate a fresher reading had
+> would have cleared it, because the window resets first. That departs from the rate-governs rule for
+> stale readings only.
+>
+> The rule has at least these limits, all of them open:
+>
+> - It needs a published window to compare with. At least these gone readings are published and reach
+>   the history: one on an empty directory, one over a window stamped with another root or with no reset,
+>   one higher than the published window for the same gone reset, and one with a later reset than the
+>   published window. `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its
+>   level is not graded. Its history row can still feed a rate, because with no current reset the rate
+>   skips its reset filter.
+> - With no published reset ahead, there is no floor at all: a reading with no reset is taken whatever
+>   its value, and an equal one refreshes the age, until a reading brings a reset. Below the rung the gate
+>   answers REVIEW for it.
+> - Refusing a reading with no reset while the published reset is ahead drops true evidence too. A real
+>   99 over a published 89 cannot raise the number, so the rung does not hit on it until a reading that
+>   carries a reset arrives.
+> - A `level_floor` holds only while the published reset is right. After a re-login or a moved reset, a
+>   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. At the
+>   ceiling only a new reading clears it, and only an interactive terminal session on that root publishes
+>   one. Such a floor needs no verified stamp, so on an unpinned root that number may not be this
+>   account's. Below the ceiling a floor also ends when one unpinned fire rewrites the document's stamp,
+>   because the fire is refused but the document is still rewritten; the gate then answers REVIEW.
+> - A session pinned to another root that publishes here does the same at any level, the ceiling included
+>   and fresh or stale, because the reader refuses a document stamped with another root. The gate answers
+>   REVIEW until this root's next fire restores the stamp, so that mis-wire is an exception to "only a new
+>   reading clears it". Measured 2026-11-01 on a fresh 100.
+> - It applies only against this root's own window. A window stamped with another root is no floor.
+> - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
+>   next live reading corrects it.
+> - If usage ever does fall inside a period, the kept reading stops being refreshed and goes stale in
+>   20 minutes. The gate then answers REVIEW below the rung and HALT at it, until the reset.
+>
+> **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
+> with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.
+>
+> **The Steward and this gate can disagree.** As read on 2026-11-01, the projection in the Steward's
+> `watch.py` is suppressed, so it has no rate and holds on the level alone, while this gate grades by
+> rate when it has one.
 
 ### Where it is enforced, and where it is not
 

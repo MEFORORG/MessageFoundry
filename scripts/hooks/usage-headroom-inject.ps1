@@ -476,18 +476,14 @@ function Get-StewardFallback {
         $dataAge = if ($null -eq $sample -or $sample -lt 0) { "UNKNOWN" } else { Format-Number "0.0" (($ageSec + $sample) / 60) }
     }
 
-    $windows = @()
-    foreach ($w in ([ordered]@{ "5-hour" = "5h"; "weekly" = "7d" }).GetEnumerator()) {
-        $v = Get-Finite $entry.levels.($w.Key)
-        $label = "  steward " + $w.Value.PadRight(3)
-        if ($null -eq $v) { $windows += "$label UNKNOWN -- the Steward's entry carries no $($w.Key) reading"; continue }
-        $windows += ("$label " + (Format-Number "0.0" $v).PadLeft(5) + "% used   [data $dataAge min old; " +
+    # Only the weekly level: an entry may still name other windows, and they are ignored. watch.py
+    # _view refuses an entry with no percentages at all; a READ verdict over no number would be a
+    # verdict with no measurement under it.
+    $v = Get-Finite $entry.levels.weekly
+    if ($null -eq $v) { return Unknown "the Steward's entry for pool $pool carries no percentages for the weekly window" }
+    return $lines + "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)" +
+        ("  steward 7d  " + (Format-Number "0.0" $v).PadLeft(5) + "% used   [data $dataAge min old; " +
             "read $ageMin min ago by the Steward; its TTL is $ttlMin min]")
-    }
-    # watch.py _view refuses an entry with no percentages at all; a READ verdict over two UNKNOWN
-    # windows would be a verdict with no measurement under it.
-    if (-not ($windows -match "% used")) { return Unknown "the Steward's entry for pool $pool carries no percentages" }
-    return $lines + "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)" + $windows
 }
 
 # WHICH POOL THE STEWARD WOULD NAME FOR THIS SESSION, in watch.py main()'s order. Returns @{org; acct;
@@ -671,7 +667,7 @@ if (-not $j) {
 $state = Get-Folded $j.state
 if (-not $state) { $state = "UNKNOWN" }
 
-# BEFORE THE WINDOW CHECK BELOW, because an UNAVAILABLE document deliberately carries NO five_hour key
+# BEFORE THE WINDOW CHECK BELOW, because an UNAVAILABLE document deliberately carries NO seven_day key
 # -- so leaving this until after it would send every cancelled account down the "the reader returned no
 # window readings" path and report a known zero as an unread number.
 if ($state -eq "UNAVAILABLE") {
@@ -693,7 +689,7 @@ elseif ($StateDir) { $latestPath = Join-Path $StateDir "latest.json" }
 # NO WINDOWS MEANS THE READER REFUSED THE WHOLE DOCUMENT -- nothing published, a foreign root, or a
 # config root it could not resolve. Its own reason is the honest text; the source test below is what
 # separates "nobody ever published" from "something is there and it did not survive the read".
-if (-not ($j.PSObject.Properties.Name -contains "five_hour") -or -not $j.five_hour) {
+if (-not $j.seven_day) {
     $why = Get-Folded $j.reason
     if (-not $why) { $why = "the reader returned no window readings" }
     # A REFUSAL IS NOT AN UNREADABLE FILE, and saying so would be a confidently wrong diagnosis of a
@@ -714,9 +710,8 @@ if (-not ($j.PSObject.Properties.Name -contains "five_hour") -or -not $j.five_ho
     Write-Unknown "$why ($where)" @(Get-CauseNote $j)
 }
 
-function Format-Window($w, [string]$Short) {
-    $label = "  {0,-3}" -f $Short
-    if (-not $w) { return "$label UNKNOWN -- this window has never been published" }
+function Format-Window($w) {
+    $label = "  7d "
     if ([string]$w.state -eq "UNKNOWN" -or $null -eq $w.used_percentage) {
         return "$label UNKNOWN -- " + (Get-Folded $w.reason)
     }
@@ -726,7 +721,7 @@ function Format-Window($w, [string]$Short) {
     $line = "$label {0,5:0.0}% used   [{1}]" -f ([double]$w.used_percentage), $age
     if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
         $m = [int]$w.minutes_to_reset
-        $line += ("   resets in {0}h{1:00}m" -f [int]($m / 60), ($m % 60))
+        $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))
     }
     if ([string]$w.state -in @("WARN", "CRITICAL")) {
         $line += "   " + [string]$w.state + " -- " + (Get-Folded $w.reason 160)
@@ -738,8 +733,7 @@ $lines = @($HEAD)
 $account = Get-Folded $j.config_root
 if ($account) { $lines += "  account: $account" }
 $lines += "  verdict: $state"
-$lines += (Format-Window $j.five_hour "5h")
-$lines += (Format-Window $j.seven_day "7d")
+$lines += (Format-Window $j.seven_day)
 
 # PROVENANCE UNVERIFIED IS SAID OUT LOUD. The publisher recorded no CLAUDE_CONFIG_DIR, so the guard
 # that keeps another account's headroom out of this reading could not run. That is a different fact

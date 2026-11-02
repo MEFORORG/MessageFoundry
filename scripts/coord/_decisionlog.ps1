@@ -793,22 +793,22 @@ function Get-DecisionThresholdsFile {
 
 function Get-DecisionRungLevels([string]$ThresholdsFile) {
     <#
-      The session (5-hour) window's start-nothing rung: the HOLD NEW WORK percentage and its
-      time-to-cutoff in minutes. The defaults are korus roles/STEWARD.md section 3's table, the row
-      `| **1. HOLD NEW WORK** | 20 minutes | 80 percent | 90 percent | Start nothing new. ...`
-      (line 444 at korus origin/main 8940b3d): 20 minutes, and the Session column's 80. The weekly
-      column is not read, because only the 5-hour window carries the stop (STEWARD.md 3a; the owner's
-      2026-08-14 ruling quoted there).
+      The weekly window's start-nothing rung: the HOLD NEW WORK percentage and its time-to-cutoff in
+      minutes. To change the rung's defaults, change the two assignments below this comment. They
+      carry the owner's ruling of 2026-10-31, which moved the stop to the weekly window when Anthropic
+      removed the five-hour limit and replaced the 2026-08-14 ruling that a weekly rung stops nobody.
+      The percentage is the weekly HOLD level of the owner's ruling of 2026-09-17. The Steward has
+      later rungs in minutes too; only HOLD is read here.
 
-      The Steward's thresholds.json overrides them the way its watch.py does: `levels."5-hour"` and
-      `minutes`, each three numbers, HOLD first. The key is "5-hour", as watch.py names the window.
-      A missing file keeps the defaults. A file that cannot be read, or is malformed in a way
-      watch.py would also refuse, throws: the gate then fails closed rather than grade against a
-      guess.
+      The Steward's thresholds.json overrides them the way its watch.py does: `levels.weekly` and
+      `minutes`, each three numbers, HOLD first. Any other key under `levels` is an unknown window,
+      so a leftover "5-hour" key throws. A missing file keeps the defaults. A file that cannot be read,
+      or is malformed in a way watch.py would also refuse, throws: the gate then fails closed rather
+      than grade against a guess.
     #>
-    $holdAt = 80.0
-    $holdMin = 20.0
-    $source = 'korus roles/STEWARD.md section 3 defaults'
+    $holdAt = 90.0
+    $holdMin = 60.0
+    $source = 'the owner ruling of 2026-10-31 defaults'
     if (-not [System.IO.File]::Exists($ThresholdsFile)) { return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source } }
     $doc = [System.IO.File]::ReadAllText($ThresholdsFile) | ConvertFrom-Json -ErrorAction Stop
     if ($doc -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile is not a JSON object" }
@@ -823,9 +823,9 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
     if ($null -ne $levels) {
         if ($levels -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile levels is not an object" }
         foreach ($p in $levels.PSObject.Properties) {
-            if ($p.Name -cnotin @('5-hour', 'weekly')) { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
-            $t = Get-Triple $p.Value "levels[$($p.Name)]"
-            if ($p.Name -ceq '5-hour') { $holdAt = $t[0]; $source = $ThresholdsFile }
+            if ($p.Name -cne 'weekly') { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
+            $holdAt = (Get-Triple $p.Value 'levels[weekly]')[0]
+            $source = $ThresholdsFile
         }
     }
     $minutes = Get-DecisionJsonValue $doc 'minutes'
@@ -840,21 +840,39 @@ function Get-DecisionCostRung {
 
       It reads usage.ps1 -Json, the one reader of the statusLine's published files, in a child pwsh:
       usage.ps1 runs without strict mode, and an in-process call would inherit the caller's.
-      THE SESSION (5-HOUR) WINDOW ONLY: a weekly rung names a severity and stops nobody (korus
-      roles/STEWARD.md 3a). RATE GOVERNS (STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn
-      rate, the rung is hit when the window is projected to run out within HoldMin minutes and
-      before it resets, whatever the level. Only with no rate is the level the backstop.
+      THE WEEKLY WINDOW, the only one (owner ruling 2026-10-31; Get-DecisionRungLevels holds the
+      numbers). RATE GOVERNS (STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung
+      is hit when the window is projected to run out within HoldMin minutes and before it resets,
+      whatever the level. Only with no rate is the level the backstop. A rate of zero or below counts
+      as no rate, because usage inside one reset period does not fall, and such a rate must not lift
+      the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
+      is positive, but its _burn is suppressed today, so the Steward has no rate at all and holds on
+      the level alone. This gate can therefore grade the same pool differently from the Steward.
 
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
 
-      UNKNOWN when the reading is missing, stale, refused, or usage.ps1 calls it UNKNOWN overall (its
+      ONLY A LEVEL OR CEILING HIT SURVIVES AGE, AND ONLY ON A level_floor. An equal reading does not
+      refresh its age, so a flat pool goes stale, and a spent one cannot rise. usage.ps1 publishes
+      level_floor on a stale reading with its reset ahead and inside one 7-day window, and with trusted
+      provenance unless it is at the ceiling. Such a reading has reached at least that level, unless
+      the reset has moved or usage did fall, so at the level or the ceiling it is HIT. A rate hit does
+      not survive: nothing is projected from a stale reading, so it has no rate. The level then decides,
+      even where a fresher reading's rate would have cleared it, and a reading the rate would have hit
+      below the level goes to UNKNOWN. Every other stale reading is UNKNOWN, because a stale number
+      cannot clear work. That includes a level hit below the ceiling with no trusted provenance, which
+      goes from HIT to UNKNOWN when it goes stale. A ceiling hit with its reset ahead does not.
+
+      UNKNOWN when the reading is missing, stale and not a floor at the rung, refused, past its reset (it
+      describes a window that is gone, so it neither clears nor halts), below the rung with no reset
+      time (it cannot prove which window it belongs to), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
-      5-hour state does not), unless the 5-hour window grades HIT: a hit is never downgraded, since
-      that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
+      window's own state does not), unless the window grades HIT: the overall state never downgrades
+      a hit, since that would fail open. usage.ps1 skips that refusal when it reads CRITICAL overall, so a
       CRITICAL reading that this grades below the rung is UNKNOWN too: it may be another root's. A
       reader that does not finish within -TimeoutSeconds is UNKNOWN. A Desktop session that runs no
-      statusLine reads UNKNOWN here; the Steward's status.json fallback that
+      statusLine reads UNKNOWN here unless its root holds a level_floor at the rung; the Steward's
+      status.json fallback that
       usage-headroom-inject.ps1 prints is not read, because it would be a third copy of watch.py's
       pool rules.
     #>
@@ -889,23 +907,32 @@ function Get-DecisionCostRung {
     if ($overall -eq 'UNAVAILABLE') {
         return (New-DecisionRung 'HIT' 'usage.ps1 reads UNAVAILABLE: this account has no subscription, so there is no pool to spend')
     }
-    $five = Get-DecisionJsonValue $j 'five_hour'
-    $pct = Get-DecisionJsonValue $five 'used_percentage'
-    $fiveState = [string](Get-DecisionJsonValue $five 'state')
-    if ($null -eq $five -or $null -eq $pct -or $fiveState -notin @('OK', 'WARN', 'CRITICAL')) {
-        $why = [string](Get-DecisionJsonValue $five 'reason')
+    $week = Get-DecisionJsonValue $j 'seven_day'
+    $pct = Get-DecisionJsonValue $week 'used_percentage'
+    $weekState = [string](Get-DecisionJsonValue $week 'state')
+    $toReset = Get-DecisionJsonValue $week 'minutes_to_reset'
+    # BEFORE THE FLOOR, so a gone window cannot HIT by any route.
+    # -lt, not -le: usage.ps1 rounds to whole minutes, so 0 can be a live window's last 30 seconds.
+    if ($null -ne $toReset -and [double]$toReset -lt 0) {
+        return (New-DecisionRung 'UNKNOWN' "the weekly window's reset has passed, so this reading describes a window that is gone")
+    }
+    $floor = Get-DecisionJsonValue $week 'level_floor'
+    if ($null -ne $floor -and ([double]$floor -ge 98 -or [double]$floor -ge $lv.HoldAt)) {
+        return (New-DecisionRung 'HIT' "weekly at least $floor%, a stale reading whose reset is still ahead, so that level stands; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
+    }
+    if ($null -eq $week -or $null -eq $pct -or $weekState -notin @('OK', 'WARN', 'CRITICAL')) {
+        $why = [string](Get-DecisionJsonValue $week 'reason')
         if (-not $why) { $why = [string](Get-DecisionJsonValue $j 'reason') }
-        return (New-DecisionRung 'UNKNOWN' "the 5-hour window is UNKNOWN: $why")
+        return (New-DecisionRung 'UNKNOWN' "the weekly window is UNKNOWN: $why")
     }
     $pct = [double]$pct
-    $rate = Get-DecisionJsonValue $five 'rate_pct_per_hr'
-    $toEmpty = Get-DecisionJsonValue $five 'minutes_to_empty'
-    $toReset = Get-DecisionJsonValue $five 'minutes_to_reset'
-    $at = "5-hour at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
+    $rate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
+    $toEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
+    $at = "weekly at $pct%; rung $($lv.HoldMin) min to cutoff or $($lv.HoldAt)% with no rate, from $($lv.Source)"
     $rung = if ($pct -ge 98) {
         New-DecisionRung 'HIT' "$at. At the ceiling (98 percent, usage.ps1's own CRITICAL band), whatever the rate"
-    } elseif ($null -ne $rate) {
-        $cut = [double]$rate -gt 0 -and $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
+    } elseif ($null -ne $rate -and [double]$rate -gt 0) {
+        $cut = $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
         if ($cut -and [double]$toEmpty -le $lv.HoldMin) {
             New-DecisionRung 'HIT' "$at. Projected to run out in about $toEmpty min, before the window resets"
         } else {
@@ -919,6 +946,11 @@ function Get-DecisionCostRung {
     # A HIT stands whatever the overall state: halting on a reading that may be another root's
     # costs a deferral, while dropping it to UNKNOWN would let a session at the ceiling act.
     if ($rung.State -eq 'HIT') { return $rung }
+    # A reading with no reset cannot prove which window it belongs to, so it may be last week's. A
+    # missing reset must not loosen the rung, which is why this comes after the HIT above.
+    if ($null -eq $toReset) {
+        return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but this reading carries no reset time, so it cannot prove which window it belongs to")
+    }
     if ($overall -notin @('OK', 'WARN', 'CRITICAL')) {
         return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 reads '$overall' overall: $(Get-DecisionJsonValue $j 'statusline_state')")
     }

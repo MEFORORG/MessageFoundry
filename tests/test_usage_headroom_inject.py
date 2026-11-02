@@ -88,11 +88,8 @@ def window(pct: float, resets_in_s: int) -> dict[str, Any]:
     return {"used_percentage": pct, "resets_at": int(time.time()) + resets_in_s}
 
 
-def reading(five: float = 73.5, seven: float = 41.2) -> dict[str, Any]:
-    return {
-        "session_id": "fixture",
-        "rate_limits": {"five_hour": window(five, 4800), "seven_day": window(seven, 200000)},
-    }
+def reading(seven: float = 41.2) -> dict[str, Any]:
+    return {"session_id": "fixture", "rate_limits": {"seven_day": window(seven, 200000)}}
 
 
 def run_hook(
@@ -167,9 +164,8 @@ def age_document(state: Path, minutes: int) -> None:
     doc = json.loads(p.read_text(encoding="utf-8"))
     old = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
     doc["captured_at"] = old
-    for key in ("five_hour", "seven_day"):
-        if doc.get(key):
-            doc[key]["captured_at"] = old
+    if doc.get("seven_day"):
+        doc["seven_day"]["captured_at"] = old
     p.write_text(json.dumps(doc), encoding="utf-8")
 
 
@@ -195,22 +191,44 @@ def test_it_reports_the_number_that_is_actually_in_the_published_file(tmp_path: 
     other assertion in this module is worthless if that distinction is not made first.
     """
     a, b = tmp_path / "a", tmp_path / "b"
-    collect(a, reading(five=73.5, seven=41.2))
-    collect(b, reading(five=12.7, seven=88.4))
+    collect(a, reading(seven=41.2))
+    collect(b, reading(seven=88.4))
 
     ctx_a = context_of(a)
     ctx_b = context_of(b)
 
-    assert "73.5%" in ctx_a and "41.2%" in ctx_a, ctx_a
-    assert "12.7%" in ctx_b and "88.4%" in ctx_b, ctx_b
-    assert "73.5%" not in ctx_b, "the second reading carried the first fixture's number"
+    assert "41.2%" in ctx_a, ctx_a
+    assert "88.4%" in ctx_b, ctx_b
+    assert "41.2%" not in ctx_b, "the second reading carried the first fixture's number"
+
+
+def test_a_reading_whose_reset_has_passed_prints_no_number(tmp_path: Path) -> None:
+    state = tmp_path / "s"
+    collect(state, {"session_id": "f", "rate_limits": {"seven_day": window(95.0, -300)}})
+    ctx = context_of(state)
+    assert "7d  UNKNOWN" in ctx and "reset has passed" in ctx, ctx
+    assert "95.0%" not in ctx, ctx
+
+
+def test_a_document_still_carrying_five_hour_prints_no_line_for_it(tmp_path: Path) -> None:
+    """Anthropic removed the five-hour limit. An older latest.json may still name it, and the block
+    must carry only the weekly line, whose number is the positive control."""
+    state = tmp_path / "s"
+    collect(state, reading(seven=41.2))
+    doc = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    doc["five_hour"] = {"used_percentage": 77.7, "resets_at_epoch": 1, "captured_at": "x"}
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    ctx = context_of(state)
+    assert "41.2%" in ctx, ctx
+    assert "77.7%" not in ctx and re.search(r"\b5h\b", ctx) is None, ctx
 
 
 def test_it_does_not_invent_a_verdict_the_reader_did_not_give(tmp_path: Path) -> None:
     """The hook formats; ``usage.ps1`` decides. Two tools naming different states for one pool is the
     disagreement this whole design avoids by having a single definition of the rules."""
     state = tmp_path / "s"
-    collect(state, reading(five=99.5, seven=41.2))
+    collect(state, reading(seven=99.5))
     assert f"verdict: {reader_state(state)}" in context_of(state)
 
 
@@ -319,7 +337,7 @@ def test_a_refused_reading_is_not_reported_as_an_unreadable_file(tmp_path: Path)
     collect(state, reading())
     doc = json.loads((state / "latest.json").read_text(encoding="utf-8"))
     doc["published_by"]["config_root_env"] = str(tmp_path / "some-other-account")
-    doc["five_hour"]["config_root_env"] = str(tmp_path / "some-other-account")
+    doc["seven_day"]["config_root_env"] = str(tmp_path / "some-other-account")
     (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
     ctx = context_of(state)
@@ -381,7 +399,7 @@ def _every_unknown_context(tmp_path: Path) -> list[tuple[str, str]]:
     collect(foreign, reading())
     doc = json.loads((foreign / "latest.json").read_text(encoding="utf-8"))
     doc["published_by"]["config_root_env"] = str(tmp_path / "another-account")
-    doc["five_hour"]["config_root_env"] = str(tmp_path / "another-account")
+    doc["seven_day"]["config_root_env"] = str(tmp_path / "another-account")
     (foreign / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
     return [
@@ -460,7 +478,7 @@ def test_it_never_denies_and_always_exits_zero(tmp_path: Path) -> None:
     """It informs; a separate gate decides whether a launch may proceed. A decoration must never be the
     reason a tool call fails."""
     published = tmp_path / "ok"
-    collect(published, reading(five=99.9, seven=99.9))
+    collect(published, reading(seven=99.9))
 
     cases = [
         run_hook(published),
@@ -562,13 +580,13 @@ def test_a_cancelled_account_is_reported_as_unavailable_and_not_as_unknown(tmp_p
     The UNKNOWN text says the verdict "is no measurement" and tells the session to spawn on its own
     judgment. That is exactly the wrong instruction for an account with no subscription: the honest
     reading is a hard zero and there is no judgment call left. The trap is structural rather than
-    stylistic -- an UNAVAILABLE document deliberately carries NO ``five_hour`` key, so the hook's
+    stylistic -- an UNAVAILABLE document deliberately carries NO ``seven_day`` key, so the hook's
     existing "no windows" branch would swallow it and report a known zero as an unread number.
     """
     root = tmp_path / ".claude-account-9"
     root.mkdir()
     state = root / "mefor-usage"
-    collect(state, reading(five=3.0, seven=2.0))
+    collect(state, reading(seven=3.0))
 
     # Positive control: before the marker this is an ordinary reading with a percentage in it, so the
     # assertions below are measuring the marker and not an empty fixture.
@@ -613,7 +631,7 @@ FALLBACK_LABEL = "This is NOT a statusLine reading"
 
 
 def steward_entry(
-    five: float = 61.5, weekly: float = 22.4, age_s: float = 90.0, ttl: float = 300.0, **over: Any
+    weekly: float = 22.4, age_s: float = 90.0, ttl: float = 300.0, **over: Any
 ) -> dict[str, Any]:
     """One pool entry in the shape watch.py's _read_pool writes, cache version 3."""
     entry: dict[str, Any] = {
@@ -622,7 +640,7 @@ def steward_entry(
         "how": "cli login record",
         "kind": "reading",
         "source": "api",
-        "levels": {"5-hour": five, "weekly": weekly},
+        "levels": {"weekly": weekly},
         "resets": {},
         "ts": time.time() - age_s,
         "ttl": ttl,
@@ -703,12 +721,12 @@ def test_a_desktop_session_reads_the_steward_file_labelled_and_aged(tmp_path: Pa
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
-    ctx_a = desktop_context(a, steward_files(a, {ORG: steward_entry(five=61.5, weekly=22.4)}))
-    ctx_b = desktop_context(b, steward_files(b, {ORG: steward_entry(five=8.5, weekly=77.0)}))
+    ctx_a = desktop_context(a, steward_files(a, {ORG: steward_entry(weekly=22.4)}))
+    ctx_b = desktop_context(b, steward_files(b, {ORG: steward_entry(weekly=77.0)}))
 
-    assert "61.5%" in ctx_a and "22.4%" in ctx_a, ctx_a
-    assert "8.5%" in ctx_b and "77.0%" in ctx_b, ctx_b
-    assert "61.5%" not in ctx_b
+    assert "22.4%" in ctx_a, ctx_a
+    assert "77.0%" in ctx_b, ctx_b
+    assert "22.4%" not in ctx_b
 
     # The statusLine verdict stays what the reader said; the fallback never replaces it.
     assert "verdict: UNKNOWN" in ctx_a
@@ -791,20 +809,20 @@ def test_the_desktop_record_names_the_pool_before_the_login_record(tmp_path: Pat
     the CLI's login, measured naming one account while the session billed another. The two pools carry
     different numbers, so the output says which one was read."""
     pools = {
-        ORG: steward_entry(five=61.5, weekly=22.4),
-        OTHER: steward_entry(five=44.5, weekly=11.5, org=OTHER, account=APP_ACCT),
+        ORG: steward_entry(weekly=22.4),
+        OTHER: steward_entry(weekly=11.5, org=OTHER, account=APP_ACCT),
     }
     args = steward_files(tmp_path, pools)
     desktop_record(tmp_path, acct=APP_ACCT, org=OTHER)
 
     ctx = desktop_context(tmp_path, args)
-    assert "44.5%" in ctx and "11.5%" in ctx, ctx
-    assert "61.5%" not in ctx, "the login record's pool was read for a session the app recorded"
+    assert "11.5%" in ctx, ctx
+    assert "22.4%" not in ctx, "the login record's pool was read for a session the app recorded"
     assert "named by the desktop app's record for this session" in ctx, ctx
 
     # Control: another session's id finds no record, so the pinned root's login record names the pool.
     other = desktop_context(tmp_path, args, session_id="not-this-session")
-    assert "61.5%" in other and "named by this config root's login record" in other, other
+    assert "22.4%" in other and "named by this config root's login record" in other, other
 
 
 def test_an_unpinned_desktop_session_with_no_record_is_refused(tmp_path: Path) -> None:
@@ -846,7 +864,7 @@ def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) ->
     usage = tmp_path / "usage"
     usage.mkdir()
     (usage / "usage-now.py").write_text("# stand-in: watch.py keeps DIR only beside it\n")
-    steward_files(usage, {OTHER: steward_entry(five=44.5, org=OTHER, account=APP_ACCT)})
+    steward_files(usage, {OTHER: steward_entry(weekly=44.5, org=OTHER, account=APP_ACCT)})
     (usage / "steward-status.json").rename(usage / "status.json")
     root = tmp_path / "root"
     root.mkdir()
@@ -870,13 +888,22 @@ def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) ->
 
 
 def test_a_missing_window_is_unknown_and_never_a_zero(tmp_path: Path) -> None:
-    """watch.py writes only the windows it read, and PowerShell turns a missing key into 0 on a cast."""
-    entry = steward_entry()
-    del entry["levels"]["weekly"]
+    """watch.py writes only the windows it read, and PowerShell turns a missing key into 0 on a cast.
+    An entry naming only the five-hour window has no reading left to print."""
+    ctx = desktop_context(
+        tmp_path, steward_files(tmp_path, {ORG: steward_entry(levels={"5-hour": 61.5})})
+    )
+    assert "fallback verdict: UNKNOWN" in ctx and "carries no percentages" in ctx, ctx
+    assert _PERCENTAGE.search(ctx) is None, f"a missing window was printed as a number: {ctx}"
+
+
+def test_a_steward_entry_naming_the_five_hour_window_prints_the_weekly_line_only(
+    tmp_path: Path,
+) -> None:
+    entry = steward_entry(levels={"5-hour": 61.5, "weekly": 22.4})
     ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
-    assert "61.5%" in ctx, "positive control: the window that is present still reads"
-    assert "steward 7d  UNKNOWN" in ctx, ctx
-    assert "0.0%" not in ctx, f"a missing window was printed as zero usage: {ctx}"
+    assert "22.4%" in ctx and "steward 7d" in ctx, ctx
+    assert "61.5%" not in ctx and re.search(r"\b5h\b", ctx) is None, ctx
 
 
 def test_a_desktop_sourced_entry_states_the_age_of_its_data(tmp_path: Path) -> None:
@@ -953,7 +980,7 @@ def test_a_repeat_prints_one_short_line_and_a_change_prints_the_block(tmp_path: 
     of firings with the repeat check off, which must both print in full, so the assertion can see a
     repeated block and is not merely failing on a parameter the old hook lacked."""
     state, dedup = tmp_path / "state", tmp_path / "dedup"
-    collect(state, reading(five=42.0, seven=31.0))
+    collect(state, reading(seven=42.0))
     for _ in range(2):
         assert is_full(dedup_context(state, None)), (
             "control: with no -DedupDir every firing is full"
@@ -966,20 +993,20 @@ def test_a_repeat_prints_one_short_line_and_a_change_prints_the_block(tmp_path: 
     assert is_repeat(again, "OK"), f"an unchanged OK repeated the block: {again}"
     assert len(again.encode()) < 100, again
 
-    # Still OK, but the 5-hour number moved from the 40s to the 50s, so the block prints again.
-    collect(state, reading(five=55.0, seven=31.0))
+    # Still OK, but the number moved from the 40s to the 50s, so the block prints again.
+    collect(state, reading(seven=55.0))
     moved = dedup_context(state, dedup)
     assert is_full(moved) and "55.0%" in moved, moved
     assert is_repeat(dedup_context(state, dedup), "OK")
 
     # A WORSE state is never hidden: OK to WARN prints in full, and so does every WARN after it.
-    collect(state, reading(five=90.0, seven=31.0))
+    collect(state, reading(seven=90.0))
     for _ in range(2):
         warn = dedup_context(state, dedup)
         assert is_full(warn) and "verdict: WARN" in warn, warn
 
     # Back to an OK this session saw before WARN: the last thing it saw was WARN, so it is a change.
-    collect(state, reading(five=55.0, seven=31.0))
+    collect(state, reading(seven=55.0))
     assert is_full(dedup_context(state, dedup))
 
     # Another session, or a subagent inside this one, has seen nothing, so it gets the block.
@@ -999,12 +1026,12 @@ def test_unknown_repeats_short_but_a_high_number_under_it_does_not(tmp_path: Pat
     env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
     never = tmp_path / "never-published"
     steward = tmp_path / "dedup-steward"
-    low = steward_files(tmp_path, {ORG: steward_entry(five=41.5)})
+    low = steward_files(tmp_path, {ORG: steward_entry(weekly=41.5)})
     assert "41.5%" in dedup_context(never, steward, env_extra=env, extra=low)
     assert is_repeat(dedup_context(never, steward, env_extra=env, extra=low), "UNKNOWN"), (
         "control: a low fallback reading under UNKNOWN does repeat short"
     )
-    high = steward_files(tmp_path, {ORG: steward_entry(five=90.0)})
+    high = steward_files(tmp_path, {ORG: steward_entry(weekly=90.0)})
     for _ in range(2):
         ctx = dedup_context(never, steward, env_extra=env, extra=high)
         assert is_full(ctx) and "90.0%" in ctx, ctx
@@ -1038,7 +1065,6 @@ def test_unreadable_expired_or_missing_state_prints_the_block(tmp_path: Path) ->
 STUB_READER = (
     "param([string]$StateDir,[switch]$Json,[int]$MaxAgeMinutes)\n"
     '\'{"state":"OK","config_root":"stub",'
-    '"five_hour":{"state":"OK","used_percentage":10,"reading_age_min":1},'
     '"seven_day":{"state":"OK","used_percentage":10,"reading_age_min":1}}\'\n'
 )
 

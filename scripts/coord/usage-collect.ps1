@@ -13,10 +13,11 @@
     ONE PUBLISHER, N READERS, PER ACCOUNT -- AND THE "PER ACCOUNT" IS THE HALF THAT WAS MISSING. This
     is the single place that premise is stated; everything else links here.
 
-    The quota is ACCOUNT-WIDE: all sessions in every repo draw down the same 5-hour and 7-day pools, so
-    any ONE session's reading is the truth for all sessions ON THAT ACCOUNT. Do not run a collector per
-    session expecting to add them up -- summing double-counts the same shared pool. The output path is
-    therefore not repo-level: the data is a property of the account, not of a checkout, and a
+    The quota is ACCOUNT-WIDE: all sessions in every repo draw down the same 7-day pool, so any ONE
+    session's reading is a valid FLOOR for all sessions ON THAT ACCOUNT, and inside one reset period
+    the highest reading binds. It is not the truth: an idle session keeps reporting a cached number.
+    Do not run a collector per session expecting to add them up -- summing double-counts the same
+    shared pool. The output path is therefore not repo-level: the data is a property of the account, not of a checkout, and a
     repo-scoped copy would be a second truth that goes stale.
 
     IT IS NOT MACHINE-WIDE EITHER, and an earlier version of this file wrote as if it were. A box can
@@ -24,19 +25,22 @@
     HOLDS ONE CREDENTIAL SET AND THEREFORE ONE ANTHROPIC ACCOUNT. Measured on the box this was written
     for: five account roots, five different account emails, five separate pools. Publishing all of them
     to one user-level file is last-writer-wins across unrelated quotas, and the damage compounds -- the
-    percentage flaps; the carry-forward below can leave five_hour from one account beside seven_day
-    from another in one document; and usage.ps1's staleness guard never fires, because some OTHER
-    account keeps the file warm. That last one is the worst: the guard looks present and is disarmed.
+    percentage flaps; the carry-forward below can keep one account's seven_day in a document another
+    account wrote; and usage.ps1's staleness guard never fires, because some OTHER account keeps the
+    file warm. That last one is the worst: the guard looks present and is disarmed.
 
     SO THE PUBLISH PATH IS PER CONFIG ROOT: <config root>\mefor-usage. The rule lives once, in
     config-roots.ps1 (Get-UsageStateDir), and usage.ps1 derives its read path from the same function --
     so publisher and reader cannot drift apart. The filesystem is the partition key, which is why two
     roots cannot collide however CLAUDE_CONFIG_DIR is spelled.
 
-    WHAT IT CANNOT SEE, STATED HERE SO NOTHING DOWNSTREAM IMPLIES OTHERWISE. The statusLine payload
-    carries `five_hour` and `seven_day` only. Absent: the MODEL-SCOPED weekly bucket (the "Weekly /
-    Fable" bar in Settings > Usage) and the plan tier. The request to expose them was closed as
-    not-planned.
+    ONE WINDOW IS READ: `seven_day`. Anthropic removed the five-hour limit (owner instruction
+    2026-10-31), so this reads no other window, and a payload or an older latest.json that still
+    carries one is ignored rather than refused.
+
+    WHAT IT CANNOT SEE, STATED HERE SO NOTHING DOWNSTREAM IMPLIES OTHERWISE. Absent from the statusLine
+    payload: the MODEL-SCOPED weekly bucket (the "Weekly / Fable" bar in Settings > Usage) and the plan
+    tier. The request to expose them was closed as not-planned.
 
     OPUS IS NOT ONE OF THE GAPS, and an earlier draft of this file said it was. Opus and Sonnet have no
     separate weekly bucket on this plan -- they draw on "All models", which IS the `seven_day` window
@@ -178,9 +182,9 @@ try {
     $now = (Get-Date).ToUniversalTime().ToString("o")
 
     # ABSENT IS A VALUE. The docs are explicit that rate_limits "appears only for Claude.ai subscribers
-    # (Pro/Max) after the first API response in the session" and that each window "may be independently
-    # absent". So a missing window is recorded as null with a reason, never defaulted to 0 -- 0% used and
-    # "not reported yet" are opposite facts and must not share a representation.
+    # (Pro/Max) after the first API response in the session" and that a window may be absent. So a
+    # missing window is never defaulted to 0 -- 0% used and "not reported yet" are opposite facts and
+    # must not share a representation.
     function Get-Window($w) {
         if ($null -eq $w) { return $null }
         $pct = $w.used_percentage
@@ -192,32 +196,20 @@ try {
         }
     }
 
-    $five = Get-Window $rl.five_hour
     $seven = Get-Window $rl.seven_day
-
-    # Snapshotted BEFORE the carry-forward below, because HISTORY MUST RECORD ONLY WHAT WAS FRESHLY
-    # OBSERVED. A carried-forward percentage written against a new timestamp tells the burn-rate
-    # calculation that consumption had stopped -- the one lie that matters in a tool built to warn
-    # about consumption.
-    $freshFive = if ($five) { $five.used_percentage } else { $null }
-    $freshSeven = if ($seven) { $seven.used_percentage } else { $null }
 
     # DO NOT CLOBBER A GOOD READING WITH AN EMPTY ONE.
     #
     # EVERY session runs this statusLine and they all publish to ONE shared file, so every session is a
     # publisher -- there is no privileged "collector". A session that has not yet had its first API
     # response carries no rate_limits at all, and a naive write blanks the account's only good reading
-    # for all of them. Caught in test: a full 5h/7d reading was overwritten seconds later by a session
-    # reporting neither.
+    # for all of them. Caught in test: a full reading was overwritten seconds later by a session
+    # reporting none.
     #
-    # Per-window, not all-or-nothing, because the docs are explicit that the two windows are absent
-    # INDEPENDENTLY. An absent window carries the previous value forward together with ITS OWN
-    # captured_at, so staleness is tracked per window and a reader can never mistake a carried-over
-    # number for a freshly observed one.
-    $latestPath = Join-Path $StateDir "latest.json"
-    $prevDoc = $null
-    try { $prevDoc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction Stop } catch { }
-
+    # An absent window carries the previous value forward together with ITS OWN captured_at, so
+    # staleness is tracked on the window and a reader can never mistake a carried-over number for a
+    # freshly observed one.
+    #
     # THE ORIGIN TRAVELS WITH THE WINDOW, FOR THE SAME REASON captured_at DOES.
     #
     # A document-level stamp records who WROTE the file, not where the numbers in it came from, and the
@@ -230,13 +222,74 @@ try {
     # So a FRESHLY OBSERVED window is stamped here and a CARRIED one keeps whatever stamp it arrived
     # with. usage.ps1 applies the cross-root refusal per window as well as per document.
     $stampEnv = $(if ($ConfigRootEnv) { (Get-RootLabel $ConfigRootEnv) } else { "unset" })
-    if ($five) { $five.captured_at = $now; $five.config_root_env = $stampEnv }
-    elseif ($prevDoc -and $prevDoc.five_hour) { $five = $prevDoc.five_hour }
-    if ($seven) { $seven.captured_at = $now; $seven.config_root_env = $stampEnv }
-    elseif ($prevDoc -and $prevDoc.seven_day) { $seven = $prevDoc.seven_day }
+    $prevDoc = $null
+    try { $prevDoc = Get-Content -LiteralPath (Join-Path $StateDir "latest.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction Stop } catch { }
+    $published = if ($prevDoc) { $prevDoc.seven_day } else { $null }
+
+    # THE HIGHEST READING IN A RESET PERIOD BINDS. An idle session keeps reporting its cached number on
+    # a timer, and every session publishes here, so without this rule a stale 60 replaces a live 99 and
+    # reads as freshly observed. The level only rises inside a window. So against a published window
+    # of this root's, a reading is refused when it has the same reset and is not higher, or when its
+    # reset is earlier than the published one and has already passed: that is the number an idle
+    # session still holds after a reset. Any other reset is a new window and replaces in either
+    # direction. A refused reading leaves the published window whole, its own age included, so the
+    # staleness guard keeps counting from the last real observation.
+    #
+    # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. At least these gone readings are published and
+    # reach the history: one on an empty directory, one over a window stamped with another root or with
+    # no reset, one higher than the published window for the same gone reset, and one with a later reset
+    # than the published window. Nothing here reads the clock against a lone reading. The reader reports
+    # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
+    # row can still be read: with no current reset, usage.ps1's rate skips its reset filter.
+    #
+    # AN EQUAL READING IS REFUSED TOO, SO THE AGE COUNTS FROM THE LAST CHANGE. The payload carries no
+    # time of its own, so an idle session's cached number looks exactly like a live flat one. Restamping
+    # it let one idle terminal keep a frozen number fresh while sessions that never publish burned the
+    # pool, and the rung read OK on it. The cost is that a truly flat account also goes stale. On the
+    # conditions at level_floor in usage.ps1, the number still stands as a floor, and the gate's rung
+    # reads it as a HIT at the level or the ceiling.
+    #
+    # A READING WITH NO READABLE RESET CANNOT PROVE WHICH WINDOW IT BELONGS TO. So while the published
+    # reset is still ahead it is refused, higher or not. Taken bare, it would wipe the reset this rule
+    # and the reader's gone-window check both need. Given the published reset, it could set a floor no
+    # live reading could lower until that reset. With no published reset ahead there is nothing to hold
+    # on to: the reading is taken, and the rule does not apply until a reading brings a reset.
+    #
+    # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
+    # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
+    # or absent stamp counts as ours, because sessions on one root can differ in having the pin at all.
+    #
+    # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
+    # check and then land over a higher one written in between. The next live fire corrects it.
+    $keepPublished = -not $seven
+    $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
+    $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
+    if ($seven -and $published -and (-not $publishedRoot -or $publishedRoot -eq "unset" -or $publishedRoot -ieq $ownRoot)) {
+        $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $seenEpoch = $seven.resets_at_epoch -as [long]
+        $publishedEpoch = $published.resets_at_epoch -as [long]
+        $notHigher = $seven.used_percentage -le ($published.used_percentage -as [double])
+        $keepPublished = if ($seenEpoch -and $publishedEpoch) {
+            ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
+        }
+        else { $publishedEpoch -gt $nowEpoch }
+    }
+
+    # HISTORY MUST RECORD ONLY WHAT WAS FRESHLY OBSERVED. A kept percentage written against a new
+    # timestamp tells the burn-rate calculation that consumption had stopped -- the one lie that matters
+    # in a tool built to warn about consumption. A refused lower one would also read as a falling rate.
+    $freshSeven = $null
+    if ($keepPublished) { $seven = $published }
+    else {
+        $freshSeven = $seven.used_percentage
+        $seven.captured_at = $now
+        $seven.config_root_env = $stampEnv
+    }
 
     # Nothing observed and nothing remembered: publish NOTHING rather than a document full of nulls.
-    if (-not $five -and -not $seven) { Write-Output "mefor-usage: no rate_limits yet"; exit 0 }
+    # This also distinguishes "no quota data yet" from "quota fine": the first API response of a
+    # session has not landed yet, or this is not a subscription account.
+    if (-not $seven) { Write-Output "mefor-usage: no rate_limits yet"; exit 0 }
 
     $doc = [ordered]@{
         captured_at   = $now
@@ -264,7 +317,6 @@ try {
             config_root     = (Get-RootLabel (Split-Path $StateDir -Parent))
             config_root_env = $(if ($ConfigRootEnv) { (Get-RootLabel $ConfigRootEnv) } else { "unset" })
         }
-        five_hour     = $five
         seven_day     = $seven
         # Named explicitly rather than omitted, so a reader cannot mistake "this build never collected
         # it" for "the account has none". Opus is deliberately NOT listed: it has no separate weekly
@@ -279,48 +331,34 @@ try {
     $json = ($doc | ConvertTo-Json -Depth 6)
     $ok = Write-AtomicText (Join-Path $StateDir "latest.json") $json
 
-    # History drives burn rate. Append ONLY when a percentage actually moves: the statusline can fire many
-    # times a minute, and a row per fire would be a large file describing a flat line.
-    if ($ok -and ($null -ne $freshFive -or $null -ne $freshSeven)) {
+    # History drives burn rate. Append only when a FRESHLY OBSERVED percentage moves. The statusline can
+    # fire many times a minute; a row per fire would be a large file describing a flat line, and rate
+    # over a dense flat series is noise.
+    #
+    # NO ROW ON A TIMER. A slow burn then has too few rows for a rate, and the rung falls back to the
+    # level, which is the safe side. A timed row would measure nothing: an idle session keeps reporting
+    # its cached percentage, so its rows would say only that the number had not changed.
+    if ($ok -and $null -ne $freshSeven) {
         $histPath = Join-Path $StateDir "history.jsonl"
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
-        # Append only when a FRESHLY OBSERVED percentage actually moves. The statusline can fire many
-        # times a minute; a row per fire would be a large file describing a flat line, and rate over a
-        # dense flat series is noise.
-        $changed = $true
-        if ($prev) {
-            $samePct = (($null -eq $freshFive) -or ($prev.five_hour -eq $freshFive)) -and
-                       (($null -eq $freshSeven) -or ($prev.seven_day -eq $freshSeven))
-            if ($samePct) { $changed = $false }
-        }
-        if ($changed) {
+        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch) {
             $row = [ordered]@{
                 at          = $now
-                five_hour   = $freshFive
                 seven_day   = $freshSeven
-                five_reset  = if ($rl.five_hour) { $rl.five_hour.resets_at } else { $null }
-                seven_reset = if ($rl.seven_day) { $rl.seven_day.resets_at } else { $null }
+                seven_reset = $seven.resets_at_epoch
             } | ConvertTo-Json -Compress
             Add-Content -LiteralPath $histPath -Value $row -Encoding UTF8
         }
     }
 
     # The human-facing line. Keep it short; this is a status bar, not a report.
-    if ($five -or $seven) {
-        $parts = @()
-        if ($five) { $parts += ("5h {0:0}%" -f $five.used_percentage) }
-        if ($seven) { $parts += ("7d {0:0}%" -f $seven.used_percentage) }
-        $line = ($parts -join "  ")
-        if ($five -and $five.resets_at_epoch) {
-            $mins = [int](([System.DateTimeOffset]::FromUnixTimeSeconds([long]$five.resets_at_epoch) - [System.DateTimeOffset]::UtcNow).TotalMinutes)
-            if ($mins -ge 0) { $line += ("  (resets {0}h{1:00}m)" -f [int]($mins / 60), ($mins % 60)) }
-        }
-    }
-    else {
-        # Distinguish "no quota data yet" from "quota fine". The first API response of a session has not
-        # landed yet, or this is not a subscription account.
-        $line = "mefor-usage: no rate_limits yet"
+    $line = "7d {0:0}%" -f $seven.used_percentage
+    if ($seven.resets_at_epoch) {
+        $mins = [int](([System.DateTimeOffset]::FromUnixTimeSeconds([long]$seven.resets_at_epoch) - [System.DateTimeOffset]::UtcNow).TotalMinutes)
+        if ($mins -ge 0) { $line += ("  (resets {0}h{1:00}m)" -f [math]::Floor($mins / 60), ($mins % 60)) }
+        # A window that is gone has no number worth showing. usage.ps1 applies the same rule.
+        else { $line = "7d reset passed, no current reading" }
     }
 }
 catch {
