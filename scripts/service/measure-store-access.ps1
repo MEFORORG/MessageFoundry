@@ -544,17 +544,25 @@ function Invoke-ChildProcess {
       Process.Start keeps the handle CreateProcess returned, and it avoids the native stderr merge
       that aborts a 5.1 script under ErrorActionPreference=Stop.
 
-      Unlike Start-Process -Wait, this waits for the child alone, not its descendants. The callers'
-      children leave none behind: the probe runs in one process (provision's icacls runs are
-      subprocess.run, waited for), and the messagefoundry.exe launcher waits for its Python.
+      Start-Process -Wait waited for the whole process tree. This waits for the child, and the reads
+      wait for every holder of the inherited pipes to close them. The callers' children leave no
+      descendant behind: the probe runs in one process (provision's icacls runs are subprocess.run,
+      waited for), and the messagefoundry.exe launcher waits for its Python. Neither wait is
+      bounded, as -Wait was not; the step's timeout-minutes bounds a hang.
 
-      An exit code that still cannot be read throws, so it is never compared as if it were one.
+      Process.Start resolves a relative path against the process's current directory, which does
+      not follow Set-Location, so pass an absolute FilePath. The working directory defaults to the
+      PowerShell location, as Start-Process's did.
+
+      An exit code that still cannot be read throws, with the output, so it is never compared as if
+      it were one. The pipe reads use GetResult(), a method, because PowerShell turns an exception
+      in a property getter such as Task.Result into $null, which would read as empty output.
     #>
-    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory)
+    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory = $PWD.ProviderPath)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
     $psi.Arguments = $Arguments
-    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    $psi.WorkingDirectory = $WorkingDirectory
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
@@ -565,10 +573,14 @@ function Invoke-ChildProcess {
         $err = $p.StandardError.ReadToEndAsync()
         $p.WaitForExit()
         $code = $p.ExitCode
-        $result = New-Object PSObject -Property @{ Code = $code; Out = $out.Result; Err = $err.Result }
+        $result = New-Object PSObject -Property @{
+            Code = $code; Out = $out.GetAwaiter().GetResult(); Err = $err.GetAwaiter().GetResult()
+        }
     } finally { $p.Dispose() }
     if ($null -eq $code) {
-        throw "$FilePath exited, but no exit code could be read from it, so its outcome is unknown"
+        $text = ($result.Out + "`n" + $result.Err).Trim()
+        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + "..." }
+        throw "$FilePath exited, but no exit code could be read from it, so its outcome is unknown. Output: $text"
     }
     return $result
 }
@@ -657,7 +669,8 @@ $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.Wind
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "measure-store-access.ps1 installs a service and must run elevated."
 }
-if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
+# Resolved to a full path here, because Invoke-ChildProcess resolves a relative one differently.
+$AppExe = (Get-Command $(if ($AppExe) { $AppExe } else { "messagefoundry" }) -ErrorAction Stop).Source
 $Python = (Get-Command python).Source
 $Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
@@ -856,13 +869,15 @@ try {
     $StoreKeyFile = Join-Path $DataDir "store.key.dpapi"
     $env:MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
     try {
-        $protectCode = (Invoke-ChildProcess -FilePath $AppExe `
-            -Arguments "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"").Code
+        $protect = (Invoke-ChildProcess -FilePath $AppExe `
+            -Arguments "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"")
     } finally {
         Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY -ErrorAction SilentlyContinue
     }
-    if ($protectCode -ne 0 -or -not (Test-Path -LiteralPath $StoreKeyFile)) {
-        throw "protect-key could not write the store key file $StoreKeyFile (exit $protectCode)"
+    # The key comes from the environment, not --generate, so protect-key's stderr carries no key.
+    if ($protect.Code -ne 0 -or -not (Test-Path -LiteralPath $StoreKeyFile)) {
+        throw ("protect-key could not write the store key file $StoreKeyFile (exit $($protect.Code)): " +
+            (Get-Excerpt $protect.Err))
     }
     # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
     # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving is
