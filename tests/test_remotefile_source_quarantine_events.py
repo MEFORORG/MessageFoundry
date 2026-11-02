@@ -5,8 +5,10 @@
 Packet 9 finding P9-11, the remote half of the row whose FILE half PR 1583 built. The SFTP/FTP/FTPS
 poll source's four quarantine arms (over the listed size, over the retrieved size, a content-vs-type
 mismatch, a scanner rejection) moved the file to ``error_subdir`` and logged a WARNING, and wrote
-nothing to the store. Each arm now emits the FILE source's matching kind, with a reason that never
-carries the file name. The refused-unsafe-name arm deliberately records nothing: it moves nothing.
+nothing to the store. Each arm now emits the FILE source's matching kind, with a reason that carries
+no exact copy of the file name. A scanner quoting it in another form is kept, the limit
+``docs/PHI.md`` section 7 row 7 states. The refused-unsafe-name arm deliberately records nothing: it
+moves nothing.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -17,9 +19,10 @@ from collections.abc import Iterator
 
 import pytest
 
-from messagefoundry.transports.file import set_scan_hook
+from messagefoundry.redaction import safe_name
+from messagefoundry.transports.file import ScanRejected, set_scan_hook
 from messagefoundry.transports.remotefile import _RemoteError
-from tests.test_file_source_quarantine_events import _HL7, _NAME, _reject, _Sink
+from tests.test_file_source_quarantine_events import _HL7, _NAME, _QUOTED_FORMS, _reject, _Sink
 from tests.test_remotefile_transport import _FakeClient, _RecordingHandler, _settle, _src
 
 _PATH = f"/in/{_NAME}"
@@ -85,6 +88,38 @@ async def test_each_quarantine_arm_records_one_event_without_the_file_name(
     reason = sink.events[0][2]
     assert reason is not None and says in reason, f"unexpected reason: {reason!r}"
     assert "MRN123456789" not in reason, f"the file name leaked into the reason: {reason!r}"
+
+
+@pytest.mark.parametrize(
+    ("name", "quoted", "kept"), [f[1:] for f in _QUOTED_FORMS], ids=[f[0] for f in _QUOTED_FORMS]
+)
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_the_scan_reject_reason_scrubs_only_an_exact_copy_of_the_name(
+    monkeypatch: pytest.MonkeyPatch, name: str, quoted: str, kept: bool
+) -> None:
+    """Pins the limit ``docs/PHI.md`` section 7 row 7 states. A stronger scrub turns this red, and
+    that row must then change with it.
+
+    Mutation: make the replacement in ``safe_exc`` ignore case. Red: the two case rows."""
+    client = _FakeClient(files={f"/in/{name}": _HL7})
+    src = _src(monkeypatch, client)
+    sink = _Sink()
+    src.on_connection_event = sink
+    src._handler = _RecordingHandler()
+
+    def reject(_raw: bytes, _source: str) -> None:
+        raise ScanRejected(f"EICAR test signature in {quoted}")
+
+    set_scan_hook(reject)
+    await _settle(src)
+    await src._poll_once()
+
+    assert [k for k, _peer, _reason in sink.events] == ["file_scan_rejected"]
+    reason = sink.events[0][2]
+    assert reason is not None
+    assert (quoted in reason) is kept, f"unexpected reason: {ascii(reason)}"
+    if not kept:
+        assert safe_name(name) in reason, f"unexpected reason: {ascii(reason)}"
 
 
 async def test_a_failing_sink_never_stops_the_quarantine(monkeypatch: pytest.MonkeyPatch) -> None:
