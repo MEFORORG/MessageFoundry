@@ -1335,8 +1335,8 @@ def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> N
     This asserts the relation that matters on every leg -- the slowest known green run must not be
     LOW at the cap the gate divides by. On ubuntu, whose cap has been sized from its row since
     2026-10-07, it also asserts the sizing rule's equality, so the two cannot drift apart again. The
-    two Windows caps are sized from an anchor in ci.yml's engine note rather than from their rows,
-    so they carry the floor only.
+    two Windows caps share one value, sized since 2026-11-02 from the windows-2025 row (the
+    windows-2022 row is censored), but no equality is asserted for them, so they carry the floor only.
 
     Re-falsified at the 2026-10-18 re-measure, against the 33:33 row: `step_timeout` set to 43
     (43:00 / 33:33 = 1.282x) went RED on the floor, and set to 47 went RED on the rule. Restored

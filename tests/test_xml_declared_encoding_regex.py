@@ -26,9 +26,11 @@ import pytest
 
 from messagefoundry.parsing.xml import harden
 
-# The span, the threshold and the growth timer are that file's, reused so the two growth arms cannot
-# drift apart: 8x the input, where linear reads about 8x and quadratic about 64x.
-from tests.test_log_redaction_secret_domain import _GROWTH_LENGTHS, _MAX_GROWTH, _growth_between
+# The span and the threshold are that file's, and the growth timer is the shared one in
+# tests/_growth.py, reused so the two growth arms cannot drift apart: 8x the input, where linear
+# reads about 8x and quadratic about 64x.
+from tests._growth import _growth_between
+from tests.test_log_redaction_secret_domain import _GROWTH_LENGTHS, _MAX_GROWTH
 
 _BOM = chr(0xFEFF)
 

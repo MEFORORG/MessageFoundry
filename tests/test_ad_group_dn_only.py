@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import gc
 import re
-import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -43,6 +42,7 @@ from tests._ad_group_map_store_contract import (
     assert_group_map_keys_at_width_store,
 )
 from tests._admin_account import create_local_user_chosen
+from tests._growth import _growth_between
 
 PW = "Sup3rSecret!!"
 
@@ -304,38 +304,49 @@ _PATHOLOGICAL_DNS: dict[str, tuple[Callable[[int], str], bool]] = {
 _MAX_LINEAR_RATIO = 8.0
 
 
-def _fastest(judge: Callable[[str], object], text: str, runs: int) -> float:
-    """The fastest of ``runs`` timings of ``judge(text)``, with the collector off."""
-    best = float("inf")
+def _attempt_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
+    """One attempt: a reading of :func:`_growth_between`, which says how it samples, taken with
+    the collector off."""
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        for _ in range(runs):
-            started = time.perf_counter()
-            judge(text)
-            best = min(best, time.perf_counter() - started)
+        return _growth_between(judge, small, large, rounds=3)
     finally:
         if was_enabled:
             gc.enable()
-    return best
 
 
-def _scaling_ratio(judge: Callable[[str], object], make: Callable[[int], str], k: int) -> float:
-    """How much longer ``judge`` takes on an input of size ``4 * k`` than on one of size ``k``.
+def _scaling_ratios(
+    judge: Callable[[str], object], make: Callable[[int], str], k: int
+) -> list[float]:
+    """How much longer ``judge`` takes on an input of size ``4 * k`` than on one of size ``k``,
+    one reading per attempt. The lowest is the verdict; the rest go in a failure message.
 
     A ratio rather than an absolute bound, because CI runners took 1.2 to 1.6 s on one
     50,000-character linear pass that takes milliseconds locally (BACKLOG #2610). A slow runner
-    slows both sizes alike, so the ratio still tells linear from quadratic. Each size keeps its
-    fastest run, and a ratio over the line is measured again, so one preemption cannot fake a
-    curve. Keeping the lowest of three is fair to the control: a quadratic parser stays over the
-    line on every attempt, because noise never makes it scale linearly."""
+    slows both sizes alike, so the ratio still tells linear from quadratic.
+
+    A ratio at or over the line is measured again, up to three attempts, so one preemption cannot
+    fake a curve. The linear tests and their quadratic control run this one rule. A parser fails
+    the linear check only if every attempt reads at or over the line, so that is what the control
+    must show for a quadratic one.
+
+    CI read the control at 6.2 to 8.0 under this rule (BACKLOG #3452). Each attempt then timed
+    3 large runs and then 7 small ones of about 1.6 ms at ``k`` = 1,000, a window of about 11 ms
+    that one stretch of contention could cover whole. That cause is inferred from the code and
+    local timings, not measured on a hosted runner. The interleaved instrument in
+    :func:`_attempt_ratio` and the control's larger ``k`` answer it; the rule is unchanged."""
     small, large = make(k), make(4 * k)
-    ratio = float("inf")
+    readings: list[float] = []
     for _ in range(3):
-        ratio = min(ratio, _fastest(judge, large, 3) / _fastest(judge, small, 7))
-        if ratio < _MAX_LINEAR_RATIO:
+        readings.append(_attempt_ratio(judge, small, large))
+        if readings[-1] < _MAX_LINEAR_RATIO:
             break
-    return ratio
+    return readings
+
+
+def _attempts(readings: list[float]) -> str:
+    return "attempts: " + ", ".join(f"{reading:.2f}x" for reading in readings)
 
 
 @pytest.mark.parametrize(
@@ -347,23 +358,96 @@ def test_a_pathological_dn_is_judged_in_linear_time(
     """Group DNs come from operator config and from the directory, so the parser must not
     backtrack on either. Time grows with input length by about the same factor, not its square."""
     assert (canonical_group_dn(make(16_000)) is not None) is valid
-    ratio = _scaling_ratio(canonical_group_dn, make, 4_000)
-    assert ratio < _MAX_LINEAR_RATIO, f"4x the input took {ratio:.1f}x the time"
+    readings = _scaling_ratios(canonical_group_dn, make, 4_000)
+    ratio = min(readings)
+    assert ratio < _MAX_LINEAR_RATIO, (
+        f"4x the input took {ratio:.2f}x the time ({_attempts(readings)})"
+    )
 
 
 def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
     """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
+    It asserts exactly the negation of the linear test's pass condition.
 
     This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
-    start at each separator. Its work grows with the square of the length."""
+    start at each separator. Its work grows with the square of the length. It runs at ``k`` =
+    2,000; :func:`_scaling_ratios` says why the size went up (BACKLOG #3452)."""
 
     def quadratic(text: str) -> None:
         for end in range(100, len(text) + 1, 100):
             canonical_group_dn(text[:end])
 
     make = _PATHOLOGICAL_DNS["many-rdns"][0]
-    ratio = _scaling_ratio(quadratic, make, 1_000)
-    assert ratio > _MAX_LINEAR_RATIO, f"a quadratic parser scaled by only {ratio:.1f}x"
+    readings = _scaling_ratios(quadratic, make, 2_000)
+    ratio = min(readings)
+    assert ratio >= _MAX_LINEAR_RATIO, (
+        f"a quadratic parser scaled by only {ratio:.2f}x ({_attempts(readings)})"
+    )
+
+
+def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...]) -> list[float]:
+    """Make each attempt of :func:`_scaling_ratios` read the next of ``readings``; the returned
+    list records the readings the attempts took."""
+    pending = iter(readings)
+    taken: list[float] = []
+
+    def read(judge: Callable[[str], object], small: str, large: str) -> float:
+        assert len(taken) < len(readings), f"more than {len(readings)} attempts"
+        taken.append(next(pending))
+        return taken[-1]
+
+    monkeypatch.setitem(globals(), "_attempt_ratio", read)
+    return taken
+
+
+@pytest.mark.parametrize(
+    ("attempts", "spent", "failure"),
+    [
+        ((4.0, 4.0, 4.0), 1, "only 4.00x (attempts: 4.00x)"),
+        ((15.0, 15.0, 4.0), 3, "only 4.00x (attempts: 15.00x, 15.00x, 4.00x)"),
+        ((8.0, 8.0, 8.0), 3, None),
+        ((15.0, 9.0, 12.0), 3, None),
+    ],
+    ids=["reads-linear", "one-attempt-linear", "at-the-line", "every-attempt-over"],
+)
+def test_the_quadratic_control_passes_only_when_every_attempt_reads_over_the_line(
+    monkeypatch: pytest.MonkeyPatch, attempts: tuple[float, ...], spent: int, failure: str | None
+) -> None:
+    """Control of the control (BACKLOG #3452). The linear check passes a parser on any attempt
+    under the line. So one attempt under it must fail the control, even after two over it, and
+    a check that cannot tell quadratic from linear fails it on the first attempt. A reading of
+    exactly 8.0 fails the linear check, so it passes the control."""
+    taken = _stub_attempts(monkeypatch, attempts)
+    if failure is None:
+        test_the_linear_time_check_fails_a_quadratic_parser()
+    else:
+        with pytest.raises(AssertionError, match=re.escape(failure)):
+            test_the_linear_time_check_fails_a_quadratic_parser()
+    assert taken == list(attempts[:spent])
+
+
+@pytest.mark.parametrize(
+    ("attempts", "spent", "failure"),
+    [
+        ((9.0, 3.9, 20.0), 2, None),
+        ((9.0, 12.0, 10.0), 3, "took 9.00x the time (attempts: 9.00x, 12.00x, 10.00x)"),
+        ((8.0, 8.0, 8.0), 3, "took 8.00x the time (attempts: 8.00x, 8.00x, 8.00x)"),
+    ],
+    ids=["clears", "never-clears", "at-the-line"],
+)
+def test_the_linear_check_keeps_its_lowest_attempt(
+    monkeypatch: pytest.MonkeyPatch, attempts: tuple[float, ...], spent: int, failure: str | None
+) -> None:
+    """The same rule, driven through the linear test itself (BACKLOG #3452): it keeps the lowest
+    attempt and stops at the first under the line, and it fails a parser whose every attempt
+    reads at or over the line."""
+    taken = _stub_attempts(monkeypatch, attempts)
+    if failure is None:
+        test_a_pathological_dn_is_judged_in_linear_time(*_PATHOLOGICAL_DNS["many-rdns"])
+    else:
+        with pytest.raises(AssertionError, match=re.escape(failure)):
+            test_a_pathological_dn_is_judged_in_linear_time(*_PATHOLOGICAL_DNS["many-rdns"])
+    assert taken == list(attempts[:spent])
 
 
 def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFixture) -> None:
