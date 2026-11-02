@@ -157,24 +157,31 @@ jobs:
       # A smoke of the engine suite with the required legs' pytest selection. Its result goes in
       # the verdict and the summary; read the log for which tests failed and why.
       #
-      # THE STEP CAP IS SIZED TO THE SUITE, NOT TO A HANG. pytest-timeout's per-test 120s catches a
-      # hung test; this cap only bounds the whole run. At 50 minutes it killed the windows-latest
-      # leg of all five runs from this workflow's first on 2026-10-23 to 2026-10-31, on 3.14.9 as well
-      # as 3.14.10. That points at the suite's size, not the patch, though the runs printed nothing to
-      # prove it: on merge-group run 41500538639 (2026-11-02) the required legs' `Tests (pytest)` steps
-      # took 36:12 (ubuntu), 41:47 (windows-2022) and 44:40 (windows-2025), and this canary's ubuntu
-      # leg took 44:58 on run 41243486028. The output is streamed through tee, so a run that does hit
-      # the cap still shows how far it got.
+      # THE 50-MINUTE CAP KILLED THE windows-latest LEG of all five runs from this workflow's first on
+      # 2026-10-23 to 2026-10-31, on 3.14.9 as well as 3.14.10, and the step printed nothing, so the
+      # cause was never read. At least two fit, and this step now answers both:
+      #   * Size. On merge-group run 41500538639 (2026-11-02) the required legs' `Tests (pytest)`
+      #     steps took 36:12 (ubuntu), 41:47 (windows-2022) and 44:40 (windows-2025), and this
+      #     canary's ubuntu leg took 44:58 on run 41243486028. Hence 90 minutes.
+      #   * The xdist hang ci.yml describes beside its own `--max-worker-restart=0`: a worker that dies
+      #     is replaced, the replacement never reports, and the controller waits for the step cap. No
+      #     per-test timeout is armed in the controller, so only that flag ends it. The selection also
+      #     leaves out `timing_quarantine` now, as the required legs do; those tests have their own
+      #     job in ci.yml.
+      # The output goes through tee under an explicit pipefail, so a run killed at the cap still shows
+      # how far it got, and pytest's own exit status still decides the step.
       - name: Engine suite smoke
         id: suite
         if: steps.install.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 90
         run: |
+          set -o pipefail
           STATUS=0
-          python -m pytest -q -n auto --dist loadfile -p no:cacheprovider -m 'not tooling' \
+          python -m pytest -q -n auto --dist loadfile --max-worker-restart=0 -p no:cacheprovider \
+            -m 'not tooling and not timing_quarantine' \
             --ignore-glob='*messagefoundry-webconsole*' --continue-on-collection-errors \
-            --timeout=120 2>&1 | tee suite.txt || STATUS=$?
+            --timeout=120 2>&1 | tee -i suite.txt || STATUS=$?
           echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 

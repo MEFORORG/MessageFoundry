@@ -193,14 +193,17 @@ jobs:
         id: suite
         if: steps.install.outcome == 'success' || steps.fallback.outcome == 'success'
         continue-on-error: true
-        # Sized to the suite, not to a hang: py314-latest-canary.yml's suite step says why and gives
-        # the measurements. At 50 minutes this step killed the windows-latest leg on run 40504909930.
+        # At 50 minutes this step killed the windows-latest leg on run 40504909930. The cap, the
+        # worker-restart flag, the timing_quarantine exclusion and the tee are the same as in
+        # py314-latest-canary.yml's suite step, which says why and gives the measurements.
         timeout-minutes: 90
         run: |
+          set -o pipefail
           STATUS=0
-          python -m pytest -q -n auto --dist loadfile -p no:cacheprovider -m 'not tooling' \
+          python -m pytest -q -n auto --dist loadfile --max-worker-restart=0 -p no:cacheprovider \
+            -m 'not tooling and not timing_quarantine' \
             --ignore-glob='*messagefoundry-webconsole*' --continue-on-collection-errors \
-            --timeout=120 2>&1 | tee suite.txt || STATUS=$?
+            --timeout=120 2>&1 | tee -i suite.txt || STATUS=$?
           echo "summary=$(tail -1 suite.txt)" >> "$GITHUB_OUTPUT"
           exit $STATUS
 
