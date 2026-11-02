@@ -102,8 +102,6 @@ _SWITCH_LIST_LIMIT: Final = 200
 #: The longest a listener stays quiet after its refusal burst raised. The window, when shorter; a
 #: longer window, which counts more strictly, must not also hold a second attack back for as long.
 _REFUSAL_QUIET_MAX_SECONDS: Final = 300.0
-#: The least time between two log lines for failed sink calls of one event type.
-_SINK_FAILURE_LOG_SECONDS: Final = 60.0
 
 _DENIAL_ACTIONS: Final = frozenset(
     {"auth.permission_denied", "auth.channel_denied", "auth.mfa_denied"}
@@ -305,10 +303,6 @@ class SecuritySignalDetector:
         self._window_label = f"{t.window_seconds:g} s"
         #: How long a listener stays quiet after its refusal burst raised.
         self._refusal_quiet_seconds = min(t.window_seconds, _REFUSAL_QUIET_MAX_SECONDS)
-        #: Per event type whose sink call failed: when its next failure line may be written, and
-        #: how many failures were held back since its last line; see :meth:`_notify`. Keyed on the
-        #: type alone, so its size is bounded by the fixed set of event types.
-        self._sink_failures: dict[str, tuple[float, int]] = {}
         self._quiet_label = f"{self._refusal_quiet_seconds:g} s"
         self._clock = clock
         self._identity = identity
@@ -474,58 +468,20 @@ class SecuritySignalDetector:
     def _notify(self, event: str, call: Callable[[], None]) -> bool:
         """Run one sink call; False when the sink raised.
 
-        A failure is logged at WARNING at most once per :data:`_SINK_FAILURE_LOG_SECONDS` per
-        event type, whatever the subject, the exception type, or any success in between. The next
-        line carries how many failures of that type were held since the last such line, and
-        :meth:`flush_held` logs what is still held at release. So each event type writes at most
-        one failure line a minute, plus at most one flush line at release. A
-        sink that keeps raising no longer starts the refusal quiet period, and a caller can choose
-        subjects (a client address, a username), so a key on the subject would let a refused
-        peer, or a spread of subjects, write a line each. A line does not say which subject
-        failed, and no line marks a recovery. It carries the sink exception's qualified type name
-        only, never its message, which a sink may build from the alert's subject or detail."""
+        Every failure is logged, at once. A refused connection has no audit row and may have no
+        other record, so a throttled line here could be the last trace of a lost alert. A windowed
+        detector starts its subject again at each raise, failed or not, so a line takes a threshold
+        of events rather than one. A line carries the alert type and the sink exception's type
+        name only, never the exception's message, which a sink may build from the alert's subject
+        or detail."""
         try:
             call()
         except Exception as exc:  # noqa: BLE001 - an alert-sink failure must not reach the writer
-            now = self._clock()
-            next_at, held = self._sink_failures.get(event, (float("-inf"), 0))
-            if now < next_at:
-                self._sink_failures[event] = (next_at, held + 1)
-                return False
-            self._sink_failures[event] = (now + _SINK_FAILURE_LOG_SECONDS, 0)
-            kind = f"{type(exc).__module__}.{type(exc).__qualname__}"
-            if held:
-                log.warning(
-                    "security-signal alert %s could not be raised: %s (%d more failure(s) of this "
-                    "alert type held since the last such line; at most one line every %gs)",
-                    event,
-                    kind,
-                    held,
-                    _SINK_FAILURE_LOG_SECONDS,
-                )
-            else:
-                log.warning(
-                    "security-signal alert %s could not be raised: %s (at most one line every %gs)",
-                    event,
-                    kind,
-                    _SINK_FAILURE_LOG_SECONDS,
-                )
+            log.warning(
+                "security-signal alert %s could not be raised: %s", event, type(exc).__name__
+            )
             return False
         return True
-
-    def flush_held(self) -> None:
-        """Log, at most once per event type, the sink failures held since that type's last
-        failure line, so failures that no later line reported reach the log at release. Failures
-        that arrive after this runs, from calls already queued onto the loop, are not flushed."""
-        for event, (_next_at, held) in self._sink_failures.items():
-            if held:
-                log.warning(
-                    "security-signal alert %s: %d failure(s) held since the last such line were "
-                    "not logged before the detector was released",
-                    event,
-                    held,
-                )
-        self._sink_failures.clear()
 
 
 def install_security_signals(
@@ -543,8 +499,7 @@ def install_security_signals(
     cluster node, whose next start could not resolve the ``posture_loosened`` it raised. With it,
     the function this returns raises ``posture_restored`` for that alert, as
     :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor` clears its own alerts.
-    docs/SECURITY.md, *Audit*, says when the alert can stay open anyway. The function also logs
-    the sink failures still held back (:meth:`SecuritySignalDetector.flush_held`). It must run on
+    docs/SECURITY.md, *Audit*, says when the alert can stay open anyway. The function must run on
     ``loop``'s thread, before the store closes.
 
     A row or refusal on ``loop``'s own thread is judged at once. One on another thread is hopped
@@ -587,6 +542,5 @@ def install_security_signals(
         remove_refusal_observer(_refused)
         if resolve_on_stop:
             detector.release()
-        detector.flush_held()
 
     return _remove
