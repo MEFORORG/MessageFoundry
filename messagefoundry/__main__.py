@@ -79,6 +79,7 @@ from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only
     TOOLKIT_COMMAND,
 )
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.exception_origin import raised_by_the_engine  # noqa: E402
 from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
     PRODUCTION_DEBUG_REFUSED,
@@ -12560,13 +12561,7 @@ def _is_engine_refusal(exc: BaseException) -> bool:
         return False
     if type(exc) is not RuntimeError:
         return type(exc).__module__.split(".")[0] == "messagefoundry"
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    module = tb.tb_frame.f_globals.get("__name__", "")
-    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
+    return raised_by_the_engine(exc)
 
 
 def _engine_refusal_text(exc: BaseException) -> str:

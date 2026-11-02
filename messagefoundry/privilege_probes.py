@@ -36,11 +36,12 @@ import functools
 import hashlib
 import logging
 import socket
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
+from messagefoundry.exception_origin import exception_chain, raised_by_the_engine
 from messagefoundry.privilege_check import vault_admin_paths
 from messagefoundry.transports.bounded_read import TruncatedResponseError
 
@@ -133,7 +134,7 @@ def excused_failure(exc: BaseException) -> bool:
     (:func:`~messagefoundry.privilege_check.vault_preflight_outcome`)."""
     if _is_forbidden(exc):
         return True
-    chain = list(_chain(exc))
+    chain = list(exception_chain(exc))
     if any(_is_ssl(e, "SSLError") and not _is_ssl(e, "SSLEOFError") for e in chain):
         return False
     if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror, TruncatedResponseError)):
@@ -153,22 +154,6 @@ def _is_ssl(exc: BaseException, name: str) -> bool:
     the class's MRO, so this module reads an exception's type without importing ``ssl``, which the
     crypto inventory gate counts as a crypto use (``scripts/security/crypto_inventory_check.py``)."""
     return any(c.__module__ == "ssl" and c.__name__ == name for c in type(exc).__mro__)
-
-
-def _chain(exc: BaseException) -> Iterator[BaseException]:
-    """``exc`` and every exception it wraps: its cause and context, and the exceptions urllib3 and
-    requests keep in ``args``, ``reason`` and ``original_error``. Each is visited once."""
-    seen: set[int] = set()
-    todo: list[BaseException] = [exc]
-    while todo:
-        e = todo.pop()
-        if id(e) in seen:
-            continue
-        seen.add(id(e))
-        yield e
-        inner: list[object] = [e.__cause__, e.__context__, *e.args]
-        inner += [getattr(e, "reason", None), getattr(e, "original_error", None)]
-        todo += [i for i in inner if isinstance(i, BaseException)]
 
 
 def unexcused_cause(exc: BaseException) -> str | None:
@@ -207,7 +192,7 @@ def _why(exc: BaseException) -> str:
     # innermost frame, not who wrote the text, so it does not catch a ValueError a C builtin such
     # as int() raises inside engine code, nor engine code that copies a library's text. An
     # exception never raised has no frame, and keeps its type name alone.
-    if type(exc) is ValueError and _raised_by_the_engine(exc):
+    if type(exc) is ValueError and raised_by_the_engine(exc):
         return f"{name}: {strip_control_chars(str(exc))[:200]}"
     return name
 
@@ -224,20 +209,6 @@ def _ad_why(exc: BaseException) -> str:
     if isinstance(exc, InsecureHopRefused):
         return strip_control_chars(str(exc))
     return _why(exc)
-
-
-def _raised_by_the_engine(exc: BaseException) -> bool:
-    """Whether the innermost frame of ``exc``'s traceback is in a ``messagefoundry`` module (vault
-    BACKLOG #3454), the rule ``config.wiring`` and ``__main__._is_engine_refusal`` apply too. A
-    copy, not an import of ``config.wiring``'s, so the probe neither loads that module nor imports
-    anything inside its exception handlers, where a failed import would raise."""
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    module = tb.tb_frame.f_globals.get("__name__", "")
-    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
 
 
 def _strings(value: object) -> tuple[str, ...]:
