@@ -1540,6 +1540,19 @@ def test_an_interrupt_in_the_loaders_read_stops_the_load(
 
 
 @pytest.mark.usefixtures("sigint_raises")
+def test_one_interrupt_in_the_loaders_read_is_not_lost_passing_through_its_guards(
+    tmp_path: Path, fails_in_the_read: Callable[[str], Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    # Once only: _read_fault's own `raise` reaches the outer guard, which must not read that as code.
+    fails_in_the_read(
+        "if 'interrupted' in globals():\n            return None\n"
+        "        globals()['interrupted'] = True\n"
+        f"        {_thrown('KeyboardInterrupt()')}"
+    )
+    _assert_the_load_stops(tmp_path, caplog)
+
+
+@pytest.mark.usefixtures("sigint_raises")
 def test_a_raise_of_an_interrupt_in_the_loaders_read_is_absorbed(
     tmp_path: Path, fails_in_the_read: Callable[[str], Path], caplog: pytest.LogCaptureFixture
 ) -> None:
