@@ -15,7 +15,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import DatabasePoll, WiringError
-from messagefoundry.transports import build_source
+from messagefoundry.transports import build_source, database
 from messagefoundry.transports.database import DatabaseSource
 
 _MARK = "UPDATE mf_inbox SET status='DONE' WHERE id=:id"
@@ -135,3 +135,24 @@ def test_a_read_only_poll_statement_still_builds(poll: str) -> None:
     ).settings
     assert settings["poll_statement"] == poll
     assert isinstance(_build_raw(poll), DatabaseSource)
+
+
+def test_the_poll_test_admits_mysql_scalar_insert_on_the_generic_dialect_only() -> None:
+    """``DatabasePoll`` and ``DatabaseSource`` pass the poll's dialect to the read-only test, so
+    MySQL's scalar ``INSERT()`` passes on a generic poll and is refused on the SQL Server preset.
+
+    Red mutation: drop ``dialect=`` from either call and one half reds."""
+    poll = "SELECT id, INSERT(payload, 1, 0, 'x') AS payload FROM mf_inbox"
+    spec = DatabasePoll(
+        server="sql.example.com",
+        poll_statement=poll,
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.0 Unicode Driver",
+        mark_statement=_MARK,
+    )
+    assert spec.settings["poll_statement"] == poll
+    with pytest.raises(WiringError, match="found a 'INSERT' keyword"):
+        DatabasePoll(server="sql.example.com", database="MFDB", poll_statement=poll)
+    with pytest.raises(ValueError, match="found a 'INSERT' keyword"):
+        _build_raw(poll)
+    assert database._read_only_poll_refusal(poll, dialect="generic") is None

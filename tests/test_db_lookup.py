@@ -478,9 +478,9 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
         'SELECT "update" FROM t',
         # A write keyword is only a keyword as a whole word.
         "SELECT update_ts, deleted_flag, into_bin FROM t",
-        # MySQL's scalar INSERT()/TRUNCATE() share a keyword's name but are calls, not statements.
-        "SELECT INSERT('abc', 1, 1, 'z') AS s",
-        "SELECT TRUNCATE(1.234, 2) AS s",
+        # Numeric literals of every T-SQL shape, none of them glued to a word.
+        "SELECT 0x1F AS b, 0x AS e, 1e5 AS f, 1.5E-3 AS g, 12. AS h, $12.50 AS m FROM t",
+        "SELECT TOP 10 x$1 FROM t WHERE n IN (1,2,3)",
         # Comments are skipped wherever they sit, and T-SQL block comments nest.
         "SELECT 1; -- trailing note",
         "SELECT /* nested /* deep */ still */ 1",
@@ -488,6 +488,81 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
 )
 def test_read_only_statements_still_admitted(stmt: str) -> None:
     database._require_read_only(stmt)  # admitted: returns rather than raising
+
+
+# --- two bypasses of the keyword scan ------------------------------------------------------------
+#
+# Both passed the scan before this change, measured by calling _require_read_only on these exact
+# statements at origin/main f0101de6ef. (1) The INSERT()/TRUNCATE() function-form exemption looked at
+# the next SURVIVING token, and the scan drops a quoted identifier or a comment, so `INSERT [t](c)`
+# read as a call. (2) A number with a word glued to its end tokenized as one non-keyword word
+# (`0xUPDATE` became `0` and `XUPDATE`), while SQL Server reads `0x` then `UPDATE`.
+
+_FUNCTION_FORM_BYPASSES = [
+    "SELECT 1 INSERT [patients](mrn) VALUES (1)",
+    'SELECT 1 INSERT "patients"(mrn) VALUES (1)',
+    "SELECT 1 INSERT `patients`(mrn) VALUES (1)",
+    "SELECT 1 INSERT/**/(mrn) VALUES (1)",
+    "SELECT 1 INSERT--x\n(mrn) VALUES (1)",
+    "SELECT 1 TRUNCATE [patients](x)",
+    # Whitespace is not "immediately": MySQL's default also wants the `(` against the name.
+    "SELECT 1 INSERT (mrn) VALUES (1)",
+]
+
+_GLUED_LITERAL_BYPASSES = [
+    "SELECT 1e1INTO copy FROM patients",
+    "SELECT 0xUPDATE patients SET mrn='X'",
+    "SELECT mrn FROM patients FOR 0xUPDATE",
+    "SELECT 0xINSERT INTO audit SELECT 1",
+    "SELECT 1.5INTO copy FROM patients",
+    "SELECT 1E+1INTO copy FROM patients",
+    "SELECT 1eINTO copy FROM patients",
+    # Refused even where the hex digits swallow the keyword's head (`0xDE` then `LETE`): the glue is
+    # the refusal, so the gate never rests on matching where SQL Server ends the literal.
+    "SELECT 0x1FDELETE FROM patients",
+]
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize("stmt", _FUNCTION_FORM_BYPASSES)
+def test_function_form_exemption_needs_the_paren_right_after_the_keyword(
+    stmt: str, dialect: str
+) -> None:
+    """Red mutation: compare the next token's kind and text only, not its position, and the quoted and
+    commented shapes pass on the generic dialect."""
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize("stmt", _GLUED_LITERAL_BYPASSES)
+def test_a_number_glued_to_a_word_is_refused(stmt: str, dialect: str) -> None:
+    """Red mutation: drop the glue check from _scan_sql_tokens and `0x1FDELETE` passes."""
+    with pytest.raises(DbLookupError, match="a number runs into a word"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    ["SELECT INSERT('abc', 1, 1, 'z') AS s", "SELECT TRUNCATE(1.234, 2) AS s"],
+)
+def test_mysql_scalar_insert_and_truncate_pass_on_the_generic_dialect_only(stmt: str) -> None:
+    """MySQL's scalar INSERT()/TRUNCATE() share a keyword's name but are calls, so the generic dialect
+    admits them. SQL Server has neither function, so the default dialect, the one db_lookup and
+    DatabaseRef always use, refuses them.
+
+    Red mutation: drop the dialect condition and the sqlserver half passes."""
+    database._require_read_only(stmt, dialect="generic")
+    with pytest.raises(DbLookupError, match="found a '(INSERT|TRUNCATE)' keyword"):
+        database._require_read_only(stmt)
+    with pytest.raises(DbLookupError, match="found a '(INSERT|TRUNCATE)' keyword"):
+        database._require_read_only(stmt, dialect="sqlserver")
+
+
+def test_an_unglued_keyword_after_a_number_is_still_seen() -> None:
+    """Control for the glue rule: a separated keyword after a literal is refused as a keyword."""
+    with pytest.raises(DbLookupError, match="found a 'UPDATE' keyword"):
+        database._require_read_only("SELECT 0x UPDATE patients SET mrn='X'")
 
 
 def test_lookup_dsn_is_read_only() -> None:

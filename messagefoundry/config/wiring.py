@@ -4350,7 +4350,9 @@ def DatabasePoll(
     if isinstance(poll_statement, str) and poll_statement:
         from messagefoundry.transports.database import _read_only_poll_refusal
 
-        poll_refusal = _read_only_poll_refusal(poll_statement)
+        # An unresolved dialect gets the generic test here; the build re-tests with the real one.
+        poll_dialect = dialect.lower() if isinstance(dialect, str) else "generic"
+        poll_refusal = _read_only_poll_refusal(poll_statement, dialect=poll_dialect)
         if poll_refusal is not None:
             raise WiringError(poll_refusal)
     return ConnectionSpec(
