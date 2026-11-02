@@ -56,7 +56,9 @@ def _run(host: str, tmp_path: Path, script: str) -> str:
         check=False,
     )
     assert proc.returncode == 0, f"harness failed: {proc.stdout}\n{proc.stderr}"
-    return proc.stdout.strip().splitlines()[-1]
+    lines = proc.stdout.strip().splitlines()
+    assert lines, f"harness exited 0 but printed nothing on stdout; stderr: {proc.stderr}"
+    return lines[-1]
 
 
 def _need(host: str) -> None:
@@ -71,21 +73,45 @@ $names = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.Co
     ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | ForEach-Object { ($_ -split '\\\\')[-1] })
 $started = @($names | Where-Object { $_ -in @('Start-Process', 'start', 'saps') })
 $child = @($names | Where-Object { $_ -eq 'Invoke-ChildProcess' })
-ConvertTo-Json -Compress -InputObject @{ started = $started.Count; child = $child.Count }
+ConvertTo-Json -Compress -InputObject @{
+    errors = @($errs).Count; started = $started.Count; child = $child.Count }
 """
+
+
+def _census(tmp_path: Path, path: Path) -> dict[str, int]:
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile({_psq(str(path))}, [ref]$null, [ref]$errs)
+{_COMMAND_CENSUS}
+"""
+    census: dict[str, int] = json.loads(_run("pwsh", tmp_path, script))
+    return census
+
+
+def _assert_clean(census: dict[str, int]) -> None:
+    # A parse error leaves a partial AST, on which a Start-Process further down would go uncounted.
+    assert census["errors"] == 0, census
+    assert census["started"] == 0, census
+    # Both children the script starts: the probe, and protect-key.
+    assert census["child"] >= 2, census
 
 
 def test_no_command_in_the_script_is_start_process(tmp_path: Path) -> None:
     _need("pwsh")
-    script = f"""
-$ErrorActionPreference = 'Stop'
-$ast = [System.Management.Automation.Language.Parser]::ParseFile({_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
-{_COMMAND_CENSUS}
-"""
-    census = json.loads(_run("pwsh", tmp_path, script))
-    assert census["started"] == 0, census
-    # Both children the script starts: the probe, and protect-key.
-    assert census["child"] >= 2, census
+    _assert_clean(_census(tmp_path, _SCRIPT))
+
+
+def test_the_census_fails_a_copy_that_does_not_parse(tmp_path: Path) -> None:
+    _need("pwsh")
+    broken = tmp_path / "broken.ps1"
+    broken.write_text(
+        _SCRIPT.read_text(encoding="utf-8") + "\nfunction Broken {\n", encoding="utf-8-sig"
+    )
+    census = _census(tmp_path, broken)
+    assert census["errors"] > 0, census
+    with pytest.raises(AssertionError):
+        _assert_clean(census)
 
 
 def test_the_census_sees_each_spelling_and_not_a_string(tmp_path: Path) -> None:
@@ -99,10 +125,13 @@ def test_the_census_sees_each_spelling_and_not_a_string(tmp_path: Path) -> None:
     )
     script = f"""
 $ErrorActionPreference = 'Stop'
-$ast = [System.Management.Automation.Language.Parser]::ParseInput({_psq(snippet)}, [ref]$null, [ref]$null)
+$errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput({_psq(snippet)}, [ref]$null, [ref]$errs)
 {_COMMAND_CENSUS}
 """
-    assert json.loads(_run("pwsh", tmp_path, script))["started"] == 4
+    census = json.loads(_run("pwsh", tmp_path, script))
+    assert census["errors"] == 0, census
+    assert census["started"] == 4, census
 
 
 @pytest.mark.parametrize("host", ["pwsh", "powershell"])
@@ -118,7 +147,9 @@ def test_the_exit_code_is_read_on_every_fast_exiting_child(tmp_path: Path, host:
     )
     script = f"""
 $ErrorActionPreference = 'Stop'
-$ast = [System.Management.Automation.Language.Parser]::ParseFile({_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
+$errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile({_psq(str(_SCRIPT))}, [ref]$null, [ref]$errs)
+if (@($errs).Count) {{ throw "the script does not parse: $($errs[0])" }}
 $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $args[0].Name -eq 'Invoke-ChildProcess' }}, $true)
 if (-not $def) {{ throw 'missing function Invoke-ChildProcess' }}
@@ -162,14 +193,13 @@ for ($i = 0; $i -lt 5; $i++) {
     $p = Start-Process -FilePath $cmd -ArgumentList '/c exit 3' -NoNewWindow -PassThru
     Start-Sleep -Milliseconds 300
     $null = $p.Handle
-    $p.WaitForExit()
-    if ($null -eq $p.ExitCode) { $lost++ }
+    # Bounded: if the child's process id was reused during the hold, the handle names a stranger.
+    if ($p.WaitForExit(5000) -and $null -eq $p.ExitCode) { $lost++ }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $cmd; $psi.Arguments = '/c exit 3'; $psi.UseShellExecute = $false
     $q = [System.Diagnostics.Process]::Start($psi)
     Start-Sleep -Milliseconds 300
-    $q.WaitForExit()
-    if ($q.ExitCode -eq 3) { $kept++ }
+    if ($q.WaitForExit(5000) -and $q.ExitCode -eq 3) { $kept++ }
 }
 "lost=$lost kept=$kept"
 """

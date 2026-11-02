@@ -678,11 +678,13 @@ $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.Wind
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "measure-store-access.ps1 installs a service and must run elevated."
 }
-# A full path, because Invoke-ChildProcess resolves a relative one against the process's directory,
-# not $PWD. A path is resolved literally, as -DataDir is; only a bare name is looked up as a command.
-$AppExe = if (-not $AppExe) { (Get-Command messagefoundry -ErrorAction Stop).Source }
-          elseif ($AppExe -match '[\\/]') { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppExe) }
-          else { (Get-Command $AppExe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
+# $AppExe stays as passed for gen-key and the installer. protect-key gets the file Start-Process ran:
+# the path under $PWD if it exists, else the command on PATH, which Process.Start would not do.
+$AppExeFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppExe)
+if (-not (Test-Path -LiteralPath $AppExeFile -PathType Leaf)) {
+    $AppExeFile = (Get-Command $AppExe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+}
 $Python = (Get-Command python).Source
 $Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
@@ -881,7 +883,7 @@ try {
     $StoreKeyFile = Join-Path $DataDir "store.key.dpapi"
     $env:MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
     try {
-        $protect = (Invoke-ChildProcess -FilePath $AppExe `
+        $protect = (Invoke-ChildProcess -FilePath $AppExeFile `
             -Arguments "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"")
     } finally {
         Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY -ErrorAction SilentlyContinue
