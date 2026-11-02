@@ -447,6 +447,10 @@ roster alias of the Lander.
 >   one. Such a floor needs no verified stamp, so on an unpinned root that number may not be this
 >   account's. Below the ceiling a floor also ends when one unpinned fire rewrites the document's stamp,
 >   because the fire is refused but the document is still rewritten; the gate then answers REVIEW.
+> - A session pinned to another root that publishes here does the same at any level, the ceiling included
+>   and fresh or stale, because the reader refuses a document stamped with another root. The gate answers
+>   REVIEW until this root's next fire restores the stamp, so that mis-wire is an exception to "only a new
+>   reading clears it". Measured 2026-11-01 on a fresh 100.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.
