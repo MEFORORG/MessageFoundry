@@ -493,6 +493,12 @@ def _mark_in_body(pem: bytes) -> bytes:
     return pem.replace(b"-----\n", b"-----\n" + _BOM, 1)
 
 
+def _trusted(pem: bytes) -> bytes:
+    return pem.replace(b"BEGIN CERTIFICATE", b"BEGIN TRUSTED CERTIFICATE").replace(
+        b"END CERTIFICATE", b"END TRUSTED CERTIFICATE"
+    )
+
+
 @pytest.mark.parametrize(
     ("shape", "expected"),
     [
@@ -559,6 +565,22 @@ def _mark_in_body(pem: bytes) -> bytes:
             lambda a, b: a + _STRAY_END + _LONG[len(_STRAY_END) :] + _mark_in_body(b),
             _Refused(None),
             id="END and BEGIN on one line, mark on the next",
+        ),
+        # A TRUSTED block OpenSSL reads mid-line refuses, as one at a line start does.
+        pytest.param(
+            lambda a, b: a + _LONG + _trusted(b),
+            _Refused(["evil-ca", "good-ca"], "trusted-certificate"),
+            id="long, TRUSTED block",
+        ),
+        pytest.param(
+            lambda a, b: a + _LONG[1:] + b"\r" + _trusted(b),
+            _Refused(["evil-ca", "good-ca"], "trusted-certificate"),
+            id="long, lone CR, TRUSTED block",
+        ),
+        pytest.param(
+            lambda a, b: a + _trusted(b),
+            _Refused(["evil-ca", "good-ca"], "trusted-certificate"),
+            id="line start, TRUSTED block",
         ),
         pytest.param(lambda a, b: a + _LONG + b, ["evil-ca", "good-ca"], id="long, ASCII"),
         pytest.param(
@@ -650,9 +672,7 @@ def test_a_trusted_certificate_block_refuses_rather_than_vanishing(cas: tuple[_C
     plain block it would drop out of the trust set without a word. The conversion refuses and names
     the re-export."""
     good, evil = cas
-    trusted = evil.pem.replace(b"BEGIN CERTIFICATE", b"BEGIN TRUSTED CERTIFICATE").replace(
-        b"END CERTIFICATE", b"END TRUSTED CERTIFICATE"
-    )
+    trusted = _trusted(evil.pem)
     with pytest.raises(TrustAnchorError, match="trusted-certificate"):
         anchor_cadata(good.pem + trusted, _SPEC)
     # The control: raw, cadata= keeps the plain block and drops the trusted one, with no error.
