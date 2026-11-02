@@ -487,6 +487,8 @@ roster alias of the Lander.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number. The
 >   next live reading corrects it.
+> - A fire whose percentage cannot be read is dropped as an absent window, at least NaN, "99%", a negative
+>   or an object, so a published lower reading stands for up to 20 minutes.
 > - One wrong high reading binds until the reset, up to a week. The highest reading in a period binds and
 >   a reading over 100 stays a number, so every true lower reading for that reset is refused and the
 >   window goes stale. Its floor then keeps the gate at HALT only at the ceiling, or at the rung with

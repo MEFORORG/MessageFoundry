@@ -411,6 +411,17 @@ function Get-AgeMinutes($v) {
     return [math]::Round(($nowUtc - $t).TotalMinutes, 1)
 }
 
+# ONE FUTURE RULE, FOR A READING AND FOR A HISTORY ROW: nothing dated after now is current, at any
+# distance. This compares the instants, because an age is rounded and a stamp seconds ahead rounds to 0.
+# There is no tolerance, because a real stamp needs none: the collector stamps before it writes, this
+# script opens the document before it reads the clock, and both use this box's clock. So a reading dated
+# ahead means the clock stepped back or the stamp is wrong, and it grades UNKNOWN. A history row a fire
+# appends after that clock read is skipped too, and it belongs to a reading this run did not open.
+function Test-DatedAfterNow($v) {
+    $t = ConvertTo-UtcDateTime $v
+    return [bool]($null -ne $t -and $t -gt $nowUtc)
+}
+
 # --- burn rate ------------------------------------------------------------------------------------
 #
 # ONLY WITHIN ONE WINDOW EPOCH. When a window resets, the percentage falls off a cliff (90 -> 0). A rate
@@ -428,12 +439,13 @@ function Get-Rate($CurrentResetEpoch) {
             $observed = Get-Percentage $r.seven_day
             if ($null -eq $observed) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
-            # NOTHING DATED AFTER NOW, at any distance. Such a row would become the newest row and could
-            # turn the rate negative, which clears a burn. This compares the instants, because an age is
-            # rounded and a row seconds ahead rounds to 0. After a backward clock step it also skips real
-            # rows until the clock catches up, which leaves fewer rows for the rate.
-            $at = ConvertTo-UtcDateTime $r.at
-            if ($null -eq $at -or $at -gt $nowUtc) { continue }
+            # A row ahead of the clock would become the newest row and could turn the rate negative, which
+            # clears a burn. After a backward clock step this also skips real rows until the clock catches
+            # up. If two or more older rows remain, the rate comes from those and can be understated, and
+            # that understated rate governs, not the level. With fewer than two there is no rate and the
+            # level decides. A reading dated ahead is UNKNOWN, so this needs a reading stamped after the
+            # step, at least a live session confirming the same number.
+            if (Test-DatedAfterNow $r.at) { continue }
             $age = Get-AgeMinutes $r.at
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
             $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
@@ -569,11 +581,12 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # The lower bound is not defensive tidying. An age is a subtraction of two clocks, and any bug or skew
     # that makes it negative would pass an `age -gt max` test unconditionally -- the staleness guard would
     # then be permanently disarmed while looking present. Bound it BOTH ways so a nonsensical age is
-    # reported as nonsense rather than silently accepted as fresh.
-    if ($null -eq $age -or $age -gt $MaxAgeMinutes -or $age -lt -2) {
+    # reported as nonsense rather than silently accepted as fresh. Test-DatedAfterNow is that lower bound.
+    $future = Test-DatedAfterNow $w.captured_at
+    if ($null -eq $age -or $age -gt $MaxAgeMinutes -or $future) {
         $o.state = "UNKNOWN"
         $o.reason = if ($null -eq $age) { "reading is undateable" }
-        elseif ($age -lt -2) { "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it" }
+        elseif ($future) { "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it" }
         # NO CAUSAL CLAIM. This used to read "-- no live session is publishing", which nothing here
         # checks and which is often false: a session may be publishing perfectly well, into another
         # root. The mis-wire warning printed above the numbers names that case; this line states the

@@ -704,6 +704,23 @@ def test_a_window_with_no_number_cannot_clear_the_gate(
     assert code == REVIEW, why(doc)
 
 
+def test_a_reading_dated_after_now_cannot_clear_the_gate(sb: Sandbox, tmp_path: Path) -> None:
+    """Fresh by every other test. One minute ahead of the clock used to read as a current 40."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    seven = {"used_percentage": 40, "resets_at": int(ago().timestamp()) + 200000}
+    assert _fire(sb, state, seven, env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=-1).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW and "FUTURE" in why(doc), why(doc)
+
+
 def test_a_numeric_string_from_a_fire_halts_at_the_ceiling(sb: Sandbox, tmp_path: Path) -> None:
     """Through the real collector, reader and gate. Dropped, the fresh 40 would stand and clear."""
     root = tmp_path / "config-root"

@@ -583,6 +583,37 @@ def test_a_future_dated_reading_is_refused_rather_than_treated_as_fresh(tmp_path
     assert "FUTURE" in d["seven_day"]["reason"].upper()
 
 
+@pytest.mark.parametrize(
+    ("pct", "minutes_ahead"),
+    [
+        pytest.param(50.0, 1.0, id="one-minute-ahead"),
+        pytest.param(50.0, 0.5, id="thirty-seconds-ahead"),
+        pytest.param(99.0, 1.0, id="at-the-ceiling"),
+    ],
+)
+def test_a_reading_dated_after_now_is_unknown_and_nothing_rates_from_it(
+    tmp_path: Path, pct: float, minutes_ahead: float
+) -> None:
+    """The rule the history rows follow, so a small backward clock step cannot leave a fresh reading
+    beside a rate that lost its newest row: that read OK at 10 percent an hour. The control is the same
+    numbers just behind the clock, a real burn, with a reset near enough for the rate to decide."""
+    epoch = int(time.time()) + 14400
+
+    def answer(minutes_ago: float) -> tuple[int, dict[str, Any]]:
+        publish(tmp_path, seven=pct, age_min=minutes_ago, seven_epoch=epoch)
+        write_history(tmp_path, [(60, 30.0), (30, 40.0), (minutes_ago, pct)], epoch)
+        return read(tmp_path)
+
+    code, doc = answer(0.1)
+    assert code == CRITICAL and doc["seven_day"]["rate_pct_per_hr"] > 15, doc
+
+    code, doc = answer(-minutes_ahead)
+    assert code == UNKNOWN and doc["state"] == "UNKNOWN", doc
+    window_doc = doc["seven_day"]
+    assert "FUTURE" in window_doc["reason"], doc
+    assert window_doc["rate_pct_per_hr"] is None and window_doc["level_floor"] is None, doc
+
+
 def test_a_stale_reading_with_its_reset_ahead_is_a_floor_and_nothing_else_is(
     tmp_path: Path,
 ) -> None:
@@ -1040,6 +1071,7 @@ def test_the_survey_prints_no_number_for_a_window_with_none(fake_home: Path) -> 
     [
         pytest.param("", id="blank"),
         pytest.param("abc", id="text"),
+        pytest.param("99%", id="percent-sign"),
         pytest.param("-5", id="negative-string"),
         pytest.param(-5, id="negative"),
     ],
