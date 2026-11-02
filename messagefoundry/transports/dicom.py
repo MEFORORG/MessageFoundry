@@ -114,6 +114,7 @@ from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
     REFUSAL_LOG_WINDOW_SECONDS,
     RefusalLog,
+    notify_refusal,
 )
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -206,6 +207,7 @@ _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in
 _RJ_RESULT_TRANSIENT = 0x02
 _RJ_SOURCE_PRESENTATION = 0x03
 _RJ_REASON_TEMPORARY_CONGESTION = 0x01
+_RJ_REASON_LOCAL_LIMIT = 0x02
 
 #: Loopback bind interfaces that need no peer controls (the common dev/single-box case). Copied (not
 #: imported) from :data:`messagefoundry.pipeline.wiring_runner._LOOPBACK_HOSTS` to keep the dependency
@@ -666,6 +668,7 @@ def _admitting_server_class() -> type[Any]:
             *args: Any,
             admit: Callable[[Any], bool],
             refused: Callable[[str, str, str], None],
+            refused_at_cap: Callable[[], None],
             ended: Callable[[str, str], None],
             handshake_failed: Callable[[str, str], None],
             stopping: threading.Event,
@@ -680,6 +683,9 @@ def _admitting_server_class() -> type[Any]:
             self.max_object_bytes = max_object_bytes
             self._admit = admit
             self._refused = refused
+            #: Called besides ``refused`` for a connection refused at a connection cap, which the
+            #: refusal observers count; ``refused`` alone never notifies them (vault BACKLOG #2613).
+            self._refused_at_cap = refused_at_cap
             #: Called on the DUL thread with the peer address and the reason, when a read of an
             #: association that has started runs out its deadline. It is not a refusal: the SCP
             #: accepted that association and may have taken objects on it.
@@ -742,6 +748,7 @@ def _admitting_server_class() -> type[Any]:
             full = self._take_slot(host)
             if full is not None:
                 try:
+                    self._refused_at_cap()
                     self._refused(host, "a connection", full)
                 finally:
                     self.shutdown_request(request)
@@ -1497,8 +1504,10 @@ class DicomScpSource(SourceConnector):
         self._ended_log = RefusalLog(
             window_seconds=_REFUSAL_LOG_WINDOW_SECONDS, max_per_window=_REFUSAL_LOG_MAX_PER_WINDOW
         )
+        #: The inbound's name, for the refusal observers (vault BACKLOG #2613).
+        self._refusal_name = config.name or ""
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
-        self._ssl = _server_ssl_context(s, name=config.name or "")
+        self._ssl = _server_ssl_context(s, name=self._refusal_name)
         # Failed inbound TLS handshakes and their throttled WARNING (vault BACKLOG #3784). Before,
         # a failed one left no record above DEBUG. A log line rather than a connection event: this
         # SCP emits none, and #3784 adds no event kind. Driven on the loop only; the connection
@@ -1643,6 +1652,8 @@ class DicomScpSource(SourceConnector):
             # because the runner injects a gate into every source; the handler reads
             # `intake_gate` live and returns at once when there is none or it is open.
             (evt.EVT_REQUESTED, self._refuse_association_while_paused),
+            # vault BACKLOG #2613: a max_associations rejection reaches the refusal observers.
+            (evt.EVT_REJECTED, self._count_association_limit_rejection),
         ]
         if self._pacer is not None:
             # Registered ONLY when a rate is configured, so an unpaced SCP — the shipped default —
@@ -1659,6 +1670,7 @@ class DicomScpSource(SourceConnector):
             server_class=_admitting_server_class(),
             admit=self._admit_connection,
             refused=self._log_refused_peer,
+            refused_at_cap=functools.partial(notify_refusal, self._refusal_name),
             ended=self._log_ended_association,
             handshake_failed=self._note_tls_failure,
             stopping=self._stopping,
@@ -1717,6 +1729,8 @@ class DicomScpSource(SourceConnector):
         The calling AE title is not part of this: it is not known until the association request is
         read. ``calling_ae_allowlist`` is applied at that point, by pynetdicom, from
         ``require_calling_aet``, and an unlisted title is rejected before any object is sent.
+
+        Every refusal, logged or not, also reaches :func:`notify_refusal` (vault BACKLOG #2613).
         """
         reason = _NOT_IN_ALLOWLIST
         try:
@@ -1724,6 +1738,7 @@ class DicomScpSource(SourceConnector):
                 return True
         except Exception as exc:  # noqa: BLE001 - on the accept loop: fail closed, never raise
             reason = f"the source_ip_allowlist check failed ({safe_exc(exc)})"
+        notify_refusal(self._refusal_name)
         self._log_refused_peer(_address_host(client_address), "a connection", reason)
         return False
 
@@ -1913,6 +1928,32 @@ class DicomScpSource(SourceConnector):
             )
             assoc.abort()
         assoc.kill()
+
+    def _count_association_limit_rejection(self, event: Any) -> None:
+        """Tell the refusal observers about an association rejected because ``max_associations``
+        is full (vault BACKLOG #2613), the counterpart of a socket listener's connection cap.
+
+        ``EVT_REJECTED`` fires on the association's thread for each A-ASSOCIATE-RJ an
+        ``Association`` sends, after the RJ is stored as the acceptor's primitive. The RJs
+        ``_check_association_request`` writes before any association exists fire no event.
+        pynetdicom sends local-limit-exceeded only from its ``max_associations`` check, so that
+        reason alone is counted: the intake pause's temporary-congestion rejection is not. pynetdicom
+        checks the limit last, so at the limit an AE-title or user-identity failure is sent, and
+        counted, as local-limit-exceeded; below it, it is not counted.
+        """
+        try:
+            assoc = event.assoc
+            rj = assoc.acceptor.primitive
+            at_limit = (
+                assoc.is_acceptor
+                and rj.result_source == _RJ_SOURCE_PRESENTATION
+                and rj.diagnostic == _RJ_REASON_LOCAL_LIMIT
+            )
+        except Exception as exc:  # noqa: BLE001 - on pynetdicom's thread: never raise into it
+            logger.debug("DICOM rejection not read for the refusal observers: %s", safe_exc(exc))
+            return
+        if at_limit and not self._stopping.is_set():
+            notify_refusal(self._refusal_name)
 
     def _charge_association(self, event: Any) -> None:
         """Charge one token once an association is ACCEPTED — the debt is paid by the next arrival.
