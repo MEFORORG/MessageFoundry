@@ -117,7 +117,8 @@ a review is never a marker, as it is never an ack. The PR is REPAIR's turn, its 
 marker's session as ``repairOwner``, ONLY when ALL of these hold:
 
 * every AUTHOR condition above holds, reading every qualifying marker as neither a reply nor a Lander
-  event, so REPAIR is never reached from a state that would not otherwise be AUTHOR's;
+  event, so REPAIR is never reached from a state that fails an AUTHOR condition (a marker before
+  the hold, which would make it ``repair-rehold``, does not stop a fresh one making it REPAIR's);
 * at least one qualifying marker was posted strictly after the hold's second (a same-second marker
   is not provably after the hold, so it does not qualify);
 * the qualifying markers in the newest marker second all name one session;
@@ -149,6 +150,8 @@ is the unsafe direction, and the Lander's move is to post a fresh marker. ``repa
 session of the newest such marker, or is ``null`` when two sessions were named in that marker's
 second. These markers are read under the association and dismissed gates, and only from a comment,
 but a minimized one still counts: hiding a superseded marker must not bring back the author's turn.
+Only a marker on the fetched page is read: one pushed out of the latest ``COMMENT_PAGE`` comments is
+not, and a hold after it reads AUTHOR again if it stands.
 
 A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
