@@ -391,7 +391,6 @@ class SoapDestination(DestinationConnector):
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
             dest_scheme=scheme,
-            attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
             connection=config.name,

@@ -64,8 +64,9 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   does not read ``odbc_params``; ``static_credential_db_hops`` says what those keywords can carry.
 * A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
   reference, whose value is resolved only when the connector is built, and ``proxy_url='default'``,
-  where the operating system's proxy settings carry any credential. Userinfo in either is sent and
-  not listed. A ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
+  where the operating system's proxy settings carry any credential. Userinfo in either is not
+  listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
+  ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
 Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
 arguments and touches nothing else.
@@ -234,11 +235,11 @@ def _http_hop(
     return StaticCredentialHop(name, "none", f"presents no credential ({peer})", compliant_kind)
 
 
-def _proxy_url_sends_userinfo(url: object) -> bool:
-    # Lazy, like ``_smart``: the transport owns what its proxy handler sends.
-    from messagefoundry.transports.rest import proxy_url_sends_userinfo
+def _proxy_url_holds_credential(url: object) -> bool:
+    # Lazy, like ``_smart``: the transport owns which proxy URL its build refuses for a credential.
+    from messagefoundry.transports.rest import proxy_url_holds_credential
 
-    return proxy_url_sends_userinfo(url)
+    return proxy_url_holds_credential(url)
 
 
 def _proxy_bypasses(target: object, no_proxy: object) -> bool:
@@ -297,22 +298,26 @@ def _proxy_hop(
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
     ``targets`` the hop is reported, because nothing says it is bypassed.
 
-    The credential is the ``proxy_user``/``proxy_password`` pair, or a user and password in the
-    proxy URL itself (:func:`_proxy_url_sends_userinfo`). The label is built from parsed parts, so the
-    userinfo never reaches it."""
+    The credential is the ``proxy_user``/``proxy_password`` pair. A user or a password in the proxy
+    URL itself (:func:`_proxy_url_holds_credential`) is not a hop: the connector's build refuses it.
+    The label is built from parsed parts, so no userinfo reaches it."""
     proxy_url = settings.get("proxy_url") or site_proxy
-    in_url = _proxy_url_sends_userinfo(proxy_url)
-    if not in_url and not (settings.get("proxy_user") or settings.get("proxy_password")):
+    if _proxy_url_holds_credential(proxy_url):
+        # The connector's build refuses a credential in the proxy URL in every posture and under
+        # every declaration (vault BACKLOG #3007), so the hop never runs. Listing it would advise
+        # naming it in static_credential_accepted, which cannot make it run, and audit a hop that
+        # does not exist.
+        return None
+    if not (settings.get("proxy_user") or settings.get("proxy_password")):
         return None
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
     no_proxy = settings.get("proxy_no_proxy") or site_no_proxy
     if targets and all(_proxy_bypasses(target, no_proxy) for target in targets):
         return None  # every address bypasses the proxy: the credential is never sent
-    # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
-    # always Basic: the handler sends it pre-emptively and it replaces the engine's own header,
-    # whatever proxy_auth_type says. Otherwise the type is read the way the transport reads it.
-    kind = "basic" if in_url else str(settings.get("proxy_auth_type") or "basic").strip().lower()
+    # From a closed set, not echoed: only a known scheme name reaches the detail. The type is read
+    # the way the transport reads it.
+    kind = str(settings.get("proxy_auth_type") or "basic").strip().lower()
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(

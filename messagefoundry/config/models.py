@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
 # Re-exported: the enum moved to a stdlib-only leaf so `parsing/` can use it without loading this
@@ -311,7 +312,8 @@ def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
     """Read and load-validate the insecure-hop attestation pair out of a resolved settings mapping
     (BACKLOG #1666), for the carriers that have no :class:`Source`/:class:`Destination` model to hold
     it: the ``db_lookup`` executor, the SQL-backed reference source and the ``FhirLookup`` read
-    executor.
+    executor. :class:`Destination`'s own validator runs it on its settings too, because at least the
+    anonymous-FTP guard reads the attestation there, where ``_dest_config`` mirrors the typed field.
 
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
     mapping read in front of it, so these carriers cannot drift from the modelled ones or each other.
@@ -354,6 +356,24 @@ def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
     )
 
 
+def check_attested_and_accepted(attested: bool, accepted: bool) -> None:
+    """Refuse a declaration that claims its hop is both secure and not secure.
+
+    The body hop's disposition checks the attestation first, so on a cleartext body hop with both set
+    the acceptance's WARN and audit record never fire, and the hop crosses silently while declaring
+    an accepted risk. (The proxy leg reads the acceptance alone, so there the pair adds nothing; it
+    is refused as an incoherent declaration all the same.) The factories refuse the pair through
+    ``config.wiring``; this is the one rule they share with :class:`Destination` and the
+    ``FhirLookup`` read executor, so neither can be constructed directly with the pair. It runs at
+    construction only: :class:`Destination` does not validate on assignment, so a flag set on a
+    built model afterwards is not re-checked."""
+    if attested and accepted:
+        raise ValueError(
+            "tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
+            "secure) are opposite claims. Declare the one that is true"
+        )
+
+
 def _check_revocation_attestation(attested: bool, reason: str | None) -> None:
     """Load-validate the per-connection revocation-attestation pair (ADR 0173 §1.5 item 4).
 
@@ -373,8 +393,10 @@ def _check_revocation_attestation(attested: bool, reason: str | None) -> None:
     )
 
 
-class Source(BaseModel):
-    """An inbound connector endpoint."""
+class Source(_InputHidingModel):
+    """An inbound connector endpoint.
+
+    Input-hiding for the reason :class:`Destination` is: ``settings`` holds resolved secrets."""
 
     type: ConnectorType
     # The declaring inbound connection's name, carried so a connector can NAME itself in an operator-
@@ -420,7 +442,10 @@ class Source(BaseModel):
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Source:
-        _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        # The reason is written into WARNING lines, so a CR or LF in it could forge one.
+        _check_hop_attestation(
+            self.tls_hop_attested, require_hop_reason(self.tls_hop_attested_reason)
+        )
         _check_revocation_attestation(
             self.tls_revocation_attested, self.tls_revocation_attested_reason
         )
@@ -679,7 +704,7 @@ class SignatureAlgorithm(str, Enum):  # noqa: UP042
     ES384 = "ES384"  # ECDSA P-384 (secp384r1) + SHA-384 (EC key; randomized) — SMART Backend Services (ADR 0024)
 
 
-class OutboundSigning(BaseModel):
+class OutboundSigning(_InputHidingModel):
     """Opt-in per-connection message signing for a **REST/SOAP outbound** (ASVS 4.1.5, ADR 0018).
 
     OFF unless configured. When set, the connector mints a **detached JWS** (RFC 7515 Appendix F) over
@@ -732,7 +757,7 @@ class OutboundSigning(BaseModel):
         return cls.model_validate(data)
 
 
-class WindowsCredential(BaseModel):
+class WindowsCredential(_InputHidingModel):
     """A per-endpoint **alternate Windows / network-share credential** for a File (UNC/SMB) endpoint
     (ADR 0132, BACKLOG #111).
 
@@ -789,9 +814,12 @@ class WindowsCredential(BaseModel):
         return cls.model_validate(data)
 
 
-class Destination(BaseModel):
+class Destination(_InputHidingModel):
     """An outbound connector endpoint. Each outbound connection queues independently
-    so a slow/failed one never blocks the others."""
+    so a slow/failed one never blocks the others.
+
+    Input-hiding because ``settings`` holds resolved secrets, and a refusal from a validator here
+    carries the whole input on the error."""
 
     name: str
     type: ConnectorType
@@ -858,8 +886,19 @@ class Destination(BaseModel):
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Destination:
-        _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        # The reason is written into WARNING lines (at least the MLLP, DICOM, email and database
+        # guards log it), so a CR or LF in it could forge one; the settings copy is checked below.
+        _check_hop_attestation(
+            self.tls_hop_attested, require_hop_reason(self.tls_hop_attested_reason)
+        )
         _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
+        # The settings-driven seams (at least the anonymous-FTP guard) read the attestation from
+        # ``settings``, where _dest_config mirrors the typed field. So that carrier is held to the
+        # same flag, reason and control-character rules, and the pair is judged on either.
+        settings_attested = hop_attestation_from_settings(self.settings)
+        check_attested_and_accepted(
+            self.tls_hop_attested or settings_attested, self.cleartext_accepted
+        )
         _check_revocation_attestation(
             self.tls_revocation_attested, self.tls_revocation_attested_reason
         )

@@ -85,7 +85,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
     bool_setting,
-    flag_from_settings,
+    hop_attestation_from_settings,
     remote_file_protocol,
 )
 from messagefoundry.config.settings import (
@@ -2165,12 +2165,14 @@ def _anon_ftp_guard(
         return None
     if s.get("username") or s.get("password"):
         return None  # credentialed ftp: _validate_common refused it outright before any caller
-    reason = s.get("tls_hop_attested_reason")
     try:
-        attested = flag_from_settings(s, "tls_hop_attested")
+        # The whole pair, held to the flag, reason and control-character rules, on both sides: the
+        # inbound RemoteFileSource has no Destination validator in front of it to have run them.
+        attested = hop_attestation_from_settings(s)
     except ValueError as exc:
         # Vault BACKLOG #3139: name the connection, as every other refusal in this module does.
         raise ValueError(f"{hop_name_prefix(connection)}{exc}") from exc
+    reason = s.get("tls_hop_attested_reason")
     return InsecureHopGuard.capture(
         host=str(s["host"]),
         port=port_setting(s.get("port", 21), transport="REMOTEFILE ftp"),

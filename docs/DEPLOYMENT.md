@@ -774,7 +774,7 @@ nor the instance's data label — so cleartext MLLP/DICOM/DICOMweb and the
 cleartext HTTP family are now governed only by a per-connection `cleartext_accepted` + `cleartext_reason`
 (warn + audit) or a loopback hop. An HTTP-family credential over `http` to a host off this machine is
 refused with no escape, whatever either declaration says (vault BACKLOG #3533 item 4); the
-forward-proxy login is the exception, and
+forward-proxy login is the exception, under `cleartext_accepted` alone, and
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer) says which owner ruling governs it. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
 the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
 [CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is mostly
