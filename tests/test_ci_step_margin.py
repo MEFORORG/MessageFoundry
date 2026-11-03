@@ -1084,12 +1084,12 @@ def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_sui
     # job -- they are in DIFFERENT JOBS, so neither can spend the other's wall-clock at all. Assert the
     # separation structurally as well as by cap name, since the cap names alone would still pass if the
     # console step were moved back beside the engine one with its own knob.
+    assert len(caps) >= 2, f"fewer than two gated suites read a cap, so nothing is compared: {caps}"
     assert len(set(caps.values())) == len(caps), f"gated suites share a cap expression: {caps}"
     # Each gated job holds one gated step, so no suite is queued behind another in one job.
-    assert len(_GATED.values()) >= 2, "fewer than two gated suites, so nothing is compared"
     for job_name, (gated, _, _) in _GATED.items():
         names = [s.get("name") for s in _job(job_name)["steps"]]
-        others = [g for g, _, _ in _GATED.values() if g != gated and g in names]
+        others = [g for g in caps if g != gated and g in names]
         assert not others, f"{job_name} holds {gated!r} and also {others}"
 
 

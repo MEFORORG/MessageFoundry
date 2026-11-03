@@ -223,10 +223,11 @@ def test_shard_two_still_gates_a_merge() -> None:
             m in str(s.get("run", "")) for m in ("pytest", "step_margin.py", "--check-collection")
         )
     ]
+    # First, so it is the precondition the lint asks for rather than an echo of the subset check below.
+    assert gating, "no test-shard2 step runs the suite, the margin check or the guard"
     names = [str(s.get("name")) for s in gating]
     assert {_STEP, "Step margin -- engine suite"} <= set(names), names
     assert any("--check-collection" in str(s.get("run")) for s in gating), names
-    assert gating, "no test-shard2 step runs the suite, the margin check or the guard"
     softened = [str(s.get("name")) for s in gating if "continue-on-error" in s]
     assert not softened, f"test-shard2 steps carry continue-on-error: {softened}"
     assert "test-shard2" in jobs["ci-gate"]["needs"]

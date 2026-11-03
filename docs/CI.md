@@ -402,7 +402,8 @@ Two limits, stated so nobody reads more into a green than it carries:
   `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
   `zizmor.yml` is not a required check.
 - **A step's wall-clock cap is now checked against the step, and a low margin reds the leg** --
-  except the engine `test` leg until BACKLOG #3515 re-measures the cap. In `merge_group` a low margin
+  except the engine suite's legs, `test` and `test-shard2`, until BACKLOG #3515 re-measures the cap.
+  In `merge_group` a low margin
   is a warning (owner ruling 2026-10-29). On `pull_request` it is a warning from 1.30x down to 1.20x
   and reds below 1.20x (decided under the owner's delegation of 2026-10-30). Every other event on
   that leg still reds below 1.30x, including the push run on `main`, so a change that lands between
@@ -421,6 +422,12 @@ Two limits, stated so nobody reads more into a green than it carries:
   `RE-DERIVE` or `RE-SIZE`, and never changes the exit code. It puts a rotting record on the run page
   and the checks tab instead of only the step log (BACKLOG #1842). The grades, and the limits of
   that warning, are defined once in `record_escalation` in `scripts/ci/step_margin.py`.
+  **The engine suite now runs as two test shards, in `test` and `test-shard2`, and each shard keeps
+  the whole-suite cap and the whole-suite baseline row.** A shard does about half the work, so until
+  the caps and rows are re-measured from shard pools (BACKLOG #5247 item 8), the 1.30x floor, and the
+  exception's lower floor, are met against a cap sized for twice a shard's work: the margin gate is
+  about half as sensitive to a shard slowing down. The `RE-DERIVE` and `RE-SIZE` warning stays inert
+  on both shards for the same reason, since a shard run is not expected to reach a whole-suite row.
   **A red here is not a request to raise the cap:** the cap is sized against the work in `ci.yml`,
   and the underlying Windows slowness is its own backlog item.
 - **Pass matrix/expression values through `env:`, don't inline them in `run:`.** A dynamic
