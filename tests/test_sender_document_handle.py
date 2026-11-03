@@ -194,7 +194,7 @@ async def test_a_handle_naming_another_messages_document_is_never_delivered(
     _other, ref = await _held_document(store, secret)
     runner = _runner(store)
     col = _Collector()
-    runner._destinations[DEST] = col
+    runner._destinations[DEST] = col  # type: ignore[assignment]
 
     _mid, rows = await _deliver(store, runner, _hl7(make_doc_ref(ref, "Application")))
 
@@ -216,7 +216,7 @@ async def test_a_handle_its_own_message_holds_still_resolves(store: MessageStore
     obx5_5 = Message.parse(skeleton).field("OBX-5.5") or ""
     assert is_doc_ref(obx5_5)
     col = _Collector()
-    runner._destinations[DEST] = col
+    runner._destinations[DEST] = col  # type: ignore[assignment]
 
     await _deliver_holding(store, runner, skeleton, parse_doc_ref(obx5_5)[0])
 
@@ -239,7 +239,7 @@ async def test_an_unresolvable_sender_handle_dead_letters_at_once(
 ) -> None:
     runner = _runner(store)
     col = _Collector()
-    runner._destinations[DEST] = col
+    runner._destinations[DEST] = col  # type: ignore[assignment]
     runner._retry[DEST] = RetryPolicy(max_attempts=50, backoff_seconds=60.0)
 
     _mid, rows = await _deliver(store, runner, _hl7(value))
@@ -270,7 +270,7 @@ async def test_a_handle_escaped_by_msh2_is_reattached_not_sent(store: MessageSto
     msg.set("OBX-5.5", make_doc_ref(ref, "Application"))
     runner = _runner(store)
     col = _Collector()
-    runner._destinations[DEST] = col
+    runner._destinations[DEST] = col  # type: ignore[assignment]
 
     await _deliver_holding(store, runner, msg.encode(), ref)
 
@@ -322,7 +322,7 @@ async def test_a_copied_handle_is_refused_never_sent(store: MessageStore, copy) 
     assert skeleton.count(DOC_REF_MARKER) == 2
     runner = _runner(store)
     col = _Collector()
-    runner._destinations[DEST] = col
+    runner._destinations[DEST] = col  # type: ignore[assignment]
 
     rows = await _deliver_holding(store, runner, skeleton, ref)
 
@@ -337,7 +337,7 @@ async def test_a_sender_tombstone_resolves_nothing_and_rides_as_text(store: Mess
     runner = _runner(store, ic)
     assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
     col = _Collector()
-    runner._destinations[DEST] = col
+    runner._destinations[DEST] = col  # type: ignore[assignment]
 
     _mid, _rows = await _deliver(store, runner, body)
 

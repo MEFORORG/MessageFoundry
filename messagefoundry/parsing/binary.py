@@ -609,8 +609,8 @@ async def reattach_documents_in_hl7(
     (run off the event loop like every store read). **Fail-loud** (owner invariant): if a value LOOKS
     like a handle but ``reader`` raises **or** returns ``None`` (the attachment is missing / GC'd), a
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
-    into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
-    :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
+    into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle fails loud as an
+    :class:`UnreattachableDocumentError`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
     :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The
     payload-caused shapes :class:`UnreattachableDocumentError` names raise it; every other
     ``ValueError`` propagates as it is, a stored document holding a CR or LF included.
@@ -686,8 +686,8 @@ async def reattach_documents_in_hl7(
         )
     if not handles:
         # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
-        # DOC_REF_MARKER substring gate may pass on a marker sitting outside an OBX-5.5 ED value; that is
-        # not a detached document, so it is carried through verbatim (mirrors strip's no-op return).
+        # gate may pass on a marker sitting outside an OBX-5.5 value of a message that holds no
+        # attachment; that names no document of its own, so it is carried through verbatim.
         return text
     for occ, sha256 in handles:
         verbatim = await reader(sha256)

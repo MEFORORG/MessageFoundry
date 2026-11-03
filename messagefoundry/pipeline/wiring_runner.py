@@ -8120,7 +8120,8 @@ class RegistryRunner:
                 # Only the in-flight budget is the engine's own and clears as concurrent detaches
                 # finish, so only it invites a re-send, and only when the body would fit the budget
                 # once they have: one larger than the whole budget is over-size. An unsupported
-                # backend, a malformed handle and an escaped document refuse the same body every time.
+                # backend, a malformed handle, a received handle and an escaped document refuse the
+                # same body every time.
                 if isinstance(exc, _StreamBudgetExceeded):
                     kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
                 else:
@@ -9044,9 +9045,9 @@ class RegistryRunner:
         before it hits the wire (#149, ADR 0105 Phase 1b). A delivery/skeleton row carries a small
         ``mfdoc:v1:ref:`` handle in ``OBX-5.5``; splice the stored VERBATIM base64 back in (Approach B —
         no decode/encode) so the partner receives the full inline document (Epic's MLLP MDM receiver does
-        not cap the frame). A payload with **no** handle is returned byte-identical after a single
-        substring check — the below-threshold / no-detach / Handler-built (never-detached) delivery path
-        is untouched, and no store read happens.
+        not cap the frame). A payload with **no** handle is returned byte-identical after a cheap
+        gate (a substring check, plus an MSH-2 read) — the below-threshold / no-detach / Handler-built
+        (never-detached) delivery path is untouched, and no store read happens.
 
         Hydration is a **pure READ** off the immutable, content-addressed attachment; it does **not**
         decref (the message may fan out to several outbounds and is replayable — the refcount is released
@@ -9054,8 +9055,7 @@ class RegistryRunner:
         IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
         support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
         the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption). A malformed handle (:class:`DocRefError`) takes that
-        same retryable path. A failure the payload itself causes, an
+        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, an
         :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
         :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
         other ``ValueError`` propagates to the outbound's internal-error policy, a stored document
@@ -9072,7 +9072,11 @@ class RegistryRunner:
         escape the engine's own handle is re-attached rather than sent with the handle in it."""
         if not may_hold_doc_ref(payload):
             return payload  # no detached document → byte-identical, no store read (the common path)
-        bound = {str(row["attachment_id"]) for row in await self.store.attachments_for(message_id)}
+        # A store fault here re-pends the row like the attachment read below (vault BACKLOG #2756).
+        held = await _read_from_store(
+            "attachment read", lambda: self.store.attachments_for(message_id)
+        )
+        bound = {str(row["attachment_id"]) for row in held}
 
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces

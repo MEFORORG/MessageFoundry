@@ -41,6 +41,7 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
 )
 from messagefoundry.parsing.binary import (
+    InboundDocRefError,
     chunk_b64,
     is_doc_ref,
     iter_obx_documents,
@@ -136,12 +137,14 @@ def test_iter_obx_documents_yields_verbatim_and_content_type() -> None:
     assert docs == [(1, b64, "Application")]
 
 
-def test_iter_obx_documents_skips_already_detached() -> None:
-    # A skeleton whose OBX-5.5 already carries a ref handle yields nothing (re-scan is a no-op).
+def test_iter_obx_documents_refuses_a_received_handle() -> None:
+    # The scan runs on the received body only, so a handle there is the sender's text, never a
+    # document this engine detached: refused, not skipped as already detached (BACKLOG #5099).
     ref = hashlib.sha256(b"x").hexdigest()
     handle = make_doc_ref(ref, "Application")
     msg = Message.parse(_hl7_with_doc(handle))
-    assert list(iter_obx_documents(msg)) == []
+    with pytest.raises(InboundDocRefError):
+        list(iter_obx_documents(msg))
 
 
 def test_chunk_b64_concatenates_to_input() -> None:
@@ -690,8 +693,9 @@ async def test_clean_base64_still_detaches_and_rehydrates_verbatim(store: Messag
 
     assert _ack_code(await runner._handle_inbound(ic, raw.encode("utf-8"))) == "AA"
 
-    skeleton = (await _messages(store))[0]["raw"]
-    hydrated = await runner._hydrate_payload(skeleton)
+    cur = await store._db.execute("SELECT id, raw FROM messages")
+    row = dict(await cur.fetchone() or {})
+    hydrated = await runner._hydrate_payload(row["raw"], row["id"])
     assert Message.parse(hydrated).field("OBX-5.5") == b64
 
 

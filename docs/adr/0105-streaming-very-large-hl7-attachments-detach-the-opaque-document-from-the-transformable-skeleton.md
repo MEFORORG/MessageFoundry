@@ -246,13 +246,14 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   handle but whose `reader` returns `None` / raises (attachment missing or GC'd) raises `DocRefError` — it
   **never** emits the raw `mfdoc:v1:ref:` text. A body with no handle is returned **byte-identical**.
 - **The delivery seam** `RegistryRunner._hydrate_payload` runs **before** `connector.send` on both the
-  single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A single
-  `DOC_REF_MARKER` substring check short-circuits the common no-handle case to a **byte-identical**
-  passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
+  single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A cheap
+  gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or an `MSH-1`/`MSH-2` that names a character
+  of the marker and so escapes it, BACKLOG #5099) short-circuits the common no-handle case to a
+  **byte-identical** passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
   deliveries are unchanged. When a handle is present it hydrates via `reattach_documents_in_hl7` with an
   async reader over `store.read_attachment` (off the event loop, chunk-by-chunk). **Fail-loud:** a missing
-  / GC'd attachment (`KeyError`), a malformed handle (`DocRefError`), or an unsupported backend
-  (`StreamingAttachmentsUnsupported`) is turned into a retryable `DeliveryError` — exactly like the
+  / GC'd attachment the message still holds (`KeyError`, or `DocRefError` on an empty read) or an
+  unsupported backend (`StreamingAttachmentsUnsupported`) is turned into a retryable `DeliveryError` — exactly like the
   pre-send `encoding_characters` / `hl7_raw_separators` failures — so the row takes the normal
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
@@ -269,7 +270,18 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   policy judges it, as it judges a parser fault: `continue` dead-letters, and `stop` stops the
   connection with a `connection_stopped` alert. On a batched outbound that policy applies to the
   whole batch, so under `continue` every member of the batch still present is dead-lettered with it.
-  A missing attachment or a malformed handle stays the retryable `DeliveryError` above.
+  A missing attachment the message holds stays the retryable `DeliveryError` above.
+- **A handle resolves only to its own message's attachment (BACKLOG #5099, added 2026-11-03).** The
+  delivery seam reads the content addresses the row's message holds (`attachments_for`, the
+  `message_attachment` linkage the ingress commit writes; replay and resend keep the message id) and
+  passes them to the re-attach as `bound`. A handle that is malformed, names any other address, or
+  sits where the splice does not reach (`NTE-3`, a second `OBX-5.5` repetition), raises
+  `UnreattachableDocumentError` before any read, so the row dead-letters alone rather than
+  re-pending on a strict-FIFO lane. The ingress detach refuses a received body whose `OBX-5.5`
+  already holds a handle (`InboundDocRefError`, an `ERROR` row and an `AR` before the ACK) instead
+  of skipping it as already detached. An edit-and-resend body is a new child message that holds no
+  attachment, so a handle in it is refused at delivery. A `mfdoc:v1:pruned:` tombstone resolves
+  nothing and is carried as text.
 - **Delivery is a pure READ — never a decref.** A message fans out to multiple outbounds and is
   replayable, so each send **reads** the immutable, content-addressed attachment per-send and leaves the
   refcount untouched; the refcount is released **only** at retention/purge (below). This makes retry
@@ -488,7 +500,8 @@ permission), and **API + web console only** (the PySide6 desktop console is depr
       per-source knobs), so no global default change is needed.
 - [x] Phase-1b: re-attach is a **pure splice-back** (`reattach_documents_in_hl7`, injected async reader,
       VERBATIM) hydrated at the terminal egress on both the single-item and batch delivery paths; a missing
-      attachment / handle is **fail-loud** (retryable `DeliveryError`, never a handle on the wire).
+      attachment / handle is **fail-loud** (never a handle on the wire: a retryable `DeliveryError` for
+      an attachment the message holds, a permanent refusal for any other handle, BACKLOG #5099).
 - [x] Phase-1b: the outbound MLLP **send is uncapped** (the large hydrated / Handler-built MDM streams
       inline); `max_frame_bytes` bounds only the ACK read — no new knob.
 - [x] Phase-3a (built 2026-07-13): retention/purge now **decrefs** a purged message's attachment refs — a
