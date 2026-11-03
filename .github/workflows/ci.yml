@@ -1097,7 +1097,7 @@ jobs:
           # the one place a leg is named; a run that does not set it is never graded.
           MEFOR_CONNSCALE_LEG: ${{ matrix.os }}-py${{ matrix.python-version }}
           # BACKLOG #5247: which half of the engine suite this job runs; see the note above the run line.
-          ENGINE_SHARD: "1"
+          TEST_SHARD: "1"
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
         # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.
@@ -1186,7 +1186,7 @@ jobs:
         # `coverage-shard` uses; that job's header says why a hash and not a durations table. The file
         # list reaches pytest as an `@file` argument, so its length never meets the Windows
         # command-line limit. The selector leaves the tooling files out of the list by the same
-        # manifest the marker reads, and the console package out by this line's glob.
+        # manifest the marker reads, and the console package out by the same glob as this line's.
         #
         # SO `--ignore-glob` PRUNES NOTHING ON THIS LINE ANY MORE, and the #1027 note above describes
         # the step before the split. pytest does not apply it to a path named on the command line
@@ -1197,10 +1197,10 @@ jobs:
         # lists with pytest's own collection.
         # tests/test_ci_engine_suite_shards.py holds the two jobs' bodies identical.
         run: |
-          mkdir -p out/engine-shard
-          python scripts/quality/shard_tests.py --suite engine --shard "$ENGINE_SHARD" --of 2 > out/engine-shard/files.txt
-          echo "engine suite shard $ENGINE_SHARD of 2: $(wc -l < out/engine-shard/files.txt) test files"
-          bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/engine-shard-$ENGINE_SHARD.xml" @out/engine-shard/files.txt
+          mkdir -p out/test-shard
+          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 2 > out/test-shard/files.txt
+          echo "engine suite, test shard $TEST_SHARD of 2: $(wc -l < out/test-shard/files.txt) test files"
+          bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/test-shard-$TEST_SHARD.xml" @out/test-shard/files.txt
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
@@ -1325,7 +1325,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: junit-engine-shard-1-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: junit-test-shard-1-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/junit/
           if-no-files-found: ignore
           retention-days: 14
@@ -1441,12 +1441,12 @@ jobs:
           PYTEST_WORKERS: ${{ matrix.pytest_workers }}
           RETRY_NATIVE_CRASH_CAUSE: ""
           MEFOR_REQUIRE_SFTP_EXTRA: "1"
-          ENGINE_SHARD: "2"
+          TEST_SHARD: "2"
         run: |
-          mkdir -p out/engine-shard
-          python scripts/quality/shard_tests.py --suite engine --shard "$ENGINE_SHARD" --of 2 > out/engine-shard/files.txt
-          echo "engine suite shard $ENGINE_SHARD of 2: $(wc -l < out/engine-shard/files.txt) test files"
-          bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/engine-shard-$ENGINE_SHARD.xml" @out/engine-shard/files.txt
+          mkdir -p out/test-shard
+          python scripts/quality/shard_tests.py --suite engine --shard "$TEST_SHARD" --of 2 > out/test-shard/files.txt
+          echo "engine suite, test shard $TEST_SHARD of 2: $(wc -l < out/test-shard/files.txt) test files"
+          bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/test-shard-$TEST_SHARD.xml" @out/test-shard/files.txt
 
       # The `test` job's margin check, byte for byte. Its note there, REVERT line included, covers
       # this copy too.
@@ -1493,7 +1493,7 @@ jobs:
       # collection is not timed as part of the suite.
       # Only after a passing suite: after one killed at its cap, the guard's minutes could push the job
       # past `job_timeout`, and a hang would then report as a cancellation.
-      - name: Engine shards partition pytest's collection
+      - name: Test shards partition pytest's collection
         if: ${{ !cancelled() && steps.tests.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 6
         env:
@@ -1504,7 +1504,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: junit-engine-shard-2-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: junit-test-shard-2-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/junit/
           if-no-files-found: ignore
           retention-days: 14
@@ -6538,6 +6538,9 @@ jobs:
       - test-shard2
     runs-on: ubuntu-latest
     steps:
+      # BACKLOG #5247 added a THIRD failing step, after these two, for the one need whose skip is not a
+      # pass: test-shard2 where the engine suite runs. The note below is about the first two.
+      #
       # TWO failing steps, not one, and the predicates PARTITION the old single condition -- their
       # union is identical and their intersection is empty, so this gate's BEHAVIOUR is unchanged and
       # only the message differs. Both arms still `exit 1`.

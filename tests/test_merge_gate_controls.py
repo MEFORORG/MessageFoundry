@@ -120,7 +120,9 @@ def _ci_gate_job() -> dict[str, Any]:
 
 
 #: The `needs.*.result` values a leg can report. The roll-up must fire on the first two and stay
-#: quiet on the last two -- see the two tests below, which are opposite halves of one property.
+#: quiet on the last two -- see the two tests below, which are opposite halves of one property. One
+#: need is the exception, test-shard2's skip where the engine suite runs (BACKLOG #5247); the
+#: `_DEFAULT_CONTEXT` below holds it at success so these vector tests grade the other needs.
 _LEG_RESULTS = ("failure", "cancelled", "skipped", "success")
 
 
@@ -152,7 +154,7 @@ def _rollup_fail_conditions() -> list[tuple[str, str]]:
 
 
 #: The context a condition naming ONE need, the `changes` output or the event is evaluated in, unless a
-#: test passes its own. The default is an ordinary code pull request whose engine shard 2 passed, so
+#: test passes its own. The default is an ordinary code pull request whose test shard 2 passed, so
 #: the BACKLOG #5247 step stays quiet and the vector tests below grade the two arms alone.
 _DEFAULT_CONTEXT: dict[str, str] = {
     "code": "true",
@@ -347,7 +349,7 @@ def test_the_rollup_steps_partition_and_each_one_exits_nonzero() -> None:
 
 
 def _shard2_step() -> str:
-    """The `ci-gate` step for engine shard 2's own result (BACKLOG #5247), found by what it reads."""
+    """The `ci-gate` step for test shard 2's own result (BACKLOG #5247), found by what it reads."""
     found = [cond for _, cond in _rollup_fail_conditions() if "needs['test-shard2'].result" in cond]
     assert len(found) == 1, f"expected one ci-gate step reading test-shard2's result, found {found}"
     return found[0]

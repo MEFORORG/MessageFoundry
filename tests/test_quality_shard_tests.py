@@ -99,7 +99,7 @@ def engine(mod: ModuleType) -> dict[int, list[str]]:
     return mod.partition(2, "engine")
 
 
-def test_the_engine_shards_partition_the_engine_step_s_file_set(
+def test_the_test_shards_partition_the_engine_step_s_file_set(
     mod: ModuleType, files: list[str], engine: dict[int, list[str]]
 ) -> None:
     """Every file the engine step runs, in exactly one of the two shards: testpaths, less the
@@ -114,8 +114,8 @@ def test_the_engine_shards_partition_the_engine_step_s_file_set(
     listed = engine[1] + engine[2]
     print(f"[shards] engine: shard 1 {len(engine[1])}, shard 2 {len(engine[2])} files")
     assert sorted(listed) == expected
-    assert len(set(listed)) == len(listed), "a file is in both engine shards"
-    assert engine[1] and engine[2], "an engine shard is empty"
+    assert len(set(listed)) == len(listed), "a file is in both test shards"
+    assert engine[1] and engine[2], "an test shard is empty"
 
 
 def test_the_engine_suite_leaves_the_console_package_out_and_the_coverage_suite_keeps_it(
@@ -133,7 +133,7 @@ def test_the_connscale_smoke_is_held_in_shard_one(mod: ModuleType) -> None:
     """scripts/connscale_harvest.py joins its readings to the `test (...)` jobs, and only that job
     sets MEFOR_CONNSCALE_LEG. Its hash puts it in shard 2, so the hold is doing real work.
 
-    Falsified by emptying ENGINE_SHARD_ONE: RED on the first assertion. Restored."""
+    Falsified by emptying ENGINE_SUITE_SHARD_ONE: RED on the first assertion. Restored."""
     smoke = "tests/test_connscale_smoke.py"
     assert (_ROOT / smoke).is_file()
     assert mod.assign(smoke, 2, "engine") == 1
@@ -180,18 +180,33 @@ def test_check_collection_exits_by_what_pytest_collected(
     """The real collection is a ci.yml step, too slow for a unit test; this drives its verdicts on
     a stubbed one. Falsified by returning 0 on a fault: RED on the second call. Restored."""
 
-    def check(stdout: str, returncode: int = 0) -> int:
-        done = subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
-        return mod.check_collection(2, "engine", ["-m", "x"], run=lambda *a, **k: done)
+    def check(*answers: tuple[list[str], int]) -> int:
+        """Each call of the stub answers with the next (files, exit code) pair."""
+        queue = list(answers)
+
+        def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            files, code = queue.pop(0)
+            out = "".join(f"{path}::test_x\n" for path in files)
+            return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr="")
+
+        result: int = mod.check_collection(2, "engine", ["-m", "x"], run=run)
+        assert not queue, "the stub was asked fewer times than expected"
+        return result
 
     every = engine[1] + engine[2]
-    assert check("".join(f"{path}::test_x\n" for path in every)) == 0
-    assert check("".join(f"{path}::test_x\n" for path in [*every, "tests/test_nowhere.py"])) == 1
-    assert check("", returncode=4) == 2
+    quiet, rest = every[0], every[1:]
+    assert check((every, 0)) == 0
+    assert check(([*every, "tests/test_nowhere.py"], 0)) == 1
+    assert check(([], 4)) == 2
+    # A listed file the suite collected nothing from: allowed when it is quiet named too (exit 5),
+    # a fault when naming it collects tests (a collection-time ignore a shard would bypass).
+    assert check((rest, 0), ([], 5)) == 0
+    assert check((rest, 0), ([quiet], 0)) == 1
+    assert check((rest, 0), ([], 3)) == 2
     for bad in ("0", "-1"):
         with pytest.raises(SystemExit):
             mod.main(["--suite", "engine", "--of", bad, "--check-collection"])
     with pytest.raises(SystemExit):
         mod.main(["--suite", "engine", "--shard", "1", "--of", "2", "--check-collection"])
     with pytest.raises(SystemExit):
-        mod.main(["--shard", "1", "--of", "2", "-m", "x"])
+        mod.main(["--shard", "1", "--of", "2", "--", "-m", "x"])

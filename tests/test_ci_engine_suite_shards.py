@@ -81,23 +81,23 @@ def test_both_shards_run_one_body_under_one_condition_and_one_cap() -> None:
     env_one, env_two = dict(one["env"]), dict(two["env"])
     for name in _SHARD_ONE_ONLY_ENV:
         env_one.pop(name)
-    assert {env_one.pop("ENGINE_SHARD"), env_two.pop("ENGINE_SHARD")} == {"1", "2"}
-    assert env_one == env_two, "the two shards' env differ beyond ENGINE_SHARD"
+    assert {env_one.pop("TEST_SHARD"), env_two.pop("TEST_SHARD")} == {"1", "2"}
+    assert env_one == env_two, "the two shards' env differ beyond TEST_SHARD"
 
 
 def test_each_job_runs_its_own_shard_of_the_count_there_are_shards() -> None:
     """A shard number repeated, or a `--of` that is not the job count, drops or doubles files."""
     for job, shard in _SHARD_JOBS.items():
         step = _step(job, _STEP)
-        assert step["env"]["ENGINE_SHARD"] == shard, job
+        assert step["env"]["TEST_SHARD"] == shard, job
         run = str(step["run"])
         found = re.findall(
-            r"shard_tests\.py --suite engine --shard \"\$ENGINE_SHARD\" --of (\d+)", run
+            r"shard_tests\.py --suite engine --shard \"\$TEST_SHARD\" --of (\d+)", run
         )
         assert found == [str(len(_SHARD_JOBS))], (job, found)
         # The list the selector wrote is the list pytest reads.
-        assert "> out/engine-shard/files.txt" in run
-        assert _pytest_argv(run)[-1] == "@out/engine-shard/files.txt"
+        assert "> out/test-shard/files.txt" in run
+        assert _pytest_argv(run)[-1] == "@out/test-shard/files.txt"
 
 
 def test_shard_two_carries_the_suite_s_belts() -> None:
@@ -148,7 +148,10 @@ def test_the_partition_guard_reads_the_suite_s_own_selection() -> None:
     assert "--suite" in argv and argv[argv.index("--suite") + 1] == "engine"
     tail = argv[argv.index("--") + 1 :]
     suite = _pytest_argv(str(_step("test", _STEP)["run"]))
-    assert _selection(tail) == _selection(suite), (tail, suite)
+    # The WHOLE tail, so a narrowing flag on the guard alone (`-k`, `--deselect`) is a drift too.
+    expression = suite[suite.index("-m") + 1]
+    globs = [w for w in suite if w.startswith("--ignore-glob")]
+    assert tail == ["-m", expression, *globs], (tail, suite)
     assert _selection(suite), "the suite step carries no selection, so this compares nothing"
     assert guard[0].get("if") == (
         "${{ !cancelled() && steps.tests.outcome == 'success' && runner.os == 'Linux' }}"
@@ -182,15 +185,14 @@ def test_each_shard_uploads_its_junit_under_a_name_no_other_job_uses(job: str) -
     shard = _SHARD_JOBS[job]
     argv = _pytest_argv(str(_step(job, _STEP)["run"]))
     junit = next(w for w in argv if w.startswith("--junitxml="))
-    assert junit == "--junitxml=out/junit/engine-shard-$ENGINE_SHARD.xml"
+    assert junit == "--junitxml=out/junit/test-shard-$TEST_SHARD.xml"
     upload = _step(job, f"Upload engine suite junit (shard {shard})")
     assert upload["if"] == "always()"
     assert upload["with"]["path"] == "out/junit/"
     assert upload["with"]["if-no-files-found"] == "ignore"
     name = str(upload["with"]["name"])
     assert (
-        name
-        == f"junit-engine-shard-{shard}-${{{{ matrix.os }}}}-py${{{{ matrix.python-version }}}}"
+        name == f"junit-test-shard-{shard}-${{{{ matrix.os }}}}-py${{{{ matrix.python-version }}}}"
     )
     others = [
         str(s["with"]["name"])
