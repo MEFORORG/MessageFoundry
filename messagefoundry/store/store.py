@@ -2551,8 +2551,13 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
 
 def global_epoch_or_refuse(value: Any) -> int:
     """``value``, the global session epoch a read returned, as an int; a store with no row reads
-    ``None`` and is refused with :data:`GLOBAL_SESSION_EPOCH_MISSING` (BACKLOG #5091). Every read
-    of the global epoch on every backend goes through this one check."""
+    ``None`` and is refused with :data:`GLOBAL_SESSION_EPOCH_MISSING` (BACKLOG #5091).
+
+    Its callers: every user read, through :meth:`UserRecord.from_mapping`; SQLite
+    ``create_session``'s account read; each store's ``_global_session_epoch``; and the raise in the
+    Postgres and SQL Server ``revoke_all_sessions``, which reads the raised value back. SQLite's
+    ``revoke_all_sessions`` does not call it: its raise reads nothing back, so it checks the
+    ``UPDATE``'s ``rowcount`` itself and raises the same error."""
     if value is None:
         raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
     return int(value)
