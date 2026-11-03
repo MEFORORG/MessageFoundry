@@ -714,8 +714,10 @@ async def hold_and_retry(
     event; a fault the earlier retries clear leaves WARNING lines and no event. A fault that never
     clears holds the connection until the listener stops.
 
-    A stop cuts the pause short for one last attempt at once, inside stop()'s grace for its client
-    tasks. Should that fail too, or should stop() cancel the task, the hold ends without the frame,
+    Once a stop is seen, the next attempt to start is the last, made at once, inside stop()'s grace
+    for its client tasks: a stop during a pause cuts it short, and a stop during a failing attempt
+    still gets one after it. Should that fail too, or should stop() cancel the task, the hold ends
+    without the frame,
     and the frames behind it on this connection are lost with it, since the connection closes and
     the sender never resends. Each way logs one ERROR line saying so and reports, unless it already
     has. A failed last attempt raises :class:`HandlerFaultUnrecovered`. A cancel bounds the report
@@ -730,7 +732,19 @@ async def hold_and_retry(
     in_attempt = False
     try:
         while True:
-            if not stopped():
+            # The last attempt is the first one to START once the stop is seen, so a stop that
+            # lands during a failing attempt still gets one after it.
+            last = stopped()
+            if last:
+                log.warning(
+                    "%s message from %s failed in the inbound handler (attempt %d): %s; the "
+                    "listener is stopping, so making one last attempt now",
+                    transport,
+                    peer,
+                    failed,
+                    reason,
+                )
+            else:
                 if failed == HANDLER_FAULT_REPORT_AFTER:
                     log.error(
                         "%s message from %s failed in the inbound handler %d times: %s (this "
@@ -754,7 +768,7 @@ async def hold_and_retry(
                     delay,
                 )
                 await _pause(delay, stopped)
-            # After a stop, before or during the pause, this is the last attempt.
+                last = stopped()  # a stop during the pause makes this attempt the last
             in_attempt = True
             try:
                 reply = await handler(frame)
@@ -762,7 +776,7 @@ async def hold_and_retry(
                 in_attempt = False
                 reason = safe_exc(exc)
                 failed += 1
-                if stopped():
+                if last:
                     break
                 continue
             in_attempt = False
@@ -1437,9 +1451,10 @@ class SourceConnector(abc.ABC):
     socket listeners differ there:
 
     * the raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or
-      the listener stops (:func:`hold_and_retry`, BACKLOG #5022), so only a stop during the hold,
-      whose last attempt also fails or is cancelled, loses it, together with every frame behind
-      it on that connection;
+      the listener stops (:func:`hold_and_retry`, BACKLOG #5022). At least two things lose it,
+      together with every frame behind it on that connection: a stop during the hold whose last
+      attempt also fails or is cancelled, which logs the loss at ERROR, and the process dying
+      during the hold, which logs nothing, since the held frames are only in memory;
     * the MLLP listener records ``handler_error``, drops the frame with no retry and reads on. That
       is a gap in the shipped code, not a pattern to copy. Other sources may have one too."""
 

@@ -150,13 +150,17 @@ async def test_no_reply_a_stop_ends_the_hold_and_names_the_loss(
     writer = _Peer()
     with caplog.at_level(logging.WARNING):
         events = await _drive(source, _ThenEof(wire + wire), writer, handler=explode_then_stop)
-    assert seen == [body] * 2, "no attempt once stopping, and the frame behind it is not handled"
+    # The stop lands during attempt 2, which fails, so attempt 3 is the last one; nothing after it,
+    # and the frame behind it in the read is never handled.
+    assert seen == [body] * 3
     assert _kinds(events) == ["established", "handler_error"], (
         "reported before the threshold, and a failed connection must not also emit `closed`"
     )
     assert writer.closed and not writer.written
     retrying = [r for r in caplog.records if "retrying in" in r.getMessage()]
     assert len(retrying) == 1, "no `retrying in` line once the listener is stopping"
+    last = [r for r in caplog.records if "one last attempt" in r.getMessage()]
+    assert len(last) == 1 and "(attempt 2)" in last[0].getMessage()
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "nor is any frame behind it" in errors[0] and "listener is stopping" in errors[0]
@@ -252,9 +256,9 @@ async def test_a_stop_gets_one_last_attempt_that_can_record_the_frame(
         events = await _drive(source, _ThenEof(wire), _Peer(), handler=stop_then_recover)
     assert seen == [body] * 2
     assert _kinds(events) == ["established", "closed"]
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-        "no `retrying in` line once stopping, and nothing is lost"
-    )
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(lines) == 1, "the first fault is still logged, and nothing is lost"
+    assert "one last attempt" in lines[0] and "retrying in" not in lines[0]
 
 
 @pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
