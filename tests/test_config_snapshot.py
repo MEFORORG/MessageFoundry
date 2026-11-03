@@ -23,6 +23,7 @@ import importlib.machinery
 import importlib.util
 import marshal
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -49,7 +50,13 @@ from messagefoundry.config.snapshot import (
     is_missing_directory,
     read_config_snapshot,
 )
-from messagefoundry.config.wiring import WiringError, load_config, load_snapshot, validate_config
+from messagefoundry.config.wiring import (
+    WiringError,
+    load_config,
+    load_snapshot,
+    read_trusted_snapshot,
+    validate_config,
+)
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.engine import ConfigDirUnreadable, Engine
@@ -61,6 +68,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxWorkerRefused,
     graph_shape,
 )
+from tests._share_fault import _share_fault
 
 RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||900001||DOE^JANE\r"
 
@@ -590,17 +598,6 @@ def test_serve_s_value_reader_parses_the_snapshot_or_answers_none(
 # --- vault BACKLOG #3535: a share Windows cannot reach is a fault, not a missing path ------------
 
 
-def _share_fault(winerror: int = 53) -> OSError:
-    """The error Windows raises for a share it cannot reach, which Python on Windows maps to a
-    ``FileNotFoundError``. POSIX ignores the code and builds a plain ``OSError``, which would
-    pass on the old code, so there the same error is built by hand."""
-    fault = OSError(None, "share unreachable", None, winerror)
-    if not isinstance(fault, FileNotFoundError):
-        fault = FileNotFoundError(2, "share unreachable")
-        fault.winerror = winerror  # type: ignore[attr-defined]
-    return fault
-
-
 def _lost_share(
     monkeypatch: pytest.MonkeyPatch,
     path: Path,
@@ -777,19 +774,76 @@ def test_a_load_goes_on_past_a_value_folder_on_a_lost_share_and_the_digest_says_
 def test_a_load_refuses_a_base_directory_on_a_lost_share_rather_than_run_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The base still answers ``is_dir`` here, so only the read can refuse. It read as an empty
-    bundle before, and with ``allow_empty`` that returned an empty graph."""
+    """The first check lists it, and it still answers ``is_dir``, so only the read can refuse. It
+    read as an empty bundle before, and with ``allow_empty`` that returned an empty graph."""
     cfg = _config(tmp_path / "cfg")
-    _lost_share(monkeypatch, cfg, answers_is_dir=True)
+    _lost_share(monkeypatch, cfg, answers_is_dir=True, after=1)
     with pytest.raises(WiringError, match=r"could not read \."):
         load_config(cfg, allow_empty=True)
 
 
-def test_a_lax_load_of_a_base_that_stops_answering_is_dir_still_answers_as_missing(
+def test_a_directory_that_lists_but_is_not_a_directory_to_is_dir_runs_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``Path.is_dir`` answers ``False`` for a lost share, so ``read_trusted_snapshot`` still calls
-    the base missing, as it always has: it refuses, under a reason that does not name the share."""
+    """The trust check vets nothing where ``is_dir`` says no, so such a directory must not reach
+    the load that runs its modules. ``_lost_share`` with every listing allowed is that case."""
+    cfg = _config(tmp_path / "cfg")
+    ran = tmp_path / "ran.txt"
+    (cfg / "graph.py").write_text(f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8")
+    _lost_share(monkeypatch, cfg, after=sys.maxsize)
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(cfg, allow_empty=True)
+    with pytest.raises(OSError) as refused:
+        read_trusted_snapshot(cfg, strict=True)
+    assert not isinstance(refused.value, ConfigDirMissing)
+    assert "could not read ." in validate_config(cfg, allow_empty=True)[0].message
+    assert not ran.exists()
+
+
+def test_validate_config_reports_a_trust_check_that_cannot_list_a_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It returns every problem and raises none, and the check's walk raises what it cannot list."""
+    cfg = _config(tmp_path / "cfg")
+
+    def unlistable(directory: Path) -> list[Path]:
+        raise PermissionError(13, "Permission denied", str(directory))
+
+    monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
+    [diagnostic] = validate_config(cfg, allow_empty=True)
+    assert "Permission denied" in diagnostic.message
+
+
+def test_a_trust_check_that_cannot_list_a_folder_refuses_a_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw error here is no reload refusal, so a reload would answer 500 as a fault. A strict read
+    raises it, which its caller reports as a digest it could not take."""
+    cfg = _config(tmp_path / "cfg")
+
+    def unlistable(directory: Path) -> list[Path]:
+        raise PermissionError(13, "Permission denied", str(directory))
+
+    monkeypatch.setattr(wiring, "config_source_trust_paths", unlistable)
+    with pytest.raises(WiringError, match="could not vet it"):
+        load_config(cfg, allow_empty=True)
+    with pytest.raises(PermissionError):
+        read_trusted_snapshot(cfg, strict=True)
+
+
+def test_a_name_listing_refuses_outright_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger=wiring.__name__), pytest.raises(ConfigDirMissing):
+        load_config(tmp_path / "embedded\0nul", allow_empty=True)
+    assert "cannot be opened" in caplog.text
+
+
+def test_a_lax_load_of_a_base_lost_after_its_check_keeps_the_fault_the_read_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.is_dir`` answers ``False`` for a lost share, so judging the base by it threw away the
+    ``.`` the read had just recorded and called the share a missing directory."""
     cfg = _config(tmp_path / "cfg")
 
     def losing(directory: Path, *, strict: bool) -> ConfigSnapshot:
@@ -797,8 +851,95 @@ def test_a_lax_load_of_a_base_that_stops_answering_is_dir_still_answers_as_missi
         return read_config_snapshot(directory, strict=strict)
 
     monkeypatch.setattr(wiring, "read_config_snapshot", losing)
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(cfg, allow_empty=True)
+
+
+def test_a_lax_load_of_a_base_lost_after_an_empty_read_is_not_a_missing_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read recorded nothing here, so only the check after it can tell this from a directory
+    moved away."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+
+    def losing(directory: Path, *, strict: bool) -> ConfigSnapshot:
+        snapshot = read_config_snapshot(directory, strict=strict)
+        _lost_share(monkeypatch, cfg)
+        return snapshot
+
+    monkeypatch.setattr(wiring, "read_config_snapshot", losing)
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(cfg, allow_empty=True)
+
+
+def test_a_base_gone_behind_a_value_folder_fault_still_answers_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder no load reads refuses no load, so the empty read still gets its check of the base."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+
+    def vanishing(directory: Path, *, strict: bool) -> ConfigSnapshot:
+        cfg.rmdir()
+        return ConfigSnapshot(directory=directory, files={}, unreadable=("environments",))
+
+    monkeypatch.setattr(wiring, "read_config_snapshot", vanishing)
     with pytest.raises(ConfigDirMissing):
         load_config(cfg, allow_empty=True)
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+def test_a_base_on_a_lost_share_at_the_first_check_is_a_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """The check before the trust check: a load refuses it, a strict read raises the fault, and a
+    report names a read that failed. None of them calls it a missing directory."""
+    cfg = _config(tmp_path / "cfg")
+    _lost_share(monkeypatch, cfg, winerror=winerror)
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(cfg, allow_empty=True)
+    with pytest.raises(OSError) as refused:
+        read_trusted_snapshot(cfg, strict=True)
+    assert not isinstance(refused.value, ConfigDirMissing)
+    [diagnostic] = validate_config(cfg, allow_empty=True)
+    assert "could not read ." in diagnostic.message and "not found" not in diagnostic.message
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a UNC path means nothing on POSIX")
+def test_a_share_windows_really_cannot_reach_is_a_fault() -> None:
+    """The same answers from the operating system itself, with no double. Skipped where this
+    host's redirector does not answer the two errors, since the path then proves nothing."""
+    share = Path(r"\\127.0.0.1\nosuchshare\cfg")
+    with pytest.raises(OSError) as listing:
+        os.scandir(share)
+    if getattr(listing.value, "winerror", None) not in (53, 67):
+        pytest.skip(f"this host answers {listing.value!r}")
+    with pytest.raises(WiringError, match=r"could not read \."):
+        load_config(share, allow_empty=True)
+    with pytest.raises(OSError) as refused:
+        read_trusted_snapshot(share, strict=True)
+    assert not isinstance(refused.value, ConfigDirMissing)
+    assert "could not read ." in validate_config(share, allow_empty=True)[0].message
+
+
+@pytest.mark.parametrize(
+    "name", ["gone", "a-file", "embedded\0nul"], ids=["absent", "a-file", "embedded-nul"]
+)
+def test_a_directory_really_missing_still_answers_as_missing(tmp_path: Path, name: str) -> None:
+    """The listing that replaced ``Path.is_dir`` keeps its answer for these, a name ``os.scandir``
+    refuses with ``ValueError`` included. A reserved Windows device name such as ``NUL`` is not one
+    of them: its listing raises an error ``is_missing_directory`` does not class as missing."""
+    (tmp_path / "a-file").write_text("", encoding="utf-8")
+    target = tmp_path / name
+    message = re.escape(f"config directory not found: {target}")
+    with pytest.raises(ConfigDirMissing, match=message):
+        load_config(target, allow_empty=True)
+    with pytest.raises(ConfigDirMissing, match=message):
+        read_trusted_snapshot(target, strict=True)
+    assert [(d.message, d.file) for d in validate_config(target, allow_empty=True)] == [
+        (f"config directory not found: {target}", str(target))
+    ]
 
 
 def test_the_code_digest_of_a_base_directory_on_a_lost_share_is_none(
@@ -824,7 +965,7 @@ def test_the_engine_refuses_a_reload_target_on_a_lost_share_as_unreadable(
         Engine._existing_reload_target_blocking(engine, cfg)
 
 
-@pytest.mark.parametrize("folder", ["codesets", "environments"])
+@pytest.mark.parametrize("folder", [".", "codesets", "environments"])
 def test_the_engine_takes_no_gating_digest_of_a_bundle_on_a_lost_share(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str
 ) -> None:
