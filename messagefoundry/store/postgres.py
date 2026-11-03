@@ -829,10 +829,10 @@ _SCHEMA: list[str] = [
         created_at  DOUBLE PRECISION NOT NULL
     )""",
     # The store's global session epoch (BACKLOG #5091) -- see the SQLite `_SCHEMA`, and
-    # GLOBAL_SESSION_EPOCH_SQL in store.py for what it decides. One row, seeded here, so a database
-    # this batch built has it. Unlike SQLite, a deleted row is not seeded again at the next open: an
-    # open skips this batch while the schema_meta marker matches _schema_hash() (ADR 0064), so every
-    # user read refuses until `DELETE FROM schema_meta` forces a full run. Non-secret: a counter.
+    # GLOBAL_SESSION_EPOCH_SQL in store.py for what it decides. One row, seeded at 0 whenever this
+    # batch runs, which an ordinary open skips while the schema_meta marker matches (ADR 0064).
+    # docs/SECURITY.md, *Limits of the session sweep*, says what runs it and what a deleted row
+    # costs until then. Non-secret: a counter.
     """CREATE TABLE IF NOT EXISTS global_session_epoch (
         id    INTEGER PRIMARY KEY CHECK (id = 1),
         epoch INTEGER NOT NULL DEFAULT 0

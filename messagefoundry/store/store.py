@@ -2556,8 +2556,9 @@ def global_epoch_or_refuse(value: Any) -> int:
     Its callers: every user read, through :meth:`UserRecord.from_mapping`; SQLite
     ``create_session``'s account read; each store's ``_global_session_epoch``; and the raise in the
     Postgres and SQL Server ``revoke_all_sessions``, which reads the raised value back. SQLite's
-    ``revoke_all_sessions`` does not call it: its raise reads nothing back, so it checks the
-    ``UPDATE``'s ``rowcount`` itself and raises the same error."""
+    ``revoke_all_sessions`` reads nothing back from its raise, so the raise checks the ``UPDATE``'s
+    ``rowcount`` itself and raises the same error; its re-seal of the kept row then reads the
+    epoch through ``_global_session_epoch``, which calls this."""
     if value is None:
         raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
     return int(value)
@@ -8559,7 +8560,8 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
 
 -- BACKLOG #5091: the store's global session epoch, one row, raised by every every-account session
 -- revoke. A session resolves only while its global_epoch equals it; GLOBAL_SESSION_EPOCH_SQL in
--- store.py says why. Seeded here, so every open finds the row. Non-secret: a counter.
+-- store.py says why. Seeded here, at every writable open; a read-only open runs none of this, and
+-- docs/SECURITY.md, *Limits of the session sweep*, says what a deleted row costs. Non-secret: a counter.
 CREATE TABLE IF NOT EXISTS global_session_epoch (
     id    INTEGER PRIMARY KEY CHECK (id = 1),
     epoch INTEGER NOT NULL DEFAULT 0
