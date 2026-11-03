@@ -606,7 +606,9 @@ def test_a_repair_marker_without_a_standing_hold_is_not_a_repair(
         capsys,
         # No hold at all: the marker alone is not a Lander event.
         _pr(160, comments=[_repair()]),
-        # A marker older than the latest hold: the newer hold re-opens the author's turn.
+        # A marker older than the latest hold makes no REPAIR turn. Nor does the hold park the PR
+        # on its author: the hold the marker transferred may have fallen off the fetched page, so
+        # it reads LANDER repair-rehold, the safe direction.
         _pr(
             161,
             comments=[_repair("2026-10-28T11:00:00Z"), _hold("2026-10-28T12:00:00Z", _sha(161))],
@@ -622,7 +624,7 @@ def test_a_repair_marker_without_a_standing_hold_is_not_a_repair(
     more = _engine_rows(tmp_path, capsys, _held(165, bot))
     assert _repair_row(more[165]) == ("AUTHOR", ["held"], None)
     assert _repair_row(rows[160]) == ("LANDER", ["no-hold"], None)
-    assert _repair_row(rows[161]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[161]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
     assert _repair_row(rows[162]) == ("LANDER", ["no-hold"], None)
     assert _repair_row(rows[163]) == ("LANDER", ["no-hold"], None)
 
@@ -703,6 +705,52 @@ def test_a_rehold_on_a_transferred_pr_with_no_fresh_marker_is_the_landers(
     _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
     line = next(x for x in out.splitlines() if x.startswith("LANDER"))
     assert line.split()[:2] == ["LANDER", f"held,repair-rehold={OWNER_ID}"]
+
+
+def test_a_hold_after_any_marker_is_the_landers_whatever_came_before(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Any qualifying marker before the hold, and none after, reads LANDER ``repair-rehold``,
+    whether or not the hold it transferred was fetched or recognised."""
+    rehold = "2026-10-28T15:00:00Z"
+    dismissed = _review(_marker_body(_sha(1)), "2026-10-28T12:00:00Z", state="DISMISSED")
+    # More than COMMENT_PAGE comments after the marker push the earlier hold off the page; here
+    # the page simply starts at the marker.
+    truncated = _pr(190, comments=[_repair(), _hold(rehold, _sha(190))])
+    legacy = _pr(
+        191,
+        comments=[
+            _comment(SESSION + "**Held.**", "2026-10-28T12:00:00Z"),
+            _repair(),
+            _hold(rehold, _sha(191)),
+        ],
+    )
+    # The marker shares the earlier hold's second, so it is not provably after that hold.
+    same_second = _pr(
+        192,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T12:00:00Z"),
+            _hold(rehold, _sha(192)),
+        ],
+    )
+    dismissed_hold = _pr(193, comments=[_repair(), _hold(rehold, _sha(193))], reviews=[dismissed])
+    # Controls: an outside account's marker was never a transfer, and a fresh marker after the
+    # hold is a REPAIR turn.
+    outsider = _pr(194, comments=[_repair(), _hold(rehold, _sha(194))])
+    outsider["comments"]["nodes"][0]["authorAssociation"] = "CONTRIBUTOR"
+    fresh = _pr(
+        195, comments=[_repair(), _hold(rehold, _sha(195)), _repair("2026-10-28T15:00:01Z")]
+    )
+    never = _pr(196, comments=[_hold(rehold, _sha(196))])
+    rows = _engine_rows(
+        tmp_path, capsys, truncated, legacy, same_second, dismissed_hold, outsider, fresh, never
+    )
+    for n in (190, 191, 192, 193):
+        assert _repair_row(rows[n]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID), n
+    assert _repair_row(rows[194]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[195]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[196]) == ("AUTHOR", ["held"], None)
 
 
 def test_the_repair_marker_shape_is_exact() -> None:

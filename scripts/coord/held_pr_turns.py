@@ -100,10 +100,8 @@ AUTHOR's turn only when ALL of these hold: the newest Lander event is a marker h
 tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts with the marker's SHA,
 ignoring case; no non-Lander event other than an ack (THE ACK CONTRACT) is at or after the hold's
 second (a tie is a reply, but a tied ack is not); and no comment or review, Lander or not and
-the hold itself included, was edited at or after the hold's second. Otherwise LANDER's. When all of
-these hold and a repair-owner marker also qualifies, the turn is REPAIR's instead, and when they
-hold on a PR transferred before this hold with no marker after it, the turn is LANDER's,
-``repair-rehold`` (THE REPAIR CONTRACT).
+the hold itself included, was edited at or after the hold's second. Otherwise LANDER's. THE REPAIR
+CONTRACT says when a PR that meets these reads REPAIR's, or LANDER's ``repair-rehold``, instead.
 
 THE REPAIR CONTRACT. When a held author does not answer, the Lander may hand the repair to a Repair
 Manager session by posting, as an issue comment, ONLY this shape::
@@ -128,7 +126,7 @@ marker's session as ``repairOwner``, ONLY when ALL of these hold:
   sort out. An ack before the marker is history the transfer overrode, and is kept as ``acked``.
 
 Otherwise the PR is classified exactly as it was before this contract, with every marker an ordinary
-event, except that a re-hold with no fresh marker reads LANDER rather than AUTHOR (below). Under that
+event, except that a hold with a marker before it reads LANDER rather than AUTHOR (below). Under that
 reading a marker body starts with ``<!--``, not the signature, so it is not a Lander event, and one
 after the hold is a reply: the PR reads LANDER ``replied``, even when the marker is the only thing
 after the hold, so ``replied`` beside a marker can be the Lander's own transfer comment. So at least
@@ -141,17 +139,16 @@ newer non-hold Lander comment (``no-hold``).
 
 A MARKER OLDER THAN THE LATEST HOLD DOES NOT MAKE A REPAIR TURN. Each hold re-opens the turn, so a
 transfer that should outlive a new hold needs a new marker posted after it, in a later second, since
-one comment cannot be both; that new marker makes the PR REPAIR's, naming its session. A RE-HOLD ON
-A TRANSFERRED PR WITH NO FRESH MARKER IS THE LANDER'S: when the hold would otherwise stand, and a
-marker earlier than the hold's second was posted strictly after an earlier hold's second, the PR
-reads LANDER, flagged ``held`` and ``repair-rehold`` (and ``acked`` when an ack stands). The
-original author was told to stand down, so parking the PR on them is the unsafe direction, and the
-Lander's move is to post a fresh marker. ``repairOwner`` names the session of the newest such
-earlier marker, or is ``null`` when two sessions were named in that marker's second. That earlier
-hold and marker are read under the association and dismissed gates, and the marker only from a
-comment, but a minimized one still counts: hiding a superseded hold or marker must not bring back
-the author's turn. A marker older than every hold the fetched page holds was never a transfer, so a
-hold after it reads on its own: AUTHOR if it stands.
+one comment cannot be both; that new marker makes the PR REPAIR's, naming its session. A HOLD WITH
+ANY MARKER BEFORE IT AND NONE AFTER IT IS THE LANDER'S: when the hold would otherwise read AUTHOR,
+and any marker was posted before the hold's second, the PR reads LANDER, flagged ``held`` and
+``repair-rehold`` (and ``acked`` when an ack stands). No earlier hold is needed, and none is read:
+one may have fallen out of the fetched page, been a prose hold, been dismissed, or shared the
+marker's second. A marker means some author was told to stand down, so parking the PR on an author
+is the unsafe direction, and the Lander's move is to post a fresh marker. ``repairOwner`` names the
+session of the newest such marker, or is ``null`` when two sessions were named in that marker's
+second. These markers are read under the association and dismissed gates, and only from a comment,
+but a minimized one still counts: hiding a superseded marker must not bring back the author's turn.
 
 A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
@@ -198,15 +195,16 @@ named; the JSON carries the id as ``repairOwner``, ``null`` on any row with neit
 FLAGS. ``held`` (a hold stands: AUTHOR's turn, or REPAIR's beside ``repair``, unless the PR is
 queued or armed, or LANDER's beside ``repair-rehold``); ``repair`` (beside ``held``: a repair-owner
 marker after the hold made it REPAIR's turn, so ``held`` alone never means the author owns a
-``repair`` row); ``repair-rehold`` (beside ``held``: a re-hold on a transferred PR with no fresh
-marker after it, so the Lander's move is to post one; THE REPAIR CONTRACT); ``no-hold`` (no
+``repair`` row); ``repair-rehold`` (beside ``held``: a hold with a marker before it and none after
+it, so the Lander's move is to post one; THE REPAIR CONTRACT); ``no-hold`` (no
 Lander event, or the newest is not a marker hold); ``new-commit`` (the head does not start with the
 marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
 head); ``edited`` (a comment or review, of any author, the hold included,
-edited at or after the hold); ``acked`` (beside ``held``: an author's ack kept the turn the
-author's, or, beside ``repair``, an ack came before the transfer); ``no-new-commit`` (replied or
-edited, but the head still matches the marker: the Lander
-must read the reply or edit, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
+edited at or after the hold); ``acked`` (beside ``held``: an author's ack naming the head stands
+after the hold; alone, it kept the turn the author's; beside ``repair``, it came before the
+transfer; beside ``repair-rehold``, it did not keep the turn, which is still the Lander's);
+``no-new-commit`` (replied or edited, but the head still matches the marker: the Lander must read
+the reply or edit, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
 already in the merge queue or has auto-merge armed).
 
 Stdlib only.
@@ -409,24 +407,17 @@ class Event:
     #: which this script does not read, may hold the reply.
     review: bool = False
     #: A trusted association, minimized or not; ``None`` reads as ``trusted``. Only an earlier
-    #: transfer is read through it (``past_hold``, ``past_repair_by``): hiding a superseded hold or
-    #: marker must not bring back the author's turn.
+    #: transfer is read through it (``past_repair_by``): hiding a superseded marker must not bring
+    #: back the author's turn.
     associated: bool | None = None
-
-    @property
-    def _standing(self) -> bool:
-        associated = self.trusted if self.associated is None else self.associated
-        return associated and not self.dismissed
-
-    @property
-    def past_hold(self) -> bool:
-        """A hold, minimized or not, for judging whether a transfer came before a re-hold."""
-        return self._standing and self._marker is not None
 
     @property
     def past_repair_by(self) -> str | None:
         """``repair_by``, minimized or not, for judging whether a re-hold follows a transfer."""
-        return repair_owner(self.body) if self._standing and not self.review else None
+        associated = self.trusted if self.associated is None else self.associated
+        if not associated or self.dismissed or self.review:
+            return None
+        return repair_owner(self.body)
 
     @property
     def latest(self) -> datetime:
@@ -515,16 +506,13 @@ def _events(pr: dict[str, Any]) -> list[Event]:
 
 
 def _earlier_transfer(turn_events: list[Event], hold: datetime) -> tuple[str | None] | None:
-    """``(owner,)`` when a repair-owner marker before ``hold``'s second followed an earlier hold.
+    """``(owner,)`` when any repair-owner marker came before ``hold``'s second, else ``None``.
 
-    ``None`` when there was no such transfer. The owner is the session the newest such marker
-    names, or ``None`` when two sessions were named in that second and so neither can be ordered.
+    No earlier hold is required: one may have fallen off the fetched page, been a prose hold, or
+    been dismissed. The owner is the session the newest such marker names, or ``None`` when two
+    sessions were named in that second and so neither can be ordered.
     """
-    holds = [e.when for e in turn_events if e.past_hold and e.when < hold]
-    if not holds:
-        return None
-    first = min(holds)
-    markers = [e for e in turn_events if e.past_repair_by is not None and first < e.when < hold]
+    markers = [e for e in turn_events if e.past_repair_by is not None and e.when < hold]
     if not markers:
         return None
     newest = max(e.when for e in markers)
@@ -575,8 +563,8 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
             flags = ["held", "acked"] if acks else ["held"]
             transferred = _earlier_transfer(turn_events, when)
             if transferred is not None:
-                # A re-hold on a transferred PR with no fresh marker: the author was told to stand
-                # down, so parking it on them is the unsafe direction. The Lander re-posts a marker.
+                # A marker before this hold and none after it: an author was told to stand down,
+                # so parking it on them is the unsafe direction. The Lander re-posts a marker.
                 return LANDER, [*flags, "repair-rehold"], transferred[0]
             return AUTHOR, flags, None
     flags = ["new-commit"] if new_commit else []
