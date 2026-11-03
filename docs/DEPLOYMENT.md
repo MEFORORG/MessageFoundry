@@ -459,6 +459,47 @@ MEFOR designs for the VIP and exposes the health-check/role endpoints, but **doe
 balancer** — you stand it up (keepalived, HAProxy, F5, a cloud NLB, …). Single-node deployments need
 none of this.
 
+### Per-address listener caps behind the VIP
+
+An L4 load balancer or a source-NAT hop can make every client reach a listener from one source
+address. A cap keyed on the peer address then applies to all clients together. That is why
+`Http()` ships `max_connections_per_host` **off** (vault BACKLOG #2606): a cap of 32 there would
+become the whole listener's capacity for authenticated, established requests.
+
+`Http()` ships `max_handshakes_per_host` **on, at 32** (vault BACKLOG #4888). It counts only the
+sockets one address holds a connection slot with while still in their TLS handshake, before any
+peer has authenticated. A socket leaves the count when its handshake ends, so the cap never limits
+established requests. It applies only on a `tls = true` listener where the engine upgrades the
+socket itself, which is the stdlib event loop, the loop the Windows service runs on. On uvloop a
+socket takes no slot until its handshake is done, so there is nothing to bound.
+
+Without it, one address that opens sockets and never finishes a handshake could hold every
+`max_connections` slot (256) for up to the 10 s handshake bound each. An mTLS peer with no client
+certificate is one such peer.
+
+**The counter-case, behind a balancer that collapses addresses.** There the 32 bound every client's
+handshakes together. A client behind the balancer that stalls 32 handshakes would refuse every
+other client's new connection for as long as it keeps them stalled. The budget does not make that
+lockout meaningfully cheaper, though: without it, the same client would refuse everyone by stalling
+256 sockets instead, which costs it no more. A real client finishes its handshake in one or two
+round trips, so 32 in flight at once from the balancer's address means a very high connection rate.
+If you measure your listener's concurrent handshakes nearing 32, raise the cap. Set it to `None` or
+`0` to turn it off.
+
+**`source_ip_allowlist` is a further mitigation, not a replacement.** It refuses an unlisted peer
+before any TLS byte. A listed peer with no client certificate passes it and is bounded only by this
+budget. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
+it cannot tell clients apart either.
+
+Two other shapes were weighed and not built:
+
+- Turning `max_connections_per_host` on for TLS listeners. TLS listeners are the off-loopback ones,
+  which is where a balancer sits, so this would bring back #2606's counter-case for established
+  traffic.
+- A listener-wide total of sockets in their handshake. Every new connection needs a handshake, so a
+  stalling peer that fills such a total would refuse every newcomer, exactly as a full
+  `max_connections` does. It would add no protection.
+
 **Cloud / Kubernetes HA** (runs the Linux image, so
 [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)): for a multi-replica, Postgres-backed HA deployment on k8s — the copyable
 `replicas: 3` manifest, the L4-NLB-per-MLLP-port recipe (primary-only health check, no L7/HPA for MLLP),

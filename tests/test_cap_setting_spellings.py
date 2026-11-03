@@ -435,6 +435,9 @@ _INT_CAPS = [
     pytest.param(
         _HTTP_IN, "max_connections_per_host", "max_connections_per_host", id="http-in-per_host"
     ),
+    pytest.param(
+        _HTTP_IN, "max_handshakes_per_host", "max_handshakes_per_host", id="http-in-handshakes"
+    ),
     pytest.param(_HTTP_IN, "max_body_bytes", "max_body_bytes", id="http-in-max_body_bytes"),
     pytest.param(_HTTP_IN, "max_header_bytes", "max_header_bytes", id="http-in-max_header_bytes"),
     pytest.param(_file, "max_file_bytes", "max_file_bytes", id="file-max_file_bytes"),

@@ -8,8 +8,9 @@ frame deadline and a refuse-while-stopping check, and every listener wrote one W
 refusal (vault BACKLOG #2606). This module holds those controls once.
 
 * :class:`ListenerAdmission` makes the pre-read decision, in order: refuse while stopping, the source
-  allowlist, the global connection cap and the per-host cap. It owns the live-connection counts and
-  the throttled refusal log. Each listener keeps its own read loop; only the admission is shared.
+  allowlist, the global connection cap, the per-host cap and, for a socket admitted before its TLS
+  handshake, the per-host handshake budget (vault BACKLOG #4888). It owns the live-connection counts
+  and the throttled refusal log. Each listener keeps its own read loop; only the admission is shared.
 * :class:`RefusalLog` is the per-address, windowed log throttle the DICOM server introduced, moved here
   so the four socket listeners and the DICOM server share one.
 * :class:`FrameClock` is the frame deadline: the bound on one frame from its first byte to its last.
@@ -171,6 +172,7 @@ _STOPPING = Refusal(kind=None)
 _NOT_ALLOWLISTED = Refusal(kind="peer_not_allowlisted")
 _AT_CAPACITY = Refusal(kind="at_capacity")
 _AT_HOST_CAPACITY = Refusal(kind="at_capacity", reason="max_connections_per_host")
+_AT_HANDSHAKE_CAPACITY = Refusal(kind="at_capacity", reason="max_handshakes_per_host")
 
 
 class ListenerAdmission:
@@ -184,6 +186,12 @@ class ListenerAdmission:
     from one peer address, so one address cannot take the whole listener. It keys on the source IP,
     so behind a source-NAT proxy every partner is one peer and the per-host cap becomes the whole
     capacity; switch it off there.
+
+    ``max_handshakes_per_host`` counts only sockets from one peer address that hold a slot while
+    still in their TLS handshake, the phase in which no peer has authenticated yet. A socket leaves
+    that count when its handshake ends, however it ends (:meth:`end_handshake`), so it bounds the
+    unauthenticated holding without capping an address's established connections (vault BACKLOG
+    #4888). Only a listener that admits a socket before upgrading it passes ``handshake``.
     """
 
     def __init__(
@@ -194,6 +202,7 @@ class ListenerAdmission:
         max_connections: int | None,
         max_connections_per_host: int | None,
         source_ip_allowlist: list[str] | None,
+        max_handshakes_per_host: int | None = None,
     ) -> None:
         self.transport = transport
         #: The inbound connection's name, for :func:`notify_refusal`. Required, so a new listener
@@ -202,6 +211,7 @@ class ListenerAdmission:
         self.max_connections = max_connections
         self.max_connections_per_host = max_connections_per_host
         self.source_ip_allowlist = source_ip_allowlist
+        self.max_handshakes_per_host = max_handshakes_per_host
         #: Set from the start of the listener's stop() until its next start().
         self.stopping = False
         self.active = 0
@@ -212,25 +222,34 @@ class ListenerAdmission:
         self.per_host: dict[str, int] = {}
         #: Hosts already warned about their per-host cap this episode, cleared with the count above.
         self.host_capacity_warned: set[str] = set()
+        #: Admitted sockets per peer address still in their TLS handshake, kept and dropped at zero
+        #: like :attr:`per_host`, so it inherits that table's bound, with a warned set of its own.
+        self.handshaking: dict[str, int] = {}
+        self.handshake_capacity_warned: set[str] = set()
         self.refusal_log = RefusalLog()
         #: Which run of the listener the per-host tables describe. :meth:`admit` hands it to the
         #: connection and :meth:`reset` advances it, so a release from an earlier run can be told
         #: from one the tables still count (vault BACKLOG #2939).
         self._epoch = 0
 
-    def check(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
+    def check(
+        self, writer: asyncio.StreamWriter, peer_host: str | None, *, handshake: bool = False
+    ) -> Refusal | None:
         """Decide whether to admit this connection. Logs a refusal, throttled; emits no event.
 
-        Every refusal but the stopping one is passed to :func:`notify_refusal`."""
+        ``handshake`` says the socket will hold its slot through a TLS handshake, so the handshake
+        budget applies to it. Every refusal but the stopping one is passed to :func:`notify_refusal`."""
         if self.stopping:
             logger.debug("%s connection refused: the listener is stopping", self.transport)
             return _STOPPING
-        refusal = self._refusal(writer, peer_host)
+        refusal = self._refusal(writer, peer_host, handshake)
         if refusal is not None:
             notify_refusal(self.name)
         return refusal
 
-    def _refusal(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
+    def _refusal(
+        self, writer: asyncio.StreamWriter, peer_host: str | None, handshake: bool
+    ) -> Refusal | None:
         if self.source_ip_allowlist is not None:
             peer = writer.get_extra_info("peername")
             if not peer_ip_allowed(peer, self.source_ip_allowlist):
@@ -244,16 +263,37 @@ class ListenerAdmission:
             assert peer_host is not None  # _at_host_capacity is False without an address
             self._log_host_capacity_once(peer_host)
             return _AT_HOST_CAPACITY
+        if handshake and self._at_handshake_capacity(peer_host):
+            assert peer_host is not None  # as above
+            self._log_handshake_capacity_once(peer_host)
+            return _AT_HANDSHAKE_CAPACITY
         return None
 
-    def admit(self, peer_host: str | None) -> int:
+    def admit(self, peer_host: str | None, *, handshake: bool = False) -> int:
         """Take one connection slot, globally and (when the peer has an address) for that host.
+        With ``handshake``, the socket also counts against its host's handshake budget until
+        :meth:`end_handshake`.
 
-        Returns the epoch to hand back to :meth:`release`."""
+        Returns the epoch to hand back to :meth:`release` and :meth:`end_handshake`."""
         self.active += 1
         if peer_host is not None:
             self.per_host[peer_host] = self.per_host.get(peer_host, 0) + 1
+            if handshake:
+                self.handshaking[peer_host] = self.handshaking.get(peer_host, 0) + 1
         return self._epoch
+
+    def end_handshake(self, peer_host: str | None, epoch: int) -> None:
+        """The TLS handshake of a socket admitted with ``handshake`` ended, however it ended. Call
+        it exactly once for such a socket, before its :meth:`release`. The connection slots stay
+        taken; only the handshake count drops. ``epoch`` follows :meth:`release`'s rule."""
+        if peer_host is None or epoch != self._epoch:
+            return
+        remaining = self.handshaking.get(peer_host, 0) - 1
+        if remaining > 0:
+            self.handshaking[peer_host] = remaining
+        else:
+            self.handshaking.pop(peer_host, None)
+            self.handshake_capacity_warned.discard(peer_host)
 
     def release(self, peer_host: str | None, epoch: int) -> None:
         """Give both slots back. One place for both counters, so they cannot drift: a per-host count
@@ -293,12 +333,19 @@ class ListenerAdmission:
         self._epoch += 1
         self.per_host.clear()
         self.host_capacity_warned.clear()
+        self.handshaking.clear()
+        self.handshake_capacity_warned.clear()
 
     def _at_host_capacity(self, peer_host: str | None) -> bool:
         # A cap that cannot name its subject must not refuse anybody.
         if self.max_connections_per_host is None or peer_host is None:
             return False
         return self.per_host.get(peer_host, 0) >= self.max_connections_per_host
+
+    def _at_handshake_capacity(self, peer_host: str | None) -> bool:
+        if self.max_handshakes_per_host is None or peer_host is None:
+            return False
+        return self.handshaking.get(peer_host, 0) >= self.max_handshakes_per_host
 
     def _log_not_allowlisted(self, peer_host: str | None) -> None:
         address = peer_host or "an unknown address"
@@ -332,6 +379,20 @@ class ListenerAdmission:
             self.transport,
             peer_host,
             self.max_connections_per_host,
+        )
+
+    def _log_handshake_capacity_once(self, peer_host: str) -> None:
+        """:meth:`_log_host_capacity_once` for the handshake budget, with its own warned set."""
+        if peer_host in self.handshake_capacity_warned:
+            return
+        self.handshake_capacity_warned.add(peer_host)
+        logger.warning(
+            "%s connections from %s refused: it holds max_handshakes_per_host (%d) sockets still "
+            "in their TLS handshake. Further refusals for this host are not logged until none of "
+            "its sockets is in a handshake.",
+            self.transport,
+            peer_host,
+            self.max_handshakes_per_host,
         )
 
 

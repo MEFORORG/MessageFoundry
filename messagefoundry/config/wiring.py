@@ -2930,6 +2930,8 @@ def Http(
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
     max_connections_per_host: int
     | None = None,  # cap clients from ONE peer address; OFF by default
+    max_handshakes_per_host: int
+    | None = 32,  # cap ONE peer address's sockets still in their TLS handshake (on by default)
     # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
     # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
     # request per connection, so a per-connection bucket would pace nothing at all.
@@ -3002,7 +3004,10 @@ def Http(
     ``max_connections_per_host`` caps concurrent sockets from one peer address and **ships off** here
     (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
     would become the listener's whole capacity. Set one only where the listener sees real client
-    addresses.
+    addresses. ``max_handshakes_per_host`` (32) **ships on**: it caps only the sockets one address
+    holds a connection slot with while still in their TLS handshake, which happens where the engine
+    runs on a stdlib event loop with ``tls=True`` (vault BACKLOG #4888). See ``docs/DEPLOYMENT.md``
+    for the L4 load-balancer case.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
     takes messages in; ``message_burst`` is how large a burst passes before the sustained rate applies
@@ -3082,6 +3087,7 @@ def Http(
         "max_body_bytes": max_body_bytes,
         "max_header_bytes": max_header_bytes,
         "max_connections_per_host": max_connections_per_host,
+        "max_handshakes_per_host": max_handshakes_per_host,
         "max_messages_per_second": max_messages_per_second,
         "message_burst": message_burst,
         "tls": tls,
