@@ -313,6 +313,10 @@ def is_doc_ref(value: str) -> bool:
 #: raw text (BACKLOG #5099).
 _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
+#: The whitespace before a payload's first segment, matched rather than stripped so the gate never
+#: copies a large payload.
+_LEADING_SPACE = re.compile(r"\s*")
+
 
 def may_hold_doc_ref(text: str) -> bool:
     """Whether a delivery payload may carry a live document handle the re-attach must resolve
@@ -321,20 +325,37 @@ def may_hold_doc_ref(text: str) -> bool:
     True when the marker is in the raw text. Also true for an HL7 payload whose MSH-1 or MSH-2
     names a character of the marker: there an engine handle written into ``OBX-5.5`` is escaped,
     so the raw text never holds the marker, and a substring test alone let the handle reach the
-    wire unresolved. A handle hidden by any other escape cannot be the engine's, which escapes
-    only the delimiters, so it is the sender's text and resolves nothing unless the gate opens for
-    another handle, where the re-attach parses and checks it. False otherwise."""
+    wire unresolved. ``Message.set`` escapes by the first MSH's delimiters, so for a payload led by
+    an FHS or BHS batch header the first MSH is checked as well as the header. A handle hidden by
+    any other escape cannot be the engine's, which escapes only the delimiters, so it is the
+    sender's text and resolves nothing unless the gate opens for another handle, where the
+    re-attach parses and checks it. False otherwise."""
     if DOC_REF_MARKER in text:
         return True
-    head = text.lstrip()[:16]
-    if not head.startswith("MSH") or len(head) < 4:
+    space = _LEADING_SPACE.match(text)
+    lead = space.end() if space else 0
+    head = text[lead : lead + 3]
+    if head == "MSH":
+        return _header_names_marker_char(text, lead)
+    if head not in ("FHS", "BHS"):
         return False
-    end = head.find(head[3], 4)
-    if end - 4 < 4:
-        # No complete MSH-2 of four characters: Message.set refuses such a payload, so no engine
-        # handle can be in it, escaped or not.
+    if _header_names_marker_char(text, lead):
+        return True
+    starts = [i for i in (text.find("\rMSH", lead), text.find("\nMSH", lead)) if i != -1]
+    return bool(starts) and _header_names_marker_char(text, min(starts) + 1)
+
+
+def _header_names_marker_char(text: str, start: int) -> bool:
+    """Whether the MSH, FHS or BHS segment at ``start`` names a character of the marker in its
+    field separator or its four encoding characters. A segment with no complete set of four is
+    False: ``Message.set`` refuses such a payload, so no engine handle can be in it."""
+    window = text[start + 3 : start + 16]
+    if not window:
         return False
-    return not _DOC_REF_MARKER_CHARS.isdisjoint(head[3:end])
+    end = window.find(window[0], 1)
+    if end - 1 < 4:
+        return False
+    return not _DOC_REF_MARKER_CHARS.isdisjoint(window[:end])
 
 
 def make_doc_ref(sha256: str, content_type: str) -> str:
@@ -639,7 +660,7 @@ async def reattach_documents_in_hl7(
     # at a 64 MiB document and stayed about 0.1 s at 15 MiB: the splice's escape pass over the whole
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
-    def _handles() -> tuple[Message, list[tuple[int, str]], int]:
+    def _handles() -> tuple[Message, list[tuple[int, str]], str]:
         refused: str | None = None
         try:
             message = Message.parse(text)
@@ -674,16 +695,16 @@ async def reattach_documents_in_hl7(
         # wrote, or a Handler copied, carries exactly this text wherever it sits.
         field_sep, comp_sep, rep_sep, esc, sub_sep = message._encoding_chars()
         marker = escape_leaf(DOC_REF_MARKER, (field_sep, comp_sep, rep_sep, sub_sep, esc))
-        return message, found, text.count(marker)
+        return message, found, marker
 
-    message, handles, markers = await asyncio.to_thread(_handles)
+    message, handles, marker = await asyncio.to_thread(_handles)
     for occ, sha256 in handles:
         if sha256 not in bound:
             raise UnreattachableDocumentError(
                 f"the document handle in OBX-5.5 occurrence {occ} names an attachment its message "
                 "does not hold"
             )
-    if bound and markers > len(handles):
+    if bound and text.count(marker) > len(handles):
         raise UnreattachableDocumentError(
             "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
         )
@@ -694,9 +715,11 @@ async def reattach_documents_in_hl7(
         return text
     for occ, sha256 in handles:
         verbatim = await reader(sha256)
-        if verbatim is None:
-            # The handle names a document the store no longer has (missing / GC'd). Fail loud rather
-            # than deliver the raw handle text into the partner's OBX-5.5 (silent corruption).
+        if not verbatim:
+            # The handle names a document the store no longer has (missing / GC'd), or a header
+            # whose chunks are gone, which a store read returns as "": the detach never stores an
+            # empty value. Fail loud rather than deliver the raw handle text, or an empty OBX-5.5,
+            # into the partner's message (silent corruption).
             raise DocRefError(
                 f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
                 "deliver an un-hydrated document handle"
@@ -713,4 +736,17 @@ async def reattach_documents_in_hl7(
                 "be set back"
             )
         await asyncio.to_thread(message.set, "OBX-5.5", verbatim, occurrence=occ)
-    return await asyncio.to_thread(message.encode)
+
+    def _encode() -> str:
+        spliced = message.encode()
+        # The count check above is cheap but can be offset: a handle the parser reads through a
+        # hex escape is a handle the raw text does not hold as the marker, so one copy elsewhere
+        # would pass it. Every handle has now been replaced by base64, which holds no ':' and no
+        # escape character, so any marker left is a copy the splice did not reach (BACKLOG #5099).
+        if marker in spliced:
+            raise UnreattachableDocumentError(
+                "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
+            )
+        return spliced
+
+    return await asyncio.to_thread(_encode)

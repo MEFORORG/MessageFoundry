@@ -282,20 +282,31 @@ async def test_a_handle_escaped_by_msh2_is_reattached_not_sent(store: MessageSto
 async def _deliver_holding(
     store: MessageStore, runner: RegistryRunner, payload: str, ref: str
 ) -> list:
-    """Queue ``payload`` as a message that holds ``ref``, as the ingress commit links a detached
-    document, deliver its one outbound row once, and return its outbound rows."""
-    mid = await store.enqueue_message(
-        channel_id="IB_STREAM", raw=payload, deliveries=[(DEST, payload)], now=100.0
-    )
-    await store._db.execute(
-        "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)", (mid, ref)
-    )
-    await store._db.commit()
-    await store.attachment_incref(ref)
-    item = await store.claim_next_fifo(DEST)
-    assert item is not None and item.message_id == mid
-    await runner._process_delivery_item(DEST, item)
+    """Queue ``payload`` as a message that holds ``ref``, linked by the ingress commit itself as the
+    detach links a document, route and transform it to ``DEST``, deliver that row once, and return
+    its outbound rows."""
+    mid = await store.enqueue_ingress(channel_id="IB_HOLDER", raw=payload, attachment_refs=[ref])
+    await _route_to_dest(store, mid, "IB_HOLDER", payload)
+    await _deliver_queued(store, runner, mid)
     return list(await store.outbox_for(mid))
+
+
+async def _route_to_dest(store: MessageStore, mid: str, channel: str, body: str) -> None:
+    """Drain ``mid``'s ingress row through the router and transform stages to one ``DEST`` row."""
+    ingress = await store.claim_next_fifo(channel, stage="ingress")
+    assert ingress is not None and ingress.message_id == mid
+    assert await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id=channel,
+        handlers=[("h", body)],
+        disposition=MessageStatus.ROUTED,
+    )
+    routed = await store.claim_next_fifo(channel, stage="routed")
+    assert routed is not None and routed.message_id == mid
+    await store.transform_handoff(
+        routed_id=routed.id, message_id=mid, channel_id=channel, deliveries=[(DEST, body)]
+    )
 
 
 def _with_copy_in_nte(skeleton: str, handle: str) -> str:
@@ -501,3 +512,65 @@ async def test_an_edit_and_resend_child_delivers_the_origins_document(
 
     assert outcome.status == "resent"
     assert [Message.parse(d).field("OBX-5.5") for d in col.deliveries] == [doc]
+
+
+# --- review findings on the gate, the copied-handle guard and an empty read --------------------
+
+
+def _batch(msh2: str, obx5_5: str) -> str:
+    """An FHS/BHS-led batch whose header keeps the default delimiters while its one MSH names
+    ``msh2``. ``Message.set`` escapes a value by the MSH's delimiters, not the batch header's."""
+    return (
+        "FHS|^~\\&|APP|FAC|RCV|RCVF|20260101120000\r"
+        "BHS|^~\\&|APP|FAC|RCV|RCVF|20260101120000\r" + _hl7(obx5_5, msh2=msh2)
+    )
+
+
+def test_the_gate_opens_when_a_batch_msh2_escapes_the_marker() -> None:
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    msg = Message.parse(_batch(":~\\&", _b64(10)))
+    msg.set("OBX-5.5", handle)
+    payload = msg.encode()
+    assert payload.startswith("FHS")
+    assert DOC_REF_MARKER not in payload  # the engine's own handle is escaped here
+    assert may_hold_doc_ref(payload)
+    assert not may_hold_doc_ref(_batch("^~\\&", _b64(10)))
+
+
+async def test_a_hex_escaped_handle_cannot_offset_a_copy_left_live(store: MessageStore) -> None:
+    """The copy guard compared marker counts, so a handle written with hex escapes, which the
+    parser reads as a handle but the raw text does not hold as the marker, let one literal copy
+    elsewhere pass and reach the wire after the splice."""
+    doc = _b64(1200)
+    ref = await store.put_attachment(chunk_b64(doc), "application/pdf")
+    handle = make_doc_ref(ref, "Application")
+    hexed = "\\X" + DOC_REF_MARKER[:1].encode("ascii").hex().upper() + "\\" + handle[1:]
+    payload = _hl7(hexed) + f"NTE|1||{handle}\r"
+    assert payload.count(DOC_REF_MARKER) == 1
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    rows = await _deliver_holding(store, runner, payload, ref)
+
+    assert all(DOC_REF_MARKER not in d for d in col.deliveries)
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(rows)
+
+
+async def test_a_held_document_whose_chunks_are_gone_is_never_sent_empty(
+    store: MessageStore,
+) -> None:
+    doc = _b64(1200)
+    ref = await store.put_attachment(chunk_b64(doc), "application/pdf")
+    await store._db.execute("DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,))
+    await store._db.commit()
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    rows = await _deliver_holding(store, runner, _hl7(make_doc_ref(ref, "Application")), ref)
+
+    assert col.deliveries == []  # never an empty OBX-5.5 on the wire
+    assert [str(r["status"]) for r in rows] != [OutboxStatus.DONE.value]
+    assert "document re-attach failed" in str(rows[0]["last_error"])
