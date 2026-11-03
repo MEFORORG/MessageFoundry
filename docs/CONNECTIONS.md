@@ -2287,9 +2287,10 @@ just runs whatever statement you declare, bound from the row.
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
 **unmarked** so it retries — never marked-and-dropped. A `poll_statement` that writes breaks that
-(see the `poll_statement` row above). **A handler failure also stops the poll at that row** (BACKLOG
-#4921): no later row of the same poll is handed off or marked, and the next poll starts again from
-what is still unmarked. That keeps a high-water-mark `mark_statement` from moving the cursor past
+(see the `poll_statement` row above). **With a `mark_statement`, a handler failure also stops the
+poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
+next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on, since
+every row is read again next poll anyway. That keeps a high-water-mark `mark_statement` from moving the cursor past
 a failed row, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
 column): a later row's mark would otherwise do so, and the poll would never select the failed row
 again. Without that order, a row with a higher key handed off earlier in the same poll has already
@@ -2302,7 +2303,8 @@ Its reason renders the error the way the log line does: a driver error as its ty
 native error number, without its message, and any other error as the scrubbed, bounded text of
 `safe_exc`, which is a bound rather than a guarantee that no value survives. Repair or remove that
 row to release the feed.
-**A row the source cannot decode is different:** it is skipped rather than stopped at (see
+**A row the source cannot decode is different,** and so is a body the configured `encoding` cannot
+carry, which never reaches the handler: it is skipped rather than stopped at (see
 [per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
 still moves the cursor past it, and its `row_undecodable` event is the record of it.
 A `poll_statement` the read-only test refuses never

@@ -53,6 +53,7 @@ from messagefoundry.transports.database import (
     generic_odbc_tls_unenforced,
 )
 from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
+from tests.test_poll_source_tick_ceilings import _CapturingSink
 
 INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
 
@@ -1112,14 +1113,6 @@ async def test_source_handler_failure_leaves_row_unmarked() -> None:
     assert cur.marks == []  # but the row is NOT marked → it re-emits next poll (at-least-once)
 
 
-class _EventSink:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str | None, str | None]] = []
-
-    async def __call__(self, kind: str, peer_host: str | None, reason: str | None) -> None:
-        self.events.append((kind, peer_host, reason))
-
-
 HWM_POLL = "SELECT id, payload FROM mf_inbox WHERE id > (SELECT last_id FROM mf_cursor) ORDER BY id"
 HWM_MARK = "UPDATE mf_cursor SET last_id=:id"
 
@@ -1178,7 +1171,7 @@ async def test_source_handler_failure_emits_a_handler_error_event() -> None:
         f"'MRN{_SYNTHETIC_ID}'. (2628) (SQLExecDirectW)"
     )
     src = _src(body_column="payload")
-    sink = _EventSink()
+    sink = _CapturingSink()
     src.on_connection_event = sink
     h = _RecordingHandler(exc=_driver_exc("22001", truncated))  # every row would fail
     await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B")], h)
@@ -1193,7 +1186,7 @@ async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
     """A row whose mark failed was still ingested, so the batch goes on and no event is emitted;
     only a handler failure stops the poll (BACKLOG #4921)."""
     src = _src(body_column="payload")
-    sink = _EventSink()
+    sink = _CapturingSink()
     src.on_connection_event = sink
     h = _RecordingHandler()
     cur = await _run_poll(
@@ -1202,6 +1195,42 @@ async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
     assert h.bodies == [b"A", b"B"]  # both rows handled despite the first mark erroring
     assert len(cur.marks) == 2  # both marks attempted (the error is logged, not fatal)
     assert sink.events == []
+
+
+async def test_source_handler_failure_without_a_mark_statement_does_not_stop_the_batch() -> None:
+    """With no ``mark_statement`` there is no cursor to protect and every row is read again next
+    poll anyway, so a handler failure does not hold back the rows behind it (BACKLOG #4921). The
+    failure is still reported.
+
+    Red mutation: stop the batch on every handler failure. Row 3 is then not handed off."""
+    src = _src(body_column="payload", mark_statement=None)
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler(RuntimeError("store write failed"), fail_on={b"B"})
+    await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B"), (3, "C")], h)
+    assert h.bodies == [b"A", b"B", b"C"]
+    assert [kind for kind, _peer, _reason in sink.events] == ["handler_error"]
+    assert (sink.events[0][2] or "").startswith("row left unmarked: ")
+
+
+async def test_source_row_it_cannot_encode_is_skipped_not_a_stall() -> None:
+    """A body the configured ``encoding`` cannot carry fails on every poll and never reaches the
+    handler, so it is skipped and reported like an undecodable row rather than stopping the batch
+    as a handler failure would (BACKLOG #4921). It is not marked.
+
+    Red mutation: encode inside the handler's ``try`` again. The row then stops the poll, row 2 is
+    neither handed off nor marked, and the event is ``handler_error``."""
+    src = _src(body_column="payload", encoding="ascii")
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler()
+    cur = await _run_poll(src, ["id", "payload"], [(1, "caf\xe9"), (2, "B")], h)
+    assert h.bodies == [b"B"]
+    assert [params for _sql, params in cur.marks] == [(2,)]
+    assert [kind for kind, _peer, _reason in sink.events] == ["row_undecodable"]
+    reason = sink.events[0][2] or ""
+    assert "UnicodeEncodeError" in reason
+    assert "caf" not in reason
 
 
 async def test_source_without_mark_statement_does_not_mark() -> None:
