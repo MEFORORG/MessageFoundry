@@ -135,8 +135,8 @@ def _pr(
                 }
             ]
         },
-        "comments": {"nodes": comments or []},
-        "reviews": {"nodes": reviews or []},
+        "comments": {"pageInfo": {"hasPreviousPage": False}, "nodes": comments or []},
+        "reviews": {"pageInfo": {"hasPreviousPage": False}, "nodes": reviews or []},
     }
 
 
@@ -591,8 +591,10 @@ def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
         _held(153, _repair(), _ack("2026-10-28T13:00:00Z", _sha(153))),
     )
     assert _repair_row(rows[140]) == ("LANDER", ["new-commit", "replied"], None)
-    for n in (141, 142, 143, 145, 147, 148, 149, 150, 151, 152, 153):
+    for n in (141, 142, 145, 147, 148, 149, 150, 151, 152, 153):
         assert _repair_row(rows[n]) == ("LANDER", ["replied", "no-new-commit"], None), n
+    # A minimized marker is a cancelled transfer: set aside, so the hold reads as it did before.
+    assert _repair_row(rows[143]) == ("AUTHOR", ["held"], None)
     # Signed on line one, it is a newer non-hold Lander comment, so no hold stands.
     assert _repair_row(rows[146]) == ("LANDER", ["no-hold"], None)
     assert _repair_row(rows[144]) == ("LANDER", ["replied", "edited", "no-new-commit"], None)
@@ -689,17 +691,14 @@ def test_a_rehold_on_a_transferred_pr_with_no_fresh_marker_is_the_landers(
     assert _repair_row(rows[168]) == ("LANDER", ["held", "repair-rehold"], None)
     assert _repair_row(rows[169]) == ("REPAIR", ["held", "repair"], "new-owner")
     assert _repair_row(rows[172]) == ("AUTHOR", ["held"], None)
-    # Hiding the superseded hold or the earlier marker does not bring back the author's turn; a
-    # marker from an outside account was never a transfer.
+    # Hiding the superseded hold does not bring back the author's turn, and a marker from an
+    # outside account was never a transfer.
     hidden_hold = _transferred(173)
     hidden_hold["comments"]["nodes"][0]["isMinimized"] = True
-    hidden_marker = _transferred(174)
-    hidden_marker["comments"]["nodes"][1]["isMinimized"] = True
     outsider = _transferred(175)
     outsider["comments"]["nodes"][1]["authorAssociation"] = "CONTRIBUTOR"
-    hidden = _engine_rows(tmp_path, capsys, hidden_hold, hidden_marker, outsider)
+    hidden = _engine_rows(tmp_path, capsys, hidden_hold, outsider)
     assert _repair_row(hidden[173]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
-    assert _repair_row(hidden[174]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
     assert _repair_row(hidden[175]) == ("AUTHOR", ["held"], None)
     doc = {ENGINE: {"pages": [_page([_transferred(164)])], "required": ENGINE_REQUIRED}}
     _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
@@ -751,6 +750,130 @@ def test_a_hold_after_any_marker_is_the_landers_whatever_came_before(
     assert _repair_row(rows[194]) == ("AUTHOR", ["held"], None)
     assert _repair_row(rows[195]) == ("REPAIR", ["held", "repair"], OWNER_ID)
     assert _repair_row(rows[196]) == ("AUTHOR", ["held"], None)
+
+
+def _minimized(comment: dict[str, Any]) -> dict[str, Any]:
+    comment["isMinimized"] = True
+    return comment
+
+
+def test_a_minimized_marker_is_a_cancelled_transfer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Minimizing the newest marker hands the PR back to its author: it never gives REPAIR and
+    never keeps a hold on the Lander, and the PR reads as if the marker had never been posted."""
+    before = _transferred(174)
+    _minimized(before["comments"]["nodes"][1])
+    # The newest marker before the re-hold is minimized; the older visible one still qualifies.
+    re_transfer = _pr(
+        176,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z", session="old-1"),
+            _minimized(_repair("2026-10-28T14:00:00Z")),
+            _hold("2026-10-28T15:00:00Z", _sha(176)),
+        ],
+    )
+    outsider = _minimized(_repair())
+    outsider["authorAssociation"] = "CONTRIBUTOR"
+    edited = _minimized(_repair())
+    edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        before,
+        re_transfer,
+        # Control: the same PR with its marker visible is the Lander's re-hold.
+        _transferred(177),
+        # After the hold: no REPAIR, the hold stands for the author.
+        _held(178, _minimized(_repair())),
+        # A minimized marker in a visible one's second names no second session.
+        _held(179, _repair(), _minimized(_repair(session="other-session"))),
+        # The newest QUALIFYING marker wins: a newer minimized one does not displace it.
+        _held(180, _repair(session="old-1"), _minimized(_repair("2026-10-28T14:00:00Z"))),
+        # Controls: an outside account's minimized marker was never a marker, so it is a reply,
+        # and an edit to a minimized marker is an edit.
+        _held(181, outsider),
+        _held(182, edited),
+    )
+    assert _repair_row(rows[174]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[176]) == ("LANDER", ["held", "repair-rehold"], "old-1")
+    assert _repair_row(rows[177]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[178]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[179]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[180]) == ("REPAIR", ["held", "repair"], "old-1")
+    assert _repair_row(rows[181]) == ("LANDER", ["replied", "no-new-commit"], None)
+    assert _repair_row(rows[182]) == ("LANDER", ["edited", "no-new-commit"], None)
+    cancelled = hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=True)
+    assert cancelled.cancelled and cancelled.repair_by is None and not cancelled.lander
+    for not_cancelled in (
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=True, associated=True),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=False),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=True, review=True),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=True, dismissed=True),
+        hpt.Event(NOW, "Manager: I am back.", bot=False, trusted=False, associated=True),
+    ):
+        assert not not_cancelled.cancelled
+
+
+def _cut(pr: dict[str, Any], kind: str = "comments", info: object = None) -> dict[str, Any]:
+    """``pr`` with its ``kind`` page cut: ``info`` replaces ``pageInfo``, or "absent" drops it."""
+    if info == "absent":
+        del pr[kind]["pageInfo"]
+    else:
+        pr[kind]["pageInfo"] = {"hasPreviousPage": True} if info is None else info
+    return pr
+
+
+def test_a_cut_page_never_reads_author(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A marker before the hold, or an old comment edited into a reply, may be off a cut page, so
+    a row that would read AUTHOR reads LANDER ``page-cut``. Nothing else changes."""
+    rehold = "2026-10-28T15:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        # The transfer that told the author to stand down is off the page: only the re-hold shows.
+        _cut(_pr(200, comments=[_hold(rehold, _sha(200))])),
+        _cut(_held(201), "reviews"),
+        _cut(_held(202, _ack("2026-10-28T12:30:00Z", _sha(202)))),
+        # A pageInfo that cannot say is no proof the page is whole.
+        _cut(_held(203), info="absent"),
+        _cut(_held(204), info={"hasPreviousPage": None}),
+        _cut(_held(205), "reviews", info="x"),
+        # Controls: an uncut page still reads AUTHOR, and rows that would not read AUTHOR do not
+        # change.
+        _held(206),
+        _cut(_held(207, _repair())),
+        _cut(_held(208, _comment("Manager: fixed.", "2026-10-28T13:00:00Z"))),
+        _cut(_transferred(209)),
+        _cut(_pr(210)),
+    )
+    for n in (200, 201, 203, 204, 205):
+        assert _repair_row(rows[n]) == ("LANDER", ["held", "page-cut"], None), n
+    assert _repair_row(rows[202]) == ("LANDER", ["held", "acked", "page-cut"], None)
+    assert _repair_row(rows[206]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[207]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[208]) == ("LANDER", ["replied", "no-new-commit"], None)
+    assert _repair_row(rows[209]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[210]) == ("LANDER", ["no-hold"], None)
+    queued = _cut(_held(211))
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    assert _repair_row(_engine_rows(tmp_path, capsys, queued)[211]) == (
+        "LANDER",
+        ["held", "page-cut", "in-queue"],
+        None,
+    )
+    doc = {ENGINE: {"pages": [_page([_cut(_held(212))])], "required": ENGINE_REQUIRED}}
+    _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    line = next(x for x in out.splitlines() if x.startswith("LANDER"))
+    assert line.split()[:2] == ["LANDER", "held,page-cut"]
+
+
+def test_the_query_asks_whether_the_comment_and_review_pages_were_cut() -> None:
+    query = " ".join(hpt.QUERY.split())
+    for kind, page in (("comments", hpt.COMMENT_PAGE), ("reviews", hpt.REVIEW_PAGE)):
+        assert f"{kind}(last: {page}) {{ pageInfo {{ hasPreviousPage }} nodes {{" in query, kind
 
 
 def test_the_repair_marker_shape_is_exact() -> None:
