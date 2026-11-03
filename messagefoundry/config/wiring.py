@@ -4017,6 +4017,13 @@ def Direct(
     )
 
 
+#: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
+#: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
+#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, the one the
+#: connections.toml type check and the GUI schema read. Not ``_UNSET``, which is ``env()``'s.
+_ROLE_DEFAULT: Any = object()
+
+
 def DICOM(
     *,
     ae_title: str
@@ -4051,9 +4058,10 @@ def DICOM(
     tls_ciphers: str
     | EnvRef
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
-    max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
-    # failure BEFORE the object is decoded, and so before the durable commit (the X12
-    # max_interchange_bytes analog; OOM/DoS guard, §9)
+    max_object_bytes: int | None = _ROLE_DEFAULT,  # per-C-STORE-object cap; unset → each role's
+    # default (SCP: 16 MiB, never above it; outbound SCU: 32 MiB). SCP: over-cap → DIMSE failure
+    # BEFORE the object is decoded, and so before the durable commit (the X12
+    # max_interchange_bytes analog; OOM/DoS guard, §9). SCU: over-cap → refused before dialing
     max_associations: int = 10,  # cap concurrent associations
     max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
@@ -4084,7 +4092,10 @@ def DICOM(
     ``[egress].allowed_tcp`` (a raw socket, like X12). The destination recovers the outgoing object's
     bytes from the base64 carriage (ADR 0028), runs the blocking association **off the event loop**, and
     classifies the C-STORE status onto the retry model (out-of-resources → retry; a hard refusal →
-    dead-letter). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
+    dead-letter). Its ``max_object_bytes`` defaults to 32 MiB, the most an engine SCP holds of one
+    object before it aborts the association, and a raised or removed cap re-sends an object over that
+    which ends with no response a bounded number of times before it dead-letters (vault BACKLOG
+    #4908). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
     imaging lane is the sibling :func:`DICOMweb` STOW-RS destination.
 
     **Association-rate pacing (SCP, ASVS 2.4.1 / 15.2.2, BACKLOG #1114).**
@@ -4118,34 +4129,33 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
-    return ConnectionSpec(
-        ConnectorType.DIMSE,
-        {
-            "ae_title": ae_title,
-            "host": host,
-            "port": port,
-            "called_ae_title": called_ae_title,
-            "presentation_contexts": presentation_contexts,
-            "calling_ae_allowlist": calling_ae_allowlist,
-            "require_called_ae_title": require_called_ae_title,
-            "tls": tls,
-            "tls_cert_file": tls_cert_file,
-            "tls_key_file": tls_key_file,
-            "tls_key_password": tls_key_password,
-            "tls_ca_file": tls_ca_file,
-            "tls_ca_pin": tls_ca_pin,
-            "tls_crl_file": tls_crl_file,
-            "tls_allow_expired": tls_allow_expired,
-            "tls_ciphers": tls_ciphers,
-            "max_object_bytes": max_object_bytes,
-            "max_associations": max_associations,
-            "max_associations_per_second": max_associations_per_second,
-            "association_burst": association_burst,
-            "max_pdu_size": max_pdu_size,
-            "timeout_seconds": timeout_seconds,
-            "connect_timeout": connect_timeout,
-        },
-    )
+    settings: dict[str, Any] = {
+        "ae_title": ae_title,
+        "host": host,
+        "port": port,
+        "called_ae_title": called_ae_title,
+        "presentation_contexts": presentation_contexts,
+        "calling_ae_allowlist": calling_ae_allowlist,
+        "require_called_ae_title": require_called_ae_title,
+        "tls": tls,
+        "tls_cert_file": tls_cert_file,
+        "tls_key_file": tls_key_file,
+        "tls_key_password": tls_key_password,
+        "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
+        "tls_crl_file": tls_crl_file,
+        "tls_allow_expired": tls_allow_expired,
+        "tls_ciphers": tls_ciphers,
+        "max_associations": max_associations,
+        "max_associations_per_second": max_associations_per_second,
+        "association_burst": association_burst,
+        "max_pdu_size": max_pdu_size,
+        "timeout_seconds": timeout_seconds,
+        "connect_timeout": connect_timeout,
+    }
+    if max_object_bytes is not _ROLE_DEFAULT:
+        settings["max_object_bytes"] = max_object_bytes
+    return ConnectionSpec(ConnectorType.DIMSE, settings)
 
 
 def DICOMweb(

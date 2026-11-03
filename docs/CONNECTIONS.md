@@ -3188,7 +3188,7 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `host` | — (required for outbound) | the downstream PACS host (`env()`-able) |
 | `port` | `104` | the peer's DIMSE port |
 | `called_ae_title` | `None` → `ANY-SCP` | the peer SCP's AE title to address |
-| `max_object_bytes` | `134217728` (128 MiB) | reject an over-cap object **before** dialing (permanent — no retry) |
+| `max_object_bytes` | `33554432` (32 MiB, `DEFAULT_SCU_MAX_OBJECT_BYTES`) | reject an over-cap object **before** dialing (permanent — no retry). The default is the SCU's own, not the SCP's 128 MiB: it is twice the engine's 16 MiB binary ingress ceiling, the most an engine SCP holds of one object before it aborts the association with no status (owner ruling B462-R3, vault BACKLOG #4908). The SCU cannot read a peer's limit, and that is the one it knows, so at the default an engine SCP answers every object it is sent with a status. Raise it, or set `0`/`None` to remove it, for a PACS that takes larger objects. Leaving it unset in `DICOM(...)` writes no value, so each role applies its own default |
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
 | `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. Since BACKLOG #2193 it carries the **revocation gate** MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL carry: `tls=true` to an off-box PACS **is refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (CORRECTED 2026-10-04: this row said the hop had no revocation gate and was not refused). With `tls_allow_expired` set, a CRL cannot admit it; off-box on an enforcing instance only the attestation crosses (vault BACKLOG #2978) |
@@ -3199,7 +3199,17 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 **Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a
 caveat) → delivered; **Out of Resources** (`0xA7xx`) or an association/transport failure → transient
 `DeliveryError` (retried with backoff); any other hard refusal (Cannot Understand, dataset-does-not-match-SOP,
-Not Authorized, SOP-class-not-supported) → permanent `NegativeAckError` → dead-letter. **Idempotency:**
+Not Authorized, SOP-class-not-supported) → permanent `NegativeAckError` → dead-letter. **A store that
+ends with no response** (the association aborted, a timeout, or a transport error mid-store) is transient,
+with one bound (vault BACKLOG #4908): for an object over 32 MiB, which only a raised or removed
+`max_object_bytes` lets through, the third such end in a row is a permanent `NegativeAckError`
+(`unanswered-over-ceiling`) and dead-letters, whatever the retry policy, `max_attempts=None` included.
+Every engine SCP aborts such an object with no status (owner ruling B462-R3), and the SCU cannot tell
+that abort from any other, so each unanswered end of it counts. An answered store starts its count again,
+and the count is kept in memory, so a restart or a reload starts it again too. An unanswered end of an object
+at or under 32 MiB is not counted and keeps re-sending. It would still re-send without end under
+`max_attempts=None` against a peer whose own limit is lower, such as an engine SCP whose `max_object_bytes`
+was set below 16 MiB; set this SCU's `max_object_bytes` to that peer's limit. **Idempotency:**
 delivery is at-least-once, so a retry re-sends the same object — the receiving PACS must be idempotent on
 `SOPInstanceUID`. **PHI:** logs carry only routing-safe identifiers (SOP class/instance UID, peer host).
 
