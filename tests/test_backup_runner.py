@@ -13,6 +13,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import shutil
 import sys
 import tarfile
@@ -888,6 +889,51 @@ def test_the_space_estimate_does_not_count_a_directory_link(tmp_path, make_link)
     cfg = _config_with_a_linked_dir(tmp_path, make_link)
     real = (cfg / "feed.py").stat().st_size + (cfg / "sub" / "plain.txt").stat().st_size
     assert _tree_size(cfg) == real
+
+
+@pytest.mark.parametrize(
+    ("tag", "is_link"),
+    [
+        (0xA0000003, True),  # IO_REPARSE_TAG_MOUNT_POINT: a junction or volume mount point
+        (0xA000000C, True),  # IO_REPARSE_TAG_SYMLINK
+        (0x9000001A, False),  # IO_REPARSE_TAG_CLOUD: a placeholder that names no other path
+        (0x80000013, False),  # IO_REPARSE_TAG_DEDUP
+    ],
+)
+def test_only_a_reparse_point_naming_another_path_is_a_directory_link(
+    tmp_path, monkeypatch, tag, is_link
+) -> None:
+    """A reparse point that names no other path is ordinary config, so a rule that prunes every
+    reparse point would drop a OneDrive or deduplicated folder from the bundle. The real folder,
+    read before the patch, is the control that an ordinary entry is not a link."""
+    import stat as stat_mod
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dr_backup as dr
+
+    assert dr._is_dir_link(str(tmp_path)) is False
+    fake = SimpleNamespace(
+        st_mode=stat_mod.S_IFDIR,
+        st_file_attributes=stat_mod.FILE_ATTRIBUTE_REPARSE_POINT,
+        st_reparse_tag=tag,
+    )
+    monkeypatch.setattr(os, "lstat", lambda _path: fake)
+    assert dr._is_dir_link(str(tmp_path)) is is_link
+
+
+def test_a_directory_whose_lstat_fails_is_pruned_from_the_config_walk(
+    tmp_path, monkeypatch
+) -> None:
+    """The config walk fails closed on an entry it cannot classify; the staging walk's default
+    leaves it to ``os.walk``, which reports what it cannot list."""
+    from messagefoundry.pipeline import dr_backup as dr
+
+    def refuse(_path: object) -> object:
+        raise PermissionError("synthetic")
+
+    monkeypatch.setattr(os, "lstat", refuse)
+    assert dr._is_dir_link(str(tmp_path), unreadable=True) is True
+    assert dr._is_dir_link(str(tmp_path)) is False
 
 
 # --- AC-9/AC-10: failure alerts + preserves the prior good archive -----------

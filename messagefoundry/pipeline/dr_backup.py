@@ -1114,18 +1114,32 @@ class BackupRunner:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
         arbitrary host file into the archive, so only regular files are added and at least these are
-        NOT followed: a symlinked file, a symlinked directory, and an NTFS junction or volume mount
-        point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads them. ``base``
-        itself is the operator's configured directory and is walked whatever it is. Each directory
-        link passed over is named in one WARNING, since the loader and the config digest may read
-        through it. Not covered: a link swapped in after the walk listed a path, because
-        ``tar.add`` opens each path by name.
+        NOT followed: a symlinked file, a symlinked directory, and on Windows a junction or volume
+        mount point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads them. A
+        filesystem mounted below ``base`` on POSIX is not a link, and is walked. ``base`` itself is
+        the operator's configured directory and is walked whatever it is. At least each directory
+        link the walk lists as a directory is named in one WARNING, since the loader and the config
+        digest may read through it.
+
+        Not covered: a path swapped for a link after the walk read it, because the walk lists and
+        ``tar.add`` opens by name. ``tar.add`` is not recursive, so such a swap adds at most one
+        member, never the tree behind it.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
-        killed editor's leftover is not config."""
+        killed editor's leftover is not config. So is the backup's own staging, which a data dir
+        inside the config dir puts there (BACKLOG #1174): its plaintext snapshot and the tar being
+        written must not ride in the bundle."""
         pruned: list[str] = []
-        found = sorted(Path(d, n) for d, _, files in _walk_unfollowed(base, pruned) for n in files)
+        found: list[Path] = []
+        for dirpath, dirs, files in _walk_unfollowed(base, pruned):
+            # Pruned here, before the walk descends them, so a link inside one is not reported.
+            dirs[:] = [
+                d
+                for d in dirs
+                if not (atomic_edit.is_candidate_dir_name(d) or _is_staging_dir(Path(dirpath, d)))
+            ]
+            found.extend(Path(dirpath, name) for name in files)
         if pruned:
             log.warning(
                 "DR backup: the config bundle of %s does not follow a directory link, so it leaves "
@@ -1135,21 +1149,14 @@ class BackupRunner:
                     ", ".join(sorted(Path(p).relative_to(base).as_posix() for p in pruned))
                 ),
             )
-        for path in found:
+        # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
+        for path in sorted(found):
             if path.is_symlink() or not path.is_file():
                 continue
-            if _is_config_edit_artifact(path.relative_to(base)):
+            rel = path.relative_to(base)
+            if _is_config_edit_artifact(rel):
                 continue
-            if any(
-                _is_staging_dir(base / parent)
-                for parent in path.relative_to(base).parents
-                if parent != Path(".")
-            ):
-                # A data dir inside the config dir puts the backup's own staging there (BACKLOG
-                # #1174): its plaintext snapshot and the tar being written must not ride in the bundle.
-                continue
-            rel = path.relative_to(base).as_posix()
-            tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel}")
+            tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
 
     # --- keep-N retention ----------------------------------------------------
 
@@ -1332,8 +1339,9 @@ class BackupRunner:
 
         A directory that is gone or cannot be listed is not bundled, and the archive records that
         with the fault's class name (vault BACKLOG #3094). The fold and the archive walk both list
-        through calls that swallow that error (``glob``, ``os.walk``), so without this check the archive would carry
-        an empty ``config/``, and an empty-bundle digest, under a clean success. A full pass still
+        through calls that swallow that error (``glob``, ``os.walk``), so without this check the
+        archive would carry an empty ``config/``, and an empty-bundle digest, under a clean
+        success. A full pass still
         goes on, because the store snapshot is worth keeping; a config-only pass fails, in
         :meth:`_do_backup`. The digest itself catches what
         :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
@@ -2334,16 +2342,18 @@ def _is_config_edit_artifact(rel: Path) -> bool:
 def _walk_unfollowed(
     root: Path, pruned: list[str] | None = None
 ) -> Iterator[tuple[str, list[str], list[str]]]:
-    """``os.walk(root)``, top-down, that never descends a directory link below ``root``, as
-    :func:`_is_dir_link` reads one: at least a symlinked directory and an NTFS junction or volume
-    mount point, which ``os.walk`` descends even with ``followlinks=False`` (vault BACKLOG #5221).
-    Each pruned directory's path is appended to ``pruned`` when one is given. A caller may prune the
-    yielded directory list further, as with ``os.walk``."""
+    """``os.walk(root)``, top-down, that does not descend a directory link below ``root``, as
+    :func:`_is_dir_link` reads one: at least a symlinked directory and, on Windows, a junction or
+    volume mount point, which ``os.walk`` descends even with ``followlinks=False`` (vault BACKLOG
+    #5221). A directory whose ``lstat`` fails is not descended either. Each pruned directory's path
+    is appended to ``pruned`` when one is given. A caller may prune the yielded directory list
+    further, as with ``os.walk``. The read and the descent are by name, so a directory swapped for a
+    link between them is descended."""
     for dirpath, dirs, files in os.walk(root, followlinks=False):
         kept = []
         for d in dirs:
             full = os.path.join(dirpath, d)
-            if not _is_dir_link(full):
+            if not _is_dir_link(full, unreadable=True):
                 kept.append(d)
             elif pruned is not None:
                 pruned.append(full)
@@ -2351,16 +2361,17 @@ def _walk_unfollowed(
         yield dirpath, dirs, files
 
 
-def _is_dir_link(path: str) -> bool:
+def _is_dir_link(path: str, *, unreadable: bool = False) -> bool:
     """Whether ``path`` names another path: a symlink, or on Windows a name-surrogate reparse point,
     at least a junction or a volume mount point. Read by ``lstat``, never by a following ``stat``. A
     reparse point that names no other path, such as a cloud placeholder or a deduplicated file, is
-    not one, so it is walked as what it holds; the same rule as :func:`_owner_of`. An entry that
-    cannot be read is not one either, so ``os.walk`` goes on to list it as it did before."""
+    not one, so it is walked as what it holds; the same rule as :func:`_owner_of`. ``unreadable`` is
+    the answer when the ``lstat`` fails: the config walk prunes such an entry, and the staging walk,
+    which reports what it cannot list, lets ``os.walk`` try it as it did before."""
     try:
         st = os.lstat(path)
     except OSError:
-        return False
+        return unreadable
     reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     return stat.S_ISLNK(st.st_mode) or bool(
         reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
@@ -2368,9 +2379,10 @@ def _is_dir_link(path: str) -> bool:
 
 
 def _tree_size(root: Path) -> int:
-    """The total size of the regular files under ``root``, never following a link or a junction
-    (:func:`_walk_unfollowed`), which is also what ``_add_config_dir`` puts in the archive. 0 when
-    ``root`` cannot be walked."""
+    """The total size of the regular files under ``root``, on the walk ``_add_config_dir`` uses
+    (:func:`_walk_unfollowed`), so a directory link it passes over is not counted. Unlike that
+    walk it does not skip the backup's own staging or a config editor's lock file. 0 when ``root``
+    cannot be walked."""
     total = 0
     for dirpath, dirs, files in _walk_unfollowed(root):
         # Candidate directories are pruned, as _add_config_dir skips their files.

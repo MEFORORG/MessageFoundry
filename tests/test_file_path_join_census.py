@@ -736,9 +736,10 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/pipeline/dr_backup.py::_walk_unfollowed": Site(
         1,
-        INTERNAL,
-        "A directory name os.walk listed, joined only to lstat it for a link or a junction "
-        "(BACKLOG #5221).",
+        OPERATOR,
+        "A directory name os.walk listed under the operator's config directory, joined to lstat "
+        "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
+        "#5221).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
