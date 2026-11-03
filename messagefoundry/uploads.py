@@ -652,7 +652,7 @@ class ResealResult:
     #: both look like this, and the pass cannot tell them apart: read as zero uploads, an unmounted
     #: volume's uploads would stay under the prior key while the run reported success.
     #: ``rotate-key`` refuses such a root before it writes anything, so this is the backstop for one
-    #: that goes away mid-run, and it fails the run as a skip does.
+    #: that goes away mid-run. It is not a skip: ``rotate-key`` aborts on it before its audit roll.
     #: A root it can list is never missing, empty or not; what that leaves uncaught is in
     #: docs/PHI.md, at the ``rotate-key`` passage.
     root_missing: bool = False

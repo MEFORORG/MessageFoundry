@@ -10480,6 +10480,11 @@ def _shown_path(path: str) -> str:
         return path
 
 
+class _UploadsRootLost(Exception):
+    """``rotate-key``'s uploads pass could not list a root that passed :func:`_uploads_root_refusal`
+    (BACKLOG #4940). Raised before the audit roll, so the run stops short of it."""
+
+
 def _uploads_root_refusal(uploads_dir: str) -> str | None:
     """Why ``rotate-key`` refuses the configured uploads directory, or ``None`` (BACKLOG #4940).
     Checked before anything is written, so a refusal costs nothing, the audit roll included. Why a
@@ -10487,6 +10492,13 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
     the backstop for one that goes away after this check."""
     import os
 
+    if "\0" in uploads_dir:
+        # No filesystem call accepts one: it raises ValueError, not OSError.
+        return (
+            f"the uploads directory {uploads_dir!r} ([store].uploads_dir) contains a NUL "
+            "character, which no path can hold, so rotate-key changed nothing. Correct "
+            "uploads_dir and re-run."
+        )
     try:
         # Resolving a relative path reads the working directory, which can itself be gone.
         root = Path(uploads_dir).absolute()
@@ -10508,8 +10520,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
             "causes include at least a volume that is not mounted, a path that is wrong or is "
             "relative (it is read from the directory this command runs in) and, since the "
             "directory is created on the first upload, a site that has never stored one. Create "
-            "it, empty, only in that last case: anywhere else an empty directory hides the uploads "
-            "this run must re-seal. Fix the cause and re-run."
+            "it, empty and readable only by the account the engine runs as, only in that last "
+            "case: the engine does not tighten a directory that is already there, and anywhere "
+            "else an empty directory hides the uploads this run must re-seal. Fix the cause and "
+            "re-run."
         )
     except OSError as exc:
         # Not only a missing right: Windows raises PermissionError for a volume that is not ready
@@ -10562,8 +10576,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
     either data pass, the audit range rolls after both, and the stamp and the record's close come
     last, on a run with no skip, an uploads directory it could read throughout (BACKLOG #4940) and
-    a good roll. One it cannot list at the start refuses before anything is written; one that goes
-    away mid-run fails the run like a skip. A skip does not stop the roll (owner ruling
+    a good roll. One it cannot list at the start refuses before anything is written; one its
+    uploads pass cannot list aborts the run before the roll, which is not a skip. A skip does not
+    stop the roll (owner ruling
     2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
     that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
     key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
@@ -10708,6 +10723,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
                 if settings.store.uploads_dir
                 else ResealResult()
             )
+            if uploads.root_missing:
+                # BACKLOG #4940: stop before the one-way audit roll, as a listing error the pass let
+                # escape did before the pass caught it. The owner ruling of 2026-10-30 rolls on a
+                # skip, and this is not one: the pass reached no upload at all. Nothing below runs,
+                # so the chain stays on the prior key, nothing is stamped and the record stays open.
+                raise _UploadsRootLost
             # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
             # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
             # gets a range under the NEW key, whose first row commits to a digest of the old range, so
@@ -10722,8 +10743,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
             # Only once the whole rotation is done, so after the audit step (BACKLOG #3181). After a
-            # skipped upload, part of that file may still be under the prior key, so may every
-            # upload behind an uploads root that was not there (BACKLOG #4940), and after a failed
+            # skipped upload, part of that file may still be under the prior key, and after a failed
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
@@ -10797,6 +10817,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except _StoreOpenRefused as exc:  # #2109, #2532, #1720: the open refused; nothing re-encrypted
         print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
         return 2
+    except _UploadsRootLost:
+        # BACKLOG #4940. Exit 1, not 2: the store pass has already re-encrypted under the active key
+        # and the rotation record is open, so this run changed things. See ResealResult.root_missing.
+        print(
+            f"error: rotation aborted -- the uploads directory {uploads_shown} "
+            "([store].uploads_dir) could be listed when this run started and could not be by its "
+            "uploads pass, so no uploaded file was re-sealed, and its uploads may still be under "
+            "the prior key. The log names the cause. It was there at the start, so do not create "
+            "an empty one. The causes include at least a volume that went offline or was "
+            "unmounted, a directory that was moved and a right to list it that was taken away. "
+            "The run stopped before its audit chain step, so the audit chain did not roll, the "
+            "key's rotation date was not stamped, and the rotation stays open. Fix the cause and "
+            "re-run rotate-key BEFORE retiring any prior key "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
+            file=sys.stderr,
+        )
+        return 1
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     done = (
@@ -10864,21 +10901,6 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
         )
-    if uploads.root_missing:
-        # BACKLOG #4940: the directory passed the check before the store opened and could not be
-        # listed by the uploads pass, for any OSError. See ResealResult.root_missing.
-        print(
-            f"error: the uploads directory {uploads_shown} "
-            "([store].uploads_dir) could be listed when this run started and could not be by its "
-            "uploads pass, so no uploaded file was re-sealed, and its uploads may still be under "
-            "the prior key. The log names the cause. It was there at the start, so do not create "
-            "an empty one. The causes include at least a volume that went offline or was "
-            "unmounted, a directory that was moved and a right to list it that was taken away: "
-            "fix the cause, and re-run rotate-key "
-            "BEFORE retiring any prior key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). This run did not "
-            "stamp the key's rotation date.",
-            file=sys.stderr,
-        )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
         # the prior key, that range's key is missing, or the chain does not verify (BACKLOG #1945).
@@ -10891,20 +10913,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
-    if uploads.incomplete:
-        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, nor does an
-        # uploads root that went away mid-run (#4940), so an operator who reads PARTIAL as "go
-        # back" must be told. Conditional, because this run cannot see whether the key changed: a
-        # same-key run or a keyless chain rolled nothing. A new key is no remedy here, because the
-        # cause stands the same way under it.
-        remedy = (
-            "Fix the cause and re-run, or remove the two files of an upload that cannot be fixed "
-            "and re-run."
-            if uploads.skipped
-            else "Fix the cause and re-run."
-        )
+    if uploads.skipped:
+        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, so an operator who
+        # reads PARTIAL as "go back" must be told. Conditional, because this run cannot see whether
+        # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
+        # here, because the file skips the same way under it.
         print(
-            f"note: this run did not complete. {remedy} If this store is moving to a new key and "
+            "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
+            "an upload that cannot be fixed and re-run. If this store is moving to a new key and "
             "its audit chain is keyed, the chain has rolled to that key, and a key opens one audit "
             "range, so you cannot go back to the prior key: keep it in "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until a run completes."

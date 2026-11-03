@@ -5,9 +5,10 @@
 The reseal pass returned all-zero counts for a root that was not a directory, so ``rotate-key``
 printed OK, stamped the key and closed the rotation record. Behind an unmounted volume every upload
 was still under the prior key, which the OK invited the operator to retire. ``rotate-key`` now
-checks the root before it writes anything and refuses, exit 2, with nothing changed. A root that
-goes away during the run fails it as a skip does: exit 1, no stamp, the record left open. A site
-with no uploads, an empty root or no ``uploads_dir`` at all, still completes.
+checks the root before it writes anything and refuses, exit 2, with nothing changed. A root the
+uploads pass cannot list after that aborts the run before the audit roll, which is not a skip:
+exit 1, no roll, no stamp, the record left open. A site with no uploads, an empty root or no
+``uploads_dir`` at all, still completes.
 
 The root is created on the first save (``UploadStore._ensure_root``), not at ``serve``, so a site
 that configured ``uploads_dir`` and never stored an upload has no root either. Nothing tells that from an
@@ -124,6 +125,45 @@ def test_an_uploads_root_it_cannot_list_is_refused_with_its_cause(
     assert "Create it" not in refusal
 
 
+def test_a_missing_root_is_told_to_be_created_owner_only(tmp_path: Path) -> None:
+    """The engine creates the root owner-only and never tightens one already there, so a directory
+    the operator creates must be owner-only from the start."""
+    refusal = _uploads_root_refusal(str(tmp_path / "never-created"))
+    assert refusal is not None
+    assert "Create it, empty and readable only by the account the engine runs as" in refusal
+    assert "does not tighten a directory that is already there" in refusal
+
+
+def test_a_nul_in_uploads_dir_is_refused_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No filesystem call takes a NUL; it raises ValueError, which the run's OSError arms miss."""
+    monkeypatch.chdir(tmp_path)
+    refusal = _uploads_root_refusal("up\0loads")
+    assert refusal is not None
+    assert "contains a NUL character, which no path can hold, so rotate-key changed nothing" in (
+        refusal
+    )
+
+
+def test_rotate_key_refuses_a_nul_in_uploads_dir_with_exit_2(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End to end: the refusal's exit 2 with nothing written, not a ValueError at exit 1. An
+    environment variable cannot hold a NUL, so the settings file carries it as a TOML escape."""
+    db, uploads, key_a, key_b = rig
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    monkeypatch.delenv("MEFOR_STORE_UPLOADS_DIR")
+    cfg = db.with_name("nul.toml")
+    cfg.write_text('[store]\nuploads_dir = "up\\u0000loads"\n', encoding="utf-8")
+    assert main(["rotate-key", "--service-config", str(cfg), "--db", str(db)]) == 2
+    assert "contains a NUL character" in capsys.readouterr().err
+    rows = asyncio.run(_rows(db, key_a))  # key A alone: nothing was re-encrypted
+    assert ROTATION_RECORD_ID not in rows
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -181,13 +221,24 @@ def test_a_relative_uploads_dir_is_named_as_read(
     assert f"relative, so it was read here as {uploads.absolute()}" in capsys.readouterr().err
 
 
-def test_an_uploads_root_gone_mid_run_fails_it_and_leaves_the_record_open(
+def _chain_rolled(db: Path, key_b: str, monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Whether the audit chain rolled to key B, by ``audit-verify`` itself: with key B alone, a chain
+    whose current range is still under key A does not verify (BACKLOG #1945), and a rolled one
+    does. The store's cells are under key B either way, since its pass runs first."""
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", raising=False)
+    return main(["audit-verify", "--db", str(db)]) == 0
+
+
+def test_an_uploads_root_gone_mid_run_aborts_before_the_audit_roll(
     rig: tuple[Path, Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The backstop: the root passes the check before the store opens and is gone by the uploads
-    pass. The reseal reports it rather than zero uploads, so the run fails as a skip does."""
+    pass. The reseal reports it rather than zero uploads, and the run stops before the one-way audit
+    roll, as a listing error that escaped the pass did. Not a skip, so the 2026-10-30 ruling does not
+    roll it: the chain stays under key A, nothing is stamped and the record stays open."""
     db, uploads, key_a, key_b = rig
     unmounted = uploads.with_name("uploads-elsewhere")
     reencrypt = MessageStore.reencrypt_to_active
@@ -201,23 +252,54 @@ def test_an_uploads_root_gone_mid_run_fails_it_and_leaves_the_record_open(
 
     assert main(["rotate-key", "--db", str(db)]) == 1
     captured = capsys.readouterr()
-    assert "PARTIAL:" in captured.out and "OK: re-encrypted" not in captured.out
+    assert "OK" not in captured.out and "PARTIAL" not in captured.out
+    assert "error: rotation aborted -- the uploads directory" in captured.err
     assert "could not be by its uploads pass, so no uploaded file was re-sealed" in captured.err
     assert "do not create an empty one" in captured.err  # it was there when the run started
     # Any listing error lands here, so the remedy is not "mount it" alone.
     assert "at least a volume that went offline or was unmounted" in captured.err
+    assert "a directory that was moved" in captured.err
     assert "a right to list it that was taken away" in captured.err
-    assert "remove the two files" not in captured.out  # that remedy is a skip's, not this
-    assert "you cannot go back to the prior key" in captured.out
+    assert "so the audit chain did not roll" in captured.err
+    assert "you cannot go back to the prior key" not in captured.out + captured.err
     rows = asyncio.run(_rows(db, key_b, key_a))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))  # no stamp
     assert rows[_DEK].last_rotated == _OLD_DATE
     assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))  # still open
     assert not uploads.exists()  # the run created nothing where the volume should be
+    assert not _chain_rolled(db, key_b, monkeypatch), "the run rolled the audit chain"
+    capsys.readouterr()
 
     monkeypatch.setattr(MessageStore, "reencrypt_to_active", reencrypt)
     unmounted.rename(uploads)
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     _completes_once_mounted(db, uploads, key_b)
+
+
+def test_a_skip_still_rolls_the_audit_chain(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control for the abort above, and the owner ruling of 2026-10-30 it leaves alone: a run
+    whose uploads pass skips a file still rolls, so the same instrument reads a rolled chain."""
+    db, uploads, key_a, key_b = rig
+    real = UploadStore.reseal_to_active
+
+    async def one_skip(self: UploadStore) -> ResealResult:
+        await real(self)
+        return ResealResult(skipped=1)
+
+    monkeypatch.setattr(UploadStore, "reseal_to_active", one_skip)
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "PARTIAL:" in captured.out
+    assert "you cannot go back to the prior key" in captured.out
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE  # no stamp
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))  # still open
+    assert _chain_rolled(db, key_b, monkeypatch), capsys.readouterr()
 
 
 def test_a_relative_root_gone_mid_run_with_its_working_directory_still_warns(
@@ -225,8 +307,8 @@ def test_a_relative_root_gone_mid_run_with_its_working_directory_still_warns(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Printing the path must not need the working directory: one gone mid-run used to raise there,
-    after PARTIAL, and lose the error and the note that the chain has rolled."""
+    """Printing the path must not need the working directory: one gone mid-run used to raise there
+    and lose the error."""
     db, uploads, key_a, key_b = rig
     reencrypt = MessageStore.reencrypt_to_active
     getcwd = os.getcwd
@@ -247,11 +329,10 @@ def test_a_relative_root_gone_mid_run_with_its_working_directory_still_warns(
         monkeypatch.setattr(os, "getcwd", getcwd)
     assert code == 1
     captured = capsys.readouterr()
-    assert "PARTIAL:" in captured.out
     assert f"the uploads directory {uploads.absolute()} ([store].uploads_dir) could be" in (
         captured.err
     )
-    assert "you cannot go back to the prior key" in captured.out
+    assert "so the audit chain did not roll" in captured.err
 
 
 @pytest.mark.parametrize("uploads_dir", ["empty", "unset"])

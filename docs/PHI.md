@@ -633,10 +633,13 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    step did not complete (BACKLOG #3181). **It refuses a configured `uploads_dir` it cannot list
    before it writes anything (BACKLOG #4940),** with exit 2, because a volume that is not mounted
    reads the same as one with no uploads, and its uploads may still be under the prior key. One that
-   goes away during the run fails it as a skip does, and rolls the audit chain as a skip does. The
-   directory is created on the first upload, so a site that has never stored one creates it, empty,
-   and re-runs. **It refuses only a path it cannot list: it cannot tell a directory it can list from
-   the one that holds the uploads.** When `uploads_dir` names a listable directory other than that
+   its uploads pass cannot list, after that check passed, aborts the run with exit 1 before the
+   audit chain step: that is not a skip, so the chain does not roll, nothing is stamped and the
+   rotation record stays open. The directory is created on the first upload, so a site that has
+   never stored one creates it, empty, and re-runs. **Create it readable only by the account the
+   engine runs as:** the engine creates the directory with mode 0700 where the OS honours that, and
+   never tightens one that is already there. **It refuses only a path it cannot list: it cannot
+   tell a directory it can list from the one that holds the uploads.** When `uploads_dir` names a listable directory other than that
    one, it re-seals only what that directory holds, then prints OK, stamps the key and closes the
    rotation record while the real uploads may still be under the prior key. At least these reach
    that: a volume that is not mounted over an empty mount point, which reads as no uploads; a
@@ -658,7 +661,6 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    running `rotate-key`: that stamp stands however the run ends.
    **After a run whose roll succeeded on a keyed audit chain, moving it to a new key, you cannot go
    back to the prior key (owner ruling 2026-10-30, BACKLOG #3737).** A skip does not stop the roll,
-   nor does an uploads directory that goes away mid-run (BACKLOG #4940),
    so an engine started on the new key alone keeps a chain that verifies. A key opens one audit
    range, so the prior key can never open another. `rotate-key` under it re-seals the data and then
    refuses at the audit step, and leaves you worse off. A skip clears when you fix its cause, or
