@@ -624,6 +624,12 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
 # stays PURE (no store/I/O import) and unit-testable — the pipeline supplies the async `read_attachment`.
 
 
+def _copy_names_address(text: str, marker: str) -> bool:
+    """Whether ``marker``, the handle marker as the payload's delimiters escape it, is followed
+    somewhere in ``text`` by a content address: a handle copy, not a bare marker."""
+    return re.search(re.escape(marker) + "[0-9a-f]{64}", text) is not None
+
+
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     """The content addresses named by the well-formed document handles in an HL7 body's
     ``OBX-5.5`` values, read as :func:`reattach_documents_in_hl7` reads them: the places delivery
@@ -677,8 +683,9 @@ async def reattach_documents_in_hl7(
     ``bound`` is the content addresses the payload's own message holds, which the caller reads from
     the store's ``message_attachment`` linkage (BACKLOG #5099). A handle naming any other address is
     refused before ``reader`` runs, so a value the sender wrote cannot name another message's
-    document. When ``bound`` is not empty, an escaped handle marker anywhere the splice does not reach
-    is refused too, so a handle a Handler copied elsewhere is never emitted."""
+    document. The handle marker, as this payload's delimiters escape it, anywhere the splice does not
+    reach is refused too where ``bound`` is not empty or the copy names a content address, so a
+    handle a Handler copied elsewhere is never emitted."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -734,8 +741,12 @@ async def reattach_documents_in_hl7(
         # The marker as Message.set writes it under this payload's delimiters: a handle the engine
         # wrote, or a Handler copied, carries exactly this text wherever it sits.
         marker = Message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
-        if bound and not found and marker in text:
+        if not found and marker in text and (bound or _copy_names_address(text, marker)):
             # No handle to splice, so the text is what would be sent: a marker in it is a copy.
+            # Refused where the message holds a document, and also where the copy names a content
+            # address: a child that inherited none, because its only handle sits outside OBX-5.5,
+            # would otherwise send the engine's handle with no document. A bare marker in a
+            # message that holds nothing names no document, so it is carried as text.
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, marker
 
@@ -751,8 +762,8 @@ async def reattach_documents_in_hl7(
             )
     if not handles:
         # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
-        # gate may pass on a marker sitting outside an OBX-5.5 value of a message that holds no
-        # attachment; that names no document of its own, so it is carried through verbatim.
+        # gate may open on a header alone, or on a bare marker outside OBX-5.5 in a message that
+        # holds no document; that names no document, so it is carried through verbatim.
         return text
     for occ, sha256 in handles:
         verbatim = await reader(sha256)

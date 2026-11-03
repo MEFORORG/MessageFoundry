@@ -98,6 +98,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
+from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
@@ -1020,9 +1021,12 @@ def attachments_named(held: Iterable[str], body: str) -> list[str]:
     not: delivery never resolves one there. Only a named document is inherited: a child whose
     Handler dropped the document holds none, so the child's channel cannot download it, and
     retention is not kept waiting on a document no row of the child can deliver. The body is parsed
-    only when the parent holds a document."""
+    only when the parent holds a document and delivery's own gate
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`) would open on it, so a handle that gate
+    would pass over unresolved is not inherited, and a large body with no handle is not parsed
+    inside the caller's write transaction."""
     held = list(held)
-    if not held:
+    if not held or not _may_hold_doc_ref(body):
         return []
     named = _doc_ref_addresses_in_hl7(body)
     return [ref for ref in held if ref in named]

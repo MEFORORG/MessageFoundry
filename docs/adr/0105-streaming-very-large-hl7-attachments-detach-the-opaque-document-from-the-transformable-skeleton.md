@@ -278,22 +278,25 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   `message_attachment` linkage the ingress commit writes; replay and an unedited resend keep the
   message id) and
   passes them to the re-attach as `bound`. A handle in an `OBX-5.5` that is malformed or names any
-  other address raises `UnreattachableDocumentError` before any read. Where the message holds a
-  document, a copy of the handle marker where the splice does not reach (`NTE-3`, a second
-  `OBX-5.5` repetition) raises it too, after the splice where the message also carries a bound
-  handle. Either way the row dead-letters alone rather than re-pending on a strict-FIFO lane. A
-  message that holds no document carries a marker outside `OBX-5.5` through as text, since it names
-  nothing that message could resolve. The ingress detach refuses a received body whose `OBX-5.5`
+  other address raises `UnreattachableDocumentError` before any read. A copy of the handle marker,
+  as the payload's delimiters escape it, where the splice does not reach (`NTE-3`, a second
+  `OBX-5.5` repetition) raises it too, where the message holds a document or the copy names a
+  content address, after the splice where the message also carries a bound handle. Either way the row dead-letters alone rather than re-pending on a strict-FIFO lane. A
+  handle the payload hides behind any other escape never opens the gate, so it is carried as the
+  sender's text and resolves nothing. The ingress detach refuses a received body whose `OBX-5.5`
   already holds a handle (`InboundDocRefError`, an `ERROR` row and an `AR` before the ACK) instead
   of skipping it as already detached. A pass-through child, an edit-and-resubmit child and an
   edit-and-resend child each carry a body under a new message id, so the store links each child
-  to the parent's documents a handle in its `OBX-5.5` names, read as delivery reads one, with one
-  reference of its own, in the commit that makes it (`_inherit_attachments`). An address the body
+  to the parent's documents a handle in its `OBX-5.5` names, read as delivery reads one (behind
+  its gate), with one reference of its own, in the commit that makes it (`_inherit_attachments`). An address the body
   carries anywhere else, bare or as a copied handle, is not linked. A document whose header a purge
   collected first is not linked either, so `refcount` still equals the live linkage rows. Purging
   either message then releases only its own reference. A handle naming a document the parent does
   not hold is not linked, and is refused at delivery.
-  An operator upload and a loopback reply are new bodies, not a parent's, and inherit nothing. A
+  A pass-through inbound is a channel of its own, so a user scoped to it can download, through the
+  child, a document the parent's channel detached: the child carries that document and delivers
+  it, so its channel is granted it as the parent's is. An operator upload and a loopback reply are
+  new bodies, not a parent's, and inherit nothing. A
   `mfdoc:v1:pruned:` tombstone resolves nothing and is carried as text.
 - **Delivery is a pure READ — never a decref.** A message fans out to multiple outbounds and is
   replayable, so each send **reads** the immutable, content-addressed attachment per-send and leaves the

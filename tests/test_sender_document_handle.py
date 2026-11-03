@@ -644,3 +644,34 @@ async def test_a_short_msh2_payload_carrying_the_marker_is_still_refused(
 
     assert col.deliveries == []
     assert _dead_lettered_at_once(rows)
+
+
+async def test_a_child_whose_only_handle_is_a_copy_never_sends_it(store: MessageStore) -> None:
+    """The child inherits nothing, since its handle sits outside OBX-5.5, so it holds no document.
+    The copy guard must still refuse the engine's handle rather than send it with no document."""
+    parent, ref, _skeleton = await _detached_parent(store, _b64(1500))
+    handle = make_doc_ref(ref, "Application")
+    child = await _passthrough_child(store, parent, _with_copy_in_nte(_hl7("plain text"), handle))
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    await _deliver_queued(store, runner, child)
+
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(list(await store.outbox_for(child)))
+
+
+def test_a_handle_the_delivery_gate_passes_over_is_not_inherited() -> None:
+    """A handle hex-escaped in OBX-5.5 under default delimiters never opens delivery's gate, so it
+    is sent as text and resolves nothing. A child must not hold the document it seems to name."""
+    from messagefoundry.store.store import attachments_named
+
+    ref = hashlib.sha256(b"x").hexdigest()
+    handle = make_doc_ref(ref, "Application")
+    hexed = "\\X" + DOC_REF_MARKER[:1].encode("ascii").hex().upper() + "\\" + handle[1:]
+    body = _hl7(hexed)
+    assert Message.parse(body).field("OBX-5.5") == handle  # the parser reads it as the handle
+    assert not may_hold_doc_ref(body)
+
+    assert attachments_named([ref], body) == []
