@@ -45,15 +45,29 @@ def _bundle(tmp_path: Path, signer: _CaPair, **kwargs: Any) -> Path:
     return _client_bundle(tmp_path, signer, cn="partner.example", **kwargs)
 
 
+def _labelled(cert: x509.Certificate, label: str) -> bytes:
+    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``, body unchanged."""
+    return (
+        _pem(cert)
+        .replace(b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii"))
+        .replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
+    )
+
+
 def _source(
-    tmp_path: Path, trusted: list[x509.Certificate], subjects: dict[str, list[str]] | None
+    tmp_path: Path,
+    trusted: list[x509.Certificate],
+    subjects: dict[str, list[str]] | None,
+    *,
+    label: str = "CERTIFICATE",
 ) -> HttpSource:
     """A loopback mTLS listener trusting ``trusted``, built through the ``Http()`` factory.
 
-    ``subjects`` set means ``mtls_subject``; ``None`` means a bare mTLS listener with no intake auth."""
+    ``subjects`` set means ``mtls_subject``; ``None`` means a bare mTLS listener with no intake auth.
+    ``label`` is the PEM label every block in ``tls_ca_file`` is written under."""
     cert, key = _self_signed(tmp_path)
     ca_file = tmp_path / "client-ca.pem"
-    ca_file.write_bytes(b"".join(_pem(c) for c in trusted))
+    ca_file.write_bytes(b"".join(_labelled(c, label) for c in trusted))
     spec = Http(
         port=0,
         tls=True,
@@ -107,19 +121,27 @@ async def _admitted(source: HttpSource, bundle: Path) -> int:
     return await _status(source, bundle, send=True)
 
 
+@pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
 async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subject_is_not(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
-    """The defect itself: two loaded CAs, and the unlisted one issues a listed subject."""
+    """The defect itself: two loaded CAs, and the unlisted one issues a listed subject.
+
+    Run under both labels the TLS context loads a CA from. Under the legacy ``X509 CERTIFICATE`` the
+    handshake verified a leaf, but the index read only ``BEGIN CERTIFICATE``, so it never held the
+    CA: every partner under it was refused, and the start warning said the key named no loaded CA
+    rather than that a block went unread (BACKLOG #4948)."""
     named = _ca(_dn((NameOID.ORGANIZATION_NAME, "Acme"), (NameOID.COMMON_NAME, "Partner CA")))
     other = _ca(_dn((NameOID.ORGANIZATION_NAME, "Other"), (NameOID.COMMON_NAME, "Other CA")))
-    source = await _started(
-        _source(
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        source = _source(
             tmp_path,
             [named[0], other[0]],
             {named[0].subject.rfc4514_string(): [SUBJECT]},
+            label=label,
         )
-    )
+    at_start = [r.getMessage() for r in caplog.records]
+    await _started(source)
     try:
         # Control: the same subject from the CA it is listed under is admitted.
         assert await _admitted(source, _bundle(tmp_path, named)) == 202
@@ -127,6 +149,7 @@ async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subjec
         assert await _refused(source, _bundle(tmp_path, other)) == 403
     finally:
         await source.stop()
+    assert not at_start, at_start
 
 
 async def test_a_ca_with_a_lookalike_name_is_refused(tmp_path: Path) -> None:
@@ -258,15 +281,17 @@ async def test_two_loaded_cas_with_one_name_and_different_keys_admit_neither(
         await source.stop()
 
 
+@pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
 def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
     """Driven at the index builder: a block OpenSSL loads but ``cryptography`` refuses is what this
     warns about, and a trust store the listener's context loads cannot be made to hold one here, so
-    the builder is handed the text directly."""
+    the builder is handed the text directly. Under either label the context loads a CA from, such a
+    block names no issuer and is counted: fail closed, with a warning (BACKLOG #4948)."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
-    junk = b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n"
-    cadata = (_pem(good[0]) + junk).decode("ascii")
+    junk = f"-----BEGIN {label}-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END {label}-----\n"
+    cadata = _pem(good[0]).decode("ascii") + junk
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         index = _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
     assert index is not None and index.unreadable == 1
@@ -277,6 +302,56 @@ def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         _client_issuer_index("IB_PARTNER", _pem(good[0]).decode("ascii"), {"CN=Acme CA": [SUBJECT]})
     assert not caplog.records
+
+
+def _probe(label: str, prefix: str) -> tuple[int, bool]:
+    """How many certificates ``cadata=`` loads from a plain CA plus a probe CA written under
+    ``label`` after ``prefix`` on its BEGIN line, and whether the index reads the probe."""
+    plain = _ca(_dn((NameOID.COMMON_NAME, "Plain CA")))
+    probe = _ca(_dn((NameOID.COMMON_NAME, "Probe CA")))
+    cadata = _pem(plain[0]).decode("ascii") + prefix + _labelled(probe[0], label).decode("ascii")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=cadata)
+    index = _client_issuer_index("IB_PARTNER", cadata, {})
+    assert index is not None and index.unreadable == 0
+    assert "CN=Plain CA" not in index.unmatched_keys(["CN=Plain CA"])  # control: always read
+    return ctx.cert_store_stats()["x509"], "CN=Probe CA" not in index.unmatched_keys(
+        ["CN=Probe CA"]
+    )
+
+
+@pytest.mark.parametrize("prefix", ["", " ", "x ", "\r"], ids=["line", "space", "text", "lone-cr"])
+@pytest.mark.parametrize(
+    "label",
+    [
+        "CERTIFICATE",
+        "X509 CERTIFICATE",
+        "TRUSTED CERTIFICATE",
+        "PKCS7",
+        "CERTIFICATE PAIR",
+        "x509 certificate",
+    ],
+)
+def test_the_index_reads_the_same_blocks_the_context_loads(label: str, prefix: str) -> None:
+    """The index and ``load_verify_locations(cadata=)`` agree, block by block (BACKLOG #4948).
+
+    Measured on CPython 3.14.7 / OpenSSL 3.5.7: beside a plain block, ``cadata=`` loads a certificate
+    from a ``CERTIFICATE`` or an ``X509 CERTIFICATE`` block whose BEGIN marker starts a line, and
+    skips, without a word, every other label and a marker after a space, text or a lone CR. A CA the
+    handshake trusts that the index skips denies every partner under it; a CA the index reads that
+    the handshake never loaded could be named for a leaf whose chain ran through a client-sent copy
+    of it. So each shape is asked of OpenSSL here, not assumed."""
+    loaded, indexed = _probe(label, prefix)
+    assert loaded in (1, 2), loaded
+    assert indexed == (loaded == 2), (label, prefix, loaded)
+
+
+def test_a_marker_254_bytes_into_a_line_is_skipped_though_the_context_loads_it() -> None:
+    """The one measured shape where the two disagree, kept so a change on either side is seen.
+    OpenSSL reads a long line in 254-byte pieces, so a BEGIN marker starting the second piece loads.
+    The index models a line, not those pieces, so it skips that CA: every partner under it is
+    denied, never admitted. ``pki._pem_certificate_blocks`` records the same trade."""
+    assert _probe("CERTIFICATE", "y" * 254) == (2, False)
 
 
 @pytest.mark.parametrize(

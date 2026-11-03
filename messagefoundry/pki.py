@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import ipaddress
 import os
+import re
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -1663,13 +1664,32 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
+#: The BEGIN marker of each PEM label ``load_verify_locations(cadata=)`` loads a certificate from:
+#: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE`` (BACKLOG #4948). The measurement, and the
+#: labels it skips, are in ``tests/test_inbound_http_intake_issuer.py``, which asks OpenSSL label by
+#: label. Group 1 is the label, which picks the matching END marker.
+_CERTIFICATE_BEGIN = re.compile(rb"-----BEGIN ((?:X509 )?CERTIFICATE)-----")
+
+
 def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
-    """Each ``CERTIFICATE`` PEM block in ``pem``, in order."""
-    begin, end = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
+    """Each certificate block in ``pem`` the TLS context loads from it as ``cadata``, in order.
+
+    A block the context loads but this skipped would hold a CA the handshake trusts and the index
+    never names, so every partner under it would be denied and the start warning would name the wrong
+    cause. A block this read but the context skipped would let a client-sent copy of that CA count as
+    loaded. So a block counts under a label :data:`_CERTIFICATE_BEGIN` matches, and only where its
+    BEGIN marker starts a line, the rule :func:`_crl_blocks` records. Like that reader this models
+    OpenSSL rather than being it: a marker 254 bytes into a line was measured to load, and is skipped
+    here, which denies rather than admits. A block read here that ``cryptography`` cannot parse is
+    counted in :attr:`IssuerIndex.unreadable` instead, which fails closed with a warning."""
     at = 0
-    while (start := pem.find(begin, at)) >= 0:
-        stop = pem.find(end, start)
+    while (begin := _CERTIFICATE_BEGIN.search(pem, at)) is not None:
+        if not _begins_line(pem, begin.start()):
+            at = begin.end()
+            continue
+        end = b"-----END " + begin[1] + b"-----"
+        stop = pem.find(end, begin.end())
         if stop < 0:
             return
         at = stop + len(end)
-        yield pem[start:at]
+        yield pem[begin.start() : at]
