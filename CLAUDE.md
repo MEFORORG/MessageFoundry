@@ -469,9 +469,9 @@ owner's GitHub identity, only the original author's comment or commit counts, a 
 Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
 branch updates included. A `hold-ack` expires 2 hours after it while it is still the original
 author's newest event since the hold and no commit by the original author has landed since it
-(decided by the Lander under the owner's delegation of 2026-11-03, records
-d20261103T190111765-2aa8b6 and d20261103T190116898-0f1b73: asked *"should a hold-ack expire 2h
-after it"*, the owner answered *"/driver"*). The hold then counts as unacknowledged, which
+(decided by the Lander under the owner's delegation of 2026-11-03, record
+d20261103T190111765-2aa8b6: asked *"should a hold-ack expire 2h after it"*, the owner answered
+*"/driver"*). The hold then counts as unacknowledged, which
 `scripts/coord/held_pr_turns.py` shows as the Lander's turn, flagged `ack-expired` only while the
 head is unchanged; any other head move already reads as the Lander's turn. A transfer on an
 expired `hold-ack` also needs the author to read not live: no live session, or a transcript that
