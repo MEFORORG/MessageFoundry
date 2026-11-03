@@ -27,7 +27,9 @@
 # measurement of one: no shard pool exists yet. Read the consequence before trusting a quiet run. A
 # shard does about half the work, so a shard run is not expected to reach a whole-suite record, and
 # the RE-DERIVE and RE-SIZE escalations are expected to stay silent on both shards until a re-measure
-# from shard pools replaces these rows. The gate itself is unaffected: it divides by the cap, never by a row.
+# from shard pools replaces these rows. One row per shard is not possible as the file stands: rows are
+# keyed by step and leg, and the two shard steps share both, so that re-measure also needs a key that
+# tells the shards apart, such as distinct step names. The gate itself is unaffected: it divides by the cap, never by a row.
 #
 # THE TWO LEGS NAME DIFFERENT KINDS OF NUMBER, AND THAT ASYMMETRY IS THE POINT OF THIS PARAGRAPH.
 # On the web console leg the gate's cap and the step's `timeout-minutes` were SPLIT: the kill is

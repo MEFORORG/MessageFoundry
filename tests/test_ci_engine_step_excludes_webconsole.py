@@ -138,7 +138,12 @@ def test_console_is_in_testpaths() -> None:
 
 
 def test_engine_step_subtracts_the_console_package() -> None:
-    """Without this, the console's ~356 tests run twice per leg."""
+    """Without this, the console's ~356 tests run twice per leg.
+
+    SINCE BACKLOG #5247 THE FLAG IS NOT WHAT KEEPS THEM OUT OF THE SHARD STEPS. Each shard names its
+    files, and pytest does not apply `--ignore-glob` to a named path. The selector's own exclusion
+    is the control there (tests/test_quality_shard_tests.py), and the flag prunes in the guard step's
+    unlisted collection, which tests/test_ci_engine_suite_shards.py holds to this selection."""
     for job_id, run in _engine_step_invocations():
         assert "--ignore-glob" in run and "messagefoundry-webconsole" in run, (
             f"ci.yml's {_ENGINE_STEP} step in job {job_id!r} must subtract the web console "

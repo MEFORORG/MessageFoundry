@@ -30,8 +30,11 @@ the smoke's readings to the `test (...)` jobs, and the herd floor is armed only 
 `--check-collection` IS THE PARTITION GUARD, and it reads pytest's own collection rather than this
 file's re-implementation of it. The arguments after `--` are the step's selection. It runs
 `pytest --collect-only -q` with them, and fails if a file pytest collects is in no shard or a file
-is in two. A listed file that collects nothing under the selection, such as one whose every test is
-quarantined, is printed and allowed: pytest deselects it inside its shard too.
+is in two. A listed file that collects nothing under the selection is printed and allowed, which is
+right for marker deselection (pytest deselects it inside its shard too) and for a module-level skip.
+It is NOT right for a collection-time ignore (`collect_ignore`, an ignore hook, `--ignore-glob`):
+pytest skips those for a path named on the command line, so a shard would run a file the plain suite
+ignores. No conftest here declares one; read the printed lines if one is ever added.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ import subprocess
 import sys
 import tomllib
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -146,11 +150,18 @@ def partition_faults(split: dict[int, list[str]], collected: set[str]) -> list[s
     return faults
 
 
-def check_collection(shards: int, suite: str, pytest_args: list[str]) -> int:
-    """Exit 0 when the shards partition pytest's collection, 1 when they do not, 2 when unmeasured."""
+def check_collection(
+    shards: int,
+    suite: str,
+    pytest_args: list[str],
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int:
+    """Exit 0 when the shards partition pytest's collection, 1 when they do not, 2 when unmeasured.
+
+    `run` is the seam a test replaces, so a stub never reaches the process-wide `subprocess.run`."""
     split = partition(shards, suite)
     # The argv is this interpreter's pytest plus the workflow's own selection, with no shell.
-    done = subprocess.run(  # noqa: S603  # nosec B603
+    done = run(  # noqa: S603  # nosec B603
         [
             sys.executable,
             "-m",
@@ -201,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("pytest_args", nargs="*", help="with --check-collection, the selection")
     args = parser.parse_args(argv)
+    if args.shards < 1:
+        parser.error(f"--of must be at least 1, got {args.shards}")
     if args.check_collection:
         if args.shard is not None:
             parser.error("--check-collection checks every shard, so it takes no --shard")

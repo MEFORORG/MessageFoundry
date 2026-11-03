@@ -332,9 +332,11 @@ would be exactly the thing it exists to prevent.
 
 ### The `CI gate` roll-up
 
-`CI gate` `needs:` the individual legs, runs with `if: always()`, and fails **only** on a `failure` or
+`CI gate` `needs:` the individual legs, runs with `if: always()`, and fails on a `failure` or
 `cancelled` leg. A **`skipped`** leg counts as a **pass** — that is what lets a path-gated leg stay off
-an unrelated PR without turning the gate red.
+an unrelated PR without turning the gate red. **One exception:** `test-shard2`, the engine suite's
+second shard (BACKLOG #5247), must SUCCEED wherever a `test` leg runs its suite (a code pull request,
+a push, a dispatch or a queue entry), so a skip there is a red too.
 
 **The Windows Postgres leg is deliberately outside the roll-up.** `postgres store (windows-2022)`
 and `postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres

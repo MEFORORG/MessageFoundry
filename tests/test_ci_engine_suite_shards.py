@@ -150,7 +150,9 @@ def test_the_partition_guard_reads_the_suite_s_own_selection() -> None:
     suite = _pytest_argv(str(_step("test", _STEP)["run"]))
     assert _selection(tail) == _selection(suite), (tail, suite)
     assert _selection(suite), "the suite step carries no selection, so this compares nothing"
-    assert guard[0].get("if") == "${{ !cancelled() && runner.os == 'Linux' }}"
+    assert guard[0].get("if") == (
+        "${{ !cancelled() && steps.tests.outcome == 'success' && runner.os == 'Linux' }}"
+    )
     # The matrix's ubuntu leg is the one a fork's matrix keeps, so the guard runs on every repo.
     assert '"os":"ubuntu-latest"' in _CI.read_text(encoding="utf-8")
 

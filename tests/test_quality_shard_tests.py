@@ -175,22 +175,22 @@ def test_the_partition_faults_name_a_missing_file_a_doubled_file_and_an_empty_co
 
 
 def test_check_collection_exits_by_what_pytest_collected(
-    mod: ModuleType, monkeypatch: pytest.MonkeyPatch, engine: dict[int, list[str]]
+    mod: ModuleType, engine: dict[int, list[str]]
 ) -> None:
     """The real collection is a ci.yml step, too slow for a unit test; this drives its verdicts on
     a stubbed one. Falsified by returning 0 on a fault: RED on the second call. Restored."""
 
-    def collect(stdout: str, returncode: int = 0) -> None:
+    def check(stdout: str, returncode: int = 0) -> int:
         done = subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: done)
+        return mod.check_collection(2, "engine", ["-m", "x"], run=lambda *a, **k: done)
 
     every = engine[1] + engine[2]
-    collect("".join(f"{path}::test_x\n" for path in every))
-    assert mod.main(["--suite", "engine", "--of", "2", "--check-collection", "--", "-m", "x"]) == 0
-    collect("".join(f"{path}::test_x\n" for path in [*every, "tests/test_nowhere.py"]))
-    assert mod.main(["--suite", "engine", "--of", "2", "--check-collection"]) == 1
-    collect("", returncode=4)
-    assert mod.main(["--suite", "engine", "--of", "2", "--check-collection"]) == 2
+    assert check("".join(f"{path}::test_x\n" for path in every)) == 0
+    assert check("".join(f"{path}::test_x\n" for path in [*every, "tests/test_nowhere.py"])) == 1
+    assert check("", returncode=4) == 2
+    for bad in ("0", "-1"):
+        with pytest.raises(SystemExit):
+            mod.main(["--suite", "engine", "--of", bad, "--check-collection"])
     with pytest.raises(SystemExit):
         mod.main(["--suite", "engine", "--shard", "1", "--of", "2", "--check-collection"])
     with pytest.raises(SystemExit):

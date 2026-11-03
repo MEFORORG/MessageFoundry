@@ -1185,9 +1185,16 @@ jobs:
         # `--suite engine` assigns each whole file to one shard, the split quality-advisory.yml's
         # `coverage-shard` uses; that job's header says why a hash and not a durations table. The file
         # list reaches pytest as an `@file` argument, so its length never meets the Windows
-        # command-line limit. `--ignore-glob` stays: the list already leaves the console package out,
-        # and the flag still pins the selection on this line. `test-shard2` runs this same body, and
-        # its `--check-collection` step compares both lists with pytest's own collection.
+        # command-line limit. The selector leaves the tooling files out of the list by the same
+        # manifest the marker reads, and the console package out by this line's glob.
+        #
+        # SO `--ignore-glob` PRUNES NOTHING ON THIS LINE ANY MORE, and the #1027 note above describes
+        # the step before the split. pytest does not apply it to a path named on the command line
+        # (measured 2026-11-03: a glob matching a named file still collected all of its tests). The
+        # list is now what keeps the console tests from running twice. The flag stays because the
+        # guard step in `test-shard2` collects WITHOUT a list, where it does prune, and the two
+        # selections are held equal. `test-shard2` runs this same body, and that guard compares both
+        # lists with pytest's own collection.
         # tests/test_ci_engine_suite_shards.py holds the two jobs' bodies identical.
         run: |
           mkdir -p out/engine-shard
@@ -1484,8 +1491,10 @@ jobs:
       # selection and fails if a collected file is in neither shard or a file is in both. The split is
       # a pure function of the tree, so one leg answers for all three. After the margin check, so its
       # collection is not timed as part of the suite.
+      # Only after a passing suite: after one killed at its cap, the guard's minutes could push the job
+      # past `job_timeout`, and a hang would then report as a cancellation.
       - name: Engine shards partition pytest's collection
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 6
         env:
           QT_QPA_PLATFORM: offscreen
@@ -6683,4 +6692,4 @@ jobs:
           exit 1
 
       - name: Gated legs OK
-        run: echo "All gated CI legs succeeded or were skipped."
+        run: echo "All gated CI legs succeeded, or were skipped where a skip is allowed."

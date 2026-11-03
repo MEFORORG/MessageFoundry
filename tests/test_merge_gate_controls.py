@@ -214,9 +214,9 @@ def _rollup_fires(condition: str, results: list[str]) -> bool:
     return _evaluate(condition, results)
 
 
-def _gate_fires(results: list[str]) -> bool:
+def _gate_fires(results: list[str], context: dict[str, str] | None = None) -> bool:
     """Does the gate as a WHOLE fail on this results vector? Any failing step firing is enough."""
-    return any(_evaluate(cond, results) for _, cond in _rollup_fail_conditions())
+    return any(_evaluate(cond, results, context) for _, cond in _rollup_fail_conditions())
 
 
 def _states_the_gate_fires_on() -> set[str]:
@@ -265,6 +265,11 @@ def test_the_ci_gate_rollup_stays_green_when_every_gated_leg_skipped() -> None:
     """
     assert not _gate_fires(["skipped"] * 6)
     assert not _gate_fires(["success"] * 6)
+    # BACKLOG #5247 is the one need whose skip is NOT always a pass. On a docs-only PR it skips with
+    # the rest and the gate stays green; on a code PR its skip reds the gate.
+    docs_only = dict(_DEFAULT_CONTEXT, code="false", need_test_shard2="skipped")
+    assert not _gate_fires(["skipped"] * 7, docs_only)
+    assert _gate_fires(["skipped"] * 7, dict(docs_only, code="true"))
     assert not _gate_fires(["success", "skipped", "skipped", "success", "skipped"])
 
 
