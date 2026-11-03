@@ -541,8 +541,8 @@ function Get-DesktopSessionRecordFiles([string]$Dir, [string]$HomeDir) {
     $roots = [System.Collections.Generic.List[string]]::new()
     if ($Dir) { $roots.Add($Dir) }
     if ($HomeDir -and (Test-Path -LiteralPath $HomeDir -PathType Container)) {
-        # -Force here and below because Python's glob does not skip a hidden item. Sorted ordinally, as
-        # watch.py's sorted() sorts its roots.
+        # -Force here and below because Python's glob skips a dot-named item, never one with the Hidden
+        # attribute. Sorted ordinally, as watch.py's sorted() sorts its roots.
         $found = [string[]]@(Get-ChildItem -LiteralPath $HomeDir -Directory -Force -Filter ".claude-desktop-*" |
             ForEach-Object { Join-Path $_.FullName "claude-code-sessions" })
         [Array]::Sort($found, [StringComparer]::Ordinal)
@@ -555,8 +555,11 @@ function Get-DesktopSessionRecordFiles([string]$Dir, [string]$HomeDir) {
         try { $key = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($root)).ToLowerInvariant() } catch { continue }
         if (-not $seen.Add($key)) { continue }
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        Get-ChildItem -LiteralPath $root -Directory -Force | Get-ChildItem -Directory -Force |
-            Get-ChildItem -Filter "local_*.json" -File -Force
+        # watch.py's glob is */*/local_*.json: each * skips a name that starts with a dot, and the last
+        # part matches a directory too, which counts toward the cap and is skipped when read below.
+        Get-ChildItem -LiteralPath $root -Directory -Force | Where-Object { -not $_.Name.StartsWith(".") } |
+            Get-ChildItem -Directory -Force | Where-Object { -not $_.Name.StartsWith(".") } |
+            Get-ChildItem -Filter "local_*.json" -Force
     }
     # -Stable, because watch.py's list.sort is stable: a tie keeps root order, then listing order.
     return @($files | Sort-Object LastWriteTimeUtc -Descending -Stable | Select-Object -First 400)

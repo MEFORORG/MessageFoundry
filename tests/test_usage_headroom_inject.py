@@ -1003,6 +1003,24 @@ def test_a_record_only_under_a_per_account_root_resolves(
     assert pool_read(desktop_context(tmp_path, args))[1] == named_by
 
 
+@pytest.mark.parametrize(
+    ("acct", "org", "named_by"),
+    [
+        pytest.param(APP_ACCT, OTHER, BY_RECORD, id="control"),
+        pytest.param(f".{APP_ACCT}", OTHER, BY_LOGIN, id="dot-named-account"),
+        pytest.param(APP_ACCT, f".{OTHER}", BY_LOGIN, id="dot-named-org"),
+    ],
+)
+def test_a_record_under_a_dot_named_directory_is_not_read(
+    tmp_path: Path, acct: str, org: str, named_by: str
+) -> None:
+    """watch.py's glob */*/local_*.json skips a dot-named directory at either level, so the hook does
+    too, or the two would name different pools for one session."""
+    args = steward_files(tmp_path, two_pools())
+    session_record(account_root(tmp_path, 2), acct, org)
+    assert pool_read(desktop_context(tmp_path, args))[1] == named_by
+
+
 def test_the_app_wide_root_still_resolves_beside_the_per_account_roots(tmp_path: Path) -> None:
     """An install that still writes %APPDATA%\\Claude keeps resolving, with per-account roots present
     and holding only other sessions' records."""
