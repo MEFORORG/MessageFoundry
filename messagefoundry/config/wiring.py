@@ -6239,26 +6239,22 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         return False
 
     def _typed_refused(
-        settings: Mapping[str, Any],
-        attested: bool,
-        reason: str | None,
-        *,
-        accepted: bool = False,
-        cleartext_reason: str | None = None,
-        revocation: bool = False,
-        revocation_reason: str | None = None,
+        settings: Mapping[str, Any], attested: bool, reason: str | None, accepted: bool
     ) -> bool:
-        # What _source_config and _dest_config refuse on a connection's declarations: a raw
-        # attestation key in its transport settings, the other declaration pairs the Source and
-        # Destination validators check, then the typed attestation by the settings carriers' own
-        # rule above (the flag type, a missing, blank or control-character reason, and the
-        # attested-plus-accepted pair). Such an entry is a hop the engine never builds, however it
-        # got past the factory.
+        # What _source_config and _dest_config refuse on a connection: a raw attestation key in its
+        # transport settings, then the typed pair by the settings carriers' own rule above (the flag
+        # type, a missing, blank or control-character reason, and the attested-plus-accepted pair,
+        # which outbound() and the Destination model refuse). Such an entry is a hop the engine
+        # never builds, however it got past the factory.
+        #
+        # It does NOT read the cleartext or revocation pairs. The Source and Destination models
+        # coerce those flags as lax bool, so the strict require_flag rule would mark REFUSED a hop
+        # the build builds (an int 1 or 0), and a reason of a wrong type would reach .strip() here
+        # and crash the report. A wrong pair there is therefore listed as a hop crossed, which errs
+        # toward listing rather than toward hiding a hop the engine builds.
         try:
             refuse_raw_hop_attestation(settings, "")
-            _check_cleartext_acceptance(accepted, cleartext_reason)
-            _check_revocation_attestation(revocation, revocation_reason)
-        except (WiringError, ValueError):
+        except WiringError:
             return True
         pair = {"tls_hop_attested": attested, "tls_hop_attested_reason": reason}
         return _refused("", pair, accepted)
@@ -6268,11 +6264,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             inbound_record_name(ic.name),
             _attested_reason_text(ic.tls_hop_attested_reason),
             _typed_refused(
-                ic.spec.settings,
-                ic.tls_hop_attested,
-                ic.tls_hop_attested_reason,
-                revocation=ic.tls_revocation_attested,
-                revocation_reason=ic.tls_revocation_attested_reason,
+                ic.spec.settings, ic.tls_hop_attested, ic.tls_hop_attested_reason, False
             ),
         )
         for ic in registry.inbound.values()
@@ -6286,10 +6278,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
                 oc.spec.settings,
                 oc.tls_hop_attested,
                 oc.tls_hop_attested_reason,
-                accepted=oc.cleartext_accepted,
-                cleartext_reason=oc.cleartext_reason,
-                revocation=oc.tls_revocation_attested,
-                revocation_reason=oc.tls_revocation_attested_reason,
+                oc.cleartext_accepted,
             ),
         )
         for oc in registry.outbound.values()

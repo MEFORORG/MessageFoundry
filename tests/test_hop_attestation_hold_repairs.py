@@ -242,22 +242,55 @@ def test_a_site_proxy_credential_is_refused_for_it_before_its_shape() -> None:
         )
 
 
-# --- review round 2 ------------------------------------------------------------------------------
+# --- review round 3: the report reads only what the build reads ---------------------------------
+
+_ATTEST: dict[str, Any] = {"tls_hop_attested": True, "tls_hop_attested_reason": REASON}
 
 
-def test_a_connection_another_declaration_pair_refuses_is_marked_refused() -> None:
-    """The Source and Destination validators also refuse the revocation and cleartext pairs, so a
-    hop refused for one of them is never built and is marked refused."""
-    reg = Registry()
+def test_a_hop_the_build_builds_with_an_int_flag_is_not_marked_refused() -> None:
+    """The Source and Destination models coerce the revocation and cleartext flags as lax bool, so
+    the build builds a hop that sets one to an int. The report must not call that hop refused."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import _dest_config, _source_config
+
     spec = File(directory=".")
-    attest: dict[str, Any] = {"tls_hop_attested": True, "tls_hop_attested_reason": REASON}
-    reg.add_outbound(OutboundConnection("OB_REVOKE", spec, tls_revocation_attested=True, **attest))
-    reg.add_outbound(OutboundConnection("OB_CLEAR", spec, cleartext_reason="why", **attest))
-    reg.add_outbound(OutboundConnection("OB_GOOD", spec, **attest))
-    reg.add_inbound(
-        InboundConnection("IB_REVOKE", spec, "R", tls_revocation_attested=True, **attest)
-    )
+    revoke: dict[str, Any] = {"tls_revocation_attested": 1, "tls_revocation_attested_reason": "pki"}
+    clear: dict[str, Any] = {"cleartext_accepted": 0}
+    outbounds = [
+        OutboundConnection("OB_REVOKE_INT", spec, **revoke, **_ATTEST),
+        OutboundConnection("OB_CLEAR_INT", spec, **clear, **_ATTEST),
+    ]
+    inbound = InboundConnection("IB_REVOKE_INT", spec, "R", **revoke, **_ATTEST)
+    # The premise: the build builds each of them.
+    for oc in outbounds:
+        _dest_config(oc, {}, None, EgressSettings())
+    _source_config(inbound, "127.0.0.1", {})
+
+    reg = Registry()
+    for oc in outbounds:
+        reg.add_outbound(oc)
+    reg.add_inbound(inbound)
     records = {hop.name: hop.refused for hop in attested_secure_hop_records(reg)}
-    assert records["OB_REVOKE"] is True and records["OB_CLEAR"] is True
-    assert records["OB_GOOD"] is False
-    assert [refused for name, refused in records.items() if "IB_REVOKE" in name] == [True]
+    assert len(records) == 3
+    assert not any(records.values()), records
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"cleartext_accepted": True, "cleartext_reason": 5},
+        {"tls_revocation_attested": True, "tls_revocation_attested_reason": 5},
+        {"tls_revocation_attested": True, "tls_revocation_attested_reason": ["x"]},
+    ],
+    ids=["cleartext-int", "revocation-int", "revocation-list"],
+)
+def test_a_non_str_declaration_reason_does_not_crash_the_report(extra: dict[str, Any]) -> None:
+    """A reason of a wrong type, set past the factory, must not raise out of the report that
+    ``messagefoundry check`` and ``/security/posture`` both render."""
+    spec = File(directory=".")
+    reg = Registry()
+    reg.add_outbound(OutboundConnection("OB_ODD", spec, **extra, **_ATTEST))
+    if "cleartext_accepted" not in extra:
+        reg.add_inbound(InboundConnection("IB_ODD", spec, "R", **extra, **_ATTEST))
+    names = [hop.name for hop in attested_secure_hop_records(reg)]
+    assert "OB_ODD" in names
