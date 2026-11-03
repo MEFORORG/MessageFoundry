@@ -1120,26 +1120,56 @@ class _EventSink:
         self.events.append((kind, peer_host, reason))
 
 
-async def test_source_handler_failure_stops_the_batch_so_no_later_row_is_marked() -> None:
-    """BACKLOG #4921. With a high-water-mark ``mark_statement``, a later row's mark advances the
-    cursor past an earlier row whose handler failed, and the next poll never selects that row
-    again. So a handler failure stops the poll: the row before it is handed off and marked, and no
-    row after it is handed off or marked.
+HWM_POLL = "SELECT id, payload FROM mf_inbox WHERE id > (SELECT last_id FROM mf_cursor) ORDER BY id"
+HWM_MARK = "UPDATE mf_cursor SET last_id=:id"
 
-    Red mutation: drop the ``break`` on a failed hand-off in ``_poll_once``. Row 3 is then handed
-    off and marked, and both assertions red."""
-    src = _src(body_column="payload")
+
+class _HighWaterCursor(_SrcCursor):
+    """A table read through a high-water-mark cursor: the poll selects the rows above ``last_id`` in
+    id order, and a mark sets ``last_id`` to the marked row's id."""
+
+    def __init__(self, table: list[tuple[int, str]]) -> None:
+        super().__init__(["id", "payload"], [])
+        self._table = table
+        self.last_id = 0
+
+    async def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        await super().execute(sql, params)
+        if params is None:
+            self._rows = [row for row in self._table if row[0] > self.last_id]
+            self._position = 0
+        else:
+            self.last_id = params[0]
+
+
+async def test_source_handler_failure_does_not_lose_the_row_under_a_high_water_mark() -> None:
+    """BACKLOG #4921. With a high-water-mark ``mark_statement``, a later row's mark used to move the
+    cursor past an earlier row whose handler failed, so no later poll selected that row again. A
+    handler failure now stops the poll: the row before it is handed off and marked, nothing after
+    it is, and the next poll starts at the failed row.
+
+    Red mutation: drop the ``break`` on a failed hand-off in ``_poll_once``. Row 3 is then marked in
+    the first poll, the cursor passes row 2, and the second poll selects nothing."""
+    src = _src(body_column="payload", poll_statement=HWM_POLL, mark_statement=HWM_MARK)
     h = _RecordingHandler(RuntimeError("store write failed"), fail_on={b"B"})
-    cur = await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B"), (3, "C")], h)
-    assert h.bodies == [b"A", b"B"]  # row 3 is never handed off this poll
-    assert cur.marks == [("UPDATE mf_inbox SET status='DONE' WHERE id=?", (1,))]
+    cur = _HighWaterCursor([(1, "A"), (2, "B"), (3, "C")])
+    src._pool = _SrcPool(_SrcConn(cur))
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"A", b"B"]  # row 3 is not handed off in the poll where row 2 failed
+    assert cur.last_id == 1  # ... and the cursor stays below the failed row
+    h._fail_on = set()  # the outage is over
+    await src._poll_once()
+    assert h.bodies == [b"A", b"B", b"B", b"C"]  # the next poll starts at the failed row
+    assert cur.last_id == 3
 
 
 async def test_source_handler_failure_emits_a_handler_error_event() -> None:
     """BACKLOG #4921, the visibility half. Stopping the batch means one row that fails every time
     holds the feed, so the failure must reach the event log, not only a WARNING. One event per
-    poll, NULL peer (a poll source dials out), and a reason that names the driver error but never
-    the value it quotes.
+    poll, NULL peer (a poll source dials out), and a reason that leads with the fixed outcome, so
+    the store's 200-character bound cuts the error text and never the outcome, and names the
+    driver error but not the value it quotes.
 
     Red mutation: delete the ``_emit_event`` call in ``_ingest_row``. Reds here."""
     truncated = (
@@ -1154,33 +1184,24 @@ async def test_source_handler_failure_emits_a_handler_error_event() -> None:
     await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B")], h)
     assert [(kind, peer) for kind, peer, _reason in sink.events] == [("handler_error", None)]
     reason = sink.events[0][2] or ""
+    assert reason.startswith("row left unmarked and poll stopped")
     assert "[22001] driver error 2628" in reason
-    assert "poll stopped" in reason
     assert _SYNTHETIC_ID not in reason
 
 
-async def test_source_success_and_mark_failure_emit_no_handler_error_event() -> None:
-    """Only a handler failure emits the event: a clean row and a row whose mark failed (the row
-    was ingested, so the batch goes on) emit nothing."""
+async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
+    """A row whose mark failed was still ingested, so the batch goes on and no event is emitted;
+    only a handler failure stops the poll (BACKLOG #4921)."""
     src = _src(body_column="payload")
     sink = _EventSink()
     src.on_connection_event = sink
-    h = _RecordingHandler()
-    await _run_poll(
-        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
-    )
-    assert h.bodies == [b"A", b"B"]
-    assert sink.events == []
-
-
-async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
-    src = _src(body_column="payload")
     h = _RecordingHandler()
     cur = await _run_poll(
         src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
     )
     assert h.bodies == [b"A", b"B"]  # both rows handled despite the first mark erroring
     assert len(cur.marks) == 2  # both marks attempted (the error is logged, not fatal)
+    assert sink.events == []
 
 
 async def test_source_without_mark_statement_does_not_mark() -> None:

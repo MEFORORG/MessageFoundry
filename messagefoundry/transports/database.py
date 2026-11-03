@@ -3345,8 +3345,10 @@ class DatabaseSource(SourceConnector):
                 # BACKLOG #4921. Stop at the first handler failure: no later row of this poll is
                 # handed off or marked. A high-water-mark mark_statement would otherwise run on the
                 # next row and move the cursor past the failed one, which the next poll would then
-                # never select. The failed row and every row behind it wait for the next poll, so
-                # a row that fails every time holds back the rows behind it (head-of-line).
+                # never select. That holds only while poll_statement returns rows in cursor order;
+                # an earlier row with a higher key has already moved the cursor. The failed row and
+                # every row behind it wait for the next poll, so a row that fails every time holds
+                # back the rows behind it (head-of-line).
                 break
 
     async def _ingest_row(self, record: dict[str, Any], body: str) -> bool:
@@ -3373,9 +3375,9 @@ class DatabaseSource(SourceConnector):
                 "poll's rows are left for the next poll): %s",
                 reason,
             )
+            # The fixed outcome leads, so the store's bound on a reason cuts the error text, never it.
             await self._emit_event(
-                "handler_error",
-                reason=f"{reason}; row left unmarked, poll stopped, retried next poll",
+                "handler_error", reason=f"row left unmarked and poll stopped: {reason}"
             )
             return False
         try:

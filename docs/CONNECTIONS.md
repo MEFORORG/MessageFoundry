@@ -2290,13 +2290,18 @@ pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefl
 (see the `poll_statement` row above). **A handler failure also stops the poll at that row** (BACKLOG
 #4921): no later row of the same poll is handed off or marked, and the next poll starts again from
 what is still unmarked. That keeps a high-water-mark `mark_statement` from moving the cursor past
-a failed row: a later row's mark would otherwise do so, and the poll would never select the failed
-row again. **The trade-off is head-of-line blocking.** A row whose handler fails on every attempt,
-such as one whose value a server store rejects as too long, holds back every row `poll_statement`
-returns after it, on every poll and whatever the mark shape; with an `ORDER BY` on the cursor or key
-that is the whole feed. Each failure logs a WARNING and emits a `handler_error` connection event,
-once per poll. Its reason renders the error the way the log line does: a driver error as its type,
-SQLSTATE and native error number, never its message. Repair or remove that row to release the feed.
+a failed row, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
+column): a later row's mark would otherwise do so, and the poll would never select the failed row
+again. Without that order, a row with a higher key handed off earlier in the same poll has already
+moved the cursor past it. **The trade-off is head-of-line blocking.** A row whose handler fails on
+every attempt, such as one whose value a server store rejects as too long, holds back every row
+`poll_statement` returns after it, on every poll and whatever the mark shape, a status column or a
+delete-from-queue included; with an `ORDER BY` that is the whole feed. Each failure logs a WARNING
+and, when connection events are captured, emits a `handler_error` connection event, once per poll.
+Its reason renders the error the way the log line does: a driver error as its type, SQLSTATE and
+native error number, without its message, and any other error as the scrubbed, bounded text of
+`safe_exc`, which is a bound rather than a guarantee that no value survives. Repair or remove that
+row to release the feed.
 **A row the source cannot decode is different:** it is skipped rather than stopped at (see
 [per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
 still moves the cursor past it, and its `row_undecodable` event is the record of it.
@@ -4199,9 +4204,11 @@ the poll does not fetch is still in the table, unmarked. The next tick takes it.
 the [`poll_statement`](#database-source--databasepoll) row. On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
-least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
-the rest, end every poll at the skip cap described below, so the rows behind them would never be
-reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
+least two cases would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
+the rest, end every poll at the skip cap described below, and one row whose handler fails every time
+stops every poll at that row (BACKLOG #4921, the head-of-line trade-off in the
+[Database source](#database-source--databasepoll) section), so in either case the rows behind would
+never be reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
 accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never read was
 never received, and there is no disposition to record. A poll that writes and passes the read-only
 test would break that: at least the rows it marked past the ceiling would be accepted-and-dropped.
