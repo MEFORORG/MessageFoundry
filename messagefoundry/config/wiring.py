@@ -4346,7 +4346,8 @@ def DatabasePoll(
     keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
-    A ``poll_statement`` that could write is refused: a literal one here, when declared, and every
+    A ``poll_statement`` that could write is refused: a literal one here, when declared (as
+    ``generic`` while the dialect is an ``env()`` value), and every
     one, an ``env()`` value included, when the source is built (BACKLOG #2178;
     ``transports.database._read_only_poll_refusal`` says what and why)."""
     _reject_envref_odbc_params(odbc_params)
@@ -4354,10 +4355,14 @@ def DatabasePoll(
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
     # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
     # this module at its top level.
+    # A dialect that is not a literal (an env() ref) is tested as generic, the permissive superset:
+    # it refuses every write the strict test does and admits only the INSERT(/TRUNCATE( calls, which
+    # the build re-tests with the resolved dialect. So no dialect is guessed into a false refusal.
     if isinstance(poll_statement, str) and poll_statement:
         from messagefoundry.transports.database import _read_only_poll_refusal
 
-        poll_refusal = _read_only_poll_refusal(poll_statement)
+        poll_dialect = dialect.lower() if isinstance(dialect, str) else "generic"
+        poll_refusal = _read_only_poll_refusal(poll_statement, dialect=poll_dialect)
         if poll_refusal is not None:
             raise WiringError(poll_refusal)
     return ConnectionSpec(

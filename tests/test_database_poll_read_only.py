@@ -15,7 +15,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import DatabasePoll, WiringError
-from messagefoundry.transports import build_source
+from messagefoundry.transports import build_source, database
 from messagefoundry.transports.database import DatabaseSource
 
 _MARK = "UPDATE mf_inbox SET status='DONE' WHERE id=:id"
@@ -135,3 +135,57 @@ def test_a_read_only_poll_statement_still_builds(poll: str) -> None:
     ).settings
     assert settings["poll_statement"] == poll
     assert isinstance(_build_raw(poll), DatabaseSource)
+
+
+def test_the_poll_test_admits_mysql_scalar_insert_on_the_generic_dialect_only() -> None:
+    """``DatabasePoll`` and ``DatabaseSource`` pass the poll's dialect to the read-only test, so
+    MySQL's scalar ``INSERT()`` passes on a generic poll and is refused on the SQL Server preset.
+
+    Red mutation: drop ``dialect=`` from either call and one half reds."""
+    poll = "SELECT id, INSERT(payload, 1, 0, 'x') AS payload FROM mf_inbox"
+    spec = DatabasePoll(
+        server="sql.example.com",
+        poll_statement=poll,
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.0 Unicode Driver",
+        mark_statement=_MARK,
+    )
+    assert spec.settings["poll_statement"] == poll
+    with pytest.raises(WiringError, match="found a 'INSERT' keyword"):
+        DatabasePoll(server="sql.example.com", database="MFDB", poll_statement=poll)
+    with pytest.raises(ValueError, match="found a 'INSERT' keyword"):
+        _build_raw(poll)
+    generic = _build_raw(
+        poll,
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.0 Unicode Driver",
+        odbc_params={"SSLMODE": "VERIFY_IDENTITY"},
+    )
+    assert isinstance(generic, DatabaseSource)
+    assert database._read_only_poll_refusal(poll, dialect="generic") is None
+
+
+def test_an_env_dialect_poll_is_tested_as_generic_when_declared() -> None:
+    """A dialect that is not a literal is tested as ``generic`` at declaration, the permissive
+    superset: it admits MySQL's scalar ``INSERT()``, which the build re-tests with the resolved
+    dialect, and still refuses every write, as origin/main did with its single test.
+
+    Red mutation: skip the declaration test for a non-literal dialect and the UPDATE poll declares."""
+    from messagefoundry.config.wiring import env
+
+    poll = "SELECT id, INSERT(payload, 1, 0, 'x') AS payload FROM mf_inbox"
+    spec = DatabasePoll(
+        server="sql.example.com",
+        poll_statement=poll,
+        dialect=env("DB_DIALECT"),  # type: ignore[arg-type]
+        mark_statement=_MARK,
+    )
+    assert spec.settings["poll_statement"] == poll
+    with pytest.raises(WiringError) as info:
+        DatabasePoll(
+            server="sql.example.com",
+            poll_statement="UPDATE mf_inbox SET status='CLAIMED' WHERE status='NEW'",
+            dialect=env("DB_DIALECT"),  # type: ignore[arg-type]
+            mark_statement=_MARK,
+        )
+    _assert_refusal_text(str(info.value))
