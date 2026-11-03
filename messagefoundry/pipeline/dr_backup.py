@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
 import errno
 import functools
 import hmac
@@ -56,7 +55,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import BinaryIO, cast
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
@@ -97,6 +96,17 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.transports.file import (
+    _NAME_SURROGATE,
+    _WIN_UNSUPPORTED,
+    _handle_final_path,
+    _os_handle,
+    _Replaced,
+    _Unconfined,
+    _win_hold_dirs,
+    _win_open_file,
+    _win_release,
+)
 
 __all__ = [
     "BackupRunner",
@@ -1787,11 +1797,13 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     - POSIX: :func:`_fd_walk` hands over a descriptor per directory and opens each child directory with
       ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
-    - Windows: ``staging`` and each directory under it are opened without following a reparse point
-      that names another path, and must lie under ``staging``'s final path, or the directory is left
-      unwalked and reported without its name. Each file is opened the same way, and its final path
-      must lie under ``staging``'s too. A reparse point that names no path (a cloud, deduplicated or
-      tiered file) is opened again so its filter serves it, and must still be the same file.
+    - Windows: :func:`_win_held_walk` opens ``staging`` and each directory under it without following a
+      reparse point that names another path, and HOLDS each, so that none can be renamed, from before
+      its check until its files have been emptied (BACKLOG #4992). A directory must lie under
+      ``staging``'s final path, or it is left unwalked and reported without its name. Each file is
+      opened the same way, and must be a regular file with one link, before a reparse point that names
+      no path (a cloud, deduplicated or tiered file) is opened again so its filter serves it; that
+      second open must reach the same file, and its final path must lie under ``staging``'s too.
 
     What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
     unproven: list[str] = []
@@ -1806,37 +1818,8 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     walked = False
     if sys.platform == "win32":
-        try:
-            inside = _win_real_directory(staging)
-        except OSError as exc:
-            if getattr(exc, "winerror", None) in _WIN_FINAL_PATH_UNSUPPORTED:
-                # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM
-                # disks) cannot name a handle's final path, so nothing here can be shown to lie
-                # inside the directory. Truncating by path instead is what BACKLOG #2420 removed,
-                # so nothing is emptied, and that is said, without any file's name.
-                log.warning(
-                    "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
-                    "cannot report a file's final path, so no file in it was emptied",
-                    staging,
-                )
-            _unlisted(exc)
-            return unproven
-        for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
+        for dirpath, dirnames, filenames, inside in _win_held_walk(staging, unproven, _report):
             walked = True
-            # Checked before any of its entries is opened or named: a directory swapped for a
-            # junction after its listing, or reached through one, is not walked.
-            try:
-                outside = not _win_real_directory(Path(dirpath)).startswith(inside)
-            except NotADirectoryError:
-                outside = True
-            except OSError as exc:
-                dirnames[:] = []
-                _unlisted(exc)
-                continue
-            if outside:
-                dirnames[:] = []
-                _report(_OUTSIDE_REASON)
-                continue
             # Never descend through a link or a junction, which `os.walk` follows even with
             # `followlinks=False`.
             dirnames[:] = [
@@ -1861,10 +1844,10 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
 
-#: The Win32 errors ``GetFinalPathNameByHandleW`` returns on a volume that does not support it:
-#: ``ERROR_INVALID_FUNCTION``, ``ERROR_NOT_SUPPORTED`` and ``ERROR_INVALID_PARAMETER``, the set
-#: ``transports/file.py`` treats as "this volume does not do that".
-_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50, 87})
+
+class _HardLinked(OSError):
+    """Windows: the file opened as itself has a second link, so it is refused before any filter acts
+    on it (see :func:`_win_vet_for_truncate`). Never carries a name."""
 
 
 def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
@@ -1872,8 +1855,8 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
     ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
-    path on Windows, as :func:`_win_real_directory` returns it. The ``lstat`` first only skips a link
-    or a hard link without opening it; the check that decides is the one on the open handle."""
+    path on Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a
+    hard link without opening it; the check that decides is the one on the open handle."""
     name = entry.name
     try:
         st = (
@@ -1897,13 +1880,19 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
         fd = _open_unfollowed(entry, dir_fd)
     except FileNotFoundError:
         return None
+    except _HardLinked:
+        return f"{name} (hard-linked, not truncated)"
+    except (_Unconfined, _Replaced):
+        # Windows: the name became a link, or not a regular file, or the reopen that lets a filter
+        # serve the file reached another one. A swap, not something reached through a link.
+        return f"{name} (changed while being emptied, not truncated)"
     except OSError:
         return name
     try:
-        if inside is not None and not _win_final_path(fd).startswith(inside):
+        if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
             return _OUTSIDE_REASON
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or _names_another_path(fd):
+        if not stat.S_ISREG(opened.st_mode):
             return f"{name} (changed while being emptied, not truncated)"
         if opened.st_nlink > 1:
             return f"{name} (hard-linked, not truncated)"
@@ -1924,164 +1913,152 @@ def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
     after the check fails at once rather than holding the teardown's thread until a reader comes; it
     also makes an open that breaks a file lease fail rather than wait, and that file is reported.
 
-    Windows opens ``entry`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, so a link or junction there is
-    opened as itself, which the caller's check then refuses. A reparse point that names no path is
-    opened again so its filter serves its data, and must be the same file, or this raises."""
+    Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
+    connector's own open: as itself, refusing a link or junction there (``_Unconfined``). The file
+    must then be a regular file with one link (:func:`_win_vet_for_truncate`) BEFORE a reparse point
+    that names no path is opened again so its filter serves its data, so no filter recalls or
+    hydrates a file that check refuses (BACKLOG #4992). That reopen must reach the same file, or this
+    raises ``_Replaced``."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
-        fd = _win_open(entry, access, _WIN_OPEN_REPARSE_POINT, os.O_RDWR)
-        try:
-            attributes, tag = _win_attribute_tag(fd)
-            if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and not tag & _WIN_NAME_SURROGATE:
-                first = os.fstat(fd)
-                os.close(fd)
-                fd = -1
-                fd = _win_open(entry, access, 0, os.O_RDWR)
-                again = os.fstat(fd)
-                if (again.st_dev, again.st_ino) != (first.st_dev, first.st_ino):
-                    raise OSError(errno.ESTALE, "not the file first opened", str(entry))
-        except OSError:
-            if fd >= 0:
-                os.close(fd)
-            raise
-        return fd
+        return _win_open_file(entry, access, vet=_win_vet_for_truncate, fd_flags=os.O_RDWR)
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
     if dir_fd is None:
         return os.open(entry, flags)
     return os.open(entry.name, flags, dir_fd=dir_fd)
 
 
-#: Win32 constants for the fail-safe: ``FILE_FLAG_OPEN_REPARSE_POINT``, the bit a reparse tag carries
-#: when it names another path (a symbolic link, a junction), and ``FileAttributeTagInfo``.
-_WIN_OPEN_REPARSE_POINT = 0x00200000
 #: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
 #: lock file or marker planted as a link. Windows has none, and follows one there.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
-_WIN_NAME_SURROGATE = 0x20000000
-_WIN_FILE_ATTRIBUTE_TAG_INFO = 9
+#: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
+#: for :func:`_owner_of`.
+_WIN_NAME_SURROGATE = _NAME_SURROGATE
+
+# The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
+# helpers (`_win_hold_dirs`, `_win_open_file`, `_handle_final_path`), the ones the file connector
+# confines its drops with. It kept a second ctypes copy until BACKLOG #4992, and the two had drifted:
+# this one let go of each directory before its files were opened, and reopened a cloud or
+# deduplicated file through its filter before checking it.
 
 
-@functools.cache
-def _win_api() -> Any:
-    """``kernel32`` with the prototypes the Windows half of :func:`_empty_files_in_place` uses."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-    kernel32.GetFinalPathNameByHandleW.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-    ]
-    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
-    kernel32.GetFileInformationByHandleEx.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    return kernel32
+def _win_vet_for_truncate(fd: int) -> None:
+    """Windows: refuse, on the file opened as itself, what the fail-safe never truncates: something
+    that is not a regular file, or a file with a second link. :func:`_win_open_file` calls this before
+    it lets a filter serve a reparse point that names no path, so a file refused here is never
+    recalled or hydrated (BACKLOG #4992)."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise _Unconfined("not a regular file")
+    if st.st_nlink > 1:
+        raise _HardLinked("a second link")
 
 
-def _win_open(path: Path, access: int, flags: int, fd_flags: int) -> int:
-    """Open ``path`` with the given ``CreateFileW`` flags, sharing everything, and return a descriptor
-    that owns the handle."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
+def _win_final_path(handle: int) -> str:
+    """The final path of the object open on the OS ``handle``, every link and junction resolved, in
+    ``os.path.normcase`` form. A test seam: the one call whose failure can mean the volume cannot
+    report a final path at all."""
+    return os.path.normcase(_handle_final_path(handle))
 
-    api = _win_api()
-    handle = api.CreateFileW(
-        str(path),
-        access,
-        0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-        None,
-        3,  # OPEN_EXISTING
-        flags,
-        None,
+
+def _win_unlisted(
+    unproven: list[str], where: Path, exc: OSError, *, final_path: bool = False
+) -> None:
+    """Report the directory ``where`` as not listed, by its own name, and log the error it met as
+    itself (BACKLOG #4992).
+
+    Only a failed final-path query (``final_path``) with ``ERROR_INVALID_FUNCTION``,
+    ``ERROR_NOT_SUPPORTED`` or ``ERROR_INVALID_PARAMETER`` is read as a volume that cannot report a
+    final path. The same codes from an open or an attribute query mean something else, and are logged
+    as what they are."""
+    unproven.append(f"{where.name}/ (not listed)")
+    if final_path and getattr(exc, "winerror", None) in _WIN_UNSUPPORTED:
+        # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM disks)
+        # cannot name a handle's final path, so nothing here can be shown to lie inside the
+        # directory. Truncating by path instead is what BACKLOG #2420 removed, so nothing is
+        # emptied, and that is said, without any file's name.
+        log.warning(
+            "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
+            "cannot report a file's final path, so no file in it was emptied",
+            where,
+        )
+        return
+    log.warning(
+        "DR staging: the truncate fail-safe could not open or list %s, so no file in it was "
+        "emptied: %s",
+        where,
+        safe_exc(exc, file_name=where.name),
     )
-    if handle is None or handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _win_held_walk(
+    staging: Path, unproven: list[str], report: Callable[[str | None], None]
+) -> Iterator[tuple[str, list[str], list[str], str]]:
+    """Windows: walk ``staging`` with :data:`_walk`, yielding ``(dirpath, dirnames, filenames,
+    inside)`` for each directory, where ``inside`` is ``staging``'s final path with a trailing
+    separator, for a prefix test.
+
+    Each directory is yielded only while it, every directory between it and ``staging``, and
+    ``staging`` itself are HELD open by :func:`_win_hold_dirs`: opened as themselves, refused if one
+    names another path, and shared for reading and writing but not for delete, so that none can be
+    renamed, or swapped for a junction, until the caller has opened and emptied that directory's
+    files and resumes the walk (BACKLOG #4992). Before this the check opened a directory, read its
+    final path and closed it again, and the files were opened by path after that.
+
+    A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
+    ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
+    junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
+    as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
     try:
-        return msvcrt.open_osfhandle(handle, fd_flags | os.O_BINARY)
-    except BaseException:
-        api.CloseHandle(handle)
-        raise
-
-
-def _win_attribute_tag(fd: int) -> tuple[int, int]:
-    """The attributes and reparse tag of the object open on ``fd``. ``os.fstat`` reports no tag."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
-
-    info = (ctypes.c_uint32 * 2)()  # FILE_ATTRIBUTE_TAG_INFO: FileAttributes, ReparseTag
-    if not _win_api().GetFileInformationByHandleEx(
-        msvcrt.get_osfhandle(fd), _WIN_FILE_ATTRIBUTE_TAG_INFO, info, ctypes.sizeof(info)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return info[0], info[1]
-
-
-def _names_another_path(fd: int) -> bool:
-    """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
-    symbolic link or a junction opened as itself. Always ``False`` on POSIX, where ``O_NOFOLLOW``
-    already refused one."""
-    if sys.platform != "win32":
-        return False
-    attributes, tag = _win_attribute_tag(fd)
-    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _WIN_NAME_SURROGATE)
-
-
-def _win_final_path(fd: int) -> str:
-    """The final path of the object open on ``fd``, every link and junction resolved, in
-    ``os.path.normcase`` form."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
-
-    size = 512
-    while True:
-        buf = ctypes.create_unicode_buffer(size)
-        got = _win_api().GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, size, 0)
-        if got == 0:
-            raise ctypes.WinError(ctypes.get_last_error())
-        if got < size:
-            return os.path.normcase(buf.value)
-        size = got + 1  # too small: `got` is the size it needs
-
-
-def _win_real_directory(path: Path) -> str:
-    """The final path of ``path`` with a trailing separator, for a prefix test. Opened without
-    following a reparse point; raises ``OSError`` when it cannot be opened, is not a directory, or is
-    itself a link or junction."""
-    # FILE_READ_ATTRIBUTES, with FILE_FLAG_BACKUP_SEMANTICS so a directory opens at all.
-    fd = _win_open(path, 0x00000080, 0x02000000 | _WIN_OPEN_REPARSE_POINT, os.O_RDONLY)
+        root = _win_hold_dirs(staging.parent, (staging.name,))
+    except _Unconfined:
+        unproven.append(f"{staging.name}/ (not listed)")  # a link or a junction: never walked
+        return
+    except OSError as exc:
+        _win_unlisted(unproven, staging, exc)
+        return
     try:
-        attributes = getattr(os.fstat(fd), "st_file_attributes", 0)
-        if not attributes & stat.FILE_ATTRIBUTE_DIRECTORY or _names_another_path(fd):
-            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", str(path))
-        return _win_final_path(fd).rstrip("\\") + "\\"
+        try:
+            inside = _win_final_path(root[0]).rstrip("\\") + "\\"
+        except OSError as exc:
+            _win_unlisted(unproven, staging, exc, final_path=True)
+            return
+
+        def _not_listed(exc: OSError) -> None:
+            _win_unlisted(unproven, Path(exc.filename or staging), exc)
+
+        for dirpath, dirnames, filenames in _walk(staging, onerror=_not_listed):
+            where = Path(dirpath)
+            try:
+                held = _win_hold_dirs(staging, where.relative_to(staging).parts)
+            except _Unconfined:
+                dirnames[:] = []
+                report(_OUTSIDE_REASON)
+                continue
+            except OSError as exc:
+                dirnames[:] = []
+                _win_unlisted(unproven, where, exc)
+                continue
+            try:
+                if held:  # `staging` itself was checked above
+                    try:
+                        real = _win_final_path(held[-1]).rstrip("\\") + "\\"
+                    except OSError as exc:
+                        dirnames[:] = []
+                        _win_unlisted(unproven, where, exc, final_path=True)
+                        continue
+                    if not real.startswith(inside):
+                        dirnames[:] = []
+                        report(_OUTSIDE_REASON)
+                        continue
+                yield dirpath, dirnames, filenames, inside
+            finally:
+                _win_release(held)
     finally:
-        os.close(fd)
+        _win_release(root)
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
