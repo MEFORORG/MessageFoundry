@@ -836,7 +836,7 @@ _TLS_PROXY_CREDENTIALS = (
     "credentials out of the proxy URL, or remove the Proxy-Authorization header; refusing to "
     "send (vault BACKLOG #4909)"
 )
-#: The attribute a request keeps that refusal under, from the proxy handler to the https handler.
+#: The attribute that marks a request for that refusal, from the proxy handler to the https handler.
 _TLS_LEG_REFUSAL_ATTR = "_mefor_proxy_tls_leg_refusal"
 _UNVERIFIED_PROXY_TLS = (
     "this request would send a web proxy credential over TLS that does not fully verify the "
@@ -959,12 +959,12 @@ def _refuse_cleartext_proxy_credentials(
     refusal = _sends_cleartext_proxy_credentials(
         req, proxy, proxies, caller_header_admitted=caller_header_admitted
     )
-    if refusal is _TLS_PROXY_CREDENTIALS:
+    if refusal == _TLS_PROXY_CREDENTIALS:
         # Not raised yet. urllib may hand the request back and tunnel it through a CONNECT, which
-        # the next pass here judges as cleartext, in that leg's own text. Kept on the request, it
-        # is raised by the strict https handler, before it dials, if the leg is still TLS to the
-        # proxy then (vault BACKLOG #4909).
-        vars(req)[_TLS_LEG_REFUSAL_ATTR] = refusal
+        # the next pass here judges as cleartext, in that leg's own text. Marked on the request,
+        # it is raised by the strict https handler, before it dials, if the leg is still TLS to
+        # the proxy then (vault BACKLOG #4909).
+        vars(req)[_TLS_LEG_REFUSAL_ATTR] = True
     elif refusal:
         raise ProxyCredentialsRefusedError(refusal)
 
@@ -982,7 +982,9 @@ def _sends_cleartext_proxy_credentials(
 
     A header spelled other than plainly is refused with its own fixed text about the spelling,
     unless the leg is cleartext and would be refused for another reason too. That leaves the
-    cleartext text where it applies, and gives a verified TLS leg a text that is true of it."""
+    cleartext text where it applies, and gives a verified TLS leg a text that is true of it.
+    A credential from a proxy URL, or a plain header no connection admitted, on the TLS leg gets
+    the TLS leg's own text (vault BACKLOG #4909). The name predates that leg."""
     try:
         # The parser proxy_open runs, so the two readings cannot differ (vault BACKLOG #2965).
         scheme, user, password, _ = read_like_urllib(proxy)

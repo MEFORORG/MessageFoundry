@@ -1000,22 +1000,7 @@ def test_an_environment_proxy_credential_is_refused_over_verified_tls(
     assert proxy.connections == 1
     assert proxy.tls_first == 1
     assert proxy.cleartext == []
-
-
-def test_a_caller_set_header_is_refused_over_verified_tls() -> None:
-    """The same leg for a header a caller set that no connection admitted. Refusing it is the
-    Lander's proposed scope on vault BACKLOG #4909, unruled. The control is the same opener and
-    proxy with no header, which is sent TLS first."""
-    with _WireProxy() as proxy:
-        handler = LoopbackDirectProxyHandler({"http": f"https://{proxy.address}"})
-        _refused(build_strict_opener(handler), _with_header(_HTTP_TARGET), "#4909")
-    assert proxy.connections == 0
-
-    with _WireProxy() as proxy:
-        handler = LoopbackDirectProxyHandler({"http": f"https://{proxy.address}"})
-        _open_and_discard(build_strict_opener(handler), _HTTP_TARGET)
-    assert proxy.connections == 1
-    assert proxy.tls_first == 1
+    # The caller-set half of this leg is pinned in tests/test_proxy_header_name_spelling.py.
 
 
 @pytest.mark.parametrize(
