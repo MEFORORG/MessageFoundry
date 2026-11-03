@@ -36,9 +36,10 @@ _DEDUP_TAG = 0x80000013  # IO_REPARSE_TAG_DEDUP: a reparse tag with no name-surr
 
 
 def _junction(target: Path, link: Path) -> None:
-    import _winapi
+    if sys.platform == "win32":  # narrows mypy; every test here is Windows-only
+        import _winapi
 
-    _winapi.CreateJunction(str(target), str(link))
+        _winapi.CreateJunction(str(target), str(link))
 
 
 @pytest.mark.parametrize("swap", ["sub", "root"])

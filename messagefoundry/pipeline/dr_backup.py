@@ -2004,6 +2004,8 @@ def _win_held_walk(
     ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
     junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
     as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
+    if sys.platform != "win32":  # pragma: no cover - `_walk` is the descriptor walk off Windows
+        return
     held_root = _win_hold_root(staging, unproven)
     if held_root is None:
         return
