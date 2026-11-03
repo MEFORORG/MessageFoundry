@@ -10557,9 +10557,11 @@ class AuthService:
                 await self._end_lapsed_session(
                     session.token_hash, user.username, at="session", client=None
                 )
-            else:
-                await self._session_seal_failed(session.token_hash)
-            return None
+                return None
+            fresh = await self._session_after_epoch_refusal(session.token_hash, user, now)
+            if fresh is None:
+                return None
+            session = fresh
         if activity:
             await self._store.touch_session(session.token_hash, now=now)
         if user is None or user.disabled:
@@ -11624,9 +11626,36 @@ class AuthService:
                 row, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
             ):
                 kept.append(row)
-            else:
-                await self._session_seal_failed(row.token_hash)  # see identity_for_token
+            elif fresh := await self._session_after_epoch_refusal(
+                row.token_hash, user, time.time()
+            ):
+                kept.append(fresh)
         return kept
+
+    async def _session_after_epoch_refusal(
+        self, token_hash: str, user: VerifiedUser, now: float
+    ) -> SessionRecord | None:
+        """Read the session again after the gate refused it for a stale epoch, and return the row
+        if the WHOLE gate accepts it now; otherwise end it as :meth:`_session_seal_failed` ends a
+        row, and return ``None`` (BACKLOG #5091).
+
+        The session row is read before the account, so a request that straddles a revoke's commit
+        can see the old stamps beside the account's new epochs, though the revoke re-stamped a
+        session it kept. The re-read is gated whole, revoked, seal, owner, clock and both epochs,
+        so it is never an accept path that skips a check. This NARROWS the false end of a kept session and does
+        not close it: a revoke that commits between this read and the end still ends a row it had
+        just re-stamped. docs/SECURITY.md, *Limits of the session sweep*, says what that costs."""
+        fresh = await self._load_session(token_hash)  # the revoked and seal checks
+        if fresh is None:
+            return None  # revoked already, or ended and reported there for its seal
+        if (
+            fresh.user_id == user.id
+            and fresh.is_live(now=now, idle_seconds=self.session_idle_seconds)
+            and self._gate_refusal(fresh, user, now) is None
+        ):
+            return fresh
+        await self._session_seal_failed(token_hash)
+        return None
 
     async def revoke_own_session(
         self, identity: Identity, session_id: str, *, actor: str, client: str | None
