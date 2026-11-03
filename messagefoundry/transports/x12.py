@@ -505,7 +505,9 @@ class X12Destination(DestinationConnector):
                         f"sent ISA-13={sent}); delivery indeterminate"
                     )
                 occurrence = match
-            ta104 = (msg.get("TA1-04", occurrence=occurrence) or "").upper()
+            # Stripped as well as upper-cased: the element is the partner's text, and a padded "R " or
+            # "E " must reach its own arm rather than fall through to the accepted default below.
+            ta104 = (msg.get("TA1-04", occurrence=occurrence) or "").strip().upper()
             # The acknowledged interchange's control number — not PHI. Once matched it is our own ISA13.
             control = (
                 _loggable_sent(sent_isa13)
@@ -533,19 +535,28 @@ class X12Destination(DestinationConnector):
                         body=text, outcome="accepted", detail="TA1*E accepted-with-errors"
                     )
                 return None
-            # Every value that reaches here is accepted: A, an empty TA1-04, and any other value.
+            # Every value that reaches here is accepted: A, an empty TA1-04, and any other value. An
+            # empty or out-of-set code stays accepted rather than retried: the partner answered this
+            # interchange, and a retry would re-send one it may have accepted, which ADR 0016 rules
+            # unsafe for a state-changing 278N. TA1-04 is a closed code set (A, E, R), but the element
+            # is the partner's text, so the warning and the captured detail are fixed phrases that
+            # carry none of it: the store's scrub does not catch every identifier (BACKLOG #2984).
+            if ta104 == "A":
+                detail = "TA1*A"
+            else:
+                detail = (
+                    "TA1 with no TA1-04 code"
+                    if not ta104
+                    else "TA1 with a TA1-04 outside A, E and R"
+                )
+                logger.warning(
+                    "X12 %s:%d returned a %s (TA1-01=%s); recorded as delivered, not retried",
+                    self.host,
+                    self.port,
+                    detail,
+                    control,
+                )
             if self.capture_response:
-                # TA1-04 is a closed code set (A, E, R), but the element is the partner's text. The
-                # arms above match only an exact "R" or "E": ta104 is upper-cased, not stripped, so a
-                # padded value such as "R " reaches here. Only a literal A is echoed, as TA1*A; an
-                # empty TA1-04 and any other value get a fixed phrase carrying none of the partner's
-                # text, since the store's scrub does not catch every identifier (BACKLOG #2984).
-                if ta104 == "A":
-                    detail = "TA1*A"
-                elif not ta104:
-                    detail = "TA1 with no TA1-04 code"
-                else:
-                    detail = "TA1 with a TA1-04 outside A, E and R"
                 return DeliveryResponse(body=text, outcome="accepted", detail=detail)
             return None
         # No TA1: a business response (271/277/278) returned instead — it IS the confirmation.
