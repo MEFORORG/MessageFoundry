@@ -101,6 +101,7 @@ _SESSION_COLUMNS = (
     "auth_mechanism",
     "idp_auth_time",
     "user_epoch",
+    "global_epoch",
     "seal",
 )
 _LIVE_SESSION = (
@@ -115,6 +116,7 @@ _LIVE_SESSION = (
     None,
     None,
     None,
+    0,
     0,
     "",
 )
@@ -276,8 +278,9 @@ async def test_sqlserver_supersede_returns_the_output_row_by_column_name() -> No
         "last_used_at",
         "seal",
         "user_epoch",
+        "global_epoch",
     )
-    row = ("u", _HASH, _NOW, _NOW + 60, _NOW - 60, _NOW - 30, "", 0)
+    row = ("u", _HASH, _NOW, _NOW + 60, _NOW - 60, _NOW - 30, "", 0, 0)
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _mssql_store(seen)
 

@@ -58,6 +58,7 @@ _SEALED_CHANGES: tuple[tuple[str, Any], ...] = (
     ("auth_mechanism", "oidc"),
     ("idp_auth_time", 1.0),
     ("user_epoch", 7),
+    ("global_epoch", 7),  # BACKLOG #5091
 )
 
 
