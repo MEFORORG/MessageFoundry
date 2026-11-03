@@ -443,7 +443,8 @@ text moved in wave 2*.
 (decided by the Lander under the owner's delegation of 2026-10-29, decision
 d20261029T165610526-c13ae6; the owner ruling of 2026-11-03 in the next paragraph cut the window
 from 4 hours to 2 and added the suspended-author case). All of these must hold: 2 hours with no
-author comment or commit since the hold; the Lander mailed the author's seat-record worktree path
+author comment or commit since the hold, an expired acknowledgement (next paragraph) counting as
+none; the Lander mailed the author's seat-record worktree path
 and had no reply; the author's claim and seat record show no live session, or the author's
 transcript ENDS on a question unanswered for more than 2 hours, which counts as no live session
 whatever its running state (the Lander reads this with `list_events` or korus
@@ -466,16 +467,24 @@ or a second hold to. An acknowledgement is an author comment or commit; the `hol
 `scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every seat acts as the
 owner's GitHub identity, only the original author's comment or commit counts, a commit its own
 Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
-branch updates included. The author may also hand the PR over sooner. The PR must not be queued
+branch updates included. An acknowledgement expires 2 hours after it if the original author has
+pushed no commit since, and the hold then counts as unacknowledged. The author may also hand the
+PR over sooner. The PR must not be queued
 or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own CCD
 instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
-transfer is, in order: the repair-owner marker `<!-- repair-owner session=<id> -->` on the PR,
-mail to the original author's seat-record worktree where it has one, and the hold's URL sent to
-the Repair Manager as its brief. At least stacks, landing order, author intent and anything
+transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief,
+and no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
+`<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair Manager's CCD `local_` id
+copied whole; and mail to the original author's seat-record worktree where it has one, naming the
+PR URL and that id. A Repair Manager that does not find the marker re-reads once, and otherwise
+reports to the Lander and stops. Minimizing the newest marker cancels the transfer and hands the
+PR back to the original author. At least stacks, landing order, author intent and anything
 already waiting on an owner ruling stay with the original author. Like the Lander and the
 Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
 raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
-push, never force-push, and stop if the head moved, as the paragraph above says. Every repair
+push, never force-push, and stop if the head moved, as the paragraph above says. A Builder already
+in flight for the original author does not read the marker, so the head-moved check is its only
+collision control. Every repair
 head it pushes takes the Lander's own independent review the paragraph above requires, before
 the merge. The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`.
 
