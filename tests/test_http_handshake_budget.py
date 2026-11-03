@@ -19,6 +19,7 @@ it, so only the budget can close a socket in time.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HANDSHAKES_PER_HOST, HttpSource
 from messagefoundry.transports.receipt import receipt_handler
 from tests.test_http_listener_tls_admission import _https_post, _Intake
+from tests.test_listener_admission import _PeerWriter
 from tests.test_mllp_tls import _close_raw, _closed_by_listener, _Events, _until
 from tests.test_tls_handshake_failures import _http_tls_source as _tls_source
 from tests.test_tls_handshake_failures import _pinned_client
@@ -171,11 +173,6 @@ def test_the_budget_ships_on_and_can_be_turned_off() -> None:
         _http(max_handshakes_per_host=-1)
 
 
-class _PeerWriter:
-    def get_extra_info(self, name: str, default: object = None) -> object:
-        return ("192.0.2.7", 4000) if name == "peername" else default
-
-
 def _gate(budget: int | None) -> ListenerAdmission:
     return ListenerAdmission(
         transport="HTTP",
@@ -191,24 +188,29 @@ def test_admission_counts_only_sockets_in_their_handshake() -> None:
     host = "192.0.2.7"
     w: Any = _PeerWriter()
     gate = _gate(1)
-    first = gate.admit(host, handshake=True)
-    refused = gate.check(w, host, handshake=True)
-    assert refused is not None and refused.reason == "max_handshakes_per_host"
-    assert host in gate.handshake_capacity_warned
-    # CONTROL: a socket that needs no handshake (a plaintext listener, or the loop's handshake)
-    # is not measured against the budget at all.
-    assert gate.check(w, host) is None
-    gate.end_handshake(host, first)
+    first = gate.admit(host)
+    with gate.handshake(host, first):
+        refused = gate.check(w, host, handshake=True)
+        assert refused is not None and refused.reason == "max_handshakes_per_host"
+        assert host in gate.handshake_capacity_warned
+        # CONTROL: a socket that needs no handshake (a plaintext listener, or the loop's
+        # handshake) is not measured against the budget at all.
+        assert gate.check(w, host) is None
     assert gate.handshaking == {} and gate.handshake_capacity_warned == set()
     assert gate.per_host == {host: 1}, "ending the handshake gave back the connection slot"
     assert gate.check(w, host, handshake=True) is None
+    # A handshake that fails by raising leaves the count too.
+    with pytest.raises(OSError), gate.handshake(host, first):
+        raise OSError("handshake failed")
+    assert gate.handshaking == {}
     gate.release(host, first)
     assert gate.active == 0 and gate.per_host == {}
     # Off: no refusal however many are in their handshake.
     off = _gate(None)
-    for _ in range(5):
-        off.admit(host, handshake=True)
-    assert off.check(w, host, handshake=True) is None
+    with contextlib.ExitStack() as stack:
+        for _ in range(5):
+            stack.enter_context(off.handshake(host, off.admit(host)))
+        assert off.check(w, host, handshake=True) is None
 
 
 def test_a_handshake_ending_after_a_restart_leaves_the_restarted_count_alone() -> None:
@@ -216,15 +218,15 @@ def test_a_handshake_ending_after_a_restart_leaves_the_restarted_count_alone() -
     host = "192.0.2.7"
     w: Any = _PeerWriter()
     gate = _gate(1)
-    straggler = gate.admit(host, handshake=True)
+    straggler = contextlib.ExitStack()
+    straggler.enter_context(gate.handshake(host, gate.admit(host)))
     gate.stopping = True
     gate.reset()
     assert gate.handshaking == {}
     gate.stopping = False
-    current = gate.admit(host, handshake=True)
-    gate.end_handshake(host, straggler)
-    assert gate.handshaking == {host: 1}, "a pre-restart handshake freed the restarted run's slot"
-    refused = gate.check(w, host, handshake=True)
-    assert refused is not None and refused.reason == "max_handshakes_per_host"
-    gate.end_handshake(host, current)
+    with gate.handshake(host, gate.admit(host)):
+        straggler.close()  # the pre-restart handshake ends while the restarted one is running
+        assert gate.handshaking == {host: 1}, "a pre-restart handshake freed the restarted slot"
+        refused = gate.check(w, host, handshake=True)
+        assert refused is not None and refused.reason == "max_handshakes_per_host"
     assert gate.handshaking == {}

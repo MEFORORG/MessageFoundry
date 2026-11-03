@@ -108,16 +108,11 @@ DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
 #: The most sockets one peer address may hold a ``max_connections`` slot with while still in
-#: their TLS handshake (vault BACKLOG #4888). It bites only where this listener upgrades TLS itself
-#: (`_upgrades_tls_itself`, the stdlib loops), the one path on which a handshake holds a slot. There,
-#: before it, with ``max_connections_per_host`` off (vault BACKLOG #2606), one address that never
-#: finished a handshake, at least an mTLS peer with no client certificate, could hold all 256 slots
-#: for up to the 10 s handshake bound each. 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the
-#: ratio the other listeners' per-host cap ships at, so a stalling address holds at most an eighth
-#: of the listener. It counts only the handshake, so it leaves an address's established requests
-#: uncapped, which is #2606's reason for shipping the per-host cap off behind an L4 load balancer.
-#: Behind one that collapses every client to one address, the 32 bound every client's handshakes
-#: together; ``docs/DEPLOYMENT.md`` weighs that case.
+#: their TLS handshake (vault BACKLOG #4888), which happens only where this listener upgrades TLS
+#: itself (`_upgrades_tls_itself`). 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the ratio
+#: the other listeners' per-host cap ships at, so a stalling address holds at most an eighth of the
+#: listener. ``docs/DEPLOYMENT.md``, *Per-address listener caps behind the VIP*, holds the
+#: rationale and the L4 load-balancer counter-case.
 DEFAULT_MAX_HANDSHAKES_PER_HOST = 32
 _HEADER_CAP_OFF_HINT = (
     "this cap cannot be switched off; leave it unset or None for the 64 KiB default"
@@ -1373,12 +1368,10 @@ class HttpSource(SourceConnector):
                 # it, and the finally below gives the slot back however the handshake ends.
                 # It also counts against the handshake budget until the handshake ends, however
                 # it ends (vault BACKLOG #4888).
-                epoch = self._admission.admit(peer_host, handshake=True)
+                epoch = self._admission.admit(peer_host)
                 handshaking = True
-                try:
+                with self._admission.handshake(peer_host, epoch):
                     upgraded = await self._start_tls(reader, writer, peer_host)
-                finally:
-                    self._admission.end_handshake(peer_host, epoch)
                 if not upgraded:
                     return  # never a session: no `established`, so no `closed` either
                 handshaking = False
