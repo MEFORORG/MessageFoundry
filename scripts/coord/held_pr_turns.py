@@ -121,17 +121,28 @@ marker's session as ``repairOwner``, ONLY when ALL of these hold:
   event, so REPAIR is never reached from a state that would not otherwise be AUTHOR's;
 * at least one qualifying marker was posted strictly after the hold's second (a same-second marker
   is not provably after the hold, so it does not qualify);
-* the qualifying markers in the newest marker second all name one session.
+* the qualifying markers in the newest marker second all name one session;
+* no ack is at or after that newest marker's second. An ack after the transfer is most likely the
+  stood-down author saying "still my move", so two seats may be working one fix: the Lander's to
+  sort out. An ack before the marker is history the transfer overrode, and is kept as ``acked``.
 
 Otherwise the PR is classified exactly as it was before this contract, with every marker an ordinary
 event. Under that reading a marker body starts with ``<!--``, not the signature, so it is not a
-Lander event, and one after the hold is a reply: the PR reads LANDER ``replied``. So at least these
-fall back to the Lander: a marker with no hold before it (``no-hold``), a marker older than the
-latest hold (the hold's own state, AUTHOR if it stands, because each new hold re-opens the author's
-turn and needs a new marker), a push after the marker (``new-commit``: the head no longer starts with
-the hold's SHA, which is how "no commit after the marker" is read, and is stricter, since it also
-catches a push between the hold and the marker), any other reply or any edit after the hold, an
-edit to the marker itself, and a newer non-hold Lander comment (``no-hold``).
+Lander event, and one after the hold is a reply: the PR reads LANDER ``replied``, even when the
+marker is the only thing after the hold, so ``replied`` beside a marker can be the Lander's own
+transfer comment. So at least these fall back to the Lander: a marker with no hold before it
+(``no-hold``), a push after the marker (``new-commit``: the head no longer starts with the hold's
+SHA, which is how "no commit after the marker" is read, and is stricter, since it also catches a push
+between the hold and the marker), any other reply or any edit after the hold, an edit to the marker
+itself, an ack after the marker, and a newer non-hold Lander comment (``no-hold``).
+
+A MARKER OLDER THAN THE LATEST HOLD IS NOT READ, so the hold reads on its own: AUTHOR if it stands.
+That is not a fall back to the Lander. It is how a re-hold reads: each hold re-opens the turn, and a
+transfer that should outlive a new hold needs a new marker posted after it, in a later second, since
+one comment cannot be both. A re-hold on a repaired PR that is not followed by a new marker parks the
+PR on the stood-down author.
+
+A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
 WHY A MARKER IS NOT A LANDER EVENT. It is Lander-signed, but it is not the Lander answering: read as
 a Lander event it would become the newest one, which is no hold, and so erase the hold that the
@@ -171,13 +182,15 @@ Lander keeps the Repair Manager alive and so watches its rows more closely than 
 table's FLAGS cell shows ``repair=<session id>`` for the ``repair`` flag; the JSON carries the id as
 ``repairOwner``, ``null`` on any row that is not a repair.
 
-FLAGS. ``held`` (a hold stands: AUTHOR's turn, unless the PR is queued or armed); ``repair`` (beside
-``held``: a repair-owner marker after the hold made it REPAIR's turn); ``no-hold`` (no
+FLAGS. ``held`` (a hold stands: AUTHOR's turn, or REPAIR's beside ``repair``, unless the PR is
+queued or armed); ``repair`` (beside ``held``: a repair-owner marker after the hold made it REPAIR's
+turn, so ``held`` alone never means the author owns a ``repair`` row); ``no-hold`` (no
 Lander event, or the newest is not a marker hold); ``new-commit`` (the head does not start with the
 marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
 head); ``edited`` (a comment or review, of any author, the hold included,
 edited at or after the hold); ``acked`` (beside ``held``: an author's ack kept the turn the
-author's); ``no-new-commit`` (replied or edited, but the head still matches the marker: the Lander
+author's, or, beside ``repair``, an ack came before the transfer); ``no-new-commit`` (replied or
+edited, but the head still matches the marker: the Lander
 must read the reply or edit, but can bounce it fast); ``in-queue`` / ``auto-armed`` (the PR is
 already in the merge queue or has auto-merge armed).
 
@@ -404,7 +417,7 @@ class Event:
             return None
         return ack_head(self.body)
 
-    @property
+    @cached_property
     def repair_by(self) -> str | None:
         """The session a repair-owner marker comment names, else ``None``. Never a review."""
         if not self.trusted or self.dismissed or self.review:
@@ -463,14 +476,8 @@ def _events(pr: dict[str, Any]) -> list[Event]:
     return out
 
 
-def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str]]:
-    """``(turn, flags)`` for one PR. Pure; the module docstring states the rules."""
-    turn, flags, _owner = turn_of(head_oid, events)
-    return turn, flags
-
-
-def turn_of(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], str | None]:
-    """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` unless the turn is REPAIR.
+def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], str | None]:
+    """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` without a ``repair`` flag.
 
     Pure; the module docstring states the rules.
     """
@@ -493,18 +500,22 @@ def turn_of(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], str
     # Every seat posts under one login, so who edited cannot be told: any edit from the hold's
     # second on, of the hold itself or of an older Lander comment too, hands the turn back.
     edited = any(e.edited is not None and e.edited >= when for e in turn_events)
-    # THE REPAIR CONTRACT: a marker strictly after the hold is set aside as a reply only to ask
-    # whether the hold would otherwise stand. A marker is never an ack, so the two lists are
-    # disjoint, and anything that fails here falls through to the reading without the contract.
-    repairs = [e for e in after if e.when > when and e.repair_by is not None]
-    if repairs and not new_commit and not edited and len(acks) + len(repairs) == len(after):
-        newest = max(e.when for e in repairs)
-        owners = {e.repair_by for e in repairs if e.when == newest}
-        # Two sessions named in one second cannot be ordered, so neither owns the repair.
-        if len(owners) == 1:
-            return REPAIR, ["held", "acked", "repair"] if acks else ["held", "repair"], owners.pop()
-    if not new_commit and not replied and not edited:
-        return AUTHOR, ["held", "acked"] if acks else ["held"], None
+    if not new_commit and not edited:
+        # THE REPAIR CONTRACT: a marker strictly after the hold is set aside as a reply only to ask
+        # whether the hold would otherwise stand; anything that fails here reads as before it.
+        repairs = [e for e in after if e.when > when and e.repair_by is not None]
+        # A marker's first line is never an ack's, so no event is in both lists.
+        others = [e for e in after if e not in acks and e not in repairs]
+        if repairs and not others:
+            newest = max(e.when for e in repairs)
+            owners = {e.repair_by for e in repairs if e.when == newest}
+            # Two sessions named in one second cannot be ordered, so neither owns the repair; an
+            # ack from the transfer's second on may be the stood-down author still working.
+            if len(owners) == 1 and all(e.latest < newest for e in acks):
+                flags = ["held", "acked", "repair"] if acks else ["held", "repair"]
+                return REPAIR, flags, owners.pop()
+        if not replied:
+            return AUTHOR, ["held", "acked"] if acks else ["held"], None
     flags = ["new-commit"] if new_commit else []
     if replied:
         flags.append("replied")
@@ -566,7 +577,7 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
     on_head = head.get("oid") == head_oid
     committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
     events = _events(pr)
-    turn, flags, owner = turn_of(head_oid, events)
+    turn, flags, owner = classify(head_oid, events)
     if pr.get("mergeQueueEntry"):
         flags.append("in-queue")
     if pr.get("autoMergeRequest"):
@@ -737,6 +748,7 @@ def error_row(repo: str, reason: str, number: object = None) -> dict[str, Any]:
         "turn": ERROR,
         "error": reason,
         "flags": [],
+        "repairOwner": None,
         "ageSeconds": None,
     }
 

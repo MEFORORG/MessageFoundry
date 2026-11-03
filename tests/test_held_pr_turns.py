@@ -255,11 +255,11 @@ def test_same_second_tie_goes_to_the_lander(
     head = _sha(8)
     hold = hpt.Event(NOW, _marker_body(head), bot=False, trusted=True)
     note = hpt.Event(NOW, SESSION + "looking now.", bot=False, trusted=True)
-    assert hpt.classify(head, [hold, note]) == ("LANDER", ["no-hold"])
-    assert hpt.classify(head, [note, hold]) == ("LANDER", ["no-hold"])
+    assert hpt.classify(head, [hold, note]) == ("LANDER", ["no-hold"], None)
+    assert hpt.classify(head, [note, hold]) == ("LANDER", ["no-hold"], None)
     # Two tied holds must both match the head.
     other = hpt.Event(NOW, _marker_body("f4f4dd470"), bot=False, trusted=True)
-    assert hpt.classify(head, [hold, other]) == ("LANDER", ["new-commit"])
+    assert hpt.classify(head, [hold, other]) == ("LANDER", ["new-commit"], None)
 
 
 def test_newer_non_hold_lander_comment_is_lander_turn(
@@ -520,6 +520,21 @@ def test_a_repair_marker_after_a_standing_hold_is_the_repair_owners_turn(
     assert _repair_row(rows[131]) == ("REPAIR", ["held", "repair"], OWNER_ID)
     assert _repair_row(rows[132]) == ("REPAIR", ["held", "acked", "repair"], OWNER_ID)
     assert _repair_row(rows[133]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    # A re-hold on the repair's new head, then a new marker after it: still the repair's.
+    rehold = _pr(
+        135,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _hold("2026-10-28T15:00:00Z", _sha(135)),
+            _repair("2026-10-28T15:00:01Z"),
+        ],
+    )
+    assert _repair_row(_engine_rows(tmp_path, capsys, rehold)[135]) == (
+        "REPAIR",
+        ["held", "repair"],
+        OWNER_ID,
+    )
     # A row that is not a repair carries a null owner, never a missing key.
     assert _engine_rows(tmp_path, capsys, _held(134))[134]["repairOwner"] is None
 
@@ -544,7 +559,8 @@ def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
     rows = _engine_rows(
         tmp_path,
         capsys,
-        # A commit pushed after the marker: the head no longer starts with the hold's SHA.
+        # A push after the hold, and so possibly after the marker: the head no longer starts with
+        # the hold's SHA. Only the SHA is read, never the committer date.
         late,
         # The marker in the hold's own second is not provably after it.
         _held(141, _repair("2026-10-28T12:00:00Z")),
@@ -560,9 +576,12 @@ def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
         _held(150, _repair(), _comment("Manager: I am back, fixing.", "2026-10-28T14:00:00Z")),
         # Two sessions named in one second cannot be ordered.
         _held(151, _repair(), _repair(session="other-session")),
+        # An ack after the transfer, or in its second, may be the stood-down author still working.
+        _held(152, _repair(), _ack("2026-10-28T14:00:00Z", _sha(152))),
+        _held(153, _repair(), _ack("2026-10-28T13:00:00Z", _sha(153))),
     )
     assert _repair_row(rows[140]) == ("LANDER", ["new-commit", "replied"], None)
-    for n in (141, 142, 143, 145, 147, 148, 149, 150, 151):
+    for n in (141, 142, 143, 145, 147, 148, 149, 150, 151, 152, 153):
         assert _repair_row(rows[n]) == ("LANDER", ["replied", "no-new-commit"], None), n
     # Signed on line one, it is a newer non-hold Lander comment, so no hold stands.
     assert _repair_row(rows[146]) == ("LANDER", ["no-hold"], None)
@@ -606,7 +625,7 @@ def test_the_repair_marker_shape_is_exact() -> None:
         "\n" + marker + "\n" + SESSION,
         marker + " trailing\n" + SESSION,
         marker + "\n\n" + SESSION,
-        marker + " " + SESSION,
+        marker + "\u2028" + SESSION,
         marker + "\x0b\n" + SESSION,
         f"<!--repair-owner session={OWNER_ID}-->\n" + SESSION,
     ):
@@ -910,6 +929,8 @@ def test_overflowing_stamp_is_one_error_row_and_exit_zero(
     assert code == 0
     by = {r["number"]: r for r in rows}
     assert by[30]["turn"] == "ERROR" and "OverflowError" in by[30]["error"]
+    # Every row carries the key, an ERROR row's null, so a consumer never meets a KeyError.
+    assert by[30]["repairOwner"] is None
     assert "report defect" in by[30]["error"]
     assert by[31]["turn"] == "LANDER"
     code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
