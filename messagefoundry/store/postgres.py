@@ -6419,8 +6419,8 @@ class PostgresStore:
         fails the toggle with the driver's own 55P03 rather than the typed refusal. SQLSTATE 55P03
         from the flag statement raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
-        back. The bound does not hold where ``command_timeout`` is at or under it: that fires
-        first, as asyncpg's own timeout."""
+        back. Where a non-zero ``command_timeout`` is at or under the bound, that ends the wait
+        first, as asyncpg's own timeout, not retried."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (

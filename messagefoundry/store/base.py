@@ -1428,13 +1428,11 @@ class QueueStore(StoreLifecycle, Protocol):
 
         On a server backend each lock wait the flag statement makes on the table is bounded at
         :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, since the audit lock is held while it waits.
-        The bound is per lock wait, not per statement. Past it the call raises
-        :class:`ConnectionFlagLockTimeout`, with nothing written, once the transaction has rolled
-        back and released the audit lock. Where that rollback fails, the connection is discarded
-        instead, and the audit lock is held until the server ends that session. The bound does not
-        hold where ``command_timeout`` is at or under it: the driver's timeout fires first, its
-        refusal is the driver's own, and SQL Server retries it, as before the bound. ADR 0007,
-        amendment of 2026-10-31, says what the bound does not cover."""
+        Past it the call raises :class:`ConnectionFlagLockTimeout`, with nothing written, once the
+        transaction has rolled back and released the audit lock. Where that rollback fails, the
+        connection is discarded instead, and the audit lock is held until the server ends that
+        session. The constant's comment says what the bound covers, and ADR 0007, amendment of
+        2026-10-31, at least what it does not."""
         ...
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -3587,15 +3585,18 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
 #: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so a toggle that
 #: gets the audit lock at once and meets one lock hears this refusal before the engine stops
 #: waiting. A statement that meets two locks, or a toggle that first queued for the audit lock, can
-#: still be cut off by the engine instead, though each of its lock waits still ends at this bound. It
-#: does not hold where ``[store].command_timeout`` is at or under it, since the driver's timeout
-#: fires first. ADR 0007, amendment of 2026-10-31, records what it does not cover.
+#: still be cut off by the engine instead, though each lock wait on ``connection_flag`` still ends
+#: at this bound; the wait for the audit lock is not bounded by it. Where a non-zero
+#: ``[store].command_timeout`` is at or under it, the driver's timeout ends the wait first, and SQL
+#: Server's retry waits again. ADR 0007, amendment of 2026-10-31, records at least what it does not
+#: cover.
 CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 class ConnectionFlagLockTimeout(RuntimeError):
-    """A lock wait of a server backend's flag statement on ``connection_flag`` passed
-    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` (BACKLOG #2623). Toggles run one at a time under
+    """A lock wait of a server backend's flag statement on ``connection_flag`` did not end within
+    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, or within a stricter ``lock_timeout`` a Postgres
+    role or database sets (BACKLOG #2623). Toggles run one at a time under
     the audit lock, so the holder is something other than a toggle: at least a writer outside the
     store, or a schema change holding a lock on the table.
 

@@ -7963,16 +7963,17 @@ class SqlServerStore:
         applock while it waits. The setting bounds each lock wait, not the statement, so a statement
         that meets two locks can pass it. Without it a foreign lock on ``connection_flag`` would hold
         every audit append until the driver's query timeout, and for ever at ``command_timeout = 0``;
-        the retry re-runs a query timeout, so at the 30 s default that is up to
+        the retry re-runs a query timeout, so at the 30 s default one call could make up to
         ``_CIPHER_MERGE_ATTEMPTS``, five, waits of 30 s each, the applock freed only between them.
+        The engine's cancel at its own bound ends the retry, but not the attempt in flight.
         Error 1222 is treated as a failed applock wait: it raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, not retried, and the
         transaction rolls back. The setting is session-scoped and survives a rollback, so it is put
         back to -1 right after the statement, after a retry's rollback, or after the rollback on a
         failure, so neither a re-take of the applock nor a pooled connection's other work runs under
-        it. The bound does not hold where ``command_timeout`` is at or under it: that fires first as
-        HYT00, which the retry re-runs as it did before the bound, and each attempt then holds the
-        applock for up to that timeout."""
+        it. Where a non-zero ``command_timeout`` is at or under the bound, that fires first as
+        HYT00, which the retry re-runs as it would without the bound, and each attempt then holds
+        the applock for up to that timeout."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         if flagged:
