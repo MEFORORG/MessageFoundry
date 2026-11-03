@@ -2310,16 +2310,43 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 **Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
 `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
 id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
-just runs whatever statement you declare, bound from the row.
+just runs whatever statement you declare, bound from the row. A high-water mark can still pass a row
+that was never handed off, in at least the cases *Reliability* below names. Where that matters, mark
+with a status column or a delete-from-queue.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
 **unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
 `poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
-`mark_statement`. After a handler failure the poller goes on to the next row, and that row's mark
-advances the cursor past the failed one, so the failed row is never read again. Where that matters,
-mark with a status column or a delete-from-queue. A `poll_statement` the read-only test refuses never
+`mark_statement` over a `poll_statement` that does not return rows in cursor order, or over a
+cursor column that is not unique (below).
+**With a `mark_statement`, a handler failure also stops the
+poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
+next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on: no
+mark can move past the failed row, so stopping would not make a later poll any likelier to read it. That keeps a high-water-mark `mark_statement` from moving the cursor past
+a row whose handler failed, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
+column): a later row's mark would otherwise do so, and the poll would never select the failed row
+again. Without that order, a row with a higher key handed off earlier in the same poll has already
+moved the cursor past it. On a cursor column with ties, such as a timestamp, a failed row that
+shares its cursor value with a row handed off before it in the same poll is lost even in cursor
+order: that row's mark sets the cursor to the shared value, and a `>` predicate never selects the
+failed row again. **The trade-off is head-of-line blocking.** A row whose handler fails on
+every attempt, such as one whose value a server store rejects as too long, holds back every row
+`poll_statement` returns after it, on every poll and whatever the mark shape, a status column or a
+delete-from-queue included; with an `ORDER BY` that is the whole feed. Each failure logs a WARNING
+and, when connection events are captured, emits a `handler_error` connection event. With a
+`mark_statement` that is at most one event per poll, since the poll stops at the failure; with none
+it is one per failing row. Its reason renders the error the way the log line does: a driver error as its type, SQLSTATE and
+native error number, without its message, and any other error as the scrubbed, bounded text of
+`safe_exc`, which is a bound rather than a guarantee that no value survives. Repair or remove that
+row to release the feed.
+**The stop closes only the handler-failure path, not high-water-mark loss outright.** A row the
+source cannot decode is different, and so is a body the configured `encoding` cannot carry; neither
+reaches the handler. Each is skipped rather than stopped at (see
+[per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
+still moves the cursor past it, and its `row_undecodable` event is the record of it.
+A `poll_statement` the read-only test refuses never
 reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
 run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
 kills the poller; it retries next interval.
@@ -4223,9 +4250,11 @@ the poll does not fetch is still in the table, unmarked. The next tick takes it.
 the [`poll_statement`](#database-source--databasepoll) row. On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
-least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
-the rest, end every poll at the skip cap described below, so the rows behind them would never be
-reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
+least two cases would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
+the rest, end every poll at the skip cap described below, and one row whose handler fails every time
+stops every poll at that row (BACKLOG #4921, the head-of-line trade-off in the
+[Database source](#database-source--databasepoll) section), so in either case the rows behind would
+never be reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
 accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never read was
 never received, and there is no disposition to record. A poll that writes and passes the read-only
 test would break that: at least the rows it marked past the ceiling would be accepted-and-dropped.
@@ -4267,7 +4296,8 @@ to prevent.
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
 left in place. The database ceiling is charged at the **fetch**, for the memory reason above, so the
-row has to be decoded under the open cursor and replaced from the same cursor — the shortfall is
+row has to be decoded, and its body encoded in the configured `encoding` (BACKLOG #4921), under the
+open cursor and replaced from the same cursor — the shortfall is
 re-fetched, never the whole result set. Do not read this as parity of mechanism; what the two share is
 that a budget can only be charged by something that makes progress. Two bounds keep the replacement
 from becoming a log flood: a `body_column` that names no column `poll_statement` selects is **static**

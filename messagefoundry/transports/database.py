@@ -2643,8 +2643,9 @@ async def _probe_db(
 
 def _json_default(value: Any) -> Any:
     """JSON-serialize DB column types ``json.dumps`` can't handle natively (dates, ``Decimal``, bytes),
-    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError`` (surfaced as a
-    poll error and logged) rather than silently dropping data."""
+    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError``, which
+    :meth:`DatabaseSource._select` skips and reports as ``row_undecodable``, rather than silently
+    dropping data."""
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -2906,7 +2907,7 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
-#: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
+#: How many rows that cannot become a body ONE poll will step past before it stops fetching and defers the rest
 #: (BACKLOG #1662). A flat number rather than a multiple of ``poll_max_rows``, so it holds for a
 #: ceiling of 1 as well as the shipped 500: one poll pulls at most ``poll_max_rows + 64`` rows out of
 #: the driver, and logs at most 64 skip lines, which is already fewer than the 500 the shipped code
@@ -2915,8 +2916,9 @@ class DatabaseDestination(DestinationConnector):
 #: **A stop rule re-creates the starvation it was written against whenever the poison run is longer
 #: than the bound**, so the bound alone is not the answer and is not asked to be: the dominant case,
 #: a ``body_column`` that names no selected column, is caught once per poll before any row is read,
-#: and never reaches this budget at all. What is left here is genuinely per-row (an undecodable BLOB,
-#: an unserializable column type), where a run of more than 64 in front of the good rows means a
+#: and never reaches this budget at all, nor does a codec fault that is no conversion failure, which
+#: ends the poll. What is left here is per-row (an undecodable BLOB, an unserializable column type, a
+#: body the configured ``encoding`` cannot carry), where a run of more than 64 in front of the good rows means a
 #: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
 _MAX_SKIPPED_ROWS_PER_POLL = 64
 
@@ -2944,12 +2946,13 @@ _LEADER_RECHECK_S = 0.05
 class _PolledBatch(NamedTuple):
     """What one poll took from ``poll_statement``.
 
-    ``rows`` are ``(record, body)`` pairs that decoded; ``skipped`` carries one PHI-free reason per
-    row that could not become a body; ``skip_budget_spent`` says this poll stopped fetching early
-    because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than reported
-    in place so the pool connection is released before anything is logged or emitted."""
+    ``rows`` are ``(record, raw)`` pairs whose body decoded and then encoded in the configured
+    ``encoding``, ``raw`` being the bytes the handler gets; ``skipped`` carries one PHI-free reason
+    per row that could not become those bytes; ``skip_budget_spent`` says this poll stopped fetching
+    early because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than
+    reported in place so the pool connection is released before anything is logged or emitted."""
 
-    rows: list[tuple[dict[str, Any], str]]
+    rows: list[tuple[dict[str, Any], bytes]]
     skipped: list[str]
     skip_budget_spent: bool
 
@@ -2961,9 +2964,10 @@ def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> st
     the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, would mark every row it
     matches, but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the
     rows past the ceiling would be marked and never ingested, and so would at least a row whose
-    handler failed (:meth:`DatabaseSource._poll_once` goes on to the next row) and the rows a stop
-    leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
-    the handler returns, may mark a row.
+    handler failed, the rows behind it when a ``mark_statement`` is set
+    (:meth:`DatabaseSource._poll_once` then stops the batch there, BACKLOG #4921) and the rows a
+    stop leaves behind. That is accept-and-drop. Only the per-row
+    ``mark_statement``, run after the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
     ``poll_max_rows`` is; its docstring says what it refuses. ``dialect`` is the poll's own, so a
@@ -3257,7 +3261,7 @@ class DatabaseSource(SourceConnector):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # A poll error (connection drop, a bad poll_statement, an unserializable column) must
+                # A poll error (connection drop, a bad poll_statement, a codec fault) must
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 # Not logger.exception: its traceback ends in the driver's text, which quotes the
@@ -3325,42 +3329,65 @@ class DatabaseSource(SourceConnector):
             await self._emit_event("row_undecodable", reason=reason)
         if batch.skip_budget_spent:
             logger.error(
-                "DATABASE source skipped %d undecodable rows in one poll and stopped fetching; the "
-                "rest of the result set is deferred to the next poll (nothing dropped or marked)",
+                "DATABASE source skipped %d rows it could not turn into a body in one poll and "
+                "stopped fetching; the rest of the result set is deferred to the next poll (nothing "
+                "dropped or marked)",
                 len(batch.skipped),
             )
         me = asyncio.current_task()
-        for record, body in batch.rows:
+        for record, raw in batch.rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
             # A cancelled stop() gives the hand-off and mark a grace. Keyed by task, so a cut task
             # unwinding late cannot clear the flag of a task a later start() made.
             self._row_step_task = me
             try:
-                await self._ingest_row(record, body)
+                go_on = await self._ingest_row(record, raw)
             finally:
                 if self._row_step_task is me:
                     self._row_step_task = None
+            if not go_on:
+                # BACKLOG #4921. Stop at the first handler failure: no later row of this poll is
+                # handed off or marked. A high-water-mark mark_statement would otherwise run on the
+                # next row and move the cursor past the failed one, which the next poll would then
+                # never select. That holds only while poll_statement returns rows in cursor order
+                # over a unique cursor column; an earlier row with a higher or equal key has
+                # already moved the cursor. The failed row and
+                # every row behind it wait for the next poll, so a row that fails every time holds
+                # back the rows behind it (head-of-line). With no mark_statement no mark can move
+                # past the failed row, so stopping would not make it any likelier to be read again,
+                # and the batch goes on.
+                break
 
-    async def _ingest_row(self, record: dict[str, Any], body: str) -> None:
-        """Hand one row to the pipeline, then mark it. A cancelled stop() lets this step run for up
-        to :data:`_ROW_STEP_GRACE_S` before it cuts it, so the step is NOT atomic under shutdown."""
+    async def _ingest_row(self, record: dict[str, Any], raw: bytes) -> bool:
+        """Hand one row's encoded body to the pipeline, then mark the row. Returns whether the batch
+        goes on: False only when the handler raised and a ``mark_statement`` is set; True when the
+        row was handed off, whether or not its mark then failed. A body the configured ``encoding``
+        cannot carry never gets here: :meth:`_select` skips it as it skips an undecodable row. A
+        cancelled stop() lets this step run for up to :data:`_ROW_STEP_GRACE_S` before it cuts it,
+        so the step is NOT atomic under shutdown."""
         assert self._handler is not None
         try:
-            await self._handler(body.encode(self._encoding))
+            await self._handler(raw)
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
-            # returns, so an exception here is an infrastructure failure (the durable store write
-            # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
-            # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            # returns, so an exception here is usually an infrastructure failure (the durable store
+            # write failed), but it can be row-specific too, such as SQL Server's 2628 truncation in
+            # the store write. Leave the row UNMARKED so the next poll re-emits it (at-least-once) —
+            # marking it now would drop a received-but-unrecorded message (mirrors the File source's
+            # M-15). The event makes the stall visible when the row fails every time (#4921).
             # _safe_db_error: on a server store the handler's write is itself a driver call, and a
             # rejection quotes the value it refused, as SQL Server's 2628 truncation and asyncpg's
             # DETAIL line do (#1661).
+            reason = _safe_db_error(exc)
+            stops = self._mark_sql is not None
+            outcome = "row left unmarked and poll stopped" if stops else "row left unmarked"
             logger.warning(
-                "DATABASE source handler failed (row left unmarked, will retry): %s",
-                _safe_db_error(exc),
+                "DATABASE source handler failed (%s, will retry next poll): %s", outcome, reason
             )
-            return
+            # The fixed outcome leads, so the store's bound on a reason cuts the error text, never it.
+            await self._emit_event("handler_error", reason=f"{outcome}: {reason}")
+            return not stops
         try:
             await self._mark(record)
         except Exception as exc:
@@ -3373,17 +3400,20 @@ class DatabaseSource(SourceConnector):
                 "DATABASE source mark failed (row will re-emit, a duplicate): %s",
                 _safe_db_error(exc),
             )
+        return True
 
     async def _select(self) -> _PolledBatch:
-        """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most
-        ``poll_max_rows``) plus a PHI-free reason per row that could not be decoded. The connection is
-        released before the rows are handed to the (possibly slow) handler, so a batch never holds a
-        pool connection hostage to downstream store I/O.
+        """Run ``poll_statement``, turn each row into the bytes the handler gets, and return the rows
+        that made them (at most ``poll_max_rows``) plus a PHI-free reason per row that could not. The
+        connection is released before the rows are handed to the (possibly slow) handler, so a batch
+        never holds a pool connection hostage to downstream store I/O.
 
-        **Decoding happens HERE, under the open cursor, and that is what lets the ceiling count rows
-        that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and cheap — a dict
-        lookup or a ``json.dumps`` — so running it at the fetch costs nothing extra and means a row the
-        source cannot read is replaced rather than spending a ceiling slot on nothing. The shipped code
+        **Decoding and encoding happen HERE, under the open cursor, and that is what lets the ceiling
+        count rows that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and
+        cheap — a dict lookup or a ``json.dumps``, then ``str.encode`` — so running it at the fetch
+        costs little and means a row the source cannot read, or whose body
+        the configured ``encoding`` cannot carry (BACKLOG #4921), is replaced rather than spending a
+        ceiling slot on nothing, and counts against the same skip budget. The shipped code
         charged the ceiling at the fetch and skipped the row afterwards, so one undecodable row sorting
         first starved a ``poll_max_rows=1`` feed forever: three polls handled nothing and the good row
         behind it was never reached.
@@ -3418,7 +3448,7 @@ class DatabaseSource(SourceConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
-        rows: list[tuple[dict[str, Any], str]] = []
+        rows: list[tuple[dict[str, Any], bytes]] = []
         skipped: list[str] = []
         budget_spent = False
         ceiling = self._poll_max_rows
@@ -3437,6 +3467,11 @@ class DatabaseSource(SourceConnector):
                     ],
                     False,
                 )
+            # Only _mark reads a record once its body is made, so the batch need not hold the body
+            # twice, once in the record and once as raw, unless the mark binds that column.
+            drop_body = self._body_column
+            if drop_body is not None and drop_body in self._mark_names:
+                drop_body = None
             want = 0
             while True:
                 if ceiling is None:
@@ -3452,17 +3487,19 @@ class DatabaseSource(SourceConnector):
                     # remainder.
                     want = ceiling - len(rows)
                     batch = list(await cur.fetchmany(want))
-                for raw in batch:
-                    record = dict(zip(columns, raw))  # noqa: B905
+                for row in batch:
+                    record = dict(zip(columns, row))  # noqa: B905
                     try:
-                        body = self._body(record)
+                        raw = self._body(record)
                     except (ValueError, TypeError) as exc:
                         skipped.append(safe_exc(exc))
                         if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
                             budget_spent = True
                             break
                         continue
-                    rows.append((record, body))
+                    if drop_body is not None:
+                        del record[drop_body]
+                    rows.append((record, raw))
                 if ceiling is None or budget_spent or len(batch) < want or len(rows) >= ceiling:
                     # A short batch means the driver is out of rows, so there is nothing to top up
                     # with — the ONLY reason to fetch again is a skip, and then only for the shortfall.
@@ -3494,8 +3531,12 @@ class DatabaseSource(SourceConnector):
             await _close_and_release(pool, conn, cur)
         return _PolledBatch(rows, skipped, budget_spent)
 
-    def _body(self, record: dict[str, Any]) -> str:
-        """The body for one row: a single column verbatim (``body_column``) or the whole row as JSON."""
+    def _body(self, record: dict[str, Any]) -> bytes:
+        """The bytes the handler gets for one row: a single column verbatim (``body_column``) or the
+        whole row as JSON, encoded in the configured ``encoding``. A row that cannot become them
+        raises ``ValueError`` or ``TypeError``, which :meth:`_select` skips. That includes a body
+        the encoding cannot carry (BACKLOG #4921): :meth:`_through_codec` makes each codec failure
+        it lists a ``ValueError``."""
         if self._body_column is not None:
             try:
                 value = record[self._body_column]
@@ -3504,9 +3545,37 @@ class DatabaseSource(SourceConnector):
                     f"body_column {self._body_column!r} is not in the poll_statement result columns"
                 ) from None
             if isinstance(value, (bytes, bytearray)):
-                return bytes(value).decode(self._encoding)
-            return value if isinstance(value, str) else str(value)
-        return json.dumps(record, default=_json_default)
+                text = self._through_codec(bytes(value).decode)
+            else:
+                text = value if isinstance(value, str) else str(value)
+        else:
+            text = json.dumps(record, default=_json_default)
+        return self._through_codec(text.encode)
+
+    def _through_codec[T](self, call: Callable[[str], T]) -> T:
+        """Run one ``decode`` or ``encode`` in the configured ``encoding``, so that a codec's failure on
+        this row reaches :meth:`_select`'s skip with no row value in it (BACKLOG #4921).
+
+        A ``UnicodeError`` goes through as it is: ``safe_exc`` renders it from its attributes, never
+        its message. Any other ``ValueError``, and a ``TypeError`` (a codec returning the wrong
+        type), becomes a ``ValueError`` of fixed text naming the step and the class, because a
+        third-party codec's message can quote the value it refused, and the ``row_undecodable``
+        reason never carries a row value. ``_select`` skips both classes, so neither may leave here
+        with the codec's message.
+
+        Anything else propagates and ends the poll (CLAUDE.md section 6): a ``LookupError`` is the
+        codec name, not the row, so it fails every row alike and is reported once per poll; and a
+        ``RuntimeError``, ``MemoryError`` or ``RecursionError`` is a codec's bug or a resource
+        fault, not a row it cannot convert."""
+        try:
+            return call(self._encoding)
+        except UnicodeError:
+            raise
+        except (ValueError, TypeError) as exc:
+            failed = type(exc).__name__
+        # Raised outside the handler, so neither __cause__ nor __context__ holds the codec's error;
+        # ``from None`` would leave it on __context__ (tests/test_from_none_is_not_redaction.py).
+        raise ValueError(f"the configured encoding could not {call.__name__} the row ({failed})")
 
     async def _mark(self, record: dict[str, Any]) -> None:
         if self._mark_sql is None:
