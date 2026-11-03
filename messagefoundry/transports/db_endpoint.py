@@ -174,6 +174,28 @@ _PRESET_DRIVER_LIBRARIES = re.compile(
 )
 
 
+def is_remote_spelling(value: object) -> bool:
+    """Whether the trimmed ``value`` starts with two separators, or with a device prefix such as
+    ``\\\\?\\`` or ``\\??\\``, and so can name another host. The spelling only;
+    :func:`messagefoundry.transports.database.names_another_host` adds the Windows check."""
+    text = str(value).strip()
+    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
+
+
+#: The characters the SQL Server preset refuses anywhere in ``odbc_driver`` (BACKLOG #4873): the
+#: ``;{}`` the generic dialect refuses in its driver, and ``=``, which it refuses in the values it
+#: sends unbraced. The driver is sent braced with the ``}}`` escape, but whether every driver
+#: manager reads that escape in a ``DRIVER`` value is unmeasured, so a library path's directories
+#: may not hold them either.
+_PRESET_DRIVER_REFUSED = ";{}="
+
+
+def _holds_preset_delimiter(name: object) -> bool:
+    """Whether ``odbc_driver`` holds any of :data:`_PRESET_DRIVER_REFUSED`."""
+    text = str(name or "")
+    return any(ch in text for ch in _PRESET_DRIVER_REFUSED)
+
+
 def _preset_driver(name: object) -> bool:
     """Whether the SQL Server preset accepts ``odbc_driver``, as written: a whole name in
     :data:`_PRESET_DRIVER_NAMES`, or a path whose file name is in
@@ -181,14 +203,15 @@ def _preset_driver(name: object) -> bool:
 
     Blanks are NOT folded, unlike :func:`odbc_keyword_name` (docs/CONNECTIONS.md says why). The
     text must be ASCII, which refuses a no-break space, and printable, which refuses a tab and the
-    ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks. The strip test is for a path:
-    the file-name pattern does not see a blank that leads its directory. A path that opens with
-    two separators, a UNC or device path, or holds ``://`` is refused: it can name a library on
-    another host. A mapped drive or a mount is not visible here."""
+    ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks, and must hold none of
+    :data:`_PRESET_DRIVER_REFUSED`. The strip test is for a path: the file-name pattern does not
+    see a blank that leads its directory. A path :func:`is_remote_spelling` matches, a UNC or
+    device path, or one holding ``://`` is refused: it can name a library on another host. A
+    mapped drive or a mount is not visible here."""
     text = str(name or "")
     if not (text.isascii() and text.isprintable()) or text != text.strip():
         return False
-    if text[:2] in ("\\\\", "//", "\\/", "/\\") or "://" in text:
+    if _holds_preset_delimiter(text) or is_remote_spelling(text) or "://" in text:
         return False
     lowered = text.lower()
     return bool(
@@ -206,7 +229,11 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
     comma or a ``\\``. Why each is refused, and what a name cannot tell, is stated once in
     docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds*. Short, remedy first: a stored
     failure keeps about its first 200 characters."""
-    if not _preset_driver(settings.get("odbc_driver", SQLSERVER_DEFAULT_DRIVER)):
+    driver = settings.get("odbc_driver", SQLSERVER_DEFAULT_DRIVER)
+    # Its own text, ahead of the check below that also refuses it.
+    if _holds_preset_delimiter(driver):
+        return "odbc_driver must not hold ';', '{', '}' or '=' (ODBC injection risk)"
+    if not _preset_driver(driver):
         return (
             'name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect="generic": '
             "another driver can misread the server,port the preset sends"

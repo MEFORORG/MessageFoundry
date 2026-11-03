@@ -123,6 +123,7 @@ from messagefoundry.transports.db_endpoint import (
     SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
     generic_hop_endpoint,
+    is_remote_spelling,
     odbc_keyword_name,
     odbc_param,
     sqlserver_preset_refusal,
@@ -235,8 +236,6 @@ def _build_dsn(
     reads it, it changes nothing. A statement guard is a shape test on text. The control that
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
-    # Before the attested-weakened-TLS audit line, so this refusal never follows one. The auth,
-    # server and port refusals below still run after that line.
     refusal = sqlserver_preset_refusal(s)
     if refusal is not None:
         raise ValueError(f"{hop_name_prefix(connection)}DATABASE {refusal}")
@@ -255,8 +254,6 @@ def _build_dsn(
             "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
             "the default, or with no posture)."
         )
-    if (trust or not encrypt) and attested:
-        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
         raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
@@ -289,7 +286,12 @@ def _build_dsn(
         # Advertise read-only intent; the docstring says who asks for it. Not a TLS keyword, so it
         # goes in the head, before the TLS tail (messagefoundry.odbc_dsn).
         parts.append("ApplicationIntent=ReadOnly")
-    return odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
+    dsn = odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
+    # Last, once every refusal above has passed, so a connection this builder refuses leaves no
+    # audit line saying its weakened hop was permitted.
+    if (trust or not encrypt) and attested:
+        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
+    return dsn
 
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
@@ -710,13 +712,6 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     )
 
 
-def _is_remote_spelling(value: object) -> bool:
-    """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
-    can name another host. The spelling only; :func:`names_another_host` adds the Windows check."""
-    text = str(value).strip()
-    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
-
-
 #: ``GetDriveTypeW`` answers: a mapped network drive, no volume at that letter, and an unknown type.
 _DRIVE_REMOTE = 4
 _DRIVE_NO_ROOT_DIR = 1
@@ -810,7 +805,7 @@ def _windows_path_verdict(
             raise _PathEnds from None
         if target is not None:
             text = target.strip()
-            if _is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
+            if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
                 raise _LeavesHost
             if text[:1] in "\\/" and text.lstrip("\\/").split("\\")[0].lower() in _NT_OBJECT_ROOTS:
                 raise OSError("the link names an NT object path")  # the walk reports it: unclear
@@ -833,9 +828,9 @@ def _windows_path_verdict(
     return False
 
 
-#: A link target :func:`_is_remote_spelling` matches that :func:`_windows_path_verdict` does not
+#: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
 #: count as leading off the host: two separators, ``?`` or ``.``, a separator, then a drive letter
-#: or ``Volume{``. Any other link target :func:`_is_remote_spelling` matches is counted as leading
+#: or ``Volume{``. Any other link target :func:`is_remote_spelling` matches is counted as leading
 #: off the host.
 _LOCAL_DEVICE_TARGET = re.compile(r"[\\/]{2}[?.][\\/](?:[A-Za-z]:|[Vv]olume\{)")
 
@@ -872,7 +867,7 @@ def file_keyword_verdicts(value: object) -> FileVerdicts:
         return {}
     raw = str(value)
     return {
-        p: True if _is_remote_spelling(p) else _path_verdict(p)
+        p: True if is_remote_spelling(p) else _path_verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
         if p
     }

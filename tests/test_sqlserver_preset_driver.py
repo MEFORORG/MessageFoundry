@@ -24,7 +24,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.transports.database import DatabaseLookupExecutor, _build_dsn
-from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER, is_remote_spelling
 from messagefoundry.transports.egress import (
     check_egress_allowed,
     check_lookup_allowed,
@@ -80,7 +80,19 @@ REFUSED_DRIVERS = [
     r"\\?\C:\Windows\System32\msodbcsql18.dll",
     "//files.test.invalid/share/libmsodbcsql-18.so",
     "file://files.test.invalid/share/libmsodbcsql-18.so",
+    # The NT object-manager spelling of a share, which opens with one separator and a '?'.
+    r"\??\UNC\files.test.invalid\share\msodbcsql18.dll",
+    "/??/UNC/files.test.invalid/share/libmsodbcsql-18.so",
 ]
+
+#: An accepted library path with each delimiter the preset refuses in its directory. The first is
+#: the keyword injection a lone ``}}`` escape would stand between: ``SERVER=evil`` as a keyword.
+DELIMITER_DRIVERS = [
+    "/opt/x};SERVER=evil.test.invalid;Y={/libmsodbcsql-18.so",
+    *(f"/opt/x{ch}y/libmsodbcsql-18.so" for ch in ";{}="),
+    *(f"C:\\x{ch}y\\msodbcsql18.dll" for ch in ";{}="),
+]
+DELIMITER_REFUSAL = "odbc_driver must not hold ';', '{', '}' or '='"
 
 ACCEPTED_DRIVERS = [
     "ODBC Driver 18 for SQL Server",
@@ -157,6 +169,42 @@ def test_a_driver_that_is_not_a_sql_server_driver_is_refused_at_check(
             check(_preset(odbc_driver=driver), egress)
 
 
+@pytest.mark.parametrize("driver", DELIMITER_DRIVERS)
+def test_a_driver_path_holding_a_delimiter_is_refused(check: Check, driver: str) -> None:
+    # The file name is Microsoft's library, so before this the preset accepted each of these, and
+    # only the `}}` escape kept the directory's text inside the DRIVER value.
+    with pytest.raises(ValueError, match=DELIMITER_REFUSAL):
+        _build_dsn(_preset(odbc_driver=driver))
+    for egress in (HOST_ONLY, PINNED):
+        with pytest.raises(WiringError, match=DELIMITER_REFUSAL):
+            check(_preset(odbc_driver=driver), egress)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        r"\\host\share",
+        "//host/share",
+        r"\/host/share",
+        r"/\host\share",
+        r"\\?\UNC\host\share",
+        r"\??\UNC\host\share",
+        "/??/UNC/host/share",
+        "  \\\\host\\share",
+    ],
+)
+def test_a_remote_spelling_is_read_as_one(spelling: str) -> None:
+    assert is_remote_spelling(spelling)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [r"C:\Windows\msodbcsql18.dll", "/opt/libmsodbcsql-18.so", r"\opt\x", "?", "", "/"],
+)
+def test_a_local_spelling_is_not_read_as_remote(spelling: str) -> None:
+    assert not is_remote_spelling(spelling)
+
+
 @pytest.mark.parametrize("driver", ACCEPTED_DRIVERS)
 def test_a_sql_server_driver_is_accepted(check: Check, driver: str) -> None:
     assert f"SERVER={HOST},1433;" in _build_dsn(_preset(odbc_driver=driver))
@@ -223,19 +271,42 @@ def test_a_server_holding_an_instance_name_is_refused(check: Check, driver: str)
         check(_preset(server=server, odbc_driver=driver), EgressSettings(allowed_db=[server]))
 
 
-def test_the_refusal_comes_before_the_attested_weakened_tls_audit(
+#: Each refusal ``_build_dsn`` can make on an attested weakened connection, with the text it raises:
+#: the preset's, before the weakened-TLS check, and the auth, server and port refusals after it.
+WEAKENED_HOP_REFUSALS = [
+    pytest.param({"odbc_driver": "PostgreSQL Unicode"}, DRIVER_REFUSAL, id="driver"),
+    pytest.param({"server": f"{HOST},6432"}, "put the port in the port setting", id="server-comma"),
+    pytest.param({"auth": "kerberos"}, "auth must be sql|integrated|entra", id="auth"),
+    pytest.param({"server": f"{HOST};X=1"}, "ODBC injection risk", id="server-delimiter"),
+    pytest.param({"port": 70000}, "port must be from 0 to 65535", id="port"),
+]
+
+
+def _audit_lines(caplog: pytest.LogCaptureFixture) -> int:
+    return sum("tls_hop_attested" in record.getMessage() for record in caplog.records)
+
+
+def test_an_accepted_weakened_connection_writes_one_audit_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # A refused connection must leave no audit line saying its weakened hop was permitted. The
-    # line is written only on an enforcing posture; the control shows it is written there.
-    weakened = _preset(encrypt=False)
+    # The control for the test below: the line is written only on an enforcing posture, once.
     with caplog.at_level(logging.WARNING), active_hop_posture(HopPosture(enforcing=True)):
-        _build_dsn(weakened, attested=True)
-        assert "tls_hop_attested" in caplog.text
-        caplog.clear()
-        with pytest.raises(ValueError, match=DRIVER_REFUSAL):
-            _build_dsn({**weakened, "odbc_driver": "PostgreSQL Unicode"}, attested=True)
-    assert "tls_hop_attested" not in caplog.text
+        _build_dsn(_preset(encrypt=False), attested=True)
+    assert _audit_lines(caplog) == 1
+
+
+@pytest.mark.parametrize(("update", "match"), WEAKENED_HOP_REFUSALS)
+def test_a_refused_connection_writes_no_weakened_tls_audit_line(
+    caplog: pytest.LogCaptureFixture, update: dict[str, Any], match: str
+) -> None:
+    # A refused connection must leave no audit line saying its weakened hop was permitted.
+    with (
+        caplog.at_level(logging.WARNING),
+        active_hop_posture(HopPosture(enforcing=True)),
+        pytest.raises(ValueError, match=match),
+    ):
+        _build_dsn({**_preset(encrypt=False), **update}, attested=True)
+    assert _audit_lines(caplog) == 0
 
 
 def test_a_lookup_refusal_names_the_lookup() -> None:

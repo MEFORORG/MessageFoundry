@@ -175,9 +175,11 @@ _DB: dict[str, object] = {
             id="secure-sql-braces",
         ),
         pytest.param(
-            {"auth": "integrated", "encrypt": True, "odbc_driver": "/opt/x}y/libmsodbcsql-18.so"},
+            # No driver value takes a brace on either dialect now (BACKLOG #4873), so the `}}`
+            # escape is covered here by DATABASE and APP.
+            {"auth": "integrated", "encrypt": True, "odbc_driver": "/opt/x y/libmsodbcsql-18.so"},
             True,
-            "DRIVER={/opt/x}}y/libmsodbcsql-18.so};SERVER=db.example,14330;DATABASE={d}}b;x};APP={a;p}}p};"
+            "DRIVER={/opt/x y/libmsodbcsql-18.so};SERVER=db.example,14330;DATABASE={d}}b;x};APP={a;p}}p};"
             "Trusted_Connection=yes;ApplicationIntent=ReadOnly;Encrypt=yes;"
             "TrustServerCertificate=no;",
             id="read-only-before-the-tail",
