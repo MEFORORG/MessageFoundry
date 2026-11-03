@@ -3572,9 +3572,10 @@ class DatabaseSource(SourceConnector):
         except UnicodeError:
             raise
         except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"the configured encoding could not {call.__name__} the row ({type(exc).__name__})"
-            ) from None
+            failed = type(exc).__name__
+        # Raised outside the handler, so neither __cause__ nor __context__ holds the codec's error;
+        # ``from None`` would leave it on __context__ (tests/test_from_none_is_not_redaction.py).
+        raise ValueError(f"the configured encoding could not {call.__name__} the row ({failed})")
 
     async def _mark(self, record: dict[str, Any]) -> None:
         if self._mark_sql is None:

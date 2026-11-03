@@ -989,6 +989,16 @@ async def test_db_a_codec_failure_skips_the_row_without_the_codec_message(
     assert _CODEC_SENTINEL not in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
     assert len(table.rows) == 2  # not marked
+    if exc_type is not UnicodeError:
+        # Nor is the codec's error on the chain of what _select skips, so nothing that walks the
+        # chain reaches its message. Red mutation: raise inside the handler ``from None``.
+        with (
+            _refusing_codec_source(exc_type, value) as (src, _handler, _sink, _table),
+            pytest.raises(ValueError, match="the configured encoding could not") as raised,
+        ):
+            src._body({"payload": value})
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
 
 
 @pytest.mark.parametrize("value", [pytest.param("A", id="encode"), pytest.param(b"A", id="decode")])
