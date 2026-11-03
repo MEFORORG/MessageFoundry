@@ -1227,8 +1227,8 @@ def test_a_fresh_reading_at_the_ceiling_gets_no_fallback(tmp_path: Path) -> None
 
 def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Path) -> None:
     """A terminal session can publish its own reading, so it gets no fallback; neither does a fresh
-    statusLine reading, nor a probe under -StateDir that did not name both fixture files. The SDK run
-    is the positive control for the negative assertions, on the same arguments."""
+    statusLine reading, nor a probe under -StateDir that left any one fixture input unnamed. The SDK
+    run is the positive control for the negative assertions, on the same arguments."""
     args = steward_files(tmp_path)
     assert FALLBACK_LABEL in desktop_context(
         tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}
@@ -1237,7 +1237,9 @@ def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Pat
         tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "cli"}
     )
 
-    for named in (args[:2], args[:4], args[:6], args[:4] + args[6:]):
+    # Each flag and its value is a pair, so dropping one pair leaves exactly one input unnamed.
+    for i in range(0, len(args), 2):
+        named = args[:i] + args[i + 2 :]
         assert FALLBACK_LABEL not in desktop_context(tmp_path, named), (
             "under -StateDir the hook must not fall through to a real login record or session store"
         )

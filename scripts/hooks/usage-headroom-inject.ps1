@@ -116,8 +116,8 @@
       for the session that read alone; nothing here walks `pools`, so that entry is never served.
 
       Still a second copy of watch.py's rules, in another language. Nothing ties the two, so a change
-      to watch.py's _is_fresh, _desktop_pool, _session_records or CACHE_VERSION must be carried here by
-      hand.
+      to at least watch.py's _is_fresh, TTL_OK, _desktop_pool, _session_records, SCAN_LIMIT,
+      _cli_pool_selfcheck or CACHE_VERSION must be carried here by hand.
 
       No grade. The Steward's `state` field is a severity label, not a stop order (korus
       roles/STEWARD.md 3b), and usage.ps1's thresholds were set for statusLine readings. The
@@ -541,8 +541,8 @@ function Get-DesktopSessionRecordFiles([string]$Dir, [string]$HomeDir) {
     $roots = [System.Collections.Generic.List[string]]::new()
     if ($Dir) { $roots.Add($Dir) }
     if ($HomeDir -and (Test-Path -LiteralPath $HomeDir -PathType Container)) {
-        # -Force because Python's glob does not skip a hidden directory. Sorted ordinally, as watch.py's
-        # sorted() sorts its roots.
+        # -Force here and below because Python's glob does not skip a hidden item. Sorted ordinally, as
+        # watch.py's sorted() sorts its roots.
         $found = [string[]]@(Get-ChildItem -LiteralPath $HomeDir -Directory -Force -Filter ".claude-desktop-*" |
             ForEach-Object { Join-Path $_.FullName "claude-code-sessions" })
         [Array]::Sort($found, [StringComparer]::Ordinal)
@@ -555,9 +555,11 @@ function Get-DesktopSessionRecordFiles([string]$Dir, [string]$HomeDir) {
         try { $key = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($root)).ToLowerInvariant() } catch { continue }
         if (-not $seen.Add($key)) { continue }
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        Get-ChildItem -LiteralPath $root -Directory | Get-ChildItem -Directory | Get-ChildItem -Filter "local_*.json" -File
+        Get-ChildItem -LiteralPath $root -Directory -Force | Get-ChildItem -Directory -Force |
+            Get-ChildItem -Filter "local_*.json" -File -Force
     }
-    return @($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 400)
+    # -Stable, because watch.py's list.sort is stable: a tie keeps root order, then listing order.
+    return @($files | Sort-Object LastWriteTimeUtc -Descending -Stable | Select-Object -First 400)
 }
 
 # watch.py _desktop_pool: the record whose cliSessionId is this session's id, among the records above.
