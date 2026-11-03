@@ -1619,15 +1619,16 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 by this rule. It has its own, below.
 
 **Engine openers refuse a web-proxy credential on the legs where it could be read on the way,
-with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
+with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418, #4909).** That covers a user and password in a proxy URL
 and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. The error names no part of the proxy URL. Which legs are refused, and the one exception
-for a `proxy_user` credential its connection admitted when it was built, which covers cleartext
-legs only, are stated once, on
-[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
-a leg it lets through and what it does not check.
+broker. The error names no part of the proxy URL. A credential from the environment or the system
+proxy settings crosses no leg, the TLS leg to an `https://` proxy that fully verifies included
+(vault BACKLOG #4909). Which legs are refused, and the one exception for a `proxy_user` credential
+its connection admitted when it was built, are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with what it does
+not check.
 
 **No declaration lifts a credential written in a proxy URL, and `proxy_user` has one declared way
 (owner rulings of 2026-10-05 and 2026-10-30, vault BACKLOG #3007).** R1 of the vault's

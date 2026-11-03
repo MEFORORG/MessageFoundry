@@ -574,10 +574,31 @@ def test_an_oddly_spelled_header_does_not_cross_a_verified_tls_leg(
     assert proxy.connections == 0
 
 
-def test_control_the_plain_name_crosses_a_verified_tls_leg() -> None:
+def test_an_unadmitted_plain_name_does_not_cross_a_verified_tls_leg() -> None:
+    """The plain name no connection admitted, on the TLS leg to a proxy written ``https://``.
+    It crossed before vault BACKLOG #4909 and is refused before the dial now. That this caller-set
+    header is refused is the Lander's proposed scope on #4909, unruled; the decision record
+    names an environment credential only. The control is the same leg with no header."""
     with _WireProxy() as proxy:
         opener = _https_proxy_for_http_only(proxy, admitted=False)
+        _refused(opener, _request(_NAME, _HTTP_TARGET), "#4909")
+    assert proxy.connections == 0
+
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=False)
+        _open_and_discard(opener, urllib.request.Request(_HTTP_TARGET))
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
+
+
+def test_control_an_admitted_plain_name_still_crosses_a_verified_tls_leg() -> None:
+    """The one exception stands on this leg: a header its connection admitted reaches the proxy,
+    TLS first, on a context that fully verifies it (vault BACKLOG #4909 leaves it alone)."""
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=True)
         _open_and_discard(opener, _request(_NAME, _HTTP_TARGET))
+    assert proxy.connections == 1
     assert proxy.tls_first == 1
     assert proxy.cleartext == []
 

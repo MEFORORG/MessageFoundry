@@ -109,8 +109,8 @@ refused before anything enters the tunnel.
 is about the request, not the reply. It lives here because :func:`build_strict_opener` is the one
 place every engine urllib opener is built. See :class:`LoopbackDirectProxyHandler`.
 
-**A credential from a proxy URL never reaches a proxy in cleartext** (vault BACKLOG #2572, #3410,
-ASVS 12.2.1). The same handler makes that check, for the same reason. See
+**A credential from a proxy URL never reaches a proxy**, in cleartext or over TLS (vault BACKLOG
+#2572, #3410, #4909, ASVS 12.2.1). The same handler makes that check, for the same reason. See
 :class:`ProxyCredentialsRefusedError`, which states the rule and what it does not cover.
 """
 
@@ -830,6 +830,14 @@ _UNSENDABLE_PROXY_VALUE = (
     "this request holds a Proxy-Authorization header whose value can never be sent: "
     "http.client refuses the value; correct the proxy credential"
 )
+_TLS_PROXY_CREDENTIALS = (
+    "a web proxy credential for this request would reach a proxy over TLS, and it comes from a "
+    "proxy URL or no connection admitted it. Such a credential is not sent on any leg. Take the "
+    "credentials out of the proxy URL, or remove the Proxy-Authorization header; refusing to "
+    "send (vault BACKLOG #4909)"
+)
+#: The attribute a request keeps that refusal under, from the proxy handler to the https handler.
+_TLS_LEG_REFUSAL_ATTR = "_mefor_proxy_tls_leg_refusal"
 _UNVERIFIED_PROXY_TLS = (
     "this request would send a web proxy credential over TLS that does not fully verify the "
     "proxy: certificate verification is off, an expired certificate is allowed, or the host name "
@@ -859,9 +867,19 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     relaxed TLS settings apply to that leg too, because the leg to the proxy uses the same context.
     A credential that rides a ``CONNECT`` is judged as cleartext, whatever TLS follows it.
 
-    **The one exception covers cleartext legs only.** A caller-set header that its connection
-    admitted when it was built is sent on the cleartext leg to the proxy that connection's
-    ``transports.rest.ProxyConfig`` names. The admitting check is the connection's posture-keyed
+    **On a TLS leg that fully verifies the proxy, a credential from a proxy URL is refused too,
+    and so is a plainly spelled header no connection admitted** (vault BACKLOG #4909). So a
+    credential from a proxy URL, the environment or the system proxy settings crosses no leg, and
+    neither does a caller-set header no connection admitted. The proxy handler judges the leg,
+    and the strict https handler raises the refusal before it dials, once the request is still
+    bound for the proxy over TLS. That way a request urllib hands back for a ``CONNECT`` is
+    refused in the cleartext text instead, and a context that does not verify the proxy keeps its
+    own text. The environment half rests on decision d20261031T213402506-5d928c. The caller-set
+    half is the proposed scope that row records, not yet ruled.
+
+    **The one exception.** A caller-set header that its connection
+    admitted when it was built is sent on the leg to the proxy that connection's
+    ``transports.rest.ProxyConfig`` names: a cleartext leg, or a TLS leg that fully verifies. The admitting check is the connection's posture-keyed
     guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a ``proxy_user``
     credential when the connection declares ``cleartext_accepted``, or the proxy is on this
     machine. The
@@ -896,11 +914,6 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     urllib sends ``CONNECT`` with the header before any TLS. A proxy value with no scheme is read
     as cleartext. An unparseable value that holds an ``@`` is refused too. urllib's own error would
     quote it.
-
-    One measured example of a leg let through is an ``http`` target sent to a credentialed
-    ``https://`` proxy whose own host urllib's bypass list names, on an opener whose context fully
-    verifies. That send reaches the proxy over TLS. It is an example, not a list.
-    ``tests/test_proxy_url_credentials_refused.py`` pins at least that example on the wire.
 
     **Outside this check**, at least:
 
@@ -939,13 +952,20 @@ def _refuse_cleartext_proxy_credentials(
     caller_header_admitted: bool,
 ) -> None:
     """Raise :class:`ProxyCredentialsRefusedError` if ``req`` would carry a web-proxy credential to
-    ``proxy`` in cleartext. ``proxies`` is the handler's own map. Called after the loopback rule,
-    which sends the proxy nothing."""
+    ``proxy`` in cleartext, or mark it for that refusal on a TLS leg (vault BACKLOG #4909).
+    ``proxies`` is the handler's own map. Called after the loopback rule, which sends the proxy
+    nothing."""
     # Raised here, outside any handler, so no parser error that quotes the URL rides on the refusal.
     refusal = _sends_cleartext_proxy_credentials(
         req, proxy, proxies, caller_header_admitted=caller_header_admitted
     )
-    if refusal:
+    if refusal is _TLS_PROXY_CREDENTIALS:
+        # Not raised yet. urllib may hand the request back and tunnel it through a CONNECT, which
+        # the next pass here judges as cleartext, in that leg's own text. Kept on the request, it
+        # is raised by the strict https handler, before it dials, if the leg is still TLS to the
+        # proxy then (vault BACKLOG #4909).
+        vars(req)[_TLS_LEG_REFUSAL_ATTR] = refusal
+    elif refusal:
         raise ProxyCredentialsRefusedError(refusal)
 
 
@@ -986,17 +1006,18 @@ def _sends_cleartext_proxy_credentials(
     # A header already on it would then reach the destination, which the strict handlers refuse.
     if req.host and urllib.request.proxy_bypass(req.host):
         return None
-    # The TLS leg. urllib then hands the request back to the opener, so an https proxy that takes
-    # it is checked here again, with req.type now "https". The strict https handler checks that
-    # its context verifies the proxy. An oddly spelled header does not cross even that leg: a
-    # proxy that did not take it as its own could pass it on to the destination.
+    # The TLS leg: an http target, to a proxy written https://, which urllib reaches over TLS
+    # first unless it hands the request back for a CONNECT. Past the return above, a credential
+    # from a proxy URL or one no connection admitted is left, and neither crosses that leg either
+    # (vault BACKLOG #4909). Its text is true of a TLS leg, and the caller says when it is raised.
+    # An oddly spelled header keeps its own text there.
     tls_leg = req.type == "http" and (scheme or "").lower() == "https"
     unadmitted_plain = not caller_header_admitted and any(verdict.plain for verdict in carried)
     if not tls_leg and (from_a_proxy_url or unadmitted_plain):
         return _CLEARTEXT_PROXY_CREDENTIALS
     if oddly_spelled:
         return _MISSPELLED_PROXY_HEADER
-    return None if tls_leg else _CLEARTEXT_PROXY_CREDENTIALS
+    return _TLS_PROXY_CREDENTIALS if tls_leg else _CLEARTEXT_PROXY_CREDENTIALS
 
 
 def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, context: object) -> None:
@@ -1028,6 +1049,10 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
             # admission is read here: the guard that admits a caller-set header never looks at
             # this context.
             raise ProxyCredentialsRefusedError(_UNVERIFIED_PROXY_TLS)
+        if context is not None and vars(req).get(_TLS_LEG_REFUSAL_ATTR):
+            # The TLS leg to an https proxy, which a proxy handler judged would carry a
+            # credential from a proxy URL, or one no connection admitted (vault BACKLOG #4909).
+            raise ProxyCredentialsRefusedError(_TLS_PROXY_CREDENTIALS)
     for verdict in verdicts:
         if verdict.judged and not verdict.plain:
             # The class the proxy handler refuses this spelling with, on any leg, and its text

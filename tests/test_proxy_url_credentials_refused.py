@@ -177,22 +177,52 @@ def test_measured_urllib_sends_these_proxy_credentials_in_cleartext(
 
 def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy() -> None:
     """A proxy written ``https://`` gets a TLS session before anything else on this leg.
-    Measured on plain urllib and on the engine's opener, where it is also not refused."""
-    for build in (urllib.request.build_opener, build_strict_opener):
-        with _WireProxy() as proxy:
-            value = f"https://{_CRED}@{proxy.address}"
-            _open_and_discard(build(urllib.request.ProxyHandler({"http": value})), _HTTP_TARGET)
-        assert proxy.cleartext == []
-        assert proxy.tls_first == 1
+    Measured on plain urllib, with no engine code in the path."""
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        plain = urllib.request.build_opener(urllib.request.ProxyHandler({"http": value}))
+        _open_and_discard(plain, _HTTP_TARGET)
+    assert proxy.cleartext == []
+    assert proxy.tls_first == 1
 
 
-def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
+def _assert_tls_leg_refusal(exc: BaseException) -> None:
+    """The verified TLS leg's own text: it names TLS, not cleartext (vault BACKLOG #4909)."""
+    text = f"{exc!s} {getattr(exc, 'reason', '')}"
+    assert "vault BACKLOG #4909" in text
+    assert "cleartext" not in text
+    _assert_names_no_credential(exc)
+
+
+def test_the_engine_opener_refuses_an_http_target_with_no_https_proxy_over_tls() -> None:
+    """Leg 2 of vault BACKLOG #4909, on the engine's opener: refused before anything is dialled.
+    The control is a credential-free proxy, which gets one connection, TLS first."""
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value}))
+        with pytest.raises(ProxyCredentialsRefusedError) as raised:
+            opener.open(_HTTP_TARGET, timeout=5)
+    assert proxy.connections == 0
+    _assert_tls_leg_refusal(raised.value)
+
+    with _WireProxy() as proxy:
+        opener = build_strict_opener(
+            urllib.request.ProxyHandler({"http": f"https://{proxy.address}"})
+        )
+        _open_and_discard(opener, _HTTP_TARGET)
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+
+
+def test_an_http_target_to_a_bypassed_https_proxy_is_refused_before_the_tls_leg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One proxy written ``https://`` for both schemes, and ``NO_PROXY`` names the proxy's own
-    host. Plain urllib and the engine's opener both send the ``http`` request to the proxy over
-    TLS: one connection, TLS first, no cleartext request head (vault BACKLOG #3410). The control is
-    the engine's opener with no bypass list, which is refused before it dials."""
+    host: leg 1 of vault BACKLOG #4909. Plain urllib sends the ``http`` request to the proxy over
+    TLS, one connection, TLS first, and that half stays a measurement. The engine's opener let it
+    through too until #4909, and now refuses it before it dials. Two controls: with no bypass list
+    the leg is a cleartext ``CONNECT``, refused in that leg's own text; and a credential-free
+    proxy on the bypassed leg still gets one connection, TLS first."""
     with _WireProxy() as proxy:
         value = f"https://{_CRED}@{proxy.address}"
         opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
@@ -201,17 +231,37 @@ def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
     assert proxy.connections == 0
     _assert_fixed_refusal(raised.value)
 
-    for build in (urllib.request.build_opener, build_strict_opener):
-        with _WireProxy() as proxy:
-            monkeypatch.delenv("NO_PROXY", raising=False)  # the previous pass set it
-            value = f"https://{_CRED}@{proxy.address}"
-            opener = build(urllib.request.ProxyHandler({"http": value, "https": value}))
-            # Set after the build, so the pass shows the bypass list is read at send time.
-            monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
-            _open_and_discard(opener, _HTTP_TARGET)
-        assert proxy.connections == 1
-        assert proxy.tls_first == 1
-        assert proxy.cleartext == []
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        plain = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": value, "https": value})
+        )
+        # Set after the build, so the pass shows the bypass list is read at send time.
+        monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+        _open_and_discard(plain, _HTTP_TARGET)
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
+
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
+        monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+        with pytest.raises(ProxyCredentialsRefusedError) as raised:
+            opener.open(_HTTP_TARGET, timeout=5)
+    assert proxy.connections == 0
+    _assert_tls_leg_refusal(raised.value)
+
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    with _WireProxy() as proxy:
+        value = f"https://{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
+        monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+        _open_and_discard(opener, _HTTP_TARGET)
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
 
 
 # --- the refusal, on the wire --------------------------------------------------------------------
