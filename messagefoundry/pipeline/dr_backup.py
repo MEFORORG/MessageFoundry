@@ -1095,7 +1095,8 @@ class BackupRunner:
                 if config_only and added == 0:
                     # Before the archive is written, so nothing is published or pruned: an archive of
                     # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
-                    # The verdict leads, so the failure record's 200-character cut keeps it.
+                    # The verdict leads the message, ahead of the path. A staging leftover, when
+                    # there is one, is put ahead of both by `_build_in_staging`.
                     raise BackupError(
                         "snapshot",
                         "config-only backup: the config walk added no regular file, so there is "
@@ -1185,10 +1186,12 @@ class BackupRunner:
             rel = path.relative_to(base)
             if _is_config_edit_artifact(rel):
                 continue
+            before = len(tar.getmembers())
             tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
             # Counted from the member tar wrote, so a path swapped for a link or a folder after the
-            # check above does not count as a file.
-            if tar.getmembers()[-1].isreg():
+            # check above does not count as a file, nor one tar skipped, such as a socket.
+            members = tar.getmembers()
+            if len(members) > before and members[-1].isreg():
                 added += 1
         return added
 

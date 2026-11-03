@@ -797,6 +797,40 @@ async def test_a_failed_build_names_its_leftover_in_the_audited_error(
     assert "SYNTHETIC-DIR" in json.loads(row["detail"])["error"]
 
 
+async def test_a_refused_config_only_build_names_its_leftover_too(tmp_path, monkeypatch) -> None:
+    """The build's own refusal of a config-only pass whose walk adds nothing (vault BACKLOG #5220)
+    keeps its kind and leads with the leftover, as an OSError there does; a note would reach neither
+    the audit row nor the alert."""
+    import json
+
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    empty = tmp_path / "empty_config"
+    empty.mkdir()
+    real_teardown = dr_backup._teardown_staging
+    leftover = "the plaintext staging directory SYNTHETIC-DIR could not be removed"
+
+    def teardown_fails(path: Path) -> str | None:
+        real_teardown(path)
+        return leftover
+
+    monkeypatch.setattr(dr_backup, "_teardown_staging", teardown_fails)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, tmp_path / "dest", key, config_dir=empty).run_once(
+                now=1.0, force_config_only=True
+            )
+        rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
+    finally:
+        await store.close()
+    assert caught.value.kind == "snapshot"
+    assert str(caught.value).startswith(leftover)
+    assert "added no regular file" in str(caught.value)
+    (row,) = rows
+    assert "SYNTHETIC-DIR" in json.loads(row["detail"])["error"]
+
+
 async def test_a_staging_leftover_after_a_good_build_is_alerted_and_audited(
     tmp_path, monkeypatch
 ) -> None:

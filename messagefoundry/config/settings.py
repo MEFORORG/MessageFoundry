@@ -7889,7 +7889,8 @@ class ServiceSettings(_InputHidingModel):
                 "[backup].include_config = false cannot be combined with [store].backend = "
                 f"{self.store.backend.value!r}: the store backup there is DBA-delegated, so every "
                 "DR backup is config-only and would archive nothing. Set [backup].include_config = "
-                "true, or set [backup].enabled = false to take no scheduled backup on this store"
+                "true. Setting [backup].enabled = false stops the scheduled backup, but the "
+                "`messagefoundry backup` command turns enabled on, so it still refuses"
             )
         return self
 

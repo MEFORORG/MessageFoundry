@@ -995,6 +995,8 @@ async def test_a_config_only_pass_whose_walk_adds_nothing_is_refused(
     assert "added no regular file" in str(outcome)
     # Nothing published, nothing pruned, and no staging or failed copy left at the destination.
     assert sorted(p.name for p in dest.iterdir()) == [prior.name]
+    # A SQLite store stages beside its own file, so the run's staging directory is looked for there.
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("mefor-backup-")] == []
 
 
 @pytest.mark.parametrize("case", ["include_config off", "no config dir"])
