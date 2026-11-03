@@ -957,7 +957,7 @@ _CODEC_STEPS = pytest.mark.parametrize(
 
 
 @_CODEC_STEPS
-@pytest.mark.parametrize("exc_type", [UnicodeError, ValueError, LookupError, TypeError])
+@pytest.mark.parametrize("exc_type", [UnicodeError, ValueError, TypeError])
 async def test_db_a_codec_failure_skips_the_row_without_the_codec_message(
     exc_type: type[Exception], value: object, step: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -970,9 +970,8 @@ async def test_db_a_codec_failure_skips_the_row_without_the_codec_message(
     7, row 7). A ``UnicodeError`` is rendered by ``safe_exc`` from its attributes, a bare one as
     its class alone; anything else becomes fixed text naming the step and the class.
 
-    Red mutation: re-raise a plain ``ValueError`` unchanged in ``_through_codec``, and the sentinel
-    reaches the reason in the ``ValueError`` cases. Second red mutation: drop ``LookupError`` or
-    ``TypeError`` from its catch, and that case ends the poll instead."""
+    Red mutation: re-raise a plain ``ValueError`` or a ``TypeError`` unchanged in
+    ``_through_codec``, and the sentinel reaches the reason, since ``_select`` skips both."""
     with (
         _refusing_codec_source(exc_type, value) as (src, handler, sink, table),
         caplog.at_level(logging.DEBUG, logger=_DB_LOGGER),
@@ -993,17 +992,19 @@ async def test_db_a_codec_failure_skips_the_row_without_the_codec_message(
 
 
 @pytest.mark.parametrize("value", [pytest.param("A", id="encode"), pytest.param(b"A", id="decode")])
-@pytest.mark.parametrize("exc_type", [RuntimeError, RecursionError, MemoryError])
+@pytest.mark.parametrize(
+    "exc_type", [LookupError, KeyError, RuntimeError, RecursionError, MemoryError]
+)
 async def test_db_a_codec_fault_that_is_no_conversion_failure_ends_the_poll(
     exc_type: type[Exception], value: object
 ) -> None:
     """Only what a codec raises for a value it cannot convert is a skip (CLAUDE.md section 6). A
-    codec's own bug or a resource failure propagates out of ``_poll_once``, which the poll loop
-    logs as a poll failure and retries next tick; nothing is handed off, emitted or marked
-    (BACKLOG #4921).
+    ``LookupError`` names the codec, not the row, and a codec's own bug or a resource failure is no
+    conversion failure, so each propagates out of ``_poll_once``, which the poll loop logs as a
+    poll failure and retries next tick; nothing is handed off, emitted or marked (BACKLOG #4921).
 
-    Red mutation: widen ``_through_codec``'s catch back to ``Exception``. The poll then skips the
-    rows and this reds."""
+    Red mutation: widen ``_through_codec``'s catch back to ``Exception``, or add ``LookupError`` to
+    it. The poll then skips the rows and this reds."""
     with (
         _refusing_codec_source(exc_type, value) as (src, handler, sink, table),
         pytest.raises(exc_type),

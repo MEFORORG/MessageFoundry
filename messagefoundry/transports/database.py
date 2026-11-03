@@ -2907,7 +2907,7 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
-#: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
+#: How many rows that cannot become a body ONE poll will step past before it stops fetching and defers the rest
 #: (BACKLOG #1662). A flat number rather than a multiple of ``poll_max_rows``, so it holds for a
 #: ceiling of 1 as well as the shipped 500: one poll pulls at most ``poll_max_rows + 64`` rows out of
 #: the driver, and logs at most 64 skip lines, which is already fewer than the 500 the shipped code
@@ -2916,8 +2916,9 @@ class DatabaseDestination(DestinationConnector):
 #: **A stop rule re-creates the starvation it was written against whenever the poison run is longer
 #: than the bound**, so the bound alone is not the answer and is not asked to be: the dominant case,
 #: a ``body_column`` that names no selected column, is caught once per poll before any row is read,
-#: and never reaches this budget at all. What is left here is genuinely per-row (an undecodable BLOB,
-#: an unserializable column type), where a run of more than 64 in front of the good rows means a
+#: and never reaches this budget at all, nor does a codec fault that is no conversion failure, which
+#: ends the poll. What is left here is per-row (an undecodable BLOB, an unserializable column type, a
+#: body the configured ``encoding`` cannot carry), where a run of more than 64 in front of the good rows means a
 #: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
 _MAX_SKIPPED_ROWS_PER_POLL = 64
 
@@ -3260,7 +3261,7 @@ class DatabaseSource(SourceConnector):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # A poll error (connection drop, a bad poll_statement, an unserializable column) must
+                # A poll error (connection drop, a bad poll_statement, a codec fault) must
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 # Not logger.exception: its traceback ends in the driver's text, which quotes the
@@ -3349,8 +3350,9 @@ class DatabaseSource(SourceConnector):
                 # BACKLOG #4921. Stop at the first handler failure: no later row of this poll is
                 # handed off or marked. A high-water-mark mark_statement would otherwise run on the
                 # next row and move the cursor past the failed one, which the next poll would then
-                # never select. That holds only while poll_statement returns rows in cursor order;
-                # an earlier row with a higher key has already moved the cursor. The failed row and
+                # never select. That holds only while poll_statement returns rows in cursor order
+                # over a unique cursor column; an earlier row with a higher or equal key has
+                # already moved the cursor. The failed row and
                 # every row behind it wait for the next poll, so a row that fails every time holds
                 # back the rows behind it (head-of-line). With no mark_statement no mark can move
                 # past the failed row, so stopping would not make it any likelier to be read again,
@@ -3551,20 +3553,25 @@ class DatabaseSource(SourceConnector):
         return self._through_codec(text.encode)
 
     def _through_codec[T](self, call: Callable[[str], T]) -> T:
-        """Run one ``decode`` or ``encode`` in the configured ``encoding``, so that a codec's failure
-        on this row is a ``ValueError`` that :meth:`_select` skips (BACKLOG #4921).
+        """Run one ``decode`` or ``encode`` in the configured ``encoding``, so that a codec's failure on
+        this row reaches :meth:`_select`'s skip with no row value in it (BACKLOG #4921).
 
         A ``UnicodeError`` goes through as it is: ``safe_exc`` renders it from its attributes, never
-        its message. Any other ``ValueError``, a ``LookupError`` (a non-text or unregistered codec)
-        or a ``TypeError`` (a codec returning the wrong type) becomes fixed text naming the step and
-        the class, because a third-party codec's message can quote the value it refused, and a
-        ``row_undecodable`` reason never carries a row value. Anything else, such as ``MemoryError``
-        or a codec's own bug, propagates and ends the poll (CLAUDE.md section 6)."""
+        its message. Any other ``ValueError``, and a ``TypeError`` (a codec returning the wrong
+        type), becomes a ``ValueError`` of fixed text naming the step and the class, because a
+        third-party codec's message can quote the value it refused, and the ``row_undecodable``
+        reason never carries a row value. ``_select`` skips both classes, so neither may leave here
+        with the codec's message.
+
+        Anything else propagates and ends the poll (CLAUDE.md section 6): a ``LookupError`` is the
+        codec name, not the row, so it fails every row alike and is reported once per poll; and a
+        ``RuntimeError``, ``MemoryError`` or ``RecursionError`` is a codec's bug or a resource
+        fault, not a row it cannot convert."""
         try:
             return call(self._encoding)
         except UnicodeError:
             raise
-        except (ValueError, LookupError, TypeError) as exc:
+        except (ValueError, TypeError) as exc:
             raise ValueError(
                 f"the configured encoding could not {call.__name__} the row ({type(exc).__name__})"
             ) from None
