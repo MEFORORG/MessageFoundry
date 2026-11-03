@@ -4,7 +4,7 @@
 
 ``messagefoundry restore`` places the archive's whole store, so every change written to the store
 after the archive was taken is gone from the one it places. :data:`RESTORE_ROLLBACK_NOTICE` is the
-statement. The ``restore`` summary, its ``--json`` payload, the ``--allow-old-archive`` help and the
+statement. The ``restore`` summary, its ``--json`` payload, the ``restore --help`` epilog and the
 ``store_restored`` alert's ``rollback_notice`` key carry it whole. The places too short for it, the
 alert's ``detail`` and the age refusal, carry :data:`RESTORE_NOTICE_POINTER` instead, which names
 the command that prints it on an installed engine. The adopter guide's restore section names every
@@ -45,20 +45,27 @@ RESTORE_ROLLBACK_CLASSES: tuple[str, ...] = (
 )
 
 #: The statement every restore notice that has the room carries whole. Worded for a restore in
-#: general, because the ``--allow-old-archive`` help shows it before anything was written.
+#: general, because ``restore --help`` shows it before anything was written. The audited changes
+#: are bounded by the archive's newest audit row, which every notice prints; anything unaudited
+#: written between that row and the snapshot is in the archive and is not undone.
 RESTORE_ROLLBACK_NOTICE = (
-    "A restore undoes every change made to the store after the archive's newest audit row, and "
-    "each must be re-applied by hand, at least: "
+    "A restore undoes every change made to the store after the archive was taken. Each audited "
+    "change after the archive's newest audit row must be re-applied by hand, at least: "
     + "; ".join(RESTORE_ROLLBACK_CLASSES)
-    + ". Re-apply the removals before users can reach the restored engine: keep [api].host on "
-    "loopback, its default, or the API port behind a closed firewall until they are done. Most "
-    "of them need the web console or the API of a serving engine; the offline commands, at least "
+    + ". Re-apply the removals before users can reach the restored engine: keep "
+    "[security].local_access_only = true, its default, with any reverse proxy in front of the "
+    "engine stopped, or keep the API port behind a closed firewall, until they are done. They "
+    "need the web console or the API of a serving engine: the offline commands, at least "
     "admin-unlock, admin-reset-totp, admin-set-notify-email and admin-revoke-sessions, act on the "
-    "store without one. A restore can also send again: messages still queued when the archive "
-    "was taken are processed and delivered again, those delivered since included, and a file "
-    "inbound with after_read = leave ingests again the files it took since, so a partner can "
-    "receive duplicates. Messages received after the archive was taken, later reference-set "
-    "syncs and later transform state are not in a restored store either."
+    "store without one, but none of them disables or deletes an account, removes a passkey or "
+    "changes a role. A restore can also send again: messages still queued when the archive was "
+    "taken are processed and delivered again, those delivered since included, and an inbound that "
+    "leaves files in place (after_read = leave), local or remote, ingests again the files it took "
+    "since, so a partner can receive duplicates. Where [integrity].audit_anchor_file holds an "
+    "anchor taken after the archive, the start-up audit walk, where it runs, reports the "
+    "restored log as truncated (an audit-chain-truncated alert): expect it, and take a new anchor "
+    "once the restore is confirmed. Messages received after the archive was taken, later "
+    "reference-set syncs and later transform state are not in a restored store either."
 )
 
 #: Where to read :data:`RESTORE_ROLLBACK_NOTICE` from a place too short to hold it. ``restore

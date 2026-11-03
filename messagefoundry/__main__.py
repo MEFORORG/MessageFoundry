@@ -1299,10 +1299,19 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     cipher_audit.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #5094: the epilog is the one statement of what a restore rolls back, whole, so
+    # `messagefoundry restore --help` prints it on any installed engine; the store_restored alert
+    # and the age refusal point here. An import-free leaf, so the parser can build from it; the
+    # startup import budget names it. HelpFormatter, because the default breaks an epilog at a
+    # hyphen and the notice names hyphenated commands an operator copies.
+    from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
+
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
         "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+        epilog=RESTORE_ROLLBACK_NOTICE,
+        formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
     restore.add_argument(
@@ -1335,15 +1344,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         f"{_RESTORE_MAX_AGE_DAYS:g}). An archive of unknown age is refused whatever this is; "
         "only --allow-old-archive restores it",
     )
-    # BACKLOG #5094: the help carries the one statement of what a restore rolls back, whole. A
-    # stdlib-free leaf, so the parser can build from it; the startup import budget names it.
-    from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
-
     restore.add_argument(
         "--allow-old-archive",
         action="store_true",
-        help="restore an archive older than --max-age-days, or of unknown age, anyway. "
-        f"{RESTORE_ROLLBACK_NOTICE}",
+        help="restore an archive older than --max-age-days, or of unknown age, anyway. The end of "
+        "this help says what a restore rolls back, which must then be re-applied by hand",
     )
     restore.add_argument("--json", action="store_true", help="emit JSON")
 

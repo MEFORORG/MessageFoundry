@@ -27,11 +27,13 @@ import pytest
 from messagefoundry.__main__ import _build_parser, main
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _body
 from messagefoundry.pipeline.alerts import (
+    _STORE_RESTORED_CLOCK_SKEW,
     STORE_RESTORED_SUBJECT,
     LoggingAlertSink,
     store_restored_detail,
 )
 from messagefoundry.pipeline.dr_backup import (
+    _ARCHIVE_CLOCK_SKEW_SECONDS,
     BackupError,
     _refuse_an_old_archive,
     restored_accounts_notice,
@@ -52,12 +54,6 @@ _LEAF = _ROOT / "messagefoundry" / "restore_notice.py"
 def _flat(text: str) -> str:
     """``text`` with every run of whitespace made one space, so a wrapped line still matches."""
     return re.sub(r"\s+", " ", text)
-
-
-def _unwrapped(text: str) -> str:
-    """``text`` as argparse wrapped it, unwrapped: argparse breaks a line after a word's hyphen
-    (``self-`` then ``service``), and the notice has no hyphen with a space after it."""
-    return re.sub(r"-\s+", "-", _flat(text))
 
 
 def test_the_statement_names_the_classes_the_old_notices_left_out() -> None:
@@ -86,14 +82,18 @@ def test_the_statement_names_the_classes_the_old_notices_left_out() -> None:
         "before users can reach",
         # Round 4: what an operator can do about the reach, and what a restore brings back
         # rather than undoes.
-        "[api].host on loopback",
+        "[security].local_access_only = true",
+        "reverse proxy",
         "admin-unlock",
         "admin-revoke-sessions",
+        "none of them disables",
         "delivered again",
         "after_read = leave",
+        "local or remote",
         "duplicates",
         "vault_transit bound attestation",
         "withdraw-transit-bound",
+        "audit-chain-truncated",
     ):
         assert word in RESTORE_ROLLBACK_NOTICE, word
     # A floor, not a census: the restore replaces the whole store.
@@ -113,6 +113,12 @@ def _detail(created: float | None = 1_000_000.0, revoked: int = 2) -> str:
     )
 
 
+def test_the_alert_reads_a_future_archive_time_as_the_refusal_does() -> None:
+    assert _STORE_RESTORED_CLOCK_SKEW == _ARCHIVE_CLOCK_SKEW_SECONDS
+    assert "0.0 days old" in _detail(_RESTORED_AT + _STORE_RESTORED_CLOCK_SKEW)
+    assert "of unknown age" in _detail(_RESTORED_AT + _STORE_RESTORED_CLOCK_SKEW + 1)
+
+
 def test_the_alert_detail_points_at_the_statement() -> None:
     detail = _detail()
     assert RESTORE_NOTICE_POINTER in detail
@@ -130,7 +136,7 @@ def test_the_pointer_names_a_command_that_prints_the_statement(
     with pytest.raises(SystemExit) as info:
         main(["restore", "--help"])
     assert info.value.code == 0
-    assert _unwrapped(RESTORE_ROLLBACK_NOTICE) in _unwrapped(capsys.readouterr().out)
+    assert RESTORE_ROLLBACK_NOTICE in _flat(capsys.readouterr().out)
 
 
 async def test_the_notifier_event_carries_the_statement_whole() -> None:
@@ -162,8 +168,16 @@ def test_the_logging_sink_logs_the_statement_whole(caplog: pytest.LogCaptureFixt
         # The longest age written as a number, and a crafted manifest time past it.
         (_RESTORED_AT - 99_999 * 86400, 9_999_999, "99999.0 days old"),
         (-1e300, 9_999_999, "over 99999 days old"),
+        # Dated after the restore, past the refusal's skew: not "0.0 days old".
+        (_RESTORED_AT + 2 * 3600, 9_999_999, "of unknown age"),
     ],
-    ids=["short", "unknown-age-longest-count", "longest-age-longest-count", "crafted-age"],
+    ids=[
+        "short",
+        "unknown-age-longest-count",
+        "longest-age-longest-count",
+        "crafted-past-age",
+        "crafted-future-age",
+    ],
 )
 def test_the_stored_alert_reason_keeps_age_count_and_pointer_whole(
     tmp_path: Path, created: float | None, revoked: int, age: str
@@ -213,15 +227,24 @@ def test_the_age_refusal_leads_with_nothing_written_and_points_at_the_statement(
     assert len(refusal) < 300 and RESTORE_ROLLBACK_NOTICE not in refusal
 
 
-def test_the_allow_old_archive_help_carries_the_statement() -> None:
+@pytest.mark.parametrize("columns", ["50", "80", "120", "160"])
+def test_the_restore_help_carries_the_statement_unbroken(
+    monkeypatch: pytest.MonkeyPatch, columns: str
+) -> None:
+    """``restore --help`` ends with the statement, and the ``--allow-old-archive`` help points
+    there. Rendered at several widths with only whitespace collapsed, so a hyphenated command the
+    notice names (``admin-reset-totp``) split across lines at any of them fails here."""
+    monkeypatch.setenv("COLUMNS", columns)
     parser, _dispatch = _build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     restore = sub.choices["restore"]
+    assert restore.epilog == RESTORE_ROLLBACK_NOTICE
     flag = next(a for a in restore._actions if "--allow-old-archive" in a.option_strings)
-    assert flag.help is not None
-    assert RESTORE_ROLLBACK_NOTICE in flag.help
+    assert flag.help is not None and "The end of this help says what a restore rolls back" in (
+        flag.help
+    )
     # argparse %-formats help when it renders it, so a "%" in the notice would break --help.
-    assert "must be re-applied by hand" in _flat(restore.format_help())
+    assert RESTORE_ROLLBACK_NOTICE in _flat(restore.format_help())
 
 
 def test_the_guide_restore_section_names_every_class() -> None:

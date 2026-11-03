@@ -692,8 +692,8 @@ in again. Other commands that open the store, such as `provision-admin`, leave t
 start.
 
 **What a restore rolls back (BACKLOG #5094).** A restore undoes every change made to the store
-after the archive's newest audit row, and the engine does not re-apply any of it. Re-apply by hand
-at least these:
+after the archive was taken, and the engine does not re-apply any of it. Re-apply by hand at least
+these audited changes made after the archive's newest audit row:
 
 - account creations, disables, enables and deletes;
 - account locks and unlocks;
@@ -713,26 +713,19 @@ at least these:
   live again, and one recorded since (store attest-transit-bound) is gone, so serve refuses
   under [security].enforcement = enforce until it is recorded again.
 
-Re-apply the removals before users can reach the restored engine: keep `[api].host` on loopback,
-its default, or the API port behind a closed firewall until they are done. Most of them need the
-web console or the API of a serving engine; the offline commands, at least `admin-unlock`,
-`admin-reset-totp`, `admin-set-notify-email` and `admin-revoke-sessions`, act on the store without
-one.
+The statement this list is drawn from also says how to keep users off the engine while you
+re-apply the removals, what a restore can send again (duplicates to a partner), and what else it
+leaves out. `messagefoundry restore --help` prints that statement whole, at its end, on any
+installed engine, with no config or store. Read the source's audit log, or its off-host copy, for
+the changes themselves.
 
-A restore can also send again. Messages still queued when the archive was taken are processed and
-delivered again, those delivered since included, and a file inbound with `after_read = "leave"`
-ingests again the files it took since, so a partner can receive duplicates. Messages received after
-the archive was taken, later reference-set syncs and later transform state are not in a restored
-store either. Read the source's audit log, or its off-host copy, for the changes themselves.
-
-`messagefoundry restore --help` prints this list on any installed engine, under
-`--allow-old-archive`, with no config or store. The `restore` summary (its `rollback_notice` under
-`--json`) carries it whole too, and so does the `store_restored` alert: as its `rollback_notice`
-key in the webhook JSON and the default email body, and, with no `[alerts]` transport configured,
-in the engine log's `ALERT store_restored` line. A custom email template cannot name that key, and
-a rule with `transports = []` sends nothing. For those, the alert's reason in the web console's
-alert list keeps the archive's age, the count of sessions ended and a pointer to `messagefoundry
-restore --help`, all inside the about 200 characters it keeps.
+The `restore` summary (its `rollback_notice` under `--json`) carries the statement whole too, and
+so does the `store_restored` alert: as its `rollback_notice` key in the webhook JSON and the default
+email body, and, with no `[alerts]` transport configured, in the engine log's `ALERT store_restored`
+line. A custom email template cannot name that key, and a rule with `transports = []` sends nothing.
+For those, the alert's reason in the web console's alert list keeps the archive's age, the count of
+sessions ended and a pointer to `messagefoundry restore --help`, all inside the about 200 characters
+it keeps.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,

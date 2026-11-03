@@ -233,6 +233,10 @@ def utc_or_unknown(ts: float | None) -> str:
 #: crafted manifest time could otherwise print hundreds of digits and push the count and the
 #: pointer past the reason column's cut (BACKLOG #5094).
 _STORE_RESTORED_MAX_AGE_DAYS = 99_999
+#: How far after the restore an archive's time may fall and still read as an age: the hour of
+#: clock skew ``restore``'s age refusal allows (``dr_backup._ARCHIVE_CLOCK_SKEW_SECONDS``, which
+#: this module cannot import: dr_backup imports it).
+_STORE_RESTORED_CLOCK_SKEW = 3600.0
 
 
 def store_restored_detail(
@@ -252,7 +256,9 @@ def store_restored_detail(
     pointer follows, all three short enough to fit that cut whole, and the time comes last, naming
     the ``store_restored`` audit row, which carries it whole. The notice itself rides the event as
     its own ``rollback_notice`` key."""
-    if archive_created_at is None:
+    if archive_created_at is None or archive_created_at > restored_at + _STORE_RESTORED_CLOCK_SKEW:
+        # A time after the restore says the backup host's clock was wrong, as the age refusal
+        # reads it, so "0.0 days old" would understate what to re-apply.
         age = "of unknown age"
     else:
         days = max(0.0, restored_at - archive_created_at) / 86400
@@ -1040,8 +1046,10 @@ class AlertSink(Protocol):
         """The engine started on a store that ``messagefoundry restore`` placed, and recorded it:
         every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614).
         What the restore undid, which an operator must apply again, is
-        :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094), which
-        each sink shows whole beside ``detail``: fixed text, no PHI.
+        :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094), fixed
+        text that is not passed in: a sink adds it itself where it has the room, as the logging
+        sink's line and the notifier's ``rollback_notice`` key do. ``detail`` names the command
+        that prints it, for every path that shows only ``detail``.
 
         ``name`` is :data:`STORE_RESTORED_SUBJECT`. ``detail`` is built by
         :func:`store_restored_detail`: an age, a count, fixed words and a time, no PHI.
