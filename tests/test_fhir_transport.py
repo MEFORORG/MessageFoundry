@@ -669,6 +669,22 @@ async def test_overlong_entry_etag_is_not_captured_and_hides_the_bundle_etag() -
     assert isinstance(resp, DeliveryResponse) and resp.headers == {}
 
 
+@pytest.mark.parametrize("etag", [1, True, [1], {"a": 1}])
+async def test_non_string_entry_etag_is_not_captured_and_hides_the_bundle_etag(
+    etag: object,
+) -> None:
+    # docs/PHI.md lists a non-string entry value among the drops (BACKLOG #5017): it is neither
+    # stringified into a header nor replaced by the reply's own ETag, which describes the Bundle.
+    reply_headers = email.message.Message()
+    reply_headers["ETag"] = 'W/"bundle-level"'
+    dest = _dest(interaction="update", capture_response=True, capture_response_headers=["ETag"])
+    dest._opener = _FakeOpener(  # type: ignore[assignment]
+        body=_transaction_response("200 OK", etag=etag), headers=reply_headers
+    )
+    resp = await dest.send(UPDATE_1965)
+    assert isinstance(resp, DeliveryResponse) and resp.headers == {}
+
+
 @pytest.mark.parametrize(
     ("outcome", "expected"),
     [

@@ -1095,13 +1095,14 @@ class DeliveryResponse:
       limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
       knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
       cut back to a whole token, followed by a ``(+N chars)`` note when it cut. When ``detail`` is
-      longer than the scrubber's 64 KiB scan window, the text past a whitespace cut at or before that
-      window is never scanned, and a ``[redaction bound: dropped N more chars unscanned]`` marker
-      follows any count note, so the stored value can be longer than 200 characters. ``docs/PHI.md``
-      section 3, *The store's 200-character bound*, is the one statement of that bound (BACKLOG
-      #5017). It does not catch
-      every identifier: at least a lone surname such as ``Smith``, an identifier such as
-      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
+      longer than the scan window (``redaction._REDACT_WINDOW`` characters, not bytes), only the
+      text before a whitespace cut at or before the window is scanned, and none of it where the
+      window holds no whitespace. The rest is dropped unscanned, never stored, and a ``[redaction bound: dropped N more chars
+      unscanned]`` marker is appended (BACKLOG #5017). ``docs/PHI.md`` section 3, *The store's
+      200-character bound*, is the one statement of those notes and of when a value can run past
+      200 characters. The scrub does not catch every identifier: at least a lone surname such as
+      ``Smith``, an identifier such as ``MRN7731`` and a resource id such as ``Patient/12345`` read
+      back unchanged through
       ``response_get(dest).detail``, so a connector author keeps partner free text out of
       ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
