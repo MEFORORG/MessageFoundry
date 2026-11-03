@@ -25,6 +25,7 @@ from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, BackupSettings, StoreSettings
 from messagefoundry.pipeline.alerts import STORE_RESTORED_SUBJECT, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import BackupRunner, run_restore
+from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import (
     STORE_RESTORED_ACTION,
@@ -106,7 +107,7 @@ async def test_the_first_start_after_a_marker_records_the_restore(tmp_path: Path
             (STORE_RESTORED_SUBJECT, "1970-01-12T13:30:00Z")
         ]
         assert "3.0 days old" in sink.raised[0][1] and "2 session(s)" in sink.raised[0][1]
-        assert "Re-apply every disable, delete, role change and reset" in sink.raised[0][1]
+        assert RESTORE_ROLLBACK_NOTICE in sink.raised[0][1]  # BACKLOG #5094
 
         # Once only: the marker is gone, so a second start writes and raises nothing.
         fresh = await _seed(store, "u2")

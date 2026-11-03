@@ -25,6 +25,7 @@ from typing import Protocol
 
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.redaction import log_timestamp
+from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 
 __all__ = [
     "INTAKE_DEPTH_REASON",
@@ -239,16 +240,17 @@ def store_restored_detail(
 
     The alert instance's reason column keeps only about the first 200 characters, and the store's
     redaction turns the time in it into ``[redacted]``. So the age and the count lead, and the
-    line names the ``store_restored`` audit row, which carries the time whole."""
+    line names the ``store_restored`` audit row, which carries the time whole. What to re-apply is
+    :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE`, whole (BACKLOG #5094)."""
     age = (
         "of unknown age"
         if archive_created_at is None
         else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
     )
     return (
-        f"started on a store restored from an archive {age}; {revoked} session(s) revoked. "
-        "Re-apply every disable, delete, role change and reset made after its newest audit row "
-        f"({utc_or_unknown(last_audit_at)}; also in the store_restored audit row)."
+        f"started on a store restored from an archive {age}; {revoked} session(s) revoked; "
+        f"its newest audit row is {utc_or_unknown(last_audit_at)} (also in the store_restored "
+        f"audit row). {RESTORE_ROLLBACK_NOTICE}"
     )
 
 
@@ -1022,10 +1024,9 @@ class AlertSink(Protocol):
 
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
         """The engine started on a store that ``messagefoundry restore`` placed, and recorded it:
-        every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614). The
-        restored accounts, password hashes, roles and factors are the archive's, so every
-        disable, delete, role change and reset made after its newest audit row is undone until
-        an operator applies it again.
+        every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614).
+        What the restore undid, which an operator must apply again, is
+        :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094).
 
         ``name`` is :data:`STORE_RESTORED_SUBJECT`. ``detail`` is built by
         :func:`store_restored_detail`: a time, an age and a count, no PHI. ``last_audit_at`` is

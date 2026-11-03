@@ -66,6 +66,7 @@ from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
+from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
@@ -3352,18 +3353,12 @@ _DECRYPT_REFUSAL = (
 )
 
 
-#: What a restore undoes, said once for the refusal and the CLI summary (BACKLOG #2614).
-REAPPLY_NOTICE = (
-    "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
-    "delete, role change and reset made after its newest audit row must be re-applied by hand."
-)
-
-
 def restored_accounts_notice(sessions_revoked: int) -> str:
-    """The CLI summary's whole notice: what to re-apply, and what the restore already did. Worded
-    from the count the restore's own revoke returned, so it never claims more than it ended."""
+    """The CLI summary's whole notice: what to re-apply (BACKLOG #5094), and what the restore
+    already did. Worded from the count the restore's own revoke returned, so it never claims more
+    than it ended."""
     return (
-        f"{REAPPLY_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
+        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
         "placed, and the first engine start on this store ends every session again and records "
         "the restore."
     )
@@ -3408,8 +3403,7 @@ def _refuse_an_old_archive(
         )
     raise BackupError(
         kind,
-        f"{taken}. Its newest audit row is {newest}. A restore of it would bring the accounts back "
-        f"as they were then. {REAPPLY_NOTICE} Nothing was written.",
+        f"{taken}. Its newest audit row is {newest}. {RESTORE_ROLLBACK_NOTICE} Nothing was written.",
     )
 
 

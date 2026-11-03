@@ -692,14 +692,29 @@ in again. Other commands that open the store, such as `provision-admin`, leave t
 start. The engine does not re-apply
 changes made after the archive was taken.
 
+**What a restore rolls back (BACKLOG #5094).** A restore puts back the archive's whole store, so
+every change made after its newest audit row is undone. Re-apply by hand at least these:
+
+- account creations, disables, enables and deletes;
+- role changes and custom roles;
+- password resets and password changes, self-service ones included;
+- MFA and passkey enrolments and removals, and recovery codes issued or used. A factor or passkey
+  removed after the archive is live again on the restored store;
+- notify-email changes;
+- channel scopes;
+- AD group-to-role and AD group-to-scope maps.
+
+Read the source's audit log, or its off-host copy, for the changes themselves. The source of record
+for this list is `messagefoundry/restore_notice.py`. The `store_restored` alert, the `restore`
+summary, its age refusal and the `--allow-old-archive` help all print it from there, and a test
+fails if this list misses a class it names.
+
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,
 is refused too, and raising `--max-age-days` does not change that: only `--allow-old-archive`
 restores it. The refusal, and every successful restore, print the time of the archive's newest
-audit row. Every disable, delete, role change and
-password or factor reset made after that time is undone by the restore and must be re-applied by
-hand; read the source's audit log, or its off-host copy, for the list. To restore an older archive on
-purpose, pass `--allow-old-archive`, or raise `--max-age-days` past its age.
+audit row and the list above of what a restore rolls back. To restore an older archive
+on purpose, pass `--allow-old-archive`, or raise `--max-age-days` past its age.
 
 **Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
 same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI

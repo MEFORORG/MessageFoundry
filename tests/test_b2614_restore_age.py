@@ -5,7 +5,7 @@
 A restore undoes every account change made after the archive was taken, so ``restore`` refuses an
 archive older than ``--max-age-days`` (7 by default), or one that does not say when it was taken,
 unless ``--allow-old-archive`` is given. It prints the time of the archive's newest audit row and
-says that every disable, delete, role change and reset after it must be re-applied by hand.
+what a restore rolls back (``messagefoundry.restore_notice``, BACKLOG #5094).
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from messagefoundry.pipeline.dr_backup import (
     _refuse_an_old_archive,
     run_restore,
 )
+from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
@@ -101,6 +102,7 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     out = capsys.readouterr().out
     assert "newest audit row in it 20" in out
     assert "must be re-applied by hand" in out
+    assert RESTORE_ROLLBACK_NOTICE in out  # BACKLOG #5094: the CLI prints the one statement whole
     # Worded from the restore's own count (none here: the archive holds no session), never as
     # "every session" whether or not its revoke ran.
     assert "The restore ended 0 open session(s) in the store it placed" in out

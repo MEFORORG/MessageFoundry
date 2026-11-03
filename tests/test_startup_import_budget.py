@@ -78,6 +78,9 @@ _CLI_ENGINE = frozenset(
         # Eager on purpose (vault BACKLOG #2700, #2742): `__main__` imports it first and installs
         # the guard before its other imports. Stdlib and `controlchars` only.
         "messagefoundry.remotedebug",
+        # Eager on purpose (BACKLOG #5094): `restore --allow-old-archive`'s help is built from the
+        # one statement of what a restore rolls back. A leaf with no imports.
+        "messagefoundry.restore_notice",
         "messagefoundry.secretscrub",
         # Eager on purpose (BACKLOG #3414): `config.tls_policy` re-exports the stdlib-only
         # signature-scheme narrower from it, so loading tls_policy loads it.

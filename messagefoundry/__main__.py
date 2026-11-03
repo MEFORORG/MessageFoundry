@@ -1335,12 +1335,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         f"{_RESTORE_MAX_AGE_DAYS:g}). An archive of unknown age is refused whatever this is; "
         "only --allow-old-archive restores it",
     )
+    # BACKLOG #5094: the help carries the one statement of what a restore rolls back, whole. A
+    # stdlib-free leaf, so the parser can build from it; the startup import budget names it.
+    from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
+
     restore.add_argument(
         "--allow-old-archive",
         action="store_true",
-        help="restore an archive older than --max-age-days, or of unknown age, anyway. Every "
-        "disable, delete, role change and reset made after its newest audit row must then be "
-        "re-applied by hand",
+        help="restore an archive older than --max-age-days, or of unknown age, anyway. "
+        f"{RESTORE_ROLLBACK_NOTICE}",
     )
     restore.add_argument("--json", action="store_true", help="emit JSON")
 
