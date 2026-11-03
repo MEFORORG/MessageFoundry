@@ -43,12 +43,11 @@ from messagefoundry.transports.base import (
     SourceConnector,
     count_setting,
     float_setting,
-    hold_and_retry,
-    log_owed_reply_fault,
     owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
+    recover_handler_fault,
     register_destination,
     register_source,
     wait_for_intake,
@@ -702,23 +701,17 @@ class TcpSource(SourceConnector):
                             decoded += 1
                             try:
                                 reply = await self._handler(message)
-                            except Exception as exc:  # noqa: BLE001 -- see hold_and_retry
-                                # BACKLOG #5022: the decoder read this frame cleanly, so this is a handler
-                                # fault, not a framing fault.
-                                if owes_hl7_reply(self.ack_mode, self.content_type):
-                                    failed = True  # set before the emit, as the other arms do
-                                    reason = log_owed_reply_fault(
-                                        exc, transport="TCP", peer=peer, log=logger
-                                    )
-                                    await self._emit_event(
-                                        "handler_error", peer_host=peer_host, reason=reason
-                                    )
-                                    break  # close, so the sender resends
+                            except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
+                                # BACKLOG #5022: the decoder read this frame cleanly, so this is a
+                                # handler fault, not a framing fault. `failed` is set until it is
+                                # recovered, so a cancel inside the recovery is no clean close.
+                                failed = True
                                 try:
-                                    reply = await hold_and_retry(
+                                    reply = await recover_handler_fault(
                                         self._handler,
                                         message,
                                         exc,
+                                        owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
                                         transport="TCP",
                                         peer=peer,
                                         log=logger,
@@ -728,8 +721,8 @@ class TcpSource(SourceConnector):
                                         ),
                                     )
                                 except HandlerFaultUnrecovered:
-                                    failed = True  # hold_and_retry recorded handler_error
-                                    break
+                                    break  # handler_error is recorded; close
+                                failed = False
                             if reply is not None:
                                 writer.write(
                                     frame_reply(

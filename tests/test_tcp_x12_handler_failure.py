@@ -18,17 +18,29 @@ Synthetic payloads only.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 
 import pytest
 
 import messagefoundry.transports.base as base_mod
+import messagefoundry.transports.tcp as tcp_mod
+import messagefoundry.transports.x12 as x12_mod
 from messagefoundry.config.models import AckMode, ContentType
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.tcp import TcpSource
 from messagefoundry.transports.x12 import X12Source
-from tests.test_x12_connection_events import EDI, _drive, _kinds, _Peer, _tcp, _x12
+from tests.test_x12_connection_events import (
+    EDI,
+    Event,
+    _drive,
+    _kinds,
+    _Peer,
+    _sink,
+    _tcp,
+    _x12,
+)
 
 #: A frame the raw-TCP decoder reads cleanly; the X12 one is the ISA/IEA interchange ``EDI``.
 TCP_FRAME = b"\x02synthetic raw tcp body\x03"
@@ -54,7 +66,9 @@ class _ThenEof:
 
 @pytest.fixture(autouse=True)
 def _no_retry_pauses(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The same schedule, without the real pauses, so a test stays inside _drive's bound.
+    # The same schedule, without the real pauses, so a test stays inside _drive's 2 s bound. A zero
+    # pause still yields to the loop, so that bound can fire on a hold that never ends;
+    # test_a_fault_that_never_clears_holds_until_the_task_is_cancelled is the control that shows it.
     monkeypatch.setattr(base_mod, "HANDLER_RETRY_DELAYS", (0.0,))
 
 
@@ -133,14 +147,96 @@ async def test_no_reply_a_stop_ends_the_hold_and_names_the_loss(
         raise RuntimeError("synthetic store outage")
 
     writer = _Peer()
-    with caplog.at_level(logging.ERROR):
-        events = await _drive(source, _ThenEof(wire), writer, handler=explode_then_stop)
-    assert seen == [body] * 2, "no attempt once stopping"
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(wire + wire), writer, handler=explode_then_stop)
+    assert seen == [body] * 2, "no attempt once stopping, and the frame behind it is not handled"
     assert _kinds(events) == ["established", "handler_error"], (
         "reported before the threshold, and a failed connection must not also emit `closed`"
     )
     assert writer.closed and not writer.written
-    assert any("is not recorded" in r.getMessage() for r in caplog.records)
+    retrying = [r for r in caplog.records if "retrying in" in r.getMessage()]
+    assert len(retrying) == 1, "no `retrying in` line once the listener is stopping"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "nor is any frame behind it" in errors[0] and "listener is stopping" in errors[0]
+
+
+class _Blocking:
+    """A handler that faults once, then hangs in every retry, as a store write that never returns."""
+
+    def __init__(self) -> None:
+        self.seen: list[bytes] = []
+        self.blocked = asyncio.Event()
+
+    async def __call__(self, raw: bytes) -> None:
+        self.seen.append(raw)
+        if len(self.seen) == 1:
+            raise RuntimeError("synthetic store outage")
+        self.blocked.set()
+        await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize(
+    ("transport", "build", "wire", "module"),
+    [("X12", _x12, EDI, x12_mod), ("TCP", _tcp, TCP_FRAME, tcp_mod)],
+)
+async def test_a_stop_past_its_grace_during_a_blocked_retry_names_the_loss(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+    build: Build,
+    wire: bytes,
+    module: object,
+) -> None:
+    # stop() cancels a client task still running past its grace. A retry blocked in the store never
+    # sees the stopping flag, so the cancel is what ends the hold. It must still log the loss and
+    # record handler_error, and the stream must not read as a clean `closed`.
+    monkeypatch.setattr(module, "_CLIENT_SHUTDOWN_GRACE", 0.1)
+    source = _no_reply(build)
+    handler = _Blocking()
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    with caplog.at_level(logging.ERROR):
+        client = asyncio.create_task(source._on_client(_ThenEof(wire), _Peer()))  # type: ignore[arg-type]
+        await asyncio.wait_for(handler.blocked.wait(), timeout=2.0)
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert client.cancelled()
+    assert _kinds(events) == ["established", "handler_error"]
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and errors[0].startswith(f"{transport} message")
+    assert "nor is any frame behind it" in errors[0] and "task was cancelled" in errors[0]
+
+
+@pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
+async def test_a_fault_that_never_clears_holds_until_the_task_is_cancelled(
+    caplog: pytest.LogCaptureFixture, transport: str, build: Build, wire: bytes, body: bytes
+) -> None:
+    # The control for the fixture above: with zero pauses the hold still yields, so a bound in the
+    # test can end it rather than the run hanging, and the cancel that ends it is logged as the loss.
+    # The fault is reported once, at the threshold, and not again on the cancel.
+    source = _no_reply(build)
+    seen: list[bytes] = []
+    past_threshold = asyncio.Event()
+
+    async def handler(raw: bytes) -> None:
+        seen.append(raw)
+        if len(seen) > REPORT_AFTER:
+            past_threshold.set()
+        raise RuntimeError("synthetic store outage")
+
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    with caplog.at_level(logging.ERROR):
+        client = asyncio.create_task(source._on_client(_ThenEof(wire), _Peer()))  # type: ignore[arg-type]
+        await asyncio.wait_for(past_threshold.wait(), timeout=2.0)
+        client.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(client, timeout=2.0)
+    assert set(seen) == {body}
+    assert _kinds(events) == ["established", "handler_error"]
+    assert any("task was cancelled" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)

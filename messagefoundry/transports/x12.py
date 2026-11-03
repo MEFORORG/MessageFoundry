@@ -51,12 +51,11 @@ from messagefoundry.transports.base import (
     SourceConnector,
     encode_wire_body,
     float_setting,
-    hold_and_retry,
-    log_owed_reply_fault,
     owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
+    recover_handler_fault,
     register_destination,
     register_source,
     wait_for_intake,
@@ -850,23 +849,17 @@ class X12Source(SourceConnector):
                             decoded += 1
                             try:
                                 reply = await self._handler(interchange)
-                            except Exception as exc:  # noqa: BLE001 -- see hold_and_retry
+                            except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
                                 # BACKLOG #5022: the reader framed this interchange cleanly, so this
-                                # is a handler fault, not a framing fault.
-                                if owes_hl7_reply(self.ack_mode, self.content_type):
-                                    failed = True  # set before the emit, as the other arms do
-                                    reason = log_owed_reply_fault(
-                                        exc, transport="X12", peer=peer, log=logger
-                                    )
-                                    await self._emit_event(
-                                        "handler_error", peer_host=peer_host, reason=reason
-                                    )
-                                    break  # close, so the sender resends
+                                # is a handler fault, not a framing fault. `failed` is set until it
+                                # is recovered, so a cancel inside the recovery is no clean close.
+                                failed = True
                                 try:
-                                    reply = await hold_and_retry(
+                                    reply = await recover_handler_fault(
                                         self._handler,
                                         interchange,
                                         exc,
+                                        owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
                                         transport="X12",
                                         peer=peer,
                                         log=logger,
@@ -876,8 +869,8 @@ class X12Source(SourceConnector):
                                         ),
                                     )
                                 except HandlerFaultUnrecovered:
-                                    failed = True  # hold_and_retry recorded handler_error
-                                    break
+                                    break  # handler_error is recorded; close
+                                failed = False
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
                                 await self._drain_reply(writer)
