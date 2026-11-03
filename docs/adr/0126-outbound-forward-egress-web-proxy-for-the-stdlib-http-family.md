@@ -338,8 +338,8 @@ unchanged, and so is every `proxy_url`. What it says, and what it does not, is i
 B462-R1, R2 and R4 of the vault's `OWNER-RULINGS-2026-10-30-BATCH462.md` add to R1 of
 `ASVS-OWNER-RULINGS-2026-10-05.md` (vault BACKLOG #3007, #3416). `tls_hop_attested` no longer admits
 a proxy credential, so `cleartext_accepted` with a reason is the one declaration left. A credential
-in a `proxy_url`, a connection's own or an inherited `[egress].proxy_url`, now fails the
-connection's build whatever it declares, which is stricter than the 2026-10-05 text. The rule stays
+in a connection's own `proxy_url` now fails the connection's build whatever it declares, and one in
+`[egress].proxy_url` fails the config load, which is stricter than the 2026-10-05 text. The rule stays
 in two seams, the build and the send, because an environment proxy is known only at send.
 [CONNECTIONS.md](../CONNECTIONS.md) states it.
 

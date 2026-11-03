@@ -1647,8 +1647,8 @@ declares the cleartext acceptance with a reason. B462-R1, R2 and R4 of the vault
   rule: the engine cannot see a tunnel, so honouring one in code would mean refusing every off-box
   proxy, which the owner's 2026-10-05 ruling declined.
 - **No declaration lifts a credential written in a URL or the environment.** A user, a password or
-  both in a connection's own `proxy_url`, or in an `[egress].proxy_url` it inherits, fail its build.
-  That holds at every `[security].enforcement` setting and for a proxy on this machine, and
+  both in a connection's own `proxy_url` fail its build, and in `[egress].proxy_url` they are
+  refused at config load, naming that setting. That holds at every `[security].enforcement` setting and for a proxy on this machine, and
   `static_credential_accepted` does not lift it. A userinfo with nothing in it (`http://@host`,
   `http://:@host`) holds no credential and is not refused for one. A credential in `HTTP_PROXY`, `HTTPS_PROXY` or the
   system proxy settings meets the send-time rule above.
@@ -2187,7 +2187,7 @@ opt-out. That is expected, and the table says which they are.
 | `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
 | `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
 | `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
-| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`, or a user and password in the proxy URL, its own or an inherited `[egress].proxy_url`; the URL form is listed, but no acceptance helps it, because a user or a password in the URL fails the connection's build) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup | **no** (Basic or Digest only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`; a user or a password in the proxy URL is not listed, because it fails the connection's build, or for `[egress].proxy_url` the config load) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup | **no** (Basic or Digest only) |
 | `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
 | `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
 | `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |
