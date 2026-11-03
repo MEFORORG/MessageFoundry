@@ -2281,14 +2281,16 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 **Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
 `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
 id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
-just runs whatever statement you declare, bound from the row.
+just runs whatever statement you declare, bound from the row. A high-water mark can still pass a row
+that was never handed off, in at least the cases *Reliability* below names.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
 **unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
 `poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
-`mark_statement` over a `poll_statement` that does not return rows in cursor order (below).
+`mark_statement` over a `poll_statement` that does not return rows in cursor order, or over a
+cursor column that is not unique (below).
 **With a `mark_statement`, a handler failure also stops the
 poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
 next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on, since
@@ -2296,7 +2298,10 @@ every row is read again next poll anyway. That keeps a high-water-mark `mark_sta
 a row whose handler failed, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
 column): a later row's mark would otherwise do so, and the poll would never select the failed row
 again. Without that order, a row with a higher key handed off earlier in the same poll has already
-moved the cursor past it. **The trade-off is head-of-line blocking.** A row whose handler fails on
+moved the cursor past it. On a cursor column with ties, such as a timestamp, a failed row that
+shares its cursor value with a row handed off before it in the same poll is lost even in cursor
+order: that row's mark sets the cursor to the shared value, and a `>` predicate never selects the
+failed row again. **The trade-off is head-of-line blocking.** A row whose handler fails on
 every attempt, such as one whose value a server store rejects as too long, holds back every row
 `poll_statement` returns after it, on every poll and whatever the mark shape, a status column or a
 delete-from-queue included; with an `ORDER BY` that is the whole feed. Each failure logs a WARNING

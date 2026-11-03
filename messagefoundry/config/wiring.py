@@ -4441,7 +4441,10 @@ def DatabasePoll(
     + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
     high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
-    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
+    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a
+    handler failure stops that poll at the failed row, so a row that fails every time holds back the
+    rows behind it; the *Database source* section of docs/CONNECTIONS.md says what a high-water mark
+    needs on top of that (BACKLOG #4921). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
     ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
