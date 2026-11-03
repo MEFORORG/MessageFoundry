@@ -63,6 +63,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import errno
 import fnmatch
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
 import hashlib
@@ -76,7 +77,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
@@ -259,6 +260,63 @@ def _where(host: str, path: str) -> str:
     return f"{host}:{path}"
 
 
+#: A fixed meaning for each FTP reply code an operation or a login commonly fails with (RFC 959,
+#: RFC 2228 for 534 and 536, RFC 3659 for 430). A code not listed is reported by its number alone.
+_FTP_REPLY_MEANINGS = {
+    "421": "service not available",
+    "425": "cannot open the data connection",
+    "426": "connection closed, transfer aborted",
+    "430": "invalid user name or password",
+    "450": "file unavailable, such as busy",
+    "451": "local error in processing",
+    "452": "insufficient storage",
+    "500": "command not recognised",
+    "501": "syntax error in parameters",
+    "502": "command not implemented",
+    "503": "bad sequence of commands",
+    "504": "command not implemented for that parameter",
+    "530": "not logged in",
+    "532": "need an account for storing files",
+    "534": "request denied for policy reasons",
+    "536": "protection level not supported",
+    "550": "file unavailable, such as not found or no access",
+    "551": "page type unknown",
+    "552": "storage allocation exceeded",
+    "553": "file name not allowed",
+}
+
+#: An FTP reply code where ``ftplib`` puts it, at the start of the reply. A digit run longer than
+#: three, or one not followed by a space, a ``-`` or the end, is no reply code.
+_FTP_REPLY_CODE = re.compile(r"[1-5]\d\d(?=[ -]|$)")
+
+
+def _fault_detail(exc: BaseException) -> str:
+    """What an error text may say about ``exc``: never its ``str()``, which for a server's reply is
+    that reply's free text (BACKLOG #5026; :class:`_RemoteError` states the rule).
+
+    - An ``ftplib`` reply error gives its reply code and the code's fixed meaning.
+    - An ``OSError`` gives its type and errno, with the errno's symbolic name. Not its ``strerror``:
+      paramiko raises an SFTP status as an ``OSError`` whose ``strerror`` is the server's text.
+    - Anything else gives its type, and an integer ``code`` attribute where it has one, such as the
+      reason code of paramiko's ``ChannelException``."""
+    name = type(exc).__name__
+    if isinstance(exc, ftplib.Error):
+        match = _FTP_REPLY_CODE.match(str(exc))
+        if match is None:
+            return f"{name}, a reply with no code"
+        code = match.group(0)
+        meaning = _FTP_REPLY_MEANINGS.get(code)
+        return f"reply {code}" + (f" ({meaning})" if meaning else "")
+    if isinstance(exc, OSError):
+        if isinstance(exc.errno, int):
+            return f"{name}, errno {exc.errno} ({errno.errorcode.get(exc.errno, 'unknown')})"
+        return name
+    status = getattr(exc, "code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"{name}, code {status}"
+    return name
+
+
 # --- client abstraction ------------------------------------------------------
 
 
@@ -278,7 +336,17 @@ class _RemoteError(Exception):
 
     The connector maps a transient error to :class:`DeliveryError` (retry) and a permanent one to
     :class:`NegativeAckError` (dead-letter, or a STOP on either marker), so the client layer stays
-    transport-detail-only."""
+    transport-detail-only.
+
+    **Its text never carries the server's reply text (BACKLOG #5026).** The text reaches at least
+    ``last_error`` and the alert detail, and a reply can quote the path it refused, which on an
+    upload ends in a name rendered from message fields. So an FTP reply is reported by its code and
+    a fixed meaning, and an error raised in a session by its type and errno or status code, through
+    :func:`_fault_detail`. A denylist over the reply cannot do this: a reply that cuts a name short
+    or encodes it some other way keeps that form. Each client raises it outside the handler that
+    caught the reply, so the reply is on neither ``__cause__`` nor ``__context__`` either. One
+    carve-out: an SFTP connect refusal keeps paramiko's text; :meth:`_SftpClient._connect` says
+    why."""
 
     def __init__(
         self,
@@ -298,34 +366,6 @@ class _RemoteError(Exception):
         """True for a credential or a configuration fault: a fault of the connection, which every
         row meets alike, rather than of one message or one path."""
         return self.credential_fault or self.config_fault
-
-    def without_names(self, names: Iterable[str]) -> _RemoteError:
-        """A copy of this error, same markers, with every basename in ``names`` replaced by its
-        ``safe_name`` label, in any letter case (BACKLOG #2814). A server reply can quote the path
-        it refused, and on an upload that path ends in a name rendered from message fields, in its
-        temp form or as a bumped candidate; a case-insensitive server may echo it in its stored
-        case. A temp name holds the name it is for, so replacing the name covers it. One pass,
-        longest name first, so a label already put in is never matched again. Each echo takes the
-        label of the name as rendered, whatever its case, so it matches the label the upload's own
-        log lines carry.
-
-        It is a denylist over the server's free text: a reply that cuts a name short or encodes it
-        some other way keeps that form. A very short name is also replaced where it appears as
-        other text, such as a reply code."""
-        text = str(self)
-        bases = sorted({posixpath.basename(n) for n in names} - {""}, key=len, reverse=True)
-        if bases:
-            labels = {base.casefold(): safe_name(base) for base in bases}
-            pattern = re.compile("|".join(map(re.escape, bases)), re.IGNORECASE)
-            text = pattern.sub(
-                lambda m: labels.get(m.group(0).casefold()) or safe_name(m.group(0)), text
-            )
-        return _RemoteError(
-            text,
-            permanent=self.permanent,
-            credential_fault=self.credential_fault,
-            config_fault=self.config_fault,
-        )
 
     def as_delivery_error(self) -> DeliveryError:
         """The pipeline error for this failure: a transient one retries, a permanent one is a
@@ -925,33 +965,38 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
     for a credential fault, rather than dead-letter each row in turn. Both follow
     ``credential_fault_policy``; ``"dead_letter"`` dead-letters instead. :meth:`_list_or_retry`
     passes both markers through unchanged.
+
+    The reply text decides the class and is read here only; the error carries the reply code
+    (BACKLOG #5026, :func:`_fault_detail`).
     """
     reply = str(exc)
+    detail = _fault_detail(exc)
     if _names_connection_limit(reply, at_login=step == _FTP_LOGIN):
         return _RemoteError(
-            f"FTP server refused {step} at its connection limit (retried): {reply}",
+            f"FTP server refused {step} at its connection limit (retried): {detail}",
             permanent=False,
         )
     if step in (_FTP_AUTH_TLS, _FTP_PROT_P):
         return _RemoteError(
-            f"FTPS server refused {step}, a TLS configuration fault, not a credential fault: {reply}",
+            f"FTPS server refused {step}, a TLS configuration fault, not a credential fault: "
+            f"{detail}",
             permanent=True,
             config_fault=True,
         )
     if step == _FTP_LOGIN and not tls and _demands_tls(reply):
         return _RemoteError(
             f"FTP server requires TLS at {step}, a TLS configuration fault, not a credential "
-            f"fault: {reply}",
+            f"fault: {detail}",
             permanent=True,
             config_fault=True,
         )
     if step == _FTP_GREETING:
         return _RemoteError(
-            f"FTP server refused the connection, a configuration fault: {reply}",
+            f"FTP server refused the connection, a configuration fault: {detail}",
             permanent=True,
             config_fault=True,
         )
-    return _RemoteError(f"FTP login refused: {reply}", permanent=True, credential_fault=True)
+    return _RemoteError(f"FTP login refused: {detail}", permanent=True, credential_fault=True)
 
 
 class _FtpClient(_RemoteClient):
@@ -1015,11 +1060,10 @@ class _FtpClient(_RemoteClient):
             if isinstance(ftp, ftplib.FTP_TLS):
                 step = _FTP_PROT_P
                 ftp.prot_p()  # encrypt the data channel, not just the control channel
+            return ftp
         except ftplib.error_perm as exc:
-            ftp.close()
-            raise _ftp_connect_refusal(step, exc, tls=self._tls) from exc
+            fault = _ftp_connect_refusal(step, exc, tls=self._tls)
         except ftplib.error_temp as exc:
-            ftp.close()
             if step == _FTP_LOGIN and _names_credential(str(exc)):
                 # A 4xx that names the credential ("430 Invalid username or password") is a refused
                 # login too: retried, it would lock the partner account (BACKLOG #2083, fix round 3).
@@ -1027,17 +1071,21 @@ class _FtpClient(_RemoteClient):
                 # many connections; account locked" stops the lane. The word list is broad, so some
                 # busy or closing 4xx replies ("blocked", "terminated") stop it too: the cheaper
                 # error, as :func:`_names_connection_limit` explains (fix round 4 review 2).
-                raise _RemoteError(
-                    f"FTP login refused: {exc}", permanent=True, credential_fault=True
-                ) from exc
-            raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc
+                fault = _RemoteError(
+                    f"FTP login refused: {_fault_detail(exc)}",
+                    permanent=True,
+                    credential_fault=True,
+                )
+            else:
+                fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
         except ftplib.all_errors as exc:  # connect/timeout/4xx/protocol/OSError -- transient
-            ftp.close()
-            raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc
+            fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
         except BaseException:
             ftp.close()
             raise
-        return ftp
+        ftp.close()
+        # Raised outside the handlers, so the reply is on neither __cause__ nor __context__ (#5026).
+        raise fault
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
         return [(entry.name, entry.size) for entry in self.list_entries(remote_dir)]
@@ -1159,7 +1207,7 @@ class _FtpClient(_RemoteClient):
                         logger.warning(
                             "REMOTEFILE could not list the upload directory to confirm a refused "
                             "RNTO, so the refusal stands: %s",
-                            exc,
+                            _fault_detail(exc),
                         )
                         return False
                     return name.casefold() in {n.casefold() for n in listing}
@@ -1167,10 +1215,14 @@ class _FtpClient(_RemoteClient):
                     try:
                         listing = self._names(ftp, directory)
                     except ftplib.error_perm as exc:
-                        raise _RemoteError(
-                            f"FTP could not list the upload directory to check a name: {exc}",
-                            permanent=False,
-                        ) from exc
+                        refusal = _fault_detail(exc)
+                    else:
+                        return name in listing
+                    # Outside the handler, so the reply is not chained (#5026).
+                    raise _RemoteError(
+                        f"FTP could not list the upload directory to check a name: {refusal}",
+                        permanent=False,
+                    )
                 return name in listing
 
             def rename(dst: str) -> None:
@@ -1226,19 +1278,25 @@ class _FtpClient(_RemoteClient):
     def _op(self, fn: Callable[[ftplib.FTP], _T]) -> _T:
         """Connect, run ``fn(ftp)``, always close. A connect fault arrives already classified from
         :meth:`_connect`. An operation fault is mapped here: a permanent reply (``error_perm`` --
-        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error is transient."""
+        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error is transient. The
+        error carries the reply code, never the reply (BACKLOG #5026)."""
         ftp = self._connect()
         try:
             return fn(ftp)
         except ftplib.error_perm as exc:
-            raise _RemoteError(f"FTP rejected the operation: {exc}", permanent=True) from exc
+            fault = _RemoteError(
+                f"FTP rejected the operation: {_fault_detail(exc)}", permanent=True
+            )
         except ftplib.all_errors as exc:
-            raise _RemoteError(f"FTP operation failed: {exc}", permanent=False) from exc
+            fault = _RemoteError(f"FTP operation failed: {_fault_detail(exc)}", permanent=False)
         finally:
             try:
                 ftp.quit()
             except ftplib.all_errors:
                 ftp.close()
+        # Raised outside the handlers, so the reply, which can quote the path, is on neither
+        # __cause__ nor __context__.
+        raise fault
 
 
 #: SSH MAC algorithms this connector will PROPOSE (BACKLOG #1171, ASVS 11.4.1). Appendix C of the
@@ -1738,7 +1796,13 @@ class _SftpClient(_RemoteClient):
         operator must add the key; a retry cannot fix it), an authentication refusal is a permanent
         credential fault, and a TCP/IO failure is transient, as is a banner, key-exchange or
         authentication timeout (BACKLOG #1999). Whatever else is raised propagates unmapped. The
-        client is closed on every failure."""
+        client is closed on every failure.
+
+        **These errors keep paramiko's text and chain its exception**, the one carve-out from the
+        rule :class:`_RemoteError` states (BACKLOG #5026). They come before any path is sent on the
+        session, so the server has no upload name to quote yet, and the text carries this engine's
+        own refusals, such as the host-key fix :class:`_RefuseUnknownHostKey` names. At least one
+        part of it is the server's: paramiko quotes a banner it cannot read."""
         paramiko = _import_paramiko()
         client = paramiko.SSHClient()
         started = time.monotonic()
@@ -2031,7 +2095,12 @@ class _SftpClient(_RemoteClient):
           protocol"), bytes that are not SFTP ("Garbage packet received", as a login script that
           prints text produces), or a reply of the wrong type. The same server gives the same
           answer on a retry;
-        - a helper thread that cannot start is transient (:func:`_start_helper`)."""
+        - a helper thread that cannot start is transient (:func:`_start_helper`).
+
+        Each error carries the exception's type and errno or code, never its text, which for an
+        SFTP status is the server's (BACKLOG #5026). paramiko keeps only three statuses apart: no
+        such file and permission denied as an errno, end of file as ``EOFError``; any other status
+        is an ``OSError`` with its text alone, so it reads here as a bare ``OSError``."""
         paramiko = _import_paramiko()
         client = self._connect()
         try:
@@ -2045,29 +2114,29 @@ class _SftpClient(_RemoteClient):
         except (_RemoteError, _RemoteOversize, _RemoteChanged):
             raise  # already classified, or a content refusal the source handles itself
         except FileNotFoundError as exc:
-            raise _RemoteError(f"SFTP path not found: {exc}", permanent=True) from exc
+            fault = _RemoteError(f"SFTP path not found: {_fault_detail(exc)}", permanent=True)
         except paramiko.SFTPError as exc:
-            raise _RemoteError(f"SFTP protocol error: {exc}", permanent=True) from exc
+            fault = _RemoteError(f"SFTP protocol error: {_fault_detail(exc)}", permanent=True)
         except EOFError as exc:
-            # A bare EOFError has no text, which would leave the operator a message ending in ": ".
-            raise _RemoteError(
-                f"SFTP connection closed: {str(exc) or type(exc).__name__}", permanent=False
-            ) from exc
+            fault = _RemoteError(f"SFTP connection closed: {_fault_detail(exc)}", permanent=False)
         except paramiko.SSHException as exc:
-            raise _RemoteError(f"SFTP operation failed: {exc}", permanent=False) from exc
+            fault = _RemoteError(f"SFTP operation failed: {_fault_detail(exc)}", permanent=False)
         except TimeoutError as exc:
             # A silent peer, not a broken one: the channel bound fired (BACKLOG #1195). Transient, so
             # the caller retries. Named before the OSError arm below only to say so in the message --
             # TimeoutError is an OSError subclass and would otherwise be classified identically.
-            raise _RemoteError(
+            fault = _RemoteError(
                 f"SFTP read timed out after {SFTP_CHANNEL_READ_TIMEOUT_SECONDS:g}s "
-                f"with no data from the server: {exc}",
+                f"with no data from the server: {_fault_detail(exc)}",
                 permanent=False,
-            ) from exc
+            )
         except OSError as exc:
-            raise _RemoteError(f"SFTP operation failed: {exc}", permanent=False) from exc
+            fault = _RemoteError(f"SFTP operation failed: {_fault_detail(exc)}", permanent=False)
         finally:
             client.close()
+        # Raised outside the handlers, so the server's text is on neither __cause__ nor
+        # __context__.
+        raise fault
 
 
 def _make_client(
@@ -2381,10 +2450,16 @@ class RemoteFileDestination(DestinationConnector):
         # Write to a unique temp name then rename, so a poller on the far side never sees a partial
         # file. The temp suffix is unguessable so two concurrent uploads never collide on it.
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
+        # Every cleanup and raise below runs outside the handlers (BACKLOG #5026), so neither a
+        # cleanup that raises something other than a _RemoteError nor the failure itself carries
+        # the caught error on __context__. Its text never quotes the server's reply in any case
+        # (_RemoteError states the rule), and the clients chain no reply.
         failed: _RemoteError | None = None
         try:
             self._client.store(tmp, data)
         except _RemoteError as exc:
+            failed = exc
+        if failed is not None:
             # A store cut off part-way, by the stall bound (#2082) or a dropped connection, can leave
             # a partial temp behind, one more on every retry. Not after a credential fault: another
             # login would be one more refused attempt against the partner account. Nor after a
@@ -2392,27 +2467,23 @@ class RemoteFileDestination(DestinationConnector):
             # connect would meet the same refusal (#2083). A store that failed before it connected
             # for any other reason left no temp, so this costs one more connect and a warning there;
             # _prepare_remote_dir connected just before, so that case is rare.
-            if not exc.connection_fault:
+            if not failed.connection_fault:
                 self._remove_temp(tmp, name, "store")
+            raise failed
+        try:
+            if self._overwrite:  # replacing is what it asks for
+                self._client.rename(tmp, posixpath.join(self._remote_dir, name))
+            else:
+                self._publish_new(tmp, name, candidates)
+        except _RemoteError as exc:
             failed = exc
-        if failed is None:
-            try:
-                if self._overwrite:  # replacing is what it asks for
-                    self._client.rename(tmp, posixpath.join(self._remote_dir, name))
-                else:
-                    self._publish_new(tmp, name, candidates)
-            except _RemoteError as exc:
-                # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise
-                # so the delivery is classified (retry/dead-letter) by send(). Unlike the store
-                # branch, this tries even after a connection fault: the store succeeded, so a whole
-                # message sits in the temp, and the lane stops right after, so it costs one more
-                # login at most.
-                self._remove_temp(tmp, name, "rename")
-                failed = exc
         if failed is not None:
-            # A reply can quote the paths this upload chose (BACKLOG #2814). Raised outside the
-            # handlers, so the unscrubbed reply is on neither __cause__ nor __context__.
-            raise failed.without_names([name, *candidates])
+            # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so
+            # the delivery is classified (retry/dead-letter) by send(). Unlike the store branch,
+            # this tries even after a connection fault: the store succeeded, so a whole message
+            # sits in the temp, and the lane stops right after, so it costs one more login at most.
+            self._remove_temp(tmp, name, "rename")
+            raise failed
 
     def _publish_new(self, tmp: str, name: str, candidates: list[str]) -> None:
         """Publish ``tmp`` under the first of ``candidates`` still free when the client tries it,

@@ -389,7 +389,9 @@ def test_a_fast_open_failure_keeps_its_own_message(monkeypatch: pytest.MonkeyPat
     with pytest.raises(_RemoteError) as caught:
         client.list_dir("/in")
 
-    assert "administratively prohibited" in str(caught.value)
+    # Reported as the refusal's own class, by its type: the error carries no exception text
+    # (BACKLOG #5026).
+    assert str(caught.value) == "SFTP operation failed: _FakeSshException"
     assert "timed out" not in str(caught.value)
 
 
