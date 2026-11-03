@@ -10329,9 +10329,9 @@ class RegistryRunner:
         except CipherError as exc:
             # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
             # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
-            # does an unopenable payload; the token keeps its reference for a replay. Only the read is
-            # guarded: a CipherError from the handoff's encrypt (the invocation ceiling) is a
-            # deliberate hard stop and keeps the fault arm.
+            # does an unopenable payload; the token keeps its reference for a replay. The handoff
+            # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
+            # any CipherError the handoff raises still takes the fault arm.
             log.warning(
                 "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                 name,

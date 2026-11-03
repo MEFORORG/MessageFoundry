@@ -78,8 +78,9 @@ async def spoil_with_a_wrong_cell(fetch: RawFetch, raw: RawSql, bad: str, good: 
 
 
 async def spoil_with_a_foreign_key(_fetch: RawFetch, raw: RawSql, bad: str, _good: str) -> None:
-    """The right cell, sealed under a key this store was never given: the shape a rotated key
-    that was not supplied at start takes."""
+    """The right cell, sealed under a key this store was never given. A real unsupplied key would
+    also fail the token's payload, sealed in the same transaction, and the claim dead-letters
+    that first; this builds the body-only case to pin the arm for a key the store does not hold."""
     foreign = make_cipher(generate_key(), write_v2=True)
     sealed = foreign.encrypt(REPLY, aad=cell_aad("response", "body", bad, "OB_X", 1))
     await raw("UPDATE response SET body=? WHERE message_id=?", (sealed, bad))

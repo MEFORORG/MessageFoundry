@@ -5669,7 +5669,7 @@ async def test_queue_tag_contract(store) -> None:
 
 
 def _raw_adapters(s) -> tuple[RawSql, RawFetch]:
-    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    """``(raw, fetch)`` for the contracts below, on pooled connections, outside the store."""
     from tests._session_seal_contract import dollar_placeholders
 
     async def raw(sql: str, params: tuple[object, ...]) -> None:

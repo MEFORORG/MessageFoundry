@@ -6251,7 +6251,7 @@ async def test_queue_tag_contract(store) -> None:
 
 
 def _raw_adapters(s) -> tuple[Any, Any]:
-    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    """``(raw, fetch)`` for the contracts below, on pooled connections, outside the store."""
 
     async def raw(sql: str, params: tuple[Any, ...]) -> None:
         async with s._pool.acquire() as conn:
