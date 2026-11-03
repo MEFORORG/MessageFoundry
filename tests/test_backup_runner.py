@@ -803,8 +803,9 @@ async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> 
 
 
 def _config_with_a_linked_dir(tmp_path: Path, make_link) -> Path:
-    """A config dir holding a top-level file, a plain subfolder's file (the control), and a
-    directory link, made by ``make_link(target, link)``, to a host folder outside it."""
+    """A config dir holding a top-level file, a plain subfolder's file (the control), and two
+    directory links, made by ``make_link(target, link)``, to a host folder outside it: one at the
+    top and one below the plain subfolder, so a prune at the top level alone does not pass."""
     cfg = tmp_path / "config"
     (cfg / "sub").mkdir(parents=True)
     (cfg / "feed.py").write_text("# router")
@@ -813,6 +814,7 @@ def _config_with_a_linked_dir(tmp_path: Path, make_link) -> Path:
     host.mkdir()
     (host / "buried.txt").write_text("SMUGGLED-THROUGH-A-DIRECTORY-LINK " * 40)
     make_link(host, cfg / "linked")
+    make_link(host, cfg / "sub" / "nested")
     return cfg
 
 
@@ -855,16 +857,24 @@ async def _config_member_bytes(tmp_path: Path, key_b64: str, cfg: Path) -> tuple
     "make_link", [_make_junction, _make_dir_symlink], ids=["junction", "symlink"]
 )
 async def test_a_directory_link_in_the_config_dir_adds_nothing(
-    tmp_path, key_b64, make_link
+    tmp_path, key_b64, make_link, caplog
 ) -> None:
     """A junction answers False to ``is_symlink()``, and ``rglob`` and ``os.walk(followlinks=False)``
     both descended it, so a host folder it named reached the archive and the space estimate. The
     junction case fails on that walk; the symlink case is the same rule on the other link kind. The
     plain subfolder's file is the control that the walk still descends a real folder."""
     cfg = _config_with_a_linked_dir(tmp_path, make_link)
-    names, tar_bytes = await _config_member_bytes(tmp_path, key_b64, cfg)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        names, tar_bytes = await _config_member_bytes(tmp_path, key_b64, cfg)
     assert names == ["config/feed.py", "config/sub/plain.txt"]
     assert b"SMUGGLED-THROUGH-A-DIRECTORY-LINK" not in tar_bytes
+    # The loader and the digest may read through a link, so passing one over is not silent.
+    left_out = [
+        r.getMessage()
+        for r in caplog.records
+        if "does not follow a directory link" in r.getMessage()
+    ]
+    assert len(left_out) == 1 and left_out[0].endswith("leaves out: linked, sub/nested")
 
 
 @pytest.mark.parametrize(
