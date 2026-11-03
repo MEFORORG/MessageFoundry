@@ -570,6 +570,163 @@ def test_an_unglued_keyword_after_a_number_is_still_seen() -> None:
         database._require_read_only("SELECT 0x UPDATE patients SET mrn='X'")
 
 
+# --- BACKLOG #5259: misses measured after engine PR 2718 ---------------------------------------------
+#
+# Each row below passed _require_read_only at origin/main e0f5f744e0, measured by calling it. Nobody has
+# run these against a server, and the tests make no claim about how one lexes them: the gate refuses
+# each shape whatever a lexer does with it.
+
+_SIGIL_GLUED_WRITES = [
+    "SELECT * INTO#x FROM patients",
+    "SELECT 1 EXEC@s",
+    "SELECT 1 EXECUTE@s",
+    "SELECT 1 DELETE#t",
+    "SELECT 1 UPDATE@x SET a=1",
+    "SELECT 1 INSERT#t(a) VALUES (1)",
+]
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize("stmt", _SIGIL_GLUED_WRITES)
+def test_a_write_keyword_glued_to_a_sigil_is_refused(stmt: str, dialect: str) -> None:
+    """Item 1. A word used to run on through `#` and `@`, so `INTO#x` was one name that matched no
+    keyword. Red mutation: let `_SQL_WORD_RE` continue a word through a sigil again."""
+    with pytest.raises(DbLookupError, match="found a '(INTO|EXEC|EXECUTE|DELETE|UPDATE|INSERT)'"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize("stmt", ["SELECT#x FROM t", "WITH@c AS (SELECT 1) SELECT 1"])
+def test_a_leading_select_glued_to_a_sigil_stays_refused(stmt: str, dialect: str) -> None:
+    """Splitting a word at a sigil must not turn `SELECT#x`, one name before the split, into an
+    admitted `SELECT`. Red mutation: drop the glue check on the first token."""
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        "SELECT * FROM #tmp",
+        "SELECT @@ROWCOUNT AS n, @v AS v FROM ##global",
+        "SELECT a#b, x$1 FROM t",
+    ],
+)
+def test_sigil_names_that_hold_no_keyword_are_still_admitted(stmt: str, dialect: str) -> None:
+    """Control for item 1: a leading sigil is still part of a name, and so is `$`."""
+    database._require_read_only(stmt, dialect=dialect)
+
+
+_CALL_ESCAPES = [
+    "SELECT 1 {call sp_x}",
+    "SELECT 1 {?= call sp_x(?)}",
+    "SELECT 1 { CALL sp_x }",
+    "SELECT 1 {/* note */call sp_x}",
+]
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize("stmt", _CALL_ESCAPES)
+def test_an_odbc_call_escape_after_select_is_refused(stmt: str, dialect: str) -> None:
+    """Item 3. Only a leading `{call}` was refused, by the first-token rule. Red mutation: drop the
+    CALL check from the keyword loop."""
+    with pytest.raises(DbLookupError, match="found a 'CALL' keyword"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+def test_a_bare_call_is_refused_on_the_generic_dialect_only() -> None:
+    """Item 3. MySQL and PostgreSQL run a bare `CALL`; SQL Server has no such statement, so on the
+    preset a `call` name is still admitted. Red mutation: refuse CALL only after `{` on generic too."""
+    with pytest.raises(DbLookupError, match="found a 'CALL' keyword"):
+        database._require_read_only("SELECT 1 CALL sp_x()", dialect="generic")
+    database._require_read_only("SELECT call FROM calls")
+
+
+_LONE_LINE_BREAKS = [
+    "SELECT 1 --x\rDELETE FROM t",
+    "SELECT 1 --x\x85DELETE FROM t",
+    "SELECT 1 --x\u2028DELETE FROM t",
+    "SELECT 1 --x\fDELETE FROM t",
+    # Ending the comment at the CR instead would admit this one: the quote would then swallow a
+    # DELETE that a lexer ending the comment at the LF runs. So the gate refuses, never guesses.
+    "SELECT 1 --x\r' \nDELETE FROM t --'",
+]
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize("stmt", _LONE_LINE_BREAKS)
+def test_a_dash_comment_holding_a_line_break_other_than_lf_is_refused(
+    stmt: str, dialect: str
+) -> None:
+    """Item 4. The `--` comment ended only at LF. Red mutation: drop the line-break check."""
+    with pytest.raises(DbLookupError, match="a line comment holds a line break other than LF"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+def test_a_crlf_ended_dash_comment_is_still_read(dialect: str) -> None:
+    """Control for item 4: a CRLF line ending is not a lone break, before a read or a write."""
+    database._require_read_only("SELECT 1 -- note\r\nFROM t\r\n-- end\r", dialect=dialect)
+    with pytest.raises(DbLookupError, match="found a 'DELETE' keyword"):
+        database._require_read_only("SELECT 1 --x\r\nDELETE FROM t", dialect=dialect)
+
+
+_MYSQL_COMMENT_MISSES = [
+    # MySQL needs whitespace after `--`, so this is `5 - -1`, then INTO.
+    "SELECT 5 --1 INTO OUTFILE '/tmp/x'",
+    # MySQL runs the body of an executable comment, MariaDB `/*M!` too.
+    "SELECT 1 /*! INTO OUTFILE '/tmp/x' */",
+    "SELECT 1; /*!DELETE FROM t*/",
+    "SELECT 1 /*M!100100 DELETE FROM t */",
+    # MySQL block comments do not nest, so the comment ends at the first `*/`.
+    "SELECT 1 /* /* */ DELETE FROM t */",
+    # MySQL `#` starts a comment, so the quote is inside it and DELETE is code.
+    "SELECT 1 #'\nDELETE FROM t -- '",
+    # The same `#` inside a word: a word that ran on through `#` hid this comment from the MySQL scan.
+    "SELECT x#'\nDELETE FROM t -- '",
+]
+
+
+@pytest.mark.parametrize("stmt", _MYSQL_COMMENT_MISSES)
+def test_mysql_comment_forms_are_refused_on_the_generic_dialect(stmt: str) -> None:
+    """Item 2 and the two misses the row did not list. Red mutation: scan the generic dialect with
+    the T-SQL comment model only."""
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt, dialect="generic")
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        # Each reads as code under the T-SQL and PostgreSQL comment model and as a comment under
+        # MySQL's, so the generic dialect must still run the first scan.
+        "SELECT 1 FROM #t DELETE FROM t",
+        "SELECT 1 /* /* */ ' */ DELETE FROM t --'",
+        "SELECT 1 --' \nDELETE FROM t --'",
+    ],
+)
+def test_the_generic_dialect_still_refuses_what_the_tsql_reading_sees(stmt: str) -> None:
+    """The generic dialect can reach SQL Server and PostgreSQL as well as MySQL, so it is scanned
+    under both comment models. Red mutation: scan generic with the MySQL model alone."""
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt, dialect="generic")
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        "SELECT /*!40001 SQL_NO_CACHE */ id FROM t",
+        "SELECT 1 -- note\nFROM t",
+        "SELECT 1 # note\nFROM t",
+        "SELECT /* a /* b */ c */ 1",
+    ],
+)
+def test_mysql_comment_reads_are_still_admitted_on_the_generic_dialect(stmt: str) -> None:
+    """Control for item 2: a read with MySQL comments still passes both scans."""
+    database._require_read_only(stmt, dialect="generic")
+
+
 def test_lookup_dsn_is_read_only() -> None:
     # The db_lookup pool advertises ApplicationIntent=ReadOnly; the destination default does NOT (so the
     # DATABASE destination/source DSN stays byte-identical).

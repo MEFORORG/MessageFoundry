@@ -1515,12 +1515,23 @@ def _build_connection(
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
-# One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
-# `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil followed by a digit
-# (`#1tmp`, `@1x`) is NOT taken as one name, though T-SQL allows it: on the generic dialect `#` and `@`
-# can be operators, and there `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose
-# glue refusal refuses the statement on every dialect.
-_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
+# One bare SQL word token. A LEADING T-SQL sigil (`@var`, `@@ROWCOUNT`, `#temp`) is part of the token,
+# so `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil INSIDE a word
+# starts a new token (BACKLOG #5259): `INTO#x` is `INTO` then `#x`, so the keyword is seen. That is
+# this gate's fail-closed choice, not a claim about how any server lexes `INTO#x`: whichever way a
+# lexer reads it, the statement is refused. A sigil followed by a digit (`#1tmp`, `@1x`) is NOT taken
+# as one name, though T-SQL allows it: on the generic dialect `#` and `@` can be operators, and there
+# `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose glue refusal refuses the
+# statement on every dialect.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$]*")
+
+# Line breaks other than LF. A `--` comment ends at an LF here, and one holding any of these before
+# that LF is refused (BACKLOG #5259), whatever lexer reads it: SQL lexers can disagree about which of
+# them end a line comment, and either guess lets a write through. Ending at a CR admits
+# `--x\r' <LF> DELETE ... --'`, where the quote swallows a DELETE that a lexer ending at the LF runs;
+# ending at the LF admits `--x\rDELETE`. A CR right before the LF is a CRLF ending and is not refused.
+# The set is Python's `str.splitlines` breaks less LF, a superset of what any lexer is likely to use.
+_SQL_OTHER_LINE_BREAKS = frozenset("\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
@@ -1551,11 +1562,14 @@ _SQL_WRITE_KEYWORDS = frozenset(
 # fail-closed choice, not a MySQL rule: MySQL accepts `TRUNCATE (1.2, 2)`, and the gate refuses it.
 # Only `dialect='generic'` gets the exemption. The SQL Server preset never does: SQL Server has no
 # native function of either name, and an ODBC scalar escape (`{fn TRUNCATE(x, 2)}`), which its
-# driver does translate, is refused with the rest, failing closed. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
-# Server driver), so the exemption there rests on this premise, read from the documented T-SQL
-# grammar and not run against a server: no T-SQL statement puts a `(` straight after `INSERT` or
-# `TRUNCATE`. `INSERT` takes `TOP (n)`, `INTO` or a target name first, and `TRUNCATE` takes `TABLE`.
-# "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
+# driver does translate, is refused with the rest, failing closed. The generic dialect can still
+# reach SQL Server (its default `odbc_driver` is the SQL Server driver), so the exemption there must
+# not admit a T-SQL write. A T-SQL statement CAN put a `(` straight after `INSERT`: the column list of
+# `MERGE ... WHEN NOT MATCHED THEN INSERT(cols) VALUES (...)`, read from the documented T-SQL grammar
+# and not run against a server. The exemption is still safe there because `MERGE` is itself in
+# `_SQL_WRITE_KEYWORDS` and gets no exemption, so the statement is refused at its `MERGE` whatever
+# its `INSERT(` reads as. A standalone T-SQL `INSERT` takes `TOP (n)`, `INTO` or a target name first,
+# and `TRUNCATE` takes `TABLE`. "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
 # between the keyword and the `(` is dropped by the scan, and `INSERT [patients](mrn) VALUES (1)`
 # must not read as a call.
 # `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL, the exact shape
@@ -1589,21 +1603,36 @@ def _read_only_message(subject: str) -> str:
     )
 
 
-def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") -> list[_SqlToken]:
+def _scan_sql_tokens(
+    statement: str, *, subject: str = "db_lookup statement", mysql_comments: bool = False
+) -> list[_SqlToken]:
     """Tokenize ``statement`` into :class:`_SqlToken` values, dropping comments and the contents of string
     literals and quoted identifiers.
 
     Single-quoted strings and double-quoted / ``[...]``-bracketed / backtick-quoted identifiers are
     consumed whole, doubled-delimiter escapes included, so a keyword *inside* one is data and never a
-    token. T-SQL block comments nest, so the scan tracks depth.
+    token.
+
+    ``mysql_comments`` picks the comment model (BACKLOG #5259). Off, it is the T-SQL one, which
+    PostgreSQL shares: ``--`` always starts a comment, block comments nest, so the scan tracks depth,
+    and ``#`` is a sigil. On, it is MySQL's: ``--`` starts a comment only when whitespace or a control
+    character follows it (``5 --1`` is ``5 - -1``), ``#`` starts a comment, block comments do not
+    nest, and the body of a ``/*!`` or MariaDB ``/*M!`` comment, which MySQL runs, is scanned as code.
+    :func:`_require_read_only` says which caller gets which. Quoting is the same in both.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
-    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a numeric
-    literal with a word character glued to its end (:data:`_SQL_NUMBER_RE`): SQL Server reads
-    ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``. That refusal
-    also catches valid reads, at least an Oracle ``1.5f``, a MySQL name that starts with a digit
-    (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp`` or ``@1x`` and a ``:1st`` placeholder;
-    it fails closed on purpose.
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a line comment
+    holding a line break other than LF before the LF that ends it (:data:`_SQL_OTHER_LINE_BREAKS`
+    says why). So does a numeric literal with a word character glued to its end
+    (:data:`_SQL_NUMBER_RE`): SQL Server reads ``0xUPDATE`` as ``0x`` then ``UPDATE`` and
+    ``1e1INTO`` as ``1e1`` then ``INTO``. Those refusals, and the split of a word at an internal
+    sigil (:data:`_SQL_WORD_RE`), also catch valid reads, at least an Oracle ``1.5f``, a MySQL name
+    that starts with a digit (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp``, ``@1x`` or
+    ``t#1x``, a ``:1st`` placeholder, a line comment in a statement with CR-only line endings, and a
+    name such as ``update#n`` whose part before an internal ``#`` or ``@`` is a write keyword. The
+    MySQL model adds at least a ``--`` comment with no space after the dashes, a ``/*!`` body or a
+    nested block comment's tail holding a write keyword or a lone quote, and a T-SQL ``#temp`` name
+    whose line ends inside a multi-line quoted literal. It fails closed on purpose.
     ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
     tokens: list[_SqlToken] = []
@@ -1613,14 +1642,27 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
         if ch.isspace():
             i += 1
             continue
-        if statement.startswith("--", i):
+        # MySQL reads `--x` as two minus signs, so the rest of its line is code: it falls through to
+        # the one-character token below. Only an ASCII space or control character after the dashes
+        # makes a MySQL comment, since MySQL reads a non-ASCII space as part of a name.
+        if (
+            statement.startswith("--", i)
+            and not (mysql_comments and statement[i + 2 : i + 3] > " ")
+        ) or (mysql_comments and ch == "#"):
             nl = statement.find("\n", i)
-            i = n if nl == -1 else nl + 1
+            end = n if nl == -1 else nl
+            if not _SQL_OTHER_LINE_BREAKS.isdisjoint(statement[i:end].rstrip("\r")):
+                raise DbLookupError(f"{refusal}; a line comment holds a line break other than LF")
+            i = end + 1
+            continue
+        if mysql_comments and statement.startswith(("/*!", "/*M!"), i):
+            # MySQL runs an executable comment's body, so it is code here. Its `*/` scans as `*`, `/`.
+            i = statement.index("!", i) + 1
             continue
         if statement.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:
-                if statement.startswith("/*", i):
+                if statement.startswith("/*", i) and not mysql_comments:
                     depth, i = depth + 1, i + 2
                 elif statement.startswith("*/", i):
                     depth, i = depth - 1, i + 2
@@ -1678,11 +1720,27 @@ def _require_read_only(
        ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
 
+    Rule 2 also refuses a ``CALL`` word that follows an ODBC ``{`` escape opener (``{call p}``,
+    ``{?= call p(?)}``), anywhere in the statement, on every dialect. Rule 1 alone refused only a
+    leading one (BACKLOG #5259). On every dialect but ``sqlserver`` it refuses a bare ``CALL`` too,
+    since MySQL and PostgreSQL run one; SQL Server has no ``CALL`` statement, so there a ``call``
+    name is still admitted. Rule 1 also refuses a leading ``SELECT`` or ``WITH`` glued to a ``#``
+    or ``@``, which was one name before :data:`_SQL_WORD_RE` split words at a sigil.
+
     One exception to rule 2: on ``dialect="generic"`` only, ``INSERT`` or ``TRUNCATE`` with a ``(``
     as the very next character is MySQL's scalar function, not a statement
-    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception, so a caller
-    that does not know the dialect gets the stricter test. ``db_lookup`` and ``DatabaseRef`` are SQL
-    Server only and pass none.
+    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception.
+    ``db_lookup`` and ``DatabaseRef`` are SQL Server only and pass none, so they get the
+    ``sqlserver`` default. ``DatabasePoll`` passes its own dialect, and while that dialect is an
+    ``env()`` value it tests the poll as ``generic`` when declared and again with the resolved
+    dialect when the source is built; ``DatabaseSource`` passes the dialect it was built with.
+
+    Every dialect but ``sqlserver`` is tokenized twice, once with each comment model of
+    :func:`_scan_sql_tokens`, and the three rules apply to each token list: the generic path can
+    reach at least SQL Server, PostgreSQL and MySQL, which disagree about comments, and a statement
+    that one of them reads as a write must be refused whichever one is behind the connection. So the
+    generic test refuses everything the ``sqlserver`` test does, less the function-form exception,
+    and can refuse reads the ``sqlserver`` test admits.
 
     Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
     or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
@@ -1696,10 +1754,27 @@ def _require_read_only(
     :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
-    tokens = _scan_sql_tokens(statement, subject=subject)
-    if not tokens or tokens[0].kind != "word" or tokens[0].text not in ("SELECT", "WITH"):
+    preset = dialect == "sqlserver"
+    # The T-SQL model runs first on every dialect, so a refusal it raises reads as it always did.
+    for mysql_comments in (False,) if preset else (False, True):
+        tokens = _scan_sql_tokens(statement, subject=subject, mysql_comments=mysql_comments)
+        _check_read_only_tokens(
+            statement, tokens, refusal, preset=preset, function_forms=dialect == "generic"
+        )
+    return None
+
+
+def _check_read_only_tokens(
+    statement: str, tokens: list[_SqlToken], refusal: str, *, preset: bool, function_forms: bool
+) -> None:
+    """Apply :func:`_require_read_only`'s three rules to one scan's ``tokens``, raising on a miss."""
+    if (
+        not tokens
+        or tokens[0].kind != "word"
+        or tokens[0].text not in ("SELECT", "WITH")
+        or statement.startswith(("#", "@"), tokens[0].end)
+    ):
         raise DbLookupError(refusal)
-    function_forms = dialect == "generic"
     last = len(tokens) - 1
     for index, (kind, text, end) in enumerate(tokens):
         if kind != "word":
@@ -1708,6 +1783,8 @@ def _require_read_only(
             if text == ";" and index != last:
                 raise DbLookupError(refusal)
             continue
+        if text == "CALL" and (not preset or _follows_escape_opener(tokens, index)):
+            raise DbLookupError(f"{refusal}; found a 'CALL' keyword")
         if text not in _SQL_WRITE_KEYWORDS:
             continue
         if (
@@ -1717,7 +1794,16 @@ def _require_read_only(
         ):
             continue  # a scalar function call that shares the keyword's name, not a statement
         raise DbLookupError(f"{refusal}; found a '{text}' keyword")
-    return None
+
+
+def _follows_escape_opener(tokens: list[_SqlToken], index: int) -> bool:
+    """Whether ``tokens[index]`` follows an ODBC escape's ``{``, past the ``?=`` of a ``{?= call}``."""
+    while index > 0:
+        index -= 1
+        kind, text, _ = tokens[index]
+        if kind != "other" or text not in ("?", "="):
+            return kind == "other" and text == "{"
+    return False
 
 
 def _parse_named_params(statement: str) -> tuple[str, list[str]]:
@@ -2968,7 +3054,7 @@ def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> st
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
     ``poll_max_rows`` is; its docstring says what it refuses. ``dialect`` is the poll's own, so a
     ``generic`` poll admits MySQL's scalar ``INSERT(...)``/``TRUNCATE(...)``, which ``db_lookup``,
-    always on the SQL Server preset, refuses. A locking ``FOR UPDATE`` read is refused
+    always on the SQL Server preset, refuses, and is also scanned with MySQL's comment model. A locking ``FOR UPDATE`` read is refused
     with the rest (``UPDATE`` is a keyword), and on this autocommit connection its lock ends with the
     statement, so refusing it loses nothing. **It reads the statement's shape only**, so at least a
     ``SELECT`` that calls a function which writes, and a T-SQL second statement with no ``;`` whose
