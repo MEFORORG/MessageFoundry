@@ -673,9 +673,12 @@ def _split_or_refuse(
     Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
     all, and ``from None`` would leave it on ``__context__`` (#1796).
 
-    Split uncached (vault BACKLOG #5287). The callers are the constructors that refuse a credential
-    in the URL, so a cached split would keep a refused password as a key in urllib's process-wide
-    cache. The uncached function is the same code, so it raises the same NFKC ValueError."""
+    Split uncached (vault BACKLOG #5287). At least :func:`url_scheme` and
+    :func:`refuse_url_credentials` call this on a URL that may hold a credential, and a cached split
+    would make a refused password a key in urllib's process-wide cache. The uncached function is
+    the same code, so it raises the same NFKC ValueError. This keeps only this split from adding
+    the key: a reader that splits the same value cached first, such as the egress gate's query
+    credential warning on an endpoint ``url``, still adds one."""
     try:
         parsed: urllib.parse.SplitResult | None = _UNCACHED_URLSPLIT(url)
     except ValueError:
@@ -2362,8 +2365,8 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
         return False
     try:
         # Uncached, so the [egress].proxy_url load check, which asks this, adds no key to
-        # urlsplit's process-wide cache (vault BACKLOG #3454). url_scheme, which the build reads
-        # the scheme through first, splits uncached too (vault BACKLOG #5287).
+        # urlsplit's process-wide cache (vault BACKLOG #3454). The build's url_scheme read before
+        # this is uncached too; _split_or_refuse says why.
         if _UNCACHED_URLSPLIT(proxy).scheme.lower() not in ("http", "https"):
             return False
         # The parser ProxyHandler.proxy_open runs; a test pins the pairing.
