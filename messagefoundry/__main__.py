@@ -10575,11 +10575,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
     either data pass, the audit range rolls after both, and the stamp and the record's close come
-    last, on a run with no skip, an uploads directory it could read throughout (BACKLOG #4940) and
-    a good roll. One it cannot list at the start refuses before anything is written; one its
-    uploads pass cannot list aborts the run before the roll, which is not a skip. A skip does not
-    stop the roll (owner ruling
-    2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
+    last, on a run with no skip, an uploads directory both its pre-check and its uploads pass could
+    list (BACKLOG #4940; a listable directory that is not the one holding the uploads passes both,
+    which docs/PHI.md states) and a good roll. One it cannot list at the start refuses before
+    anything is written; one its uploads pass cannot list aborts the run before the roll, which is
+    not a skip. A skip does not stop the roll (owner ruling 2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
     that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
     key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
     the close follow. A run that stops
