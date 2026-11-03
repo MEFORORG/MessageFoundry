@@ -468,11 +468,12 @@ or a second hold to. An acknowledgement is an author comment or commit; the `hol
 owner's GitHub identity, only the original author's comment or commit counts, a commit its own
 Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
 branch updates included. A `hold-ack` expires 2 hours after it while it is still the original
-author's newest event since the hold and the head is still the held head, and the hold then counts
-as unacknowledged; an author commit or ordinary reply hands the turn back to the Lander, and
-nothing expires then. The author may also hand the PR over sooner. The PR must not be queued
-or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own CCD
-instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
+author's newest event since the hold and no commit by the original author has landed since it, and
+the hold then counts as unacknowledged, which `scripts/coord/held_pr_turns.py` shows as the
+Lander's turn, flagged `ack-expired`; an author commit or ordinary reply hands the turn back to the
+Lander, and nothing expires then. The author may also hand the PR over sooner. The PR must not be
+queued or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own
+CCD instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
 transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief,
 and no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
 `<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair Manager's CCD `local_` id
