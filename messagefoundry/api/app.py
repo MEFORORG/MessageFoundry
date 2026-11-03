@@ -5778,8 +5778,8 @@ def create_app(
         is refused **409**, as is a toggle that arrives once a shutdown's drain has begun or reaches
         the engine's write lock after that. A toggle the store did not confirm is refused **503**,
         which does not say the flag is unchanged (:class:`ConnectionFlagNotRecorded`), and so is one
-        still queued for that lock when its wait runs out, drain or not. The request deadline ends this handler's wait, not the
-        write (:meth:`Engine.set_connection_flag`). Paced and audited.
+        still queued for that lock when its wait runs out, drain or not. The request deadline ends
+        this handler's wait, not the write (:meth:`Engine.set_connection_flag`). Paced and audited.
 
         Gated by ``config:deploy``, which the flag's old home justified and which stays by decision:
         the flag marks what an operator should look at, and a change of gate is its own decision

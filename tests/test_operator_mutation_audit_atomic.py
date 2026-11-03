@@ -57,11 +57,13 @@ async def test_sqlite_overlapping_toggles_from_two_handles_stay_ordered(tmp_path
     SQLite's single writer is the lock: the second handle's flag statement waits for the first's
     commit, so it holds with no lock of the store's own."""
     first = await MessageStore.open(tmp_path / "two.db")
-    second = await MessageStore.open(tmp_path / "two.db")
     try:
-        await assert_connection_flag_ordered_across_stores(first, second)
+        second = await MessageStore.open(tmp_path / "two.db")
+        try:
+            await assert_connection_flag_ordered_across_stores(first, second)
+        finally:
+            await second.close()
     finally:
-        await second.close()
         await first.close()
 
 

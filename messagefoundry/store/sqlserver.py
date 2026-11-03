@@ -7943,13 +7943,14 @@ class SqlServerStore:
         The audit applock comes FIRST, before the flag statement, and holds to the commit, so two
         toggles from any engine shard or node run one after the other. Taken at the append instead,
         a clear that matched no row locks nothing at READ COMMITTED, so a set beside it could commit
-        first and the clear's row would still be the newer. Only toggles touch ``connection_flag``,
-        and each holds the applock first, so a key lock under it cannot cycle.
-        ``HOLDLOCK`` keeps the MERGE's match-then-insert one decision, as it was before the applock.
+        first and the clear's row would still be the newer. Only toggles write ``connection_flag``,
+        and each holds the applock first, so a key lock under it cannot cycle. ``HOLDLOCK`` stays
+        on the MERGE, though the applock already keeps two toggles off the key at once.
 
-        The opener, the applock and the flag statement are retried together, as
-        :meth:`_claim_keyed_surface` retries its MERGE. Nothing before them can be lost to the
-        rollback, and the re-run takes the applock again before its flag statement."""
+        Only the flag statement is retried, as :meth:`_claim_keyed_surface` retries its MERGE. The
+        rollback before a re-run releases the applock, so the re-run opens a transaction and takes
+        it again first. A wait for the applock that fails, at the first take or a re-take, is never
+        retried: it raises, as it did when the append took the applock."""
         now = time.time() if now is None else now
         if flagged:
             statement = "connection flag MERGE"
@@ -7968,12 +7969,14 @@ class SqlServerStore:
                 async with self._cursor(conn) as cur:
 
                     async def write_flag() -> None:
-                        await self._open_under_audit_applock(cur)
                         await cur.execute(sql, (connection, direction))
 
-                    await _retry_idempotent_merge(
-                        write_flag, on_retry=conn.rollback, statement=statement
-                    )
+                    async def reopen() -> None:
+                        await conn.rollback()
+                        await self._open_under_audit_applock(cur)
+
+                    await self._open_under_audit_applock(cur)
+                    await _retry_idempotent_merge(write_flag, on_retry=reopen, statement=statement)
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
                     await self._commit(conn)
             except Exception:
@@ -13682,9 +13685,10 @@ class SqlServerStore:
 
         It does NOT take the in-process ``_audit_lock``. That lock is only the cheap near gate
         :meth:`record_audit` describes; ``_AUDIT_APPEND_LOCK`` is what serialises the chain, and it
-        is taken here, at the tail, after the mutation's own writes. Holding ``_audit_lock`` across a
-        whole mutation would queue every audit write in this process, sign-ins included, behind a
-        bulk replay or purge."""
+        is taken here, at the tail, after the mutation's own writes, except by
+        :meth:`set_connection_flag`, which takes it before its write and says why. Holding
+        ``_audit_lock`` across a whole mutation would queue every audit write in this process,
+        sign-ins included, behind a bulk replay or purge."""
         audits = operator_audits(audit, result)
         written.add(audits, await self._append_audits(cur, audits, now=written.now))
 

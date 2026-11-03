@@ -279,7 +279,9 @@ async def _assert_connection_flag_atomic(store: Any, tag: str) -> None:
 
 
 #: How long the second toggle gets to reach its audit append while the first is held open. Under the
-#: audit lock taken first it waits at the database and never gets there, whatever this is.
+#: audit lock taken first it waits at the database and never gets there, whatever this is. Without
+#: that lock, a server slower than this to run one statement would let the old order pass here; the
+#: offline order tests in test_connection_flag.py and test_sqlserver_cipher_retry.py do not wait.
 _OVERLAP_WINDOW = 1.0
 
 

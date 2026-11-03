@@ -2574,10 +2574,9 @@ class Engine:
 
         That task holds the engine's write lock across the store call, so this process's toggles
         reach the store one at a time, in arrival order. What keeps the flag matching the newest
-        ``connection_flag_set`` row is the store: each server backend takes its audit lock before
-        the flag statement and holds it to the commit, and SQLite has one writer. That holds across
-        engine shards and cluster nodes, which share the store and not this lock, and for a commit
-        that outlives its store call, such as one cut off at the bound."""
+        ``connection_flag_set`` row is the store, across engine shards and cluster nodes too, and
+        for a commit that outlives its store call
+        (:meth:`~messagefoundry.store.base.QueueStore.set_connection_flag`)."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner

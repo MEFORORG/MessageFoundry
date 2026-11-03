@@ -13,11 +13,13 @@ longer does, and a dry-run reload runs them, which it still does and ``docs/SECU
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import dataclasses
 import json
 import logging
+import re
 import textwrap
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -34,6 +36,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
+from messagefoundry.store import postgres as postgres_store
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._operator_audit_atomic_contract import AppendFailed, failing_append
@@ -912,8 +915,8 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
 ) -> None:
     """Offline, against a recording connection: the order the live cross-handle contract in
     ``tests/test_postgres_store.py`` depends on. The lock taken only at the append let a clear run
-    beside another shard's uncommitted set at READ COMMITTED, delete nothing, and append the newer
-    row. Pinned to READ COMMITTED, since a REPEATABLE READ snapshot would predate the lock wait."""
+    beside another engine shard's uncommitted set at READ COMMITTED, delete nothing, and append
+    the newer row. Pinned to READ COMMITTED, since a REPEATABLE READ snapshot would predate the lock wait."""
     log: list[str] = []
 
     class _Conn:
@@ -932,8 +935,10 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
     async def _timed_acquire(*, record: bool = True) -> Any:
         yield _Conn()
 
-    async def _advisory_lock(_conn: Any, _classid: int, key: str) -> None:
-        log.append(f"LOCK {key}")
+    async def _advisory_lock(_conn: Any, classid: int, key: str) -> None:
+        # The class and the key together are the lock's identity, which the append's must match.
+        same = (classid, key) == (postgres_store._LOCK_CLASS_AUDIT, postgres_store._AUDIT_LOCK)
+        log.append("LOCK audit" if same else f"LOCK {classid} {key}")
 
     async def _append_operator_audit(*_args: Any) -> None:
         log.append("APPEND")
@@ -947,4 +952,37 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
         "OB_A", "outbound", flagged=flagged, audit=AuditAppend("connection_flag_set")
     )
     statement = "INSERT" if flagged else "DELETE"
-    assert log == ["BEGIN read_committed", "LOCK mefor_audit_chain", statement, "APPEND"]
+    assert log == ["BEGIN read_committed", "LOCK audit", statement, "APPEND"]
+
+
+#: A statement that writes the flag table, as a SQL string literal spells it.
+_FLAG_WRITE = re.compile(
+    r"\b(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE|MERGE|TRUNCATE\s+TABLE)\s+connection_flag\b", re.I
+)
+
+
+def test_only_the_toggle_writes_the_flag_table() -> None:
+    """The cross-process order rests on this: every writer of ``connection_flag`` takes the audit
+    lock before its statement, so no row lock is ever held while the audit lock is awaited. A
+    writer that appended at the tail instead could deadlock a toggle, and let the flag and its
+    newest row disagree again. This finds a writer in a string literal in the engine's Python,
+    by enclosing function; one built from parts, or in another language, it cannot see."""
+    root = Path(__file__).resolve().parents[1] / "messagefoundry"
+    writers: set[tuple[str, str]] = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and _FLAG_WRITE.search(node.value)
+                ):
+                    writers.add((path.name, fn.name))
+    assert writers == {
+        ("postgres.py", "set_connection_flag"),
+        ("sqlserver.py", "set_connection_flag"),
+        ("store.py", "set_connection_flag"),
+    }

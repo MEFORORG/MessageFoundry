@@ -194,10 +194,16 @@ async def test_a_raising_attempt_never_reaches_the_backoff() -> None:
 
 class _FlagStore:
     """The surface ``set_connection_flag`` touches. It holds one cursor across its retries, unlike
-    ``add_cipher_invocations``, so each execute takes the next outcome."""
+    ``add_cipher_invocations``, so each execute takes the next outcome. Each take of the audit
+    applock takes the next of ``applock`` the same way, and an exhausted list lets it through."""
 
-    def __init__(self, outcomes: list[BaseException | None]) -> None:
+    def __init__(
+        self,
+        outcomes: list[BaseException | None],
+        applock: list[BaseException | None] | None = None,
+    ) -> None:
         self._outcomes = outcomes
+        self._applock = applock or []
         self.statements: list[str] = []
         self.rollbacks = 0
         self.discards = 0
@@ -212,10 +218,13 @@ class _FlagStore:
 
     async def rollback(self) -> None:
         self.rollbacks += 1
+        self.statements.append("ROLLBACK")
 
     async def _open_under_audit_applock(self, _cur: Any) -> None:
-        # Recorded, never failed: the order is under test here, and a rollback releases the lock.
         self.statements.append("APPLOCK")
+        outcome = self._applock.pop(0) if self._applock else None
+        if outcome is not None:
+            raise outcome
 
     @contextlib.asynccontextmanager
     async def _acquire(self) -> AsyncIterator[_FlagStore]:
@@ -256,7 +265,13 @@ async def test_a_flag_write_retries_past_a_conflict_and_appends_one_row(
     store = _FlagStore([_DEADLOCK, None])
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.sqlserver"):
         await _set_flag(store, flagged=flagged)
-    assert [sql.split()[0] for sql in store.statements] == ["APPLOCK", statement] * 2
+    assert [sql.split()[0] for sql in store.statements] == [
+        "APPLOCK",
+        statement,
+        "ROLLBACK",
+        "APPLOCK",
+        statement,
+    ]
     assert (store.rollbacks, store.audits, store.commits, store.discards) == (1, 1, 1, 0)
     other = "DELETE" if flagged else "MERGE"
     retried = [r.getMessage() for r in caplog.records if "retrying" in r.getMessage()]
@@ -270,7 +285,24 @@ async def test_a_flag_write_that_never_clears_commits_nothing() -> None:
     store = _FlagStore([_HYT00] * _CIPHER_MERGE_ATTEMPTS)
     with pytest.raises(Exception, match="HYT00"):
         await _set_flag(store, flagged=False)
-    assert [sql.split()[0] for sql in store.statements] == ["APPLOCK", "DELETE"] * (
-        _CIPHER_MERGE_ATTEMPTS
+    retry = ["ROLLBACK", "APPLOCK", "DELETE"]
+    assert [sql.split()[0] for sql in store.statements] == ["APPLOCK", "DELETE"] + retry * (
+        _CIPHER_MERGE_ATTEMPTS - 1
     )
+    assert (store.audits, store.commits, store.discards) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("retake", [False, True], ids=["first-take", "re-take"])
+async def test_a_flag_write_whose_applock_wait_fails_is_not_retried(retake: bool) -> None:
+    """A transient-looking failure at the audit applock, first or after a rollback, raises at once
+    and writes nothing. It is the store's busiest lock, and a retry there would queue on it again;
+    the append took it outside any retry before the applock moved to the front."""
+    if retake:
+        store = _FlagStore([_DEADLOCK, None], applock=[None, _HYT00])
+    else:
+        store = _FlagStore([None], applock=[_HYT00])
+    with pytest.raises(Exception, match="HYT00"):
+        await _set_flag(store, flagged=False)
+    expected = ["APPLOCK", "DELETE", "ROLLBACK", "APPLOCK"] if retake else ["APPLOCK"]
+    assert [sql.split()[0] for sql in store.statements] == expected
     assert (store.audits, store.commits, store.discards) == (0, 0, 1)

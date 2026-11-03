@@ -6397,8 +6397,9 @@ class PostgresStore:
         two toggles from any engine shard or node run one after the other, and the later one's flag
         statement sees the earlier one's commit. Taken at the append instead, a clear beside another
         session's uncommitted set would delete nothing and still append the newer row. The append
-        re-takes the lock, which the same transaction may do. Only toggles touch ``connection_flag``,
-        and each holds the audit lock first, so taking a row lock under it cannot cycle.
+        re-takes the lock, which the same transaction may do. Only toggles write
+        ``connection_flag``, and each holds the audit lock first, so a row lock under it cannot
+        cycle; ``tests/test_connection_flag.py`` fails on another writer it can see.
 
         READ COMMITTED is pinned, as :meth:`reserve_upload_quota` pins it: a REPEATABLE READ server
         default would take the snapshot as the lock statement starts, before it waits."""
@@ -8476,7 +8477,8 @@ class PostgresStore:
 
         The mutation already holds its queue rows and finalize locks; the append then takes the audit
         advisory lock. No audit-lock holder takes a queue or finalize lock, so the order cannot
-        cycle."""
+        cycle. :meth:`set_connection_flag` is the exception: it takes the audit lock before its
+        row, and its docstring says why that cannot cycle either."""
         audits = operator_audits(audit, result)
         written.add(audits, await self._append_audits(conn, audits, now=written.now))
 

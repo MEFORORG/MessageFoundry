@@ -1421,7 +1421,8 @@ class QueueStore(StoreLifecycle, Protocol):
 
         Two calls, from any process on the store, run one after the other: a server backend takes
         its audit lock before the flag statement and holds it to the commit, and SQLite has one
-        writer. So the flag always matches the newest row a call appended."""
+        writer. So the flag matches the newest row a call appended, unless something outside the
+        store writes the table (ADR 0007, amendment of 2026-10-31)."""
         ...
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:

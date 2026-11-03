@@ -244,10 +244,10 @@ it could reach only its own copy.
    **An engine's toggles land one at a time, in arrival order.** The tracked task holds an engine
    lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
    The store's audit lock, below, keeps the flag and its newest row in step whatever the order; this
-   lock keeps the order the toggles arrived in. The wait for the lock has its own 10 seconds, and the store call then gets
-   a fresh 10, so past the auth gate a toggle's wall-clock ceiling is about two bounds plus the
-   store's unwind, and time in the queue does not cut off a store call. A toggle still queued when its wait runs out answers
-   the same 503, having written nothing, rather than meeting the request deadline. If the stuck
+   lock keeps the order the toggles arrived in. The wait for the lock has its own 10 seconds, and
+   the store call then gets a fresh 10, so past the auth gate a toggle's wall-clock ceiling is about
+   two bounds plus the store's unwind, and time in the queue does not cut off a store call. A
+   toggle still queued when its wait runs out answers the same 503, having written nothing, rather than meeting the request deadline. If the stuck
    toggle ahead of it gives way first, the queued toggle reaches the store and can be cut off there,
    close to 20 seconds after it arrived, with a commit that may land after the 503. A toggle that
    reaches the lock once a shutdown's drain has begun answers 409, and one whose wait runs out first
@@ -303,7 +303,8 @@ Postgres's audit advisory lock, at READ COMMITTED pinned, and SQL Server's audit
 again on each retry of the flag statement. A later toggle's flag statement therefore runs after the
 earlier toggle has committed, and its row is the newer, from any process and whenever the earlier
 call's caller stopped waiting. Only toggles write `connection_flag`, and each takes the audit lock
-first, so the row lock under it cannot cycle. SQLite's writer runs one transaction at a time, so a
+first, so the row lock under it cannot cycle; `tests/test_connection_flag.py` fails on another
+writer it can see in the engine's Python. SQLite's writer runs one transaction at a time, so a
 toggle there was always whole. Nothing of this gap remains open; a database writer outside the store
 is the accepted residual above.
 
