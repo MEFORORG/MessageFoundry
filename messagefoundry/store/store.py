@@ -7983,9 +7983,13 @@ CREATE TABLE IF NOT EXISTS attachment_chunk (
 -- rows referencing it. Logical refs (no FK — mirrors attachment_chunk.attachment_id / queue.body_ref); the
 -- messages row is kept by retention (Mirth Data-Pruner), so a dangling message_id never occurs in normal
 -- flow. SQLite only in Phase 3a; SQL Server / Postgres gain the whole attachment substrate at Phase 4.
+-- `inherited` is 1 on a link a child message took from its parent (BACKLOG #5099,
+-- _inherit_attachments): it lets delivery resolve the child's handle and holds a reference, but it
+-- grants no download, so the child's channel reads nothing the parent's channel stored.
 CREATE TABLE IF NOT EXISTS message_attachment (
     message_id    TEXT NOT NULL,    -- logical ref to messages.id
     attachment_id TEXT NOT NULL,    -- logical ref to attachment.id
+    inherited     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (message_id, attachment_id)
 );
 
@@ -10334,6 +10338,13 @@ class MessageStore:
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
+        # BACKLOG #5099: a link a child inherited grants no download. A pre-existing linkage table
+        # predates the flag; every row in it is an ingress detach's own link, so 0 is right.
+        cur = await db.execute("PRAGMA table_info(message_attachment)")
+        if "inherited" not in {row["name"] for row in await cur.fetchall()}:
+            await db.execute(
+                "ALTER TABLE message_attachment ADD COLUMN inherited INTEGER NOT NULL DEFAULT 0"
+            )
         # BACKLOG #1256: the federated guard in auth/service.py is CHECK-THEN-ACT -- it reads the
         # current holder and writes the binding in two separate awaits, so two concurrent FIRST
         # logins for one subject can both observe "no holder" and both bind. This index is the
@@ -10832,20 +10843,29 @@ class MessageStore:
                     aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
                 )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b). JOINs the ``message_attachment`` linkage to its ``attachment`` header and returns one
         row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``, and
         ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted here (the
         bytes ride :meth:`read_attachment`), so it stays cheap for the message-detail view. Returns ``[]``
-        for a message with no detached document."""
+        for a message with no detached document.
+
+        A link a child message inherited from its parent (BACKLOG #5099) is left out unless
+        ``include_inherited`` is set. The operator surfaces read without it, so an inherited link
+        grants no download: a user scoped only to the child's channel reads nothing the parent's
+        channel stored. Delivery's handle binding sets it, since the child must resolve the
+        documents its body carries."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND ma.inherited = 0"
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                 "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                "WHERE ma.message_id=? ORDER BY a.id",
+                f"WHERE ma.message_id=?{own_only} ORDER BY a.id",
                 (message_id,),
             )
             return [dict(r) for r in await cur.fetchall()]
@@ -10953,9 +10973,13 @@ class MessageStore:
         resolves a handle only against the row's own message, so the child must hold the documents
         it carries. Each holder keeps its own reference, so purging either releases only its own and
         ``refcount`` still equals the live linkage rows. :func:`attachments_named` says why only a
-        named document is inherited."""
+        named document is inherited. The link is written ``inherited``, so it serves delivery and
+        retention but grants no download (:meth:`attachments_for`)."""
+        # In content-address order, as the server backends read it, where the order is what stops
+        # two transactions increfing the same documents in opposite orders.
         cur = await self._db.execute(
-            "SELECT attachment_id FROM message_attachment WHERE message_id=?", (parent_id,)
+            "SELECT attachment_id FROM message_attachment WHERE message_id=? ORDER BY attachment_id",
+            (parent_id,),
         )
         held = [str(r["attachment_id"]) for r in await cur.fetchall()]
         for ref in attachments_named(held, body):
@@ -10969,7 +10993,8 @@ class MessageStore:
             if cur.rowcount != 1:
                 continue
             await self._db.execute(
-                "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
+                "INSERT INTO message_attachment (message_id, attachment_id, inherited) "
+                "VALUES (?,?,1)",
                 (child_id, ref),
             )
 

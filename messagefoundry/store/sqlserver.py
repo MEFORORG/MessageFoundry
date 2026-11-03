@@ -909,11 +909,15 @@ _SQL_SELECT_MESSAGE_STATUS: Final[str] = (
 _SQL_UPDATE_MESSAGE_STATUS: Final[str] = "UPDATE messages SET status=? WHERE id=?"
 _SQL_SELECT_MESSAGE_EXISTS: Final[str] = "SELECT 1 FROM messages WHERE id=?"
 # A child message inherits the documents its body names (BACKLOG #5099, _inherit_attachments).
+# ORDER BY: each incref takes the attachment header's row lock until commit, so two transactions
+# that incref the same documents must take them in one order, or each can wait on the other. The
+# ingress incref takes them in this order too.
 _SQL_SELECT_MESSAGE_ATTACHMENTS: Final[str] = (
-    "SELECT attachment_id FROM message_attachment WHERE message_id=?"
+    "SELECT attachment_id FROM message_attachment WHERE message_id=? ORDER BY attachment_id"
 )
+# Written inherited: the link serves delivery and retention, and grants no download.
 _SQL_INSERT_MESSAGE_ATTACHMENT: Final[str] = (
-    "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)"
+    "INSERT INTO message_attachment (message_id, attachment_id, inherited) VALUES (?,?,1)"
 )
 # Reports through OUTPUT, which a session-wide SET NOCOUNT ON cannot hide, so the caller links
 # only an attachment whose header the incref found.
@@ -1988,9 +1992,16 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('attachment_chunk','U') IS NULL CREATE TABLE attachment_chunk (
         attachment_id NVARCHAR(64) NOT NULL, seq INT NOT NULL, ciphertext NVARCHAR(MAX) NOT NULL,
         CONSTRAINT pk_attachment_chunk PRIMARY KEY (attachment_id, seq))""",
+    # `inherited` marks a link a child message took from its parent (BACKLOG #5099): it serves
+    # delivery and retention, and grants no download (attachments_for).
     """IF OBJECT_ID('message_attachment','U') IS NULL CREATE TABLE message_attachment (
         message_id NVARCHAR(64) NOT NULL, attachment_id NVARCHAR(64) NOT NULL,
+        inherited BIT NOT NULL CONSTRAINT DF_message_attachment_inherited DEFAULT 0,
         CONSTRAINT pk_message_attachment PRIMARY KEY (message_id, attachment_id))""",
+    # A pre-existing linkage table holds only ingress detaches' own links, so 0 backfills it.
+    """IF COL_LENGTH('message_attachment','inherited') IS NULL
+        ALTER TABLE message_attachment ADD inherited BIT NOT NULL
+        CONSTRAINT DF_message_attachment_inherited DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_ready','IndexID') IS NULL
         CREATE INDEX ix_queue_ready ON queue(stage, status, next_attempt_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_message','IndexID') IS NULL
@@ -6526,7 +6537,9 @@ class SqlServerStore:
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
-        refs = list(dict.fromkeys(attachment_refs or ()))
+        # Sorted, so the increfs below take the attachment header locks in content-address order,
+        # the order a child's inheritance takes them in (BACKLOG #5099, _inherit_attachments).
+        refs = sorted(set(attachment_refs or ()))
         # BACKLOG #2624: an operator's inject passes an ``audit``; a live receipt passes none and
         # takes no audit lock.
         async with AuditedWrite(now) as written, self._acquire() as conn:
@@ -11276,20 +11289,25 @@ class SqlServerStore:
                 r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
             )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b, SQL Server parity). JOINs ``message_attachment`` to its ``attachment`` header and
         returns one row per attachment carrying ``attachment_id`` (the sha256 content address),
         ``content_type``, and ``total_bytes``. **Metadata only** — the chunk ciphertext is never
-        touched/decrypted. Returns ``[]`` for a message with no detached document."""
+        touched/decrypted. Returns ``[]`` for a message with no detached document. An inherited link
+        is left out unless ``include_inherited`` is set, so it grants no download (BACKLOG #5099; the
+        SQLite twin says why)."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND ma.inherited = 0"
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                     "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                    "WHERE ma.message_id=? ORDER BY a.id",
+                    f"WHERE ma.message_id=?{own_only} ORDER BY a.id",
                     (message_id,),
                 )
                 cols = [c[0] for c in cur.description]

@@ -8244,7 +8244,9 @@ class RegistryRunner:
             # before any document is stored (vault BACKLOG #2809). Only one thread touches `message`
             # at a time: each hop is awaited.
             message = await asyncio.to_thread(Message.parse, text)
-            documents = iter_obx_documents(message)
+            # The received text rides along so a body holding the handle marker anywhere is refused
+            # here, before the ACK, rather than dead-lettered after the splice (BACKLOG #5099).
+            documents = iter_obx_documents(message, received=text)
 
             def _next_document() -> tuple[int, str, str] | None:
                 return next(documents, None)
@@ -9077,7 +9079,10 @@ class RegistryRunner:
             return payload  # no detached document → byte-identical, no store read (the common path)
         # A store fault here re-pends the row like the attachment read below (vault BACKLOG #2756).
         held = await _read_from_store(
-            "attachment read", lambda: self.store.attachments_for(message_id)
+            # A child's inherited links count here, and only here: they let it deliver what its
+            # body carries, and grant no download.
+            "attachment read",
+            lambda: self.store.attachments_for(message_id, include_inherited=True),
         )
         bound = {str(row["attachment_id"]) for row in held}
 

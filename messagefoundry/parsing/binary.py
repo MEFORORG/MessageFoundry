@@ -339,8 +339,8 @@ def may_hold_doc_ref(text: str) -> bool:
     wire unresolved. ``Message.set`` escapes by the first MSH's delimiters, so for a payload led by
     an FHS or BHS batch header the first MSH is checked as well as the header. A handle hidden by
     any other escape cannot be the engine's, which escapes only the delimiters, so it is the
-    sender's text and resolves nothing unless the gate opens for another handle, where the
-    re-attach parses and checks it. False otherwise."""
+    sender's text and resolves nothing unless the gate opens for another reason, where the
+    re-attach parses it and resolves it only to an attachment the message holds. False otherwise."""
     if DOC_REF_MARKER in text:
         return True
     lead = _whitespace_end(text, 0, len(text))
@@ -447,7 +447,9 @@ def _is_base64_ed(message: Message, occurrence: int) -> bool:
     return encoding.strip().lower() == _ED_ENCODING.lower()
 
 
-def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tuple[int, str, str]]:
+def iter_obx_documents(
+    message: Message, *, min_b64_len: int = 0, received: str | None = None
+) -> Iterator[tuple[int, str, str]]:
     """Yield ``(occurrence, verbatim_base64, content_type)`` for every OBX-5 ED **Base64** document in
     ``message`` whose base64 length is at least ``min_b64_len`` (#149, ADR 0105 Phase 1a).
 
@@ -463,7 +465,15 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
     :class:`InboundDocRefError` when any ``OBX-5.5``, ED or not, already holds a live handle: only
     this detach writes one, so a received one is the sender's (BACKLOG #5099). Every OBX is checked
     before the first document is yielded, so a caller that stores each one as it goes has stored
-    none of them when the refusal comes."""
+    none of them when the refusal comes.
+
+    It raises :class:`InboundDocRefError` too when a document would be detached and the body holds
+    the handle marker anywhere else: in a document's value past its start, or, where ``received``
+    is the text ``message`` was parsed from, anywhere in that text, raw or as the message's
+    delimiters escape it. Delivery refuses a marker left after the splice
+    (:func:`reattach_documents_in_hl7`), so such a body would be ACKed and then dead-letter on
+    every outbound. No base64 value holds the marker, since base64 has no ``:``, so the refusal
+    turns away no document a conformant sender sends."""
     occurrences: list[int] = []
     for occ in range(1, message.count_segments("OBX") + 1):
         # Every OBX, as the delivery re-attach resolves a handle in any OBX-5.5 first repetition.
@@ -481,14 +491,41 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
                 "sequence, which base64 never needs; refusing to detach a value that is not the "
                 "sender's verbatim bytes"
             )
+    documents: list[tuple[int, str]] = []
     for occ in occurrences:
         data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
         if not data_b64 or is_document_tombstone(data_b64):
             continue  # empty / already-stripped: a tombstone resolves nothing, so it rides as text
         if len(data_b64) < min_b64_len:
             continue
+        documents.append((occ, data_b64))
+    if documents and _detach_would_leave_a_marker(message, documents, received):
+        raise InboundDocRefError(
+            "the body holds the document handle marker outside an OBX-5.5 start, and a document "
+            "would be detached from it; refusing a body delivery would refuse after the ACK"
+        )
+    for occ, data_b64 in documents:
         ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
         yield occ, data_b64, ed_type
+
+
+def _detach_would_leave_a_marker(
+    message: Message, documents: list[tuple[int, str]], received: str | None
+) -> bool:
+    """Whether the handle marker sits where a detach would leave it for delivery's after-the-splice
+    guard to find (BACKLOG #5099): inside a document's value, which the splice puts back verbatim,
+    or anywhere in ``received``, raw or escaped by the message's delimiters."""
+    if any(DOC_REF_MARKER in value for _occ, value in documents):
+        return True
+    if received is None:
+        return False
+    if DOC_REF_MARKER in received:
+        return True
+    try:
+        escaped = message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
+    except ValueError:
+        return False  # no separators to escape by, so no escaped form to look for
+    return escaped in received
 
 
 def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:
@@ -683,9 +720,9 @@ async def reattach_documents_in_hl7(
     ``bound`` is the content addresses the payload's own message holds, which the caller reads from
     the store's ``message_attachment`` linkage (BACKLOG #5099). A handle naming any other address is
     refused before ``reader`` runs, so a value the sender wrote cannot name another message's
-    document. The handle marker, as this payload's delimiters escape it, anywhere the splice does not
-    reach is refused too where ``bound`` is not empty or the copy names a content address, so a
-    handle a Handler copied elsewhere is never emitted."""
+    document. The handle marker, raw or as this payload's delimiters escape it, anywhere the
+    splice does not reach is refused too where ``bound`` is not empty or the copy names a content
+    address, so a handle a Handler copied elsewhere is never emitted."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -701,7 +738,7 @@ async def reattach_documents_in_hl7(
     # at a 64 MiB document and stayed about 0.1 s at 15 MiB: the splice's escape pass over the whole
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
-    def _handles() -> tuple[Message, list[tuple[int, str]], str] | None:
+    def _handles() -> tuple[Message, list[tuple[int, str]], tuple[str, ...]] | None:
         refused: str | None = None
         try:
             message = Message.parse(text)
@@ -740,20 +777,28 @@ async def reattach_documents_in_hl7(
                     raise UnreattachableDocumentError(refused)
         # The marker as Message.set writes it under this payload's delimiters: a handle the engine
         # wrote, or a Handler copied, carries exactly this text wherever it sits.
+        # The raw marker is checked as well: a whole-field set, a Handler's NTE-3 copy for one,
+        # leaves the component separator unescaped, so under delimiters that escape the marker the
+        # copy keeps it raw.
         marker = Message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
-        if not found and marker in text and (bound or _copy_names_address(text, marker)):
+        markers = (marker, DOC_REF_MARKER) if marker != DOC_REF_MARKER else (marker,)
+        if (
+            not found
+            and any(m in text for m in markers)
+            and (bound or any(_copy_names_address(text, m) for m in markers))
+        ):
             # No handle to splice, so the text is what would be sent: a marker in it is a copy.
             # Refused where the message holds a document, and also where the copy names a content
             # address: a child that inherited none, because its only handle sits outside OBX-5.5,
             # would otherwise send the engine's handle with no document. A bare marker in a
             # message that holds nothing names no document, so it is carried as text.
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
-        return message, found, marker
+        return message, found, markers
 
     scanned = await asyncio.to_thread(_handles)
     if scanned is None:
         return text
-    message, handles, marker = scanned
+    message, handles, markers = scanned
     for occ, sha256 in handles:
         if sha256 not in bound:
             raise UnreattachableDocumentError(
@@ -792,10 +837,11 @@ async def reattach_documents_in_hl7(
     def _encode() -> str:
         spliced = message.encode()
         # Every handle has now been replaced by base64, which holds no ':' and no escape
-        # character, so any marker left is a copy the splice did not reach (BACKLOG #5099). Read
+        # character, so any marker left, raw or escaped, is a copy the splice did not reach, or a
+        # sender's text the ingress detach refused to store (BACKLOG #5099). Read
         # from the spliced text, not counted beforehand: a handle the parser reads through a hex
         # escape is not the marker in the raw text, so a count could be offset by one copy.
-        if marker in spliced:
+        if any(m in spliced for m in markers):
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return spliced
 

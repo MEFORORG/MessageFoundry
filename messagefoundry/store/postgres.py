@@ -628,11 +628,17 @@ _SCHEMA: list[str] = [
         ciphertext    TEXT NOT NULL,
         PRIMARY KEY (attachment_id, seq)
     )""",
+    # `inherited` marks a link a child message took from its parent (BACKLOG #5099): it serves
+    # delivery and retention, and grants no download (attachments_for).
     """CREATE TABLE IF NOT EXISTS message_attachment (
         message_id    TEXT NOT NULL,
         attachment_id TEXT NOT NULL,
+        inherited     BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (message_id, attachment_id)
     )""",
+    # A pre-existing linkage table holds only ingress detaches' own links, so FALSE backfills it.
+    "ALTER TABLE message_attachment ADD COLUMN IF NOT EXISTS inherited BOOLEAN NOT NULL"
+    " DEFAULT FALSE",
     # ix_queue_lease (the reclaim sweep's index) is created in _migrate_lease_columns, AFTER the lease
     # columns are guaranteed present — on a Step-1 table the index references a not-yet-added column.
     """CREATE TABLE IF NOT EXISTS message_events (
@@ -4219,7 +4225,9 @@ class PostgresStore:
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
-        refs = list(dict.fromkeys(attachment_refs or ()))
+        # Sorted, so the increfs below take the attachment header locks in content-address order,
+        # the order a child's inheritance takes them in (BACKLOG #5099, _inherit_attachments).
+        refs = sorted(set(attachment_refs or ()))
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             await self._insert_message(
                 conn,
@@ -6964,19 +6972,24 @@ class PostgresStore:
                 r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
             )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b, Postgres parity). JOINs ``message_attachment`` to its ``attachment`` header and returns
         one row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``,
         and ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted. Returns
-        ``[]`` for a message with no detached document."""
+        ``[]`` for a message with no detached document. An inherited link is left out unless
+        ``include_inherited`` is set, so it grants no download (BACKLOG #5099; the SQLite twin says
+        why)."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND NOT ma.inherited"
         async with self._timed_acquire() as conn:
             rows = await conn.fetch(
                 "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                 "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                "WHERE ma.message_id=$1 ORDER BY a.id",
+                f"WHERE ma.message_id=$1{own_only} ORDER BY a.id",
                 message_id,
             )
         return [dict(r) for r in rows]
@@ -7101,8 +7114,13 @@ class PostgresStore:
         """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
         in the CALLER's transaction (BACKLOG #5099). Postgres twin of
         :meth:`MessageStore._inherit_attachments`, which says why."""
+        # ORDER BY: each incref below takes the attachment header's row lock until commit, so two
+        # transactions that incref the same documents must take them in one order, or each can wait
+        # on the other. The ingress incref takes them in this order too.
         rows = await conn.fetch(
-            "SELECT attachment_id FROM message_attachment WHERE message_id=$1", parent_id
+            "SELECT attachment_id FROM message_attachment WHERE message_id=$1"
+            " ORDER BY attachment_id",
+            parent_id,
         )
         for ref in attachments_named([str(r["attachment_id"]) for r in rows], body):
             # The incref first, and the link only where it found the header (the SQLite twin
@@ -7113,7 +7131,8 @@ class PostgresStore:
             if _rowcount(status) != 1:
                 continue
             await conn.execute(
-                "INSERT INTO message_attachment (message_id, attachment_id) VALUES ($1,$2)",
+                "INSERT INTO message_attachment (message_id, attachment_id, inherited)"
+                " VALUES ($1,$2,TRUE)",
                 child_id,
                 ref,
             )

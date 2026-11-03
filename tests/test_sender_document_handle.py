@@ -413,7 +413,9 @@ async def test_a_passthrough_child_delivers_the_document_its_parent_detached(
     await _deliver_queued(store, runner, child)
 
     assert [Message.parse(d).field("OBX-5.5") for d in col.deliveries] == [doc]
-    assert [r["attachment_id"] for r in await store.attachments_for(child)] == [ref]
+    assert [
+        r["attachment_id"] for r in await store.attachments_for(child, include_inherited=True)
+    ] == [ref]
 
 
 async def test_a_child_holds_its_own_reference_so_either_purge_keeps_the_count(
@@ -425,7 +427,9 @@ async def test_a_child_holds_its_own_reference_so_either_purge_keeps_the_count(
 
     await store.release_message_attachments(parent)
     assert await _refcount(store, ref) == 1  # the child still holds the document
-    assert [r["attachment_id"] for r in await store.attachments_for(child)] == [ref]
+    assert [
+        r["attachment_id"] for r in await store.attachments_for(child, include_inherited=True)
+    ] == [ref]
 
     await store.release_message_attachments(child)
     assert await _refcount(store, ref) is None  # the last holder gone, the document is collected
@@ -437,7 +441,7 @@ async def test_a_passthrough_child_holds_only_the_documents_its_body_names(
     parent, _ref, _skeleton = await _detached_parent(store, _b64(1500))
     # The Handler dropped the document: the child's body names none, so the child holds none.
     child = await _passthrough_child(store, parent, _hl7("plain text"))
-    assert list(await store.attachments_for(child)) == []
+    assert list(await store.attachments_for(child, include_inherited=True)) == []
 
 
 async def test_an_edit_and_resubmit_child_holds_only_the_document_its_obx_names(
@@ -460,9 +464,10 @@ async def test_an_edit_and_resubmit_child_holds_only_the_document_its_obx_names(
     )
 
     assert outcome.status == "resubmitted"
-    assert [r["attachment_id"] for r in await store.attachments_for(outcome.new_message_id)] == [
-        ref
-    ]
+    assert [
+        r["attachment_id"]
+        for r in await store.attachments_for(outcome.new_message_id, include_inherited=True)
+    ] == [ref]
     assert await _refcount(store, other) == 1  # the origin's reference alone
 
 
@@ -478,7 +483,7 @@ async def test_a_child_holds_no_document_its_body_names_outside_obx_5_5(
 
     child = await _passthrough_child(store, parent, body)
 
-    assert list(await store.attachments_for(child)) == []
+    assert list(await store.attachments_for(child, include_inherited=True)) == []
     assert await _refcount(store, ref) == 1
 
 
@@ -675,3 +680,148 @@ def test_a_handle_the_delivery_gate_passes_over_is_not_inherited() -> None:
     assert not may_hold_doc_ref(body)
 
     assert attachments_named([ref], body) == []
+
+
+# --- repair round 4: download scope, the raw-marker copy, and a marker in a received document --
+
+
+async def test_an_inherited_link_grants_no_download_through_the_child(tmp_path: Path) -> None:
+    """A user scoped only to the pass-through channel must not read, through the child, a document
+    the parent's channel stored: the inherited link serves delivery only. The parent's channel
+    still downloads it, and the child still delivers it."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.auth import Role
+    from messagefoundry.pipeline import Engine
+    from tests.test_attachment_download_api import _add, _login, _service
+
+    engine = await Engine.create(
+        tmp_path / "scope.db", poll_interval=0.02, egress_settings=EgressSettings()
+    )
+    try:
+        store = engine.store
+        assert isinstance(store, MessageStore)
+        raw_doc = b"%PDF-1.4\nsynthetic inherited document, not real PHI\n%%EOF\n"
+        doc = base64.b64encode(raw_doc).decode("ascii")
+        parent, ref, skeleton = await _detached_parent(store, doc)
+        child = await _passthrough_child(store, parent, skeleton)
+        service = await _service(engine)
+        await service.set_channel_scope(
+            await _add(service, "child_op", Role.OPERATOR), ["PT_NEXT"], actor="admin"
+        )
+        await service.set_channel_scope(
+            await _add(service, "parent_op", Role.OPERATOR), ["IB_STREAM"], actor="admin"
+        )
+        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            child_op = await _login(c, "child_op")
+            parent_op = await _login(c, "parent_op")
+            via_child = await c.get(f"/messages/{child}/attachments/{ref}", headers=child_op)
+            detail = await c.get(f"/messages/{child}", headers=child_op)
+            via_parent = await c.get(f"/messages/{parent}/attachments/{ref}", headers=parent_op)
+
+        assert via_child.status_code == 404
+        assert detail.status_code == 200 and detail.json()["attachments"] == []
+        assert via_parent.status_code == 200 and via_parent.content == raw_doc
+        # The link is still there for delivery and retention.
+        assert [r["attachment_id"] for r in await store.attachments_for(child)] == []
+        assert [
+            r["attachment_id"] for r in await store.attachments_for(child, include_inherited=True)
+        ] == [ref]
+        runner = _runner(store)
+        col = _Collector()
+        runner._destinations[DEST] = col  # type: ignore[assignment]
+        await _deliver_queued(store, runner, child)
+        assert [Message.parse(d).field("OBX-5.5") for d in col.deliveries] == [doc]
+    finally:
+        await engine.stop()
+
+
+def _colon_delimited_with_copy(handle: str, *, in_obx: bool) -> str:
+    """A payload in MSH-2 ``:~\\&``, whose component separator is a character of the marker, with
+    a whole-field ``set`` copy of ``handle`` in ``NTE-3``. A whole-field set leaves the component
+    separator unescaped, so the copy keeps the marker raw while ``OBX-5.5`` holds it escaped."""
+    msg = Message.parse(_hl7(_b64(10), msh2=":~\\&"))
+    if in_obx:
+        msg.set("OBX-5.5", handle)
+    else:
+        msg.set("OBX-5.5", "plain text")
+    msg.add_segment("NTE|1")
+    msg.set("NTE-3", handle)
+    return msg.encode()
+
+
+@pytest.mark.parametrize("in_obx", [True, False], ids=["after-the-splice", "no-handle-to-splice"])
+async def test_a_raw_copy_under_delimiters_that_escape_the_marker_is_refused(
+    store: MessageStore, in_obx: bool
+) -> None:
+    doc = _b64(1200)
+    ref = await store.put_attachment(chunk_b64(doc), "application/pdf")
+    handle = make_doc_ref(ref, "Application")
+    payload = _colon_delimited_with_copy(handle, in_obx=in_obx)
+    assert DOC_REF_MARKER in payload  # the copy is raw, not escaped
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    rows = await _deliver_holding(store, runner, payload, ref)
+
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(rows)
+
+
+def _with_marker_mid_document(doc: str) -> str:
+    """A streaming body whose one ED Base64 value carries the handle marker past its start. Not
+    base64, since base64 has no ':', but nothing at ingress validated the value before."""
+    half = len(doc) // 2
+    return _hl7(doc[:half] + DOC_REF_MARKER + doc[half:])
+
+
+def _with_marker_in_nte(doc: str) -> str:
+    return _hl7(doc) + f"NTE|1||see {DOC_REF_MARKER}x\r"
+
+
+@pytest.mark.parametrize(
+    "shape", [_with_marker_mid_document, _with_marker_in_nte], ids=["mid-document", "in-nte"]
+)
+async def test_a_streaming_body_holding_the_marker_is_refused_before_the_ack(
+    store: MessageStore, shape
+) -> None:
+    """Detached and ACKed AA, such a body would dead-letter on every outbound after the splice,
+    where the guard refuses any marker left. It is refused at the detach instead, counted as an
+    ERROR row, with an AR on MLLP and a permanent refusal on HTTP."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    body = shape(_b64(2000))
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert receipt.refusal is RefusalKind.PERMANENT
+    cur = await store._db.execute(
+        "SELECT status, error FROM messages WHERE channel_id=?", (ic.name,)
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all("handle marker" in str(r["error"]) for r in rows)
+    cur = await store._db.execute("SELECT COUNT(*) FROM attachment")
+    count = await cur.fetchone()
+    assert count is not None and int(count[0]) == 0  # nothing stored for a refused body
+
+
+def test_the_detach_refuses_a_marker_its_delimiters_escape_in_the_received_text() -> None:
+    msg = Message.parse(_hl7(_b64(10), msh2=":~\\&"))
+    msg.add_segment("NTE|1")
+    msg.set("NTE-3.1", DOC_REF_MARKER + "x")  # a component set escapes the separator
+    received = msg.encode()
+    assert DOC_REF_MARKER not in received
+    parsed = Message.parse(received)
+    with pytest.raises(InboundDocRefError):
+        list(iter_obx_documents(parsed, received=received))
+    # The control: without the copy the same body yields its one document.
+    plain = _hl7(_b64(10), msh2=":~\\&")
+    assert len(list(iter_obx_documents(Message.parse(plain), received=plain))) == 1

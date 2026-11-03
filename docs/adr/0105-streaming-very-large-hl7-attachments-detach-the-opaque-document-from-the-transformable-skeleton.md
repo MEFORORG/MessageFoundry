@@ -274,30 +274,42 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   header, or on a backend without the substrate, is linked to no message, so its handle is refused
   permanently by the binding below.
 - **A handle resolves only to its own message's attachment (BACKLOG #5099, added 2026-11-03).** The
-  delivery seam reads the content addresses the row's message holds (`attachments_for`, the
-  `message_attachment` linkage the ingress commit writes; replay and an unedited resend keep the
-  message id) and
-  passes them to the re-attach as `bound`. A handle in an `OBX-5.5` that is malformed or names any
-  other address raises `UnreattachableDocumentError` before any read. A copy of the handle marker,
-  as the payload's delimiters escape it, where the splice does not reach (`NTE-3`, a second
-  `OBX-5.5` repetition) raises it too, where the message holds a document or the copy names a
-  content address, after the splice where the message also carries a bound handle. Either way the row dead-letters alone rather than re-pending on a strict-FIFO lane. A
-  handle the payload hides behind any other escape never opens the gate, so it is carried as the
-  sender's text and resolves nothing. The ingress detach refuses a received body whose `OBX-5.5`
-  already holds a handle (`InboundDocRefError`, an `ERROR` row and an `AR` before the ACK) instead
-  of skipping it as already detached. A pass-through child, an edit-and-resubmit child and an
-  edit-and-resend child each carry a body under a new message id, so the store links each child
-  to the parent's documents a handle in its `OBX-5.5` names, read as delivery reads one (behind
-  its gate), with one reference of its own, in the commit that makes it (`_inherit_attachments`). An address the body
-  carries anywhere else, bare or as a copied handle, is not linked. A document whose header a purge
-  collected first is not linked either, so `refcount` still equals the live linkage rows. Purging
-  either message then releases only its own reference. A handle naming a document the parent does
-  not hold is not linked, and is refused at delivery.
-  A pass-through inbound is a channel of its own, so a user scoped to it can download, through the
-  child, a document the parent's channel detached: the child carries that document and delivers
-  it, so its channel is granted it as the parent's is. An operator upload and a loopback reply are
-  new bodies, not a parent's, and inherit nothing. A
-  `mfdoc:v1:pruned:` tombstone resolves nothing and is carried as text.
+  delivery seam reads the content addresses the row's message holds (`attachments_for` with
+  `include_inherited`, the `message_attachment` linkage; replay and an unedited resend keep the
+  message id) and passes them to the re-attach as `bound`. A handle in an `OBX-5.5` that is
+  malformed or names any other address raises `UnreattachableDocumentError` before any read. A
+  copy of the handle marker, raw or as the payload's delimiters escape it, where the splice does
+  not reach (`NTE-3`, a second `OBX-5.5` repetition) raises it too: before the splice where the
+  message holds a document or the copy names a content address, and after the splice wherever the
+  message also carries a bound handle. Either way the row dead-letters alone rather than
+  re-pending on a strict-FIFO lane. A handle the payload hides behind any other escape does not
+  open the gate by itself, so on its own it is carried as the sender's text and resolves nothing.
+  Where the gate opens for another reason, the re-attach reads it as it reads any handle, so it
+  still resolves only to an attachment the message holds.
+  The ingress detach refuses a received body whose `OBX-5.5` already holds a handle instead of
+  skipping it as already detached. Where a document would be detached, it also refuses a body
+  holding the marker anywhere else, raw or escaped, a document's value past its start included:
+  delivery would refuse that marker after the splice, so the body would be ACKed and then
+  dead-letter on every outbound. No base64 value holds the marker, since base64 has no `:`. Each
+  refusal is an `InboundDocRefError`: an `ERROR` row, an `AR` on MLLP and a permanent refusal on
+  HTTP, before the ACK.
+  A pass-through child, an edit-and-resubmit child and an edit-and-resend child each carry a body
+  under a new message id, so the store links each child to the parent's documents a handle in its
+  `OBX-5.5` names, read as delivery reads one (behind its gate), with one reference of its own, in
+  the commit that makes it (`_inherit_attachments`). An address the body carries anywhere else,
+  bare or as a copied handle, is not linked. A document whose header a purge collected first is
+  not linked either, so `refcount` still equals the live linkage rows. Purging either message then
+  releases only its own reference. A handle naming a document the parent does not hold is not
+  linked, and is refused at delivery. On Postgres and SQL Server the increfs run in
+  content-address order, as the ingress increfs now do, so an inheritance and an ingress take the
+  documents' header locks in one order.
+  **An inherited link grants no download.** It is written with `inherited` set, and
+  `attachments_for` leaves it out unless the caller asks for it, which only delivery does. So the
+  download route and the message detail's attachment list read through the child exactly as
+  before the child held the link: a user scoped only to the pass-through inbound's channel reads
+  nothing the parent's channel stored, while a user scoped to the parent's channel still downloads
+  it through the parent. An operator upload and a loopback reply are new bodies, not a parent's,
+  and inherit nothing. A `mfdoc:v1:pruned:` tombstone resolves nothing and is carried as text.
 - **Delivery is a pure READ — never a decref.** A message fans out to multiple outbounds and is
   replayable, so each send **reads** the immutable, content-addressed attachment per-send and leaves the
   refcount untouched; the refcount is released **only** at retention/purge (below). This makes retry
