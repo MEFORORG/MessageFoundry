@@ -27,6 +27,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from _bash_resolver import probe_env, require_bash
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -149,25 +150,43 @@ def test_the_database_legs_do_not_file_every_crash_under_1459(bash: Path) -> Non
 # ---------------------------------------------------------------------------------------------
 
 
+#: The main suite runs in two shards, one per job, and each shard's step carries both arms below
+#: (BACKLOG #5247).
+_MAIN_SUITE_JOBS = ("test", "test-shard2")
+
+
+def _main_suite_steps() -> list[tuple[str, dict[str, object]]]:
+    jobs = yaml.safe_load(_CI.read_text(encoding="utf-8"))["jobs"]
+    found = [
+        (job, step)
+        for job in _MAIN_SUITE_JOBS
+        for step in jobs[job]["steps"]
+        if step.get("name") == "Tests (pytest)"
+    ]
+    assert len(found) == len(_MAIN_SUITE_JOBS), (
+        f"expected one Tests (pytest) step in each of {_MAIN_SUITE_JOBS}, found "
+        f"{[job for job, _ in found]} -- re-derive this from the workflow"
+    )
+    return found
+
+
 def test_the_main_suite_step_is_wrapped() -> None:
     """THE FILED GAP. Every retry-native-crash invocation sat in the database legs; the main suite's
     run line was a bare pytest, so the one leg most people read could not tell a crash from a
     failure."""
-    text = _CI.read_text(encoding="utf-8")
-    step = text.split("- name: Tests (pytest)", 1)
-    assert len(step) == 2, "the Tests (pytest) step is gone -- re-derive this from the workflow"
-    body = step[1].split("- name:", 1)[0]
-    assert "retry-native-crash.sh" in body, (
-        "the main suite's run line is unwrapped again; a native crash there reports as a test failure"
-    )
+    for job, step in _main_suite_steps():
+        assert "retry-native-crash.sh" in str(step.get("run", "")), (
+            f"the main suite's run line in {job!r} is unwrapped again; a native crash there "
+            "reports as a test failure"
+        )
 
 
 def test_the_main_suite_step_declares_its_cause_unproven() -> None:
     """The coverage arm alone would let the pyodbc clause reach a leg where it is not established --
     which would fix the legibility defect by introducing an attribution one."""
-    text = _CI.read_text(encoding="utf-8")
-    body = text.split("- name: Tests (pytest)", 1)[1].split("- name:", 1)[0]
-    assert 'RETRY_NATIVE_CRASH_CAUSE: ""' in body
+    for job, step in _main_suite_steps():
+        env = step.get("env") or {}
+        assert isinstance(env, dict) and env.get("RETRY_NATIVE_CRASH_CAUSE") == "", (job, env)
 
 
 def test_the_wrappers_own_grep_hint_matches_what_it_prints() -> None:

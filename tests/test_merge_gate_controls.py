@@ -40,6 +40,7 @@ the two read as one.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shlex
@@ -112,7 +113,9 @@ def _text(proc: subprocess.CompletedProcess[bytes]) -> str:
 # ===================================================================================================
 # `CI gate` -- the roll-up that is the ONLY way six path-gated legs reach branch protection.
 # ===================================================================================================
+@functools.cache
 def _ci_gate_job() -> dict[str, Any]:
+    """Parsed once per process; ci.yml does not change under a run, and no reader here mutates it."""
     return jobs_of("ci.yml")["ci-gate"]
 
 
@@ -148,7 +151,17 @@ def _rollup_fail_conditions() -> list[tuple[str, str]]:
     return found
 
 
-def _evaluate(condition: str, results: list[str]) -> bool:
+#: The context a condition naming ONE need, the `changes` output or the event is evaluated in, unless a
+#: test passes its own. The default is an ordinary code pull request whose engine shard 2 passed, so
+#: the BACKLOG #5247 step stays quiet and the vector tests below grade the two arms alone.
+_DEFAULT_CONTEXT: dict[str, str] = {
+    "code": "true",
+    "event": "pull_request",
+    "need_test_shard2": "success",
+}
+
+
+def _evaluate(condition: str, results: list[str], context: dict[str, str] | None = None) -> bool:
     """Evaluate one step's `if` against a synthetic results vector.
 
     EVALUATED, NOT PATTERN-MATCHED, AND THE DIFFERENCE IS LOAD-BEARING. The previous reader pulled
@@ -161,23 +174,39 @@ def _evaluate(condition: str, results: list[str]) -> bool:
     The translated subset is deliberately tiny. Anything outside it raises rather than being
     silently mis-evaluated, because a condition this reader cannot parse is a condition it must not
     grade.
+
+    BACKLOG #5247 widened it by four forms, each translated to a name `context` must supply: one
+    need's result (`needs['test-shard2'].result` -> `need_test_shard2`), the `changes` job's `code`
+    output, the event name, and `==` / `!=` between those and a quoted literal. A name `context` does
+    not supply raises rather than defaulting.
     """
     expr = re.sub(
         r"contains\(\s*needs\.\*\.result\s*,\s*'([a-z]+)'\s*\)",
         lambda m: repr(m.group(1)) + " in results",
         condition,
     )
-    expr = expr.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+    expr = re.sub(
+        r"needs\['([a-z0-9-]+)'\]\.result",
+        lambda m: "need_" + m.group(1).replace("-", "_"),
+        expr,
+    )
+    expr = expr.replace("needs.changes.outputs.code", "code").replace("github.event_name", "event")
+    expr = expr.replace("&&", " and ").replace("||", " or ")
+    expr = re.sub(r"!(?!=)", " not ", expr)
     # Whitelist BEFORE evaluating. The input is this repository's own workflow, so this is not a
     # trust boundary -- it is a guard against grading an expression that grew syntax this function
     # does not model.
-    if not re.fullmatch(r"[\s()'a-z_]+", expr):
+    if not re.fullmatch(r"[\s()'a-z0-9_=!]+", expr):
         raise AssertionError(
             f"the roll-up condition uses syntax this reader does not model: {condition!r}. Teach "
             "_evaluate the new form rather than loosening this check -- an unmodelled operator "
             "silently changes what the gate is graded against."
         )
-    return bool(eval(expr, {"__builtins__": {}}, {"results": results}))  # noqa: S307
+    names = dict(_DEFAULT_CONTEXT if context is None else context)
+    try:
+        return bool(eval(expr, {"__builtins__": {}}, {"results": results, **names}))  # noqa: S307
+    except NameError as exc:
+        raise AssertionError(f"{condition!r} names something its context does not: {exc}") from exc
 
 
 def _rollup_fires(condition: str, results: list[str]) -> bool:
@@ -310,6 +339,54 @@ def test_the_rollup_steps_partition_and_each_one_exits_nonzero() -> None:
         "wins when both are present must be the same one that reports a plain failure, or a real "
         "break gets announced in the words of a supersede and read as expected noise."
     )
+
+
+def _shard2_step() -> str:
+    """The `ci-gate` step for engine shard 2's own result (BACKLOG #5247), found by what it reads."""
+    found = [cond for _, cond in _rollup_fail_conditions() if "needs['test-shard2'].result" in cond]
+    assert len(found) == 1, f"expected one ci-gate step reading test-shard2's result, found {found}"
+    return found[0]
+
+
+_SUITE_EVENTS = ("push", "workflow_dispatch", "merge_group")
+
+
+@pytest.mark.parametrize("result", ["skipped", "success", "failure", "cancelled"])
+@pytest.mark.parametrize(
+    ("code", "event"),
+    [("true", "pull_request"), ("false", "pull_request"), ("false", "schedule")]
+    + [("false", event) for event in _SUITE_EVENTS],
+)
+def test_the_shard2_step_fires_on_a_skip_only_where_the_engine_suite_runs(
+    code: str, event: str, result: str
+) -> None:
+    """A skipped need is a pass to the two arms above, and that is right for a path-gated leg and
+    wrong for half the engine suite. This step closes that, and only that: a FAILED or CANCELLED
+    shard is the arms' to name, and a docs-only pull request or a cron run, where `test` skips its
+    suite too, must stay green.
+
+    Falsified by dropping the event bracket (a docs-only PR goes red) and by dropping either leading
+    guard (a failed or cancelled shard fires two steps): RED each time. Restored.
+    """
+    condition = _shard2_step()
+    context = dict(_DEFAULT_CONTEXT, code=code, event=event, need_test_shard2=result)
+    vector = ["success", "skipped", result]
+    suite_runs = code == "true" or event in _SUITE_EVENTS
+    assert _evaluate(condition, vector, context) is (suite_runs and result == "skipped")
+    fired = [name for name, cond in _rollup_fail_conditions() if _evaluate(cond, vector, context)]
+    expected = (
+        1 if result in ("failure", "cancelled") or (result == "skipped" and suite_runs) else 0
+    )
+    assert len(fired) == expected, fired
+
+
+def test_the_shard2_step_reads_the_condition_the_shard2_job_runs_on() -> None:
+    """The bracket in the step and the job's own `if:` are one condition written twice. If they
+    drift, the step either reds a run where the job rightly skipped or stays quiet where it wrongly
+    did. Falsified by dropping `merge_group` from the job's `if:`: RED. Restored."""
+    job_if = str(jobs_of("ci.yml")["test-shard2"]["if"])
+    flat = " ".join(_shard2_step().split())
+    assert f"({job_if}) &&" in flat, (job_if, flat)
 
 
 def test_the_ci_gate_rollup_still_covers_every_leg_it_is_required_for() -> None:

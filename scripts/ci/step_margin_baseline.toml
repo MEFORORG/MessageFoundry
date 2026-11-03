@@ -20,6 +20,15 @@
 # the observed distribution the cap was sized against, kept separately so a run exceeding the record is
 # visible without anyone re-reading a comment.
 #
+# THE ENGINE ROWS NOW SERVE TWO STEPS, AND EVERY ONE OF THEM WAS MEASURED ON THE WHOLE SUITE. Since
+# BACKLOG #5247 the engine suite runs in two shards, the `test` job's `Tests (pytest)` step and the
+# `test-shard2` job's step of the same name, and both margin checks read the `Tests (pytest)` rows
+# below. Those pools hold whole-suite runs, so each row is an upper bound on a shard and not a
+# measurement of one: no shard pool exists yet. Read the consequence before trusting a quiet run. A
+# shard does about half the work, so a shard run is not expected to reach a whole-suite record, and
+# the RE-DERIVE and RE-SIZE escalations are expected to stay silent on both shards until a re-measure
+# from shard pools replaces these rows. The gate itself is unaffected: it divides by the cap, never by a row.
+#
 # THE TWO LEGS NAME DIFFERENT KINDS OF NUMBER, AND THAT ASYMMETRY IS THE POINT OF THIS PARAGRAPH.
 # On the web console leg the gate's cap and the step's `timeout-minutes` were SPLIT: the kill is
 # `matrix.webconsole_step_timeout` and the gate divides by `matrix.webconsole_margin_cap`, which sits

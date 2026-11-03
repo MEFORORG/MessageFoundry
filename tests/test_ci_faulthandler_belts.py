@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The hang-diagnostic belts on CI's two pytest steps, pinned so a silent removal goes red.
+"""The hang-diagnostic belts on CI's pytest steps, pinned so a silent removal goes red.
 
 BACKLOG #1304. The ``repo harness tests (windows-2025)`` leg intermittently hangs on a ``pwsh``
 launch. The engine ``Tests (pytest)`` step already carried two watchdogs against a hung Windows
@@ -50,6 +50,11 @@ _PYPROJECT = _ROOT / "pyproject.toml"
 _ENGINE_STEP = "Tests (pytest)"
 _TOOLING_STEP = "Harness tests (pytest)"
 
+#: Every pytest step these belts must ride, as (job id, step name). The engine suite runs in two
+#: shards, one per job (BACKLOG #5247), and both carry the same step name, so the job is part of the
+#: address.
+_BELTED = [("test", _ENGINE_STEP), ("test-shard2", _ENGINE_STEP), ("tooling", _TOOLING_STEP)]
+
 
 def _logical_lines(run: str) -> list[str]:
     """The whole ``run:`` block with backslash-continuations joined, so one command is one string."""
@@ -73,29 +78,29 @@ def _is_pytest_command(line: str) -> list[str] | None:
     return argv
 
 
-def _step(step_name: str) -> tuple[str, dict[str, object]]:
-    """The single step with this name, as ``(job id, step)``. Zero or many fails loudly.
+def _step(job: str, step_name: str) -> tuple[str, dict[str, object]]:
+    """The single step with this name in this job, as ``(job id, step)``. Zero or many fails loudly.
 
     A guard that finds nothing and passes is the defect, one rename away.
     """
     workflow = yaml.safe_load(_CI.read_text(encoding="utf-8"))
     found = [
         (job_id, step)
-        for job_id, job in workflow["jobs"].items()
-        for step in (job.get("steps") or [])
-        if step.get("name") == step_name
+        for job_id, body in workflow["jobs"].items()
+        for step in (body.get("steps") or [])
+        if job_id == job and step.get("name") == step_name
     ]
     if len(found) != 1:
         pytest.fail(
-            f"expected exactly one step named {step_name!r} in {_CI}; found {len(found)} "
-            f"({[job for job, _ in found]}). Re-point this guard rather than deleting it."
+            f"expected exactly one step named {step_name!r} in job {job!r} of {_CI}; found "
+            f"{len(found)}. Re-point this guard rather than deleting it."
         )
     return found[0]
 
 
-def _invocation(step_name: str) -> tuple[str, list[str]]:
+def _invocation(job: str, step_name: str) -> tuple[str, list[str]]:
     """The step's one pytest argv, as ``(job id, argv)``."""
-    job_id, step = _step(step_name)
+    job_id, step = _step(job, step_name)
     run = str(step.get("run", ""))
     argvs = [argv for line in _logical_lines(run) if (argv := _is_pytest_command(line)) is not None]
     if len(argvs) != 1:
@@ -136,10 +141,10 @@ def test_thread_method_is_repo_wide() -> None:
     )
 
 
-@pytest.mark.parametrize("step_name", [_ENGINE_STEP, _TOOLING_STEP])
-def test_step_exports_pythonfaulthandler(step_name: str) -> None:
+@pytest.mark.parametrize(("job", "step_name"), _BELTED)
+def test_step_exports_pythonfaulthandler(job: str, step_name: str) -> None:
     """Arms the fatal-signal handler from interpreter start, and is inherited by Python children."""
-    job_id, step = _step(step_name)
+    job_id, step = _step(job, step_name)
     env = step.get("env") or {}
     assert isinstance(env, dict)
     assert str(env.get("PYTHONFAULTHANDLER", "")) == "1", (
@@ -148,10 +153,10 @@ def test_step_exports_pythonfaulthandler(step_name: str) -> None:
     )
 
 
-@pytest.mark.parametrize("step_name", [_ENGINE_STEP, _TOOLING_STEP])
-def test_step_arms_faulthandler_timeout(step_name: str) -> None:
+@pytest.mark.parametrize(("job", "step_name"), _BELTED)
+def test_step_arms_faulthandler_timeout(job: str, step_name: str) -> None:
     """The env var alone arms no watchdog -- the per-test dump needs the ini key as well."""
-    job_id, argv = _invocation(step_name)
+    job_id, argv = _invocation(job, step_name)
     value = _ini_override(argv, "faulthandler_timeout")
     assert value, (
         f"the {step_name!r} step in job {job_id!r} must pass `-o faulthandler_timeout=` (BACKLOG "
@@ -167,7 +172,7 @@ def test_tooling_faulthandler_sits_above_its_own_pytest_timeout() -> None:
     The engine step passes both through env from the runtime matrix, so a numeric check here would
     re-implement that matrix and drift from it.
     """
-    job_id, argv = _invocation(_TOOLING_STEP)
+    job_id, argv = _invocation("tooling", _TOOLING_STEP)
     fault = _ini_override(argv, "faulthandler_timeout")
     per_test = _flag_value(argv, "--timeout")
     assert fault is not None and per_test is not None, (

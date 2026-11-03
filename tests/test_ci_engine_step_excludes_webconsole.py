@@ -90,8 +90,8 @@ def _engine_step_invocations() -> list[tuple[str, str]]:
     # ASSERT OVER EVERY MATCHING STEP, NOT THE FIRST. Returning on first match meant a second job
     # whose `Tests (pytest)` step dropped the subtraction was never examined, and a correct step in
     # an earlier job masked a broken one in `test`. Both MEASURED green before this change. ci.yml
-    # today has exactly one step with this name (`test`, `id: tests`) -- MEASURED -- and the loop is
-    # what keeps that a fact rather than an assumption. The bind stays on `name:` alone: `id: tests`
+    # today has two steps with this name, one per engine shard (`test` and `test-shard2`, BACKLOG
+    # #5247, each `id: tests`), and the loop is what holds both to every assertion here. The bind stays on `name:` alone: `id: tests`
     # is unique today too, but an id is scoped to its job, so matching on it invites a second job's
     # `id: tests` to be swept in silently.
     #
