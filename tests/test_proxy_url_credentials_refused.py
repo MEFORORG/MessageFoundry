@@ -784,8 +784,8 @@ def test_a_credential_in_egress_proxy_url_is_refused_at_load(proxy_url: str) -> 
         assert _USER not in text and _PASSWORD not in text, text
 
 
-#: A user or a password beside a shape fault: the parse refuses the shape and the credential read
-#: misses it, so the refusal is made after the parse's handler. The host carries no port of its own.
+#: A user or a password beside a shape fault. The parse refuses the shape, and the early credential
+#: read misses it, so the validator refuses it after the parse's handler. The host has no port.
 _SHAPE_FAULT_HOST = "proxy-marker.invalid"
 _CREDENTIAL_BESIDE_A_SHAPE_FAULT = [
     f"http://{_USER}@{_SHAPE_FAULT_HOST}:99999",
@@ -816,6 +816,24 @@ def test_a_credential_beside_a_shape_fault_is_refused_with_no_chain(proxy_url: s
     cause = (errors[0].get("ctx") or {}).get("error")
     assert isinstance(cause, ValueError)
     assert "[egress].proxy_url holds a user or a password" in str(cause)
+    _assert_names_no_credential(cause)
+    for text in (str(refused.value), repr(refused.value), refused.value.json()):
+        assert _USER not in text and _PASSWORD not in text, text
+
+
+def test_a_split_fault_beside_a_credential_keeps_the_parse_refusal_with_no_chain() -> None:
+    """urlsplit itself refuses this value inside the parse's handler, and its own error can quote
+    the netloc. The validator drops that error and re-raises the parse's fixed refusal."""
+    proxy_url = f"http://{_USER}@[::1:3128"
+    with pytest.raises(ValueError, match="Invalid IPv6"):
+        urllib.parse.urlsplit(proxy_url)
+    with pytest.raises(ValidationError) as refused:
+        EgressSettings(
+            deny_by_default=False, proxy_url=proxy_url, allowed_proxy=[_SHAPE_FAULT_HOST]
+        )
+    cause = (refused.value.errors()[0].get("ctx") or {}).get("error")
+    assert isinstance(cause, ValueError)
+    assert "2965" in str(cause)
     _assert_names_no_credential(cause)
 
 
