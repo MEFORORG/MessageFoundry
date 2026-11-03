@@ -636,7 +636,7 @@ async def test_a_drain_that_runs_out_leaves_the_write_running(
     await asyncio.wait_for(slow.entered.wait(), 5)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
         await engine.drain_config_writes(0.05)
-    assert "1 connection flag write(s) still running at shutdown" in caplog.text
+    assert "1 connection flag write(s) still running or queued at shutdown" in caplog.text
     assert slow.ended == [], "the drain reached the write"
     assert not caller.done(), "the caller still waits on the write"
     slow.release.set()
@@ -734,7 +734,7 @@ async def test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_ro
 async def test_a_queue_behind_a_stuck_toggle_gets_the_refusal_at_its_own_bound(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The bound runs from the start of the wait for the lock, so a toggle behind a stuck one hears
+    """The bound covers the wait for the lock too, so a toggle behind a stuck one hears
     the typed refusal rather than the 120 s request deadline, even while the stuck one has not
     unwound. It never reached the store, and the log says so. RED with the bound around the store
     call alone: the later toggle waits for the lock and here meets the test's own guard."""
@@ -768,6 +768,30 @@ async def test_a_queue_behind_a_stuck_toggle_gets_the_refusal_at_its_own_bound(
     assert "was not started (outbound OB_CODE)" in caplog.text
     assert "may still land" not in caplog.text
     assert calls == 1
+
+
+async def test_time_in_the_queue_does_not_eat_the_bound_of_the_store_call(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two toggles that each fit the bound both land, one behind the other. RED with one clock over
+    the queue and the store call: the second is cut off in the store, with a refusal that cannot
+    say whether it landed, on a store that is only slow."""
+    real: Callable[..., Awaitable[None]] = engine.store.set_connection_flag
+
+    async def _slow(*args: object, **kwargs: object) -> None:
+        await asyncio.sleep(0.6)
+        await real(*args, **kwargs)
+
+    monkeypatch.setattr(BOUND, 1.0)
+    monkeypatch.setattr(engine.store, "set_connection_flag", _slow)
+    await asyncio.gather(
+        _flag(engine, "OB_TOML", "outbound"),
+        _flag(engine, "OB_CODE", "outbound"),
+    )
+    assert await engine.store.list_connection_flags() == {
+        ("OB_TOML", "outbound"),
+        ("OB_CODE", "outbound"),
+    }
 
 
 async def test_a_toggle_queued_when_the_drain_begins_is_refused_at_the_lock(

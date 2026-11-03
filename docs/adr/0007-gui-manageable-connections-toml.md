@@ -243,11 +243,13 @@ it could reach only its own copy.
 
    **An engine's toggles land one at a time, in arrival order.** The tracked task holds an engine
    lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
-   Without it, a clear running beside an uncommitted set could delete nothing on a server backend
-   and still append the newest row. The 10-second bound starts before the wait for that lock, so a
-   toggle queued behind a stuck one answers the same 503 within its own 10 seconds, having written
-   nothing, rather than meeting the request deadline. A toggle still queued when a shutdown's drain
-   begins answers 409.
+   Without it, a clear running beside an uncommitted set could delete nothing on Postgres and still
+   append the newest row. The wait for the lock has its own 10 seconds, and the store call then gets
+   a fresh 10, so a toggle queued behind a stuck one answers the same 503, having written nothing,
+   rather than meeting the request deadline, and time in the queue does not cut off a store call. A
+   toggle that reaches the lock once a shutdown's drain has begun answers 409. Unlike the old write,
+   the wait for the lock is in the tracked task too, so a drain sees a queued toggle, and a toggle
+   whose caller leaves while it queues still lands, with its row, under that caller's name.
 7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering
    a gate is a decision of its own, not a side effect of this move.
 8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept
@@ -286,10 +288,12 @@ audit row: at least the Deployment role holds `config:deploy` and no bulk-action
 cluster nodes share the store and each holds its own lock, so two of them can toggle one connection
 at once. On Postgres at READ COMMITTED, a clear beside another process's uncommitted set deletes
 nothing and then waits on the audit lock, so the flag would stay set under a newest row that says it
-is clear, until the next toggle. One process can reach the same state only through a commit cut off
-at the bound, since the lock frees when the store call ends. That is read from the store's code and
-was not run on a server, and SQL Server was not examined for it. SQLite's writer runs one transaction
-at a time, so a toggle there is whole. No database lock was built for this.
+is clear, until the next toggle. The reverse is open too: a set of a flag already set changes no row,
+so a clear beside it would leave no flag under a newest row that says set. One process can reach
+these states at least through a commit that outlives its store call, cut off at the bound or with
+its answer lost, since the lock frees when that call ends. All of this is read from the store's code
+and was not run on a server, and SQL Server was not examined for it. SQLite's writer runs one
+transaction at a time, so a toggle there is whole. No database lock was built for this.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.
@@ -311,9 +315,9 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
   that filter, and say why on the page.
   → `tests/test_connection_audit_writes.py::test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page`,
   `packaging/messagefoundry-webconsole/tests/test_ui_flag_read_failed.py`
-- **AC-6** — WHEN two toggles of one connection overlap in one engine process, THE SYSTEM SHALL land
-  them in arrival order, so the flag matches the newest `connection_flag_set` row, whether or not
-  the earlier caller is still waiting.
+- **AC-6** — WHEN two toggles of one connection overlap in one engine process and the earlier's store
+  call ends with its commit, THE SYSTEM SHALL land them in arrival order, so the flag matches the
+  newest `connection_flag_set` row, whether or not the earlier caller is still waiting.
   → `tests/test_connection_flag.py::test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row`
 
 ---

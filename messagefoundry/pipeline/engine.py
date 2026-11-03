@@ -159,12 +159,13 @@ _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 #: How long a connection flag toggle waits for the store (BACKLOG #2623). A write normally takes
 #: milliseconds, so this is a stuck or saturated store. Well under the API's 120 s request deadline
 #: (``api/request_timeout.py``), so the caller hears the toggle's own refusal and the console shows
-#: its page, not the deadline's JSON. One clock covers the wait for the engine's write lock and the
-#: store call, so a toggle queued behind a stuck one is refused here too, and at most this long
-#: after it arrived. It bounds nothing before them: the auth gate writes first, so a store stopped
-#: outright can still meet that deadline there. A refusal in the store call comes once that call
-#: has unwound, which a stalled store can stretch past this, by ``_ROLLBACK_TIMEOUT`` on SQLite. It
-#: sits inside the tracked write, so it also ends a write whose caller has gone. Read at call time.
+#: its page, not the deadline's JSON. It bounds the wait for the engine's write lock and then,
+#: afresh, the store call: a toggle queued behind a stuck one is refused at this bound, and time in
+#: the queue never cuts off a store call that would have finished. It bounds nothing before them:
+#: the auth gate writes first, so a store stopped outright can still meet that deadline there. A
+#: refusal in the store call comes once that call has unwound, which a stalled store can stretch
+#: past this, by ``_ROLLBACK_TIMEOUT`` on SQLite. It sits inside the tracked write, so it also ends
+#: a write whose caller has gone. Read at call time.
 CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS = 10.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
@@ -748,10 +749,10 @@ class Engine:
         # gets the lock below after that, is refused.
         self._config_writes_closed = False
         # Serializes those writes in this process, each held by its tracked task, so a write whose
-        # caller has gone keeps it. The toggles of one connection must not overlap: on a server
-        # backend a clear running beside an uncommitted set deletes nothing and still appends the
-        # newest audit row. asyncio.Lock wakes waiters in arrival order, so the last toggle lands
-        # last. It reaches no other process; set_connection_flag's docstring says what that leaves.
+        # caller has gone keeps it. Overlapping toggles of one connection could leave the flag
+        # disagreeing with the newest audit row (ADR 0007, amendment of 2026-10-31). asyncio.Lock
+        # wakes waiters in arrival order, so the last toggle lands last. It reaches no other
+        # process; set_connection_flag's docstring says what that leaves.
         self._config_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
@@ -2559,9 +2560,9 @@ class Engine:
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
         no such connection: the name has to be a real one, because the store would take any text.
         It raises the same once :meth:`drain_config_writes` has begun, including to a toggle that
-        was queued when it began. Raises :class:`ConnectionFlagNotRecorded` when the store did not
-        confirm the write within :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`, a bound that starts
-        before the wait for the lock below.
+        reaches the lock below after that. Raises :class:`ConnectionFlagNotRecorded` when that lock
+        or the store did not answer within :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`, which each
+        gets in full.
 
         The write runs as a tracked task the caller only waits on, so a caller cancelled from then
         on (a request deadline, a client that went away, a shutdown) stops waiting and does not stop
@@ -2572,11 +2573,11 @@ class Engine:
         That task holds the engine's write lock across the store call, so this process's toggles
         land one at a time, in arrival order, and the flag matches the newest
         ``connection_flag_set`` row. The lock frees when the store call has ended, which a commit
-        cut off at the bound may outlive, so such a commit can still overlap the next toggle. The
-        lock also reaches no other process: engine shards and cluster nodes share the store, so two
-        of them can overlap, and on a server backend the flag could then disagree with that row
-        (ADR 0007, amendment of 2026-10-31). The flag drives no engine path, so a disagreement
-        misstates a marker and its record, and the next toggle puts them right."""
+        may outlive, at least one cut off at the bound, so such a commit can still overlap the next
+        toggle. The lock also reaches no other process: engine shards and cluster nodes share the
+        store, so two of them can overlap. ADR 0007's amendment of 2026-10-31 says what the flag and
+        that row could then do, and that no engine path reads the flag does not make it cosmetic:
+        until the next toggle, the marker, Flagged only and the record could all be wrong."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner
@@ -2618,13 +2619,16 @@ class Engine:
                     if self._config_writes_closed:
                         raise WiringError(stopping)
                     started = True
+                    # The store call gets the whole bound: cut off for time spent queueing, a
+                    # write that would have finished becomes one that may land late.
+                    deadline.reschedule(asyncio.get_running_loop().time() + bound)
                     await self.store.set_connection_flag(
                         name, direction, flagged=flagged, audit=audit
                     )
             except WiringError:
                 raise
             except Exception as exc:
-                if not started:
+                if deadline.expired() and not started:
                     log.error(
                         "a connection flag change waited %g s behind another and was not started "
                         "(%s %s)",
@@ -2684,8 +2688,8 @@ class Engine:
         _done, pending = await asyncio.wait(set(self._config_writes), timeout=timeout)
         if pending:
             log.warning(
-                "%d connection flag write(s) still running at shutdown; each change and its audit "
-                "row land together or not at all",
+                "%d connection flag write(s) still running or queued at shutdown; each change and "
+                "its audit row land together or not at all",
                 len(pending),
             )
 
