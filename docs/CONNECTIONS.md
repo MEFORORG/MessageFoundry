@@ -2282,7 +2282,8 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
 id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
 just runs whatever statement you declare, bound from the row. A high-water mark can still pass a row
-that was never handed off, in at least the cases *Reliability* below names.
+that was never handed off, in at least the cases *Reliability* below names. Where that matters, mark
+with a status column or a delete-from-queue.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
