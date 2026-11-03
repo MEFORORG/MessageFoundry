@@ -629,6 +629,40 @@ def test_a_burn_dated_after_now_stays_critical_and_never_reads_ok(tmp_path: Path
     assert doc["seven_day"]["level_floor"] == 50.0 and "FUTURE" in doc["seven_day"]["reason"], doc
 
 
+@pytest.mark.parametrize(
+    ("pct", "rows", "stamped"),
+    [
+        pytest.param(89.0, [(89.0, 51.0), (25.0, 89.0)], True, id="89-stamped"),
+        pytest.param(89.0, [(89.0, 51.0), (25.0, 89.0)], False, id="89-unset"),
+        pytest.param(80.0, [(88.0, 10.0), (21.0, 80.0)], True, id="80-stamped"),
+        pytest.param(80.0, [(88.0, 10.0), (21.0, 80.0)], False, id="80-unset"),
+    ],
+)
+def test_a_stale_reading_whose_rows_project_a_run_out_is_critical(
+    tmp_path: Path, pct: float, rows: list[tuple[float, float]], stamped: bool
+) -> None:
+    """An idle repeat leaves the age counting, so these go stale. The code before restamped them and
+    projected about 19 minutes to empty, a stop. Returning before the rate turned that into REVIEW."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=pct, age_min=rows[-1][0], seven_epoch=epoch)
+    if stamped:
+        _stamp(tmp_path, tmp_path.parent)
+    write_history(tmp_path, rows, epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
+    assert doc["seven_day"]["minutes_to_empty"] == pytest.approx(19, abs=1), doc
+
+
+def test_a_stale_reading_whose_rows_do_not_reach_a_run_out_stays_unknown(tmp_path: Path) -> None:
+    """The control: the same shape with a slow rate projects past the reset, and a stale number clears
+    nothing, so it stays UNKNOWN with no rate."""
+    epoch = int(time.time()) + 3600
+    publish(tmp_path, seven=70.0, age_min=25, seven_epoch=epoch)
+    write_history(tmp_path, [(85.0, 65.0), (25.0, 70.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == UNKNOWN and doc["seven_day"]["rate_pct_per_hr"] is None, doc
+
+
 def test_a_stale_reading_with_its_reset_ahead_is_a_floor_and_nothing_else_is(
     tmp_path: Path,
 ) -> None:

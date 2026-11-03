@@ -857,10 +857,11 @@ function Get-DecisionCostRung {
       one cannot rise. usage.ps1 publishes
       level_floor on a stale reading with its reset ahead and inside one 7-day window, and with trusted
       provenance unless it is at the ceiling. Such a reading has reached at least that level, unless
-      the reset has moved or usage did fall, so at the level or the ceiling it is HIT. A rate hit does
-      not survive: nothing is projected from a stale reading, so it has no rate. The level then decides,
-      even where a fresher reading's rate would have cleared it, and a reading the rate would have hit
-      below the level goes to UNKNOWN. Every other stale reading is UNKNOWN, because a stale number
+      the reset has moved or usage did fall, so at the level or the ceiling it is HIT. A rate hit
+      survives only where usage.ps1 projects a run-out from the history rows, before the reset or with
+      no reset, and marks the window CRITICAL; the rate branch below then hits within HoldMin. Short of
+      that the level decides, even where a fresher reading's rate would have cleared it. Every other
+      stale reading is UNKNOWN, because a stale number
       cannot clear work. That includes a level hit below the ceiling with no trusted provenance, which
       goes from HIT to UNKNOWN when it goes stale. A ceiling hit with its reset ahead does not.
 

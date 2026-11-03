@@ -320,7 +320,7 @@ $HEAD = "[usage headroom, read at the spawn point from the file the statusLine c
 
 $AGE_NOTE = "Ages are part of the reading, counted from the last time the number changed or a session " +
             "that had just called the API reported it; an idle session's repeat does not count. Anything " +
-            "past $MaxAgeMinutes min is not projected from: it reads UNKNOWN, or 'at least' where it still holds as a floor."
+            "past $MaxAgeMinutes min reads UNKNOWN, or 'at least' where it still holds as a floor, or CRITICAL where its history projects a run-out."
 
 # WHY AN UNKNOWN WILL NOT CLEAR ON ITS OWN (BACKLOG #1459). A bare "UNKNOWN" hid two causes that
 # waiting cannot fix, and a session told only "UNKNOWN" waits for a number that cannot arrive. ONE

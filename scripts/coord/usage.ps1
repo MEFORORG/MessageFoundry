@@ -25,11 +25,12 @@
       1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was last confirmed:
          it changed, or a session that had just called the API reported it. An idle session's repeat
          does not count; usage-collect.ps1 says why.
-      2. REFUSE TO PROJECT ON STALE OR THIN DATA. Past -MaxAgeMinutes the window's state is UNKNOWN. Not
-         an extrapolation, not a last-known value dressed up as current. A level_floor at the ceiling
-         still sets CRITICAL, as "at least this"; below the ceiling a floor is only a lower bound, so the
-         verdict stays UNKNOWN. Below two samples in the current window there is no rate and no
-         projection, and the percentage bands still grade the reading.
+      2. DO NOT LET A STALE NUMBER CLEAR ANYTHING. Past -MaxAgeMinutes the window's state is UNKNOWN,
+         not a last-known value dressed up as current. Two things still stop work on it. A level_floor at
+         the ceiling sets CRITICAL, as "at least this"; below the ceiling a floor is only a lower bound,
+         so the verdict stays UNKNOWN. And a rate from its history rows that projects a run-out before
+         the reset, or with no reset, sets CRITICAL. Below two samples in the current window there is no
+         rate and no projection, and the percentage bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -51,8 +52,9 @@
         0  OK
         10 WARN        -- high, or projected to exhaust before reset with slack, on a fresh reading only
         11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling, fresh or as a
-                          stale level_floor. A reading dated after now reaches this too: at the ceiling,
-                          projected to exhaust before reset, or projected at all with no reset time
+                          stale level_floor. A stale reading, or one dated after now, reaches this too: at
+                          the ceiling, projected to exhaust before reset, or projected at all with no reset
+                          time
         20 UNKNOWN     -- no data, stale data with no level_floor at the ceiling, a window whose reset has
                           passed, a reading dated after now with none of the above, or a reading this root
                           may not trust. A level_floor below the ceiling reads UNKNOWN too, because the
@@ -591,6 +593,21 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         $fitsAWeek = $null -ne $minsToReset -and ($age + $minsToReset) -le 10081
         $stamped = $wEnv -and $wEnv -ne "unset"
         if ($age -gt $MaxAgeMinutes -and $fitsAWeek -and ($stamped -or $pct -ge $CeilingPct)) { $o.level_floor = $pct }
+        # A PROJECTED RUN-OUT STILL STOPS WORK ON A STALE READING. Its history rows are as real as they
+        # were, and the code before the weekly amendment restamped an idle repeat as fresh and projected
+        # from this same number. Short of a run-out nothing is projected, so a stale number clears nothing.
+        if ($age -gt $MaxAgeMinutes) {
+            $rate = Get-Rate -CurrentResetEpoch $resetEpoch
+            if ($rate -and $rate.PctPerHour -gt 0) {
+                $toEmpty = [math]::Round((100.0 - $pct) / $rate.PctPerHour * 60.0, 0)
+                if ($null -eq $minsToReset -or $toEmpty -lt $minsToReset) {
+                    $o.state = "CRITICAL"
+                    $o.rate_pct_per_hr = $rate.PctPerHour
+                    $o.minutes_to_empty = $toEmpty
+                    $o.reason = "projected to hit 100% in ~$toEmpty min from its history rows; $($o.reason)"
+                }
+            }
+        }
         return $o
     }
 

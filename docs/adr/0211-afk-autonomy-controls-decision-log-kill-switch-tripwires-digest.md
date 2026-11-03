@@ -451,16 +451,20 @@ roster alias of the Lander.
 > note. The window's own state stays UNKNOWN, which is what the
 > gate reads below the rung, so the verdict cannot clear anything.
 >
-> **A stale reading has no rate, so a rate hit does not survive age.** Nothing is projected from a stale
-> reading. A fresh 70 percent with 45 minutes to empty hits; the same reading once stale answers REVIEW.
-> From 90 to 97 percent the opposite applies: the rung is hit even where the rate a fresher reading had
-> would have cleared it, because the window resets first. That departs from the rate-governs rule for
-> stale readings and for readings dated after now.
+> **A stale reading keeps a projected run-out, and nothing short of one.** Its history rows still give a
+> rate, and a projection to run out before the reset, or with no reset, makes the window CRITICAL, so the
+> gate hits on it within its 60 minutes as it would on a fresh reading. The code before this amendment
+> reached the same answer by restamping an idle repeat. Short of a run-out nothing is projected: a fresh
+> 70 percent whose rate does not reach the rung reads OK, and once stale it answers REVIEW. From 90 to 97
+> percent the level decides instead: the rung is hit even where a fresher reading's rate would have
+> cleared it, because the window resets first. That departs from the rate-governs rule for stale readings
+> and for readings dated after now.
 >
 > **A reading dated after now can stop work and cannot clear it.** It reads UNKNOWN, because nothing proves
 > when it was taken, so OK and WARN cannot come from it. But a small backward clock step dates a real
 > reading ahead, so it keeps a `level_floor` at its number on any provenance, unless its reset has passed.
-> A projection to run out before the reset stays CRITICAL, and with no reset any projection does. Any
+> A projection to run out before the reset stays CRITICAL, and with no reset any projection does. The gate
+> halts on a projection only inside its 60 minutes, and answers REVIEW beyond that. Any
 > distance ahead counts, with no tolerance: the collector stamps before it writes, and the reader opens the
 > document before it reads the clock. A history row dated ahead stays in the rate at its own date. When the
 > gate halts on such a reading, its reason and the spawn hook's line say the machine's clock looks wrong.

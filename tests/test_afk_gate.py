@@ -752,6 +752,29 @@ def _set_rows(state: Path, rows: list[tuple[datetime, int]], resets: int | None)
     )
 
 
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_an_idle_stale_reading_with_a_rate_halts(sb: Sandbox, tmp_path: Path, pinned: bool) -> None:
+    """89 with rows at 89 and 25 minutes ago, then an idle repeat through the real collector. The code
+    before restamped it and HALTed on about 19 minutes to empty."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    fire_env = env if pinned else {"CLAUDE_CONFIG_DIR": ""}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + 14400
+    seven = {"used_percentage": 89, "resets_at": resets}
+    assert _fire(sb, state, seven, fire_env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=25).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    _set_rows(state, [(ago(minutes=89), 51), (ago(minutes=25), 89)], resets)
+    assert _fire(sb, state, seven, fire_env).returncode == 0
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == HALT and "Projected to run out" in why(doc), why(doc)
+
+
 def test_a_burn_dated_after_now_with_no_reset_halts_and_names_the_clock(
     sb: Sandbox, tmp_path: Path
 ) -> None:
