@@ -6408,8 +6408,9 @@ class PostgresStore:
 
         The flag statement holds the audit lock while it waits for its row, so its lock waits are
         bounded by ``lock_timeout``, at
-        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`. The pool sets no
-        server ``statement_timeout``, so without it the wait would run to asyncpg's client-side
+        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` each: Postgres times
+        each lock acquisition separately, so a statement that meets two locks can pass it. The pool
+        sets no server ``statement_timeout``, so without it the wait would run to asyncpg's client-side
         ``command_timeout``, or without end at 0, unless the role or database set a bound of its
         own; a foreign lock on ``connection_flag`` would hold every audit append that long. It is
         set after the advisory lock, whose wait keeps its own bound, and only tightens, as the
@@ -6418,7 +6419,8 @@ class PostgresStore:
         fails the toggle with the driver's own 55P03 rather than the typed refusal. SQLSTATE 55P03
         from the flag statement raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
-        back. A ``command_timeout`` at or under the bound fires first, as asyncpg's own timeout."""
+        back. The bound does not hold where ``command_timeout`` is at or under it: that fires
+        first, as asyncpg's own timeout."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (
