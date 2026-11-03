@@ -5406,8 +5406,7 @@ class EgressSettings(_Section):
                 raise
         else:
             return value
-        # Raised after the handler ends, not inside it with ``from None``: that would still leave the
-        # parse's error on ``__context__``, so neither chain may hold it (BACKLOG #1796).
+        # Raised after the handler ends: tests/test_from_none_is_not_redaction.py says why.
         raise refused
 
     @field_validator("allowed_recipient_domains", mode="after")

@@ -784,24 +784,39 @@ def test_a_credential_in_egress_proxy_url_is_refused_at_load(proxy_url: str) -> 
         assert _USER not in text and _PASSWORD not in text, text
 
 
+#: A user or a password beside a shape fault: the parse refuses the shape and the credential read
+#: misses it, so the refusal is made after the parse's handler. The host carries no port of its own.
+_SHAPE_FAULT_HOST = "proxy-marker.invalid"
+_CREDENTIAL_BESIDE_A_SHAPE_FAULT = [
+    f"http://{_USER}@{_SHAPE_FAULT_HOST}:99999",
+    f"http://:{_PASSWORD}@{_SHAPE_FAULT_HOST}/path",
+    f"http://{_USER}@{_SHAPE_FAULT_HOST}?x",
+]
+
+
 @pytest.mark.parametrize(
     "proxy_url",
-    [
-        f"http://{_USER}@{_PROXY_HOST}:99999",
-        f"http://:{_PASSWORD}@{_PROXY_HOST}/path",
-        f"http://{_USER}@{_PROXY_HOST}?x",
-    ],
-    ids=["user-bad-port", "password-with-path", "user-with-query"],
+    _CREDENTIAL_BESIDE_A_SHAPE_FAULT,
+    ids=["user-port-out-of-range", "password-with-path", "user-with-query"],
 )
 def test_a_credential_beside_a_shape_fault_is_refused_with_no_chain(proxy_url: str) -> None:
-    """The credential refusal made after the parse refused the shape carries neither chain.
-    ``from None`` would clear ``__cause__`` and leave the parse's error on ``__context__``
-    (BACKLOG #1796), so the refusal is raised after that handler ends. Called on the validator
-    itself, because pydantic's wrapper would hide the chain this pins."""
-    with pytest.raises(ValueError, match=r"\[egress\]\.proxy_url holds a user") as refused:
-        EgressSettings._proxy_url_shape(proxy_url)
-    assert refused.value.__cause__ is None
-    assert refused.value.__context__ is None
+    """Refused naming the setting, with neither chain holding the parse's error (the safe shape in
+    ``tests/test_from_none_is_not_redaction.py``). Read through the load, where pydantic keeps the
+    validator's error in each error's ``ctx``."""
+    # Positive control: each value reaches the raise after the parse's handler, not the early one.
+    assert not rest.proxy_url_holds_credential(proxy_url)
+    with pytest.raises(ValueError):
+        parse_proxy_url(proxy_url)
+    with pytest.raises(ValidationError) as refused:
+        EgressSettings(
+            deny_by_default=False, proxy_url=proxy_url, allowed_proxy=[_SHAPE_FAULT_HOST]
+        )
+    errors = refused.value.errors()
+    assert len(errors) == 1
+    cause = (errors[0].get("ctx") or {}).get("error")
+    assert isinstance(cause, ValueError)
+    assert "[egress].proxy_url holds a user or a password" in str(cause)
+    _assert_names_no_credential(cause)
 
 
 def test_a_credential_inherited_from_egress_proxy_url_fails_the_build() -> None:
