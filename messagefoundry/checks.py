@@ -120,10 +120,23 @@ __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
 def _config_modules(base: Path) -> list[Path]:
     """The config dir's ``*.py`` files, by the loader's own rule: a dot-named backup is never run, so
-    the static lints do not report on it either (vault BACKLOG #2781)."""
+    the static lints do not report on it either (vault BACKLOG #2781). Raises the ``OSError`` of a
+    directory it cannot list, which each lint reports by :func:`_unlisted` (vault BACKLOG #5117)."""
     from messagefoundry.config.wiring import config_py_files
 
     return config_py_files(base)
+
+
+def _unlisted(name: str, exc: OSError, *, required: bool = False) -> CheckResult:
+    """The line of a lint that could not list the config dir. It vetted nothing, so it is skipped,
+    and a required lint fails: a listing fault once read as an empty directory, which a lint
+    reported as a clean scan (vault BACKLOG #5117)."""
+    from messagefoundry.redaction import safe_exc
+
+    detail = f"could not list the config dir: {safe_exc(exc)}"
+    if required:
+        return CheckResult(name, ok=False, required=True, detail=detail)
+    return CheckResult(name, ok=True, required=False, skipped=True, detail=detail)
 
 
 # What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
@@ -575,8 +588,12 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
         return CheckResult(
             "raise-fstring", ok=True, required=False, skipped=True, detail="not a config dir"
         )
+    try:
+        modules = _config_modules(base)
+    except OSError as exc:
+        return _unlisted("raise-fstring", exc)
     hits: list[str] = []
-    for path in _config_modules(base):
+    for path in modules:
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -705,8 +722,12 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
         return CheckResult(
             "accepts-candidate", ok=True, required=False, skipped=True, detail="not a config dir"
         )
+    try:
+        modules = _config_modules(base)
+    except OSError as exc:
+        return _unlisted("accepts-candidate", exc)
     hits: list[str] = []
-    for path in _config_modules(base):
+    for path in modules:
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -1611,13 +1632,17 @@ def _check_handler_security(
         return CheckResult(
             "handler-security", ok=True, required=False, skipped=True, detail="not a config dir"
         )
+    try:
+        modules = _config_modules(base)
+    except OSError as exc:
+        return _unlisted("handler-security", exc, required=strict)
     # sibling config modules (the dir's own *.py stems) are first-party for the unvetted-import rule.
-    local_modules = frozenset(p.stem for p in _config_modules(base))
+    local_modules = frozenset(p.stem for p in modules)
     # unvetted-import needs a trustworthy shipped-dep set to tell operator-added from shipped; if the
     # metadata probe degraded to empty, skip the rule entirely rather than flag/block on a blind vet.
     shipped = _shipped_dep_import_roots()
     hits: list[str] = []
-    for path in _config_modules(base):
+    for path in modules:
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
