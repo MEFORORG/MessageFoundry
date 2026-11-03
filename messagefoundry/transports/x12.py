@@ -50,6 +50,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     encode_wire_body,
     float_setting,
+    handle_with_retry,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
@@ -816,6 +817,7 @@ class X12Source(SourceConnector):
                     max_frame_seconds=self.max_frame_seconds,
                     receive_timeout=self.receive_timeout,
                 )
+                peer = writer.get_extra_info("peername")  # fixed for the connection
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
@@ -840,15 +842,32 @@ class X12Source(SourceConnector):
                         decoded = 0
                         for interchange in decoder.feed(chunk):
                             decoded += 1
-                            reply = await self._handler(interchange)
+                            try:
+                                reply = await handle_with_retry(
+                                    self._handler,
+                                    interchange,
+                                    transport="X12",
+                                    peer=peer,
+                                    log=logger,
+                                )
+                            except Exception as exc:  # noqa: BLE001 -- see handle_with_retry
+                                # BACKLOG #5022: the reader framed this interchange cleanly, so this
+                                # is a handler fault, not a framing fault. handle_with_retry logged
+                                # it. Record it, then close, as TcpSource does.
+                                await self._emit_event(
+                                    "handler_error", peer_host=peer_host, reason=safe_exc(exc)
+                                )
+                                failed = True  # handler_error already names why this closes
+                                break
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
                                 await self._drain_reply(writer)
+                        if failed:
+                            break
                         # Charge AFTER the interchanges in this chunk are fully handled.
                         if pacer is not None:
                             pacer.settle(decoded)
                     except X12FrameError as exc:
-                        peer = writer.get_extra_info("peername")
                         logger.warning(
                             "X12 interchange from %s over cap; closing connection: %s", peer, exc
                         )
@@ -863,9 +882,9 @@ class X12Source(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
-                        # per-connection task die silently or leak detail. Log redacted; drop the conn.
-                        peer = writer.get_extra_info("peername")
+                        # Last-resort (ASVS 16.5.4): an unexpected codec or reply-encoding error must
+                        # not let the per-connection task die silently or leak detail. Log redacted;
+                        # drop the conn. A handler fault is caught above and is `handler_error`.
                         logger.error(
                             "X12 connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )

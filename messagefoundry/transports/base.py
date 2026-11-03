@@ -24,6 +24,7 @@ import abc
 import asyncio
 import contextlib
 import errno
+import logging
 import math
 import numbers
 import operator
@@ -50,6 +51,7 @@ from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 # transports/ must not import api/, so the shared leaf lives at the package root. The five connector
 # call sites (mllp/tcp/x12/dicom/http_listener) keep importing it from here, unchanged.
 from messagefoundry.netaddr import peer_ip_allowed
+from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "ENCODING_CODE",
@@ -61,6 +63,8 @@ __all__ = [
     "IntakeGate",
     "intake_open",
     "wait_for_intake",
+    "HANDLER_RETRY_DELAYS",
+    "handle_with_retry",
     "InboundReply",
     "ReplyOutcome",
     "SyncReplyResolver",
@@ -586,6 +590,70 @@ async def wait_for_intake(
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(opened.wait(), poll_seconds)
     return True
+
+
+#: The pauses between attempts when the inbound handler raises on a frame a listener read cleanly
+#: (BACKLOG #5022). Such a fault is an infrastructure failure, most often a store write that did not
+#: commit (:class:`SourceConnector` says so), and a sender that waits for no reply never resends, so
+#: the frame in hand is the only copy. A store blip is the common case, and retrying in place
+#: recovers it with nothing lost and order kept. Short and bounded, because the connection reads
+#: nothing while it waits; the total stays well inside the listeners' shutdown grace, so a stop()
+#: during the retries still finds the task done.
+HANDLER_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
+
+
+async def handle_with_retry(
+    handler: InboundHandler,
+    frame: bytes,
+    *,
+    transport: str,
+    peer: object,
+    log: logging.Logger,
+) -> str | None:
+    """Run ``handler`` on ``frame``, retrying after each :data:`HANDLER_RETRY_DELAYS` pause.
+
+    Returns the handler's reply. Once every attempt has failed, logs at ERROR and re-raises the last
+    attempt's exception; the caller then records ``handler_error`` and closes the connection.
+    ``CancelledError`` is not caught, so a stop still ends the wait. A fault that came after a commit
+    means a retry commits another copy, which at-least-once delivery allows. Every log line carries
+    the exception through ``safe_exc``, never the frame.
+
+    Closing, rather than keeping on like the MLLP listener's no-reply arm, means nothing more is
+    accepted behind a frame that may not be recorded, the sender sees its connection drop instead
+    of an unbroken stream, and a sender pinned to a node whose store is down reconnects, which lets
+    a load balancer move it. Nothing is acknowledged, so the ACK-after-commit rule holds. The ERROR
+    line says what is lost, since closing cannot recover it.
+    """
+    attempts = len(HANDLER_RETRY_DELAYS) + 1
+    for attempt, delay in enumerate(HANDLER_RETRY_DELAYS, start=1):
+        try:
+            return await handler(frame)
+        except Exception as exc:  # noqa: BLE001 -- any escape is a handler fault; see the docstring
+            log.warning(
+                "%s message from %s failed in the inbound handler (attempt %d of %d): %s; "
+                "retrying in %.2fs",
+                transport,
+                peer,
+                attempt,
+                attempts,
+                safe_exc(exc),
+                delay,
+            )
+        await asyncio.sleep(delay)
+    try:
+        return await handler(frame)
+    except Exception as exc:  # noqa: BLE001 -- logged here, re-raised for the caller to record
+        log.error(
+            "%s message from %s failed in the inbound handler %d times and may not be recorded: "
+            "%s (closing the connection; a sender that waits for a reply resends it, but one that "
+            "waits for none has lost it, with any it sent behind it that this connection had not "
+            "handled)",
+            transport,
+            peer,
+            attempts,
+            safe_exc(exc),
+        )
+        raise
 
 
 class ReplyOutcome(str, Enum):  # noqa: UP042 - matches MessageStatus/OutboxStatus house style
@@ -1199,10 +1267,16 @@ class SourceConnector(abc.ABC):
 
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
-    answer. A sender that waits for none cannot be told to resend, and at least one shipped
-    listener loses a message that was not committed in that case: the MLLP listener records
-    ``handler_error`` and keeps the connection. It may not be the only one. That is a gap in the
-    shipped code, not a pattern to copy."""
+    answer. A sender that waits for none cannot be told to resend, so the frame in hand is the only
+    copy, and the socket listeners differ there:
+
+    * the raw-TCP and X12 listeners retry the handler in place on that frame, a bounded number of
+      times (:func:`handle_with_retry`). If it still faults they record ``handler_error``, log at
+      ERROR that the frame may not be recorded, and close the connection, so nothing more is
+      accepted behind it. That frame is lost, with any the sender had already sent behind it that
+      were not handled (BACKLOG #5022);
+    * the MLLP listener records ``handler_error`` and keeps the connection, so the failed frame is
+      lost with no retry. That is a gap in the shipped code, not a pattern to copy."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
