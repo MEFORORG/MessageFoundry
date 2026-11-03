@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import shutil
+import sys
 import tarfile
 import time
 from collections import namedtuple
@@ -750,7 +751,7 @@ async def test_add_config_dir_skips_edit_candidates_and_the_lock(
 async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> None:
     # Security: `_add_config_dir` must add regular config files only. A symlink inside the config dir
     # pointing at a host file OUTSIDE the bundle would smuggle arbitrary host contents into the
-    # archive — it must be skipped (dr_backup.py:448 is_symlink guard + rglob(recurse_symlinks=False)).
+    # archive — it must be skipped (the is_symlink guard in _add_config_dir + _walk_unfollowed).
     store = await _store_with_rows(tmp_path / "msg.db", key_b64)
     cfg = tmp_path / "config"
     cfg.mkdir()
@@ -764,8 +765,8 @@ async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> 
     except (OSError, NotImplementedError):
         pytest.skip("symlink not permitted (Windows w/o Developer Mode/privilege)")
 
-    # A symlinked DIRECTORY that escapes the bundle too — rglob(recurse_symlinks=False) must not
-    # descend into it, so its contents never land in the archive.
+    # A symlinked DIRECTORY that escapes the bundle too — the walk must not descend into it, so its
+    # contents never land in the archive.
     host_dir = tmp_path / "host_dir"
     host_dir.mkdir()
     (host_dir / "buried.txt").write_text("SMUGGLED-SECRET-DIR")
@@ -796,6 +797,87 @@ async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> 
     # (3) The legitimate regular file IS present (the fix must not over-exclude real config files).
     assert "config/feed.py" in names
     await store.close()
+
+
+# --- config bundle: a junction or a symlinked directory adds nothing (vault BACKLOG #5221) ---
+
+
+def _config_with_a_linked_dir(tmp_path: Path, make_link) -> Path:
+    """A config dir holding a top-level file, a plain subfolder's file (the control), and a
+    directory link, made by ``make_link(target, link)``, to a host folder outside it."""
+    cfg = tmp_path / "config"
+    (cfg / "sub").mkdir(parents=True)
+    (cfg / "feed.py").write_text("# router")
+    (cfg / "sub" / "plain.txt").write_text("plain subfolder file")
+    host = tmp_path / "host_dir"
+    host.mkdir()
+    (host / "buried.txt").write_text("SMUGGLED-THROUGH-A-DIRECTORY-LINK " * 40)
+    make_link(host, cfg / "linked")
+    return cfg
+
+
+def _make_junction(target: Path, link: Path) -> None:
+    if sys.platform != "win32":
+        pytest.skip("an NTFS junction is a Windows feature")
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def _make_dir_symlink(target: Path, link: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("a directory symlink cannot be made here (Windows without the privilege)")
+
+
+async def _config_member_bytes(tmp_path: Path, key_b64: str, cfg: Path) -> tuple[list[str], bytes]:
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    try:
+        runner = BackupRunner(
+            store,
+            _settings(tmp_path / "b", key_b64),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        )
+        result = await runner.run_once(now=1.0)
+        assert result is not None and result.verify is not None and result.verify.status == "PASS"
+        import base64
+
+        with open(result.archive_path, "rb") as src:
+            tar_bytes = _decrypt_to_bytes(src, base64.b64decode(key_b64))
+    finally:
+        await store.close()
+    return sorted(n for n in _member_names(tar_bytes) if n.startswith("config/")), tar_bytes
+
+
+@pytest.mark.parametrize(
+    "make_link", [_make_junction, _make_dir_symlink], ids=["junction", "symlink"]
+)
+async def test_a_directory_link_in_the_config_dir_adds_nothing(
+    tmp_path, key_b64, make_link
+) -> None:
+    """A junction answers False to ``is_symlink()``, and ``rglob`` and ``os.walk(followlinks=False)``
+    both descended it, so a host folder it named reached the archive and the space estimate. The
+    junction case fails on that walk; the symlink case is the same rule on the other link kind. The
+    plain subfolder's file is the control that the walk still descends a real folder."""
+    cfg = _config_with_a_linked_dir(tmp_path, make_link)
+    names, tar_bytes = await _config_member_bytes(tmp_path, key_b64, cfg)
+    assert names == ["config/feed.py", "config/sub/plain.txt"]
+    assert b"SMUGGLED-THROUGH-A-DIRECTORY-LINK" not in tar_bytes
+
+
+@pytest.mark.parametrize(
+    "make_link", [_make_junction, _make_dir_symlink], ids=["junction", "symlink"]
+)
+def test_the_space_estimate_does_not_count_a_directory_link(tmp_path, make_link) -> None:
+    """``_tree_size`` counts what the archive will carry: the two real files, the plain subfolder's
+    included, and nothing the link names."""
+    from messagefoundry.pipeline.dr_backup import _tree_size
+
+    cfg = _config_with_a_linked_dir(tmp_path, make_link)
+    real = (cfg / "feed.py").stat().st_size + (cfg / "sub" / "plain.txt").stat().st_size
+    assert _tree_size(cfg) == real
 
 
 # --- AC-9/AC-10: failure alerts + preserves the prior good archive -----------

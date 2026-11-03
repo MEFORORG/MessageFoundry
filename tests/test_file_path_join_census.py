@@ -660,7 +660,10 @@ SITES: dict[str, Site] = {
         1, INTERNAL, "A fixed lock name in the spool directory."
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._add_config_dir": Site(
-        1, OPERATOR, "Parents of files found walking the operator's config directory."
+        2,
+        OPERATOR,
+        "Names found walking the operator's config directory, never through a link or a junction "
+        "(BACKLOG #5221), and the parents of those files.",
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._build_archive_blocking": Site(
         1, INTERNAL, "A fixed name in a work directory this module made."
@@ -680,7 +683,7 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
-        4,
+        3,
         INTERNAL,
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
@@ -730,6 +733,12 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_walk_unfollowed": Site(
+        1,
+        INTERNAL,
+        "A directory name os.walk listed, joined only to lstat it for a link or a junction "
+        "(BACKLOG #5221).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."

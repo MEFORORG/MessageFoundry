@@ -1112,13 +1112,16 @@ class BackupRunner:
 
     def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> None:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
-        ``connections.toml``, ``codesets/``, fixtures). Symlinks are NOT followed (a symlink out of the
-        bundle would smuggle an arbitrary host file into the archive); only regular files are added.
+        ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
+        arbitrary host file into the archive, so only regular files are added and at least these are
+        NOT followed: a symlinked file, a symlinked directory, and an NTFS junction or volume mount
+        point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads them. ``base``
+        itself is the operator's configured directory and is walked whatever it is.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
         killed editor's leftover is not config."""
-        for path in sorted(base.rglob("*")):
+        for path in sorted(Path(d, n) for d, _, files in _walk_unfollowed(base) for n in files):
             if path.is_symlink() or not path.is_file():
                 continue
             if _is_config_edit_artifact(path.relative_to(base)):
@@ -1839,11 +1842,7 @@ def _empty_files_in_place(staging: Path) -> list[str]:
                 continue
             # Never descend through a link or a junction, which `os.walk` follows even with
             # `followlinks=False`.
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
-            ]
+            dirnames[:] = [d for d in dirnames if not _is_dir_link(os.path.join(dirpath, d))]
             for name in filenames:
                 _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
     else:
@@ -2318,11 +2317,29 @@ def _is_config_edit_artifact(rel: Path) -> bool:
     )
 
 
-def _tree_size(root: Path) -> int:
-    """The total size of the regular files under ``root``, never following a link, which is also
-    what ``_add_config_dir`` puts in the archive. 0 when ``root`` cannot be walked."""
-    total = 0
+def _walk_unfollowed(root: Path) -> Iterator[tuple[str, list[str], list[str]]]:
+    """``os.walk(root)``, top-down, that never descends a directory link below ``root``: at least a
+    symlinked directory and an NTFS junction or volume mount point, which ``os.walk`` descends even
+    with ``followlinks=False`` (vault BACKLOG #5221). Each is read from the entry itself, by
+    ``lstat``, never by a following ``stat``. Other reparse points, such as a cloud placeholder or a
+    deduplicated file, are not directory links, so they are listed as what they hold. A caller may
+    prune the yielded directory list further, as with ``os.walk``."""
     for dirpath, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if not _is_dir_link(os.path.join(dirpath, d))]
+        yield dirpath, dirs, files
+
+
+def _is_dir_link(path: str) -> bool:
+    """Whether ``path`` is a symlink or a junction, read without following it."""
+    return os.path.islink(path) or os.path.isjunction(path)
+
+
+def _tree_size(root: Path) -> int:
+    """The total size of the regular files under ``root``, never following a link or a junction
+    (:func:`_walk_unfollowed`), which is also what ``_add_config_dir`` puts in the archive. 0 when
+    ``root`` cannot be walked."""
+    total = 0
+    for dirpath, dirs, files in _walk_unfollowed(root):
         # Candidate directories are pruned, as _add_config_dir skips their files.
         dirs[:] = [d for d in dirs if not atomic_edit.is_candidate_dir_name(d)]
         for name in files:
