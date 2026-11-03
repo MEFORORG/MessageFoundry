@@ -2357,8 +2357,9 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     if proxy.lower() == PROXY_DEFAULT:
         return False
     try:
-        # Uncached, so a URL that holds a credential leaves no key in urlsplit's process-wide
-        # cache (vault BACKLOG #3454): the [egress].proxy_url load check asks this.
+        # Uncached, so the [egress].proxy_url load check, which asks this, adds no key to
+        # urlsplit's process-wide cache (vault BACKLOG #3454). The build path does not gain that
+        # from this read: proxy_config_from_settings reads the scheme through url_scheme first.
         if _UNCACHED_URLSPLIT(proxy).scheme.lower() not in ("http", "https"):
             return False
         # The parser ProxyHandler.proxy_open runs; a test pins the pairing.
@@ -2383,8 +2384,7 @@ def proxy_url_holds_credential(proxy_url: object) -> bool:
         return False
     proxy = proxy_url.strip()
     try:
-        # Uncached, so a URL that holds a credential leaves no key in urlsplit's process-wide
-        # cache (vault BACKLOG #3454): the [egress].proxy_url load check asks this.
+        # Uncached, for the same load check as proxy_url_sends_userinfo.
         if _UNCACHED_URLSPLIT(proxy).scheme.lower() not in ("http", "https"):
             return False
         return parse_proxy_url(proxy).holds_credential

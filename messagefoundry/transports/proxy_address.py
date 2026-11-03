@@ -26,9 +26,9 @@ module. Other proxy-URL readers exist and do not, at least ``ambient_proxy``'s l
 
 ``urlsplit`` is called here with its cache taken off, as ``strict_requests`` does (vault BACKLOG
 #3454), so this parse adds no key to the process-wide cache. That is all it does: a caller that
-reads the scheme first through the cached function makes the value a cache key all the same. The
-``[egress].proxy_url`` load check reads only through this split, so a value it refuses for a
-credential is no key.
+reads the scheme first through the cached function makes the value a cache key all the same. At
+least the connector build and the egress gate do, through ``rest.url_scheme``. The
+``[egress].proxy_url`` load check does not; a test pins that its credential refusal adds no key.
 
 Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
 cycle.

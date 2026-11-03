@@ -5395,8 +5395,8 @@ class EgressSettings(_Section):
             # A user or a password alone beside a shape fault: the parse's own text says a URL
             # credential fails the connection's build, which is not where this setting is refused.
             # Read from the authority urlsplit sees, so a value urllib alone splits at a later '@'
-            # (the #2965 shapes) keeps the parse's refusal for its shape. Uncached, as every read
-            # here is, so a refused password leaves no key in urlsplit's cache (vault BACKLOG #3454).
+            # (the #2965 shapes) keeps the parse's refusal for its shape. Uncached, as the two
+            # credential reads above are, so it adds no urlsplit cache key (vault BACKLOG #3454).
             try:
                 netloc = _UNCACHED_URLSPLIT(proxy).netloc
             except ValueError:

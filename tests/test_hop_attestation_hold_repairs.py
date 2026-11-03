@@ -254,22 +254,25 @@ def test_a_refused_site_proxy_credential_leaves_no_key_in_the_urlsplit_cache() -
     cache_clear = getattr(urllib.parse.urlsplit, "cache_clear", None)
     if cache_info is None or cache_clear is None:
         pytest.skip("urllib.parse.urlsplit is not cached on this interpreter")
-    for url in (
-        "http://svc:SYNTHPW@proxy.example.org:3128",  # refused for the credential alone
-        "http://svc:SYNTHPW@proxy.example.org:3128/x",  # beside a shape fault: the fallback read
-        "http://:SYNTHPW@proxy.example.org:3128/x",  # a password alone beside a shape fault
-    ):
-        # Emptied first, so a full cache evicting as it inserts cannot hide an insert.
-        cache_clear()
-        with pytest.raises(
-            ValidationError, match=r"\[egress\]\.proxy_url holds a user or a password"
+    try:
+        for url in (
+            "http://svc:SYNTHPW@proxy.example.org:3128",  # the credential reads refuse it
+            "http://svc@proxy.example.org:3128/x",  # a user alone beside a shape fault: the fallback
+            "http://:SYNTHPW@proxy.example.org:3128/x",  # a password alone: the fallback too
         ):
-            EgressSettings(proxy_url=url, allowed_proxy=["proxy.example.org"])
-        assert cache_info().currsize == 0, url
-        # Control: the cached split of the same value is a key.
-        urllib.parse.urlsplit(url)
-        assert cache_info().currsize == 1, url
-    cache_clear()
+            # Emptied first, so a full cache evicting as it inserts cannot hide an insert.
+            cache_clear()
+            with pytest.raises(
+                ValidationError, match=r"\[egress\]\.proxy_url holds a user or a password"
+            ):
+                EgressSettings(proxy_url=url, allowed_proxy=["proxy.example.org"])
+            assert cache_info().currsize == 0, url
+            # Control: the cached split of the same value is a key.
+            urllib.parse.urlsplit(url)
+            assert cache_info().currsize == 1, url
+    finally:
+        # The control left a synthetic password in the cache; take it out whatever failed.
+        cache_clear()
 
 
 # --- review rounds 2 and 3: the report marks REFUSED exactly what the build refuses -------------
@@ -358,8 +361,9 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
     """Without this the agreement tests could pass with every case on one side, outbound or
     inbound. It pins the build as it is today: a build that refused a non-bool flag outright would
     move the lax cases to the refused side, and this control, not the agreement tests, would need
-    updating. A string ``"false"`` flag is left out on purpose: that it builds is a known gap, held
-    by :func:`test_a_string_false_flag_is_not_mirrored_as_set`, not an outcome to pin."""
+    updating. A lax-false string flag such as ``"false"`` is left out on purpose: it builds, which
+    is right, but the settings mirror reads it as set. That known gap is held by
+    :func:`test_a_lax_false_string_flag_is_not_mirrored_as_set`, not pinned here."""
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline.wiring_runner import _dest_config, _source_config
 
@@ -384,26 +388,35 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
         built = {name for name, refused in outcomes.items() if not refused}
         assert "revocation-int-1" in built
         assert {"revocation-int-reason", "revocation-no-reason"} <= set(outcomes) - built
+    # The cleartext family on both sides too.
+    assert not outbound["cleartext-int-0"]
     assert outbound["cleartext-int-reason"]
 
 
-_STRING_FALSE_GAP = (
-    "pre-existing on main and owed by a separate row: a string 'false' flag builds, and the "
-    "settings mirror reads it as set (_mirror_declarations tests the raw value by truthiness)"
+_LAX_FALSE_GAP = (
+    "pre-existing on main and owed by a separate row: a lax-false string flag ('false', 'no', "
+    "'off', '0') builds as False, but the settings mirror reads it as set, because "
+    "_mirror_declarations tests the raw value by truthiness"
 )
+_LAX_FALSE_CASES = [
+    {flag: text}
+    for flag in ("tls_revocation_attested", "cleartext_accepted")
+    for text in ("false", "no", "off", "0")
+]
 
 
-@pytest.mark.xfail(strict=True, reason=_STRING_FALSE_GAP)
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=_LAX_FALSE_GAP)
 @pytest.mark.parametrize(
     "extra",
-    [{"tls_revocation_attested": "false"}, {"cleartext_accepted": "false"}],
-    ids=["revocation-str-false", "cleartext-str-false"],
+    _LAX_FALSE_CASES,
+    ids=[f"{k}-{v}" for case in _LAX_FALSE_CASES for k, v in case.items()],
 )
-def test_a_string_false_flag_is_not_mirrored_as_set(extra: dict[str, Any]) -> None:
-    """Known gap, not the behaviour wanted: ``Destination`` reads ``"false"`` as ``False`` while
-    the settings mirror the token seams read holds ``True``. Strict, so the fix -- refusing the
-    string at build, or mirroring the typed value -- turns this into a pass that must drop the
-    mark. Either fix passes: a refused build, or a mirror that does not read the flag as set."""
+def test_a_lax_false_string_flag_is_not_mirrored_as_set(extra: dict[str, Any]) -> None:
+    """Known gap, not the behaviour wanted: ``Destination`` reads the string as ``False`` while the
+    settings mirror the token seams read holds ``True``. Strict, and only an ``AssertionError``
+    counts, so a fix -- mirroring the typed value, or refusing the string anywhere from the
+    connection's construction to its build -- turns this into a pass that must drop the mark, and
+    an unrelated crash is an error rather than the expected failure."""
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline.wiring_runner import _dest_config
 
@@ -415,7 +428,7 @@ def test_a_string_false_flag_is_not_mirrored_as_set(extra: dict[str, Any]) -> No
             EgressSettings(),
         )
     except ValueError:
-        return  # the build refuses the string: the gap is closed that way
+        return  # the string is refused, at construction or build: the gap is closed that way
     (key,) = extra
     assert not dest.settings.get(key)
 
