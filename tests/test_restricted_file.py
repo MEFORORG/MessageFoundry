@@ -386,9 +386,11 @@ def test_posix_raises_and_leaves_nothing_when_the_mode_does_not_read_back(
     created: set[int] = set()
     forged: list[int] = []
 
-    def opening(path_: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
-        fd = real_open(path_, flags, mode, dir_fd=dir_fd)
-        if os.fspath(path_) == os.fspath(path):
+    # Forward the call untouched rather than re-declare os.open's signature: a copied default
+    # mode can drift from os.open's own, and CodeQL flags a hand-written 0o777.
+    def opening(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        if os.fspath(kwargs["path"] if "path" in kwargs else args[0]) == os.fspath(path):
             created.add(fd)
         return fd
 
