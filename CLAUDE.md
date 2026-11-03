@@ -476,9 +476,9 @@ transfer is, in order: the hold's URL sent to the Repair Manager with `send_mess
 and no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
 `<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair Manager's CCD `local_` id
 copied whole; and mail to the original author's seat-record worktree where it has one, naming the
-PR URL and that id. A Repair Manager that does not find the marker re-reads once, and otherwise
-reports to the Lander and stops. Minimizing the newest marker cancels the transfer and hands the
-PR back to the original author. At least stacks, landing order, author intent and anything
+PR URL and that id. A Repair Manager that does not find the marker re-reads once after its
+research, and otherwise reports to the Lander and stops. Minimizing the newest marker, and any
+older one still unminimized, cancels the transfer and hands the PR back to the original author. At least stacks, landing order, author intent and anything
 already waiting on an owner ruling stay with the original author. Like the Lander and the
 Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
 raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
