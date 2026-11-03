@@ -451,11 +451,12 @@ whatever its running state (the Lander reads this with `list_events` or korus
 an older orphaned ask); the PR is not queued and has no armed auto-merge request; the hold names
 one determinate fix, not a question of intent, of an owner ruling or of behaviour; and the PR is
 not ASVS record content, which stays a Manager's. The Builder fetches before it pushes, never
-force-pushes, stops if the head moved, and makes only the fixes the hold names. One repair per PR; a second hold goes to a spawned Manager. Every other non-trivial fix
-still goes to a spawned Manager session, as the paragraph above says. The Lander merges only once a
-code-review fork at `xhigh` that the Lander starts itself, on the repair head, covers it, its tag
-read with `review_tag.py`; the repair Builder's own QA does not count. That independent review is
-what keeps authoring apart from landing.
+force-pushes, stops if the head moved, and makes only the fixes the hold names. One repair per
+PR; a second hold goes to a spawned Manager. Every other non-trivial fix still goes to a spawned
+Manager session, as the paragraph above says. The Lander merges only once a code-review fork at
+`xhigh` that the Lander starts itself, on the repair head, covers it, its tag read with
+`review_tag.py`; the repair Builder's own QA does not count. That independent review is what keeps
+authoring apart from landing.
 
 **A held PR whose author has not acknowledged the hold within 2 hours transfers to the Repair
 Manager** (owner ruling 2026-11-03: asked *"Which tiers do you want to adopt?"* of the Repair
