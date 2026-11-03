@@ -5775,9 +5775,10 @@ def create_app(
         """Set the object-of-interest flag on a connection in the running graph (#131, BACKLOG
         #2623). The store holds the flag, so a toggle runs no config module and writes no file, and
         the flag and its ``connection_flag_set`` row commit together. A name the graph does not have
-        is refused **409**, as is a toggle once a shutdown's drain has begun, and a toggle the store
-        did not confirm **503**, which does not say the flag is unchanged
-        (:class:`ConnectionFlagNotRecorded`). The request deadline ends this handler's wait, not the
+        is refused **409**, as is a toggle that arrives once a shutdown's drain has begun or reaches
+        the engine's write lock after that. A toggle the store did not confirm is refused **503**,
+        which does not say the flag is unchanged (:class:`ConnectionFlagNotRecorded`), and so is one
+        still queued for that lock when its wait runs out, drain or not. The request deadline ends this handler's wait, not the
         write (:meth:`Engine.set_connection_flag`). Paced and audited.
 
         Gated by ``config:deploy``, which the flag's old home justified and which stays by decision:

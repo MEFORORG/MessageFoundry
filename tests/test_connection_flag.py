@@ -670,10 +670,12 @@ class _SlowFirstWrite:
     """Holds the first flag write open until :attr:`release`, around the real store, and lets every
     later write through, so a later toggle nothing holds back overtakes it.
 
-    A clear that overtakes takes the one branch here that is not the real store, because SQLite's
-    one writer rules out what a READ COMMITTED server allows and no test here runs a server: a clear
-    during an uncommitted set sees no row, deletes nothing, and still appends its audit row, after
-    the set's, because that row waits on the audit lock the set holds."""
+    A clear that overtakes takes the one branch here that is not the real store. It models a READ
+    COMMITTED server store that took the audit lock only at the append: a clear during an
+    uncommitted set saw no row, deleted nothing, and still appended its audit row, after the set's.
+    The server stores now take that lock before the flag statement, which the cross-handle contract
+    in ``tests/_operator_audit_atomic_contract.py`` pins, so the engine lock here keeps arrival
+    order, and the branch is what a store without that lock would do."""
 
     def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         self.entered, self.release, self.first_done = (asyncio.Event() for _ in range(3))

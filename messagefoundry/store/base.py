@@ -1417,7 +1417,11 @@ class QueueStore(StoreLifecycle, Protocol):
         """Set or clear the operator's object-of-interest flag on ``connection`` in ``direction``
         (BACKLOG #2623), with ``audit`` appended in the same transaction, so a failed append changes
         nothing. Setting a flag already set, or clearing one that is not, still appends the row: the
-        audit log records what the operator asked for."""
+        audit log records what the operator asked for.
+
+        Two calls, from any process on the store, run one after the other: a server backend takes
+        its audit lock before the flag statement and holds it to the commit, and SQLite has one
+        writer. So the flag always matches the newest row a call appended."""
         ...
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:

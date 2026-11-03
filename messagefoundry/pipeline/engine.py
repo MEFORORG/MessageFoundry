@@ -752,10 +752,10 @@ class Engine:
         # gets the lock below after that, is refused.
         self._config_writes_closed = False
         # Serializes those writes in this process, each held by its tracked task, so a write whose
-        # caller has gone keeps it. Overlapping toggles of one connection could leave the flag
-        # disagreeing with the newest audit row (ADR 0007, amendment of 2026-10-31). asyncio.Lock
-        # wakes waiters in arrival order, so the last toggle lands last. It reaches no other
-        # process; set_connection_flag's docstring says what that leaves.
+        # caller has gone keeps it. asyncio.Lock wakes waiters in arrival order, so the last toggle
+        # lands last. The store's audit lock, taken before the flag statement, is what keeps the
+        # flag and its newest audit row in step, across processes too (ADR 0007, amendment of
+        # 2026-10-31).
         self._config_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
@@ -2575,13 +2575,11 @@ class Engine:
         not land.
 
         That task holds the engine's write lock across the store call, so this process's toggles
-        land one at a time, in arrival order, and the flag matches the newest
-        ``connection_flag_set`` row. The lock frees when the store call has ended, which a commit
-        may outlive, at least one cut off at the bound, so such a commit can still overlap the next
-        toggle. The lock also reaches no other process: engine shards and cluster nodes share the
-        store, so two of them can overlap. ADR 0007's amendment of 2026-10-31 says what the flag and
-        that row could then do, and that no engine path reads the flag does not make it cosmetic:
-        until the next toggle, the marker, Flagged only and the record could all be wrong."""
+        reach the store one at a time, in arrival order. What keeps the flag matching the newest
+        ``connection_flag_set`` row is the store: each server backend takes its audit lock before
+        the flag statement and holds it to the commit, and SQLite has one writer. That holds across
+        engine shards and cluster nodes, which share the store and not this lock, and for a commit
+        that outlives its store call, such as one cut off at the bound."""
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         live = self._registry_runner

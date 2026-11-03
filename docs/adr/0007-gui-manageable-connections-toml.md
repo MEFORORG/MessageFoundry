@@ -243,8 +243,8 @@ it could reach only its own copy.
 
    **An engine's toggles land one at a time, in arrival order.** The tracked task holds an engine
    lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
-   Without it, a clear running beside an uncommitted set could delete nothing on Postgres and still
-   append the newest row. The wait for the lock has its own 10 seconds, and the store call then gets
+   The store's audit lock, below, keeps the flag and its newest row in step whatever the order; this
+   lock keeps the order the toggles arrived in. The wait for the lock has its own 10 seconds, and the store call then gets
    a fresh 10, so past the auth gate a toggle's wall-clock ceiling is about two bounds plus the
    store's unwind, and time in the queue does not cut off a store call. A toggle still queued when its wait runs out answers
    the same 503, having written nothing, rather than meeting the request deadline. If the stuck
@@ -288,16 +288,24 @@ hidden rows included. Unticked, a click adds every row it can take and leaves th
 That states what the box does, and accepts nothing further. The toggle gives the same reach with an
 audit row: at least the Deployment role holds `config:deploy` and no bulk-action permission.
 
-**Left open: the engine lock reaches one process. Not an accepted residual.** Engine shards and
-cluster nodes share the store and each holds its own lock, so two of them can toggle one connection
-at once. On Postgres at READ COMMITTED, a clear beside another process's uncommitted set deletes
-nothing and then waits on the audit lock, so the flag would stay set under a newest row that says it
-is clear, until the next toggle. The reverse is open too: a set of a flag already set changes no row,
-so a clear beside it would leave no flag under a newest row that says set. One process can reach
-these states at least through a commit that outlives its store call, cut off at the bound or with
-its answer lost, since the lock frees when that call ends. All of this is read from the store's code
-and was not run on a server, and SQL Server was not examined for it. SQLite's writer runs one
-transaction at a time, so a toggle there is whole. No database lock was built for this.
+**Closed (2026-11-03): toggles from different processes run one after the other.** Engine shards
+and cluster nodes share the store and each holds its own engine lock, so two of them can toggle one
+connection at once. While the store took its audit lock only at the append, at READ COMMITTED that
+let the flag and the newest `connection_flag_set` row disagree until the next toggle. On Postgres a
+clear beside another process's uncommitted set deleted nothing and appended the newer row; a set of
+a flag already set changed no row, so a clear beside it could commit first; and a clear of nothing
+let a set beside it commit first. On SQL Server the last of these was open, since a delete that
+matches no row locks nothing there. One process could reach the same states through a commit that
+outlived its store call, since the engine lock frees when that call ends.
+
+Each toggle now takes the store's audit lock before its flag statement and holds it to the commit:
+Postgres's audit advisory lock, at READ COMMITTED pinned, and SQL Server's audit applock, taken
+again on each retry of the flag statement. A later toggle's flag statement therefore runs after the
+earlier toggle has committed, and its row is the newer, from any process and whenever the earlier
+call's caller stopped waiting. Only toggles write `connection_flag`, and each takes the audit lock
+first, so the row lock under it cannot cycle. SQLite's writer runs one transaction at a time, so a
+toggle there was always whole. Nothing of this gap remains open; a database writer outside the store
+is the accepted residual above.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.
@@ -323,6 +331,14 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
   call ends with its commit, THE SYSTEM SHALL land them in arrival order, so the flag matches the
   newest `connection_flag_set` row, whether or not the earlier caller is still waiting.
   → `tests/test_connection_flag.py::test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row`
+- **AC-7** — WHEN two store handles on one database toggle one connection and the first is held open
+  between its flag statement and its commit, THE SYSTEM SHALL keep the second's flag statement
+  waiting until that commit, so the flag matches the newest `connection_flag_set` row.
+  → `tests/_operator_audit_atomic_contract.py::assert_connection_flag_ordered_across_stores`, run
+  live by the Postgres and SQL Server suites (hosted CI only) and on SQLite by
+  `tests/test_operator_mutation_audit_atomic.py`; the lock order is pinned offline by
+  `tests/test_connection_flag.py::test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statement`
+  and `tests/test_sqlserver_cipher_retry.py`.
 
 ---
 
