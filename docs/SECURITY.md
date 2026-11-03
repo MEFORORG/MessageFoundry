@@ -4704,19 +4704,28 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   limit too. That is a reading by likeness to the per-account sweep, not one traced for the
   table-wide statement, and the lock-order bullet below does not cover its every-account lock
   footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592), with
-  at least the two exceptions below. Each of these raises the account's session epoch in the same
+  at least the exception below. Each of these raises the account's session epoch in the same
   transaction, and a rotation keeps the epoch the session was sealed under. So the gate refuses
   and ends the session, and the user's own session list hides it and ends it the same way.
-  **The first exception is the every-account revoke's, on the PostgreSQL and SQL Server
-  stores:** it raises the session epoch only for the accounts its one read of the account list
-  returns, so it may fail to end a session of an account that read does not return, for example
-  an account created while the revoke runs, and such a session would stay live. This was read
-  from the code and has not been run or traced in detail, and closing it is follow-up work. The
-  SQLite store takes its write lock before that read.
-  **The second exception,** for every other sweep this bullet names, and for the every-account
-  revoke only for a session of an account its read returned: a request from a missed session to
-  end the user's other sessions, accepted just before the sweep commits, waits for it and then
-  stamps the session with the new epoch, so it stays usable.
+  **The every-account revoke also raises the store's global session epoch, on all three stores
+  (BACKLOG #5091).** Every session is stamped with that epoch when it is minted and resolves
+  only while it is current, so the revoke ends a session whatever its read of the account list
+  returned. That covers a session of an account created while the revoke runs, a session its
+  sweep missed, and a session of an account whose record fails its seal at the revoke, whose own
+  epoch the revoke cannot raise, even once that record verifies again. A sign-in that commits
+  before the revoke does read the global epoch the revoke replaces, so it ends too.
+  `tests/test_b5091_global_session_epoch.py` replays the first and third cases on each store,
+  the Postgres leg also runs a sign-in that commits inside a revoke, and both server legs run a
+  revoke racing sign-ins. The SQL Server store raises the global epoch last, after its sweep, for
+  the lock-order reason its `revoke_all_sessions` states. That reasoning was read from the code,
+  and the only test of it is that race. The global row is not sealed, so whoever can write the database
+  could lower it and revive a session that only the global epoch had ended.
+  **The exception,** for every sweep this bullet names: a request from a missed session,
+  accepted just before the sweep commits, waits for it and then stamps the session with the
+  account's new epoch, so it stays usable. Against the every-account revoke, that request must be
+  a second every-account revoke, which needs `users:manage` and a step-up, because only that
+  revoke stamps the global epoch. A request to end the user's own other sessions stamps the
+  account's epoch alone, so the session still ends.
   **At least three things are also wrong about a refused one.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. The report is rate-limited per session, and the alert goes through the alert notifier's
@@ -4728,8 +4737,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
   until the session is presented or listed, the store still holds it as live. A follow-up row,
   not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
-  session, so no rotated session is missed. That would not change the -1 count, or the first
-  exception. The Postgres store follows a rotated row and the SQLite store runs one writer at a
+  session, so no rotated session is missed. That would not change the -1 count. The Postgres store follows a rotated row and the SQLite store runs one writer at a
   time, so neither misses a rotated session. The rotation miss was read from the code and has not
   been reproduced against a server. A bind ends sessions only: an engine factor already enrolled
   on the account stays.
