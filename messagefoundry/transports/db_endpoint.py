@@ -157,8 +157,9 @@ SQLSERVER_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
 
 #: The ``odbc_driver`` names the SQL Server preset accepts, whole, in lower case and spelled with
 #: single spaces: Microsoft's registered names for its ODBC Driver (``13.1`` included) and its SQL
-#: Server Native Client. Whole names on purpose, as the password escape list in
-#: :mod:`messagefoundry.transports.database` reads them. Why another name is refused is in
+#: Server Native Client. Whole names on purpose. The password escape list in
+#: :mod:`messagefoundry.transports.database` is a separate list, and holds neither ``13.1`` nor
+#: the Native Client. Why another name is refused is in
 #: docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds* (BACKLOG #4873).
 _PRESET_DRIVER_NAMES = re.compile(
     r"odbc driver [0-9]+(?:\.[0-9]+)? for sql server|sql server native client [0-9]+(?:\.[0-9]+)?"
@@ -181,9 +182,13 @@ def _preset_driver(name: object) -> bool:
     Blanks are NOT folded, unlike :func:`odbc_keyword_name` (docs/CONNECTIONS.md says why). The
     text must be ASCII, which refuses a no-break space, and printable, which refuses a tab and the
     ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks. The strip test is for a path:
-    the file-name pattern does not see a blank that leads its directory."""
+    the file-name pattern does not see a blank that leads its directory. A path that opens with
+    two separators, a UNC or device path, or holds ``://`` is refused: it can name a library on
+    another host. A mapped drive or a mount is not visible here."""
     text = str(name or "")
     if not (text.isascii() and text.isprintable()) or text != text.strip():
+        return False
+    if text[:2] in ("\\\\", "//", "\\/", "/\\") or "://" in text:
         return False
     lowered = text.lower()
     return bool(

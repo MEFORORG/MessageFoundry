@@ -75,6 +75,11 @@ REFUSED_DRIVERS = [
     # A library file name needs its dot before the extension.
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18so",
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18..so",
+    # A path that can name a library on another host.
+    r"\\files.test.invalid\share\msodbcsql18.dll",
+    r"\\?\C:\Windows\System32\msodbcsql18.dll",
+    "//files.test.invalid/share/libmsodbcsql-18.so",
+    "file://files.test.invalid/share/libmsodbcsql-18.so",
 ]
 
 ACCEPTED_DRIVERS = [
