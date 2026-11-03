@@ -1160,9 +1160,9 @@ async def test_source_handler_failure_does_not_lose_the_row_under_a_high_water_m
 async def test_source_handler_failure_emits_a_handler_error_event() -> None:
     """BACKLOG #4921, the visibility half. Stopping the batch means one row that fails every time
     holds the feed, so the failure must reach the event log, not only a WARNING. One event per
-    poll, NULL peer (a poll source dials out), and a reason that leads with the fixed outcome, so
-    the store's 200-character bound cuts the error text and never the outcome, and names the
-    driver error but not the value it quotes.
+    poll, NULL peer (a poll source dials out), and a reason that leads with the fixed outcome, which
+    is what lets the store's 200-character bound cut the error text rather than the outcome (this
+    test reads the sink, not the store), and names the driver error but not the value it quotes.
 
     Red mutation: delete the ``_emit_event`` call in ``_ingest_row``. Reds here."""
     truncated = (

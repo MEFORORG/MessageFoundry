@@ -902,33 +902,43 @@ async def test_db_the_batch_holds_each_body_once_unless_the_mark_binds_it() -> N
     assert batch.rows == [({"id": 0, "payload": _ADT.format(n=0)}, _ADT.format(n=0).encode())]
 
 
-_PLAIN_UNICODE_ERROR_CODEC = "mefor_test_plain_unicode_error"
+_REFUSING_CODEC = "mefor_test_refusing_codec"
 
 
-def _plain_unicode_error_codec(name: str) -> codecs.CodecInfo | None:
-    """A text codec that refuses every non-empty input with a plain ``UnicodeError``, not a
-    ``UnicodeEncodeError``. It passes the build's ``"".encode(...)`` probe."""
-    if name != _PLAIN_UNICODE_ERROR_CODEC:
-        return None
+def _refusing_codec(exc_type: type[Exception]) -> Callable[[str], codecs.CodecInfo | None]:
+    """A codec search function for a text codec whose encoder raises ``exc_type`` on every
+    non-empty input. It passes the build's ``"".encode(...)`` probe."""
 
-    def encode(text: str, errors: str = "strict") -> tuple[bytes, int]:
-        if text:
-            raise UnicodeError("refused")
-        return b"", 0
+    def search(name: str) -> codecs.CodecInfo | None:
+        if name != _REFUSING_CODEC:
+            return None
 
-    return codecs.CodecInfo(encode, codecs.lookup("ascii").decode, name=_PLAIN_UNICODE_ERROR_CODEC)
+        def encode(text: str, errors: str = "strict") -> tuple[bytes, int]:
+            if text:
+                raise exc_type("refused")
+            return b"", 0
+
+        return codecs.CodecInfo(encode, codecs.lookup("ascii").decode, name=_REFUSING_CODEC)
+
+    return search
 
 
-async def test_db_a_codec_that_raises_a_plain_unicode_error_skips_the_row() -> None:
-    """A codec need not raise ``UnicodeEncodeError``. Any ``UnicodeError`` is a ``ValueError``, so
-    ``_select`` skips the row and the poll goes on, rather than the error ending the poll as a poll
-    failure that recurs on every tick (BACKLOG #4921).
+@pytest.mark.parametrize("exc_type", [UnicodeError, LookupError, RuntimeError])
+async def test_db_a_codec_that_raises_something_else_skips_the_row(
+    exc_type: type[Exception],
+) -> None:
+    """A codec need not raise ``UnicodeEncodeError``. Whatever it raises, ``_select`` skips the row
+    and the poll goes on, rather than the error ending the poll as a poll failure that recurs on
+    every tick (BACKLOG #4921). The reason names the exception type, not the value.
 
-    Red mutation: catch only ``UnicodeEncodeError`` around the encode. The poll then raises."""
-    codecs.register(_plain_unicode_error_codec)
+    Red mutation: catch only ``UnicodeEncodeError`` around the encode, and every case reds. Second
+    red mutation: drop the conversion in ``_through_codec``, and the ``LookupError`` and
+    ``RuntimeError`` cases red."""
+    search = _refusing_codec(exc_type)
+    codecs.register(search)
     try:
         table = _FakeTable(0, rows=[(0, "A"), (1, "B")])
-        src = _db_source(encoding=_PLAIN_UNICODE_ERROR_CODEC)
+        src = _db_source(encoding=_REFUSING_CODEC)
         _attach(src, table)
         sink = _CapturingSink()
         src.on_connection_event = sink
@@ -936,7 +946,7 @@ async def test_db_a_codec_that_raises_a_plain_unicode_error_skips_the_row() -> N
         src._handler = handler
         await src._poll_once()
     finally:
-        codecs.unregister(_plain_unicode_error_codec)
+        codecs.unregister(search)
     assert handler.bodies == []
     assert [kind for kind, _peer, _reason in sink.events] == ["row_undecodable", "row_undecodable"]
     assert len(table.rows) == 2  # not marked

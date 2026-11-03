@@ -3351,8 +3351,9 @@ class DatabaseSource(SourceConnector):
                 # never select. That holds only while poll_statement returns rows in cursor order;
                 # an earlier row with a higher key has already moved the cursor. The failed row and
                 # every row behind it wait for the next poll, so a row that fails every time holds
-                # back the rows behind it (head-of-line). With no mark_statement there is nothing
-                # to protect and every row is read again anyway, so the batch goes on.
+                # back the rows behind it (head-of-line). With no mark_statement no mark can move
+                # past the failed row, so stopping would not make it any likelier to be read again,
+                # and the batch goes on.
                 break
 
     async def _ingest_row(self, record: dict[str, Any], raw: bytes) -> bool:
@@ -3407,7 +3408,7 @@ class DatabaseSource(SourceConnector):
         **Decoding and encoding happen HERE, under the open cursor, and that is what lets the ceiling
         count rows that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and
         cheap — a dict lookup or a ``json.dumps``, then ``str.encode`` — so running it at the fetch
-        costs nothing extra and means a row the source cannot read, or whose body
+        costs little and means a row the source cannot read, or whose body
         the configured ``encoding`` cannot carry (BACKLOG #4921), is replaced rather than spending a
         ceiling slot on nothing, and counts against the same skip budget. The shipped code
         charged the ceiling at the fetch and skipped the row afterwards, so one undecodable row sorting
@@ -3487,7 +3488,7 @@ class DatabaseSource(SourceConnector):
                     record = dict(zip(columns, row))  # noqa: B905
                     try:
                         raw = self._body(record)
-                    except (ValueError, TypeError, LookupError) as exc:
+                    except (ValueError, TypeError) as exc:
                         skipped.append(safe_exc(exc))
                         if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
                             budget_spent = True
@@ -3530,10 +3531,9 @@ class DatabaseSource(SourceConnector):
     def _body(self, record: dict[str, Any]) -> bytes:
         """The bytes the handler gets for one row: a single column verbatim (``body_column``) or the
         whole row as JSON, encoded in the configured ``encoding``. A row that cannot become them
-        raises ``ValueError``, ``TypeError`` or ``LookupError``, which :meth:`_select` skips. That
-        includes a body the encoding cannot carry (BACKLOG #4921), since every ``UnicodeError``,
-        encode or decode, is a ``ValueError``; ``LookupError`` is a codec the registry no longer
-        finds, which the build's codec check makes unlikely rather than impossible."""
+        raises ``ValueError`` or ``TypeError``, which :meth:`_select` skips. That includes a body
+        the encoding cannot carry (BACKLOG #4921): :meth:`_through_codec` makes every codec failure
+        a ``ValueError``."""
         if self._body_column is not None:
             try:
                 value = record[self._body_column]
@@ -3542,12 +3542,26 @@ class DatabaseSource(SourceConnector):
                     f"body_column {self._body_column!r} is not in the poll_statement result columns"
                 ) from None
             if isinstance(value, (bytes, bytearray)):
-                text = bytes(value).decode(self._encoding)
+                text = self._through_codec(bytes(value).decode)
             else:
                 text = value if isinstance(value, str) else str(value)
         else:
             text = json.dumps(record, default=_json_default)
-        return text.encode(self._encoding)
+        return self._through_codec(text.encode)
+
+    def _through_codec[T](self, call: Callable[[str], T]) -> T:
+        """Run one decode or encode in the configured ``encoding``, so that whatever the codec
+        raises is a ``ValueError`` and :meth:`_select` skips the row (BACKLOG #4921). Any other
+        exception would end the poll instead, on every tick while the row stays. A ``UnicodeError``
+        is a ``ValueError`` already; the conversion covers a codec that raises something else,
+        such as a ``LookupError`` once the registry no longer finds it. It wraps only the codec
+        call, so a fault elsewhere in :meth:`_body` still surfaces as a poll failure."""
+        try:
+            return call(self._encoding)
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a codec's failure is this row's, never the poll's
+            raise ValueError(f"the {self._encoding!r} codec raised {type(exc).__name__}") from exc
 
     async def _mark(self, record: dict[str, Any]) -> None:
         if self._mark_sql is None:
