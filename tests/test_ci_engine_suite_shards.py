@@ -226,6 +226,7 @@ def test_shard_two_still_gates_a_merge() -> None:
     names = [str(s.get("name")) for s in gating]
     assert {_STEP, "Step margin -- engine suite"} <= set(names), names
     assert any("--check-collection" in str(s.get("run")) for s in gating), names
-    softened = [n for n, s in zip(names, gating, strict=True) if "continue-on-error" in s]
+    assert gating, "no test-shard2 step runs the suite, the margin check or the guard"
+    softened = [str(s.get("name")) for s in gating if "continue-on-error" in s]
     assert not softened, f"test-shard2 steps carry continue-on-error: {softened}"
     assert "test-shard2" in jobs["ci-gate"]["needs"]

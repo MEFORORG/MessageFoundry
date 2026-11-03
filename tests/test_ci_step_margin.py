@@ -1086,6 +1086,7 @@ def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_sui
     # console step were moved back beside the engine one with its own knob.
     assert len(set(caps.values())) == len(caps), f"gated suites share a cap expression: {caps}"
     # Each gated job holds one gated step, so no suite is queued behind another in one job.
+    assert len(_GATED.values()) >= 2, "fewer than two gated suites, so nothing is compared"
     for job_name, (gated, _, _) in _GATED.items():
         names = [s.get("name") for s in _job(job_name)["steps"]]
         others = [g for g, _, _ in _GATED.values() if g != gated and g in names]

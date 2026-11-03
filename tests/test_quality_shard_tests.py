@@ -115,7 +115,7 @@ def test_the_test_shards_partition_the_engine_step_s_file_set(
     print(f"[shards] engine: shard 1 {len(engine[1])}, shard 2 {len(engine[2])} files")
     assert sorted(listed) == expected
     assert len(set(listed)) == len(listed), "a file is in both test shards"
-    assert engine[1] and engine[2], "an test shard is empty"
+    assert engine[1] and engine[2], "a test shard is empty"
 
 
 def test_the_engine_suite_leaves_the_console_package_out_and_the_coverage_suite_keeps_it(
