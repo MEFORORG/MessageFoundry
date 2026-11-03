@@ -9,8 +9,11 @@
     statusLine is the only source). Adds the two things a raw reading cannot give you: a BURN RATE, and
     the only question that actually matters operationally -- WILL THIS WINDOW RUN OUT BEFORE IT RESETS?
 
-    A percentage on its own does not answer that. 80% with two hours left and nothing running is fine;
-    45% with 30 minutes left and six sessions compiling is not.
+    A percentage on its own does not answer that. 80% with a day left and nothing running is fine; 45%
+    with three hours left and six sessions compiling is not.
+
+    ONE WINDOW: `seven_day`, so the verdict below is the weekly window's. usage-collect.ps1's header
+    says why.
 
     WHICH ACCOUNT'S NUMBERS. This root's. The publish path is per config root -- see usage-collect.ps1
     for why, stated once there -- so a bare invocation answers for the account THIS session booted
@@ -19,11 +22,18 @@
     FOUR HONESTY RULES, because a usage tool that is confidently wrong is worse than no usage tool --
     it converts "I should check" into "I already know".
 
-      1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was observed.
-         Windows are aged INDEPENDENTLY, because they are published independently.
-      2. REFUSE TO PROJECT ON STALE OR THIN DATA. Below two fresh samples in the current window, or past
-         -MaxAgeMinutes, the answer is UNKNOWN. Not an extrapolation, not a last-known value dressed up
-         as current.
+      1. NO PERCENTAGE WITHOUT ITS AGE. Every number is printed with how long ago it was last confirmed:
+         it changed, or a session that had just called the API reported it. An idle session's repeat
+         does not count; usage-collect.ps1 says why.
+      2. DO NOT LET A STALE NUMBER CLEAR ANYTHING. Past -MaxAgeMinutes the window's state is UNKNOWN,
+         not a last-known value dressed up as current. At least these still stop work on it:
+           - a level_floor at the ceiling, which sets CRITICAL, as "at least this";
+           - a level_floor at the gate's own level (HoldAt), which Get-DecisionCostRung reads for itself
+             while this verdict stays UNKNOWN, because below the ceiling a floor is only a lower bound;
+           - a rate from its history rows that projects a run-out, counted from now, before the reset or
+             with no reset, which sets CRITICAL.
+         Below two samples in the current window there is no rate and no projection, and the percentage
+         bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -43,9 +53,15 @@
 
     EXIT CODES, so a coordinator can branch without parsing prose:
         0  OK
-        10 WARN        -- high, or projected to exhaust before reset with slack
-        11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling
-        20 UNKNOWN     -- no data, stale data, not enough samples, or a reading this root may not trust
+        10 WARN        -- high, or projected to exhaust before reset with slack, on a fresh reading only
+        11 CRITICAL    -- projected to exhaust before reset, or already at the ceiling, fresh or as a
+                          stale level_floor. A stale reading, or one dated after now, reaches this too: at
+                          the ceiling, projected to exhaust before reset, or projected at all with no reset
+                          time
+        20 UNKNOWN     -- no data, stale data with no level_floor at the ceiling, a window whose reset has
+                          passed, a reading dated after now with none of the above, or a reading this root
+                          may not trust. A level_floor below the ceiling reads UNKNOWN too, because the
+                          number is only a lower bound; the gate reads level_floor for itself
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
     Every diagnostic state added for the per-root publish path is UNKNOWN/20: they distinguish WHICH
     FIX to apply, not how bad the situation is, and a coordinator branches on the codes above.
@@ -89,12 +105,12 @@ param(
     [string]$StateDir,
     # Machine-readable, for the coordinator.
     [switch]$Json,
-    # Older than this and a reading is reported but NOT projected from.
+    # Older than this and a reading is stale: reported, and projected only to find a run-out (rule 2).
     [int]$MaxAgeMinutes = 20,
     # Rate is measured over at most this much recent history.
     [int]$RateWindowMinutes = 90,
     # One line per config root on this box. A SURVEY, NEVER A MERGE: these are different accounts with
-    # different 5h and 7d pools, so summing, averaging or taking a worst-of across them would rebuild
+    # different 7d pools, so summing, averaging or taking a worst-of across them would rebuild
     # the exact lie the per-root publish path removes.
     [switch]$AllRoots,
     # A parameter for the test-safety reason config-roots.ps1 states.
@@ -139,9 +155,9 @@ if (-not $StateDir) { $StateDir = Get-UsageStateDir $rootInfo.Path }
 $avail = Get-RootUnavailability -StateDir $StateDir
 if ($avail.state -in @('UNAVAILABLE', 'MALFORMED')) {
     $availRoot = Split-Path $StateDir -Parent
-    # NO five_hour / seven_day KEYS AT ALL, deliberately. Emitting them as nulls would let a consumer
-    # that reaches straight for a percentage read this as a window that merely has not published yet.
-    # Their absence is what forces the state to be looked at.
+    # NO seven_day KEY AT ALL, deliberately. Emitting it as null would let a consumer that reaches
+    # straight for a percentage read this as a window that merely has not published yet. Its absence
+    # is what forces the state to be looked at.
     if ($Json) {
         [ordered]@{
             state          = "UNAVAILABLE"
@@ -284,8 +300,10 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
     # starts (BACKLOG #1459; measured on a live account root 2026-09-30).
     #
     # NOT IN $dxUntrusted, ON PURPOSE. On a box where Claude Code runs the statusLine under bash no
-    # fresh reading can exist, and the age refusal already turns an old one into UNKNOWN. On a box where
-    # it runs under some other shell the command may work, and a fresh reading it wrote is real.
+    # fresh reading can exist, and an old one reads UNKNOWN. On a box where it runs under some other
+    # shell the command may work, and a fresh reading it wrote is real. THE COST: an old reading that
+    # is stamped, with its reset ahead, also sets level_floor here, so the gate can HALT on a number
+    # that nothing on this root may be able to correct. ADR 0211 states it as a limit.
     if (Test-IsPowerShellSourceStatusLine $cmd) {
         $o.state = "WIRED_POWERSHELL_SOURCE"
         $o.line = "WIRED (ours) but the command is PowerShell source. Claude Code runs a statusLine under bash where Git Bash is installed, and bash cannot parse it, so pwsh never starts and nothing publishes. WAITING WILL NOT FIX THIS."
@@ -392,35 +410,55 @@ function Get-AgeMinutes($v) {
     return [math]::Round(($nowUtc - $t).TotalMinutes, 1)
 }
 
+# DATED AFTER NOW, at any distance. This compares the instants, because an age is rounded and a stamp
+# seconds ahead rounds to 0. There is no tolerance, because a real stamp needs none: the collector stamps
+# before it writes, this script opens the document before it reads the clock, and both use this box's
+# clock. So a reading dated ahead means the clock stepped back or the stamp is wrong. Get-WindowReport
+# says what such a reading does.
+function Test-DatedAfterNow($v) {
+    $t = ConvertTo-UtcDateTime $v
+    return [bool]($null -ne $t -and $t -gt $nowUtc)
+}
+
 # --- burn rate ------------------------------------------------------------------------------------
 #
 # ONLY WITHIN ONE WINDOW EPOCH. When a window resets, the percentage falls off a cliff (90 -> 0). A rate
 # computed across that boundary is a large NEGATIVE number, which would read as "consumption has stopped"
 # at the exact moment a fresh window starts being spent. Rows are therefore grouped by their reset epoch
 # and only rows sharing the CURRENT epoch are used.
-function Get-Rate([string]$Key, [string]$ResetKey, $CurrentResetEpoch) {
+function Get-Rate($CurrentResetEpoch) {
     if (-not (Test-Path -LiteralPath $histPath)) { return $null }
     $rows = @()
     try {
         foreach ($line in (Get-Content -LiteralPath $histPath -Tail 400 -ErrorAction Stop)) {
             try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ($null -eq $r.$Key) { continue }                       # carried-forward or absent: not an observation
-            if ($CurrentResetEpoch -and ($r.$ResetKey -ne $CurrentResetEpoch)) { continue }  # a previous window
+            # Carried forward, absent or not a percentage: not an observation. A NaN row would turn the
+            # whole rate into NaN and clear a burn, and a blank row reads as 0 and fakes one.
+            $observed = Get-Percentage $r.seven_day
+            if ($null -eq $observed) { continue }
+            if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
             $age = Get-AgeMinutes $r.at
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
-            $rows += [pscustomobject]@{ AgeMin = $age; Pct = [double]$r.$Key }
+            $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
         }
     } catch { return $null }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
     $oldest = $rows | Sort-Object AgeMin -Descending | Select-Object -First 1
-    $newest = $rows | Sort-Object AgeMin | Select-Object -First 1
-    $spanH = ($oldest.AgeMin - $newest.AgeMin) / 60.0
+    # THE SPAN RUNS FROM THE OLDEST ROW TO THE NEWEST ROW, ON RAW AGES, AND THERE IS NO MINIMUM. So a burn
+    # that stopped keeps reading as a burn until its rows leave the window, and one tick seconds apart
+    # reads as a fast burn. Both can stop work on a pool that has room, and a false stop is the safe
+    # direction. A row dated after now has a negative age and stays in the span: dropping it, or clamping
+    # it to 0, lost or understated a rate that stopped work on a real burn.
+    $newestRow = $rows | Sort-Object AgeMin | Select-Object -First 1
+    $spanH = ($oldest.AgeMin - $newestRow.AgeMin) / 60.0
     if ($spanH -le 0) { return $null }
-    $delta = $newest.Pct - $oldest.Pct
+    # THE HIGHEST PERCENTAGE IS THE LEVEL IT REACHED. Usage does not fall inside a window, and a row's date
+    # can be wrong, so a low row ahead of the clock cannot turn the rate negative and clear a burn.
+    $delta = ($rows | Sort-Object Pct -Descending | Select-Object -First 1).Pct - $oldest.Pct
     return [pscustomobject]@{
         PctPerHour = [math]::Round($delta / $spanH, 2)
         Samples    = $rows.Count
-        SpanMin    = [math]::Round($oldest.AgeMin - $newest.AgeMin, 1)
+        SpanMin    = [math]::Round($oldest.AgeMin - $newestRow.AgeMin, 1)
     }
 }
 
@@ -434,7 +472,54 @@ function Test-WindowFromRoot($w, [string]$ReadRoot) {
     return [bool](Test-SameRoot $e $ReadRoot)
 }
 
-function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [string]$ReadRoot) {
+# A READING WHOSE RESET HAS PASSED DESCRIBES A WINDOW THAT IS GONE. Its level says nothing about the
+# window now running, so it is no current reading, in either direction: a gone 99 must not stop work on
+# a refilled pool, and a gone 40 must not clear work on a spent one. One definition, for the same reason
+# as the test above.
+function Test-WindowResetPassed($w) {
+    $epoch = $w.resets_at_epoch -as [long]
+    return [bool]($epoch -and $epoch -le [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+}
+
+# A number out of JSON, or $null. usage-collect.ps1 and the spawn hook hold the same function, because
+# each must survive without the others; tests/test_coord_usage.py pins the copies equal.
+function Get-Finite($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $null }
+    $d = $Value -as [double]
+    if ($null -eq $d -or -not [double]::IsFinite($d)) { return $null }
+    return $d
+}
+
+# A percentage out of JSON, or $null: a finite number, and not below 0. usage-collect.ps1 holds the same
+# function and says why a numeric string counts and a reading over 100 stays a number;
+# tests/test_coord_usage.py pins them.
+function Get-Percentage($Value) {
+    if ($Value -is [string]) {
+        $parsed = 0.0
+        $style = [System.Globalization.NumberStyles]::Float
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [double]::TryParse($Value, $style, $culture, [ref]$parsed)) { return $null }
+        $Value = $parsed
+    }
+    $d = Get-Finite $Value
+    if ($null -eq $d -or $d -lt 0) { return $null }
+    return $d
+}
+
+# A WINDOW WITH NO NUMBER HOLDS NO READING. `[double]$null` and `[double]""` are both 0, NaN compares false
+# with every level, a negative is below every level, and an object, an array or a date casts to nothing,
+# so each of those read OK or worse. Anything Get-Percentage refuses is refused here, and no bare cast
+# reads this field. One definition, as above.
+function Test-WindowHasNumber($w) {
+    return ($null -ne (Get-Percentage $w.used_percentage))
+}
+
+# The band this reader calls "at the ceiling". A fresh reading here stops work on any provenance, so a
+# stale one with its reset ahead must too; see level_floor below. Get-DecisionCostRung holds its own 98.
+$CeilingPct = 98
+
+function Get-WindowReport($w, [string]$ReadRoot) {
+    $Label = "weekly (7d)"
     if (-not $w) {
         return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "never published"; used_percentage = $null }
     }
@@ -451,8 +536,14 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
             used_percentage = $null
         }
     }
+    if (Test-WindowResetPassed $w) {
+        return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "no current reading: this window's reset has passed"; used_percentage = $null }
+    }
+    if (-not (Test-WindowHasNumber $w)) {
+        return [ordered]@{ label = $Label; state = "UNKNOWN"; reason = "no current reading: this window carries no percentage"; used_percentage = $null }
+    }
     $age = Get-AgeMinutes $w.captured_at
-    $pct = [double]$w.used_percentage
+    $pct = Get-Percentage $w.used_percentage
     $resetEpoch = $w.resets_at_epoch
     $minsToReset = $null
     if ($resetEpoch) {
@@ -468,77 +559,167 @@ function Get-WindowReport($w, [string]$Label, [string]$Key, [string]$ResetKey, [
         rate_pct_per_hr  = $null
         projected_at_reset = $null
         minutes_to_empty = $null
+        # Set only on a reading past -MaxAgeMinutes with its reset ahead and inside one 7-day window, and
+        # with trusted provenance unless it is at the ceiling. Usage does not fall inside a reset period,
+        # so such a reading says the window has reached at least this level, unless the reset has moved
+        # or usage did fall. Past -MaxAgeMinutes means nothing confirmed the number: an idle session's
+        # repeat does not refresh its age, and a live session's does only once its mark is written.
+        # Get-DecisionCostRung halts on it at the level or the ceiling. The verdict below reads it at the
+        # ceiling, and the spawn hook prints it. A reading dated after now sets it too, on its own terms
+        # below. At least an undateable reading and a stale one with no reset set nothing.
+        level_floor      = $null
+        # So the provenance test below can leave such a reading's floor alone.
+        dated_ahead      = $false
         state            = "OK"
         reason           = ""
     }
 
-    # RULE 2: stale readings are reported, never projected from.
+    # RULE 2: a stale reading is reported, and projected only to find a run-out. It clears nothing.
     #
     # The lower bound is not defensive tidying. An age is a subtraction of two clocks, and any bug or skew
     # that makes it negative would pass an `age -gt max` test unconditionally -- the staleness guard would
     # then be permanently disarmed while looking present. Bound it BOTH ways so a nonsensical age is
-    # reported as nonsense rather than silently accepted as fresh.
-    if ($null -eq $age -or $age -gt $MaxAgeMinutes -or $age -lt -2) {
+    # reported as nonsense rather than silently accepted as fresh. Test-DatedAfterNow is that lower bound,
+    # and the end of this function says what such a reading does.
+    if ($null -eq $age -or $age -gt $MaxAgeMinutes) {
         $o.state = "UNKNOWN"
         $o.reason = if ($null -eq $age) { "reading is undateable" }
-        elseif ($age -lt -2) { "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it" }
         # NO CAUSAL CLAIM. This used to read "-- no live session is publishing", which nothing here
         # checks and which is often false: a session may be publishing perfectly well, into another
         # root. The mis-wire warning printed above the numbers names that case; this line states the
         # age and stops.
         else { "reading is $age min old (max $MaxAgeMinutes)" }
+        # A window lasts 10080 minutes, so a reading older than that before its reset cannot belong to
+        # that reset. The one minute is the rounding of the two values added here. An unstamped window
+        # cannot be tied to this account, which counts only below the ceiling; the document's stamp and
+        # the wiring are tested below. A window stamped with another root returned above.
+        $fitsAWeek = $null -ne $minsToReset -and ($age + $minsToReset) -le 10081
+        $stamped = $wEnv -and $wEnv -ne "unset"
+        if ($age -gt $MaxAgeMinutes -and $fitsAWeek -and ($stamped -or $pct -ge $CeilingPct)) { $o.level_floor = $pct }
+        # A PROJECTED RUN-OUT STILL STOPS WORK ON A STALE READING. Its history rows are as real as they
+        # were, and the code before the weekly amendment restamped an idle repeat as fresh and projected
+        # from this same number. Short of a run-out nothing is projected, so a stale number clears nothing.
+        #
+        # COUNTED FROM NOW, NOT FROM THE READING. The reset and the gate's HoldMin are counted from now,
+        # so the run-out is too: the reading's age is taken off. A run-out already past is 0, which the
+        # gate hits on, and its reason says it has passed rather than naming a moment already gone.
+        if ($age -gt $MaxAgeMinutes) {
+            $rate = Get-Rate -CurrentResetEpoch $resetEpoch
+            if ($rate -and $rate.PctPerHour -gt 0) {
+                # The tense is chosen on the unrounded value, so a run-out seconds ahead is not "already".
+                $fromNow = (100.0 - $pct) / $rate.PctPerHour * 60.0 - $age
+                $toEmpty = [math]::Max(0.0, [math]::Round($fromNow, 0))
+                if ($null -eq $minsToReset -or $fromNow -lt $minsToReset) {
+                    $o.state = "CRITICAL"
+                    $o.rate_pct_per_hr = $rate.PctPerHour
+                    $o.minutes_to_empty = $toEmpty
+                    $o.reason = if ($fromNow -le 0) {
+                        "projected from its history rows to have already hit 100%, about $([math]::Abs([math]::Round($fromNow, 0))) min ago; $($o.reason)"
+                    }
+                    else { "projected from its history rows to hit 100% about $toEmpty min from now; $($o.reason)" }
+                }
+            }
+        }
         return $o
     }
 
-    $rate = Get-Rate -Key $Key -ResetKey $ResetKey -CurrentResetEpoch $resetEpoch
+    # A FRESH READING IS PROJECTED FROM NOW TOO, as the stale branch above is: the reset and the gate's
+    # HoldMin are counted from now, so the minutes since the reading come off the run-out and onto the
+    # burn to the reset. A reading dated ahead takes nothing off.
+    $elapsed = [math]::Max(0.0, [double]$age)
+    $rate = Get-Rate -CurrentResetEpoch $resetEpoch
     if ($rate) {
         $o.rate_pct_per_hr = $rate.PctPerHour
         if ($null -ne $minsToReset -and $minsToReset -gt 0) {
-            $o.projected_at_reset = [math]::Round([math]::Min(100.0, $pct + $rate.PctPerHour * ($minsToReset / 60.0)), 1)
+            $o.projected_at_reset = [math]::Round([math]::Min(100.0, $pct + $rate.PctPerHour * (($minsToReset + $elapsed) / 60.0)), 1)
         }
         if ($rate.PctPerHour -gt 0) {
-            $o.minutes_to_empty = [math]::Round((100.0 - $pct) / $rate.PctPerHour * 60.0, 0)
+            $o.minutes_to_empty = [math]::Max(0.0, [math]::Round((100.0 - $pct) / $rate.PctPerHour * 60.0 - $elapsed, 0))
         }
     }
     else {
-        $o.reason = "not enough samples in this window for a rate"
+        $o.reason = "not enough samples or span in this window for a rate"
     }
 
     # Bands. The question is not "is the number big" but "does it run out before it resets".
-    if ($pct -ge 98) { $o.state = "CRITICAL"; $o.reason = "at the ceiling" }
+    if ($pct -ge $CeilingPct) { $o.state = "CRITICAL"; $o.reason = "at the ceiling" }
     elseif ($null -ne $o.minutes_to_empty -and $null -ne $minsToReset -and $o.minutes_to_empty -lt $minsToReset) {
         $o.state = "CRITICAL"
-        $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, $minsToReset min before this window resets"
+        $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, $($minsToReset - $o.minutes_to_empty) min before this window resets"
     }
-    elseif ($pct -ge 85) { $o.state = "WARN"; $o.reason = "high, but not projected to run out before reset" }
+    elseif ($pct -ge 85) {
+        $o.state = "WARN"
+        $o.reason = if ($null -eq $o.minutes_to_empty -or $null -eq $minsToReset) { "high, with no rising rate or no reset time, so nothing is projected" } else { "high, but not projected to run out before reset" }
+    }
     elseif ($null -ne $o.projected_at_reset -and $o.projected_at_reset -ge 95) {
         $o.state = "WARN"; $o.reason = "projected to reach $($o.projected_at_reset)% by reset"
+    }
+
+    # A READING DATED AFTER NOW CAN STOP WORK AND CANNOT CLEAR IT. Nothing proves when it was taken, so it
+    # is not fresh: it reads UNKNOWN, and OK or WARN cannot come from it. But a small backward clock step
+    # dates a real reading ahead, and a stop must not lapse on one. So it keeps a level_floor at its number
+    # on any provenance, with no test of its reset, as a fresh reading's level hit stands on any
+    # provenance. A projection to run out before the reset stays CRITICAL, because the rate behind it may
+    # be real and the gate needs the state to read it, and with no reset any projection does, because a
+    # missing reset must not loosen the rung. At the ceiling the floor sets that verdict.
+    if (Test-DatedAfterNow $w.captured_at) {
+        $future = "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it"
+        $o.dated_ahead = $true
+        $o.level_floor = $pct
+        if ($null -eq $minsToReset -and $null -ne $o.minutes_to_empty -and $pct -lt $CeilingPct) {
+            $o.state = "CRITICAL"
+            $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, with no reset time; $future"
+        }
+        elseif ($o.state -eq "CRITICAL" -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason); $future" }
+        else {
+            $o.state = "UNKNOWN"
+            $o.reason = $future
+            $o.rate_pct_per_hr = $null
+            $o.projected_at_reset = $null
+            $o.minutes_to_empty = $null
+        }
     }
     return $o
 }
 
-$five = Get-WindowReport $doc.five_hour "session (5h)" "five_hour" "five_reset" $readRoot
-$seven = Get-WindowReport $doc.seven_day "weekly (7d)" "seven_day" "seven_reset" $readRoot
+$seven = Get-WindowReport $doc.seven_day $readRoot
 
 # NO "UNAVAILABLE" ENTRY, DELIBERATELY. It would be unreachable: Get-WindowReport only ever emits the
 # four states below, and the UNAVAILABLE path exits far above this line. Adding it would also make this
-# table disagree with the three sibling lists that have no UNAVAILABLE arm -- the verdict chain, the
-# $advice switch (which would fall through to "Normal working") and Show-Window's colours. The comment
+# table disagree with the two sibling lists that have no UNAVAILABLE arm -- the $advice switch (which
+# would fall through to "Normal working") and Show-Window's colours. The comment
 # below already warns that two lists naming different states is how the prose and the exit code come to
 # describe different situations; a fifth key here would be that defect, planted.
 $rank = @{ "OK" = 0; "WARN" = 10; "CRITICAL" = 11; "UNKNOWN" = 20 }
-$states = @($five.state, $seven.state)
-# CRITICAL outranks UNKNOWN: a known emergency in one window is not softened by the other being unknown.
 # ONE LIST, READ TWICE. The warning printed below and the verdict computed here must name the same
 # states, or the prose and the exit code describe different situations -- the two-instruments-
 # disagreeing defect this whole change exists to remove, reproduced inside one script.
 $dxUntrusted = @("WIRED_ELSEWHERE", "WIRED_LEGACY", "WIRED_COLLECTOR_MISSING", "FOREIGN_STATUSLINE",
     "NOT_WIRED_NO_SETTINGS", "NOT_WIRED_NO_STATUSLINE")
 
-$overall = if ($states -contains "CRITICAL") { "CRITICAL" }
-elseif ($states -contains "WARN") { "WARN" }
-elseif ($states -contains "UNKNOWN") { "UNKNOWN" }
-else { "OK" }
+$overall = $seven.state
+
+# BELOW THE CEILING, A FLOOR NEEDS TRUSTED PROVENANCE. It can hold a seat at HALT until the reset, which
+# is too long a deferral on a number this reader cannot tie to this account. So a document with no
+# verified stamp, or a root it does not trust, gets no floor and stays UNKNOWN. An explicit -StateDir is
+# exempt from the wiring half, as it is from the verdict below: the operator named the directory.
+#
+# AT THE CEILING IT DOES NOT. A fresh reading there is a stop on any provenance, and an idle session's
+# equal reading does not refresh the age, so this test would turn that stop into REVIEW 21 minutes later
+# with nothing changed. A document or window stamped with another root was refused above and never gets
+# here.
+if ($seven.Contains('level_floor') -and -not $seven.dated_ahead -and $seven.level_floor -lt $CeilingPct -and ($provenance -ne "OK" -or (-not $script:GaveStateDir -and $dx.state -in $dxUntrusted))) {
+    $seven.level_floor = $null
+}
+
+# A FLOOR AT THE CEILING GRADES THE VERDICT, AND LEAVES THE WINDOW'S STATE AT UNKNOWN. A spent pool with
+# an unchanged reading is still CRITICAL, so the exit code and the advice must say so. BELOW THE CEILING
+# THE VERDICT STAYS UNKNOWN: the number is only a lower bound, so "commit at your next stop" would grade
+# a number nothing fresh backs. Get-DecisionCostRung reads level_floor for itself and hits at its rung
+# whatever this says, and the spawn hook prints the number and why. The window stays UNKNOWN, unless its
+# history rows project a run-out, because nothing fresh backs a clear, and that is what the gate reads
+# below the rung, so this cannot loosen it.
+if ($null -ne $seven.level_floor -and $seven.level_floor -ge $CeilingPct) { $overall = "CRITICAL" }
 
 # A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The
 # diagnosis used to reach the prose only, so a root the script itself called mis-wired still exited 0
@@ -566,7 +747,7 @@ $blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan 
 function Get-RootSummary([string]$Root) {
     $sd = Get-UsageStateDir $Root
     $lp = Join-Path $sd "latest.json"
-    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; five = $null; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
     # THE SURVEY IS WHERE A CANCELLED ACCOUNT DOES ITS DAMAGE, because the survey is the only place
     # accounts are COMPARED -- and a dead one presents as the emptiest pool in the list. Checked per
     # row against that row's own root, before its document is opened, for the same ordering reason the
@@ -595,27 +776,23 @@ function Get-RootSummary([string]$Root) {
     # THE SURVEY IS THE ONLY PLACE ACCOUNTS ARE COMPARED, so it is where the cross-root refusal
     # matters most -- and it was the one place it did not run. Checking only the DOCUMENT stamp passes
     # a carry-forward: the document was written by this root and sits under this root, while the
-    # numbers inside came from another. Measured: the single-root reader refused both windows and the
-    # survey four lines later printed them as this root's own.
-    $fiveOurs = Test-WindowFromRoot $d.five_hour $Root
+    # numbers inside came from another. Measured: the single-root reader refused the window and the
+    # survey four lines later printed it as this root's own.
     $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
-    $s.five = if ($d.five_hour -and $fiveOurs) { [double]$d.five_hour.used_percentage } else { $null }
-    $s.seven = if ($d.seven_day -and $sevenOurs) { [double]$d.seven_day.used_percentage } else { $null }
-    # AGED BY ITS WINDOWS, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
+    $sevenGone = Test-WindowResetPassed $d.seven_day
+    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone -and (Test-WindowHasNumber $d.seven_day)) { Get-Percentage $d.seven_day.used_percentage } else { $null }
+    # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
     # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
-    # six-hour-old reading rendered as "[seen 0 min ago]". The OLDER of the two windows is the honest
-    # single number for a row printing both. The @() wrapper is load-bearing: without it a single
-    # surviving age arrives as a scalar and .Count is unreliable.
-    $fa = if ($d.five_hour) { Get-AgeMinutes $d.five_hour.captured_at } else { $null }
+    # six-hour-old reading rendered as "[seen 0 min ago]".
     $sa = if ($d.seven_day) { Get-AgeMinutes $d.seven_day.captured_at } else { $null }
-    $ages = @(@($fa, $sa) | Where-Object { $null -ne $_ })
-    # The document stamp is the fallback only when no window carries one, which keeps pre-change
+    # The document stamp is the fallback only when the window carries none, which keeps pre-change
     # documents and hand-written fixtures readable.
-    $s.age_min = if ($ages.Count) { ($ages | Measure-Object -Maximum).Maximum } else { Get-AgeMinutes $d.captured_at }
+    $s.age_min = if ($null -ne $sa) { $sa } else { Get-AgeMinutes $d.captured_at }
     $s.stale = ($null -eq $s.age_min) -or ($s.age_min -gt $MaxAgeMinutes)
-    if (-not $fiveOurs -or -not $sevenOurs) {
-        $s.note = "REFUSED -- a window here was observed under a DIFFERENT config root"
+    if (-not $sevenOurs) {
+        $s.note = "REFUSED -- this window was observed under a DIFFERENT config root"
     }
+    elseif ($sevenGone) { $s.note = "no current reading: this window's reset has passed" }
     elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
     # A PENDING CANCELLATION RIDES BESIDE THE NUMBERS RATHER THAN REPLACING THEM. The pool is still
     # live until that date, so suppressing the percentage would throw away a reading that is true and
@@ -639,16 +816,15 @@ if ($Json) {
     [ordered]@{
         state        = $overall
         exit_code    = $rank[$overall]
-        five_hour    = $five
         seven_day    = $seven
         advice       = $advice
         not_measured = $blindSpot
         provenance   = $provenance
         # ALWAYS PRESENT, null when there is no pending cancellation. An earlier comment here claimed
         # the key was emitted only when dated, which was simply false -- an [ordered] literal emits the
-        # key whatever the value, and the test asserts the null. The five_hour/seven_day keys really
-        # are absent on the UNAVAILABLE path and are pinned that way; this one is not, and a comment
-        # describing a shape the code does not have is worse than no comment.
+        # key whatever the value, and the test asserts the null. The seven_day key really is absent on
+        # the UNAVAILABLE path and is pinned that way; this one is not, and a comment describing a
+        # shape the code does not have is worse than no comment.
         cancellation_pending_from = $(if ($avail.state -eq 'PENDING') { $avail.effective_from } else { $null })
         statusline_state = $dx.state
         statusline_line = $dx.line
@@ -670,8 +846,8 @@ function Show-Window($o) {
         return
     }
     $colour = switch ($o.state) { "CRITICAL" { "Red" } "WARN" { "Yellow" } "UNKNOWN" { "DarkGray" } default { "Green" } }
-    $reset = if ($null -ne $o.minutes_to_reset) { "resets in {0}h{1:00}m" -f [int]($o.minutes_to_reset / 60), ($o.minutes_to_reset % 60) } else { "reset unknown" }
-    Write-Host ("  {0,-14} {1,5:0.0}%  {2}   [seen {3} min ago]" -f $o.label, $o.used_percentage, $reset, $o.reading_age_min) -ForegroundColor $colour
+    $reset = if ($null -ne $o.minutes_to_reset) { "resets in {0}h{1:00}m" -f [math]::Floor($o.minutes_to_reset / 60), ($o.minutes_to_reset % 60) } else { "reset unknown" }
+    Write-Host ("  {0,-14} {1,5:0.0}%  {2}   [confirmed {3} min ago]" -f $o.label, $o.used_percentage, $reset, $o.reading_age_min) -ForegroundColor $colour
     if ($null -ne $o.rate_pct_per_hr) {
         $proj = if ($null -ne $o.projected_at_reset) { ", ~{0}% by reset" -f $o.projected_at_reset } else { "" }
         Write-Host ("                 {0:+0.0;-0.0;0.0} %/hr{1}" -f $o.rate_pct_per_hr, $proj) -ForegroundColor DarkGray
@@ -701,10 +877,10 @@ if ($dx.state -in $dxUntrusted) {
 }
 # POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
 # reading on a box that does not use bash survives. Without this arm, a stale one fell through both
-# warnings and the operator saw no cause and no fix. Same -and rule as the WIRED_HERE arm below.
-elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+# warnings and the operator saw no cause and no fix.
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and ($seven.state -eq "UNKNOWN" -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
     Write-Host ""
-    Write-Host "  WARNING -- nothing fresh has published here, and the wiring says why:" -ForegroundColor Yellow
+    Write-Host "  WARNING -- this reading has not been confirmed lately, and the wiring may be why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
     foreach ($l in $dx.remedy) { Write-Host "  $l" -ForegroundColor DarkGray }
 }
@@ -717,13 +893,10 @@ elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $five.state -eq "UNKNOWN" -
 #
 # EVERY CLAUSE IS BACKED. "wired, and the collector it names exists" is what WIRED_HERE already tested
 # (ownership, an extracted -StateDir matching this directory, and Test-Path on the collector). "nothing
-# fresh" is the window states. The two CAUSES are offered as alternatives, never asserted, because
+# fresh" is the window's state. The three CAUSES are offered as alternatives, never asserted, because
 # nothing here can tell them apart.
-# -and, NOT -or. With -or this fired on a document published 0.15 seconds earlier: a fresh five_hour
-# beside a seven_day that has simply never been published leaves one window UNKNOWN, and the warning
-# then claimed "nothing fresh has published here" over a reading taken moments ago. The claim is that
-# NOTHING is fresh, so the test has to be that nothing is.
-elseif ($dx.state -eq "WIRED_HERE" -and $five.state -eq "UNKNOWN" -and $seven.state -eq "UNKNOWN") {
+# NOT FOR A GONE WINDOW: that reading can be seconds old, so neither cause below is in play.
+elseif ($dx.state -eq "WIRED_HERE" -and ($seven.state -eq "UNKNOWN" -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
     # THE COLLECTOR CLAUSE IS CONDITIONAL, because WIRED_HERE does not always mean one was checked: a
     # wired command carrying a -StateDir but no recognisable collector assignment yields a null
     # collector path, which skips the Test-Path guard entirely. Asserting it exists would be asserting
@@ -731,14 +904,14 @@ elseif ($dx.state -eq "WIRED_HERE" -and $five.state -eq "UNKNOWN" -and $seven.st
     $collClause = if ($dx.wired_collector) { " and the collector it names exists" } else { "" }
     Write-Host ""
     Write-Host "  WARNING -- this root is wired correctly$collClause," -ForegroundColor Yellow
-    Write-Host "  yet nothing fresh has published here. Two causes, and this cannot tell them apart:" -ForegroundColor Yellow
+    Write-Host "  yet this reading has not been confirmed lately. At least these causes, and this cannot tell them apart:" -ForegroundColor Yellow
+    Write-Host "    - no session here has called the API for that long, and an idle session's repeat keeps the old age, or" -ForegroundColor DarkGray
     Write-Host "    - no session has STARTED here since it was wired (settings are read at session start), or" -ForegroundColor DarkGray
     Write-Host "    - the statusLine is configured but never runs. It is part of the terminal UI's render" -ForegroundColor DarkGray
     Write-Host "      tree, so check whether your client shows a status bar at all; a line beginning" -ForegroundColor DarkGray
     Write-Host "      'mefor-usage' there means it IS firing and the fault is elsewhere." -ForegroundColor DarkGray
 }
 Write-Host ""
-Show-Window $five
 Show-Window $seven
 Write-Host ""
 Write-Host "  $advice"
@@ -762,15 +935,14 @@ if ($survey) {
             Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor Magenta
         }
         elseif ($s.published) {
-            $f = if ($null -ne $s.five) { "5h {0,3:0}%" -f $s.five } else { "5h   -" }
             $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
             # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
             # throws ("Cannot convert null to type System.ConsoleColor"), measured.
             if ($s.stale) {
-                Write-Host ("    {0,-46} {1}  {2}   [STALE -- oldest window seen {3} min ago, max {4}]{5}" -f $s.root, $f, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
+                Write-Host ("    {0,-46} {1}   [STALE -- confirmed {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
             }
             else {
-                Write-Host ("    {0,-46} {1}  {2}   [seen {3} min ago]{4}" -f $s.root, $f, $v, $s.age_min, $mark)
+                Write-Host ("    {0,-46} {1}   [confirmed {2} min ago]{3}" -f $s.root, $v, $s.age_min, $mark)
             }
             if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
         }

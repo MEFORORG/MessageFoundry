@@ -31,8 +31,8 @@
     state; wire it deliberately with -ConfigDir "$HOME\.claude" if a bare `claude` run needs numbers.
 
     EACH ROOT IS WIRED TO PUBLISH UNDER ITSELF (<root>\mefor-usage), because a config root holds one
-    credential set and therefore one Anthropic account, and separate accounts have separate 5-hour and
-    7-day pools. One shared file across roots is last-writer-wins across unrelated quotas. The rule
+    credential set and therefore one Anthropic account, and separate accounts have separate 7-day
+    pools. One shared file across roots is last-writer-wins across unrelated quotas. The rule
     lives once, in config-roots.ps1, and the reader derives its path from the same function -- so the
     two halves cannot drift into the disagreement described above.
 

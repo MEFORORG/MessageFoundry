@@ -13,8 +13,8 @@ lies converts "I should check" into "I already know":
 * **An empty reading must never overwrite a good one.** Every session runs the statusLine and they all
   publish to one shared file, so a session that has not yet had its first API response would otherwise
   blank the account's only reading for all of them.
-* **Windows are absent independently**, so staleness is tracked per window — a carried-forward number
-  must keep its own older timestamp and must never enter the burn-rate history.
+* **An absent window is carried, not blanked** — and a carried-forward number must keep its own older
+  timestamp and must never enter the burn-rate history.
 * **Stale, undateable and future-dated readings are UNKNOWN**, never extrapolated.
 * **Rate is never computed across a window reset**, where the percentage legitimately falls to zero.
 
@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
@@ -131,6 +132,12 @@ def latest(state: Path) -> dict[str, Any]:
     return parsed
 
 
+def captured_at(state: Path) -> datetime:
+    """The window's stamp as an instant. PowerShell drops a trailing zero when it re-serialises a
+    kept stamp, so two spellings of one instant differ as strings."""
+    return datetime.fromisoformat(latest(state)["seven_day"]["captured_at"])
+
+
 def history(state: Path) -> list[dict[str, Any]]:
     p = state / "history.jsonl"
     if not p.exists():
@@ -141,7 +148,9 @@ def history(state: Path) -> list[dict[str, Any]]:
 # ------------------------------------------------------------------------------ collector
 
 
-def test_publishes_both_windows(tmp_path: Path) -> None:
+def test_publishes_the_weekly_window_and_ignores_a_five_hour_key(tmp_path: Path) -> None:
+    """Anthropic removed the five-hour limit, so a payload still carrying the key is not an error
+    and its number goes nowhere: not the document, not the history, not the status line."""
     line = collect(
         tmp_path,
         {
@@ -150,9 +159,56 @@ def test_publishes_both_windows(tmp_path: Path) -> None:
         },
     )
     d = latest(tmp_path)
-    assert d["five_hour"]["used_percentage"] == pytest.approx(80.4)
     assert d["seven_day"]["used_percentage"] == pytest.approx(36.2)
-    assert "80" in line and "36" in line, f"the human line must show both: {line!r}"
+    assert "five_hour" not in d, d
+    assert "7d 36%" in line and "80" not in line and "5h" not in line, line
+    (row,) = history(tmp_path)
+    assert set(row) == {"at", "seven_day", "seven_reset"}, row
+
+
+def test_a_payload_carrying_only_five_hour_publishes_no_window(tmp_path: Path) -> None:
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"five_hour": window(80.0, 5940)}})
+    assert line == "mefor-usage: no rate_limits yet", line
+    assert not (tmp_path / "latest.json").exists(), "a window nobody reads was published"
+    assert history(tmp_path) == []
+
+
+def test_a_document_and_history_written_with_five_hour_still_read_and_rewrite(
+    tmp_path: Path,
+) -> None:
+    """The real shape of a root published before the change. The reader takes the weekly numbers
+    from it, rate included, and the next publish drops the old key."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=71.0, seven_epoch=epoch)
+    doc = latest(tmp_path)
+    doc["five_hour"] = {"used_percentage": 99.0, "resets_at_epoch": 1, "captured_at": "garbage"}
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    rows = [(60.0, 60.0, 90.0), (30.0, None, 95.0), (1.0, 70.0, 99.0)]
+    (tmp_path / "history.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "at": _minutes_ago(m),
+                    "five_hour": five,
+                    "seven_day": seven,
+                    "five_reset": 1790475000,
+                    "seven_reset": epoch,
+                }
+            )
+            + "\n"
+            for m, seven, five in rows
+        ),
+        encoding="utf-8",
+    )
+
+    code, d = read(tmp_path)
+    assert code == CRITICAL, d
+    assert "five_hour" not in d, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(10.17, abs=0.5), d
+
+    collect(tmp_path, {"session_id": "B"})
+    assert "five_hour" not in latest(tmp_path)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(71.0)
 
 
 def test_a_session_with_no_rate_limits_does_not_clobber_a_good_reading(tmp_path: Path) -> None:
@@ -165,42 +221,29 @@ def test_a_session_with_no_rate_limits_does_not_clobber_a_good_reading(tmp_path:
     """
     collect(
         tmp_path,
-        {
-            "session_id": "A",
-            "rate_limits": {"five_hour": window(80.4, 5940), "seven_day": window(36.2, 280000)},
-        },
+        {"session_id": "A", "rate_limits": {"seven_day": window(36.2, 280000)}},
     )
     collect(tmp_path, {"session_id": "B"})  # a session that has not made an API call yet
 
     d = latest(tmp_path)
-    assert d["five_hour"]["used_percentage"] == pytest.approx(80.4), (
+    assert d["seven_day"]["used_percentage"] == pytest.approx(36.2), (
         "a session with no data destroyed the reading"
     )
-    assert d["seven_day"]["used_percentage"] == pytest.approx(36.2)
 
 
 def test_an_absent_window_is_carried_forward_with_its_own_older_timestamp(tmp_path: Path) -> None:
-    """The docs are explicit that the two windows are absent INDEPENDENTLY, so staleness is per window.
-
-    A carried-forward value stamped with the current time would be a stale number wearing a fresh
+    """A carried-forward value stamped with the current time would be a stale number wearing a fresh
     timestamp — which is precisely the shape of claim that this repo keeps having to retract.
     """
-    collect(
-        tmp_path,
-        {
-            "session_id": "A",
-            "rate_limits": {"five_hour": window(80.0, 5940), "seven_day": window(36.0, 280000)},
-        },
-    )
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(36.0, 280000)}})
     time.sleep(1.1)
-    collect(tmp_path, {"session_id": "C", "rate_limits": {"five_hour": window(88.0, 5940)}})
+    collect(tmp_path, {"session_id": "C", "rate_limits": {}})
 
     d = latest(tmp_path)
-    assert d["five_hour"]["used_percentage"] == pytest.approx(88.0), "the fresh window must update"
     assert d["seven_day"]["used_percentage"] == pytest.approx(36.0), (
         "the absent window must be carried, not nulled"
     )
-    assert d["seven_day"]["captured_at"] < d["five_hour"]["captured_at"], (
+    assert d["seven_day"]["captured_at"] < d["captured_at"], (
         "the carried window must keep its ORIGINAL timestamp, or it reads as freshly observed"
     )
 
@@ -208,30 +251,230 @@ def test_an_absent_window_is_carried_forward_with_its_own_older_timestamp(tmp_pa
 def test_history_never_records_a_carried_forward_value(tmp_path: Path) -> None:
     """Burn rate is computed from this file. A carried-forward percentage against a new timestamp says
     consumption stopped — the one lie that matters in a tool built to warn about consumption."""
-    collect(
-        tmp_path,
-        {
-            "session_id": "A",
-            "rate_limits": {"five_hour": window(80.0, 5940), "seven_day": window(36.0, 280000)},
-        },
-    )
-    collect(tmp_path, {"session_id": "C", "rate_limits": {"five_hour": window(88.0, 5940)}})
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(36.0, 280000)}})
+    collect(tmp_path, {"session_id": "C", "rate_limits": {}})
 
-    rows = history(tmp_path)
-    assert rows, "expected history rows"
-    assert rows[-1]["five_hour"] == pytest.approx(88.0)
-    assert rows[-1]["seven_day"] is None, (
-        "a carried-forward window must be null in history, not repeated"
-    )
+    assert len(history(tmp_path)) == 1, "a carried-forward window must not reach the history"
 
 
 def test_a_flat_reading_does_not_append_history(tmp_path: Path) -> None:
     """The statusline fires many times a minute; a row per fire is a big file describing a flat line."""
-    payload = {"session_id": "A", "rate_limits": {"five_hour": window(50.0, 5940)}}
+    payload = {"session_id": "A", "rate_limits": {"seven_day": window(50.0, 5940)}}
     collect(tmp_path, payload)
     collect(tmp_path, payload)
     collect(tmp_path, payload)
     assert len(history(tmp_path)) == 1
+
+
+def test_an_idle_session_writes_no_row_on_a_timer(tmp_path: Path) -> None:
+    """An idle session keeps reporting its cached percentage. A row for it would read as a measured
+    rate of zero while other sessions burn the pool, and a rate of zero lifts the level backstop. So
+    however old the last row is, a flat reading adds nothing and the rate stays unmeasured."""
+    seven = window(92.0, 280000)
+    write_history(tmp_path, [(60.0, 92.0)], seven["resets_at"])
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    assert len(history(tmp_path)) == 1
+    _, d = read(tmp_path)
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+
+
+def test_a_lower_reading_in_one_reset_period_replaces_nothing(tmp_path: Path) -> None:
+    """An idle session keeps reporting its cached percentage, on a timer. Inside one reset period
+    the level only rises, so the highest reading binds, and the lower one must not move the number,
+    its age, or the history. Live 99 then idle 60 used to grade clear at the ceiling."""
+    live = window(91.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": live}})
+    first = captured_at(tmp_path)
+
+    time.sleep(1.1)
+    idle = {**live, "used_percentage": 60.0}
+    line = collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": idle}})
+    kept = latest(tmp_path)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(91.0), "the idle reading replaced the live one"
+    assert captured_at(tmp_path) == first, "a refused reading must not refresh the age"
+    assert "7d 91%" in line, line
+    assert len(history(tmp_path)) == 1, "a refused reading reached the rate's history"
+
+    # CONTROL. A guard that froze the window would pass everything above.
+    higher = {**live, "used_percentage": 93.0}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": higher}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(93.0)
+    assert len(history(tmp_path)) == 2
+
+
+def test_a_new_reset_period_replaces_the_old_value_in_either_direction(tmp_path: Path) -> None:
+    epoch = int(time.time()) + 3600
+    for resets_at, pct in ((epoch, 91.0), (epoch + 7 * 86400, 2.0), (epoch + 14 * 86400, 50.0)):
+        seven = {"used_percentage": pct, "resets_at": resets_at}
+        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+        assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
+    assert [r["seven_day"] for r in history(tmp_path)] == [91.0, 2.0, 50.0]
+
+
+def test_a_reading_from_an_earlier_reset_period_replaces_nothing(tmp_path: Path) -> None:
+    """After a reset, an idle session still holds last week's number and last week's reset time.
+    Letting it in would swap a current reading for a gone one, every few seconds."""
+    epoch = int(time.time()) + 3600
+    current = {"used_percentage": 2.0, "resets_at": epoch}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": current}})
+    gone = {"used_percentage": 95.0, "resets_at": epoch - 7 * 86400}
+    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": gone}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
+    assert len(history(tmp_path)) == 1
+
+
+def test_a_later_reading_with_an_earlier_reset_ahead_of_now_is_a_new_window(tmp_path: Path) -> None:
+    """A re-login or a moved reset. Only a reset already passed marks a window as gone."""
+    now = int(time.time())
+    first = {"used_percentage": 95.0, "resets_at": now + 500000}
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": first}})
+    moved = {"used_percentage": 3.0, "resets_at": now + 100000}
+    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": moved}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(3.0)
+
+
+def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
+    tmp_path: Path,
+) -> None:
+    """It cannot prove which window it belongs to. Taken bare, it would wipe the reset. Given the
+    published reset, a cached 95 would set a floor no live reading could lower until that reset."""
+    seven = window(3.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
+    bare = {"used_percentage": 95.0}
+    collect(tmp_path, {"session_id": "odd", "rate_limits": {"seven_day": bare}})
+    kept = latest(tmp_path)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(3.0), kept
+    assert kept["resets_at_epoch"] == seven["resets_at"], kept
+    assert len(history(tmp_path)) == 1
+
+    # CONTROL: the next reading that carries the reset still moves the number.
+    live = {**seven, "used_percentage": 4.0}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": live}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(4.0)
+
+
+def test_with_no_published_reset_there_is_no_floor(tmp_path: Path) -> None:
+    """The stated limit, pinned so a change to it is a decision: with no reset to compare, the rule
+    has nothing to hold on to. A lower reading replaces, and an equal one refreshes the age."""
+    for pct in (70.0, 40.0):
+        seven = {"used_percentage": pct}
+        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+        assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
+    first = captured_at(tmp_path)
+    time.sleep(1.1)
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": {"used_percentage": 40.0}}})
+    assert captured_at(tmp_path) > first
+
+
+def test_a_gone_reading_on_an_empty_directory_is_published_and_read_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """The floor refuses a gone reading only against a later published reset. With nothing published
+    it lands in both files, and the reader is what keeps its number from being used."""
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(95.0, -300)}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(95.0)
+    assert len(history(tmp_path)) == 1
+    code, d = read(tmp_path)
+    assert code == UNKNOWN, d
+    assert d["seven_day"]["used_percentage"] is None, d
+
+
+def test_a_lower_reading_with_no_reset_cannot_disarm_the_floor(tmp_path: Path) -> None:
+    """Taken, it would wipe the published reset, and every lower reading after it would pass too."""
+    seven = window(99.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
+    collect(
+        tmp_path, {"session_id": "odd", "rate_limits": {"seven_day": {"used_percentage": 50.0}}}
+    )
+    kept = latest(tmp_path)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(99.0), kept
+    assert kept["resets_at_epoch"] == seven["resets_at"], kept
+
+
+@pytest.mark.parametrize("stamp", ["own-root", "unset", None], ids=["own", "unset", "absent"])
+def test_a_differently_stamped_session_on_this_root_still_meets_the_floor(
+    tmp_path: Path, stamp: str | None
+) -> None:
+    """A pinned session and an unpinned one can share a root, and the reader calls both its own."""
+    seven = window(99.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
+    doc = latest(tmp_path)
+    if stamp is None:
+        del doc["seven_day"]["config_root_env"]
+    else:
+        own = str(tmp_path.parent)
+        doc["seven_day"]["config_root_env"] = own if stamp == "own-root" else stamp
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    idle = {**seven, "used_percentage": 60.0}
+    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": idle}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(99.0)
+
+
+def test_an_unchanged_reading_does_not_refresh_the_age(tmp_path: Path) -> None:
+    """An idle session's cached value looks the same as a live flat one, and restamping it let one
+    idle terminal keep a frozen number fresh while the pool burned, so the rung read OK on it. The
+    age now counts from the last change. The control is a move, which does refresh it."""
+    seven = window(89.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
+    first = captured_at(tmp_path)
+    time.sleep(1.1)
+    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": seven}})
+    assert captured_at(tmp_path) == first
+
+    higher = {**seven, "used_percentage": 90.0}
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": higher}})
+    assert captured_at(tmp_path) > first
+
+
+def test_an_unchanged_reading_cannot_revive_a_stale_one(tmp_path: Path) -> None:
+    """End to end through the reader: an old reading stays UNKNOWN after an idle session fires."""
+    seven = window(89.0, 280000)
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
+    doc = latest(tmp_path)
+    doc["seven_day"]["captured_at"] = _minutes_ago(300)
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[0] == UNKNOWN, "control: the old reading is stale before the idle fire"
+
+    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": seven}})
+    code, d = read(tmp_path)
+    assert code == UNKNOWN, d
+
+
+def test_the_first_reading_of_a_new_reset_period_gets_a_row_at_the_same_percent(
+    tmp_path: Path,
+) -> None:
+    """A row for the new period is what the rate counts from, whatever the number happens to be."""
+    epoch = int(time.time()) + 3600
+    for resets_at in (epoch, epoch + 7 * 86400):
+        seven = {"used_percentage": 0.0, "resets_at": resets_at}
+        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    assert [r["seven_reset"] for r in history(tmp_path)] == [epoch, epoch + 7 * 86400]
+
+
+def test_the_status_line_shows_no_number_for_a_gone_window(tmp_path: Path) -> None:
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(99.0, -300)}})
+    assert line == "7d reset passed, no current reading", line
+
+
+def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: Path) -> None:
+    """The highest reading binds inside one account's pool only. A foreign number kept as a floor
+    would block this root's own readings until the reset, and the reader would refuse it throughout."""
+    seven = window(88.0, 280000)
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    doc = latest(tmp_path)
+    doc["seven_day"]["config_root_env"] = str(tmp_path / "another-account")
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    mine = {**seven, "used_percentage": 12.0}
+    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": mine}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
+
+
+def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Path) -> None:
+    """90 minutes rounded to the even hour read as 2h30m."""
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5430)}})
+    assert re.search(r"resets 1h30m", line), line
 
 
 @pytest.mark.parametrize("bad", ["", "not json at all", "{truncated", "null"])
@@ -252,39 +495,31 @@ def test_no_data_publishes_nothing_rather_than_a_document_of_nulls(tmp_path: Pat
 # ------------------------------------------------------------------------------ reader
 
 
+def _minutes_ago(mins: float) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=mins)).isoformat().replace("+00:00", "Z")
+
+
 def publish(
     state: Path,
     *,
-    five: float | None,
     seven: float | None,
-    five_in_s: int = 3600,
     age_min: float = 0.0,
-    five_epoch: int | None = None,
+    seven_epoch: int | None = None,
 ) -> None:
     """Write a latest.json directly, so reader behaviour can be tested independently of the collector."""
     state.mkdir(parents=True, exist_ok=True)
-    stamp = (datetime.now(UTC) - timedelta(minutes=age_min)).isoformat().replace("+00:00", "Z")
+    stamp = _minutes_ago(age_min)
     doc: dict[str, Any] = {
         "captured_at": stamp,
         "published_by": {"session_id": "T"},
         "source": "test",
     }
-    doc["five_hour"] = (
-        None
-        if five is None
-        else {
-            "used_percentage": five,
-            "resets_at_epoch": five_epoch or int(time.time()) + five_in_s,
-            "resets_at": "x",
-            "captured_at": stamp,
-        }
-    )
     doc["seven_day"] = (
         None
         if seven is None
         else {
             "used_percentage": seven,
-            "resets_at_epoch": int(time.time()) + 280000,
+            "resets_at_epoch": seven_epoch or int(time.time()) + 280000,
             "resets_at": "x",
             "captured_at": stamp,
         }
@@ -292,24 +527,32 @@ def publish(
     (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
-def write_history(state: Path, points: list[tuple[float, float]], five_epoch: int) -> None:
-    """points = [(minutes_ago, five_hour_pct)] within one window epoch."""
+def _stamp(state: Path, root: Path) -> None:
+    """Stamp a published document and its window with ``root``, as a pinned collector would."""
+    doc = latest(state)
+    doc["published_by"]["config_root_env"] = str(root)
+    doc["seven_day"]["config_root_env"] = str(root)
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _floor(state: Path, **published: Any) -> float | None:
+    """The level_floor of a reading of this root's, read with -StateDir so wiring does not apply."""
+    publish(state, **published)
+    _stamp(state, state.parent)
+    floor: float | None = read(state)[1]["seven_day"]["level_floor"]
+    return floor
+
+
+def write_history(state: Path, points: list[tuple[float, float]], seven_epoch: int) -> None:
+    """points = [(minutes_ago, seven_day_pct)] within one window epoch."""
     state.mkdir(parents=True, exist_ok=True)
-    lines = []
-    for mins, pct in points:
-        at = (datetime.now(UTC) - timedelta(minutes=mins)).isoformat().replace("+00:00", "Z")
-        lines.append(
-            json.dumps(
-                {
-                    "at": at,
-                    "five_hour": pct,
-                    "seven_day": None,
-                    "five_reset": five_epoch,
-                    "seven_reset": None,
-                }
-            )
-        )
-    (state / "history.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    rows = [
+        {"at": _minutes_ago(mins), "seven_day": pct, "seven_reset": seven_epoch}
+        for mins, pct in points
+    ]
+    (state / "history.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
 
 
 def test_no_data_at_all_is_unknown_and_says_how_to_fix_it(tmp_path: Path) -> None:
@@ -317,16 +560,16 @@ def test_no_data_at_all_is_unknown_and_says_how_to_fix_it(tmp_path: Path) -> Non
     assert code == UNKNOWN
 
 
-def test_a_stale_reading_is_reported_but_never_projected_from(tmp_path: Path) -> None:
+def test_a_stale_reading_with_no_rate_is_reported_and_projects_nothing(tmp_path: Path) -> None:
     """A dead publisher is the expected steady state here: the statusLine does not run headless, so the
-    coordinator itself can never publish. Extrapolating from an hour-old number would be a confident
-    answer about a window that may already have reset."""
-    publish(tmp_path, five=71.0, seven=30.0, age_min=75)
+    coordinator itself can never publish. With no history rows there is no rate, and nothing is
+    projected from the number alone. A stale reading whose rows project a run-out is the other case."""
+    publish(tmp_path, seven=71.0, age_min=75)
     code, d = read(tmp_path)
     assert code == UNKNOWN
-    assert d["five_hour"]["used_percentage"] == pytest.approx(71.0), "the number is still shown"
-    assert d["five_hour"]["reading_age_min"] >= 70, "with its age"
-    assert d["five_hour"]["projected_at_reset"] is None, "but nothing is projected from it"
+    assert d["seven_day"]["used_percentage"] == pytest.approx(71.0), "the number is still shown"
+    assert d["seven_day"]["reading_age_min"] >= 70, "with its age"
+    assert d["seven_day"]["projected_at_reset"] is None, "but nothing is projected from it"
 
 
 def test_a_future_dated_reading_is_refused_rather_than_treated_as_fresh(tmp_path: Path) -> None:
@@ -334,15 +577,868 @@ def test_a_future_dated_reading_is_refused_rather_than_treated_as_fresh(tmp_path
     dead publisher would be disarmed while still looking present. Measured during development: a
     reading written 90 seconds earlier reported as 299 minutes in the future — exactly this machine's
     UTC offset, from stringifying a value ``ConvertFrom-Json`` had already typed as a UTC datetime."""
-    publish(tmp_path, five=71.0, seven=30.0, age_min=-120)
+    publish(tmp_path, seven=71.0, age_min=-120)
     code, d = read(tmp_path)
     assert code == UNKNOWN
-    assert "FUTURE" in d["five_hour"]["reason"].upper()
+    assert "FUTURE" in d["seven_day"]["reason"].upper()
+
+
+@pytest.mark.parametrize(
+    ("pct", "minutes_ahead", "code"),
+    [
+        pytest.param(99.0, 1.0, CRITICAL, id="ceiling-one-minute-ahead"),
+        pytest.param(99.0, 0.5, CRITICAL, id="ceiling-thirty-seconds-ahead"),
+        pytest.param(99.0, 120.0, CRITICAL, id="ceiling-two-hours-ahead"),
+        pytest.param(92.0, 1.0, UNKNOWN, id="at-the-gates-level"),
+        pytest.param(50.0, 1.0, UNKNOWN, id="below-the-rung"),
+    ],
+)
+def test_a_reading_dated_after_now_is_unknown_and_keeps_its_floor(
+    tmp_path: Path, pct: float, minutes_ahead: float, code: int
+) -> None:
+    """It is not fresh, so its own state is UNKNOWN and nothing clears on it. But a small backward clock
+    step dates a real reading ahead, and a stop must not lapse on one, so its number stands as a floor. No
+    stamp here: a fresh reading's level hit stands on any provenance, so this does too."""
+    publish(tmp_path, seven=pct, age_min=-minutes_ahead)
+    got, doc = read(tmp_path)
+    assert got == code, doc
+    window_doc = doc["seven_day"]
+    assert window_doc["state"] == "UNKNOWN" and "FUTURE" in window_doc["reason"], doc
+    assert window_doc["level_floor"] == pct, doc
+    assert window_doc["rate_pct_per_hr"] is None, doc
+
+
+def test_a_reading_dated_after_now_with_no_reset_keeps_its_floor(tmp_path: Path) -> None:
+    """A fresh reading at the rung hits with no reset, because a missing reset must not loosen the rung."""
+    publish(tmp_path, seven=99.0, age_min=-1)
+    doc = latest(tmp_path)
+    del doc["seven_day"]["resets_at_epoch"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] == 99.0
+
+
+def test_a_burn_dated_after_now_stays_critical_and_never_reads_ok(tmp_path: Path) -> None:
+    """The reviewer's case: 30, 40, then 50 one minute ahead, with a reset near enough for the rate to
+    decide. Dropping the row read OK at 10 percent an hour."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=50.0, age_min=-1, seven_epoch=epoch)
+    write_history(tmp_path, [(60, 30.0), (30, 40.0), (-1, 50.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
+    assert doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=0.5), doc
+    assert doc["seven_day"]["level_floor"] == 50.0 and "FUTURE" in doc["seven_day"]["reason"], doc
+
+
+@pytest.mark.parametrize(
+    ("pct", "rows", "stamped"),
+    [
+        pytest.param(89.0, [(89.0, 51.0), (25.0, 89.0)], True, id="89-stamped"),
+        pytest.param(89.0, [(89.0, 51.0), (25.0, 89.0)], False, id="89-unset"),
+        pytest.param(80.0, [(88.0, 10.0), (21.0, 80.0)], True, id="80-stamped"),
+        pytest.param(80.0, [(88.0, 10.0), (21.0, 80.0)], False, id="80-unset"),
+    ],
+)
+def test_a_stale_reading_whose_rows_project_a_run_out_is_critical(
+    tmp_path: Path, pct: float, rows: list[tuple[float, float]], stamped: bool
+) -> None:
+    """An idle repeat leaves the age counting, so these go stale. The code before restamped them and
+    projected about 19 minutes to empty, a stop. Returning before the rate turned that into REVIEW.
+    Counted from now, those 19 minutes have passed, so it reads as already run out."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=pct, age_min=rows[-1][0], seven_epoch=epoch)
+    if stamped:
+        _stamp(tmp_path, tmp_path.parent)
+    write_history(tmp_path, rows, epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
+    assert doc["seven_day"]["minutes_to_empty"] == 0, doc
+    assert "already hit 100%" in doc["seven_day"]["reason"], doc
+
+
+def test_a_stale_run_out_already_past_is_critical_and_says_so(tmp_path: Path) -> None:
+    """Counted from the reading, 89 runs out about 19 minutes after it was taken, which is 6 minutes ago,
+    and after the reset 10 minutes from now. Counted from now it has already run out, before the reset."""
+    epoch = int(time.time()) + 600
+    publish(tmp_path, seven=89.0, age_min=25, seven_epoch=epoch)
+    write_history(tmp_path, [(89.0, 51.0), (25.0, 89.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
+    assert doc["seven_day"]["minutes_to_empty"] == 0, doc
+    assert "already" in doc["seven_day"]["reason"] and "in ~" not in doc["seven_day"]["reason"], doc
+
+
+def test_a_stale_run_out_ahead_is_counted_from_now(tmp_path: Path) -> None:
+    """80 with rows at 85 and 25 minutes ago runs out about 67 minutes after the reading, so about 42
+    minutes from now."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=80.0, age_min=25, seven_epoch=epoch)
+    write_history(tmp_path, [(85.0, 62.0), (25.0, 80.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["minutes_to_empty"] == pytest.approx(42, abs=1), (
+        doc
+    )
+    assert "min from now" in doc["seven_day"]["reason"], doc
+
+
+def test_a_fresh_run_out_is_counted_from_now(tmp_path: Path) -> None:
+    """19 minutes old at 80 percent an hour from 80 runs out 15 minutes after the reading, so 4 minutes
+    ago, before the reset 10 minutes from now. Counted from the reading it read OK."""
+    epoch = int(time.time()) + 600
+    publish(tmp_path, seven=80.0, age_min=19, seven_epoch=epoch)
+    write_history(tmp_path, [(34.0, 60.0), (19.0, 80.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["minutes_to_empty"] == 0, doc
+
+
+def test_a_stale_reading_whose_rows_do_not_reach_a_run_out_stays_unknown(tmp_path: Path) -> None:
+    """The control: the same shape with a slow rate projects past the reset, and a stale number clears
+    nothing, so it stays UNKNOWN with no rate."""
+    epoch = int(time.time()) + 3600
+    publish(tmp_path, seven=70.0, age_min=25, seven_epoch=epoch)
+    write_history(tmp_path, [(85.0, 65.0), (25.0, 70.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == UNKNOWN and doc["seven_day"]["rate_pct_per_hr"] is None, doc
+
+
+def test_a_stale_reading_with_its_reset_ahead_is_a_floor_and_nothing_else_is(
+    tmp_path: Path,
+) -> None:
+    """The gate may HALT on level_floor, so only a reading that was once true and whose window is
+    still running may carry it. No reset proves no window, for a reading that is only stale. A reading
+    dated after now keeps one: test_a_reading_dated_after_now_is_unknown_and_keeps_its_floor."""
+    assert _floor(tmp_path, seven=95.0, age_min=75) == pytest.approx(95.0)
+    assert _floor(tmp_path, seven=95.0) is None, "a fresh reading is no floor"
+
+    publish(tmp_path, seven=95.0, age_min=75)
+    _stamp(tmp_path, tmp_path.parent)
+    doc = latest(tmp_path)
+    del doc["seven_day"]["resets_at_epoch"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "no reset proves no window"
+
+
+@pytest.mark.parametrize(
+    ("doc_root", "window_root"),
+    [
+        pytest.param(None, None, id="no-stamp"),
+        pytest.param("unset", "unset", id="unset"),
+        pytest.param("own", "unset", id="window-unset"),
+        pytest.param("unset", "own", id="document-unset"),
+    ],
+)
+def test_a_stale_reading_with_unverified_provenance_is_no_floor(
+    tmp_path: Path, doc_root: str | None, window_root: str | None
+) -> None:
+    """Halting until the reset on a number this reader cannot tie to this account is too long a
+    deferral. Such a reading answers REVIEW, as it did before the floor."""
+    publish(tmp_path, seven=95.0, age_min=75)
+    own = str(tmp_path.parent)
+    doc = latest(tmp_path)
+    if doc_root:
+        doc["published_by"]["config_root_env"] = own if doc_root == "own" else doc_root
+    if window_root:
+        doc["seven_day"]["config_root_env"] = own if window_root == "own" else window_root
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None
+
+
+@pytest.mark.parametrize(
+    ("pct", "expected"),
+    [
+        pytest.param(97.9, None, id="just-below-the-ceiling"),
+        pytest.param(98.0, 98.0, id="the-ceiling"),
+        pytest.param(100.0, 100.0, id="spent"),
+    ],
+)
+def test_at_the_ceiling_unverified_provenance_still_leaves_a_floor(
+    tmp_path: Path, pct: float, expected: float | None
+) -> None:
+    """A fresh reading at the ceiling stops work on any provenance, and an idle session's equal reading
+    does not refresh its age, so without this the stop would decay on an unchanged number."""
+    publish(tmp_path, seven=pct, age_min=21)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] == expected
+
+
+def test_the_ceiling_floor_keeps_the_other_bounds(tmp_path: Path) -> None:
+    """Provenance is the only test the ceiling drops. A fresh, gone or over-long reading still sets
+    nothing, and a window stamped with another root is still refused."""
+    publish(tmp_path, seven=100.0)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "fresh"
+    publish(tmp_path, seven=100.0, age_min=75, seven_epoch=int(time.time()) + 10050 * 60)
+    assert read(tmp_path)[1]["seven_day"]["level_floor"] is None, "does not fit a week"
+    publish(tmp_path, seven=100.0, age_min=75, seven_epoch=int(time.time()) - 60)
+    assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "reset passed"
+    publish(tmp_path, seven=100.0, age_min=-1, seven_epoch=int(time.time()) - 60)
+    assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "dated ahead, reset passed"
+
+    publish(tmp_path, seven=100.0, age_min=75)
+    doc = latest(tmp_path)
+    doc["seven_day"]["config_root_env"] = str(tmp_path.parent / "another-root")
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert read(tmp_path)[1]["seven_day"].get("level_floor") is None, "another root's window"
+
+
+def _age_window(state: Path, minutes: float) -> None:
+    doc = latest(state)
+    doc["seven_day"]["captured_at"] = _minutes_ago(minutes)
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _session_fire(
+    state: Path, seven: dict[str, Any], session: str = "S", api_ms: float | str | None = None
+) -> None:
+    payload: dict[str, Any] = {"session_id": session, "rate_limits": {"seven_day": seven}}
+    if api_ms is not None:
+        payload["cost"] = {"total_api_duration_ms": api_ms}
+    collect(state, payload)
+
+
+def _mark(state: Path, session: str = "S") -> Path:
+    return state / "live-marks" / f"mark-{session}.json"
+
+
+def _age_min(state: Path) -> float:
+    return (datetime.now(UTC) - captured_at(state)).total_seconds() / 60
+
+
+def _marks(state: Path) -> list[Path]:
+    """Every file under the state directory that holds a mark, wherever the collector puts it."""
+    return [p for p in state.rglob("*") if p.is_file() and "mark" in p.name]
+
+
+def test_a_session_that_called_the_api_confirms_an_equal_reading(tmp_path: Path) -> None:
+    """A healthy live flat account stays fresh. An idle session's repeat, the same counter, does not."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+
+    _session_fire(tmp_path, seven, api_ms=1000)
+    code, doc = read(tmp_path)
+    assert code == UNKNOWN and doc["seven_day"]["reading_age_min"] >= 24, "control: an idle repeat"
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    code, doc = read(tmp_path)
+    assert code == 0 and doc["seven_day"]["reading_age_min"] < 5, doc
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(40.0)
+    assert len(history(tmp_path)) == 1, "a confirmation is not a new observation of a moved number"
+
+
+def _confirm_refused_case(state: Path, case: str) -> None:
+    """Drive one fire that must leave the age counting; the window starts 25 minutes old at 40."""
+    seven = window(40.0, 280000)
+    _session_fire(state, seven, api_ms=1000)
+    _age_window(state, 25)
+    if case == "first-fire-of-a-session":
+        _session_fire(state, seven, session="T", api_ms=5000)
+    elif case == "another-sessions-counter":
+        _session_fire(state, seven, session="T", api_ms=1000)
+        _session_fire(state, seven, session="U", api_ms=2000)
+    elif case == "no-counter":
+        _session_fire(state, seven)
+    elif case == "counter-fell":
+        _session_fire(state, seven, api_ms=500)
+    elif case == "counter-fell-and-came-back":
+        _session_fire(state, seven, api_ms=500)
+        _session_fire(state, seven, api_ms=1000)
+    elif case == "two-processes-on-one-id":
+        for api_ms in (7000, 5000, 7000, 5000, 7000):
+            _session_fire(state, seven, api_ms=api_ms)
+        _age_window(state, 25)
+        for api_ms in (5000, 7000):
+            _session_fire(state, seven, api_ms=api_ms)
+    elif case == "lower-number":
+        _session_fire(state, {**seven, "used_percentage": 30.0}, api_ms=2000)
+    elif case == "unreadable-mark":
+        _mark(state).write_text("{ not json", encoding="utf-8")
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "missing-mark":
+        _mark(state).unlink()
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "mark-with-no-counter":
+        _mark(state).write_text('{"at": 1}', encoding="utf-8")
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "mark-with-a-blank-counter":
+        _mark(state).write_text('{"api_ms": ""}', encoding="utf-8")
+        _session_fire(state, seven, api_ms=2000)
+    elif case == "payload-with-a-blank-counter":
+        _session_fire(state, seven, session="T", api_ms="")
+        _session_fire(state, seven, session="T", api_ms=2000)
+    else:
+        raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "first-fire-of-a-session",
+        "another-sessions-counter",
+        "no-counter",
+        "counter-fell",
+        "counter-fell-and-came-back",
+        "two-processes-on-one-id",
+        "lower-number",
+        "unreadable-mark",
+        "missing-mark",
+        "mark-with-no-counter",
+        "mark-with-a-blank-counter",
+        "payload-with-a-blank-counter",
+    ],
+)
+def test_nothing_else_confirms_an_equal_reading(tmp_path: Path, case: str) -> None:
+    _confirm_refused_case(tmp_path, case)
+    code, doc = read(tmp_path)
+    assert code == UNKNOWN and doc["seven_day"]["reading_age_min"] >= 24, doc
+
+
+def test_a_mark_that_cannot_be_written_leaves_the_age_counting(tmp_path: Path) -> None:
+    """If the write fails, the mark keeps the old counter, so every idle repeat would read as a rise and
+    a frozen number would stay fresh for good. A read-only mark makes the real rename fail. The control
+    is the same fire with the write working again."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+    marks = _marks(tmp_path)
+    assert marks, "the first fire left no mark to hold read-only"
+    for mark in marks:
+        mark.chmod(stat.S_IREAD)
+    try:
+        _session_fire(tmp_path, seven, api_ms=2000)
+        assert _age_min(tmp_path) > 24, "a rise whose mark was lost confirmed the reading"
+        _session_fire(tmp_path, seven, api_ms=2000)
+        assert _age_min(tmp_path) > 24, "an idle repeat confirmed the reading"
+    finally:
+        for mark in marks:
+            mark.chmod(stat.S_IREAD | stat.S_IWRITE)
+    _session_fire(tmp_path, seven, api_ms=3000)
+    assert _age_min(tmp_path) < 5, "control: with the write working, a rise confirms"
+
+
+def test_a_blocked_mark_directory_costs_the_refresh_and_not_the_publish(tmp_path: Path) -> None:
+    """The directory cannot be made, so the mark write throws. That must not reach the outer catch and
+    cost the session its reading."""
+    (tmp_path / "live-marks").write_text("in the way", encoding="utf-8")
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+    line = collect(
+        tmp_path,
+        {
+            "session_id": "S",
+            "cost": {"total_api_duration_ms": 2000},
+            "rate_limits": {"seven_day": seven},
+        },
+    )
+    assert line.startswith("7d 40%"), line
+    assert _age_min(tmp_path) > 24, "a rise with no mark confirmed the reading"
+    _session_fire(tmp_path, {**seven, "used_percentage": 41.0}, api_ms=3000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(41.0)
+
+
+def test_one_sessions_late_write_cannot_restore_another_sessions_mark(tmp_path: Path) -> None:
+    """The race on one shared file, made deterministic: T's write lands after S has recorded a rise. If
+    both sessions shared a file, that write would put S's older counter back, and S's idle repeat would
+    then read as a rise."""
+    seven = window(40.0, 280000)
+    other = "44444444-aaaa-4bbb-8ccc-000000000004"
+    _session_fire(tmp_path, seven, api_ms=1000)
+    before = {p: p.read_bytes() for p in _marks(tmp_path)}
+    _session_fire(tmp_path, seven, session=other, api_ms=7000)
+    late = {p: p.read_bytes() for p in _marks(tmp_path) if before.get(p) != p.read_bytes()}
+    assert late, "control: the other session's fire wrote nothing"
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    for path, content in late.items():
+        path.write_bytes(content)
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert _age_min(tmp_path) > 24, "an idle repeat read as a rise"
+
+
+def test_two_sessions_keep_their_own_marks(tmp_path: Path) -> None:
+    """Each session has one file and writes no other. Neither fire disturbs the other's counter."""
+    seven = window(40.0, 280000)
+    other = "44444444-aaaa-4bbb-8ccc-000000000004"
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _session_fire(tmp_path, seven, session=other, api_ms=7000)
+    held = _mark(tmp_path, other).read_bytes()
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert _mark(tmp_path, other).read_bytes() == held
+    assert json.loads(_mark(tmp_path).read_text(encoding="utf-8"))["api_ms"] == 2000
+
+    _session_fire(tmp_path, seven, session=other, api_ms=8000)
+    assert json.loads(_mark(tmp_path).read_text(encoding="utf-8"))["api_ms"] == 2000
+    assert json.loads(_mark(tmp_path, other).read_text(encoding="utf-8"))["api_ms"] == 8000
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        pytest.param("a/../../escaped", id="interior-forward"),
+        pytest.param("a\\..\\..\\escaped", id="interior-back"),
+        pytest.param("a:stream", id="alternate-stream"),
+        pytest.param("..", id="parent"),
+        pytest.param("name.with.dots", id="dots"),
+        pytest.param("x" * 129, id="too-long"),
+    ],
+)
+def test_a_session_id_that_is_not_a_plain_name_writes_no_mark(tmp_path: Path, session: str) -> None:
+    """The id comes from a JSON payload and names a file. An id that is not a plain name is refused
+    rather than cleaned up, because two ids cleaned to one name would share a mark. The file name is
+    prefixed, so an id must hold an interior segment to climb out; each case here does write a file with
+    the test removed."""
+    state = tmp_path / "root" / "mefor-usage"
+    state.mkdir(parents=True)
+    seven = window(40.0, 280000)
+    _session_fire(state, seven, session=session, api_ms=1000)
+    _age_window(state, 25)
+    _session_fire(state, seven, session=session, api_ms=2000)
+    assert _age_min(state) > 24, "a refused id cannot prove a rise"
+    written = {p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file()}
+    assert written == {"root/mefor-usage/latest.json", "root/mefor-usage/history.jsonl"}, written
+
+
+@pytest.mark.parametrize(
+    "damaged",
+    [
+        pytest.param("{ not json", id="not-json"),
+        pytest.param('{"at": 1}', id="no-counter"),
+        pytest.param('{"api_ms": ""}', id="blank-counter"),
+        pytest.param('{"api_ms": NaN}', id="not-finite"),
+    ],
+)
+def test_a_mark_that_cannot_be_read_is_not_replaced(tmp_path: Path, damaged: str) -> None:
+    """It may hide a higher counter, so a lower one must not replace it: the process holding the higher
+    counter would then read its own idle repeat as a rise."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=8000)
+    _mark(tmp_path).write_text(damaged, encoding="utf-8")
+    _age_window(tmp_path, 25)
+
+    _session_fire(tmp_path, seven, api_ms=5000)
+    assert _mark(tmp_path).read_text(encoding="utf-8") == damaged, "the mark was replaced"
+    _session_fire(tmp_path, seven, api_ms=8000)
+    assert _mark(tmp_path).read_text(encoding="utf-8") == damaged, "the mark was replaced"
+    assert _age_min(tmp_path) > 24, "an idle repeat read as a rise"
+
+
+def test_a_mark_the_read_fails_on_is_not_replaced(tmp_path: Path) -> None:
+    """The failed-read route: a good mark at 8000, its read denied, while replacing it still works
+    (measured). Nothing here says the counter is lower, so the 5000 must not land."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=8000)
+    _age_window(tmp_path, 25)
+    mark = str(_mark(tmp_path))
+    user = os.environ["USERNAME"]
+    subprocess.run(["icacls", mark, "/deny", f"{user}:(RD)"], capture_output=True, check=True)
+    try:
+        _session_fire(tmp_path, seven, api_ms=5000)
+    finally:
+        subprocess.run(["icacls", mark, "/reset"], capture_output=True, check=True)
+    assert json.loads(_mark(tmp_path).read_text(encoding="utf-8"))["api_ms"] == 8000
+    _session_fire(tmp_path, seven, api_ms=8000)
+    assert _age_min(tmp_path) > 24, "an idle repeat read as a rise"
+
+
+def test_a_prune_clears_an_unreadable_mark_and_the_session_recovers(tmp_path: Path) -> None:
+    """A file holding no number does not mend itself. At least a read that works again or a hand delete
+    also ends an unreadable mark; this is the route the collector takes itself."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _mark(tmp_path).write_text("{ not json", encoding="utf-8")
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(_mark(tmp_path), (eight_days_ago, eight_days_ago))
+
+    _session_fire(tmp_path, seven, session="new", api_ms=1000)
+    assert not _mark(tmp_path).exists()
+    _session_fire(tmp_path, seven, api_ms=2000)
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, seven, api_ms=3000)
+    assert _age_min(tmp_path) < 5, "control: a new mark confirms a rise again"
+
+
+def test_a_new_session_clears_marks_nobody_touched_for_a_week(tmp_path: Path) -> None:
+    """One file per session has no other bound. An old mark's loss costs that session one refresh."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    old, recent = _mark(tmp_path, "old"), _mark(tmp_path, "recent")
+    other = tmp_path / "live-marks" / "note.txt"
+    for path in (old, recent, other):
+        path.write_text('{"api_ms": 5}', encoding="utf-8")
+    eight_days_ago = time.time() - 8 * 86400
+    os.utime(old, (eight_days_ago, eight_days_ago))
+    os.utime(other, (eight_days_ago, eight_days_ago))
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert old.exists(), "control: a session's later fires prune nothing"
+
+    _session_fire(tmp_path, seven, session="new", api_ms=1000)
+    assert not old.exists()
+    assert recent.exists() and other.exists() and _mark(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [pytest.param(None, id="absent"), pytest.param("", id="blank")],
+)
+def test_a_published_window_with_no_number_is_not_a_reading_of_zero(
+    tmp_path: Path, missing: str | None
+) -> None:
+    """A published window with no percentage must not compare as 0. A live 0 for the same reset would
+    otherwise be kept, its age refreshed, over a window with no number in it."""
+    seven = window(0.0, 280000)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    doc = latest(tmp_path)
+    if missing is None:
+        del doc["seven_day"]["used_percentage"]
+    else:
+        doc["seven_day"]["used_percentage"] = missing
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _age_window(tmp_path, 25)
+
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == 0, latest(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("", id="blank"),
+        pytest.param(True, id="bool"),
+        pytest.param("abc", id="text"),
+        pytest.param("NaN", id="nan-string"),
+        pytest.param("Infinity", id="infinity-string"),
+        pytest.param("-5", id="negative-string"),
+        pytest.param(-5, id="negative"),
+        pytest.param(-0.1, id="just-below-zero"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param({}, id="object"),
+        pytest.param([], id="empty-array"),
+        pytest.param([95], id="one-element-array"),
+        pytest.param([1, 2], id="array"),
+        pytest.param("2026-11-02T10:00:00Z", id="date-string"),
+    ],
+)
+def test_the_reader_does_not_turn_a_window_with_no_number_into_a_zero(
+    tmp_path: Path, missing: Any
+) -> None:
+    """Fresh, stamped and with its reset ahead, so nothing but the number is wrong. Each of these read
+    OK or a 0, and NaN cleared the gate. The survey prints no number either."""
+    publish(tmp_path, seven=40.0)
+    doc = latest(tmp_path)
+    if missing is None:
+        del doc["seven_day"]["used_percentage"]
+    else:
+        doc["seven_day"]["used_percentage"] = missing
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    code, got = read(tmp_path)
+    assert code == UNKNOWN and got["state"] == "UNKNOWN", got
+    assert got["seven_day"]["used_percentage"] is None, got
+    assert "carries no percentage" in got["seven_day"]["reason"], got
+
+
+def test_the_survey_prints_no_number_for_a_window_with_none(fake_home: Path) -> None:
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    publish(state, seven=40.0)
+    doc = latest(state)
+    del doc["seven_day"]["used_percentage"]
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _, got, _ = reader("-Json", "-AllRoots", pin=pin, home=fake_home)
+    row = next(r for r in got["roots"] if r["root"].endswith(".claude-account-1"))
+    assert row["seven"] is None, row
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("", id="blank"),
+        pytest.param("abc", id="text"),
+        pytest.param("99%", id="percent-sign"),
+        pytest.param("-5", id="negative-string"),
+        pytest.param(-5, id="negative"),
+    ],
+)
+def test_a_percentage_that_is_not_one_is_no_reading(tmp_path: Path, value: Any) -> None:
+    """An absent window is carried, and one with no percentage in it is absent. The control is that
+    nothing replaced the reading, and the empty directory below publishes nothing at all."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven)
+    _session_fire(tmp_path, {**window(0.0, 290000), "used_percentage": value})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(40.0)
+    assert len(history(tmp_path)) == 1, history(tmp_path)
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _session_fire(empty, {**window(0.0, 290000), "used_percentage": value})
+    assert not (empty / "latest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "number"),
+    [pytest.param("99", 99.0, id="whole"), pytest.param("99.5", 99.5, id="decimal")],
+)
+def test_a_numeric_string_in_a_payload_is_a_reading(
+    tmp_path: Path, text: str, number: float
+) -> None:
+    """Dropping it would leave a lower reading published and fresh. It is published as a number."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven)
+    _session_fire(tmp_path, {**seven, "used_percentage": text})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(number)
+    assert history(tmp_path)[-1]["seven_day"] == pytest.approx(number), history(tmp_path)
+
+
+def test_a_numeric_string_in_the_document_keeps_its_verdict(tmp_path: Path) -> None:
+    publish(tmp_path, seven=40.0)
+    doc = latest(tmp_path)
+    doc["seven_day"]["used_percentage"] = "99"
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    code, got = read(tmp_path)
+    assert code == CRITICAL and got["seven_day"]["used_percentage"] == pytest.approx(99.0), got
+
+
+def test_a_published_numeric_string_still_binds_the_reset(tmp_path: Path) -> None:
+    """The highest reading binds, so a lower one for the same reset does not replace it."""
+    seven = window(40.0, 280000)
+    _session_fire(tmp_path, seven)
+    doc = latest(tmp_path)
+    doc["seven_day"]["used_percentage"] = "99"
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _session_fire(tmp_path, seven)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == "99"
+
+
+def test_a_reading_over_100_stays_a_number_and_keeps_the_stop(tmp_path: Path) -> None:
+    """The client clamps this window at 100 today, and the clamp is the client's. Refusing 104 would turn
+    a spent pool into UNKNOWN, so it reads as the stop it is."""
+    collect(tmp_path, {"session_id": "S", "rate_limits": {"seven_day": window(104.0, 280000)}})
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(104.0)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["used_percentage"] == pytest.approx(104.0), doc
+
+
+@pytest.mark.parametrize(
+    ("ahead_pct", "highest"),
+    [
+        pytest.param(20.0, 40.0, id="a-low-row-cannot-turn-the-rate-negative"),
+        pytest.param(50.0, 50.0, id="a-high-row-stays-in-the-rate"),
+    ],
+)
+@pytest.mark.parametrize("minutes_ahead", [5.0, 1.0], ids=["five-minutes", "one-minute"])
+def test_a_history_row_dated_after_now_stays_in_the_rate(
+    tmp_path: Path, minutes_ahead: float, ahead_pct: float, highest: float
+) -> None:
+    """Beside a fresh reading, which is what a live confirmation leaves after a backward clock step. The
+    span keeps the row's own date, and the highest percentage is the level reached."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=50.0, seven_epoch=epoch)
+    write_history(tmp_path, [(60.0, 30.0), (30.0, 40.0), (-minutes_ahead, ahead_pct)], epoch)
+    _, doc = read(tmp_path)
+    rate = (highest - 30.0) / ((60.0 + minutes_ahead) / 60.0)
+    assert doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, abs=0.5), doc
+
+
+def test_rows_all_dated_after_now_still_give_a_rate(tmp_path: Path) -> None:
+    """Clamping both to 0 left no span and no rate, so a burn read OK where main stops."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=70.0, seven_epoch=epoch)
+    write_history(tmp_path, [(-1.0, 40.0), (-16.0, 70.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(120, abs=1), (
+        doc
+    )
+
+
+def test_a_burn_dated_after_now_with_no_reset_stays_critical(tmp_path: Path) -> None:
+    """No reset to run out before, so the band alone would clear the rate, and the floor of 70 sits below
+    the rung. A missing reset must not loosen the rung."""
+    publish(tmp_path, seven=70.0, age_min=-1)
+    doc = latest(tmp_path)
+    del doc["seven_day"]["resets_at_epoch"]
+    (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    now = int(time.time())
+    write_history(tmp_path, [(15.0, 40.0), (-1.0, 70.0)], now)
+    code, got = read(tmp_path)
+    assert code == CRITICAL and got["seven_day"]["state"] == "CRITICAL", got
+    assert got["seven_day"]["minutes_to_empty"] is not None, got
+    assert "FUTURE" in got["seven_day"]["reason"] and got["seven_day"]["dated_ahead"] is True, got
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param("", id="blank"),
+        pytest.param(True, id="bool"),
+        pytest.param(-5, id="negative"),
+        pytest.param({}, id="object"),
+    ],
+)
+def test_a_history_row_with_no_number_is_skipped(tmp_path: Path, bad: Any) -> None:
+    """At either end of the span. A NaN row used to read OK and clear a burn, and a blank one faked a
+    burn from 0. The control is the same history without the bad rows: the answer must match it."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=40.0, seven_epoch=epoch)
+
+    def rows(points: list[tuple[float, Any]]) -> None:
+        (tmp_path / "history.jsonl").write_text(
+            "".join(
+                json.dumps({"at": _minutes_ago(m), "seven_day": v, "seven_reset": epoch}) + "\n"
+                for m, v in points
+            ),
+            encoding="utf-8",
+        )
+
+    good: list[tuple[float, Any]] = [(60, 30.0), (30, 40.0)]
+    rows(good)
+    want_code, want = read(tmp_path)
+    assert want["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=0.5), want
+    rows([(80, bad), *good, (1, bad)])
+    got_code, got = read(tmp_path)
+    assert got_code == want_code, got
+    assert got["seven_day"]["rate_pct_per_hr"] == pytest.approx(
+        want["seven_day"]["rate_pct_per_hr"], abs=0.5
+    ), got
+
+
+def test_every_copy_of_a_number_rule_agrees() -> None:
+    """Copies of one rule in three files that must each survive without the others, so drift goes red
+    here."""
+    hook = ROOT / "scripts" / "hooks" / "usage-headroom-inject.ps1"
+    for name, paths in (("Get-Finite", (COLLECT, READ, hook)), ("Get-Percentage", (COLLECT, READ))):
+        body = re.compile(rf"^function {name}\(\$Value\) \{{$.*?^\}}$", re.M | re.S)
+        copies = set()
+        for path in paths:
+            found = body.search(path.read_text(encoding="utf-8"))
+            assert found, f"no {name} in {path}"
+            copies.add(found.group())
+        assert len(copies) == 1, copies
+
+
+def test_a_session_of_another_root_cannot_confirm_this_roots_reading(tmp_path: Path) -> None:
+    root = tmp_path / "this-root"
+    state = root / "mefor-usage"
+    state.mkdir(parents=True)
+    seven = window(40.0, 280000)
+    _session_fire(state, seven, api_ms=1000)
+    _age_window(state, 25)
+    payload = {
+        "session_id": "S",
+        "cost": {"total_api_duration_ms": 2000},
+        "rate_limits": {"seven_day": seven},
+    }
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(COLLECT), "-StateDir", str(state)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(tmp_path / "other-root"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert datetime.now(UTC) - captured_at(state) > timedelta(minutes=24)
+
+
+def test_a_gone_window_cannot_be_confirmed(tmp_path: Path) -> None:
+    seven = window(40.0, -300)
+    _session_fire(tmp_path, seven, api_ms=1000)
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, seven, api_ms=2000)
+    assert datetime.now(UTC) - captured_at(tmp_path) > timedelta(minutes=24)
+
+
+@pytest.mark.parametrize(
+    ("pct", "stamped", "code", "state", "floor"),
+    [
+        pytest.param(100.0, False, CRITICAL, "CRITICAL", 100.0, id="spent-unstamped"),
+        pytest.param(98.0, True, CRITICAL, "CRITICAL", 98.0, id="ceiling-stamped"),
+        pytest.param(97.9, True, UNKNOWN, "UNKNOWN", 97.9, id="just-below-the-ceiling"),
+        pytest.param(90.0, True, UNKNOWN, "UNKNOWN", 90.0, id="at-the-gates-level"),
+        pytest.param(85.0, True, UNKNOWN, "UNKNOWN", 85.0, id="fresh-warn-band"),
+        pytest.param(84.9, True, UNKNOWN, "UNKNOWN", 84.9, id="below-the-band"),
+        pytest.param(90.0, False, UNKNOWN, "UNKNOWN", None, id="high-with-no-floor"),
+    ],
+)
+def test_only_a_floor_at_the_ceiling_sets_the_verdict(
+    tmp_path: Path, pct: float, stamped: bool, code: int, state: str, floor: float | None
+) -> None:
+    """The header promises exit 11 at the ceiling. Below it the number is only a lower bound, so the
+    verdict stays UNKNOWN (exit 20), while level_floor still carries it to the gate; test_afk_gate holds
+    the gate to it. The window's own state is UNKNOWN throughout, which is what the gate reads below the
+    rung."""
+    publish(tmp_path, seven=pct, age_min=25)
+    if stamped:
+        _stamp(tmp_path, tmp_path.parent)
+    got, doc = read(tmp_path)
+    assert (got, doc["state"]) == (code, state), doc
+    assert doc["seven_day"]["state"] == "UNKNOWN", doc
+    assert doc["seven_day"]["level_floor"] == floor, doc
+    assert ("COMMIT NOW" in doc["advice"]) == (state == "CRITICAL"), doc
+
+
+def test_a_root_wired_elsewhere_gets_no_floor_and_a_wired_one_does(fake_home: Path) -> None:
+    pin = fake_home / ".claude-account-1"
+    publish(pin / "mefor-usage", seven=95.0, age_min=75)
+    _stamp(pin / "mefor-usage", pin)
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["seven_day"]["level_floor"] is None, "an unwired root's reading is no floor"
+
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["seven_day"]["level_floor"] == pytest.approx(95.0), "control: wired, it is one"
+
+
+@pytest.mark.parametrize(
+    ("state_name", "settings"),
+    [
+        pytest.param("SETTINGS_UNREADABLE", "{ not json", id="settings-unreadable"),
+        pytest.param("WIRED_POWERSHELL_SOURCE", None, id="powershell-source"),
+    ],
+)
+def test_a_diagnosis_off_the_untrusted_list_keeps_a_floor_it_cannot_correct(
+    fake_home: Path, state_name: str, settings: str | None
+) -> None:
+    """ADR 0211 states this as a limit: neither state proves the root is wired here, and the floor
+    stands anyway. If either joins $dxUntrusted, this fails and that sentence has to go."""
+    pin = fake_home / ".claude-account-1"
+    state = pin / "mefor-usage"
+    publish(state, seven=95.0, age_min=75)
+    _stamp(state, pin)
+    command = _powershell_source_command(COLLECT, state)
+    text = settings or json.dumps({"statusLine": {"type": "command", "command": command}})
+    (pin / "settings.json").write_text(text, encoding="utf-8")
+    _, doc, _ = reader("-Json", pin=pin, home=fake_home)
+    assert doc["statusline_state"] == state_name, doc
+    assert doc["seven_day"]["level_floor"] == pytest.approx(95.0), doc
+
+
+@pytest.mark.parametrize(
+    ("resets_in_min", "expected"),
+    [
+        pytest.param(9000, 95.0, id="fits-a-week"),
+        pytest.param(10050, None, id="age-plus-reset-past-a-week"),
+        pytest.param(43200, None, id="reset-a-month-ahead"),
+    ],
+)
+def test_no_floor_outlasts_the_seven_day_window(
+    tmp_path: Path, resets_in_min: int, expected: float | None
+) -> None:
+    """A reading 75 minutes old cannot belong to a 7-day window that ends more than 6 days and 22
+    hours away. Without this bound a wrong floor could hold for as long as its reset says."""
+    epoch = int(time.time()) + resets_in_min * 60
+    assert _floor(tmp_path, seven=95.0, age_min=75, seven_epoch=epoch) == expected
 
 
 def test_a_never_published_window_is_unknown_not_zero(tmp_path: Path) -> None:
-    publish(tmp_path, five=50.0, seven=None)
-    _, d = read(tmp_path)
+    publish(tmp_path, seven=None)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN
     assert d["seven_day"]["state"] == "UNKNOWN"
     assert d["seven_day"]["used_percentage"] is None, "absent must not render as 0% used"
 
@@ -350,25 +1446,116 @@ def test_a_never_published_window_is_unknown_not_zero(tmp_path: Path) -> None:
 def test_burning_faster_than_the_window_resets_is_critical(tmp_path: Path) -> None:
     """The operational question is not 'is the number big' but 'does it run out before it resets'."""
     epoch = int(time.time()) + 3600
-    publish(tmp_path, five=71.0, seven=30.0, five_epoch=epoch)
+    publish(tmp_path, seven=71.0, seven_epoch=epoch)
     write_history(tmp_path, [(60, 40.0), (40, 52.0), (20, 64.0), (1, 71.0)], epoch)
 
     code, d = read(tmp_path)
     assert code == CRITICAL
-    assert d["five_hour"]["rate_pct_per_hr"] > 20
-    assert 0 < d["five_hour"]["minutes_to_empty"] < 60, "must run out before the window resets"
+    assert d["seven_day"]["rate_pct_per_hr"] > 20
+    assert 0 < d["seven_day"]["minutes_to_empty"] < 60, "must run out before the window resets"
+    gap = d["seven_day"]["minutes_to_reset"] - d["seven_day"]["minutes_to_empty"]
+    assert f"{gap:.0f} min before this window resets" in d["seven_day"]["reason"], d
 
 
 def test_a_high_but_stable_reading_is_not_critical(tmp_path: Path) -> None:
     """85% with nothing being consumed is not an emergency, and calling it one is how a warning gets
     ignored when it is real."""
     epoch = int(time.time()) + 3600
-    publish(tmp_path, five=86.0, seven=30.0, five_epoch=epoch)
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
     write_history(tmp_path, [(60, 86.0), (30, 86.0), (1, 86.0)], epoch)
 
     code, d = read(tmp_path)
     assert code == WARN
-    assert d["five_hour"]["minutes_to_empty"] is None, "a flat rate cannot project exhaustion"
+    assert d["seven_day"]["minutes_to_empty"] is None, "a flat rate cannot project exhaustion"
+
+
+def test_a_burn_that_stopped_still_reads_as_a_burn_until_its_rows_age_out(tmp_path: Path) -> None:
+    """The span ends at the newest row, so the flat time since then does not dilute the rate. It can
+    stop work on a pool that has room, and a false stop is the safe direction. Ending the span at now
+    let a real burn read as clear: a fresh 80 with rows at 85 and 70 minutes ago and 60 minutes to the
+    reset. The rows here are that case."""
+    epoch = int(time.time()) + 3600
+    publish(tmp_path, seven=80.0, seven_epoch=epoch)
+    write_history(tmp_path, [(85, 55.0), (70, 80.0)], epoch)
+
+    code, d = read(tmp_path)
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(100.0, abs=0.5), d
+    assert d["seven_day"]["minutes_to_empty"] == pytest.approx(12.0, abs=1), d
+
+
+@pytest.mark.parametrize(
+    ("older", "newer", "rate"),
+    [
+        pytest.param((4.0, 85.0), (0.1, 86.0), 15.4, id="over-four-minutes"),
+        pytest.param((0.5, 85.0), (0.02, 86.0), 120.0, id="seconds-apart"),
+    ],
+)
+def test_one_tick_is_a_rate_however_close_the_rows(
+    tmp_path: Path, older: tuple[float, float], newer: tuple[float, float], rate: float
+) -> None:
+    """The weekly prints whole numbers, so a tick can be quantisation, and this can stop work on a pool
+    that has room. A false stop is the safe direction, and a minimum span read a real burn as clear."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [older, newer], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, rel=0.15), d
+
+
+def test_a_fast_burn_is_a_rate(tmp_path: Path) -> None:
+    """40 to 84 in 25 minutes is the burn a stop exists for, and the level alone would grade it clear."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=84.0, seven_epoch=epoch)
+    write_history(tmp_path, [(25, 40.0), (15, 60.0), (5, 80.0), (0.5, 84.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(107.8, abs=2), d
+
+
+def test_a_tick_over_half_an_hour_is_a_small_rate(tmp_path: Path) -> None:
+    """The same two percentages, further apart, are a smaller rate."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(31.0, 85.0), (0.1, 86.0)], epoch)
+    _, d = read(tmp_path)
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(1.94, abs=0.05), d
+
+
+def test_a_reading_whose_reset_has_passed_is_no_current_reading(tmp_path: Path) -> None:
+    """It describes a window that is gone: UNKNOWN, with no number to act on and no reset to print."""
+    publish(tmp_path, seven=95.0, seven_epoch=int(time.time()) - 300)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN, d
+    assert d["seven_day"]["state"] == "UNKNOWN", d
+    assert d["seven_day"]["used_percentage"] is None, d
+    assert "reset has passed" in d["seven_day"]["reason"], d
+    _, _, human = reader("-StateDir", str(tmp_path), pin=None)
+    assert "95.0%" not in human and "resets in" not in human, human
+
+
+def test_a_wired_root_with_a_gone_window_gets_no_never_ran_diagnosis(fake_home: Path) -> None:
+    """The reading is seconds old, so "no session has started" and "the statusLine never runs" are
+    both false. The control is the same root with a stale reading, which does get them."""
+    pin = fake_home / ".claude-account-1"
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+    state = pin / "mefor-usage"
+    publish(state, seven=95.0, seven_epoch=int(time.time()) - 300)
+    _, _, gone = reader(pin=pin, home=fake_home)
+    assert "reset has passed" in gone and "cannot tell them apart" not in gone, gone
+
+    publish(state, seven=95.0, age_min=48)
+    _, _, stale = reader(pin=pin, home=fake_home)
+    assert "cannot tell them apart" in stale, stale
+
+
+def test_a_high_reading_with_no_rate_does_not_claim_a_projection(tmp_path: Path) -> None:
+    publish(tmp_path, seven=91.0)
+    code, d = read(tmp_path)
+    assert code == WARN
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert "nothing is projected" in d["seven_day"]["reason"], d
 
 
 def test_rate_is_not_computed_across_a_window_reset(tmp_path: Path) -> None:
@@ -379,20 +1566,14 @@ def test_rate_is_not_computed_across_a_window_reset(tmp_path: Path) -> None:
     """
     old_epoch = int(time.time()) - 600  # a window that already reset
     new_epoch = int(time.time()) + 3600
-    publish(tmp_path, five=5.0, seven=30.0, five_epoch=new_epoch)
+    publish(tmp_path, seven=5.0, seven_epoch=new_epoch)
     state = tmp_path
     rows = [
-        {
-            "at": (datetime.now(UTC) - timedelta(minutes=m)).isoformat().replace("+00:00", "Z"),
-            "five_hour": p,
-            "seven_day": None,
-            "five_reset": e,
-            "seven_reset": None,
-        }
+        {"at": _minutes_ago(m), "seven_day": p, "seven_reset": e}
         for m, p, e in [
             (50, 88.0, old_epoch),
             (40, 93.0, old_epoch),
-            (10, 2.0, new_epoch),
+            (35, 2.0, new_epoch),
             (1, 5.0, new_epoch),
         ]
     ]
@@ -401,13 +1582,13 @@ def test_rate_is_not_computed_across_a_window_reset(tmp_path: Path) -> None:
     )
 
     _, d = read(state)
-    rate = d["five_hour"]["rate_pct_per_hr"]
+    rate = d["seven_day"]["rate_pct_per_hr"]
     assert rate is not None and rate > 0, f"rate must come from the CURRENT window only, got {rate}"
 
 
 def test_the_unmeasured_bucket_is_named_every_run(tmp_path: Path) -> None:
     """The model-scoped weekly bucket (the "Weekly / Fable" bar) is not in the statusLine payload."""
-    publish(tmp_path, five=10.0, seven=10.0)
+    publish(tmp_path, seven=10.0)
     _, d = read(tmp_path)
     assert "fable" in d["not_measured"].lower()
 
@@ -423,7 +1604,7 @@ def test_opus_is_not_claimed_as_a_blind_spot(tmp_path: Path) -> None:
     It came from reading ``seven_day_opus``/``seven_day_sonnet`` in an undocumented endpoint's *schema*
     and assuming a field implies an active limit. A schema is not a measurement.
     """
-    publish(tmp_path, five=10.0, seven=10.0)
+    publish(tmp_path, seven=10.0)
     _, d = read(tmp_path)
     text = d["not_measured"].lower()
     # TWO INDEPENDENT ASSERTIONS, NOT ONE DISJUNCTION. As a single `or` this could not fail for the
@@ -553,7 +1734,7 @@ def test_bash_runs_the_wired_command_end_to_end_and_it_publishes(bash: str, tmp_
 
     script = tmp_path / "run-wired.sh"
     script.write_bytes(wired(settings).encode("utf-8"))
-    payload = json.dumps({"session_id": "bash", "rate_limits": {"five_hour": window(44.0, 3600)}})
+    payload = json.dumps({"session_id": "bash", "rate_limits": {"seven_day": window(44.0, 3600)}})
     proc = subprocess.run(
         [bash, script.as_posix()],
         input=payload,
@@ -674,7 +1855,7 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
         f"the wired command names no per-root publish path: {cmd!r}"
     )
 
-    payload = json.dumps({"session_id": "wired", "rate_limits": {"five_hour": window(55.0, 3600)}})
+    payload = json.dumps({"session_id": "wired", "rate_limits": {"seven_day": window(55.0, 3600)}})
     proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
         input=payload,
@@ -698,7 +1879,7 @@ def test_the_installed_command_actually_runs_the_collector(tmp_path: Path) -> No
 #
 # The second half is the publish path. A config root holds one credential set and therefore one
 # Anthropic account; measured on the box this was written for, five account roots carry five different
-# account emails and five separate 5h/7d pools. Publishing them all to one user-level file is
+# account emails and five separate pools. Publishing them all to one user-level file is
 # last-writer-wins across unrelated quotas, and it disarms the staleness guard -- some other account
 # keeps the file warm, so a reading always looks fresh. So the publish path is per config root, and
 # these tests pin that the writer and the reader derive it from the same rule.
@@ -1178,14 +2359,9 @@ def test_the_reader_defaults_to_its_own_config_roots_state_dir(fake_home: Path) 
         json.dumps(
             {
                 "captured_at": now,
-                "five_hour": {
+                "seven_day": {
                     "used_percentage": 12.0,
                     "resets_at_epoch": int(time.time()) + 3600,
-                    "captured_at": now,
-                },
-                "seven_day": {
-                    "used_percentage": 30.0,
-                    "resets_at_epoch": int(time.time()) + 280000,
                     "captured_at": now,
                 },
             }
@@ -1193,12 +2369,12 @@ def test_the_reader_defaults_to_its_own_config_roots_state_dir(fake_home: Path) 
         encoding="utf-8",
     )
     code, doc, _ = reader("-Json", pin=pin, home=fake_home)
-    # Both windows are fresh, so the verdict is a real OK rather than the UNKNOWN that a partly
-    # published document would give — which would let this pass while reading the wrong directory.
+    # The window is fresh, so the verdict is a real OK rather than the UNKNOWN that an unpublished
+    # document would give — which would let this pass while reading the wrong directory.
     assert code == OK, doc
     assert doc["config_root"].lower() == str(pin).lower()
     assert doc["state_dir"].lower() == str(state).lower()
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(12.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(12.0)
 
 
 # ---------------------------------------------------------------- requirement 4: the five diagnoses
@@ -1345,7 +2521,7 @@ def test_a_document_stamped_with_another_config_root_is_refused(tmp_path: Path) 
             {
                 "captured_at": datetime.now(UTC).isoformat(),
                 "published_by": {"config_root_env": str(tmp_path / "acct-b")},
-                "five_hour": {
+                "seven_day": {
                     "used_percentage": 99.0,
                     "resets_at_epoch": int(time.time()) + 3600,
                     "captured_at": datetime.now(UTC).isoformat(),
@@ -1366,14 +2542,14 @@ def test_a_document_with_no_stamp_is_read_and_says_the_guard_could_not_run(
     """Absence is UNVERIFIABLE provenance, not WRONG provenance — two different facts, and only one is
     an error. Refusing on absence would also break every hand-written fixture in this file and every
     document written before the stamp existed, for no gain."""
-    collect(tmp_path, {"session_id": "x", "rate_limits": {"five_hour": window(40.0, 3600)}})
+    collect(tmp_path, {"session_id": "x", "rate_limits": {"seven_day": window(40.0, 3600)}})
     doc = latest(tmp_path)
     del doc["published_by"]["config_root_env"]
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
     code, parsed, _ = reader("-StateDir", str(tmp_path), "-Json", pin=None)
     assert parsed["provenance"] == "UNVERIFIED"
-    assert parsed["five_hour"]["used_percentage"] == pytest.approx(40.0), (
+    assert parsed["seven_day"]["used_percentage"] == pytest.approx(40.0), (
         "an unstamped reading must still be read"
     )
     _, _, human = reader("-StateDir", str(tmp_path), pin=None)
@@ -1396,7 +2572,7 @@ def test_an_explicit_state_dir_is_not_refused_for_being_another_root(tmp_path: P
             {
                 "captured_at": datetime.now(UTC).isoformat(),
                 "published_by": {"config_root_env": str(other)},
-                "five_hour": {
+                "seven_day": {
                     "used_percentage": 33.0,
                     "resets_at_epoch": int(time.time()) + 3600,
                     "captured_at": datetime.now(UTC).isoformat(),
@@ -1408,7 +2584,7 @@ def test_an_explicit_state_dir_is_not_refused_for_being_another_root(tmp_path: P
     # Read it from a session pinned somewhere else entirely.
     _, doc, _ = reader("-StateDir", str(state), "-Json", pin=tmp_path / "acct-a")
     assert doc["provenance"] == "OK", doc
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(33.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(33.0)
 
 
 def test_the_survey_lists_every_root_and_computes_nothing_across_them(fake_home: Path) -> None:
@@ -1422,7 +2598,7 @@ def test_the_survey_lists_every_root_and_computes_nothing_across_them(fake_home:
                 {
                     "captured_at": datetime.now(UTC).isoformat(),
                     "published_by": {"config_root_env": str(fake_home / name)},
-                    "five_hour": {
+                    "seven_day": {
                         "used_percentage": pct,
                         "resets_at_epoch": int(time.time()) + 3600,
                         "captured_at": datetime.now(UTC).isoformat(),
@@ -1439,9 +2615,9 @@ def test_the_survey_lists_every_root_and_computes_nothing_across_them(fake_home:
     assert str(fake_home / ".claude").lower() in rows, (
         "the survey must list every root, not only ours"
     )
-    assert rows[str(fake_home / ".claude-account-2").lower()]["five"] == pytest.approx(90.0)
+    assert rows[str(fake_home / ".claude-account-2").lower()]["seven"] == pytest.approx(90.0)
     # The exit code is THIS session's verdict, not a roll-up across accounts.
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(10.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(10.0)
     assert doc["exit_code"] == code
 
 
@@ -1464,7 +2640,7 @@ def test_the_collector_publishes_under_its_pinned_root_when_given_no_state_dir(
             "-HomeDir",
             str(fake_home),
         ],
-        input=json.dumps({"session_id": "p", "rate_limits": {"five_hour": window(21.0, 3600)}}),
+        input=json.dumps({"session_id": "p", "rate_limits": {"seven_day": window(21.0, 3600)}}),
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
@@ -1484,7 +2660,7 @@ def test_the_collector_never_manufactures_a_config_root(fake_home: Path) -> None
     nothing can launch from — on every statusLine fire.
     """
     ghost = fake_home / ".claude-account-99"
-    payload = json.dumps({"session_id": "g", "rate_limits": {"five_hour": window(5.0, 3600)}})
+    payload = json.dumps({"session_id": "g", "rate_limits": {"seven_day": window(5.0, 3600)}})
     for args, pin in (
         ([], ghost),  # resolved from the pin
         (["-StateDir", str(ghost / "mefor-usage")], None),  # named explicitly
@@ -1532,7 +2708,7 @@ def test_the_collector_still_publishes_when_the_shared_library_is_missing(
             "-HomeDir",
             str(fake_home),
         ],
-        input=json.dumps({"session_id": "iso", "rate_limits": {"five_hour": window(7.0, 3600)}}),
+        input=json.dumps({"session_id": "iso", "rate_limits": {"seven_day": window(7.0, 3600)}}),
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
@@ -1659,15 +2835,7 @@ def test_install_then_the_wired_command_then_the_reader_all_agree(fake_home: Pat
     cmd = wired(pin / "settings.json")
     proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd],
-        # BOTH windows, deliberately: with only five_hour the seven_day window is legitimately
-        # "never published", the overall verdict is UNKNOWN, and this test would be asserting the
-        # partition works by reading a code that means "I could not tell".
-        input=json.dumps(
-            {
-                "session_id": "e2e",
-                "rate_limits": {"five_hour": window(64.0, 3600), "seven_day": window(31.0, 280000)},
-            }
-        ),
+        input=json.dumps({"session_id": "e2e", "rate_limits": {"seven_day": window(64.0, 280000)}}),
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
@@ -1679,7 +2847,7 @@ def test_install_then_the_wired_command_then_the_reader_all_agree(fake_home: Pat
 
     code, doc, _ = reader("-Json", pin=pin, home=fake_home)
     assert code == OK, doc
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(64.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(64.0)
     assert doc["provenance"] == "OK", (
         "the collector did not stamp the pin, so the cross-root guard cannot fire"
     )
@@ -1855,21 +3023,21 @@ def test_a_window_carried_from_another_root_is_refused_even_when_the_document_is
         )
         assert proc.returncode == 0, proc.stderr
 
-    run(a, {"session_id": "A", "rate_limits": {"five_hour": window(91.0, 3600)}})
+    run(a, {"session_id": "A", "rate_limits": {"seven_day": window(91.0, 3600)}})
     run(b, {"session_id": "B"})  # B has no rate_limits yet, so A's window is carried forward
 
     doc = latest(state)
     assert doc["published_by"]["config_root_env"].lower() == str(b).lower(), (
         "the document should now be stamped by B -- that is what makes this laundering"
     )
-    assert doc["five_hour"]["config_root_env"].lower() == str(a).lower(), (
+    assert doc["seven_day"]["config_root_env"].lower() == str(a).lower(), (
         "the carried window must keep A's stamp, exactly as it keeps A's captured_at"
     )
 
     code, parsed, _ = reader("-StateDir", str(state), "-Json", pin=b, home=fake_home)
     assert code == UNKNOWN
-    assert parsed["five_hour"]["used_percentage"] is None, "A's 91% was reported as B's headroom"
-    assert "DIFFERENT config root" in parsed["five_hour"]["reason"]
+    assert parsed["seven_day"]["used_percentage"] is None, "A's 91% was reported as B's headroom"
+    assert "DIFFERENT config root" in parsed["seven_day"]["reason"]
 
 
 def test_a_root_wired_elsewhere_is_flagged_even_when_it_still_has_an_old_reading(
@@ -1903,11 +3071,6 @@ def test_a_root_wired_elsewhere_is_flagged_even_when_it_still_has_an_old_reading
         json.dumps(
             {
                 "captured_at": now,
-                "five_hour": {
-                    "used_percentage": 20.0,
-                    "resets_at_epoch": int(time.time()) + 3600,
-                    "captured_at": now,
-                },
                 "seven_day": {
                     "used_percentage": 20.0,
                     "resets_at_epoch": int(time.time()) + 280000,
@@ -1995,7 +3158,7 @@ def test_the_survey_names_a_settings_bearing_root_its_own_predicate_rejected(
         json.dumps(
             {
                 "captured_at": now,
-                "five_hour": {
+                "seven_day": {
                     "used_percentage": 5.0,
                     "resets_at_epoch": int(time.time()) + 3600,
                     "captured_at": now,
@@ -2035,13 +3198,8 @@ def test_a_correctly_wired_root_that_stopped_publishing_still_warns(fake_home: P
         json.dumps(
             {
                 "captured_at": old,
-                "five_hour": {
-                    "used_percentage": 64.0,
-                    "resets_at_epoch": int(time.time()) + 780,
-                    "captured_at": old,
-                },
                 "seven_day": {
-                    "used_percentage": 31.0,
+                    "used_percentage": 64.0,
                     "resets_at_epoch": int(time.time()) + 280000,
                     "captured_at": old,
                 },
@@ -2054,16 +3212,16 @@ def test_a_correctly_wired_root_that_stopped_publishing_still_warns(fake_home: P
     assert code == UNKNOWN
     assert "WARNING" in human, f"a wired-but-silent root produced no warning:\n{human}"
     assert "wired correctly" in human
-    # The two causes are offered as alternatives, never asserted -- nothing here can tell them apart.
+    # The causes are offered as alternatives, never asserted -- nothing here can tell them apart.
     assert "cannot tell them apart" in human
     # And the properties the staleness guard already provided must survive alongside it.
     _, parsed, _ = reader("-Json", pin=pin, home=fake_home)
     assert parsed["statusline_state"] == WIRED_HERE
-    assert parsed["five_hour"]["used_percentage"] == pytest.approx(64.0), (
+    assert parsed["seven_day"]["used_percentage"] == pytest.approx(64.0), (
         "the number must still show"
     )
-    assert parsed["five_hour"]["reading_age_min"] is not None, "its age must still show"
-    assert parsed["five_hour"]["projected_at_reset"] is None, (
+    assert parsed["seven_day"]["reading_age_min"] is not None, "its age must still show"
+    assert parsed["seven_day"]["projected_at_reset"] is None, (
         "a stale reading must not be projected"
     )
 
@@ -2131,7 +3289,7 @@ def test_the_survey_refuses_a_window_carried_from_another_root(fake_home: Path) 
         a,
         {
             "session_id": "A",
-            "rate_limits": {"five_hour": window(88.0, 3600), "seven_day": window(77.0, 280000)},
+            "rate_limits": {"seven_day": window(88.0, 280000)},
         },
     )
     fire(b, {"session_id": "B"})
@@ -2152,7 +3310,7 @@ def test_the_survey_refuses_a_window_carried_from_another_root(fake_home: Path) 
         input=json.dumps(
             {
                 "session_id": "A2",
-                "rate_limits": {"five_hour": window(12.0, 3600), "seven_day": window(9.0, 280000)},
+                "rate_limits": {"seven_day": window(12.0, 280000)},
             }
         ),
         capture_output=True,
@@ -2166,11 +3324,10 @@ def test_the_survey_refuses_a_window_carried_from_another_root(fake_home: Path) 
     _, doc, _ = reader("-AllRoots", "-Json", pin=a, home=fake_home)
     rows = {r["root"].lower(): r for r in doc["roots"]}
     row_b = rows[str(b).lower()]
-    assert row_b["five"] is None, f"A's 88% was printed as B's own: {row_b}"
-    assert row_b["seven"] is None, row_b
+    assert row_b["seven"] is None, f"A's 88% was printed as B's own: {row_b}"
     assert "DIFFERENT config root" in row_b["note"], row_b
     # A's own row is untouched -- the refusal fires on error, not on the survey as a whole.
-    assert rows[str(a).lower()]["five"] == pytest.approx(12.0)
+    assert rows[str(a).lower()]["seven"] == pytest.approx(12.0)
 
 
 def test_the_survey_ages_a_row_by_its_windows_not_by_the_document(fake_home: Path) -> None:
@@ -2190,12 +3347,6 @@ def test_the_survey_ages_a_row_by_its_windows_not_by_the_document(fake_home: Pat
             {
                 "captured_at": now,
                 "published_by": {"config_root_env": str(pin)},
-                "five_hour": {
-                    "used_percentage": 55.0,
-                    "resets_at_epoch": int(time.time()) + 3600,
-                    "captured_at": old,
-                    "config_root_env": str(pin),
-                },
                 "seven_day": {
                     "used_percentage": 33.0,
                     "resets_at_epoch": int(time.time()) + 280000,
@@ -2212,6 +3363,17 @@ def test_the_survey_ages_a_row_by_its_windows_not_by_the_document(fake_home: Pat
     assert row["stale"] is True, row
     _, _, human = reader("-AllRoots", pin=pin, home=fake_home)
     assert "STALE" in human, human
+
+
+def test_the_survey_prints_no_number_for_a_window_whose_reset_has_passed(fake_home: Path) -> None:
+    """The survey is the only place accounts are compared, so a gone week's number must not show
+    as this root's pool. The same rule the single-root read applies."""
+    pin = fake_home / ".claude-account-1"
+    publish(pin / "mefor-usage", seven=95.0, seven_epoch=int(time.time()) - 300)
+    _, doc, _ = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
+    row = next(r for r in doc["roots"] if r["root"].lower() == str(pin).lower())
+    assert row["seven"] is None, row
+    assert "reset has passed" in row["note"], row
 
 
 def test_rewired_says_which_thing_changed_not_always_the_publish_path(tmp_path: Path) -> None:
@@ -2305,7 +3467,7 @@ def tempting(state: Path) -> None:
     95% would be skipped for the right answer by accident, and a fixture that cannot fail the way the
     defect fails proves nothing about the guard.
     """
-    publish(state, five=3.0, seven=2.0)
+    publish(state, seven=3.0)
 
 
 def test_a_cancelled_account_reports_unavailable_and_never_a_percentage(tmp_path: Path) -> None:
@@ -2320,7 +3482,7 @@ def test_a_cancelled_account_reports_unavailable_and_never_a_percentage(tmp_path
     # anything else.
     code, doc = read(state)
     assert code == OK, doc
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(3.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(3.0)
 
     marked = avail("-Mark", "-ConfigDir", str(root), "-Reason", "subscription cancelled")
     assert marked.returncode == 0, marked.stdout
@@ -2329,9 +3491,8 @@ def test_a_cancelled_account_reports_unavailable_and_never_a_percentage(tmp_path
     assert code == UNAVAILABLE, doc
     assert doc["state"] == "UNAVAILABLE"
     assert doc["reason"] == "subscription cancelled"
-    # THE KEYS ARE ABSENT, NOT NULL. Emitting them as nulls would let a consumer that reaches straight
+    # THE KEY IS ABSENT, NOT NULL. Emitting it as null would let a consumer that reaches straight
     # for a percentage read this as a window that merely has not published yet.
-    assert "five_hour" not in doc, doc
     assert "seven_day" not in doc, doc
 
     _, _, human = reader("-StateDir", str(state))
@@ -2391,7 +3552,7 @@ def test_a_future_dated_cancellation_leaves_the_pool_readable_and_names_its_end(
     root.mkdir()
     state = root / "mefor-usage"
     state.mkdir()
-    publish(state, five=61.0, seven=44.0)
+    publish(state, seven=61.0)
 
     when = (datetime.now(UTC) + timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
     out = avail(
@@ -2407,7 +3568,7 @@ def test_a_future_dated_cancellation_leaves_the_pool_readable_and_names_its_end(
 
     code, doc = read(state)
     assert code == OK, doc
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(61.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(61.0)
     assert doc["cancellation_pending_from"] == when
 
     _, _, human = reader("-StateDir", str(state))
@@ -2459,7 +3620,7 @@ def test_the_survey_never_ranks_a_cancelled_root_as_headroom(fake_home: Path) ->
     live = fake_home / ".claude-account-1"
     dead = fake_home / ".claude-account-2"
     assert install("-ConfigDir", str(live), pin=None, home=fake_home).returncode == 0
-    publish(live / "mefor-usage", five=61.0, seven=44.0)
+    publish(live / "mefor-usage", seven=61.0)
     tempting(dead / "mefor-usage")
 
     # Positive control: the tempting row really is visible as a percentage before it is marked, or the
@@ -2492,15 +3653,15 @@ def test_the_collector_refuses_to_refresh_a_cancelled_roots_document(tmp_path: P
     assert out.returncode == 0, out.stdout
 
     before = (state / "latest.json").read_text(encoding="utf-8")
-    line = collect(state, {"rate_limits": {"five_hour": window(88.0, 3600)}})
+    line = collect(state, {"rate_limits": {"seven_day": window(88.0, 3600)}})
     assert "unavailable" in line, line
     assert (state / "latest.json").read_text(encoding="utf-8") == before
 
     # CONTROL. A guard that suppressed every publish would pass the assertion above, so a live root
     # has to still work in the same test.
     ok = tmp_path / "live"
-    collect(ok, {"rate_limits": {"five_hour": window(88.0, 3600)}})
-    assert latest(ok)["five_hour"]["used_percentage"] == pytest.approx(88.0)
+    collect(ok, {"rate_limits": {"seven_day": window(88.0, 3600)}})
+    assert latest(ok)["seven_day"]["used_percentage"] == pytest.approx(88.0)
 
 
 def test_marking_refuses_a_config_root_that_does_not_exist(tmp_path: Path) -> None:
@@ -2553,10 +3714,10 @@ def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
     ever stopped meaning AVAILABLE, every root on the box would go dark at once.
     """
     state = tmp_path / "plain"
-    publish(state, five=61.0, seven=44.0)
+    publish(state, seven=61.0)
     code, doc = read(state)
     assert code == OK, doc
-    assert doc["five_hour"]["used_percentage"] == pytest.approx(61.0)
+    assert doc["seven_day"]["used_percentage"] == pytest.approx(61.0)
     assert doc["cancellation_pending_from"] is None
 
 
@@ -2579,9 +3740,9 @@ def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path
     state.mkdir()
     (state / "unavailable.json").write_text("{ torn write", encoding="utf-8")
 
-    line = collect(state, {"rate_limits": {"five_hour": window(42.0, 3600)}})
+    line = collect(state, {"rate_limits": {"seven_day": window(42.0, 3600)}})
     assert "unavailable" not in line, f"a damaged marker blanked a live account: {line}"
-    assert latest(state)["five_hour"]["used_percentage"] == pytest.approx(42.0)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(42.0)
 
     # ... and the reader still refuses it, which is where fail-closed belongs.
     code, doc = read(state)
@@ -2700,7 +3861,7 @@ def test_a_root_the_old_installer_wired_publishes_after_one_reinstall_and_the_ho
     )
     payload = {
         "session_id": "e2e-1459",
-        "rate_limits": {"five_hour": window(64.0, 3600), "seven_day": window(31.0, 280000)},
+        "rate_limits": {"seven_day": window(64.0, 280000)},
     }
 
     # 1. The defect: bash rejects the old command, pwsh never starts, nothing publishes.
@@ -2736,7 +3897,7 @@ def test_a_root_the_old_installer_wired_publishes_after_one_reinstall_and_the_ho
     # 5. The spawn hook prints a real figure, not UNKNOWN.
     ctx = _hook(pin, fake_home)
     assert "verdict: OK" in ctx, ctx
-    assert re.search(r"5h\s+64\.0% used", ctx), ctx
+    assert re.search(r"7d\s+64\.0% used", ctx), ctx
     assert WIRED_POWERSHELL_SOURCE not in ctx, ctx
 
 
@@ -2769,13 +3930,8 @@ def test_a_powershell_source_root_with_a_stale_reading_still_warns_in_the_text_o
         json.dumps(
             {
                 "captured_at": old,
-                "five_hour": {
-                    "used_percentage": 64.0,
-                    "resets_at_epoch": int(time.time()) + 780,
-                    "captured_at": old,
-                },
                 "seven_day": {
-                    "used_percentage": 31.0,
+                    "used_percentage": 64.0,
                     "resets_at_epoch": int(time.time()) + 280000,
                     "captured_at": old,
                 },

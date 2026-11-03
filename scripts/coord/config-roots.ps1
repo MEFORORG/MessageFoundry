@@ -203,8 +203,8 @@ function Get-UsageStateDir {
         directory. That would reintroduce the exact defect this partitioning removes.
 
         WHY IT IS PARTITIONED AT ALL: see usage-collect.ps1's header. Briefly, a config root holds one
-        credential set and therefore one Anthropic account, and separate accounts have separate 5-hour
-        and 7-day pools. One shared file across roots is last-writer-wins across unrelated quotas.
+        credential set and therefore one Anthropic account, and separate accounts have separate 7-day
+        pools. One shared file across roots is last-writer-wins across unrelated quotas.
     #>
     param([Parameter(Mandatory)][string]$ConfigRoot)
     return (Join-Path (ConvertTo-NormalRootPath $ConfigRoot) 'mefor-usage')

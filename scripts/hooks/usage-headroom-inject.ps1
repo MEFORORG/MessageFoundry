@@ -48,16 +48,17 @@
     endpoint returns 429 PER ENDPOINT rather than per caller, proven inside one process, so the
     design wants exactly one caller and this is not it.
 
-    AN ABSENT, STALE OR UNREADABLE SOURCE IS UNKNOWN -- NEVER ZERO, AND NEVER SILENCE. A confident
+    AN ABSENT OR UNREADABLE SOURCE IS UNKNOWN, AND SO IS A STALE ONE UNLESS usage.ps1 GRADES IT
+    (its rule 2) -- NEVER ZERO, AND NEVER SILENCE. A confident
     number derived from a failed read is worse than no number: it converts "I should check" into "I
     already know". Every failure path below says what failed and prints UNKNOWN. The reader's own
     absence is included: an empty answer and a broken probe are byte-identical unless you test the
     source first, which is the same shape as `claude agents --json` returning an empty list and
     exit 0 against a config root that does not exist.
 
-    EVERY NUMBER CARRIES ITS AGE. The collector publishes at statusLine granularity, so a reading can
-    be up to about fifteen minutes old while still looking plausible. A percentage printed with no
-    age beside it invites a decision on data that has already expired.
+    EVERY NUMBER CARRIES ITS AGE, counted from the last time it was confirmed: it changed, or a session
+    that had just called the API reported it. A percentage printed with no age beside it invites a
+    decision on data that has already expired.
 
     IT NEVER BLOCKS. There is no deny path here at all. A separate gate decides whether a launch may
     proceed; this one only makes sure the session can see what it is about to spend. Every error
@@ -84,9 +85,10 @@
 
     A DESKTOP SESSION GETS A SECOND, LABELLED SOURCE (BACKLOG #1459; seat decision under owner
     delegation 2026-10-08, not an owner ruling). A Desktop or SDK session never runs a statusLine, so
-    on a Desktop-only config root the statusLine reading stays UNKNOWN for good. When it is UNKNOWN for
-    such a session, the hook also reads the Steward's out-of-repo `status.json` and prints it as its
-    own block. Four rules keep it from passing as a statusLine reading:
+    on a Desktop-only config root the statusLine reading stays UNKNOWN for good. For such a session the
+    hook also reads the Steward's out-of-repo `status.json` and prints it as its own block, at least when
+    the reading is UNKNOWN, held as a level_floor, or stale under any verdict; `$unconfirmed` below is the
+    test. Four rules keep it from passing as a statusLine reading:
 
       Its own label. Every line it prints says where it came from, and its verdict line never
       replaces the statusLine verdict above it.
@@ -132,8 +134,10 @@
 
       A HIGH READING ALWAYS PRINTS IN FULL. That means a WARN, CRITICAL or UNAVAILABLE verdict, a window
       line marked WARN or CRITICAL, or any percentage at 85 or more, which is usage.ps1's WARN
-      threshold. The last two cover a high number under an UNKNOWN verdict: the Steward fallback is
-      ungraded, and the reader downgrades a WARN to UNKNOWN on a root it does not trust.
+      threshold. The last two cover a high number under an UNKNOWN verdict. At least three routes reach
+      one: the Steward fallback is ungraded, the reader downgrades a WARN to UNKNOWN on a root it does
+      not trust, and a stale floor below the ceiling reads UNKNOWN on a root it does, while the gate may
+      be halting on that number.
 
       THE STATE IS ADVICE THAT EXPIRES. The key is the session id, the agent id and the config root,
       because a Manager and its subagents share a session id. That the harness sends `agent_id` inside
@@ -263,8 +267,7 @@ function Get-ChangeKey([string]$Text) {
 
 # WARN, CRITICAL and UNAVAILABLE print in full every time, and so does any block that names a WARN or
 # CRITICAL window or shows a percentage at 85 or more. The last two catch a high reading under an
-# UNKNOWN verdict: the Steward fallback is ungraded, and usage.ps1 can downgrade a WARN to UNKNOWN on
-# a root it does not trust. 85 is usage.ps1's own WARN threshold.
+# UNKNOWN verdict; the header names the routes to one. 85 is usage.ps1's own WARN threshold.
 function Test-AlwaysFull([string]$Text, [string]$Verdict) {
     if ($Verdict -in @("WARN", "CRITICAL", "UNAVAILABLE")) { return $true }
     if ($Text -cmatch "\b(WARN|CRITICAL) --") { return $true }
@@ -316,9 +319,9 @@ $HEAD = "[usage headroom, read at the spawn point from the file the statusLine c
         "publishes. No API call was made and nothing polled; this is the file, at the one moment it " +
         "changes a decision.]"
 
-$AGE_NOTE = "Ages are part of the reading. The collector publishes at statusLine granularity, so a " +
-            "number can be up to about 15 min old and still look current; anything past $MaxAgeMinutes min " +
-            "is reported UNKNOWN rather than projected from."
+$AGE_NOTE = "Ages are part of the reading, counted from the last time the number changed or a session " +
+            "that had just called the API reported it; an idle session's repeat does not count. Anything " +
+            "past $MaxAgeMinutes min reads UNKNOWN, or 'at least' where it still holds as a floor, or CRITICAL where its history projects a run-out."
 
 # WHY AN UNKNOWN WILL NOT CLEAR ON ITS OWN (BACKLOG #1459). A bare "UNKNOWN" hid two causes that
 # waiting cannot fix, and a session told only "UNKNOWN" waits for a number that cannot arrive. ONE
@@ -327,7 +330,7 @@ $AGE_NOTE = "Ages are part of the reading. The collector publishes at statusLine
 #   A WIRING FAULT the reader named -- for one, PowerShell source that bash cannot parse, which the
 #   reader used to call WIRED_HERE. Any state but WIRED_HERE is named here. That is deliberately
 #   wider than the reader's $dxUntrusted, which decides whether a READING is trusted; this decides
-#   whether a fault is worth naming beside an UNKNOWN, and every one of them is. Skipped under
+#   whether a fault is worth naming beside an UNKNOWN or a floor, and every one of them is. Skipped under
 #   -StateDir, mirroring the reader: the caller named a directory, and the root above it need not be
 #   wired at all.
 #
@@ -476,18 +479,14 @@ function Get-StewardFallback {
         $dataAge = if ($null -eq $sample -or $sample -lt 0) { "UNKNOWN" } else { Format-Number "0.0" (($ageSec + $sample) / 60) }
     }
 
-    $windows = @()
-    foreach ($w in ([ordered]@{ "5-hour" = "5h"; "weekly" = "7d" }).GetEnumerator()) {
-        $v = Get-Finite $entry.levels.($w.Key)
-        $label = "  steward " + $w.Value.PadRight(3)
-        if ($null -eq $v) { $windows += "$label UNKNOWN -- the Steward's entry carries no $($w.Key) reading"; continue }
-        $windows += ("$label " + (Format-Number "0.0" $v).PadLeft(5) + "% used   [data $dataAge min old; " +
+    # Only the weekly level: an entry may still name other windows, and they are ignored. watch.py
+    # _view refuses an entry with no percentages at all; a READ verdict over no number would be a
+    # verdict with no measurement under it.
+    $v = Get-Finite $entry.levels.weekly
+    if ($null -eq $v) { return Unknown "the Steward's entry for pool $pool carries no percentages for the weekly window" }
+    return $lines + "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)" +
+        ("  steward 7d  " + (Format-Number "0.0" $v).PadLeft(5) + "% used   [data $dataAge min old; " +
             "read $ageMin min ago by the Steward; its TTL is $ttlMin min]")
-    }
-    # watch.py _view refuses an entry with no percentages at all; a READ verdict over two UNKNOWN
-    # windows would be a verdict with no measurement under it.
-    if (-not ($windows -match "% used")) { return Unknown "the Steward's entry for pool $pool carries no percentages" }
-    return $lines + "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)" + $windows
 }
 
 # WHICH POOL THE STEWARD WOULD NAME FOR THIS SESSION, in watch.py main()'s order. Returns @{org; acct;
@@ -671,7 +670,7 @@ if (-not $j) {
 $state = Get-Folded $j.state
 if (-not $state) { $state = "UNKNOWN" }
 
-# BEFORE THE WINDOW CHECK BELOW, because an UNAVAILABLE document deliberately carries NO five_hour key
+# BEFORE THE WINDOW CHECK BELOW, because an UNAVAILABLE document deliberately carries NO seven_day key
 # -- so leaving this until after it would send every cancelled account down the "the reader returned no
 # window readings" path and report a known zero as an unread number.
 if ($state -eq "UNAVAILABLE") {
@@ -693,7 +692,7 @@ elseif ($StateDir) { $latestPath = Join-Path $StateDir "latest.json" }
 # NO WINDOWS MEANS THE READER REFUSED THE WHOLE DOCUMENT -- nothing published, a foreign root, or a
 # config root it could not resolve. Its own reason is the honest text; the source test below is what
 # separates "nobody ever published" from "something is there and it did not survive the read".
-if (-not ($j.PSObject.Properties.Name -contains "five_hour") -or -not $j.five_hour) {
+if (-not $j.seven_day) {
     $why = Get-Folded $j.reason
     if (-not $why) { $why = "the reader returned no window readings" }
     # A REFUSAL IS NOT AN UNREADABLE FILE, and saying so would be a confidently wrong diagnosis of a
@@ -714,19 +713,33 @@ if (-not ($j.PSObject.Properties.Name -contains "five_hour") -or -not $j.five_ho
     Write-Unknown "$why ($where)" @(Get-CauseNote $j)
 }
 
-function Format-Window($w, [string]$Short) {
-    $label = "  {0,-3}" -f $Short
-    if (-not $w) { return "$label UNKNOWN -- this window has never been published" }
+function Format-Window($w) {
+    $label = "  7d "
+    # A FLOOR PRINTS ITS NUMBER: the reader says the window has reached at least this, and the gate may be
+    # halting on it. A bare UNKNOWN here would hide the one fact that explains the halt.
+    if ($null -ne $w.level_floor -and $null -ne $w.used_percentage) {
+        $line = if ($w.dated_ahead -eq $true) {
+            "$label at least {0:0.0}% used   [dated {1} min in the future: this machine's clock looks wrong, so fix the clock]" -f ([double]$w.level_floor), [math]::Abs([double]$w.reading_age_min)
+        }
+        else { "$label at least {0:0.0}% used   [confirmed {1} min ago; a stale reading whose reset is still ahead]" -f ([double]$w.level_floor), $w.reading_age_min }
+        if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
+            $m = [int]$w.minutes_to_reset
+            $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))
+        }
+        # A run-out projected beside the floor is the reason the verdict is CRITICAL, so it is printed too.
+        if ([string]$w.state -eq "CRITICAL") { $line += "   CRITICAL -- " + (Get-Folded $w.reason 200) }
+        return $line
+    }
     if ([string]$w.state -eq "UNKNOWN" -or $null -eq $w.used_percentage) {
         return "$label UNKNOWN -- " + (Get-Folded $w.reason)
     }
     # THE AGE IS NOT AN ORNAMENT ON THE PERCENTAGE, so it is printed in the same clause and never
     # dropped when it is null: an undated number is worth less than no number.
-    $age = if ($null -ne $w.reading_age_min) { "read {0} min ago" -f $w.reading_age_min } else { "age UNKNOWN" }
+    $age = if ($null -ne $w.reading_age_min) { "confirmed {0} min ago" -f $w.reading_age_min } else { "age UNKNOWN" }
     $line = "$label {0,5:0.0}% used   [{1}]" -f ([double]$w.used_percentage), $age
     if ($null -ne $w.minutes_to_reset -and [int]$w.minutes_to_reset -gt 0) {
         $m = [int]$w.minutes_to_reset
-        $line += ("   resets in {0}h{1:00}m" -f [int]($m / 60), ($m % 60))
+        $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))
     }
     if ([string]$w.state -in @("WARN", "CRITICAL")) {
         $line += "   " + [string]$w.state + " -- " + (Get-Folded $w.reason 160)
@@ -738,8 +751,7 @@ $lines = @($HEAD)
 $account = Get-Folded $j.config_root
 if ($account) { $lines += "  account: $account" }
 $lines += "  verdict: $state"
-$lines += (Format-Window $j.five_hour "5h")
-$lines += (Format-Window $j.seven_day "7d")
+$lines += (Format-Window $j.seven_day)
 
 # PROVENANCE UNVERIFIED IS SAID OUT LOUD. The publisher recorded no CLAUDE_CONFIG_DIR, so the guard
 # that keeps another account's headroom out of this reading could not run. That is a different fact
@@ -749,8 +761,14 @@ if ((Get-Folded $j.provenance) -eq "UNVERIFIED") {
     $lines += "  provenance: UNVERIFIED -- the publisher recorded no config root, so the cross-account guard could not run"
 }
 
-# A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does.
-if ($state -eq "UNKNOWN") {
+# A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does. SO DOES
+# A FLOOR, WHATEVER ITS VERDICT, AND SO DOES A STALE READING CRITICAL BY A PROJECTED RUN-OUT. Each is a
+# stale number, and the verdict can be CRITICAL, so testing UNKNOWN alone would leave a session the gate
+# has halted with no word of why, or that nothing it does can refresh the file.
+$staleAge = $j.seven_day.reading_age_min -as [double]
+$unconfirmed = $state -eq "UNKNOWN" -or $null -ne $j.seven_day.level_floor -or
+    ($null -ne $j.seven_day.reading_age_min -and $staleAge -gt $MaxAgeMinutes)
+if ($unconfirmed) {
     $lines += @(Get-CauseNote $j)
 }
 
@@ -758,6 +776,6 @@ $advice = Get-Folded $j.advice
 if ($advice) { $lines += "  $advice" }
 $lines += "  $AGE_NOTE"
 # AFTER the age note, which is about the statusLine reading and does not apply to the fallback.
-if ($state -eq "UNKNOWN") { $lines += @(Get-StewardFallback) }
+if ($unconfirmed) { $lines += @(Get-StewardFallback) }
 
 Write-Context ($lines -join "`n") $state
