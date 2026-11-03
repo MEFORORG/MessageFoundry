@@ -245,8 +245,8 @@ it could reach only its own copy.
    lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
    Without it, a clear running beside an uncommitted set could delete nothing on Postgres and still
    append the newest row. The wait for the lock has its own 10 seconds, and the store call then gets
-   a fresh 10, so a toggle's wall-clock ceiling is about two bounds plus the store's unwind, and time
-   in the queue does not cut off a store call. A toggle still queued when its wait runs out answers
+   a fresh 10, so past the auth gate a toggle's wall-clock ceiling is about two bounds plus the
+   store's unwind, and time in the queue does not cut off a store call. A toggle still queued when its wait runs out answers
    the same 503, having written nothing, rather than meeting the request deadline. If the stuck
    toggle ahead of it gives way first, the queued toggle reaches the store and can be cut off there,
    close to 20 seconds after it arrived, with a commit that may land after the 503. A toggle that
