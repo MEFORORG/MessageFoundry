@@ -204,7 +204,6 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
-    GLOBAL_SESSION_EPOCH_MISSING,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -309,6 +308,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    global_epoch_or_refuse,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -13935,9 +13935,7 @@ class SqlServerStore:
         transaction."""
         await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         rows = await cur.fetchall()
-        if not rows or rows[0][0] is None:
-            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
-        return int(rows[0][0])
+        return global_epoch_or_refuse(rows[0][0] if rows else None)
 
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
@@ -15535,9 +15533,7 @@ class SqlServerStore:
                     " OUTPUT inserted.epoch WHERE id = 1"
                 )
                 raised = await cur.fetchall()
-                if not raised:
-                    raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
-                current = int(raised[0][0])
+                current = global_epoch_or_refuse(raised[0][0] if raised else None)
                 if except_token_hash is not None:
                     await cur.execute(
                         "SELECT s.user_id, u.session_epoch FROM sessions s"

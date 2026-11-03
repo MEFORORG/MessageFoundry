@@ -209,7 +209,6 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
-    GLOBAL_SESSION_EPOCH_MISSING,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -309,6 +308,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    global_epoch_or_refuse,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -10571,10 +10571,7 @@ class PostgresStore:
 
     async def _global_session_epoch(self, conn: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
-        value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
-        if value is None:
-            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
-        return int(value)
+        return global_epoch_or_refuse(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
 
     async def _session_epoch(self, conn: Any, user_id: str) -> int:
         """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
@@ -10747,11 +10744,11 @@ class PostgresStore:
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            current = await conn.fetchval(
-                "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+            current = global_epoch_or_refuse(
+                await conn.fetchval(
+                    "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+                )
             )
-            if current is None:
-                raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
             for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
                 await self._bump_session_epoch(conn, str(row["id"]))
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
@@ -10761,11 +10758,10 @@ class PostgresStore:
                 )
                 if owner is not None:
                     epoch = await self._session_epoch(conn, str(owner))
-                    raised = int(current)
                     await self._write_session(
                         conn,
                         except_token_hash,
-                        lambda s: replace(s, user_epoch=epoch, global_epoch=raised),
+                        lambda s: replace(s, user_epoch=epoch, global_epoch=current),
                     )
         return _rowcount(status)
 

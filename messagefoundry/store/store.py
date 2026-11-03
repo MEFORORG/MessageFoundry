@@ -2101,7 +2101,7 @@ class UserRecord:
             session_epoch=int(d["session_epoch"]),
             # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
             # mapping without the global epoch fails here rather than decode one nobody read.
-            global_session_epoch=_global_epoch_of(d),
+            global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
             row=UserRow.from_mapping(d),
         )
 
@@ -2549,9 +2549,10 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
-def _global_epoch_of(d: Mapping[str, Any]) -> int:
-    """The global epoch a user read selected beside the row, refusing a store with no row."""
-    value = d["global_session_epoch"]
+def global_epoch_or_refuse(value: Any) -> int:
+    """``value``, the global session epoch a read returned, as an int; a store with no row reads
+    ``None`` and is refused with :data:`GLOBAL_SESSION_EPOCH_MISSING` (BACKLOG #5091). Every read
+    of the global epoch on every backend goes through this one check."""
     if value is None:
         raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
     return int(value)
@@ -17796,7 +17797,7 @@ class MessageStore:
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
-                global_epoch=0 if row is None else int(row["global_epoch"]),
+                global_epoch=0 if row is None else global_epoch_or_refuse(row["global_epoch"]),
             )
             record = seal_session(self._row_sealer, record)
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
@@ -18122,9 +18123,7 @@ class MessageStore:
         the caller's transaction."""
         cur = await self._db.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         row = await cur.fetchone()
-        if row is None or row[0] is None:
-            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
-        return int(row[0])
+        return global_epoch_or_refuse(None if row is None else row[0])
 
     async def _bump_session_epoch(self, user_id: str) -> None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
