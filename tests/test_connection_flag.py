@@ -903,3 +903,52 @@ async def test_a_stored_row_refuses_neither_a_start_nor_a_reload(tmp_path: Path)
         assert outcome.applied is True
     finally:
         await second.stop()
+
+
+@pytest.mark.parametrize("flagged", [True, False], ids=["set", "clear"])
+async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statement(
+    flagged: bool,
+) -> None:
+    """Offline, against a recording connection: the order the live cross-handle contract in
+    ``tests/test_postgres_store.py`` depends on. The lock taken only at the append let a clear run
+    beside another shard's uncommitted set at READ COMMITTED, delete nothing, and append the newer
+    row. Pinned to READ COMMITTED, since a REPEATABLE READ snapshot would predate the lock wait."""
+    from contextlib import asynccontextmanager
+    from typing import Any
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    log: list[str] = []
+
+    class _Conn:
+        @asynccontextmanager
+        async def transaction(self, **kwargs: Any) -> Any:
+            log.append(f"BEGIN {kwargs.get('isolation')}")
+            yield None
+
+        async def execute(self, sql: str, *_params: Any) -> str:
+            log.append(sql.split()[0])
+            return "OK"
+
+    store = object.__new__(PostgresStore)
+
+    @asynccontextmanager
+    async def _timed_acquire(*, record: bool = True) -> Any:
+        yield _Conn()
+
+    async def _advisory_lock(_conn: Any, _classid: int, key: str) -> None:
+        log.append(f"LOCK {key}")
+
+    async def _append_operator_audit(*_args: Any) -> None:
+        log.append("APPEND")
+
+    vars(store).update(
+        _timed_acquire=_timed_acquire,
+        _advisory_lock=_advisory_lock,
+        _append_operator_audit=_append_operator_audit,
+    )
+    await store.set_connection_flag(
+        "OB_A", "outbound", flagged=flagged, audit=AuditAppend("connection_flag_set")
+    )
+    statement = "INSERT" if flagged else "DELETE"
+    assert log == ["BEGIN read_committed", "LOCK mefor_audit_chain", statement, "APPEND"]

@@ -7938,11 +7938,18 @@ class SqlServerStore:
         audit: AuditAppend,
         now: float | None = None,
     ) -> None:
-        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`. ``HOLDLOCK`` makes
-        the MERGE's match-then-insert one decision, so two toggles cannot both take the insert
-        branch and collide on the key. The set or clear is the transaction's first statement and
-        safe to re-run, so it is retried as :meth:`_claim_keyed_surface` is. The append takes the audit applock at the tail, as
-        :meth:`_alert_write`'s does."""
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`.
+
+        The audit applock comes FIRST, before the flag statement, and holds to the commit, so two
+        toggles from any engine shard or node run one after the other. Taken at the append instead,
+        a clear that matched no row locks nothing at READ COMMITTED, so a set beside it could commit
+        first and the clear's row would still be the newer. Only toggles touch ``connection_flag``,
+        and each holds the applock first, so a key lock under it cannot cycle.
+        ``HOLDLOCK`` keeps the MERGE's match-then-insert one decision, as it was before the applock.
+
+        The opener, the applock and the flag statement are retried together, as
+        :meth:`_claim_keyed_surface` retries its MERGE. Nothing before them can be lost to the
+        rollback, and the re-run takes the applock again before its flag statement."""
         now = time.time() if now is None else now
         if flagged:
             statement = "connection flag MERGE"
@@ -7961,6 +7968,7 @@ class SqlServerStore:
                 async with self._cursor(conn) as cur:
 
                     async def write_flag() -> None:
+                        await self._open_under_audit_applock(cur)
                         await cur.execute(sql, (connection, direction))
 
                     await _retry_idempotent_merge(

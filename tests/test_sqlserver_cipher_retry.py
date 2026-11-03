@@ -213,6 +213,10 @@ class _FlagStore:
     async def rollback(self) -> None:
         self.rollbacks += 1
 
+    async def _open_under_audit_applock(self, _cur: Any) -> None:
+        # Recorded, never failed: the order is under test here, and a rollback releases the lock.
+        self.statements.append("APPLOCK")
+
     @contextlib.asynccontextmanager
     async def _acquire(self) -> AsyncIterator[_FlagStore]:
         yield self
@@ -245,13 +249,14 @@ async def _set_flag(store: _FlagStore, *, flagged: bool) -> None:
 async def test_a_flag_write_retries_past_a_conflict_and_appends_one_row(
     flagged: bool, statement: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The set and the clear are each the transaction's first statement, so a conflict rolls back
-    and re-runs that statement alone, and the audit row lands once. The log names the statement that
-    ran. RED for the clear when the helper's line says MERGE for a DELETE."""
+    """The set and the clear each follow the audit applock, so a conflict rolls back, which releases
+    the applock, and the re-run takes it again before its flag statement. The audit row lands once.
+    The log names the statement that ran. RED for the clear when the helper's line says MERGE for a
+    DELETE, and RED when a re-run reaches its flag statement without the applock."""
     store = _FlagStore([_DEADLOCK, None])
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.sqlserver"):
         await _set_flag(store, flagged=flagged)
-    assert [sql.split()[0] for sql in store.statements] == [statement, statement]
+    assert [sql.split()[0] for sql in store.statements] == ["APPLOCK", statement] * 2
     assert (store.rollbacks, store.audits, store.commits, store.discards) == (1, 1, 1, 0)
     other = "DELETE" if flagged else "MERGE"
     retried = [r.getMessage() for r in caplog.records if "retrying" in r.getMessage()]
@@ -265,5 +270,7 @@ async def test_a_flag_write_that_never_clears_commits_nothing() -> None:
     store = _FlagStore([_HYT00] * _CIPHER_MERGE_ATTEMPTS)
     with pytest.raises(Exception, match="HYT00"):
         await _set_flag(store, flagged=False)
-    assert len(store.statements) == _CIPHER_MERGE_ATTEMPTS
+    assert [sql.split()[0] for sql in store.statements] == ["APPLOCK", "DELETE"] * (
+        _CIPHER_MERGE_ATTEMPTS
+    )
     assert (store.audits, store.commits, store.discards) == (0, 0, 1)

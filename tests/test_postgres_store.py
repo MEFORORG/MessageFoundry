@@ -1218,6 +1218,23 @@ async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
     await assert_operator_audit_atomic(store)
 
 
+async def test_overlapping_toggles_from_two_handles_leave_the_flag_matching_the_newest_row(
+    store,
+) -> None:
+    """BACKLOG #2623 on the real Postgres backend: a second handle stands in for a second engine
+    shard. The audit advisory lock is taken before the flag statement, so at READ COMMITTED a
+    toggle cannot run its statement beside another's uncommitted one."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._operator_audit_atomic_contract import assert_connection_flag_ordered_across_stores
+
+    second = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        await assert_connection_flag_ordered_across_stores(store, second)
+    finally:
+        await second.close()
+
+
 async def test_approval_release_outcome_contract(store) -> None:
     """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
     ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""

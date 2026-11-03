@@ -6391,13 +6391,24 @@ class PostgresStore:
         audit: AuditAppend,
         now: float | None = None,
     ) -> None:
-        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`.
+
+        The audit advisory lock comes FIRST, before the flag statement, and holds to the commit, so
+        two toggles from any engine shard or node run one after the other, and the later one's flag
+        statement sees the earlier one's commit. Taken at the append instead, a clear beside another
+        session's uncommitted set would delete nothing and still append the newer row. The append
+        re-takes the lock, which the same transaction may do. Only toggles touch ``connection_flag``,
+        and each holds the audit lock first, so taking a row lock under it cannot cycle.
+
+        READ COMMITTED is pinned, as :meth:`reserve_upload_quota` pins it: a REPEATABLE READ server
+        default would take the snapshot as the lock statement starts, before it waits."""
         now = time.time() if now is None else now
         async with (
             AuditedWrite(now) as written,
             self._timed_acquire(record=False) as conn,
-            conn.transaction(),
+            conn.transaction(isolation="read_committed"),
         ):
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             if flagged:
                 await conn.execute(
                     "INSERT INTO connection_flag (connection, direction) VALUES ($1, $2)"

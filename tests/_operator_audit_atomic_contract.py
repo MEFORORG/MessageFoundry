@@ -26,10 +26,11 @@ inside a test function. Every name it writes is unique per run, so a shared serv
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 from uuid import uuid4
 
@@ -261,6 +262,149 @@ async def _assert_connection_flag_atomic(store: Any, tag: str) -> None:
     await is_clear()
     assert (conn, "inbound") in await store.list_connection_flags()
     await store.set_connection_flag(conn, "inbound", flagged=False, audit=built)
+
+
+#: How long the second toggle gets to reach its audit append while the first is held open. Under the
+#: audit lock taken first it waits at the database and never gets there, whatever this is.
+_OVERLAP_WINDOW = 2.0
+
+
+@contextmanager
+def _held_append(
+    store: Any, action: str, reached: asyncio.Event, release: asyncio.Event
+) -> Iterator[None]:
+    """Hold ``store``'s first append for ``action`` until ``release`` is set, and set ``reached``
+    as it starts. The flag statement has run by then and the transaction is still open."""
+    real = store._append_audit_row
+
+    async def _append(*args: Any, **kwargs: Any) -> Any:
+        if action in args and not reached.is_set():
+            reached.set()
+            await release.wait()
+        return await real(*args, **kwargs)
+
+    store._append_audit_row = _append
+    try:
+        yield
+    finally:
+        del store._append_audit_row
+
+
+async def _assert_overlapping_toggles_ordered(
+    first: Any,
+    second: Any,
+    *,
+    label: str,
+    initial: bool,
+    first_sets: bool,
+    second_sets: bool,
+    second_commits_first: bool,
+) -> None:
+    """Two store handles, standing in for two engine shards, toggle one connection. The first is
+    held open between its flag statement and its commit while the second runs, then whichever
+    ``second_commits_first`` names commits first. The flag must match the newest row after."""
+    conn = f"OB_X{label}{uuid4().hex[:8]}"
+    action = "connection_flag_set"
+
+    def audit(flagged: bool) -> AuditAppend:
+        detail = json.dumps({"connection": conn, "flagged": flagged})
+        return AuditAppend(action, actor="contract-op", detail=detail, client=_CLIENT)
+
+    if initial:
+        await first.set_connection_flag(conn, "outbound", flagged=True, audit=audit(True))
+    a_reached, a_release, b_reached, b_release = (asyncio.Event() for _ in range(4))
+    tasks: list[asyncio.Task[None]] = []
+    with (
+        _held_append(first, action, a_reached, a_release),
+        _held_append(second, action, b_reached, b_release),
+    ):
+        try:
+            tasks.append(
+                asyncio.create_task(
+                    first.set_connection_flag(
+                        conn, "outbound", flagged=first_sets, audit=audit(first_sets)
+                    )
+                )
+            )
+            await asyncio.wait_for(a_reached.wait(), 30)
+            tasks.append(
+                asyncio.create_task(
+                    second.set_connection_flag(
+                        conn, "outbound", flagged=second_sets, audit=audit(second_sets)
+                    )
+                )
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(b_reached.wait(), _OVERLAP_WINDOW)
+            overlapped = b_reached.is_set()
+            if second_commits_first:
+                b_release.set()
+                if overlapped:
+                    await tasks[1]
+                a_release.set()
+            else:
+                a_release.set()
+                await tasks[0]
+                b_release.set()
+            await asyncio.gather(*tasks)
+        finally:
+            a_release.set()
+            b_release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    flagged = (conn, "outbound") in await first.list_connection_flags()
+    rows = [
+        r
+        for r in await first.list_audit(action=action, limit=50)
+        if json.loads(str(r["detail"]))["connection"] == conn
+    ]
+    newest = json.loads(str(max(rows, key=lambda r: int(r["id"]))["detail"]))["flagged"]
+    assert flagged is newest, (
+        f"{label}: the flag is {'set' if flagged else 'clear'} under a newest row that says"
+        f" {'set' if newest else 'clear'}"
+    )
+    # What makes that hold: the second toggle could not reach its append, which follows its flag
+    # statement, until the first had committed.
+    assert not overlapped, f"{label}: the second toggle ran its flag statement beside the first"
+
+
+async def assert_connection_flag_ordered_across_stores(first: Any, second: Any) -> None:
+    """Two processes' toggles of one connection land one after the other (BACKLOG #2623): each
+    takes the audit lock before its flag statement and holds it to the commit, so the stored flag
+    always matches the newest ``connection_flag_set`` row. ``first`` and ``second`` are two handles
+    on one database, so neither shares the other's in-process locks.
+
+    Each case is a pair the old order, the lock taken only at the append, let through. On Postgres
+    at READ COMMITTED all three did; on SQL Server the no-op clear did, since it locks nothing."""
+    # A set, then a clear that cannot see it: the clear deleted nothing and appended last.
+    await _assert_overlapping_toggles_ordered(
+        first,
+        second,
+        label="setclear",
+        initial=False,
+        first_sets=True,
+        second_sets=False,
+        second_commits_first=False,
+    )
+    # A clear of nothing, then a set it does not block, which commits first.
+    await _assert_overlapping_toggles_ordered(
+        first,
+        second,
+        label="clearset",
+        initial=False,
+        first_sets=False,
+        second_sets=True,
+        second_commits_first=True,
+    )
+    # A set of a flag already set changes no row, so a clear beside it commits first.
+    await _assert_overlapping_toggles_ordered(
+        first,
+        second,
+        label="resetclear",
+        initial=True,
+        first_sets=True,
+        second_sets=False,
+        second_commits_first=True,
+    )
 
 
 async def _assert_alert_mutations_atomic(store: Any, tag: str) -> None:
