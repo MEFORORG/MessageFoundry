@@ -523,9 +523,39 @@ roster alias of the Lander.
 > **A reading whose reset has passed describes a window that is gone.** `usage.ps1` reports it UNKNOWN
 > with no percentage, so the gate answers REVIEW, neither clearing nor halting on a gone week's number.
 >
-> **The Steward and this gate can disagree.** As read on 2026-11-01, the projection in the Steward's
-> `watch.py` is suppressed, so it has no rate and holds on the level alone, while this gate grades by
-> rate when it has one.
+> **The Steward and this gate can disagree.** The 2026-11-03 amendment below says how.
+
+> **Amendment (2026-11-03): the gate and the Steward's hook read different things, and a flat pool
+> splits them.** On 2026-11-02 the owner lifted the 2026-08-14 suppression of the rate projection in
+> the Steward's `watch.py`, and ruled that a measured flat pool counts as room. Where this note and the
+> text above differ, this note wins. As read on 2026-11-03, against `usage.ps1` here and the vault's
+> `scripts/coord/watch.py` at `origin/main`, the gate (`usage.ps1 -Json`) and the hook (`watch.py`)
+> differ in at least these ways:
+>
+> - **Source.** The gate reads the statusLine's published files, `latest.json` and `history.jsonl`,
+>   under the session's config root. A Desktop session runs no statusLine, so it never writes them.
+>   Unless a statusLine session on the same root has published, a Desktop session's gate reads
+>   UNKNOWN and answers REVIEW, or HALT on a floor as the 2026-10-31 amendment says. `watch.py` reads
+>   the live usage API through the token file mapped to the session's org, and slopes those reads only.
+> - **Window.** `usage.ps1` slopes at most 90 minutes of history (`RateWindowMinutes`), oldest row to
+>   newest, with no plateau cut, and the collector writes a row only when the number changes.
+>   `watch.py` slopes at most 60 minutes (`BURN_LOOKBACK`), and 30 minutes of equal reads
+>   (`BURN_MIN_SPAN`) is a plateau that cuts the climb. One tick past a plateau is rated from the
+>   plateau's start, the one case where its slope reaches past 60 minutes. So the two can print
+>   different rates for one pool.
+> - **Flat.** In `watch.py`, a pool whose reads show one level for at least 30 minutes inside the
+>   current weekly window, with a reset time and a newest read at most 15 minutes old
+>   (`SAMPLE_MAX_AGE`), is measured flat,
+>   and below 98 percent that counts as room, as a rate with room does. The gate cannot measure a
+>   flat: no row is written without a change, so a flat pool has no positive rate, and from 90 percent
+>   the level decides. On a flat pool at 90 to 97 percent the gate therefore answers HALT on a fresh
+>   reading or a floor, and REVIEW on a stale or UNKNOWN one, while `watch.py` withholds its start-stop
+>   half. From 90 to 93 its headline is OK, with a line saying the pool is measured flat; from 94 to 97
+>   its protect rungs still fire. At 98 percent or more neither treats a flat as room.
+>
+> On a flat pool the gate is the stricter of the two, and a false stop is the safe direction. Making the
+> gate see a flat would mean another copy of `watch.py`'s rules, the cost the section above names, and it
+> is not built.
 
 ### Where it is enforced, and where it is not
 

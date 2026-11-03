@@ -846,8 +846,10 @@ function Get-DecisionCostRung {
       whatever the level. Only with no rate is the level the backstop. A rate of zero or below counts
       as no rate, because usage inside one reset period does not fall, and such a rate must not lift
       the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
-      is positive, but its _burn is suppressed today, so the Steward has no rate at all and holds on
-      the level alone. This gate can therefore grade the same pool differently from the Steward.
+      is positive. Its _burn projects again since the owner lifted its suppression on 2026-11-02, from
+      its own reads over its own window, and a pool it measures flat counts as room there. This gate
+      cannot see a flat and grades a flat pool by its level. So the two can grade the same pool
+      differently; ADR 0211's 2026-11-03 amendment says how.
 
       A WINDOW AT THE CEILING IS HIT WHATEVER THE RATE: 98 percent or more, the band usage.ps1 itself
       calls CRITICAL "at the ceiling". A flat or falling rate there says there is no room, not room.
