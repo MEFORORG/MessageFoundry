@@ -441,14 +441,15 @@ text moved in wave 2*.
 
 **The Lander may send a repair Builder subagent to a held PR whose author has gone quiet**
 (decided by the Lander under the owner's delegation of 2026-10-29, decision
-d20261029T165610526-c13ae6; owner ruling 2026-11-03 cut the window from 4 hours to 2 and added the
-suspended-author case). All of these must hold: 2 hours with no author comment or commit since
-the hold; the Lander mailed the author's seat-record worktree path and had no reply; the author's
-claim and seat record show no live session, or the author's transcript ends on a question
-unanswered for more than 2 hours, which counts as no live session even while the session shows as
-running (the Lander reads this with `list_events` or korus `scripts/board/seatstate.py`); the PR is
-not queued and has no armed auto-merge
-request; the hold names one determinate fix, not a question of intent, of an owner ruling or of
+d20261029T165610526-c13ae6; the owner ruling of 2026-11-03 in the next paragraph cut the window
+from 4 hours to 2 and added the suspended-author case). All of these must hold: 2 hours with no
+author comment or commit since the hold; the Lander mailed the author's seat-record worktree path
+and had no reply; the author's claim and seat record show no live session, or the author's
+transcript ENDS on a question unanswered for more than 2 hours that is not about this PR or its
+hold, which counts as no live session even while the session shows as running (the Lander reads
+this with `list_events` or korus `scripts/board/seatstate.py`, and confirms the question is the
+transcript's last turn rather than an older orphaned ask); the PR is not queued and has no armed
+auto-merge request; the hold names one determinate fix, not a question of intent, of an owner ruling or of
 behaviour; and the PR is not ASVS record content, which stays a Manager's. The Builder fetches
 before it pushes, never force-pushes, stops if the head moved, and makes only the fixes the hold
 names. One repair per PR; a second hold goes to a spawned Manager. Every other non-trivial fix
@@ -458,16 +459,23 @@ read with `review_tag.py`; the repair Builder's own QA does not count. That inde
 what keeps authoring apart from landing.
 
 **A held PR whose author has not acknowledged the hold within 2 hours transfers to the Repair
-Manager** (owner ruling 2026-11-03). An acknowledgement is an author comment or commit. The
-Repair Manager is one Manager the Lander spawns in its own CCD instance for repairs and keeps
-alive, so it is the spawned Manager the paragraph above sends a non-trivial fix to. The transfer
-is, in order: the repair-owner marker `<!-- repair-owner session=<id> -->` on the PR, mail to the
-original author's seat-record worktree, and the hold's URL sent to the Repair Manager as its
-brief. At least stacks, landing order, author intent and anything waiting on an owner ruling stay
-with the original author. The Repair Manager never uses `AskUserQuestion`; it carries owner
-questions in a table. It never opens a PR, enqueues or merges. The Lander still reviews every
-repair head at `xhigh` before it merges. The procedure is in korus `roles/LANDER.md` and
-`roles/MANAGER.md`.
+Manager** (owner ruling 2026-11-03: asked *"Which tiers do you want to adopt?"* of the Repair
+Manager proposal, the owner answered *"Tiers 1 and 2"*). This covers a hold the paragraph above
+does not take, so the Repair Manager is the spawned Manager that paragraph sends a non-trivial fix
+or a second hold to. An acknowledgement is a comment signed by the author's seat or a commit from
+its branch; since every seat acts as the owner's GitHub identity, the Lander's own comments and
+branch updates are not one. The PR must not be queued or carry an armed auto-merge request. The
+Lander spawns one Manager for repairs in its own CCD instance, so `send_message` can wake it, keeps
+it alive, and confirms it is running before each transfer. The
+transfer is, in order: the repair-owner marker `<!-- repair-owner session=<id> -->` on the PR,
+mail to the original author's seat-record worktree where it has one, and the hold's URL sent to
+the Repair Manager as its brief. A PR already carrying the marker stays with the Repair Manager
+on a later hold. At least stacks, landing order, author intent and anything already waiting on an
+owner ruling stay with the original author. Like the Lander and the Watchdog, the Repair Manager
+never uses `AskUserQuestion`; an owner question its own repair raises goes in a table. It never
+opens a PR, enqueues or merges. Every repair head it pushes takes the Lander's own independent
+review the paragraph above requires, before the merge. The procedure is in korus
+`roles/LANDER.md` and `roles/MANAGER.md`.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
