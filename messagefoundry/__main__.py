@@ -10794,9 +10794,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if uploads.root_missing:
-        # BACKLOG #4940: read as zero uploads, an unmounted volume printed OK and closed the record
-        # with every upload on it still under the prior key. A directory nobody created looks the
-        # same, so the operator says which by creating it.
+        # BACKLOG #4940; see ResealResult.root_missing. The operator says which case it is.
         print(
             f"error: the uploads directory {settings.store.uploads_dir} ([store].uploads_dir) does "
             "not exist or is not a directory, so no uploaded file was re-sealed. If it is on a "
@@ -10821,9 +10819,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     if uploads.incomplete:
         # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, nor does a missing
         # uploads root (#4940), so an operator who reads PARTIAL as "go back" must be told.
-        # Conditional, because this run cannot see whether
-        # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
-        # here, because the file skips the same way under it.
+        # Conditional, because this run cannot see whether the key changed: a same-key run or a
+        # keyless chain rolled nothing. A new key is no remedy here, because the file skips the
+        # same way under it.
         print(
             "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
             "an upload that cannot be fixed and re-run. If this store is moving to a new key and "

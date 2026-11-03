@@ -2114,9 +2114,7 @@ class UploadStore:
         **Only a regular file is opened (BACKLOG #3737),** no link is followed, and no file larger
         than an upload can be is read whole. See :meth:`_reseal_half`.
 
-        **A root that is not a directory is not zero uploads (BACKLOG #4940).** It sets
-        ``root_missing``, which fails ``rotate-key``: an unmounted volume reads the same as a
-        directory nobody created.
+        **A root that is not a directory sets ``root_missing`` (BACKLOG #4940),** never zero counts.
 
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
@@ -2127,8 +2125,6 @@ class UploadStore:
         if not isinstance(cipher, AesGcmCipher):
             return ResealResult()  # identity / transit cipher — nothing this process can rotate
         if not self._root.is_dir():
-            # BACKLOG #4940: not zero uploads. The root is created on the first save, so a site
-            # that never stored one has none, but neither has an unmounted volume.
             _log.warning(
                 "uploads root %s is not a directory; no uploaded file was read", self._root
             )

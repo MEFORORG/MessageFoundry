@@ -106,24 +106,18 @@ def test_a_site_with_no_uploads_still_completes(
     assert rows[ROTATION_RECORD_ID].fingerprint == ""
 
 
-@pytest.mark.parametrize("shape", ["missing", "a file"])
+@pytest.mark.parametrize("shape", ["missing", "a file", "empty"])
 async def test_reseal_reports_a_root_that_is_not_a_directory(tmp_path: Path, shape: str) -> None:
+    """Only a root that is not a directory is missing; an empty one is a site with no uploads."""
     root = tmp_path / "uploads"
     if shape == "a file":
         root.write_text("not a directory", encoding="utf-8")
+    elif shape == "empty":
+        root.mkdir()
     result = await UploadStore(
         root, make_cipher(generate_key()), max_bytes=1 << 20
     ).reseal_to_active()
-    assert result == ResealResult(root_missing=True)
-    assert result.incomplete
-    assert not root.is_dir()  # the pass creates nothing
-
-
-async def test_reseal_over_an_empty_root_is_complete(tmp_path: Path) -> None:
-    root = tmp_path / "uploads"
-    root.mkdir()
-    result = await UploadStore(
-        root, make_cipher(generate_key()), max_bytes=1 << 20
-    ).reseal_to_active()
-    assert result == ResealResult()
-    assert not result.incomplete
+    missing = shape != "empty"
+    assert result == ResealResult(root_missing=missing)
+    assert result.incomplete is missing
+    assert root.is_dir() is not missing  # the pass creates nothing
