@@ -753,9 +753,7 @@ class Engine:
         self._config_writes_closed = False
         # Serializes those writes in this process, each held by its tracked task, so a write whose
         # caller has gone keeps it. asyncio.Lock wakes waiters in arrival order, so the last toggle
-        # lands last. The store's audit lock, taken before the flag statement, is what keeps the
-        # flag and its newest audit row in step, across processes too (ADR 0007, amendment of
-        # 2026-10-31).
+        # lands last. set_connection_flag's docstring says what keeps the flag and its row in step.
         self._config_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is

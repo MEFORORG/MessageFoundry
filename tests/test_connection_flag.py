@@ -21,6 +21,7 @@ import logging
 import textwrap
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,6 +34,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
+from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._operator_audit_atomic_contract import AppendFailed, failing_append
 
@@ -670,12 +672,9 @@ class _SlowFirstWrite:
     """Holds the first flag write open until :attr:`release`, around the real store, and lets every
     later write through, so a later toggle nothing holds back overtakes it.
 
-    A clear that overtakes takes the one branch here that is not the real store. It models a READ
-    COMMITTED server store that took the audit lock only at the append: a clear during an
-    uncommitted set saw no row, deleted nothing, and still appended its audit row, after the set's.
-    The server stores now take that lock before the flag statement, which the cross-handle contract
-    in ``tests/_operator_audit_atomic_contract.py`` pins, so the engine lock here keeps arrival
-    order, and the branch is what a store without that lock would do."""
+    A clear that overtakes takes the one branch here that is not the real store: it models a READ
+    COMMITTED store without the up-front audit lock, where a clear beside an uncommitted set
+    deleted nothing and still appended the newer row."""
 
     def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         self.entered, self.release, self.first_done = (asyncio.Event() for _ in range(3))
@@ -915,15 +914,10 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
     ``tests/test_postgres_store.py`` depends on. The lock taken only at the append let a clear run
     beside another shard's uncommitted set at READ COMMITTED, delete nothing, and append the newer
     row. Pinned to READ COMMITTED, since a REPEATABLE READ snapshot would predate the lock wait."""
-    from contextlib import asynccontextmanager
-    from typing import Any
-
-    from messagefoundry.store.postgres import PostgresStore
-
     log: list[str] = []
 
     class _Conn:
-        @asynccontextmanager
+        @contextlib.asynccontextmanager
         async def transaction(self, **kwargs: Any) -> Any:
             log.append(f"BEGIN {kwargs.get('isolation')}")
             yield None
@@ -934,7 +928,7 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
 
     store = object.__new__(PostgresStore)
 
-    @asynccontextmanager
+    @contextlib.asynccontextmanager
     async def _timed_acquire(*, record: bool = True) -> Any:
         yield _Conn()
 
