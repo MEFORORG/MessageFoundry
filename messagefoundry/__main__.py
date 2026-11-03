@@ -10471,6 +10471,34 @@ def _sqlite_store_held_elsewhere(path: str) -> _OfflineProbe:
     return _OfflineProbe()
 
 
+#: Why a configured uploads directory may be unreadable to ``rotate-key`` (BACKLOG #4940).
+_UPLOADS_ROOT_CAUSES = (
+    "The causes include at least a volume that is not mounted, a path that is wrong or is "
+    "relative (it is read from the directory this command runs in) and, since the directory is "
+    "created on the first upload, a site that has never stored one. Create it, empty, only in "
+    "that last case: anywhere else an empty directory hides the uploads this run must re-seal."
+)
+
+
+def _uploads_root_refusal(uploads_dir: str) -> str | None:
+    """What stops ``rotate-key`` listing the configured uploads directory, or ``None`` (BACKLOG
+    #4940). A directory the pass cannot read is not zero uploads: behind an unmounted volume every
+    upload is still under the prior key. Checked before anything is written, so a refusal costs
+    nothing, the audit roll included. :attr:`ResealResult.root_missing` is the backstop for a
+    directory that goes away after this check."""
+    import os
+
+    root = Path(uploads_dir).absolute()
+    where = f"the uploads directory {root} ([store].uploads_dir)"
+    try:
+        with os.scandir(root):
+            return None
+    except (FileNotFoundError, NotADirectoryError):
+        return f"{where} does not exist or is not a directory"
+    except OSError as exc:
+        return f"{where} cannot be listed: {exc.strerror or type(exc).__name__}"
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10508,7 +10536,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
     either data pass, the audit range rolls after both, and the stamp and the record's close come
-    last, on a run with no skip and a good roll. A skip does not stop the roll (owner ruling
+    last, on a run with no skip, an uploads directory it could read throughout (BACKLOG #4940) and
+    a good roll. One it cannot list at the start refuses before anything is written; one that goes
+    away mid-run fails the run like a skip. A skip does not stop the roll (owner ruling
     2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
     that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
     key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
@@ -10592,6 +10622,15 @@ def _rotate_key(args: argparse.Namespace) -> int:
         unchecked = probe.unchecked
     else:
         unchecked = f"it is a {settings.store.backend.value} store"
+    if settings.store.uploads_dir:
+        refusal = _uploads_root_refusal(settings.store.uploads_dir)
+        if refusal is not None:
+            print(
+                f"error: {refusal}, so rotate-key changed nothing. {_UPLOADS_ROOT_CAUSES} Fix the "
+                "cause and re-run.",
+                file=sys.stderr,
+            )
+            return 2
     if unchecked is not None:
         print(
             f"note: rotate-key could not check for a running engine: {unchecked}. Confirm every "
@@ -10794,14 +10833,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if uploads.root_missing:
-        # BACKLOG #4940; see ResealResult.root_missing. The operator says which case it is.
+        # BACKLOG #4940: the directory passed the check before the store opened and was gone by the
+        # uploads pass. See ResealResult.root_missing.
         print(
-            f"error: the uploads directory {settings.store.uploads_dir} ([store].uploads_dir) does "
-            "not exist or is not a directory, so no uploaded file was re-sealed. If it is on a "
-            "volume that is not mounted, mount it and re-run rotate-key BEFORE retiring any prior "
-            "key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED): its uploads may still be under that key. If "
-            "this site has never stored an upload, create the directory, empty, and re-run. This "
-            "run did not stamp the key's rotation date.",
+            f"error: the uploads directory {Path(settings.store.uploads_dir or '').absolute()} "
+            "([store].uploads_dir) went away during the run, so no uploaded file was re-sealed, "
+            "and its uploads may still be under the prior key. Fix the cause and re-run rotate-key "
+            "BEFORE retiring any prior key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). "
+            f"{_UPLOADS_ROOT_CAUSES} This run did not stamp the key's rotation date.",
             file=sys.stderr,
         )
     if not rolled_ok:
@@ -10817,14 +10856,19 @@ def _rotate_key(args: argparse.Namespace) -> int:
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
     if uploads.incomplete:
-        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, nor does a missing
-        # uploads root (#4940), so an operator who reads PARTIAL as "go back" must be told.
-        # Conditional, because this run cannot see whether the key changed: a same-key run or a
-        # keyless chain rolled nothing. A new key is no remedy here, because the file skips the
-        # same way under it.
+        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, nor does an
+        # uploads root that went away mid-run (#4940), so an operator who reads PARTIAL as "go
+        # back" must be told. Conditional, because this run cannot see whether the key changed: a
+        # same-key run or a keyless chain rolled nothing. A new key is no remedy here, because the
+        # cause stands the same way under it.
+        remedy = (
+            "Fix the cause and re-run, or remove the two files of an upload that cannot be fixed "
+            "and re-run."
+            if uploads.skipped
+            else "Fix the cause and re-run."
+        )
         print(
-            "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
-            "an upload that cannot be fixed and re-run. If this store is moving to a new key and "
+            f"note: this run did not complete. {remedy} If this store is moving to a new key and "
             "its audit chain is keyed, the chain has rolled to that key, and a key opens one audit "
             "range, so you cannot go back to the prior key: keep it in "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until a run completes."

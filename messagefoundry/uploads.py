@@ -650,8 +650,9 @@ class ResealResult:
     #: True when the uploads root is not a directory, so the pass read nothing (BACKLOG #4940). An
     #: unmounted volume and a directory never created both look like this, and the pass cannot tell
     #: them apart: read as zero uploads, an unmounted volume's uploads would stay under the prior key
-    #: while the run reported success. So it fails the run as a skip does. A site with no uploads has
-    #: an empty root, or no ``uploads_dir`` at all, and completes.
+    #: while the run reported success. ``rotate-key`` refuses such a root before it writes anything,
+    #: so this is the backstop for one that goes away mid-run, and it fails the run as a skip does.
+    #: A site with no uploads has an empty root, or no ``uploads_dir`` at all, and completes.
     root_missing: bool = False
 
     @property
