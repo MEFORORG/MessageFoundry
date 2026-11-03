@@ -1998,10 +1998,6 @@ _SCHEMA: list[str] = [
         message_id NVARCHAR(64) NOT NULL, attachment_id NVARCHAR(64) NOT NULL,
         inherited BIT NOT NULL CONSTRAINT DF_message_attachment_inherited DEFAULT 0,
         CONSTRAINT pk_message_attachment PRIMARY KEY (message_id, attachment_id))""",
-    # A pre-existing linkage table holds only ingress detaches' own links, so 0 backfills it.
-    """IF COL_LENGTH('message_attachment','inherited') IS NULL
-        ALTER TABLE message_attachment ADD inherited BIT NOT NULL
-        CONSTRAINT DF_message_attachment_inherited DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_ready','IndexID') IS NULL
         CREATE INDEX ix_queue_ready ON queue(stage, status, next_attempt_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_message','IndexID') IS NULL
@@ -11375,9 +11371,11 @@ class SqlServerStore:
         no double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
         holds. ``where`` is a code-controlled fragment (never user input); ``params`` binds it identically
         in both statements."""
+        # ORDER BY: the decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle.
         await cur.execute(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id",
+            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
             params,
         )
         cols = [c[0] for c in cur.description]

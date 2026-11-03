@@ -10338,13 +10338,6 @@ class MessageStore:
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
-        # BACKLOG #5099: a link a child inherited grants no download. A pre-existing linkage table
-        # predates the flag; every row in it is an ingress detach's own link, so 0 is right.
-        cur = await db.execute("PRAGMA table_info(message_attachment)")
-        if "inherited" not in {row["name"] for row in await cur.fetchall()}:
-            await db.execute(
-                "ALTER TABLE message_attachment ADD COLUMN inherited INTEGER NOT NULL DEFAULT 0"
-            )
         # BACKLOG #1256: the federated guard in auth/service.py is CHECK-THEN-ACT -- it reads the
         # current holder and writes the binding in two separate awaits, so two concurrent FIRST
         # logins for one subject can both observe "no holder" and both bind. This index is the

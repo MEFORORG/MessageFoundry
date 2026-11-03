@@ -636,9 +636,6 @@ _SCHEMA: list[str] = [
         inherited     BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (message_id, attachment_id)
     )""",
-    # A pre-existing linkage table holds only ingress detaches' own links, so FALSE backfills it.
-    "ALTER TABLE message_attachment ADD COLUMN IF NOT EXISTS inherited BOOLEAN NOT NULL"
-    " DEFAULT FALSE",
     # ix_queue_lease (the reclaim sweep's index) is created in _migrate_lease_columns, AFTER the lease
     # columns are guaranteed present — on a Step-1 table the index references a not-yet-added column.
     """CREATE TABLE IF NOT EXISTS message_events (
@@ -7035,9 +7032,11 @@ class PostgresStore:
         join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
         an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
         (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        # ORDER BY: the decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle.
         rows = await conn.fetch(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id",
+            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
             *params,
         )
         if not rows:

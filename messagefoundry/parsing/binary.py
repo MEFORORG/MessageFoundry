@@ -524,7 +524,10 @@ def _detach_would_leave_a_marker(
     try:
         escaped = message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
     except ValueError:
-        return False  # no separators to escape by, so no escaped form to look for
+        # Fail closed: a body whose separators cannot be read cannot be checked for the escaped
+        # form, so it is refused rather than detached unchecked. The OBX reads before this call
+        # already raise on such a header, so the branch only guards a reorder.
+        return True
     return escaped in received
 
 

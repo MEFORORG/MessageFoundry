@@ -690,7 +690,7 @@ def _strip_and_scan_hl7(text: str) -> None:
     except HL7PeekError:
         return
     with contextlib.suppress(EscapedDocumentError, InboundDocRefError):
-        list(iter_obx_documents(message))
+        list(iter_obx_documents(message, received=text))
     for occurrence in range(1, message.count_segments("OBX") + 1):
         with contextlib.suppress(BinaryCarriageError):
             extract_obx_document(message, occurrence=occurrence)

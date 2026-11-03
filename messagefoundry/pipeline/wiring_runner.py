@@ -8547,7 +8547,9 @@ class RegistryRunner:
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
                 elif isinstance(exc, InboundDocRefError):
-                    nak_code, nak_text = "AR", "document handle in OBX-5.5"
+                    # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
+                    # with a document to detach.
+                    nak_code, nak_text = "AR", "document handle marker in the body"
                 else:
                     nak_code, nak_text = "AE", "streaming detach failed"
                 ack = (

@@ -301,8 +301,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   not linked either, so `refcount` still equals the live linkage rows. Purging either message then
   releases only its own reference. A handle naming a document the parent does not hold is not
   linked, and is refused at delivery. On Postgres and SQL Server the increfs run in
-  content-address order, as the ingress increfs now do, so an inheritance and an ingress take the
-  documents' header locks in one order.
+  content-address order, as the ingress increfs and the retention decrefs now do, so an
+  inheritance, an ingress and a purge take the documents' header locks in one order.
   **An inherited link grants no download.** It is written with `inherited` set, and
   `attachments_for` leaves it out unless the caller asks for it, which only delivery does. So the
   download route and the message detail's attachment list read through the child exactly as
