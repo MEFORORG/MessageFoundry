@@ -1171,11 +1171,12 @@ class BackupRunner:
         swapped for a link in between is followed. The swaps that reach it include at least these.
         A directory swapped for a junction in that gap is descended, as :func:`_walk_unfollowed`
         says, and the files behind it are bundled. A parent folder swapped for a junction after the
-        walk listed the folder lets ``tar.add`` open each name listed under the folder through the
-        junction. A swapped file adds one member, since ``tar.add`` is not recursive. Each swap
-        needs write access to the folder that holds the swapped entry: at least the config dir
-        itself, any folder below it, or one of its ancestors. On Windows, emptying a folder and
-        making it a mount point is another route.
+        walk read the folder's entry in its parent lets ``tar.add`` open each name listed under the
+        folder through the junction. A swapped file adds one member, since ``tar.add`` is not
+        recursive. At least anyone who can write to, or replace, a folder on the config dir's
+        resolved path or anywhere below it, including a share mounted below it, can make the walk
+        follow a link this way: a junction or mount point on Windows, a symlink on POSIX. With
+        write access to one of the config dir's ancestors, no race is needed.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
