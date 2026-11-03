@@ -81,6 +81,13 @@ from __future__ import annotations
 
 import ast
 import functools
+from collections.abc import Callable
+from pathlib import Path
+
+#: The packages that run in the engine process or ship beside it: the engine, the web console mounted
+#: in it at /ui, and the toolkit split out of it.
+_ENGINE_PACKAGES = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
+_REPO = Path(__file__).resolve().parents[1]
 
 __all__ = [
     "call_sites",
@@ -91,6 +98,8 @@ __all__ = [
     "delete_keeping_a_mention",
     "find_funcs",
     "named_func",
+    "outermost_def_sites",
+    "package_trees",
     "parse_source",
     "source_calls",
     "source_has_literal",
@@ -216,6 +225,40 @@ def delete_keeping_a_mention(source: str, code: str, replacement: str) -> str:
     """
     assert code in source, f"{code!r} is not in the source any more; re-point this deletion"
     return source.replace(code, replacement) + f"\n# {code.strip()}\n"
+
+
+def outermost_def_sites(tree: ast.Module, test: Callable[[ast.AST], bool]) -> set[str]:
+    """The defs in ``tree`` holding a node ``test`` accepts: class names down to the outermost
+    function, so a node in a nested closure is charged to the method that defines it, and code at
+    module level to ``<module>``. The rule the census guards key their allow-lists on."""
+    sites: set[str] = set()
+
+    def walk(node: ast.AST, owner: list[str], in_function: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if in_function:
+                    walk(child, owner, True)
+                else:
+                    is_def = not isinstance(child, ast.ClassDef)
+                    walk(child, [*owner, child.name], is_def)
+                continue
+            if test(child):
+                sites.add(".".join(owner) or "<module>")
+            walk(child, owner, in_function)
+
+    walk(tree, [], False)
+    return sites
+
+
+@functools.cache
+def package_trees() -> dict[str, ast.Module]:
+    """Every module of the packages that run in the engine process or ship beside it, by path
+    relative to the repository, parsed once for the whole run: a full pass costs seconds."""
+    return {
+        path.relative_to(_REPO).as_posix(): ast.parse(path.read_text(encoding="utf-8"))
+        for package in _ENGINE_PACKAGES
+        for path in (_REPO / package).rglob("*.py")
+    }
 
 
 def find_funcs(tree: ast.AST, name: str) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:

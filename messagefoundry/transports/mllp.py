@@ -102,6 +102,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     float_setting,
     intake_open,
+    port_setting,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -790,7 +791,7 @@ class MLLPDestination(DestinationConnector):
         if not isinstance(host, str) or not host:
             raise ValueError("MLLP destination requires a 'host' setting (the downstream peer)")
         self.host: str = host
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="MLLP destination")
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="MLLP destination"
         )
@@ -1834,7 +1835,7 @@ class MLLPSource(SourceConnector):
         # host on an inbound). Fall back to loopback for a missing/None value — never bind all
         # interfaces (0.0.0.0) by accident, since MLLP has no transport auth. See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
-        self.port: int = int(s["port"])
+        self.port: int = port_setting(s["port"], transport="MLLP")
         # The rule ingress_guards.ingress_encoding reads too, so the reply is encoded in the charset
         # the runner decoded the body with. Config load refuses an env() inbound encoding, which the
         # runner's decode would not resolve, and a non-str or unusable name (BACKLOG #2431); the str()
@@ -1934,6 +1935,7 @@ class MLLPSource(SourceConnector):
             max_connections=self.max_connections,
             max_connections_per_host=self.max_connections_per_host,
             source_ip_allowlist=self.source_ip_allowlist,
+            name=config.name or "",
         )
         # Live client writers + their handler tasks, so stop()/reload can actively close established
         # connections (a peer may hold one open for weeks) and bound the wait — server.wait_closed()

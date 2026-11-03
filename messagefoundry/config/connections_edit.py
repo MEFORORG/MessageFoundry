@@ -9,8 +9,8 @@ connection and leave every other table's comments + formatting byte-stable — h
 (load + the connector/egress build-check) BEFORE it persists: the dir is loaded with a candidate
 ``connections.toml`` in place of the live one, and only a candidate that loads replaces it (temp +
 replace, owner-only perms), so a bad edit never touches the live file. The read-modify-write holds a
-cross-process lock (:func:`locked`), so the ``connection`` CLI and the console cannot lose each other's
-edit (:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
+cross-process lock (:func:`locked`), so two ``connection`` CLI runs cannot lose each other's edit
+(:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
 
 The validation is injected as a callback so this module stays free of service-settings/engine imports
 (and is trivially testable); the ``connection`` CLI builds the callback from ``load_config`` +
@@ -65,9 +65,6 @@ _SCALAR_FIELDS = (
     # itself the first time an operator edited it in the editor.
     "auto_start",
     "deployed",
-    # Operator "object of interest" flag (#131, ADR 0007 amendment) — the FIRST console-settable key
-    # written through this seam. Absent from this whitelist it would be silently dropped on the next save.
-    "flagged",
     # Cosmetic "Waiting for Reply" pre-display delay (#136, ADR 0065 amendment) — outbound-only, seconds.
     "waiting_display_delay",
     # --- #234: every key below was in the READ schema but not written — a GUI/CLI save silently
@@ -137,11 +134,12 @@ def locked(config_dir: str | Path) -> Iterator[None]:
     """Hold the cross-process edit lock on ``config_dir``'s ``connections.toml`` for the ``with`` body.
 
     :func:`upsert_connection` and :func:`remove_connection` take it themselves. A caller whose
-    read-modify-write starts earlier, as the engine's flag toggle does with :func:`list_connections`,
-    wraps the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event
-    loop. A holder that does not let go within the timeout raises :class:`WiringError`, and so does a
-    directory the file system will not let this account write (root-owned or read-only), which the
-    API answers 409 rather than 500 (vault BACKLOG #3106)."""
+    read-modify-write starts earlier, such as one that begins with :func:`list_connections`, wraps
+    the whole of it; the lock is re-entrant within one thread. Blocking: call it off the event loop.
+    A holder that does not let go within the timeout raises :class:`WiringError`, and so does a
+    directory the file system will not let this account write (root-owned or read-only) (vault
+    BACKLOG #3106). A refused read or replace under the lock is a :class:`WiringError` too (vault
+    BACKLOG #3765)."""
     with atomic_edit.edit_lock(
         _path(config_dir), busy_error=WiringError, refused_error=WiringError
     ):
@@ -159,11 +157,14 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     to ISO strings recursively **at this boundary** — deliberately here and NOT via a ``default=``
     hook on the CLI's ``_print_json`` (``__main__.py`` is unchanged), so the CLI, the IDE's
     ``runJson``, and direct Python callers all see the same canonical form. The string form is
-    read-schema-legal on write-back (pydantic re-parses ISO strings — ``ActiveWindow.start``/``end``)."""
-    path = _path(config_dir)
-    if not path.is_file():
+    read-schema-legal on write-back (pydantic re-parses ISO strings — ``ActiveWindow.start``/``end``).
+
+    A file the file system will not let this account read raises :class:`WiringError`, as every
+    other refused step here does."""
+    text, _crlf = atomic_edit.read_text_if_present(_path(config_dir), refused_error=WiringError)
+    if text is None:
         return []
-    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc = tomlkit.parse(text)
     out: list[dict[str, Any]] = []
     for direction in ("inbound", "outbound"):
         for table in doc.get(direction, []):
@@ -203,7 +204,7 @@ def upsert_connection(
     _validate_input(obj)
     path = _path(config_dir)
     with locked(config_dir):
-        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
+        original, crlf = atomic_edit.read_text_if_present(path, refused_error=WiringError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         direction = obj["direction"]
@@ -233,10 +234,10 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
     """Remove the data-authored connection ``name``. Raises :class:`WiringError` if it isn't in
     ``connections.toml`` (a code-first connection can't be removed here)."""
     path = _path(config_dir)
-    if not path.is_file():
+    if not atomic_edit.is_file(path, refused_error=WiringError):
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
     with locked(config_dir):
-        text, crlf = atomic_edit.read_text(path)
+        text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
         removed = False
@@ -396,6 +397,6 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
         with validating_candidate(config_dir, candidate):
             validate(config_dir)
 
-    # A candidate the file system will not let this account create is a WiringError like any other
-    # refused edit (vault BACKLOG #3106); an error from the replace onward still propagates.
+    # A candidate or a replace the file system refuses is a WiringError like any other refused edit
+    # (vault BACKLOG #3106, #3765). An error after the replace still propagates: the file changed.
     atomic_edit.replace_validated(path, data, check, refused_error=WiringError)

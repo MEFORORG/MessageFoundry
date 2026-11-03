@@ -96,6 +96,7 @@ _TABLES = (
     "delivered_keys",
     "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
     "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
+    "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
     "search_presets",  # ADR 0136 saved searches (no FK, so CASCADE never reaches it) — the ciphered
     #                    `criteria` is in the key-rotation reencrypt scan, and this suite asserts EXACT
     #                    rotate counts, so a preset left by one test miscounts an unrelated one
@@ -1215,6 +1216,40 @@ async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
     from tests._operator_audit_atomic_contract import assert_operator_audit_atomic
 
     await assert_operator_audit_atomic(store)
+
+
+async def test_overlapping_toggles_from_two_handles_leave_the_flag_matching_the_newest_row(
+    store,
+) -> None:
+    """BACKLOG #2623 on the real Postgres backend: a second handle stands in for a second engine
+    shard. The audit advisory lock is taken before the flag statement, so at READ COMMITTED a
+    toggle cannot run its statement beside another's uncommitted one."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._operator_audit_atomic_contract import assert_connection_flag_ordered_across_stores
+
+    second = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        await assert_connection_flag_ordered_across_stores(store, second)
+    finally:
+        await second.close()
+
+
+async def test_a_foreign_lock_on_the_flag_table_holds_the_audit_chain_only_for_the_bound(
+    store,
+) -> None:
+    """BACKLOG #2623 on the real Postgres backend: the toggle waits for its row holding the audit
+    advisory lock, so a session holding a lock on ``connection_flag`` must cost the toggle its typed
+    refusal within ``lock_timeout``, and leave an audit append from another handle unblocked."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._operator_audit_atomic_contract import assert_flag_lock_wait_bounded
+
+    second = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        await assert_flag_lock_wait_bounded(store, second)
+    finally:
+        await second.close()
 
 
 async def test_approval_release_outcome_contract(store) -> None:

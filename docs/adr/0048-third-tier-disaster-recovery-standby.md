@@ -248,7 +248,8 @@ in-flight rows stranded.
 > re-apply, the engine digests the running config dir off the event loop, bounded by
 > `[dr].takeover_timeout_seconds`. The `dr.activate` row records the activated graph's digest, and a
 > `disk_config` verdict of `matches`, `differs`, `unreadable` or `unknown` (the running graph has no digest to
-> compare). On `differs` it also records the disk digest, and the engine logs one WARNING naming both digests
+> compare), and, when either digest left a file out, `disk_config_left_out` (vault BACKLOG #3765). Two digests
+> match only over the same files. On `differs` it also records the disk digest, and the engine logs one WARNING naming both digests
 > and the dir. On `unreadable` it records why and goes on: the check runs after the graph is live, so it never
 > fails the activation. The re-apply runs the current graph once it holds the runner's reload lock, so an
 > operator reload that lands first is re-evaluated under the threshold rather than reverted.

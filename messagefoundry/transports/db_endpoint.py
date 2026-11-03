@@ -60,12 +60,14 @@ def port_or_zero(text: str) -> int:
 def _preset_port(value: object) -> int | None:
     """The ``port`` setting of the SQL Server preset as a port, or ``None``.
 
-    ``_build_dsn`` writes ``int(port)`` into ``SERVER`` and checks neither the type nor the range.
-    This applies ``int()`` only to an int, a float or a str, and not to a bool, and returns ``None``
-    for a value ``int()`` refuses or one outside 1 to 65535. So where both read a number, they read
-    the same one: a float, a sign or a non-ASCII digit included. They part on a bool, another type
-    ``int()`` accepts (bytes, Decimal) and an out-of-range number: the connection string still
-    sends a port there, and this reads none. Against a pinned entry that refuses the hop; a
+    ``_build_dsn`` reads the setting with ``transports.base.port_setting`` and writes that number
+    into ``SERVER``. This applies ``int()`` only to an int, a float or a str, and not to a bool, and
+    returns ``None`` for a value ``int()`` refuses or one outside 1 to 65535. So where both read a
+    number, they read the same one: a whole float, a sign or a non-ASCII digit included. A bool, a
+    fraction and an out-of-range number never reach a connection string, because ``port_setting``
+    refuses them. This module cannot import that reader, so it keeps its own reading, and the two
+    part on a port of 0 and on another numeric type, such as a whole ``Decimal``: the connection
+    string sends a port there, and this reads none. Against a pinned entry that refuses the hop; a
     host-only entry admits it, as it admits any port."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None

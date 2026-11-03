@@ -15,19 +15,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import math
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 
+from messagefoundry.config.settings import StoreBackend
+from messagefoundry.store.base import (
+    CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
+    ConnectionFlagLockTimeout,
+)
 from messagefoundry.store.sqlserver import (
     _CIPHER_MERGE_ATTEMPTS,
     SqlServerStore,
     _is_transient_write_conflict,
 )
+from messagefoundry.store.store import AuditAppend
 
 _HYT00 = Exception("('HYT00', '[HYT00] [Microsoft][ODBC Driver 18]Query timeout expired (0)')")
 _DEADLOCK = Exception("[42000] ... (1205) ... was deadlocked ... chosen as the deadlock victim")
+_LOCK_WAIT_OVER = Exception("[HY000] ... Lock request time out period exceeded. (1222)")
 
 
 def test_is_transient_write_conflict_matches_hyt00_and_deadlock_only() -> None:
@@ -188,3 +197,179 @@ async def test_a_raising_attempt_never_reaches_the_backoff() -> None:
         await _add(store)
     assert store.events == ["acquire", "release"]  # no sleep
     assert store.held == 0
+
+
+class _FlagStore:
+    """The surface ``set_connection_flag`` touches. It holds one cursor across its retries, unlike
+    ``add_cipher_invocations``, so each execute takes the next outcome. Each take of the audit
+    applock takes the next of ``applock`` the same way, and an exhausted list lets it through. A
+    ``SET`` takes no outcome, and ``RESET`` records the reset that follows a failed write's
+    rollback."""
+
+    backend = StoreBackend.SQLSERVER
+
+    def __init__(
+        self,
+        outcomes: list[BaseException | None],
+        applock: list[BaseException | None] | None = None,
+    ) -> None:
+        self._outcomes = outcomes
+        self._applock = applock or []
+        self.statements: list[str] = []
+        self.rollbacks = 0
+        self.discards = 0
+        self.audits = 0
+        self.commits = 0
+
+    async def execute(self, sql: str, _params: Any = ()) -> None:
+        self.statements.append(sql)
+        if sql.startswith("SET "):
+            return
+        outcome = self._outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+        self.statements.append("ROLLBACK")
+
+    async def _open_under_audit_applock(self, _cur: Any) -> None:
+        self.statements.append("APPLOCK")
+        outcome = self._applock.pop(0) if self._applock else None
+        if outcome is not None:
+            raise outcome
+
+    @contextlib.asynccontextmanager
+    async def _acquire(self) -> AsyncIterator[_FlagStore]:
+        yield self
+
+    @contextlib.asynccontextmanager
+    async def _cursor(self, _conn: Any) -> AsyncIterator[_FlagStore]:
+        yield self
+
+    async def _append_operator_audit(self, *_args: Any) -> None:
+        self.audits += 1
+
+    async def _commit(self, _conn: Any) -> None:
+        self.commits += 1
+
+    async def _rollback_or_discard(self, _conn: Any) -> None:
+        self.discards += 1
+
+    async def _reset_lock_timeout(self, _conn: Any, *, after: str) -> None:
+        assert after == "a failed connection flag write"
+        self.statements.append("RESET")
+
+
+async def _set_flag(store: _FlagStore, *, flagged: bool) -> None:
+    await SqlServerStore.set_connection_flag(
+        store,  # type: ignore[arg-type]
+        "OB_A",
+        "outbound",
+        flagged=flagged,
+        audit=AuditAppend("connection_flag_set"),
+    )
+
+
+#: The bound the toggle sets before its flag statement, and the default it puts back after.
+_BOUND = f"SET LOCK_TIMEOUT {math.ceil(CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS * 1000)}"
+_UNBOUND = "SET LOCK_TIMEOUT -1"
+
+
+def _shape(statements: list[str]) -> list[str]:
+    """Each statement's verb, with a ``SET`` kept whole so its value is checked too."""
+    return [sql if sql.startswith("SET ") else sql.split()[0] for sql in statements]
+
+
+@pytest.mark.parametrize(("flagged", "statement"), [(True, "MERGE"), (False, "DELETE")])
+async def test_a_flag_write_retries_past_a_conflict_and_appends_one_row(
+    flagged: bool, statement: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The set and the clear each follow the audit applock, so a conflict rolls back, which releases
+    the applock, and the re-run takes it again before its flag statement. The audit row lands once.
+    The log names the statement that ran. RED for the clear when the helper's line says MERGE for a
+    DELETE, and RED when a re-run reaches its flag statement without the applock."""
+    store = _FlagStore([_DEADLOCK, None])
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.sqlserver"):
+        await _set_flag(store, flagged=flagged)
+    assert _shape(store.statements) == [
+        "APPLOCK",
+        _BOUND,
+        statement,
+        "ROLLBACK",
+        "APPLOCK",
+        _BOUND,
+        statement,
+        _UNBOUND,
+    ]
+    assert (store.rollbacks, store.audits, store.commits, store.discards) == (1, 1, 1, 0)
+    other = "DELETE" if flagged else "MERGE"
+    retried = [r.getMessage() for r in caplog.records if "retrying" in r.getMessage()]
+    assert len(retried) == 1
+    assert statement in retried[0] and other not in retried[0]
+
+
+@pytest.mark.parametrize(("flagged", "statement"), [(True, "MERGE"), (False, "DELETE")])
+async def test_the_flag_statement_runs_under_the_lock_bound_and_puts_it_back(
+    flagged: bool, statement: str
+) -> None:
+    """The flag statement holds the audit applock while it waits, so a foreign lock on
+    ``connection_flag`` would hold every audit append for as long as it waits. The bound is set
+    after the applock, whose wait keeps its own, and before the statement. ``LOCK_TIMEOUT`` is
+    session-scoped, so it goes back to -1 at once rather than ride the pooled connection into
+    other work. RED with either ``SET`` removed."""
+    store = _FlagStore([None])
+    await _set_flag(store, flagged=flagged)
+    assert _shape(store.statements) == ["APPLOCK", _BOUND, statement, _UNBOUND]
+    assert (store.audits, store.commits, store.discards) == (1, 1, 0)
+
+
+async def test_a_flag_statement_that_waits_out_the_bound_is_refused_and_not_retried() -> None:
+    """Error 1222 is a failed applock wait to the retry: a re-run would hold the applock again
+    behind the same holder. It raises the typed refusal at once, the transaction rolls back, which
+    releases the applock, and the session's bound is put back after the rollback, since a rollback
+    does not undo a ``SET``. Nothing is appended. RED when the 1222 is retried or left untyped, and
+    RED without the reset."""
+    store = _FlagStore([_LOCK_WAIT_OVER])
+    with pytest.raises(ConnectionFlagLockTimeout) as caught:
+        await _set_flag(store, flagged=True)
+    assert caught.value.__cause__ is _LOCK_WAIT_OVER
+    assert caught.value.timeout == CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
+    assert not _is_transient_write_conflict(caught.value)
+    assert _shape(store.statements) == ["APPLOCK", _BOUND, "MERGE", "RESET"]
+    assert (store.rollbacks, store.audits, store.commits, store.discards) == (0, 0, 0, 1)
+
+
+async def test_a_flag_write_that_never_clears_commits_nothing() -> None:
+    """Bounded, as the other retries are, and no audit row is appended for a write that did not
+    land. The refusal reaches the caller, which is what the route answers 503 for. The bound the
+    last attempt set is put back after the rollback."""
+    store = _FlagStore([_HYT00] * _CIPHER_MERGE_ATTEMPTS)
+    with pytest.raises(Exception, match="HYT00"):
+        await _set_flag(store, flagged=False)
+    retry = ["ROLLBACK", "APPLOCK", _BOUND, "DELETE"]
+    assert _shape(store.statements) == ["APPLOCK", _BOUND, "DELETE"] + retry * (
+        _CIPHER_MERGE_ATTEMPTS - 1
+    ) + ["RESET"]
+    assert (store.audits, store.commits, store.discards) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("retake", [False, True], ids=["first-take", "re-take"])
+async def test_a_flag_write_whose_applock_wait_fails_is_not_retried(retake: bool) -> None:
+    """A transient-looking failure at the audit applock, first or after a rollback, raises at once
+    and writes nothing. It is the store's busiest lock, and a retry there would queue on it again;
+    the append took it outside any retry before the applock moved to the front. A bound set by the
+    attempt before the rollback outlives it, so it is put back too."""
+    if retake:
+        store = _FlagStore([_DEADLOCK, None], applock=[None, _HYT00])
+    else:
+        store = _FlagStore([None], applock=[_HYT00])
+    with pytest.raises(RuntimeError, match="audit applock was not granted") as caught:
+        await _set_flag(store, flagged=False)
+    assert caught.value.__cause__ is _HYT00
+    if retake:
+        expected = ["APPLOCK", _BOUND, "DELETE", "ROLLBACK", "APPLOCK", "RESET"]
+    else:
+        expected = ["APPLOCK"]
+    assert _shape(store.statements) == expected
+    assert (store.audits, store.commits, store.discards) == (0, 0, 1)

@@ -329,8 +329,14 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     resolve_effective_policy,
 )
-from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import ConfigDirMissing, digest_coverage, fingerprint_matches
+from messagefoundry.config.fingerprint import (
+    ConfigDirMissing,
+    DigestCoverage,
+    describe_left_out,
+    digest_coverage,
+    left_out_of,
+    same_digest,
+)
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -460,9 +466,8 @@ from messagefoundry.pipeline.cluster import (
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.engine import (
-    CONFIG_WRITE_ACTIONS,
     ConfigRefusedBeforeApprovalCheck,
-    ConfigWriteAuditFailed,
+    ConnectionFlagNotRecorded,
 )
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.refused_body import RefusedBodyPolicy, head_only_resubmit_refusal
@@ -672,11 +677,33 @@ def _method_label(type_value: str) -> str:
     return _METHOD_LABELS.get(type_value, type_value.upper())
 
 
-def _is_toml_managed(source_file: str | None) -> bool:
-    """Whether a connection was authored in ``connections.toml`` (vs a code-first ``.py``), from its
-    registry ``source_file`` (#131). The console shows the flag TOGGLE only on a TOML-managed row; the
-    API's flag write refuses a non-TOML connection regardless (the guard of record)."""
-    return source_file is not None and source_file.endswith(CONNECTIONS_FILE_NAME)
+async def _connection_flags(engine: Engine, state: Any) -> set[tuple[str, str]] | None:
+    """Every ``(name, direction)`` holding the object-of-interest flag, for the dashboard rows, or
+    ``None`` when the read failed.
+
+    The flag's one reader (BACKLOG #2623). ``tests/test_connection_flag_readers.py`` fails on a
+    second in the Python it scans, by name; in the browser it only counts the literal
+    ``getAttribute("data-flagged")`` in ``app.js``. No engine path reads the flag, so a read that
+    fails costs the markers and never the page: a row a database writer planted that the driver
+    cannot decode reads as flags unknown. It is ``None`` and not an empty set so that the console
+    cannot take a failed read for an answer: an empty set would hide every row under Flagged only,
+    and every toggle would post a value derived from it. Logged at WARNING once per failure run,
+    because the stats socket reads this every second per console. ``state`` is the app's, so a run
+    belongs to one app."""
+    try:
+        flags = await engine.store.list_connection_flags()
+    except Exception as exc:  # noqa: BLE001 - the page outlives this read; see the docstring
+        if not state.connection_flags_failing:
+            _log.warning("the connection flags could not be read: %s", safe_exc(exc))
+        state.connection_flags_failing = True
+        return None
+    state.connection_flags_failing = False
+    return flags
+
+
+def _row_flag(flags: set[tuple[str, str]] | None, name: str, direction: str) -> bool | None:
+    """One dashboard row's ``flagged``, ``None`` when :func:`_connection_flags` read nothing."""
+    return None if flags is None else (name, direction) in flags
 
 
 def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
@@ -1521,7 +1548,7 @@ def _managed_teardown_steps(
     background: Sequence[asyncio.Future[None]],
     upload_retention_runner: UploadRetentionRunner | None,
     security_notifier: SecurityEventNotifier | None,
-    remove_security_signals: Callable[[], None] | None,
+    remove_security_signals: Callable[[], None],
     notifier: NotifierAlertSink | None,
 ) -> list[_TeardownStep]:
     """The managed lifespan's shutdown steps, in order, each optional one left out when its part
@@ -1552,7 +1579,7 @@ def _managed_teardown_steps(
         )
     )
     steps += _app_drain_steps(app, store, auth, owns_auth=True)
-    # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit row.
+    # BACKLOG #2623: a connection flag write whose caller was cancelled still commits its row.
     # Drained here, under the budget, rather than by the 5 s wait engine.stop() runs when no drain
     # ran first. Draining closes the engine's gate, and engine.stop() then gives a write still
     # running only a 1 s late wait, inside its reserve. Handed _INNER_SHARE of its bound, so its
@@ -1576,10 +1603,10 @@ def _managed_teardown_steps(
                 "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
             )
         )
-    if remove_security_signals is not None:
-        steps.append(
-            _TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals))
-        )
+    # This takes the observers off. An unpinned cluster node's posture inverse is not raised here,
+    # with the graph still serving: engine.stop() raises it through Engine.on_graph_stopped, and
+    # gives that write a bounded chance before the store closes.
+    steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
     steps.append(
         _TeardownStep(
             "engine.stop()",
@@ -2396,14 +2423,14 @@ async def _record_reload_audit(
     that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
     when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. The
     row is written after the swap, and nothing holds the graph still until
-    then, so a second reload or a connection flag toggle can move the engine on first. The row then
+    then, so a second reload can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
     :data:`_BASELINE_UNCHECKED`, as a superseded start row does: it is no baseline, and the next
     start compares against an older row instead. The test is whether
     :attr:`~Engine.loaded_config_fingerprint` is still this reload's digest object, which only a
-    committed reload or a flag toggle rebinds; a reload that swaps and then rolls back leaves it
-    alone. The check runs just before the write, so a change after it is not caught. The snapshot
-    and the check are inside the guard below, so a fault in either is caught like a failed write.
+    committed reload rebinds; a reload that swaps and then rolls back leaves it alone. The check
+    runs just before the write, so a change after it is not caught. The snapshot and the check are
+    inside the guard below, so a fault in either is caught like a failed write.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -2440,7 +2467,7 @@ async def _record_reload_audit(
         if isinstance(loaded, ReloadOutcome):
             state = _LoadedConfig.of(loaded)
             config_version = loaded.config_version
-            # Only a COMMITTED reload or a flag toggle rebinds the loaded fingerprint. The graph
+            # Only a COMMITTED reload rebinds the loaded fingerprint. The graph
             # object is no test: a reload part way through its swap, which then fails and rolls back
             # to this graph, would mark a row that still names the running config.
             superseded = engine.loaded_config_fingerprint is not loaded.fingerprint
@@ -2851,16 +2878,13 @@ async def _audit_reload_attempt(
         ) from exc
 
 
-#: The audit actions that record which config bytes a process ran from: a start, an applied reload,
-#: and every engine write of a file the config digest covers, such as a flag toggle that rewrote
-#: ``connections.toml`` (vault BACKLOG #2597). The writes come from ``CONFIG_WRITE_ACTIONS``, the
-#: names ``Engine.write_baseline_config`` records under, so a new engine config write needs no edit
-#: here (vault BACKLOG #2945). A dry run's ``config_reload_check`` is not one: it applied nothing.
-_CONFIG_BASELINE_ACTIONS: tuple[str, ...] = (
-    "config_loaded",
-    "config_reload",
-    *CONFIG_WRITE_ACTIONS,
-)
+#: The audit actions that record which config bytes a process ran from: a start and an applied
+#: reload (vault BACKLOG #2597). The engine has no write of a file the config digest covers, and
+#: ``tests/test_config_write_census.py`` fails on at least the writers it names.
+#: A dry run's ``config_reload_check`` is not one: it applied nothing. Nor is a flag toggle's
+#: ``connection_flag_set``: the store holds the flag, so the row carries no digest, and as a baseline
+#: it would read as degraded and leave the next start comparing nothing (BACKLOG #2623).
+_CONFIG_BASELINE_ACTIONS: tuple[str, ...] = ("config_loaded", "config_reload")
 
 #: How long the start waits for its baseline read. A slow store costs the comparison, never the start.
 _CONFIG_BASELINE_TIMEOUT_SECONDS = 5.0
@@ -2872,12 +2896,14 @@ _CONFIG_BASELINE_TIMEOUT_SECONDS = 5.0
 _CONFIG_BASELINE_WINDOW = 50
 
 #: The detail key that marks a config row whose digest this process never checked against the
-#: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest,
-#: and any flag toggle that process writes. A later start passes over such a row to the last checked
+#: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest.
+#: A later start passes over such a row to the last checked
 #: one, so the change the unchecked start could not see is still reported. A start row that a reload
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
-#: So does an inline or released reload's row written after a later reload or a flag toggle moved
+#: So does an inline or released reload's row written after a later reload moved
 #: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest.
+#: The mark means more than baseline: on a clean ``config_loaded`` row it also keeps an open
+#: ``posture_loosened`` from resolving. ``security_signals.py`` spells it too, and a test pins that.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.
@@ -2894,15 +2920,17 @@ type _StartOutcome = Literal[
 ]
 
 #: The outcomes that leave this start unchecked; see :data:`_BASELINE_UNCHECKED`. Only starts that
-#: made no comparison: one that compared, whatever marker it carries, paged on a change and is the
-#: next start's baseline, as every compared start is (vault BACKLOG #2944, #3765).
+#: made no comparison, or have no digest of the bytes they loaded to be a baseline: one that
+#: compared those bytes, whatever marker it carries, paged on a change and is the next start's
+#: baseline, as every compared start is (vault BACKLOG #2944, #3765).
 _UNCHECKED_OUTCOMES: frozenset[str] = frozenset({"read_failed", "no_start_digest"})
 
 
 @dataclass(frozen=True, slots=True)
 class _StartConfigComparison:
     """This start's config digest set against the newest one the store recorded (vault BACKLOG
-    #2597). Built only when both digests exist under one fingerprint scheme."""
+    #2597). Built only when both digests exist under one fingerprint scheme. ``fingerprint`` is the
+    digest the start judged, the one a page names: :func:`_compare_start_config` says which."""
 
     fingerprint: str
     previous_fingerprint: str
@@ -2918,8 +2946,9 @@ class _StartConfigComparison:
 
     @property
     def changed(self) -> bool:
-        return self.left_out != self.previous_left_out or not fingerprint_matches(
-            self.fingerprint, self.previous_fingerprint
+        return not same_digest(
+            DigestCoverage(self.fingerprint, self.left_out),
+            DigestCoverage(self.previous_fingerprint, self.previous_left_out),
         )
 
 
@@ -2959,11 +2988,31 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
     return task.result()
 
 
+def _moved_after_load(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest shows bytes moved after the load read them: both were taken,
+    over the same files, and differ. Not two digests that left out different files, which is a
+    lock and shows no change (vault BACKLOG #3765, LF8)."""
+    return (
+        loaded is not None
+        and disk is not None
+        and loaded.left_out == disk.left_out
+        and not same_digest(loaded, disk)
+    )
+
+
+def _may_have_moved(loaded: DigestCoverage | None, disk: DigestCoverage | None) -> bool:
+    """Whether the directory's digest fails to show the load's bytes still there. Wider than
+    :func:`_moved_after_load`: a digest that was not taken, or that left out other files, shows
+    nothing either way."""
+    return loaded is None or disk is None or not same_digest(loaded, disk)
+
+
 # The markers below are information only (vault BACKLOG #3765, items 15 to 17, the Lander's
-# send-back of engine PR 2370): wherever main paged on a digest change, this pages too. A partial
-# digest, a partial baseline or a directory that moved during the load names the page's outcome; it
-# never turns a page into a WARNING or adopts an unjudged baseline. The cost is accepted: a file an
-# antivirus lock holds at one start and not at the next pages on the same bytes, as it did on main.
+# send-back of engine PR 2370): a start pages whenever the directory after its load differs from the
+# baseline, and whenever the bytes it loaded do. A partial digest, a partial
+# baseline or a directory that moved during the load names the page's outcome; it never turns a page
+# into a WARNING or adopts an unjudged baseline. The cost is accepted: a file an antivirus lock holds
+# at one start and not at the next pages on the same bytes, as it did on main.
 #
 # Two follow-ons are declined (vault BACKLOG #2944, items 7 and 8). Paging back past
 # _CONFIG_BASELINE_WINDOW by id: a run of more than that many unusable rows takes that many
@@ -2976,7 +3025,7 @@ async def _compare_start_config(
     engine: Engine,
     snapshot: Mapping[str, object] | None,
     *,
-    before_load: Mapping[str, object] | None,
+    on_disk: Mapping[str, object] | None,
 ) -> tuple[_StartOutcome, _StartConfigComparison | None]:
     """Compare the start's config ``snapshot`` with the store's baseline (vault BACKLOG #2597), and
     return the outcome the start's ``config_loaded`` row records as ``comparison``, with the
@@ -2984,61 +3033,73 @@ async def _compare_start_config(
 
     Keyed on the store, not on a node: every engine shard and cluster node shares one config
     directory by contract, and a node id changes on every restart. The baseline is the newest
-    ``config_loaded``, ``config_reload`` or ``connection_flag_set`` row the start can use: it passes
+    ``config_loaded`` or ``config_reload`` row the start can use: it passes
     over a row whose detail is not a JSON object (at WARNING, since only the engine writes these
     rows) and a row marked :data:`_BASELINE_UNCHECKED`, and falls back to the next older one.
 
     The caller passes the digest :meth:`Engine.capture_start_provenance` took: off its snapshot,
     or, when it has none, off :attr:`Engine.loaded_config_fingerprint` read before
     ``engine.start()`` (vault BACKLOG #3076). Never a read taken once a reload can run, so a reload
-    that lands before the row is written cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
-    since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
+    that lands before the row is written cannot change what this start is said to have loaded. Only
+    the ``fingerprint`` and what it left out are compared, since ``git_head``, ``dir`` and ``node``
+    differ between nodes running the same bytes.
 
     Any digest change pages, as it did before vault BACKLOG #2944 added the markers below; they
     name the outcome and never skip the comparison (vault BACKLOG #3765).
 
-    ``before_load`` is the digest the caller took of the directory it loads, just before the load
-    (vault BACKLOG #2944). The start's own digest is taken after the load, so an edit between the
-    two reads could be recorded as loaded. When the two digests differ, or the first could not be
-    taken, the outcome is ``changed_during_load``, and the comparison still runs on the start's own
-    digest, as main's did. The caller stops the process vouching for that digest only when both
-    digests were taken over the same files and differ (:func:`_moved_during_load`): a first digest
-    that failed, or two that left out different files, is marked here and still vouched for. Two
-    reads miss at least an edit that lands and is reverted between them.
+    ``snapshot`` is the digest of the bytes the load ran, and ``on_disk`` the digest of the
+    directory just after the load, the start's one digest read (vault BACKLOG #2944, #3765). The
+    start judges both: ``on_disk`` first, then ``snapshot``. A comparison carries the first that
+    differs from the baseline, so a page fires when either differs, and names the directory
+    wherever the directory differs. A start that loaded edited bytes and saw them reverted before
+    ``on_disk`` pages too, on the bytes it ran. A digest that could not be taken is not judged. A
+    ``snapshot`` with no digest is ``no_start_digest`` whatever ``on_disk`` says, with a comparison
+    when one can be made, so it still pages, and its row is no baseline either way.
+
+    The outcome is ``changed_during_load`` when the two digests cover the same files and differ, so
+    bytes moved after the load read them. The row still names ``snapshot``, the bytes this process
+    runs, so the next start, on the moved bytes, pages again. Two reads miss at least an edit that
+    lands and is reverted after the load read that file.
 
     A digest that left out files it could not read (:func:`digest_coverage`) is still compared. A
-    start whose own digest is partial is ``partial_start_digest``, logged at WARNING with what it
-    left out; a whole start that meets a partial baseline is ``partial_baseline``. Either pages
+    start where either digest is partial is ``partial_start_digest``, logged at WARNING with what
+    it left out; a whole start that meets a partial baseline is ``partial_baseline``. Either pages
     when the digests differ, and two digests that left out different files count as different
-    (:attr:`_StartConfigComparison.changed`).
+    (:func:`~messagefoundry.config.fingerprint.same_digest`).
 
-    ``read_failed`` and ``no_start_digest`` carry no comparison and leave the start unchecked
-    (:data:`_UNCHECKED_OUTCOMES`), so a later start compares against the last checked row instead.
+    ``read_failed`` and ``no_start_digest`` leave the start unchecked (:data:`_UNCHECKED_OUTCOMES`),
+    so a later start compares against the last checked row instead.
     A fresh store, a baseline with no digest or a new scheme each starts a new baseline with no
     comparison, since passing over those rows would leave every later start in the same place.
     Every other outcome carries a comparison. It never raises, except on cancellation: the read is
     bounded by :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, and any failure, in the read or in a row
     it returns, is logged at WARNING and costs only the comparison."""
-    start = digest_coverage(snapshot)
-    if snapshot is None or start is None:
+    loaded = digest_coverage(snapshot)
+    disk = digest_coverage(on_disk)
+    digests = [digest for digest in (disk, loaded) if digest is not None]
+    if not digests:
         _log.info("config change check skipped: this start has no config fingerprint")
         return "no_start_digest", None
-    current, left_out = start
+    left_out = left_out_of(*digests)
     if left_out:
         _log.warning(
             "config change check: this start's config fingerprint left out what it could not "
             "read: %s",
-            scrub_log_argument(", ".join(left_out)),
+            scrub_log_argument(describe_left_out(left_out)),
         )
-    before = digest_coverage(before_load)
-    moved = before is None or before[1] != left_out or not fingerprint_matches(before[0], current)
+    moved = _moved_after_load(loaded, disk)
     if moved:
         _log.warning(
-            "config change check: the config directory changed while this start loaded it, or "
-            "could not be read just before the load, so its digest may name bytes this process "
-            "never loaded; it is compared all the same"
+            "config change check: the config directory changed after this start's load read it, "
+            "so the bytes on disk are not the bytes this process runs; both are compared"
         )
-    scheme = snapshot.get("scheme")
+    scheme = ((snapshot if loaded is not None else on_disk) or {}).get("scheme")
+
+    def unjudged(outcome: _StartOutcome) -> _StartOutcome:
+        """``outcome``, for a start that made no comparison: one with no digest of the bytes it
+        loaded stays unchecked whatever stopped the comparison."""
+        return "no_start_digest" if loaded is None else outcome
+
     try:
         rows = await _bounded(
             engine.store.recent_audit_of(_CONFIG_BASELINE_ACTIONS, limit=_CONFIG_BASELINE_WINDOW),
@@ -3066,15 +3127,14 @@ async def _compare_start_config(
                 )
             else:
                 _log.info("config change check: no earlier config row; this start is the baseline")
-            return "no_baseline", None
+            return unjudged("no_baseline"), None
         baseline = digest_coverage(detail)
         if baseline is None:
             _log.info(
                 "config change check skipped: the store's newest usable %s row has no fingerprint",
                 row.get("action"),
             )
-            return "degraded_baseline", None
-        previous, baseline_left_out = baseline
+            return unjudged("degraded_baseline"), None
         if scheme is None or detail.get("scheme") != scheme:
             _log.info(
                 "config change check skipped: the store's newest usable %s row used fingerprint "
@@ -3083,27 +3143,28 @@ async def _compare_start_config(
                 detail.get("scheme"),
                 scheme,
             )
-            return "scheme_mismatch", None
-        outcome: _StartOutcome = (
+            return unjudged("scheme_mismatch"), None
+        outcome: _StartOutcome = unjudged(
             "changed_during_load"
             if moved
             else "partial_start_digest"
             if left_out
             else "partial_baseline"
-            if baseline_left_out
+            if baseline.left_out
             else "compared"
         )
+        judged = next((d for d in digests if not same_digest(d, baseline)), digests[0])
         node = detail.get("node")
         actor = row.get("actor")
         return outcome, _StartConfigComparison(
-            fingerprint=current,
-            previous_fingerprint=previous,
+            fingerprint=judged.fold,
+            previous_fingerprint=baseline.fold,
             baseline_action=str(row.get("action")),
             baseline_actor=actor if isinstance(actor, str) else None,
             baseline_at=_iso_utc(row.get("ts")),
             baseline_node=node if isinstance(node, str) else None,
-            left_out=left_out,
-            previous_left_out=baseline_left_out,
+            left_out=judged.left_out,
+            previous_left_out=baseline.left_out,
         )
     except Exception as exc:  # noqa: BLE001 - alert-only (step 5): no failure here may stop a start
         _log.warning(
@@ -3111,23 +3172,6 @@ async def _compare_start_config(
             safe_exc(exc),
         )
         return "read_failed", None
-
-
-def _moved_during_load(
-    before_load: Mapping[str, object] | None, after_load: Mapping[str, object] | None
-) -> bool:
-    """Whether two digests over the same files, one just before the start's load and one just
-    after it, differ: bytes did change in between (vault BACKLOG #2944). Not every
-    ``changed_during_load``: a digest that failed, or two that left out different files (a passing
-    antivirus lock), say nothing changed."""
-    before = digest_coverage(before_load)
-    after = digest_coverage(after_load)
-    return (
-        before is not None
-        and after is not None
-        and before[1] == after[1]
-        and not fingerprint_matches(before[0], after[0])
-    )
 
 
 def _raise_config_changed(
@@ -3153,6 +3197,59 @@ def _raise_config_changed(
         )
     except Exception as exc:  # noqa: BLE001 - an alert failure must not change the start
         _log.warning("the config_changed alert could not be raised: %s", safe_exc(exc))
+
+
+def _install_security_signals(
+    engine: Engine,
+    sink: AlertSink,
+    alerts_settings: AlertsSettings | None,
+    cluster_settings: ClusterSettings | None,
+    state: Any,
+) -> Callable[[], None]:
+    """Install the security-signal layer for the managed lifespan (vault BACKLOG #2613) and
+    return its remover. Installed even with ``[alerts].security_signals = false``: that switch is
+    itself a loosening, and the posture detector, the one it leaves running, is what reports it.
+    The posture subject names this engine process, and an unpinned cluster node, whose id changes
+    on every start, raises the inverse for its own posture alert once its graph has stopped, through
+    :attr:`Engine.on_graph_stopped`, while the store is open. A clean start
+    row resolves the alert only on a clean :func:`_live_posture_is_clean` reading off ``state``."""
+
+    async def _live_clean() -> bool:
+        return await _live_posture_is_clean(state, engine)
+
+    def _after_the_graph_stops(release: Callable[[], None]) -> None:
+        engine.on_graph_stopped = release
+
+    return install_security_signals(
+        sink,
+        SecuritySignalThresholds.from_settings(alerts_settings or AlertsSettings()),
+        asyncio.get_running_loop(),
+        identity=lambda: engine.instance_identity,
+        resolve_on_stop=engine.coordinator.is_clustered()
+        and not (cluster_settings is not None and cluster_settings.node_id),
+        live_posture_clean=_live_clean,
+        defer_release=_after_the_graph_stops,
+    )
+
+
+async def _live_posture_is_clean(state: Any, engine: Engine) -> bool:
+    """Whether the running engine reads clean, by the reading ``GET /security/posture`` takes: the
+    live graph, not a start's snapshot. A scope note means the reading could not see the graph, so
+    an empty list then says nothing, and that is not a clean reading. No await follows the read,
+    so a caller that acts on the answer at once acts before a reload's swap can run."""
+    remote_debug = remote_debug_posture()
+    startup = await asyncio.to_thread(startup_posture)
+    service_env = await asyncio.to_thread(service_env_posture)
+    pairs, scope = _posture_loosenings(
+        state,
+        engine,
+        engine.registry_runner,
+        remote_debug=remote_debug,
+        startup=startup,
+        service_env=service_env,
+        security=_posture_security(state),
+    )
+    return not pairs and scope is None
 
 
 async def _record_a_restore(store: Store, sink: AlertSink) -> None:
@@ -3213,8 +3310,9 @@ async def _record_start_audit(
     could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is.
 
     ``outcome`` and ``comparison`` are :func:`_compare_start_config`'s result. The row records
-    the outcome as ``comparison``, and ``previous_fingerprint`` and ``changed``, both ``None`` when
-    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`.
+    the outcome as ``comparison``, and ``previous_fingerprint``, ``judged_fingerprint`` and
+    ``changed``, each ``None`` when no comparison was made. The caller raises the alert, through
+    :func:`_raise_config_changed`.
 
     ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
     #2838). The row names that, so the digest it records is the one the comparison used. When the
@@ -3287,6 +3385,14 @@ async def _record_start_audit(
             **({"superseded": True} if superseded else {}),
             **({_BASELINE_UNCHECKED: True} if untrusted or outcome in _UNCHECKED_OUTCOMES else {}),
             "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
+            # The digest a page names, which is the directory's where that differs: the row's own
+            # ``fingerprint`` is the bytes this process runs (vault BACKLOG #3765).
+            "judged_fingerprint": comparison.fingerprint if comparison else None,
+            **(
+                {"judged_unreadable_files": list(comparison.left_out)}
+                if comparison and comparison.left_out
+                else {}
+            ),
             "changed": comparison.changed if comparison else None,
         },
     )
@@ -4382,6 +4488,7 @@ def create_app(
     # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
     app.state.configured_log_level = configured_log_level
     app.state.ws_count = 0  # live /ws/stats connection count (API-WS cap)
+    app.state.connection_flags_failing = False  # see _connection_flags
     # BACKLOG #76 (ADR 0065 amendment): the in-memory metrics-history ring the console trend charts read
     # from GET /metrics/history. Fed by the ~1s /ws/stats sampler below (no new task, no extra store I/O);
     # bounded + process-local (a durable table would flip store_schema — out of scope for this first slice).
@@ -5184,6 +5291,8 @@ def create_app(
         # edge that has carried traffic (the outbox metrics are keyed that way).
         rr = engine.registry_runner
         if rr is not None:
+            # See _connection_flags for why its own failure stays out of the page.
+            flags = await _connection_flags(engine, app.state)
             reg = rr.registry
             for iname, ic in reg.inbound.items():
                 if not identity.can_access_channel(iname):
@@ -5232,8 +5341,7 @@ def create_app(
                         # the status; ifail takes precedence. One connection can hold both: a passive DR
                         # standby records a refused CA on a feed it parks (vault BACKLOG #3263).
                         error=ifail or ifiltered,
-                        flagged=ic.flagged,  # #131: object-of-interest marker (display-only)
-                        toml_managed=_is_toml_managed(ic.source_file),
+                        flagged=_row_flag(flags, iname, "inbound"),  # object-of-interest marker
                     )
                 )
             emitted_dests: set[str] = set()
@@ -5308,9 +5416,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=(dfail or dfiltered) if oc is not None else None,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        # #131: object-of-interest marker; a draining (removed) outbound has no oc → False.
-                        flagged=oc.flagged if oc is not None else False,
-                        toml_managed=_is_toml_managed(oc.source_file) if oc is not None else False,
+                        flagged=_row_flag(flags, dname, "outbound"),  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector, past its
                         # display delay). Duck-typed → False for non-ACK-waiting / draining outbounds.
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
@@ -5417,8 +5523,7 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
-                        flagged=oc.flagged,  # #131: object-of-interest marker (display-only)
-                        toml_managed=_is_toml_managed(oc.source_file),
+                        flagged=_row_flag(flags, dname, "outbound"),  # object-of-interest marker
                         # #136: per-message "Waiting for Reply" display state (live connector).
                         waiting_for_reply=rr.outbound_waiting_for_reply(dname),
                     )
@@ -5667,29 +5772,32 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_paced(Permission.CONFIG_DEPLOY)),
     ) -> dict[str, object]:
-        """Set the object-of-interest flag (#131, ADR 0007 amendment) on a ``connections.toml``-managed
-        connection — the FIRST console→connections.toml write seam. Persists ``flagged`` through the
-        comment-preserving, validate-before-persist writer (``connections_edit``) and reflects it on the
-        live registry **without a reload** (a cosmetic-field replace — no connector rebuild, no delivery
-        change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
-        A toggle whose audit row fails is refused **503** (vault BACKLOG #2945). Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path.
+        """Set the object-of-interest flag on a connection in the running graph (#131, BACKLOG
+        #2623). The store holds the flag, so a toggle runs no config module and writes no file, and
+        the flag and its ``connection_flag_set`` row commit together. A name the graph does not have
+        is refused **409**, as is a toggle that arrives once a shutdown's drain has begun or reaches
+        the engine's write lock after that. A toggle the store did not confirm is refused **503**,
+        which does not say the flag is unchanged (:class:`ConnectionFlagNotRecorded`), and so is one
+        still queued for that lock when its wait runs out, drain or not. The request deadline ends
+        this handler's wait, not the write (:meth:`Engine.set_connection_flag`). Paced and audited.
+
+        Gated by ``config:deploy``, which the flag's old home justified and which stays by decision:
+        the flag marks what an operator should look at, and a change of gate is its own decision
+        (ADR 0007, amendment of 2026-10-31).
 
         A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
         other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
-        engine looks the name up, so a 200 against a 409 cannot tell it which names are
-        TOML-managed. Unlike :func:`_guarded_direction` it needs no runner: with none, an in-scope
-        name reaches the engine, which answers for the connections file alone."""
+        engine looks the name up, so a 200 against a 409 cannot tell it which names exist."""
         rr = engine.registry_runner
         if identity.allowed_channels is not None and (
             req.direction != "inbound"
             or not identity.can_access_channel(name)
-            or (rr is not None and name not in rr.registry.inbound)
+            # inbound_names(), as the engine's own guard reads it: an engine shard's view holds only
+            # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
+            or (rr is not None and name not in rr.registry.inbound_names())
         ):
             await _deny_connection(engine, identity, name, client_ip(request))
         try:
-            # The engine writes the connection_flag_set row itself, with the config digest it
-            # vouches for after this write (vault BACKLOG #2597, #2945). The next start reads that
-            # row as its baseline.
             await engine.set_connection_flag(
                 name,
                 direction=req.direction,
@@ -5697,15 +5805,13 @@ def create_app(
                 actor=identity.username,
                 client=client_ip(request),
             )
-        except ConfigWriteAuditFailed as exc:
-            # The audit log did not record the row, so the engine refused the toggle and undid it,
-            # or says it could not (vault BACKLOG #2945). The audit log, not the request, is at
-            # fault, so 503 as for any refused audit write. Typed, because it is not the route's
-            # only 503 and the console names this fix (BACKLOG #3811).
+        except ConnectionFlagNotRecorded as exc:
+            # The store did not confirm the flag and its audit row (BACKLOG #2623). The store, not
+            # the request, is at fault, so 503 as for any refused audit write. Typed, because it is
+            # not the route's only 503 and the console names this fix (BACKLOG #3811).
             raise ConfigWriteNotRecorded(str(exc)) from exc
         except WiringError as exc:
-            # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
-            # which writes no config file (vault BACKLOG #2933): the edit never landed.
+            # The running graph has no such connection, or a shutdown's drain has begun.
             raise HTTPException(409, str(exc)) from exc
         return {"name": name, "direction": req.direction, "flagged": req.flagged}
 
@@ -9565,34 +9671,45 @@ def create_app(
         fingerprint + best-effort git commit captured at load, and whether the on-disk config has since
         DRIFTED. No PHI/secrets — a one-way hash + a commit sha; gated by ``monitoring:read`` like
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
-        compares it to the loaded baseline; it degrades to clean when the baseline is missing or the
-        config dir is unreadable, so a read never raises.
+        compares it to the loaded baseline. It is ``None`` when a graph is running and either digest
+        could not be taken, so a read that compared nothing does not read as clean, and ``False``
+        when no graph is running (vault BACKLOG #3765).
 
         ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
         console's Reload form follows the engine (BACKLOG #3189)."""
         reload_refused = _reload_refusal(_user)
         loaded = engine.loaded_config_fingerprint
-        fp = loaded.get("fingerprint") if loaded else None
-        if not isinstance(fp, str) or not fp:
-            # No graph loaded yet, or fingerprint unavailable.
-            return ConfigProvenance(loaded=False, reload_refused=reload_refused)
-        drift = False
+        running = digest_coverage(loaded)
+        if loaded is None or running is None:
+            # No graph loaded yet, or fingerprint unavailable. A running graph with no baseline
+            # compared nothing, which must not read as clean (vault BACKLOG #3765).
+            return ConfigProvenance(
+                loaded=False,
+                drift=None if engine.registry_runner is not None else False,
+                reload_refused=reload_refused,
+            )
+        drift: bool | None = None
+        on_disk = None
         target = engine.running_config_dir
         if target is not None:
-            # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
-            # reports clean rather than a false DRIFT alarm.
+            # The one best-effort rule every load uses (vault BACKLOG #2597). A digest that could
+            # not be taken reports no reading, which is not clean (vault BACKLOG #3765). What a
+            # digest left out is a reading, and a difference in it is drift.
             current, _reason = await engine.fingerprint_bundle(target)
             if current is not None:
-                # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift.
-                drift = not fingerprint_matches(current.get("fingerprint"), fp)
-        git_head = loaded.get("git_head") if loaded else None
-        files = loaded.get("files") if loaded else None
+                # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift,
+                # and so does a change in what a digest left out (vault BACKLOG #3765).
+                on_disk = digest_coverage(current)
+                drift = on_disk is None or not same_digest(on_disk, running)
+        git_head = loaded.get("git_head")
+        files = loaded.get("files")
         return ConfigProvenance(
             loaded=True,
-            fingerprint=fp,
+            fingerprint=running.fold,
             git_head=git_head if isinstance(git_head, str) else None,
             files=files if isinstance(files, int) else None,
             drift=drift,
+            left_out_files=len(left_out_of(running, on_disk)),
             reload_refused=reload_refused,
         )
 
@@ -12121,7 +12238,7 @@ def create_managed_app(
                 "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
             )
             # The row names the digest judged above, not the engine's at the write: a later
-            # reload or flag toggle marks it superseded instead (vault BACKLOG #3765, item 19).
+            # reload marks it superseded instead (vault BACKLOG #3765, item 19).
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,
@@ -12155,20 +12272,6 @@ def create_managed_app(
                 # Before the load reads the directory, so a sibling's reload that lands after it is
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
-                # The digest of the directory the load reads, just before it, set against the
-                # one taken just after it below, so an edit between the load and that digest is
-                # marked changed_during_load and not vouched for (vault BACKLOG #2944).
-                # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
-                # which reads as a changed directory.
-                before_load: Mapping[str, object] | None = None
-                try:
-                    before_load, _reason = await engine.fingerprint_bundle(Path(config_dir))
-                except Exception as exc:  # noqa: BLE001 - see the comment above
-                    _log.warning(
-                        "the start could not digest its config before the load (%s); its config "
-                        "is still compared, and a change still pages",
-                        safe_exc(exc),
-                    )
                 loaded = load_config(config_dir)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
@@ -12185,10 +12288,24 @@ def create_managed_app(
                 # The runner holds the graph now. The lifespan frame lives as long as the process,
                 # so this name would pin the start's graph past every reload (vault BACKLOG #3076).
                 del loaded
-                # Right after the load, so the digest covers the bytes it read, and the provenance
-                # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
-                # unreadable bundle: it leaves the baseline empty and the start goes on.
+                # The digest of the bytes the load read, so the provenance route has a baseline
+                # from the start on (vault BACKLOG #2597). Never raises on an unreadable bundle: it
+                # leaves the baseline empty and the start goes on.
                 start_fingerprint_failure = await engine.capture_start_provenance()
+                # The start's one digest read: the directory as it is now, set against those bytes
+                # below, so an edit after the load read a file still pages at this start (vault
+                # BACKLOG #3765, items 18 and 21).
+                # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
+                # and the bytes the load read are compared alone.
+                on_disk: Mapping[str, object] | None = None
+                try:
+                    on_disk, _reason = await engine.fingerprint_bundle(Path(config_dir))
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    _log.warning(
+                        "the start could not digest its config directory after the load (%s); "
+                        "the bytes it loaded are still compared, and a change still pages",
+                        safe_exc(exc),
+                    )
                 # One snapshot of what this load put live, taken before engine.start() can spawn a
                 # convergence reload. The comparison below and the config_loaded row both use it,
                 # so neither can name a graph this start did not load (vault BACKLOG #2838).
@@ -12208,32 +12325,28 @@ def create_managed_app(
                 # not later: engine.start() has not run, so no reload can have moved it yet, and a
                 # start on changed bytes still pages through a crash loop (vault BACKLOG #3076).
                 # Its row stays no baseline, since nothing can rule out a swap before the row is
-                # written. So the next start pages again for the same change, unless a flag toggle
-                # or reload row lands in between and becomes the baseline. A repeat page on a
+                # written. So the next start pages again for the same change, unless a reload row
+                # lands in between and becomes the baseline. A repeat page on a
                 # degraded start is the safe side of that trade.
-                # The digest compared is the one the during-load test judges too, so a start with
-                # no snapshot still stops vouching for a directory that moved under its load.
                 compared = (
                     start_loaded.fingerprint
                     if start_loaded is not None
                     else engine.loaded_config_fingerprint
                 )
                 start_outcome, start_config = await _compare_start_config(
-                    engine, compared, before_load=before_load
+                    engine, compared, on_disk=on_disk
                 )
-                # This process cannot vouch for a config it never checked: its flag rows say so.
-                # The outcome alone decides it, by design (vault BACKLOG #3076 item 6): a start
-                # row that names no snapshot, or that a reload superseded, is no baseline itself,
-                # but its comparison still ran, and a flag row vouches for no more than that.
-                engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
-                if _moved_during_load(before_load, compared):
-                    # The digest may name bytes this process never loaded, so the provenance route
-                    # and a DR activation must not vouch for it (vault BACKLOG #2944). Its flag
-                    # rows then carry no digest, so they are marked unchecked too: a later start
-                    # passes over them to this start's row rather than reading one as a degraded
-                    # baseline and comparing nothing (vault BACKLOG #3765).
-                    engine.loaded_config_fingerprint = None
-                    engine.config_baseline_unchecked = True
+                if compared and _may_have_moved(
+                    digest_coverage(compared), digest_coverage(on_disk)
+                ):
+                    # The VCS head is read after the load, so unless the directory is shown not to
+                    # have moved it may be the commit it moved to, which the digest of the bytes
+                    # that ran must not be bound to (vault BACKLOG #3765). Advisory, so it is
+                    # dropped.
+                    unbound = {k: v for k, v in compared.items() if k != "git_head"}
+                    engine.loaded_config_fingerprint = unbound
+                    if start_loaded is not None:
+                        start_loaded = replace(start_loaded, fingerprint=unbound)
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises. Vault BACKLOG #3145
                 # item 1 (a gate-refused restart pages on every attempt) is declined: that is this
@@ -12265,15 +12378,8 @@ def create_managed_app(
         # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
         # adds no commit to the request path. Here, just above the span whose finally removes it,
         # so no startup failure can leave it registered. Before the start's config_loaded row.
-        signal_settings = alerts_settings or AlertsSettings()
-        remove_security_signals = (
-            install_security_signals(
-                notifier or LoggingAlertSink(),
-                SecuritySignalThresholds.from_settings(signal_settings),
-                asyncio.get_running_loop(),
-            )
-            if signal_settings.security_signals
-            else None
+        remove_security_signals = _install_security_signals(
+            engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings, app.state
         )
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise

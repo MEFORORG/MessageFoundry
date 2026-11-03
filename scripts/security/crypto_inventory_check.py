@@ -1390,9 +1390,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/pipeline/engine.py": frozenset(
         {
-            "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "compare:via messagefoundry.pipeline.secret_rotation",
-            # Vault BACKLOG #2597: write_baseline_config compares two public config digests with
+            # Vault BACKLOG #2596: _require_approved compares two public config digests with
             # fingerprint_matches (constant time), as the provenance route in api/app.py does.
             "compare:via messagefoundry.config.fingerprint",
             # Vault BACKLOG #2839: fingerprint_bundle_blocking calls config_fingerprint_detail

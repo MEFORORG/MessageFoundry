@@ -19,10 +19,11 @@
   `SCHEMA_VERSION` schema in
   [`config/connection_schema.py`](../../messagefoundry/config/connection_schema.py) plus the
   `connectionEditor` / `connectionForm` / `connectionQuickInput` modules under `ide/src/`.
-  The 2026-07-19 amendment below is built too: `flagged` on both connection models and in the read and
-  write key sets, `Engine.set_connection_flag`
+  The 2026-07-19 amendment below was built and has been reversed: the 2026-10-31 amendment moved
+  the flag to the store, so `connections.toml` carries no `flagged` key.
+  `Engine.set_connection_flag`
   ([`pipeline/engine.py`](../../messagefoundry/pipeline/engine.py)) behind
-  `POST /connections/{name}/flag` ([`api/app.py`](../../messagefoundry/api/app.py)), and
+  `POST /connections/{name}/flag` ([`api/app.py`](../../messagefoundry/api/app.py)) stays, with
   `tests/test_connection_flag.py`. *Phase 4* is confirmed only in part: the decomposition
   convention is documented ([docs/CONNECTIONS.md](../CONNECTIONS.md) section "Decomposing by role")
   with the `IB_DEMO_ORU_*` sample, but the re-port of the deferred multi-destination fan-out feeds
@@ -190,9 +191,174 @@ touch this feature adds.
 
 ---
 
+## Amendment (2026-10-31) — The object flag moves to the store, and the engine stops writing config (BACKLOG #2623)
+
+- **Status:** **Accepted (2026-10-31), on a review result the owner may overturn.** Reverses the
+  2026-07-19 amendment below, whose text stays as the record of what was built and why.
+
+**What was wrong with the flag in `connections.toml`.** A toggle's validate step called `load_config`
+on the live directory, so one toggle ran every config module in the engine's process. That is a
+trigger for code execution from a route with no second approver, for a field no engine path reads.
+The write also needed the service account to hold write access to the directory it executes code
+from, which `install-service.ps1` does not grant, and a cluster node had to refuse the toggle because
+it could reach only its own copy.
+
+**Decision.**
+
+1. **`flagged`, and only `flagged`, moves to a new `connection_flag` table on all three store
+   backends.** `auto_start` and `deployed` share the old tables, and both act: the runner skips and
+   starts listeners on them. They stay in `connections.toml`, inside the ADR 0041 fingerprint.
+2. **No seal.** The flag drives no engine path: no start, reload, routing or delivery path reads
+   it. It does feed the console's Flagged-only filter, and select-all honours that filter, so a
+   database writer with no key can move a marker and could shape a bulk action's target set. The
+   owner accepted that reach on 2026-11-01; *Accepted residual* below records what bounds it.
+   `tests/test_connection_flag_readers.py` fails on a new reader in the Python it scans, by name. In
+   the browser it only counts the literal `getAttribute("data-flagged")` in `static/app.js`, so a
+   read spelled any other way, or one that replaces a counted read, passes it. That test is what
+   brings the seal question back if the flag ever comes to drive an engine path.
+3. **A row is the flag.** A flagged connection has a row, keyed by name and direction, and an
+   unflagged one has none. No value is parsed or validated. Nothing in a start or a reload
+   reads the table, and the flag is off the `Registry`, so no stored row can refuse either. The
+   dashboard read fails soft: a row the driver cannot decode costs every marker, logged once per run
+   of failures at WARNING, and never the page. Until the read recovers, each row's flag is unknown
+   rather than unset: `ConnectionRow.flagged` is `null`, the row offers no toggle, Flagged only hides
+   no row, select-all under it takes no such row, and a notice above the table says why.
+4. **The store is the only source.** The `flagged` TOML key and the `flagged=` declaration argument
+   are removed, and the loader refuses both. Ignoring the key would leave a hand edit that reads as
+   flagging a connection and flags nothing. There are no deployments, so there is nothing to migrate
+   and no compatibility to keep.
+5. **Any connection in the running graph takes the flag**, code-first included. That is the branch
+   the 2026-07-19 scope fork deferred. A name the running graph does not have is refused **409**,
+   and so is a toggle that arrives once a shutdown's drain has begun; point 6 says what one already
+   queued answers. A cluster node toggles like any other: the store is the one thing the nodes share.
+6. **A toggle still writes `connection_flag_set`**, with its actor and client, in the same transaction
+   as the flag. If the row fails the flag does not change, and the route answers **503**. A commit
+   whose answer was lost answers 503 too, and then both may have landed. So does a write the store
+   leaves unanswered past the engine's 10-second bound, and a commit cut off there may land after
+   the 503. The engine runs the write as a tracked task, so a request deadline or a shutdown ends
+   the caller's wait and not the write, and a shutdown waits for it, for a bounded time, before
+   the store closes. A write still running then may not land. The row carries no digest and is no start baseline, so `connection_flag_set` left the actions a start reads.
+   Left on that list, a row with no digest would read as a degraded baseline and the next start would
+   compare nothing.
+
+   **An engine's toggles land one at a time, in arrival order.** The tracked task holds an engine
+   lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
+   The store's audit lock, below, keeps the flag and its newest row in step whatever the order; this
+   lock keeps the order the toggles arrived in. The wait for the lock has its own 10 seconds, and
+   the store call then gets a fresh 10, so past the auth gate a toggle's wall-clock ceiling is about
+   two bounds plus the store's unwind, and time in the queue does not cut off a store call. A
+   toggle still queued when its wait runs out answers the same 503, having written nothing, rather than meeting the request deadline. If the stuck
+   toggle ahead of it gives way first, the queued toggle reaches the store and can be cut off there,
+   close to 20 seconds after it arrived, with a commit that may land after the 503. A toggle that
+   reaches the lock once a shutdown's drain has begun answers 409, and one whose wait runs out first
+   answers the 503. Unlike the old write, the wait for the lock is in the tracked task too, so a
+   drain sees a queued toggle, and a toggle whose caller leaves while it queues can still land, with
+   its row, under that caller's name.
+7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering
+   a gate is a decision of its own, not a side effect of this move.
+8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept
+   a config write and its baseline row together went with it. The tracking and the shutdown drain
+   stayed, around the store write, and keep their names. The engine lock stayed around it too, as
+   `_config_write_lock`, since no TOML is left to name it for. `tests/test_config_write_census.py` now
+   fails on an engine write through at least the writers it names, and on a direct write whose target
+   names the config directory.
+
+**Accepted residual.** A database writer can flip the flag. That changes no fingerprint and writes no
+audit row. A stored value that disagrees with the newest `connection_flag_set` row is the only trace,
+and nothing compares them. An unusable row never refuses anything. A row also outlives its name: a
+connection removed or renamed leaves a row that matches nothing, which no route clears, and a later
+connection of that name takes the flag. A row the driver cannot decode fails every read until
+someone deletes it by SQL, because no route can name it, so one such row costs every marker and
+toggle and turns Flagged only off for the whole estate.
+
+**Accepted residual: the flag reaches a bulk action (owner ruling 2026-11-01).** Flagged only hides
+rows, select-all takes only rows no filter hides, and that selection then goes into a bulk action
+such as Stop, Restart, Reset or Purge. So a database writer who sets or clears rows could add a
+connection to that target set or keep one out of it. Asked whether to accept this, the owner chose
+*"Accept, record the reach"*. A failed flag read does not widen it: the filter shows a row of
+unknown flag, and under it select-all skips any row not known to be flagged. Those rules narrow
+what a failed read could do, and the ruling accepts nothing beyond them. What bounds it: no
+filter has hidden a row select-all takes as it is taken, the toolbar counts the selection beside Go,
+and an operator must press Go. Purge then adds a confirm page naming each outbound. Every other bulk
+action has no such page, a row below the fold is still taken, and a selected row a later refresh
+hides stays selected, so it is still acted on. The header box shows the part-selected mark when the
+selection holds a row select-all could not take, and that mark covers opposite next clicks. Ticked,
+which it also is for a selection when no row can be taken, a click clears the whole selection,
+hidden rows included. Unticked, a click adds every row it can take and leaves the rest selected.
+That states what the box does, and accepts nothing further. The toggle gives the same reach with an
+audit row: at least the Deployment role holds `config:deploy` and no bulk-action permission.
+
+**Closed (2026-11-03): toggles from different processes run one after the other.** Engine shards
+and cluster nodes share the store and each holds its own engine lock, so two of them can toggle one
+connection at once. While the store took its audit lock only at the append, at READ COMMITTED that
+let the flag and the newest `connection_flag_set` row disagree until the next toggle. On Postgres a
+clear beside another process's uncommitted set deleted nothing and appended the newer row; a set of
+a flag already set changed no row, so a clear beside it could commit first; and a clear of nothing
+let a set beside it commit first. On SQL Server the last of these was open, since a delete that
+matches no row locks nothing there. One process could reach the same states through a commit that
+outlived its store call, since the engine lock frees when that call ends.
+
+Each toggle now takes the store's audit lock before its flag statement and holds it to the commit:
+Postgres's audit advisory lock, at READ COMMITTED pinned, and SQL Server's audit applock, taken
+again on each retry of the flag statement. A later toggle's flag statement therefore runs after the
+earlier toggle has committed, and its row is the newer, from any process and whenever the earlier
+call's caller stopped waiting. Only toggles write `connection_flag`, and each takes the audit lock
+first, so the row lock under it cannot cycle; `tests/test_connection_flag.py` fails on another
+writer it can see in the engine's Python. SQLite's writer runs one transaction at a time, so a
+toggle there was always whole. A database writer outside the store is still the accepted residual
+above. The order follows from the code: when this was written the live cross-handle test (AC-7) ran
+only on SQLite, and its Postgres and SQL Server legs run on hosted CI alone. The fix has a cost: a
+toggle now waits on its flag statement holding the audit lock, so a foreign lock on
+`connection_flag` would hold every audit append in the store while it waits. That wait is bounded
+at `CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, 5 s, under the engine's 10 s bound on the store call:
+`lock_timeout` local to the toggle's transaction on Postgres, kept where the role or database sets
+a stricter one, and `SET LOCK_TIMEOUT` on SQL Server, put back to -1 after the statement or after
+the rollback. Past it the toggle raises `ConnectionFlagLockTimeout`, which is never retried, rolls
+back and releases the audit lock, having written nothing, and the API answers 503. Before the bound
+each such wait ran to the driver's query timeout, 30 s by default, and without end at
+`command_timeout = 0`. Its live test, a foreign transaction holding the row while an audit append
+runs from another handle, runs on the Postgres and SQL Server legs, hosted CI only.
+
+**Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
+for an approver, because the IDE promote pre-flight would stall on a second person.
+[SECURITY.md](../SECURITY.md) records it, until a dry run can run in a throwaway worker.
+
+- **AC-1** — WHEN `POST /connections/{name}/flag` names a connection in the running graph, THE SYSTEM
+  SHALL write the flag and its `connection_flag_set` row in one transaction, and run no config module.
+  → `tests/test_connection_flag.py::test_a_toggle_runs_no_config_module`
+- **AC-2** — WHEN a toggle lands, THE SYSTEM SHALL leave every file in the config directory unchanged.
+  → `tests/test_connection_flag.py::test_a_toggle_changes_nothing_in_the_config_directory`
+- **AC-3** — WHEN the store holds a row no toggle could write, THE SYSTEM SHALL start and reload as
+  though it were absent.
+  → `tests/test_connection_flag.py::test_a_stored_row_refuses_neither_a_start_nor_a_reload`
+- **AC-4** — WHEN a Python module the census scans, other than the listed dashboard and console code,
+  reads the flag by name, THE build SHALL fail.
+  → `tests/test_connection_flag_readers.py`
+- **AC-5** — WHEN the flag read fails, THE SYSTEM SHALL answer the dashboard with each row's flag
+  unknown, offer no toggle, hide no row under Flagged only, leave such a row out of select-all under
+  that filter, and say why on the page.
+  → `tests/test_connection_audit_writes.py::test_a_row_the_driver_cannot_read_costs_the_markers_and_not_the_page`,
+  `packaging/messagefoundry-webconsole/tests/test_ui_flag_read_failed.py`
+- **AC-6** — WHEN two toggles of one connection overlap in one engine process and the earlier's store
+  call ends with its commit, THE SYSTEM SHALL land them in arrival order, so the flag matches the
+  newest `connection_flag_set` row, whether or not the earlier caller is still waiting.
+  → `tests/test_connection_flag.py::test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row`
+- **AC-7** — WHEN two store handles on one database toggle one connection and the first is held open
+  between its flag statement and its commit, THE SYSTEM SHALL keep the second's flag statement
+  waiting until that commit, so the flag matches the newest `connection_flag_set` row.
+  → `tests/_operator_audit_atomic_contract.py::assert_connection_flag_ordered_across_stores`, run
+  live by the Postgres and SQL Server suites (hosted CI only) and on SQLite by
+  `tests/test_operator_mutation_audit_atomic.py`; the lock order is pinned offline by
+  `tests/test_connection_flag.py::test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statement`
+  and `tests/test_sqlserver_cipher_retry.py`.
+
+---
+
 ## Amendment (2026-07-19) — Console-settable object flag + the FIRST console→connections.toml write seam (BACKLOG #131)
 
-- **Status:** **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
+- **Status:** **Reversed by the 2026-10-31 amendment above.** Kept as the record of what was built,
+  except that the test citations under its criteria were corrected on 2026-11-01, once the tests
+  they named were gone. **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
   a Flagged Objects filter" (lane `dg-s8a`, Wave 6). Additive to the accepted read/CLI-write design.
 
 **What it adds.**
@@ -229,10 +395,13 @@ left for a future, owner-chosen, store-serialized effort.
   connection, THE SYSTEM SHALL persist `flagged` via the comment-preserving validate-before-persist
   writer AND reflect it on the live `ConnectionRow.flagged`, constructing no channel/route object and
   making no store schema change.
-  → `tests/test_connection_flag.py::test_flag_toggle_persists_and_reflects`
+  → Withdrawn with the behaviour. The 2026-10-31 amendment deleted its test; its own AC-1 to AC-3
+  replace this criterion.
 - **AC-2 (amend)** — WHEN the flag toggle targets a code-first connection (not in `connections.toml`),
   THE SYSTEM SHALL refuse it (409) and leave `connections.toml` untouched.
-  → `tests/test_connection_flag.py::test_flag_toggle_refuses_code_first`
+  → Withdrawn with the behaviour. The 2026-10-31 amendment deleted its test, and a code-first
+  connection now takes the flag: `tests/test_connection_flag.py::test_a_code_first_connection_takes_the_flag`.
 - **AC-3 (amend)** — THE `connections_edit` write schema SHALL stay set-equal to the loader's read
   schema per direction (the `flagged` key is in both), so the #234 key-parity test stays green.
-  → `tests/test_connections_file.py::test_write_schema_matches_read_schema_per_direction`
+  → Set-equal still holds, and `flagged` is now in neither schema:
+  `tests/test_connections_file.py::test_write_schema_matches_read_schema_per_direction`.

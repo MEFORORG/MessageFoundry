@@ -43,9 +43,10 @@ from messagefoundry.remotedebug import (
 install_remote_debug_guard()
 
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
-# open a store or read a service TOML use these. The rest below runs on every command or is the
-# logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
-__lazy_modules__ = ["sqlite3", "tomllib"]
+# open a store or read a service TOML use the first two, and only a command's refusal reads the
+# third. The rest below runs on every command or is the logging chain, so it stays eager. The heavy
+# import is deferred in config/__init__.py.
+__lazy_modules__ = ["sqlite3", "tomllib", "messagefoundry.exception_origin"]
 
 # E402 on each import below: they follow the install call above on purpose.
 import argparse  # noqa: E402
@@ -79,6 +80,7 @@ from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only
     TOOLKIT_COMMAND,
 )
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.exception_origin import raised_by_the_engine  # noqa: E402
 from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
     PRODUCTION_DEBUG_REFUSED,
@@ -4314,8 +4316,8 @@ def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2368: a connection may override either body window, and its own 0 keeps that
     # connection's bodies forever. Those overrides are in the graph, which this function does not
     # load, so the gate above cannot see them. A registry guard judges them, at least at the first
-    # load and on every reload. What it refuses, warns and audits, and how that differs from the
-    # gate above, is stated once, on make_retention_override_guard.
+    # load and on every reload. What it refuses and audits, and how that differs from the gate
+    # above, is stated once, on make_retention_override_guard.
     from messagefoundry.config.retention_classification import make_retention_override_guard
 
     retention_override_guard = make_retention_override_guard(
@@ -5528,8 +5530,8 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2368: a connection's own keep-forever retention override. Each engine shard's
     # `serve` refuses the whole graph on it, so the supervisor would only restart them. It is a
     # graph refusal, so it runs where the supervisor loads the graph, and is reported the way
-    # that load's other refusals are. Refusal only: the warning and the AUDIT line belong to the
-    # engine shards, which each write their own.
+    # that load's other refusals are. Refusal only: the AUDIT line belongs to the engine shards,
+    # which each write their own.
     from messagefoundry.config.retention_classification import judge_keep_forever_overrides
     from messagefoundry.config.wiring import WiringError
 
@@ -10931,6 +10933,8 @@ def _backup(args: argparse.Namespace) -> int:
     }
     if result.staging_leftover is not None:  # BACKLOG #1174: a good archive, plaintext left behind
         payload["staging_leftover"] = result.staging_leftover
+    if result.config_unreadable_files:  # vault BACKLOG #3765: the digest covers the rest
+        payload["config_unreadable_files"] = list(result.config_unreadable_files)
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -10941,6 +10945,15 @@ def _backup(args: argparse.Namespace) -> int:
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
+        if result.config_unreadable_files:
+            from messagefoundry.config.fingerprint import describe_left_out
+            from messagefoundry.controlchars import scrub_log_argument
+
+            left_out = describe_left_out(result.config_unreadable_files)
+            print(
+                f"WARNING: the config fingerprint left out {scrub_log_argument(left_out)}",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -11716,7 +11729,7 @@ def _connection(args: argparse.Namespace) -> int:
         )
         # Vault BACKLOG #2368: a connection's own keep-forever retention override is refused here
         # as the engine's registry guard refuses it, so an edit a reload would reject is not
-        # written. Refusal only: the guard's warning and AUDIT line belong to a graph load.
+        # written. Refusal only: the guard's AUDIT line belongs to a graph load.
         verdict = judge_keep_forever_overrides(
             registry,
             acknowledged=settings.retention.allow_unbounded_phi,
@@ -12560,13 +12573,7 @@ def _is_engine_refusal(exc: BaseException) -> bool:
         return False
     if type(exc) is not RuntimeError:
         return type(exc).__module__.split(".")[0] == "messagefoundry"
-    tb = exc.__traceback__
-    if tb is None:
-        return False
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    module = tb.tb_frame.f_globals.get("__name__", "")
-    return isinstance(module, str) and module.split(".")[0] == "messagefoundry"
+    return raised_by_the_engine(exc)
 
 
 def _engine_refusal_text(exc: BaseException) -> str:

@@ -101,6 +101,7 @@ __all__ = [
     "cap_setting",
     "count_setting",
     "float_setting",
+    "port_setting",
     "positive_seconds",
     "positive_cap",
     "resolve_poll_ceiling",
@@ -147,10 +148,11 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
     """Read one integer setting as a whole count, or refuse it naming the key (BACKLOG #3431).
 
     **This docstring holds the rule; the readers that use it point here.** They are at least every
-    ``int`` cap read through :func:`cap_setting`, plus the setting reads that call this directly. Not
-    every integer read in the engine uses it yet; a ``port``, for one, is still a bare ``int()``.
-    ``int()`` turns ``True`` into 1 and ``1.9`` into 1, so either one used to build a live cap of one
-    byte or one connection, from a value nobody meant as that number. So:
+    ``int`` cap read through :func:`cap_setting`, each connector's ``port`` through
+    :func:`port_setting`, plus the setting reads that call this directly. Not every integer read in
+    the engine uses it yet. ``int()`` turns ``True`` into 1 and ``1.9`` into
+    1, so either one used to build a live cap of one byte or one connection, from a value nobody
+    meant as that number. So:
 
     - an ``int`` passes, and so does any other whole number: ``2048.0``, ``Decimal("2048")``,
       ``Fraction(4, 2)``, or another ``numbers.Integral`` type;
@@ -265,6 +267,25 @@ def positive_seconds(value: Any, *, knob: str, transport: str) -> float:
             f"{transport} {knob} must be a number of seconds above zero (value withheld)"
         )
     return seconds
+
+
+def port_setting(value: Any, *, transport: str) -> int:
+    """Read one ``port`` setting by the rule in :func:`count_setting`, then refuse a number outside
+    0 to 65535, withholding it (BACKLOG #1650).
+
+    An uncast ``env()`` reference hands the connector the environment's value as it stands, and no
+    check before this one has seen it. A bare ``int()`` read a ``true`` in ``environments/<env>.toml``
+    as port 1 and ``2575.9`` as port 2575, so a delivery would have dialled a port nobody named, and
+    its own refusal of bad text quoted the value. A number outside the range used to surface only
+    when the socket opened; here it surfaces when the connector is built, which ``serve`` and
+    ``messagefoundry check`` both do.
+
+    Zero passes, because it asks a listener for an ephemeral port. What a dial to port 0 does is the
+    socket's own refusal."""
+    port = count_setting(value, knob="port", transport=transport)
+    if not 0 <= port <= 65535:
+        raise ValueError(f"{transport} port must be from 0 to 65535 (value withheld)")
+    return port
 
 
 def _spells_zero(value: Any) -> bool:

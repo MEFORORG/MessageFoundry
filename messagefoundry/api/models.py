@@ -680,13 +680,24 @@ class ConfigProvenance(BaseModel):
     ``fingerprint`` and best-effort git ``git_head`` captured at load, plus whether the on-disk config
     has since **drifted** from it. Read-only and non-secret — a one-way content hash and a commit sha,
     never resolved ``env()`` / ``MEFOR_VALUE_*`` values. ``loaded`` is False before any graph is loaded
-    (or if the fingerprint could not be computed); ``drift`` is only meaningful when ``loaded`` is True."""
+    (or if the fingerprint could not be computed); ``drift`` still answers then, as its comment says."""
 
     loaded: bool
     fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v3)
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
-    drift: bool = False  # the on-disk config now differs from what was loaded
+    #: The on-disk config now differs from what was loaded, or the two digests left out different
+    #: files. ``None`` when a graph is running and either digest could not be taken, so nothing was
+    #: compared: that is not clean, and ``loaded`` is false when it is the loaded digest (vault
+    #: BACKLOG #3765). ``False`` when no graph is running.
+    drift: bool | None = False
+    #: How many files and folders the loaded digest or the on-disk digest left out as unreadable
+    #: (vault BACKLOG #3765). Where both left out the same ones, ``drift`` says nothing about them.
+    #: Where they differ, ``drift`` is true even on unchanged bytes, so a lock alone reads as drift.
+    #: A count, not their names: this route answers a channel-scoped caller, and a config module is
+    #: named for its connection. The ``config_loaded`` audit row names what the loaded digest left
+    #: out.
+    left_out_files: int = 0
     #: The refusal ``POST /config/reload`` gives THIS caller whatever it proves, or ``None`` when no
     #: such refusal applies (BACKLOG #3189). Today that is :data:`RELOAD_REFUSED_CHANNEL_SCOPED`
     #: for a channel-scoped caller. It is computed by the engine's own rule, so a page can stop
@@ -760,16 +771,13 @@ class ConnectionRow(PhiGatedModel):
     # Lets an operator watching a backlog on one shard's view see WHICH shard is responsible for
     # draining it (controls/purge for a non-owned lane 409 with the same owner).
     owner_shard: str | None = None
-    # #131 (ADR 0007 amendment): the operator "object of interest" flag for the Flagged Objects filter.
-    # Display-only (no runtime effect); True when the connection is marked flagged. Console-settable via
-    # POST /connections/{name}/flag on a connections.toml-managed connection only. Additive + defaulted
-    # so an older client deserializes /connections unchanged.
-    flagged: bool = False
-    # #131: whether this connection is authored in connections.toml (vs code-first). The console shows
-    # the flag TOGGLE only on TOML-managed rows (the write seam persists there); a code-first row shows a
-    # read-only flag indicator. The API refuses the toggle on a non-TOML connection regardless (the guard
-    # of record). Additive + defaulted.
-    toml_managed: bool = False
+    # #131, BACKLOG #2623: the operator "object of interest" flag for the Flagged Objects filter.
+    # Read from the store, and no engine path reads it. The console's filter does, which is the
+    # reach ADR 0007's 2026-10-31 amendment records. None means the read failed, so the flag is
+    # unknown, not unset, and a client must take it that way. Console-settable via
+    # POST /connections/{name}/flag. Defaults to None so a row built without it says unknown, and
+    # offers no toggle, rather than claiming a read that never ran.
+    flagged: bool | None = None
     # #136 (ADR 0065 amendment): destination-only per-message "Waiting for Reply" display state — True
     # while this outbound's live connector is awaiting an MLLP ACK past its waiting_display_delay. DISPLAY
     # ONLY (no delivery effect); False for source rows, non-ACK-waiting connectors, and no-ack mode.
@@ -778,9 +786,8 @@ class ConnectionRow(PhiGatedModel):
 
 
 class ConnectionFlagRequest(RequestModel):
-    """Body for ``POST /connections/{name}/flag`` (#131, ADR 0007 amendment) — the FIRST
-    console→connections.toml write seam. ``direction`` disambiguates a name declared as both an inbound
-    and an outbound. Display-only; the write is refused (409) on a code-first connection (no TOML home)."""
+    """Body for ``POST /connections/{name}/flag`` (#131, BACKLOG #2623). ``direction`` disambiguates
+    a name declared as both an inbound and an outbound."""
 
     flagged: bool
     direction: Literal["inbound", "outbound"]

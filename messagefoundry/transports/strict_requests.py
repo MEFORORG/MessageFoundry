@@ -834,8 +834,8 @@ def _unverifiable_proxy_leg(connector: str) -> str:
 #: A copy, not an import, because a marked refusal may interpolate only this module's own string
 #: literals (``tests/test_vault_hop_refusal_marker.py``).
 _ENCRYPTED_CA_TEXT = (
-    "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
-    "its PEM text, even outside a block, as in a comment"
+    'names an encryption header ("Proc-Type:" or "DEK-Info:", in any case) somewhere after the '
+    "first -----BEGIN in its PEM text, even outside a block, as in a comment"
 )
 #: The private-key refusal's twin of ``trust_anchors``'s ``PRIVATE_KEY_SCOPE`` (BACKLOG #3745),
 #: kept as a copy for the reason above and compared exactly by the same test file.

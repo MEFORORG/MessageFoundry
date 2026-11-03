@@ -61,6 +61,7 @@ from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
+from tests._share_fault import _share_fault
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
 from tests.test_trust_anchors import _block, _FaultyAuditStore, _judged_clean
 
@@ -543,8 +544,8 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
     """Lander hold on PR 2135. Reload A sits between its swap and its row while reload B swaps and
     then fails and rolls back to A's graph. A's row is written while B's graph is briefly live. A
     graph-identity test then marked A's row superseded, so the next start compared against an
-    older row and raised a false config_changed. Only a committed reload or a flag toggle moves the
-    loaded fingerprint, so A's row must stay a baseline."""
+    older row and raised a false config_changed. Only a committed reload moves the loaded
+    fingerprint, so A's row must stay a baseline."""
     cfg_a, cfg_b = tmp_path / "cfg_a", tmp_path / "cfg_b"
     _write_valid_config(cfg_a, tmp_path / "in_a", tmp_path / "out_a")
     _write_valid_config(cfg_b, tmp_path / "in_b", tmp_path / "out_b")
@@ -622,7 +623,7 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         detail = json.loads(row["detail"])
         assert row["actor"] == "alice" and detail["fingerprint"] == digest_a["fingerprint"]
         assert "superseded" not in detail and "baseline_unchecked" not in detail
-        outcome, comparison = await _compare_start_config(engine, digest_a, before_load=digest_a)
+        outcome, comparison = await _compare_start_config(engine, digest_a, on_disk=digest_a)
         assert outcome == "compared" and comparison is not None
         assert comparison.baseline_action == "config_reload"
         assert not comparison.changed, "a false config_changed on the next start"
@@ -630,16 +631,18 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         await engine.stop()
 
 
-async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: Engine) -> None:
-    """vault BACKLOG #2257: a connection flag toggle moves the loaded fingerprint without swapping
-    the graph. A reload row written after one names a digest the engine no longer reports, so it
-    marks itself superseded too. The toggle is stood in for by the rebind it performs."""
+async def test_a_reload_row_written_after_the_fingerprint_moved_is_no_baseline(
+    engine: Engine,
+) -> None:
+    """vault BACKLOG #2257: a reload row written after the loaded fingerprint moved on names a digest
+    the engine no longer reports, so it marks itself superseded. The move is stood in for by the
+    rebind a later reload performs."""
     outcome = await engine.reload_detail(propagate=False)
     assert outcome.fingerprint is not None
     assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
-    engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
+    engine.loaded_config_fingerprint = dict(loaded)  # what a later committed reload does
     assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]
@@ -1761,6 +1764,59 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
         )
     assert await engine.store.list_pending_approvals(now=0.0, limit=10) == []
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
+    """Fail every listing of ``cfg`` past the next one, which is the reload's target check, as a
+    share Windows cannot reach fails, and answer ``Path.is_dir`` of it ``False``, as both do for a
+    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory."""
+    real_scandir, real_is_dir = os.scandir, Path.is_dir
+    listings = 0
+
+    def _scandir(path: Any) -> Any:
+        nonlocal listings
+        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
+            listings += 1
+            if listings > 1:
+                raise _share_fault()
+        return real_scandir(path)
+
+    def _is_dir(self: Path, **kwargs: Any) -> bool:
+        return self.resolve() != cfg and real_is_dir(self, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    monkeypatch.setattr(Path, "is_dir", _is_dir)
+
+
+async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_inline(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ungated reload's strict read fails, so the load reads the directory itself and refuses."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        _lose_after_one_listing(monkeypatch, (tmp_path / "cfg").resolve())
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+
+
+async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release has no digest to check, so it is refused before anything runs."""
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: _lose_after_one_listing(monkeypatch, (tmp_path / "cfg").resolve()),
+    )
+    monkeypatch.undo()
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
 
 
 async def test_a_file_added_during_the_load_is_not_released_with_it(

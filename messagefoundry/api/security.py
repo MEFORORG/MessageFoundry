@@ -421,15 +421,16 @@ class RepeatedCredentialError(HTTPException):
 
 
 class ConfigWriteNotRecorded(HTTPException):
-    """A 503 for a config write the engine refused because its audit row was not recorded (vault
-    BACKLOG #2945).
+    """A 503 for a connection flag toggle the store did not confirm with its audit row (BACKLOG
+    #2623). ``pipeline.engine.ConnectionFlagNotRecorded`` says what it leaves unknown.
 
     The connection flag handler raises it in place of a plain 503, so the console's flag route can
     name this refusal's fix by its TYPE rather than by its status (BACKLOG #3811). The JSON route
     answers other 503s, at least ``_get_engine``'s "engine not started" and
-    ``RequestTimeoutMiddleware``'s deadline. Neither reaches the console, which calls the handler
-    in-process with its engine supplied, so keying on the status held only because nothing in the
-    handler itself raised another 503; a later change to the handler could. The HTTP answer is the
+    ``RequestTimeoutMiddleware``'s deadline. Neither comes out of the console route's call to the
+    handler: the first answers before that call, and the deadline cancels the route and answers the
+    browser itself. So keying on the status held only because nothing in the handler itself raised
+    another 503; a later change to the handler could. The HTTP answer is the
     ordinary 503 with ``detail``. Defined here because this is the leaf module the console imports,
     and the seam snapshot records what it imports from it."""
 

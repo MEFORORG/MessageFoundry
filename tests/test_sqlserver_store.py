@@ -134,6 +134,7 @@ async def store() -> AsyncIterator[object]:
                 "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
                 "processed_files",  # BACKLOG #3424: ledger rows a later probe would see
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
+                "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
                 "user_roles",
                 "ad_group_role_map",
                 "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
@@ -1004,6 +1005,41 @@ async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
     from tests._operator_audit_atomic_contract import assert_operator_audit_atomic
 
     await assert_operator_audit_atomic(store)
+
+
+async def test_overlapping_toggles_from_two_handles_leave_the_flag_matching_the_newest_row(
+    store,
+) -> None:
+    """BACKLOG #2623 on the real SQL Server backend: a second handle stands in for a second engine
+    shard, with its own in-process locks. The audit applock is taken before the flag statement, so
+    a clear that matched no row cannot let a set commit beside it."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._operator_audit_atomic_contract import assert_connection_flag_ordered_across_stores
+
+    second = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    try:
+        await assert_connection_flag_ordered_across_stores(store, second)
+    finally:
+        await second.close()
+
+
+async def test_a_foreign_lock_on_the_flag_table_holds_the_audit_chain_only_for_the_bound(
+    store,
+) -> None:
+    """BACKLOG #2623 on the real SQL Server backend: the toggle waits for its row holding the
+    audit applock, so a session holding a lock on ``connection_flag`` must cost the toggle its typed
+    refusal within ``LOCK_TIMEOUT``, error 1222 unretried, and leave an audit append from another
+    handle unblocked."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._operator_audit_atomic_contract import assert_flag_lock_wait_bounded
+
+    second = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    try:
+        await assert_flag_lock_wait_bounded(store, second)
+    finally:
+        await second.close()
 
 
 async def test_approval_release_outcome_contract(store) -> None:

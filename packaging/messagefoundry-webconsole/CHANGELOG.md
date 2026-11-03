@@ -37,6 +37,26 @@ this line.**
   that ships that module, which no published engine does yet, so the release that carries this
   raises the `messagefoundry` floor to the engine release that adds it. The seam digest does not
   cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
+- **The flag toggle is on every row but a draining one, and the store holds the flag.** A code-first connection takes
+  the flag like any other, and a cluster node no longer refuses it. The refused-toggle page's hint
+  now covers a name the running graph does not have and an engine that is stopping. Needs the
+  engine seam without `ConnectionRow.toml_managed`. (`BACKLOG #2623`)
+- **A failed flag read reads as unknown, not as unflagged.** Until the read recovers, a row offers
+  no toggle, Flagged only hides no row, select-all under it takes no such row, and a notice above
+  the table says why. (`BACKLOG #2623`)
+- **The page for a toggle the store did not confirm no longer says the flag did not change.** The
+  change may have landed or may still land, so it sends the operator to read the flag first, and it
+  no longer says to try again. Its heading is now "Flag change not confirmed". A flag write the store
+  leaves unanswered past the engine's 10-second bound reaches this page too. (`BACKLOG #2623`)
+- **Corrected: the two connection filters are not purely presentational.** Select-all skips a row
+  either one hides, so both shape a bulk action's target set. For Flagged only, which reads the
+  store, the owner accepted that on 2026-11-01 (ADR 0007). (`BACKLOG #2623`)
+- **Select-all's box reads the rows a click can take.** Under a filter it stays ticked once every
+  such row is taken, so the next click clears the selection, hidden rows included, rather than
+  selecting again. A selection that also holds a row select-all could not take shows the
+  part-selected mark, so a ticked box and an unticked one can look alike. A selection when no row
+  can be taken shows that mark, and a click clears it. Typing a filter or flipping Flagged only
+  judges the box again at once. (`BACKLOG #2623`)
 - **A refused start, stop or restart on the dashboard redirects back with a notice.** A 409 or a
   503 from the per-name control routes used to show as raw JSON. (BACKLOG #3746)
 - **A released config reload shows each thing it left undone in its own banner.** The approvals
@@ -166,12 +186,12 @@ this line.**
 
 ### Fixed
 
-- **The flag toggle's "audit log did not record the change" page keys on the refusal's type.**
-  The console gave that page for any 503 the engine's flag handler raised, relying on a comment
-  that the handler had no other. No other 503 reaches it today, so nothing an operator sees
-  changes; a 503 a later handler change adds is no longer named as the audit refusal. The console
-  now catches the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine
-  seam that carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+- **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
+  gave that page for any 503 the engine's flag handler raised, relying on a comment that the
+  handler had no other. The handler raises no other today, so nothing an operator sees changes; a
+  503 a later handler change adds is no longer named as the store's refusal. The console now catches
+  the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
+  carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

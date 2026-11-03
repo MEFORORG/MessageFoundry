@@ -2337,13 +2337,32 @@ def test_an_encrypted_pem_block_refuses_before_the_tls_load(
     assert ta.ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
-def test_an_encryption_header_outside_a_block_still_passes() -> None:
+def test_an_encryption_header_above_the_first_begin_still_passes() -> None:
     """The control: OpenSSL skips every line outside a block, so the same text in a comment above
     the certificate loads, and the shape check passes it too."""
     data = b"Proc-Type: 4,ENCRYPTED\n" + _real_ca("crl-test-ca")[0]
     ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=data.decode())
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
     assert ta.anchor_cadata(data, spec) == data.decode()
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param(False, True, id="above the first BEGIN"),
+        pytest.param(True, True, id="between two blocks"),
+        pytest.param(True, False, id="after the last END"),
+    ],
+)
+def test_an_encryption_header_on_a_non_ascii_comment_line_passes(before: bool, after: bool) -> None:
+    """The check reads the text the load would get, and a non-ASCII comment line is not in it, so
+    the header name on one does not refuse, wherever the line sits. The ASCII case between two
+    blocks does: see the "comment between blocks" row above."""
+    first = _real_ca("crl-test-ca")[0] if before else b""
+    last = _real_ca("second-ca")[0] if after else b""
+    data = first + b"caf\xc3\xa9 Proc-Type: 4,ENCRYPTED\n" + last
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    assert ta.anchor_cadata(data, spec) == (first + last).decode()
 
 
 async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(

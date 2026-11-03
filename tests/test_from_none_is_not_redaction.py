@@ -147,10 +147,6 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "the new message interpolates the caught CodeSetError whole",
     ),
     _Allowed(
-        "messagefoundry/config/code_sets.py::code_set::KeyError::CodeSetError",
-        _SAFE + "KeyError carries an operator-authored code-set name, also in the new message",
-    ),
-    _Allowed(
         "messagefoundry/config/reference.py::ReferenceSet.__getitem__::KeyError::KeyError",
         _SAFE + "KeyError carries the lookup key, which the new KeyError also quotes",
     ),
@@ -191,21 +187,6 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "messagefoundry/pipeline/cluster.py::acquire_leadership_lock::TimeoutError"
         "::StepdownLockTimeout",
         _SAFE + "asyncio.wait_for timeout; its chain is a CancelledError with no content",
-    ),
-    _Allowed(
-        "messagefoundry/pipeline/engine.py::Engine.write_baseline_config._apply::"
-        "(Exception, asyncio.CancelledError)::ConfigWriteAuditTimeout",
-        _SAFE + "raised only once the asyncio.timeout deadline expired, so the caught error is "
-        "that TimeoutError over a content-free CancelledError, or at least a store error that a "
-        "cleanup raised in its place while writing the row, whose detail is the config "
-        "fingerprint and the flag detail, never a message body; it is logged with safe_exc",
-    ),
-    _Allowed(
-        "messagefoundry/pipeline/engine.py::Engine.write_baseline_config._apply::Exception"
-        "::CancelledError",
-        _SAFE + "the config write's own refusal or fault under the connections.toml lock, at "
-        "least a WiringError, a connections_edit or TOML error or an OSError; the flag route "
-        "already answers such a refusal with str(exc), and it is logged with safe_exc",
     ),
     _Allowed(
         "messagefoundry/pipeline/dryrun.py::select_inbound::KeyError::UnknownInboundError",
@@ -251,6 +232,22 @@ _ALLOWED: tuple[_Allowed, ...] = (
     _Allowed(
         "messagefoundry/transports/database.py::DatabaseSource._body::KeyError::ValueError",
         _SAFE + "KeyError carries the body_column name, which the new message also quotes",
+    ),
+    _Allowed(
+        "messagefoundry/transports/database.py::_windows_path_verdict.probing::"
+        "(FileNotFoundError, NotADirectoryError)::_LeavesHost",
+        _SAFE
+        + "a control-flow signal, not a refusal: _windows_path_verdict catches it and returns "
+        "True, so it never leaves the module. The OSError names a file keyword path from the "
+        "operator's config, never message content or a secret",
+    ),
+    _Allowed(
+        "messagefoundry/transports/database.py::_windows_path_verdict.probing::"
+        "(FileNotFoundError, NotADirectoryError)::_PathEnds",
+        _SAFE
+        + "a control-flow signal, not a refusal: _windows_path_verdict catches it and returns "
+        "False, so it never leaves the module. The OSError names a file keyword path from the "
+        "operator's config, never message content or a secret",
     ),
     # api/app.py: HTTP translations of the engine's own errors.
     _Allowed(

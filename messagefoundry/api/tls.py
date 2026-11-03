@@ -37,12 +37,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
-from messagefoundry.restricted_file import (
-    WINERROR_ACCESS_DENIED,
-    WINERROR_SHARING_VIOLATION,
-    ride_out_a_held_file,
-    unlink_generated,
-)
+from messagefoundry.restricted_file import replace_generated, unlink_generated
 from messagefoundry.tls_handshake_failures import HandshakeFailures
 
 if TYPE_CHECKING:
@@ -409,10 +404,7 @@ def _replace_generated(staged: Path, live: Path) -> None:
     file's own access list, which is why the key's DACL and the cert's local-users grant are applied
     BEFORE the replace rather than after it.
     """
-    ride_out_a_held_file(
-        lambda: os.replace(staged, live),
-        frozenset({WINERROR_SHARING_VIOLATION, WINERROR_ACCESS_DENIED}),
-    )
+    replace_generated(staged, live)
 
 
 def _why_generated_pair_is_unusable(cert_path: Path, key_path: Path) -> str | None:

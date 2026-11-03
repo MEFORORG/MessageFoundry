@@ -16,9 +16,10 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.config.fingerprint import config_fingerprint
+from messagefoundry.config.fingerprint import UNREADABLE_FILES_KEY, config_fingerprint
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
+from tests.test_config_fingerprint import _unreadable
 
 
 def _write_valid_config(cfg: Path, inbox: Path, outdir: Path) -> None:
@@ -71,6 +72,7 @@ async def test_provenance_before_any_load(client: httpx.AsyncClient) -> None:
         "git_head": None,
         "files": None,
         "drift": False,
+        "left_out_files": 0,
         # The open-mode caller holds every channel, so its reload is not refused (BACKLOG #3189).
         "reload_refused": None,
     }
@@ -146,6 +148,73 @@ async def test_provenance_drift_compares_the_digests_in_constant_time(
         "messagefoundry.config.fingerprint.config_fingerprint_detail", lambda _target: {}
     )
     assert (await client.get("/config/provenance")).json()["drift"] is True
+
+
+async def test_provenance_reads_a_change_in_what_a_digest_left_out_as_drift(
+    client: httpx.AsyncClient, engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3765, item 23: the fold does not hash what a digest left out, so a loaded
+    digest that left a file out folds to the value of a whole read of a bundle without that file.
+    The route compared the folds alone and reported clean for a file that has since gone. Its
+    answer now names what neither digest could see, so a clean answer does not overclaim."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    loaded = engine.loaded_config_fingerprint
+    assert loaded is not None
+    body = (await client.get("/config/provenance")).json()
+    assert body["drift"] is False and body["left_out_files"] == 0, "control: a whole digest"
+    engine.loaded_config_fingerprint = {**loaded, UNREADABLE_FILES_KEY: ["environments/x.toml"]}
+    body = (await client.get("/config/provenance")).json()
+    assert body["fingerprint"] == loaded["fingerprint"] == config_fingerprint(cfg)
+    assert body["drift"] is True
+    assert body["left_out_files"] == 1
+    assert "x.toml" not in str(body), "a count: this route answers a channel-scoped caller"
+
+
+async def test_provenance_names_a_file_the_on_disk_digest_left_out(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    (cfg / "environments").mkdir()
+    (cfg / "environments" / "dev.toml").write_text('X = "1"\n', encoding="utf-8")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    _unreadable(monkeypatch, "dev.toml")
+    body = (await client.get("/config/provenance")).json()
+    assert body["drift"] is True
+    assert body["left_out_files"] == 1
+
+
+async def test_provenance_does_not_read_clean_on_no_reading(
+    client: httpx.AsyncClient, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that took no on-disk digest compared nothing, so ``drift`` is ``null``: not a false
+    alarm, and not the ``false`` a reader would take for a config that matches."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    assert (await client.get("/config/provenance")).json()["drift"] is False, "control"
+
+    async def _no_digest(_path: Path) -> tuple[None, str]:
+        return None, "synthetic"
+
+    monkeypatch.setattr(engine, "fingerprint_bundle", _no_digest)
+    body = (await client.get("/config/provenance")).json()
+    assert body["loaded"] is True and body["drift"] is None
+
+
+async def test_provenance_does_not_read_clean_on_a_running_graph_with_no_baseline(
+    client: httpx.AsyncClient, engine: Engine, tmp_path: Path
+) -> None:
+    """A start whose digest failed runs a graph with no baseline. ``loaded`` is false there, and
+    the IDE reads ``drift`` alone, so ``false`` would be a green for a config nobody compared."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
+    engine.loaded_config_fingerprint = None
+    body = (await client.get("/config/provenance")).json()
+    assert body["loaded"] is False and body["drift"] is None
 
 
 async def test_provenance_requires_auth(engine: Engine) -> None:

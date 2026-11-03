@@ -150,6 +150,12 @@ transport = "mllp"
   spellings and what it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
+  A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
+  digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
+  #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
+  a fraction. At least the host-and-port `[egress]` lists that pin a port, such as `allowed_mllp`,
+  compare the setting's text with the pin before the connector is built; `allowed_db` compares
+  numbers.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
@@ -175,7 +181,7 @@ transport = "mllp"
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
 - **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
   (comment/format-preserving; the edit is validated as a candidate and replaces the file only if it
-  loads, under a lock the engine's console writes take too: a hidden `.mefor-edit.lock`
+  loads, under a lock each edit takes: a hidden `.mefor-edit.lock`
   beside the file, which stays there and is safe to ignore) — which is what the **VS Code
   connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
   one opens its `.py`). `env()` secrets are never written inline.
@@ -366,7 +372,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
 | `timeout_seconds` | out | `30.0` | wait this long for the ACK |
-| `no_ack` | out | `false` | **(BACKLOG #117, ADR 0124) fire-and-forward (MLLP outbound only):** when `true`, deliver on the successful TCP **write** and read **no** ACK — delivery is confirmed on write, **not** on a positive MSA-1 ACK, so there is **no NAK- or timeout-driven retry** (*at-most-once-confirmation*). A connect/drain failure is still charged and retried (at-least-once for the write; a retry may duplicate — receivers stay idempotent). Composes with `persistent=true` (no handshake **and** no ACK wait — the max-throughput non-acking posture). **Incompatible with `capture_response`/`reingress_to`** (nothing to capture) and MLLP-only — both rejected at `check`. `false` (default) = **byte-identical** (read + validate one ACK). |
+| `no_ack` | out | `false` | **(BACKLOG #117, ADR 0124) fire-and-forward (MLLP outbound only):** when `true`, deliver on the successful TCP **write** and read **no** ACK — delivery is confirmed on write, **not** on a positive MSA-1 ACK, so there is **no NAK- or timeout-driven retry** (*at-most-once-confirmation*). A connect/drain failure is still charged and retried (at-least-once for the write; a retry may duplicate — receivers stay idempotent). Composes with `persistent=true` (no handshake **and** no ACK wait — the max-throughput non-acking posture). **Incompatible with `capture_response`/`reingress_to`** (nothing to capture) and MLLP-only — both rejected at `check`, a flag behind `env()` only once it resolves ([ADR 0124](adr/0124-outbound-mllp-fire-and-forward-no-wait-for-ack-delivery-on-write.md) AC-5 says where). `false` (default) = **byte-identical** (read + validate one ACK). |
 | `persistent` | out | `false` | **(ADR 0067)** default `false` **this release** (opt-in): connect-per-message — dial a fresh connection per delivery, send, read the ACK, close. Set `persistent=true` to reuse **one** lazily-established TCP connection across deliveries (the MLLP-standard posture) — the **reuse path**, which removes the per-message TCP/TLS handshake and its `TIME_WAIT` port pressure (recommended on sustained high-rate lanes). Under `persistent=true`, a stale cached connection is detected and redialed once **before any payload byte is written** (uncharged); any failure after the payload was written discards it (charged, normal retry). The default flips to `true` in a subsequent release (ADR 0067 §8 trigger); some partners require connection-per-message (e.g. devices that process only the first frame on a connection) and stay on `false`. |
 | `idle_timeout_seconds` | out | `60.0` | (applies when `persistent=true`) don't reuse a persistent connection idle longer than this — the next send closes it and dials fresh (uncharged). `None`/`0` = never expire on idle. |
 | `max_connection_age_seconds` | out | — (off) | (applies when `persistent=true`) recycle the persistent connection once it is this old (load-balancer / firewall hygiene). `None`/`0` = off. |
@@ -1831,8 +1837,8 @@ port compared.
 
 `[egress].allowed_db` checks the host in `server`. `odbc_params` takes a fixed list of keywords:
 the list is hand-chosen, no keyword is on it in order to name a host, and a file
-keyword's value is screened separately by spelling (vault BACKLOG #2577). **The list covers
-keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
+keyword's value is screened separately, as the paragraph on file keywords below says (vault
+BACKLOG #2577). **The list covers keywords only, and relies on at least a driver named on the escape list reading the `}}` escape
 in a braced password (*The password*, below), and the driver reading `SERVER` as its target
 (*This is a rule about keywords*, below).** The keywords set at least a port, a TLS mode, a local file or a session option:
 
@@ -1849,10 +1855,15 @@ keyword is sent as you wrote it, and not every driver trims it. A keyword given 
 case, is refused. The list says what the engine accepts. It does not say which keywords your
 driver reads, so check the driver's own manual.
 
-A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local path: a drive
-letter, or one leading separator. A path that starts with two separators, or with a device
-prefix, is refused, because it can name another host. This reads the spelling only. It does
-not follow a mapped drive or a link, so keep those files on a local disk.
+Keep a file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) on a local disk of this host.
+When the connection is built, the engine refuses a value that starts with two separators or
+with a device prefix, such as a share spelling. That part is enforced on every platform. On
+Windows the engine also runs a best-effort check of the path, and refuses the value when that
+check finds the path leads to another host, or cannot finish reading the trimmed path. Both
+refusals apply in every SSL mode. The check is defence in depth, not a guarantee. It misses at
+least: links to some object paths; paths that change after the build; the contents of an
+`SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The check does not change the
+value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -1862,10 +1873,12 @@ first `-----BEGIN` is refused when the connection is built (BACKLOG #3090). The 
 file with its own TLS library, which can wait for a password on an encrypted block. At least
 these cases are left to the driver unchecked: a file that does not exist, a directory (an
 `SSLCAPATH` directory included), and a device or pipe. A file the engine cannot read, or one
-over 1 MiB, is refused. That includes a share Windows cannot reach when the connection is
-built, however it fails. One case is left to the driver instead: under the TLS-off modes the lane
-check below names, a share Windows reports as not found because it could not reach it (errors
-53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
+over 1 MiB, is refused. A path the file-keyword check above finds leads to a share is refused
+before this read, in every SSL mode, whether Windows can reach the share or not. A path that
+check cleared, which then fails this read because Windows cannot reach a share, is refused too,
+however it fails. One case is left to the driver instead: under the TLS-off modes the lane check
+below names, such a path Windows reports as not found because it could not reach the share
+(errors 53 and 67). An `SSLCA` file that names a PEM label ending in `PRIVATE KEY` after its
 first `-----BEGIN ` is refused the same way (BACKLOG #3745), since a CA file is public trust
 material.
 
@@ -1876,9 +1889,10 @@ again. A file another account can replace, or whose content now fails, refuses t
 is built or an operator starts it, at `[security].enforcement = enforce`; `warn` warns about the
 ACL and path instead. Before a reload, the same check on a lane the reload keeps running refuses
 the whole reload, and the running lane is not stopped. A file swapped since the last check is
-audited as `changed`. The check does not run under `SSLmode=disable` (or `SSLMODE=DISABLED`),
-where the driver reads no CA, and there is no pin for this file. A missing file or a directory
-is left to the driver here too, and a pipe or device is refused unread. **What it does not
+audited as `changed`. Under `SSLmode=disable` (or `SSLMODE=DISABLED`), where the driver reads no
+CA, the file-keyword refusal above still applies to `SSLCA`, and the file is not checked as an
+anchor. There is no pin for this file. A missing file or a directory is left to the driver here
+too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
 for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all.
@@ -2067,7 +2081,7 @@ in-process layers are defence in depth and neither is authority:
 
 | Layer | What it does | What it cannot do |
 |---|---|---|
-| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement | it reads text. A write executed on a linked server through a pass-through literal is opaque to it |
+| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement. It also refuses a number with a letter or one of `_$#@` glued to its end, because SQL Server reads a write such as `1e1INTO copy` or `0xUPDATE` as a number then a keyword | it reads text. A write executed on a linked server through a pass-through literal is opaque to it. It fails closed on some valid reads, at least a word glued to a number, a name or a keyword (`#1tmp`, `@1x`, `:1st`, `x=1AND y=2`, `TOP 10PERCENT`, MySQL `2024_orders`, Oracle `1.5f`) and a scalar `INSERT(...)` or `TRUNCATE(...)` call, an ODBC `{fn TRUNCATE(...)}` escape included |
 | `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | read at least by an Always On availability group, where read-only routing sends it to a **readable secondary** and a primary set to `ALLOW_CONNECTIONS = READ_WRITE` refuses it, and by Azure SQL read scale-out, which sends it to a read-only replica; where nothing reads it, it changes nothing |
 
 Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
@@ -2284,7 +2298,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 |---------|---------|---------|
 | `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
 | `database` | — (required) | database name |
-| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the `db_lookup` read-only test is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, or a `#` comment containing a write keyword) and can miss a write hidden in a MySQL backslash escape or a PostgreSQL dollar quote. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the read-only test for the poll's dialect is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too, and so is a word glued to a number (see *Give `db_lookup` a read-only login* for the list). Only on `dialect='generic'` is MySQL's scalar `INSERT(...)` or `TRUNCATE(...)` admitted, and only with the `(` as the very next character (`TRUNCATE (1.2, 2)`, valid MySQL, is refused); the `db_lookup` test, always on the SQL Server preset, refuses it. While `dialect` is an `env()` value, the declaration tests the poll as `generic` and the build tests it again with the resolved dialect. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, or a `#` comment containing a write keyword) and can miss a write hidden in a MySQL backslash escape or a PostgreSQL dollar quote. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |

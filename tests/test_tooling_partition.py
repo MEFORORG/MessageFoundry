@@ -125,6 +125,9 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # does not trip the tooling path gate, so listed as tooling it would run on no leg for that
         # change.
         "test_client_ip_single_extractor.py",
+        # Reads the engine and console packages off disk with ast, and fails when a new reader of the
+        # connection flag appears (BACKLOG #2623). What breaks it is an engine or console diff.
+        "test_connection_flag_readers.py",
         # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled out
         # for review. Its subject is the TEST TREES: it scans both `testpaths` roots for a bare
         # `import conftest`, which binds to whichever root pytest loaded first (BACKLOG #1255). The

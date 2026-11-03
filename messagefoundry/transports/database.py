@@ -14,7 +14,8 @@ job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T
 any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
 list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`): the list is hand-chosen, no keyword is on it in order to
-name a host, and a file keyword's value is screened separately by spelling.
+name a host, and a file keyword's value is screened separately: by its spelling, and on Windows
+by a best-effort check of where the path leads (:func:`names_another_host`).
 ``[egress].allowed_db`` reads the host from the ``server`` setting (vault BACKLOG #2577). The list covers
 keywords only, and relies on at least a driver named on the escape list reading the ``}}`` escape in a
 braced password (:func:`_odbc_password`), and the driver reading ``SERVER`` as its target
@@ -54,6 +55,7 @@ import json
 import logging
 import os
 import re
+import sys
 import weakref
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
@@ -61,6 +63,7 @@ from decimal import Decimal
 from functools import partial
 from typing import Any, NamedTuple
 
+from messagefoundry.auth.anchor_path import WinProbe, _win_probe, windows_chain
 from messagefoundry.auth.trust_anchors import (
     ENCRYPTION_HEADER_SCOPE,
     PRIVATE_KEY_SCOPE,
@@ -110,6 +113,7 @@ from messagefoundry.transports.base import (
     float_setting,
     intake_open,
     poll_interval,
+    port_setting,
     positive_cap,
     register_destination,
     register_source,
@@ -255,9 +259,10 @@ def _build_dsn(
         raise ValueError(
             "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
         )
+    port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
     parts = [
         f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
-        f"SERVER={server},{int(s.get('port', SQLSERVER_DEFAULT_PORT))}",
+        f"SERVER={server},{port}",
         f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
         f"APP={odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
@@ -289,8 +294,9 @@ _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 # driver has its own keywords for a host, an address, a data source name, a socket or a whole option
 # string, and a new driver release can add another. A list of refused names would always trail the
 # drivers. Here the list is hand-chosen, no keyword is on it in order to name a host,
-# and a file keyword's value is screened separately by spelling. :func:`_build_odbc_dsn` refuses
-# everything else when the connection is built.
+# and a file keyword's value is screened separately: by its spelling, and on Windows by a
+# best-effort check of where the path leads (:func:`names_another_host`).
+# :func:`_build_odbc_dsn` refuses everything else when the connection is built.
 #
 # WHAT EARNS A PLACE. A keyword whose value is a port, a TLS mode, a local file the driver verifies or
 # authenticates with, or a session setting. Nothing that names a host, a service, a data source or a
@@ -695,38 +701,242 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
 
 def _is_remote_spelling(value: object) -> bool:
     """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
-    can name another host. The spelling only; :func:`_refuse_remote_path` says what it misses."""
+    can name another host. The spelling only; :func:`names_another_host` adds the Windows check."""
     text = str(value).strip()
     return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
 
 
-def driver_file_spellings(value: object) -> tuple[str, ...]:
-    """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
-    since a driver may trim it. Empty for a value that can name another host, which the build
-    refuses (:func:`_refuse_remote_path`), so no check opens a remote path first (vault BACKLOG
-    #3090). Any value, a ``Path`` too, is read as its ``str()``: the text the build sends and the
-    remote screen reads, so the engine checks the file the driver is told to load."""
-    if not value or _is_remote_spelling(value):
-        return ()
+#: ``GetDriveTypeW`` answers: a mapped network drive, no volume at that letter, and an unknown type.
+_DRIVE_REMOTE = 4
+_DRIVE_NO_ROOT_DIR = 1
+_DRIVE_UNKNOWN = 0
+
+#: The first component of a rooted, driveless link target that names the NT object namespace
+#: (``\Device\Mup\host\share``), which ``windows_chain`` would read as a folder on the link's drive.
+_NT_OBJECT_ROOTS = frozenset({"device", "global??", "??"})
+
+
+class _LeavesHost(Exception):
+    """Raised through :func:`~messagefoundry.auth.anchor_path.windows_chain` by a reader that met
+    another host: a network drive, a link to a share, or a share Windows could not reach. Not an
+    ``OSError``, which the walk would catch and report as a cause."""
+
+
+class _PathEnds(Exception):
+    """Raised through the walk where a component, or the drive, does not exist yet: nothing past it
+    is a link, so the rest of the path is local text. Not an ``OSError``, for the same reason."""
+
+
+def _windows_drive_type(root: str) -> int:
+    """``GetDriveTypeW``'s answer for a volume root. Raises ``OSError`` off Windows."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the drive type is read only on Windows")
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    return int(kernel32.GetDriveTypeW(root))
+
+
+def _windows_drive_target(drive: str) -> str | None:
+    """The folder a ``subst`` drive stands for, or ``None`` for a real volume or no device at all,
+    as ``anchor_path.windows_host_readers`` reads it: ``QueryDosDeviceW`` answers ``\\??\\C:\\...``
+    for a substituted drive. Any other failure of the query raises ``OSError``, so the walk does
+    not clear the path: a subst drive it could not read would hide the links behind it."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the drive target is read only on Windows")
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryDosDeviceW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+    kernel32.QueryDosDeviceW.restype = ctypes.c_uint
+    buf = ctypes.create_unicode_buffer(1024)
+    if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
+        error = ctypes.get_last_error()
+        if error == _ERROR_FILE_NOT_FOUND:  # no such device: the drive type then says no volume
+            return None
+        raise OSError(f"the drive {drive} could not be read (winerror {error})")
+    return buf.value[4:] if buf.value.startswith("\\??\\") else None
+
+
+#: ``QueryDosDeviceW``'s answer for a drive letter with no device behind it.
+_ERROR_FILE_NOT_FOUND = 2
+
+
+def _windows_path_verdict(
+    path: str,
+    *,
+    probe: WinProbe,
+    drive_type: Callable[[str], int],
+    drive_target: Callable[[str], str | None],
+    cwd: str | Callable[[], str],
+) -> bool | None:
+    """The best-effort verdict on whether a Windows ``path`` leads off this host, from a walk of it
+    with :func:`~messagefoundry.auth.anchor_path.windows_chain`. ``True``: the walk found the path
+    leads to another host. ``None``: the walk could not finish, and its cause is logged at DEBUG.
+    ``False``: the walk found nothing that leads off the host, which is not proof the path is
+    local. ``probe``, ``drive_type``, ``drive_target`` and ``cwd`` are the walk's inputs, passed in
+    so a test can stand in for the file system. ``docs/CONNECTIONS.md``, Generic ODBC, states the
+    check's limits."""
+
+    def volume_cause(root: str) -> str | None:
+        kind = drive_type(root)
+        if kind == _DRIVE_REMOTE:
+            raise _LeavesHost
+        if kind == _DRIVE_NO_ROOT_DIR:
+            raise _PathEnds  # no volume at that letter here: left to the driver, as a missing file is
+        if kind == _DRIVE_UNKNOWN:
+            return "the type of this volume could not be read"
+        return None
+
+    def probing(part: str) -> tuple[str, str | None]:
+        try:
+            kind, target = probe(part)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+                raise _LeavesHost from None
+            raise _PathEnds from None
+        if target is not None:
+            text = target.strip()
+            if _is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
+                raise _LeavesHost
+            if text[:1] in "\\/" and text.lstrip("\\/").split("\\")[0].lower() in _NT_OBJECT_ROOTS:
+                raise OSError("the link names an NT object path")  # the walk reports it: unclear
+        return kind, target
+
+    try:
+        _chain, cause = windows_chain(
+            path, cwd, probing, volume_cause=volume_cause, drive_target=drive_target
+        )
+    except _LeavesHost:
+        return True
+    except _PathEnds:
+        return False
+    except OSError as exc:  # a reader the walk does not guard, such as drive_target
+        logger.debug("DATABASE file keyword path not cleared: %s", exc)
+        return None
+    if cause is not None:
+        logger.debug("DATABASE file keyword path not cleared: %s", cause)
+        return None
+    return False
+
+
+#: A link target :func:`_is_remote_spelling` matches that :func:`_windows_path_verdict` does not
+#: count as leading off the host: two separators, ``?`` or ``.``, a separator, then a drive letter
+#: or ``Volume{``. Any other link target :func:`_is_remote_spelling` matches is counted as leading
+#: off the host.
+_LOCAL_DEVICE_TARGET = re.compile(r"[\\/]{2}[?.][\\/](?:[A-Za-z]:|[Vv]olume\{)")
+
+
+def _path_verdict(text: str) -> bool | None:
+    """:func:`_windows_path_verdict` for ``text`` on Windows, and ``None`` for an ``OSError`` or
+    ``ValueError`` it raises. ``False`` on POSIX, where nothing past the spelling is checked
+    (``docs/CONNECTIONS.md``, Generic ODBC)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return _windows_path_verdict(
+            text,
+            probe=_win_probe,
+            drive_type=_windows_drive_type,
+            drive_target=_windows_drive_target,
+            cwd=os.getcwd,
+        )
+    except (OSError, ValueError) as exc:
+        logger.debug("DATABASE file keyword path not cleared: %s", type(exc).__name__)
+        return None
+
+
+#: A file keyword's verdicts: each spelling a driver may be given, as sent and trimmed, with its
+#: :func:`_path_verdict`. Computed ONCE per judgement (:func:`file_keyword_verdicts`) and passed
+#: to every reader of it, so the refusal and the checks that read the file cannot disagree.
+FileVerdicts = Mapping[str, bool | None]
+
+
+def file_keyword_verdicts(value: object) -> FileVerdicts:
+    """:data:`FileVerdicts` for ``value``, empty for a falsy one. A spelling the spelling check
+    refuses is ``True`` and is not walked."""
+    if not value:
+        return {}
     raw = str(value)
-    return tuple(p for p in dict.fromkeys((raw, raw.strip())) if p)
+    return {
+        p: True if _is_remote_spelling(p) else _path_verdict(p)
+        for p in dict.fromkeys((raw, raw.strip()))
+        if p
+    }
 
 
-def _refuse_remote_path(value: object, *, name: str, connection: str | None) -> None:
-    """Refuse a file keyword whose path is not a plain local one.
+def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> bool:
+    """Whether a file keyword's ``value`` must be refused. ``True`` when any spelling's verdict is
+    ``True``, or the trimmed spelling's verdict is ``None``. ``False`` otherwise, including for a
+    falsy value and for a padded spelling whose verdict alone is ``None``. ``False`` is not proof
+    the path is local. ``verdicts`` are this value's (:func:`file_keyword_verdicts`) when the
+    caller already has them; otherwise they are computed here. ``docs/CONNECTIONS.md``, Generic
+    ODBC, states the check's limits."""
+    if not value:
+        return False
+    if verdicts is None:
+        verdicts = file_keyword_verdicts(value)
+    trimmed = str(value).strip()
+    return True in verdicts.values() or (bool(trimmed) and verdicts.get(trimmed) is None)
 
-    A path that starts with two separators, or with the device prefix, can name another host, and
-    the driver (or, for ``sslkey``, the engine's own wrap check) would open a connection to it. This
-    reads the spelling only. It does not resolve the path, so a mapped drive or a link that leads
-    to another host is not caught here."""
-    if _is_remote_spelling(value):
+
+def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -> tuple[str, ...]:
+    """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
+    since a driver may trim it. Empty for a falsy value and for a value :func:`names_another_host`
+    refuses; otherwise every spelling in ``verdicts``. A returned spelling is not proof the path is
+    local (``docs/CONNECTIONS.md``, Generic ODBC). Any value, a ``Path`` too, is read as its
+    ``str()``, the text the build sends.
+
+    ``verdicts`` are the value's, from the judgement that decided whether it is refused; pass them
+    whenever there is one, so the path is judged once. Without them they are computed here, and a
+    caller must treat an empty answer for a set value as its own refusal."""
+    if not value:
+        return ()
+    if verdicts is None:
+        verdicts = file_keyword_verdicts(value)
+    if names_another_host(value, verdicts):
+        return ()
+    return tuple(verdicts)  # names_another_host is False for these verdicts
+
+
+def _refuse_remote_path(
+    value: object, verdicts: FileVerdicts, *, name: str, connection: str | None
+) -> None:
+    """Raise ``ValueError`` when :func:`names_another_host` is ``True`` for ``value`` and its
+    ``verdicts`` (BACKLOG #2705); otherwise return. The message names the keyword, not the value.
+    ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    if names_another_host(value, verdicts):
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
-            "local path: a drive letter, or one leading separator"
+            "local path on this host: not a share, a network drive, a link to one, or a path it "
+            "cannot read"
         )
 
 
-def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+def _refuse_remote_paths(
+    named: Mapping[str, Any], *, connection: str | None
+) -> dict[str, FileVerdicts]:
+    """Compute the verdicts of each file keyword in ``named``, in sorted keyword order, and raise
+    ``ValueError`` (:func:`_refuse_remote_path`) at the first that :func:`names_another_host`
+    refuses, in every ``sslmode``. Otherwise return the verdicts for the checks that read the
+    files: one entry per file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic
+    ODBC, states the check's limits."""
+    verdicts: dict[str, FileVerdicts] = {}
+    for name in sorted(_ODBC_PATH_KEYS & named.keys()):
+        value = named[name]
+        verdicts[name] = file_keyword_verdicts(value)
+        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
+    return verdicts
+
+
+def _refuse_weak_driver_key(
+    named: Mapping[str, Any],
+    *,
+    connection: str | None = None,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
+) -> None:
     """Check a driver client key's passphrase wrap before the connection string reaches the driver
     (BACKLOG #1352, #1171).
 
@@ -746,10 +956,17 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
     a padded value is checked as a driver may trim it, and a pipe named here is never read: it is
     refused, as anything that is not a regular file is, on its stat, or on its descriptor if it
     was swapped in after that stat (:func:`~messagefoundry.auth.trust_anchors.read_if_regular`)."""
-    _refuse_weak_driver_wrap(named, "sslkey", "key file", connection, leave_irregular=False)
+    _refuse_weak_driver_wrap(
+        named, "sslkey", "key file", connection, leave_irregular=False, verdicts=verdicts
+    )
 
 
-def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+def _refuse_weak_driver_cert(
+    named: Mapping[str, Any],
+    *,
+    connection: str | None = None,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
+) -> None:
     """Check the key wrap of a driver's client certificate file before the driver loads it (vault
     BACKLOG #3090, step 5).
 
@@ -765,7 +982,9 @@ def _refuse_weak_driver_cert(named: Mapping[str, Any], *, connection: str | None
     connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
     what it does not cover."""
     if not str(named.get("sslkey") or "").strip():
-        _refuse_weak_driver_wrap(named, "sslcert", "certificate file", connection)
+        _refuse_weak_driver_wrap(
+            named, "sslcert", "certificate file", connection, verdicts=verdicts
+        )
 
 
 def _refuse_weak_driver_wrap(
@@ -775,6 +994,7 @@ def _refuse_weak_driver_wrap(
     connection: str | None,
     *,
     leave_irregular: bool = True,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
 ) -> None:
     """Refuse a weak or unlockable key wrap in the ``keyword`` file, with ``sslpassword`` as its
     passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`. A file the check
@@ -789,6 +1009,7 @@ def _refuse_weak_driver_wrap(
         "its wrap",
         error=KeyWrapRefused,
         leave_irregular=leave_irregular,
+        verdicts=verdicts,
     ):
         refuse_weak_key_wrap(
             data,
@@ -811,7 +1032,12 @@ _WINDOWS_INVALID_NAME = 123
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
 
 
-def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | None = None) -> None:
+def _refuse_encrypted_driver_ca(
+    named: Mapping[str, Any],
+    *,
+    connection: str | None = None,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
+) -> None:
     """Refuse an ``sslca`` CA file with an encryption header before the driver loads it (BACKLOG
     #3090).
 
@@ -826,7 +1052,9 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
     :func:`~messagefoundry.auth.trust_anchors.has_private_key_label_bytes` (BACKLOG #3745).
 
     :func:`_driver_file_spellings` says which paths are left to the driver, and which spellings
-    are read. A share Windows reports as not found because it could not reach it is refused,
+    are read. A value :func:`names_another_host` refuses is refused unread in every ``sslmode``,
+    including a share Windows could not reach during that check. A path that check cleared, whose
+    read then reports it as not found because Windows could not reach the share, is refused too,
     unless ``sslmode`` turns TLS off (:func:`generic_odbc_tls_off`): then the driver reads no CA,
     so it never meets that file.
 
@@ -839,6 +1067,7 @@ def _refuse_encrypted_driver_ca(named: Mapping[str, Any], *, connection: str | N
         "CA file",
         "it for an encryption header or a private key",
         leave_unreachable=generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}),
+        verdicts=verdicts,
     ):
         if has_encryption_header_bytes(data):
             raise ValueError(
@@ -863,13 +1092,28 @@ def _driver_file_spellings(
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
     leave_unreachable: bool = False,
+    verdicts: Mapping[str, FileVerdicts] | None = None,
 ) -> Iterator[tuple[str, bytes]]:
     """``(setting, bytes)`` for each spelling of the ``keyword`` file
     (:func:`driver_file_spellings`) that :func:`_read_driver_file` reads, for the caller to check.
     Nothing when the keyword is unset, and nothing more once a spelling is left to the driver as
-    an unreached share: another spelling of it would wait out the same network timeout."""
+    an unreached share: another spelling of it would wait out the same network timeout.
+
+    Raises ``error`` for a set value :func:`names_another_host` refuses. ``verdicts`` are the
+    build's (:func:`_refuse_remote_paths`), and the spellings read come from them; a map that lacks
+    a set ``keyword`` raises ``KeyError``, since that is a caller's bug. Without a map the verdicts
+    are computed here."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
-    for path in driver_file_spellings(named.get(keyword)):
+    value = named.get(keyword)
+    if not value:
+        return
+    given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
+    if names_another_host(value, given):
+        raise error(
+            f"{setting}: the {what} is not a plain local path on this host, so it was not read "
+            f"to check {checked_for}"
+        )
+    for path in driver_file_spellings(value, given):
         try:
             data = _read_driver_file(
                 path,
@@ -1098,8 +1342,6 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 "driver's own spelling as a string"
             )
         named[name] = value
-        if name in _ODBC_PATH_KEYS:
-            _refuse_remote_path(value, name=name, connection=connection)
         literal = _odbc_literal(
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
@@ -1107,9 +1349,11 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _refuse_unread_sslmode(literal, driver=driver, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
-    _refuse_weak_driver_key(named, connection=connection)
-    _refuse_weak_driver_cert(named, connection=connection)
-    _refuse_encrypted_driver_ca(named, connection=connection)
+    # Each file keyword is judged once, here, and every check below reads that judgement.
+    verdicts = _refuse_remote_paths(named, connection=connection)
+    _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
+    _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
+    _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
     _warn_generic_tls_unenforced(params, connection=connection)
     return ";".join(parts) + ";"
 
@@ -1272,7 +1516,10 @@ def _build_connection(
 
 
 # One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
-# `#delete` reads as one identifier rather than as the `DELETE` keyword.
+# `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil followed by a digit
+# (`#1tmp`, `@1x`) is NOT taken as one name, though T-SQL allows it: on the generic dialect `#` and `@`
+# can be operators, and there `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose
+# glue refusal refuses the statement on every dialect.
 _SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
@@ -1298,11 +1545,40 @@ _SQL_WRITE_KEYWORDS = frozenset(
     }
 )
 
-# Keywords that are also ordinary scalar FUNCTIONS in at least one supported dialect, so a `(` directly
-# after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)` and
-# `TRUNCATE(n,d)`. `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL,
-# the exact shape this gate exists to refuse.
+# Keywords that are also ordinary scalar FUNCTIONS in a dialect the generic ODBC path can reach, so a
+# `(` IMMEDIATELY after one means a call rather than a statement: MySQL has `INSERT(str,pos,len,new)`
+# and `TRUNCATE(n,d)`. Requiring the `(` right after the name, with no space, is this gate's own
+# fail-closed choice, not a MySQL rule: MySQL accepts `TRUNCATE (1.2, 2)`, and the gate refuses it.
+# Only `dialect='generic'` gets the exemption. The SQL Server preset never does: SQL Server has no
+# native function of either name, and an ODBC scalar escape (`{fn TRUNCATE(x, 2)}`), which its
+# driver does translate, is refused with the rest, failing closed. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
+# Server driver), so the exemption there rests on this premise, read from the documented T-SQL
+# grammar and not run against a server: no T-SQL statement puts a `(` straight after `INSERT` or
+# `TRUNCATE`. `INSERT` takes `TOP (n)`, `INTO` or a target name first, and `TRUNCATE` takes `TABLE`.
+# "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
+# between the keyword and the `(` is dropped by the scan, and `INSERT [patients](mrn) VALUES (1)`
+# must not read as a call.
+# `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL, the exact shape
+# this gate exists to refuse.
 _SQL_FUNCTION_FORM_KEYWORDS = frozenset({"INSERT", "TRUNCATE"})
+
+# A numeric literal as SQL Server lexes one: a binary constant (`0x`, then hex digits, `0x` alone
+# being the empty binary constant), or digits with an optional fraction and exponent. The lexer ends
+# it at the first character that cannot continue it and needs no space before the next token, so
+# `SELECT 1e1INTO copy` is `1e1` then `INTO`. :func:`_scan_sql_tokens` refuses any literal glued to a
+# word character, wherever this pattern's boundary falls, so the gate does not rest on matching a
+# lexer it cannot run. "A word character" there is any Unicode letter or digit or one of `_$#@`, a
+# superset of what `_SQL_WORD_RE` continues a word with.
+_SQL_NUMBER_RE = re.compile(r"0[xX][0-9A-Fa-f]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?")
+
+
+class _SqlToken(NamedTuple):
+    """One token of :func:`_scan_sql_tokens`: ``kind`` is ``"word"`` (text upper-cased), ``"number"``
+    or ``"other"`` (one character, ``;`` included); ``end`` indexes the raw statement just past it."""
+
+    kind: str
+    text: str
+    end: int
 
 
 def _read_only_message(subject: str) -> str:
@@ -1313,22 +1589,24 @@ def _read_only_message(subject: str) -> str:
     )
 
 
-def _scan_sql_tokens(
-    statement: str, *, subject: str = "db_lookup statement"
-) -> list[tuple[str, str]]:
-    """Tokenize ``statement`` into ``(kind, text)`` pairs, dropping comments and the contents of string
+def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") -> list[_SqlToken]:
+    """Tokenize ``statement`` into :class:`_SqlToken` values, dropping comments and the contents of string
     literals and quoted identifiers.
 
-    ``kind`` is ``"word"`` (text upper-cased) or ``"other"`` (one character, ``;`` included).
     Single-quoted strings and double-quoted / ``[...]``-bracketed / backtick-quoted identifiers are
     consumed whole, doubled-delimiter escapes included, so a keyword *inside* one is data and never a
     token. T-SQL block comments nest, so the scan tracks depth.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
-    cannot be read, and guessing at it is how a shape-based gate gets bypassed. ``subject`` names
-    whose statement it is in that refusal."""
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a numeric
+    literal with a word character glued to its end (:data:`_SQL_NUMBER_RE`): SQL Server reads
+    ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``. That refusal
+    also catches valid reads, at least an Oracle ``1.5f``, a MySQL name that starts with a digit
+    (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp`` or ``@1x`` and a ``:1st`` placeholder;
+    it fails closed on purpose.
+    ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
-    tokens: list[tuple[str, str]] = []
+    tokens: list[_SqlToken] = []
     i, n = 0, len(statement)
     while i < n:
         ch = statement[i]
@@ -1365,17 +1643,27 @@ def _scan_sql_tokens(
                     break
                 i += 1
             continue
+        # `[0-9]+` always matches at a digit, so a digit never reaches the word scan below.
+        if "0" <= ch <= "9" and (num := _SQL_NUMBER_RE.match(statement, i)):
+            end = num.end()
+            if end < n and (statement[end].isalnum() or statement[end] in "_$#@"):
+                raise DbLookupError(f"{refusal}; a number runs into a word")
+            tokens.append(_SqlToken("number", num.group(0), end))
+            i = end
+            continue
         m = _SQL_WORD_RE.match(statement, i)
         if m:
-            tokens.append(("word", m.group(0).upper()))
+            tokens.append(_SqlToken("word", m.group(0).upper(), m.end()))
             i = m.end()
             continue
-        tokens.append(("other", ch))
+        tokens.append(_SqlToken("other", ch, i + 1))
         i += 1
     return tokens
 
 
-def _require_read_only(statement: str, *, subject: str = "db_lookup statement") -> None:
+def _require_read_only(
+    statement: str, *, subject: str = "db_lookup statement", dialect: str = "sqlserver"
+) -> None:
     """Test a db_lookup statement's shape for the ADR 0010 read-only carve-out. Defence in depth only,
     like ``ApplicationIntent=ReadOnly``. A read-only login is the control (``docs/CONNECTIONS.md``).
 
@@ -1390,6 +1678,12 @@ def _require_read_only(statement: str, *, subject: str = "db_lookup statement") 
        ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
 
+    One exception to rule 2: on ``dialect="generic"`` only, ``INSERT`` or ``TRUNCATE`` with a ``(``
+    as the very next character is MySQL's scalar function, not a statement
+    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception, so a caller
+    that does not know the dialect gets the stricter test. ``db_lookup`` and ``DatabaseRef`` are SQL
+    Server only and pass none.
+
     Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
     or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
     ``WITH c AS (...) DELETE FROM patients`` writes through a CTE, and T-SQL needs no ``;`` between
@@ -1403,10 +1697,11 @@ def _require_read_only(statement: str, *, subject: str = "db_lookup statement") 
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
     tokens = _scan_sql_tokens(statement, subject=subject)
-    if not tokens or tokens[0] not in (("word", "SELECT"), ("word", "WITH")):
+    if not tokens or tokens[0].kind != "word" or tokens[0].text not in ("SELECT", "WITH"):
         raise DbLookupError(refusal)
+    function_forms = dialect == "generic"
     last = len(tokens) - 1
-    for index, (kind, text) in enumerate(tokens):
+    for index, (kind, text, end) in enumerate(tokens):
         if kind != "word":
             # A ';' is tolerated only as the final token (a statement terminator); anything after one
             # is a second statement, whatever that statement starts with.
@@ -1416,9 +1711,9 @@ def _require_read_only(statement: str, *, subject: str = "db_lookup statement") 
         if text not in _SQL_WRITE_KEYWORDS:
             continue
         if (
-            text in _SQL_FUNCTION_FORM_KEYWORDS
-            and index != last
-            and tokens[index + 1] == ("other", "(")
+            function_forms
+            and text in _SQL_FUNCTION_FORM_KEYWORDS
+            and statement.startswith("(", end)
         ):
             continue  # a scalar function call that shares the keyword's name, not a statement
         raise DbLookupError(f"{refusal}; found a '{text}' keyword")
@@ -2659,7 +2954,7 @@ class _PolledBatch(NamedTuple):
     skip_budget_spent: bool
 
 
-def _read_only_poll_refusal(statement: str) -> str | None:
+def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> str | None:
     """Why a DATABASE source ``poll_statement`` is refused, or None when it passes (BACKLOG #2178).
 
     The poll runs on the autocommit pool, so a write in it commits at execute, before any row reaches
@@ -2671,7 +2966,9 @@ def _read_only_poll_refusal(statement: str) -> str | None:
     the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
-    ``poll_max_rows`` is; its docstring says what it refuses. A locking ``FOR UPDATE`` read is refused
+    ``poll_max_rows`` is; its docstring says what it refuses. ``dialect`` is the poll's own, so a
+    ``generic`` poll admits MySQL's scalar ``INSERT(...)``/``TRUNCATE(...)``, which ``db_lookup``,
+    always on the SQL Server preset, refuses. A locking ``FOR UPDATE`` read is refused
     with the rest (``UPDATE`` is a keyword), and on this autocommit connection its lock ends with the
     statement, so refusing it loses nothing. **It reads the statement's shape only**, so at least a
     ``SELECT`` that calls a function which writes, and a T-SQL second statement with no ``;`` whose
@@ -2683,7 +2980,7 @@ def _read_only_poll_refusal(statement: str) -> str | None:
     construction. The text is the fixed refusal vocabulary, never the statement. It is returned, not
     raised, so each caller raises its own type with no ``DbLookupError`` chain."""
     try:
-        _require_read_only(statement, subject="DATABASE source poll_statement")
+        _require_read_only(statement, subject="DATABASE source poll_statement", dialect=dialect)
     except DbLookupError as exc:
         return (
             f"{exc}. A poll must only read: it runs on an autocommit connection, so a write in it, "
@@ -2739,7 +3036,7 @@ class DatabaseSource(SourceConnector):
             if not s.get(req):
                 raise ValueError(f"DATABASE source requires a {req!r} setting")
         # Before the hop is built: a refused poll must not leave a hop-crossing audit line behind.
-        refusal = _read_only_poll_refusal(str(s["poll_statement"]))
+        refusal = _read_only_poll_refusal(str(s["poll_statement"]), dialect=self._dialect)
         if refusal is not None:
             raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same

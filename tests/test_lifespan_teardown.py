@@ -617,7 +617,7 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
 async def test_the_managed_teardown_drains_config_writes_under_its_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #2945 under BACKLOG #3191: the config-write drain is a budgeted step before
+    """BACKLOG #2623 under BACKLOG #3191: the config-write drain is a budgeted step before
     engine.stop(), handed a share of its bound, and engine.stop() then does not run its own fixed
     wait as well, which would spend time past the budget."""
     labels: list[str] = []
@@ -648,11 +648,10 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
             calls.append(("stop", None))
             await real_stop()
 
-        async def _in_flight_write() -> dict[str, object] | None:
+        async def _in_flight_write() -> None:
             # Stands in for a write whose caller went: it lands after the teardown began.
             await asyncio.sleep(0.3)
             calls.append(("write landed", None))
-            return None
 
         write = asyncio.ensure_future(_in_flight_write())
         engine._config_writes.add(write)

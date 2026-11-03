@@ -2113,7 +2113,7 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name with no `connections.toml` entry.
+> reaches the engine, which answers 409 for a name the running graph does not have.
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
@@ -2266,6 +2266,20 @@ the same permission set on the same method reds CI until it is listed here.
 > queue's prediction for a held reload and purge, `reload_refused`, and the bound on a malformed
 > name in a denial row.
 
+> **A dry-run reload executes config code too, and no approver holds it (BACKLOG #2623).**
+> `POST /config/reload` with `dry_run` runs every config module's top-level code in the engine's
+> own process, because the load happens before the dry-run branch. It takes the same `config:deploy`
+> and step-up as a reload, but `[approvals]` never holds it. A dry run is not held on purpose: the
+> IDE promote pre-flight would stall on a second person. So under dual control, a `config:deploy`
+> holder who can also write the config directory can have a module run with no second approver,
+> though nothing is applied. That stays true until a dry run can run in a throwaway worker. A restart
+> also executes what the directory holds. `tests/test_connection_flag.py` pins that a dry run runs
+> the modules and applies nothing, and `test_dry_run_reload_is_never_held` in
+> `tests/test_dual_control_reload.py` pins, through the route, that `[approvals]` does not hold it.
+> A change to either fails there and this note gets read again. A connection flag
+> toggle is not such a route: the store holds the flag, so a toggle runs no config module and writes
+> no file in the config directory.
+>
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
 > the server's startup `--config` dir or an entry in `[api].config_reload_roots` — otherwise it is
@@ -2452,7 +2466,7 @@ reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline,
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
-for the config directory itself: at least one that is missing, and a share lost between the
+for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
@@ -2498,9 +2512,9 @@ read as a completed action.
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
 connection counts and the digest it took before the swap. The row is written after the swap, so a
-second reload or a connection flag toggle can move the engine on first. The row then still names
+second reload can move the engine on first. The row then still names
 its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
-it and does not compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+it and does not compare against it. Only a committed reload that moves the engine's loaded
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
 runs just before the write, so a change after it is not caught.
 
@@ -2588,17 +2602,16 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
-- a network share the engine cannot reach can read as absent, not as a fault. At least a share lost
-  between the target check and the reload's read of the directory would answer `not_found`, and
-  `validate_config`, which `messagefoundry check` runs, would report a config directory on such a
-  share as absent. A value file read from disk would read as absent there too, so an `env()`
-  reference with a default would take that default, with no refusal;
-- a DR backup bundle's config digest is a separate, ordinary read, not the digest above. It leaves
-  out what it cannot read and does not tell its caller, so it can be partial;
+- a value file read from disk on a network share the engine cannot reach would read as absent, not
+  as a fault, so an `env()` reference with a default would take that default, with no refusal. A
+  config directory on a drive letter this process does not have reads as absent too, even where the
+  letter is mapped in another session;
+- a DR backup bundle's config digest is a separate, ordinary read, not the digest above, and it
+  can be partial. `include_config` under
+  [`[backup]`](CONFIGURATION.md#backup--scheduled-dr-backup--restore-verify) gives at least part
+  of what the backup records of that, and of what it does not;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
-- a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
-  before a toggle is refused at release and must be asked for again;
 - a repeat after an edit files a second hold and leaves the first pending. The first is refused
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
@@ -4280,7 +4293,7 @@ slack.
 BACKLOG #2622 item 1).** The MLLP, DICOM, raw TCP and HTTP listener exposure gates run in two places. At
 listener start, a refusal isolates that one listener and the rest of the graph comes up (ADR 0031).
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
-reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
+reload or dry-run reload, promote, a connection edit, a DR activation
 and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
 keep its old graph, log the refusal and retry each interval. It would also write a
 `config_reload_failed` audit row under `system:cluster-convergence` (vault BACKLOG #3109).
@@ -6369,7 +6382,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login and every completed second factor | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked; see the *Concurrent session count* signal row for sign-ins that still owe a second factor |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
-| Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
+| Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged. A move that completes is also offered to the connection-event log as `file_oversize` (BACKLOG #1621), which keeps it only where connection events are captured (`docs/PHI.md` row 7); a failed move is logged only. It never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe and the AI broker report it to their own caller instead, and nothing retries those. The alert webhook counts an over-cap body after a 2xx as delivered and logs a WARNING that carries no reply byte, because nothing reads that body (owner ruling 2026-10-12, vault BACKLOG #3040 item 1). **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx does not retry either** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A 2xx body cut short of its declared length, or misframed, follows the same rule with the code `reply-truncated` or `reply-misframed` (BACKLOG #2989; ADR 0095 Amendment B.1 records who decided it). A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
@@ -6496,10 +6509,11 @@ export, and `GET /audit/export` sends `X-Audit-Withheld: true` and records `with
 `audit.export` row. Each is decided by the reader's permission alone. It shows whether or not a
 hidden row falls in the range read, so it cannot tell the reader that a lock happened.
 
-**Six audit signals also raise an operator alert (vault BACKLOG #2613).** A small rule layer
-(`messagefoundry/pipeline/security_signals.py`) watches the audit stream and raises one alert type
-per detector through the `[alerts]` notifier, or the log when no transport is set. It is on by
-default. What each one counts is stated once, in the `[alerts]` table of `docs/CONFIGURATION.md`.
+**Seven security signals also raise an operator alert (vault BACKLOG #2613).** A small rule
+layer (`messagefoundry/pipeline/security_signals.py`) watches the audit stream, and the listeners'
+peer refusals, and raises one alert type per detector through the `[alerts]` notifier, or the log
+when no transport is set. It is on by default. What each one counts is stated once, in the
+`[alerts]` table of `docs/CONFIGURATION.md`.
 
 | Alert | Setting | Subject |
 |---|---|---|
@@ -6507,8 +6521,9 @@ default. What each one counts is stated once, in the `[alerts]` table of `docs/C
 | `access_denied_burst` | `security_denials` | `account:<username>` |
 | `body_view_burst` | `security_body_views` | `account:<username>` |
 | `bulk_export` | `security_export_messages` | `account:<username>` |
+| `peer_refused_burst` | `security_peer_refusals` | `inbound:<name>` |
 | `log_level_debug` | none | `logging:debug` |
-| `posture_loosened` | none | `posture:start` |
+| `posture_loosened` | none | `posture:start`, plus `@node:<id>` or `@shard:<id>` where several engine processes share the store |
 
 The layer is an observer on the off-box audit tee, which at least `record_audit` and every
 in-transaction audit append call after their commit. So it adds no commit and no store read to the
@@ -6523,10 +6538,58 @@ sign-in detector counts `auth.login_failed`, which is written once per refused l
 lock state, and leaves out the withheld directory lock refusal, so its count does not reveal a lock.
 **An account lock raises no alert**, by the 2026-09-28 ruling above: the alert list is readable
 under `monitoring:diagnose`, and a lock alert there would show lock state to a reader the ruling
-withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
-`[alerts].security_signals = false`, or a threshold of `0`, is absent from
-`GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
+withholds it from.
+
+A listener's refusal of a peer at its source allowlist or a connection cap writes no audit row, and at most a
+`connection_event` row, only while capture is on. So at least the MLLP, raw-TCP, X12 and HTTP
+listeners and the DICOM server tell the layer directly, with the inbound's name and never the
+peer's address. Once a listener's burst raises, its refusals are not counted again for the window,
+or for five minutes when the window is longer. A refusal at a connection cap counts too, so a
+listener held full by ordinary load raises it as well.
+
+**Switching the layer off is a loosening.** `[alerts].security_signals = false`, or with the layer on
+a detector count of `0` or above its default, or a window shorter than its default while any
+count is above `0`, is named in `GET /security/posture` and in the start's `config_loaded` row.
+With the layer off, every detector stops but the posture one, so that start still raises
+`posture_loosened`. A later start that records no loosening raises the
+`posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
+process and pages nobody. A row marked `superseded` or `baseline_unchecked` raises no inverse,
+even with an empty list: the list is read off the graph the start's snapshot took, and a reload
+may have replaced that graph. A start whose baseline read failed, or that took no digest, carries
+the same mark and raises none either. The alert stays open until a later start's unmarked row
+lists none and the live posture reads clean, as the next paragraph says.
+An unpinned cluster node's identity changes on every start, so that node raises the inverse for
+its own alert once its graph has stopped during shutdown, with no live read. That alert can stay
+open after shutdown, at least after a hard kill, a stop that fails before its graph has stopped, or
+a resolve that did not land. An alert also stays open when no later start comes back
+under its identity, at least after an engine shard is removed from the config or a pinned
+`[cluster].node_id` changes. In each of these cases, resolve it by hand with
+`POST /alerts/{alert_id}/resolve` or in the web console's alert list, which goes through the same
+scope check, so both need an account that is not channel-scoped and holds `monitoring:diagnose`. `posture_loosened` does not fire, and nothing resolves, on a start whose `config_loaded` row
 records its loosenings as unknown, such as one whose config snapshot could not be taken.
+
+**A resolved `posture_loosened` does not prove the engine runs clean.** A clean, unmarked row
+resolves the alert only after a read of the live posture, the reading `GET /security/posture` takes,
+names no loosening. A read that fails, that cannot see the graph, or that is still running at
+shutdown resolves nothing. So a reload that swaps the graph before the row commits leaves the alert
+open. The detector reads `config_loaded` rows and no `config_reload` row, so at least these go
+unseen. A reload whose swap lands after that read leaves the alert resolved while the loosened graph
+runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
+reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
+read that for the current posture.
+
+**`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
+count of every loosening, then their names, cut at 200 characters and ending in `...`. The
+`alert_instance` reason then cuts the whole sentence at 200 characters. A name late in a long list
+is therefore missing, and at least some `[security]` switches come ahead of
+`alerts.security_signals`, so the cut can reach it. In one measured list of that shape, with many
+`[security]` booleans and hop loosenings set, 309 characters of names came ahead of it, and the
+alert's list ended in `...` without it. How many entries a list holds depends on the environment.
+With 116 characters of names ahead of it
+the stored reason still named it, and with 145 it did not. The count always includes it. The start's
+`config_loaded` row holds the whole list, and so does `GET /security/posture`, which narrows only
+the per-connection entries for a channel-scoped reader. Read one of those when the alert's list is
+cut.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

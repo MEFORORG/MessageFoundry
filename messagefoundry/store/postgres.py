@@ -98,7 +98,9 @@ from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
     UPLOAD_RESERVATION_STALE_AFTER,
+    ConnectionFlagLockTimeout,
     Row,
     SchemaDdlLockTimeout,
     SchemaLockTimeout,
@@ -455,9 +457,9 @@ _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
 #: SQLSTATE lock_not_available: a statement waited out lock_timeout (BACKLOG #1726).
 _LOCK_NOT_AVAILABLE: Final = "55P03"
 
-#: Sets the schema transaction's lock_timeout to $1 ms, unless the session already has a stricter
-#: one (BACKLOG #1726). 0 means no limit, so it never counts as stricter. pg_settings reports
-#: lock_timeout in ms.
+#: Sets the current transaction's lock_timeout to $1 ms, unless the session already has a stricter
+#: one: the schema batch's (BACKLOG #1726) and the connection flag toggle's (BACKLOG #2623). 0 means
+#: no limit, so it never counts as stricter. pg_settings reports lock_timeout in ms.
 _DDL_LOCK_TIMEOUT_SQL: Final = (
     "SELECT pg_catalog.set_config('lock_timeout',"
     " CASE WHEN s.setting::bigint > 0 AND s.setting::bigint < $1::bigint"
@@ -1043,6 +1045,14 @@ _SCHEMA: list[str] = [
         first_seen DOUBLE PRECISION NOT NULL,
         last_seen  DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (user_id, address)
+    )""",
+    # The object-of-interest flag (BACKLOG #2623) -- mirrors the SQLite `connection_flag` table
+    # (store/store.py), whose comment gives the reasons: a row IS the flag. Adding this DDL moves
+    # _schema_hash() automatically -- the ADR 0064 bump.
+    """CREATE TABLE IF NOT EXISTS connection_flag (
+        connection TEXT NOT NULL,
+        direction  TEXT NOT NULL,
+        PRIMARY KEY (connection, direction)
     )""",
     # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and
     # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in _CIPHER_COLUMNS). Adding this DDL moves
@@ -6374,6 +6384,67 @@ class PostgresStore:
             escalation_tier=int(r["escalation_tier"]),
         )
 
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`.
+
+        The audit advisory lock comes FIRST, before the flag statement, and holds to the commit, so
+        two toggles from any engine shard or node run one after the other, and the later one's flag
+        statement sees the earlier one's commit. Taken at the append instead, a clear beside another
+        session's uncommitted set would delete nothing and still append the newer row. The append
+        re-takes the lock, which the same transaction may do. Only toggles write
+        ``connection_flag``, and each holds the audit lock first, so a row lock under it cannot
+        cycle; ``tests/test_connection_flag.py`` fails on another writer it can see.
+
+        READ COMMITTED is pinned, as :meth:`reserve_upload_quota` pins it: a REPEATABLE READ server
+        default would take the snapshot as the lock statement starts, before it waits.
+
+        The flag statement holds the audit lock while it waits for its row, so its lock waits are
+        bounded by ``lock_timeout``, at
+        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`. Nothing else bounds
+        them: the pool sets no server ``statement_timeout``, and asyncpg's client-side
+        ``command_timeout`` is 30 s by default and absent at 0, so a foreign lock on
+        ``connection_flag`` would hold every audit append that long. It is set after the advisory
+        lock, whose wait keeps its own bound, and only tightens, as the schema batch's does. It is
+        local to the transaction, so it ends with it, and it covers the append too, which waits on
+        no lock the audit lock does not already serialise. SQLSTATE 55P03 raises
+        :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
+        back."""
+        now = time.time() if now is None else now
+        bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
+        async with (
+            AuditedWrite(now) as written,
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="read_committed"),
+        ):
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+            await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(bound * 1000))
+            sql = (
+                "INSERT INTO connection_flag (connection, direction) VALUES ($1, $2)"
+                " ON CONFLICT (connection, direction) DO NOTHING"
+                if flagged
+                else "DELETE FROM connection_flag WHERE connection=$1 AND direction=$2"
+            )
+            try:
+                await conn.execute(sql, connection, direction)
+            except Exception as exc:
+                if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
+                    raise ConnectionFlagLockTimeout(self.backend, bound) from exc
+                raise
+            await self._append_operator_audit(conn, written, if_applied(audit), True)
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
+        rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
+        return {(str(r["connection"]), str(r["direction"])) for r in rows}
+
     async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
         The row is appended only when the UPDATE matched, so a 404 writes nothing."""
@@ -8421,7 +8492,8 @@ class PostgresStore:
 
         The mutation already holds its queue rows and finalize locks; the append then takes the audit
         advisory lock. No audit-lock holder takes a queue or finalize lock, so the order cannot
-        cycle."""
+        cycle. :meth:`set_connection_flag` is the exception: it takes the audit lock before its
+        row, and its docstring says why that cannot cycle either."""
         audits = operator_audits(audit, result)
         written.add(audits, await self._append_audits(conn, audits, now=written.now))
 

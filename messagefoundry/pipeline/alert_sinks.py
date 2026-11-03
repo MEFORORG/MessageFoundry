@@ -156,6 +156,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     # #2904: a CRL file the reload no longer refuses resolves the open refusal for the same file
     # on the same process.
     "crl_reload_applied": "crl_reload_refused",
+    # vault BACKLOG #2613: a start with no security loosening resolves the open posture alert under
+    # the same posture:start key, so for the same engine process.
+    "posture_restored": "posture_loosened",
 }
 
 _T = TypeVar("_T")
@@ -1629,8 +1632,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     ) -> None:
         # vault BACKLOG #2597: the start's config differs from the store's baseline. The
         # subject (`config:<12 hex>`) stands in for "connection", so each distinct config is its own
-        # instance; nothing auto-resolves it. Digests, node and shard labels, an action name, a
-        # username and a time only: never the config dir, a git commit or message content.
+        # instance; nothing auto-resolves it. Digests, node and engine shard labels, an action
+        # name, a username, a time and the comparison marker only: never the config dir, a git
+        # commit or message content.
         self._emit(
             {
                 "type": "config_changed",
@@ -1641,6 +1645,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     baseline_action=baseline_action,
                     baseline_node=baseline_node,
                     baseline_at=baseline_at,
+                    comparison=comparison,
                 ),
                 "fingerprint": fingerprint,
                 "previous_fingerprint": previous_fingerprint,
@@ -1689,6 +1694,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # event type, so each detector routes and throttles on its own; the subject stands in for
         # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
         self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
+    def posture_restored(self, name: str) -> None:
+        # vault BACKLOG #2613: the INVERSE -- no page; auto-resolves the open posture_loosened via
+        # _AUTO_RESOLVE.
+        self._record_state({"type": "posture_restored", "connection": name}, "info")
 
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
         # BACKLOG #2614: the first start on a restored store revoked every session. The subject

@@ -196,12 +196,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     keeps running. ``warn`` warns instead for the ACL and path. A file swapped since the last
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
-    build leaves to the driver, or a value that can name another host, which the build refuses.
+    build leaves to the driver. A value the build's remote-path check refuses is refused here as a
+    setting, in every ``sslmode`` (BACKLOG #2705); ``docs/CONNECTIONS.md``, Generic ODBC, states
+    that check's limits.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
-    (:func:`read_if_regular`). Only a driver file's spellings are screened for another host before
-    that stat; a ``tls_ca_file`` is not.
+    (:func:`read_if_regular`). Only a driver file's value goes through the remote-path check before
+    that stat; a ``tls_ca_file`` does not.
 
     **Not covered**, at least, as in item 9: the driver reads the file by path, at every connect
     its pool opens. A running lane is not stopped when its file fails a later check: its pool goes on
@@ -218,6 +220,7 @@ import asyncio
 import contextlib
 import errno
 import hashlib
+import io
 import json
 import logging
 import os
@@ -465,10 +468,10 @@ def parse_anchor_pin(pin: str) -> Fingerprint:
     if sep and len(head) != 2 and head[:1].isalpha() and not _is_hex(head):
         if head not in ANCHOR_DIGESTS:
             raise TrustAnchorError(
-                f"a trust-anchor pin names the digest {head!r}, which this release does not "
-                f"support, or it is not a hex digest. Supported prefixes: "
+                f"a trust-anchor pin names a digest this release does not support, or it is not a "
+                f"hex digest (value withheld). Supported prefixes: "
                 f"{', '.join(sorted(ANCHOR_DIGESTS))}. A pin with no prefix is read as "
-                f"{UNMARKED_DIGEST}. Got {pin!r}"
+                f"{UNMARKED_DIGEST}"
             )
         algorithm, cleaned = head, rest.strip()
     digest = cleaned.replace(":", "")
@@ -476,7 +479,7 @@ def parse_anchor_pin(pin: str) -> Fingerprint:
     if len(digest) != want.hex_chars or not _is_hex(digest):
         raise TrustAnchorError(
             f"a trust-anchor pin must be a {want.title} hex digest ({want.hex_chars} hex chars, "
-            f"optional ':', optionally prefixed '{algorithm}:'); got {pin!r}"
+            f"optional ':', optionally prefixed '{algorithm}:') (value withheld)"
         )
     return Fingerprint(algorithm, digest)
 
@@ -504,8 +507,8 @@ _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: literals; ``tests/test_trust_anchors.py`` compares the two exactly. Public because the refusals
 #: in ``pki`` and ``transports.database`` that use :func:`has_encryption_header_bytes` quote it too.
 ENCRYPTION_HEADER_SCOPE = (
-    "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
-    "its PEM text, even outside a block, as in a comment"
+    'names an encryption header ("Proc-Type:" or "DEK-Info:", in any case) somewhere after the '
+    "first -----BEGIN in its PEM text, even outside a block, as in a comment"
 )
 #: The tail of every private-key PEM label OpenSSL writes, lower-cased: ``PRIVATE KEY``,
 #: ``ENCRYPTED PRIVATE KEY``, ``RSA PRIVATE KEY``, ``EC PRIVATE KEY`` and the rest (BACKLOG #3745).
@@ -603,15 +606,22 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     blocks. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a ``cafile`` with a UTF-8 comment above the
     block (a PKCS#12 export's ``friendlyName``) or a UTF-8 byte-order mark loads, and the same bytes
     as ``cadata`` raise. So this drops every non-ASCII line OUTSIDE a block, which OpenSSL skips
-    anyway, and a byte-order mark exactly where ``cafile=`` drops one: on the first line of the
-    file, and on the line straight after an ``-----END`` line. Measured, a mark there loads the
-    block behind it (two concatenated files), and a mark after a blank or comment line hides the
-    block from ``cafile=``. Stripping it anywhere else would trust a certificate ``cafile=`` never
-    loaded. ``tests/test_trust_anchor_byte_binding.py`` holds the shapes against ``cafile=``.
+    anyway, and a byte-order mark on the first line of the file and on the line straight after an
+    ``-----END`` line that closes a block in this function's line model, where any BEGIN opens
+    one. Measured, a mark ``cafile=`` drops loads the block behind it (two concatenated files), and
+    a mark it keeps hides that block, so stripping a mark it keeps would trust a certificate it
+    never loaded. ``tests/test_trust_anchor_byte_binding.py`` holds named shapes against
+    ``cafile=``. This is a line model, not OpenSSL's reader, so it does not match ``cafile=`` in
+    every shape, and the strip can fire where ``cafile=`` keeps the mark.
 
-    Every line from ``-----BEGIN`` to ``-----END`` is kept exactly. A non-ASCII byte there refuses,
-    as ``cafile=`` refuses it (``PEM lib``). The text is derived from ``data`` alone and nothing here
-    opens a file, which is the point.
+    A line ends at an LF alone, as in OpenSSL's reader, so a lone CR does not end one, and dropping
+    a line never shows OpenSSL a block hidden behind a CR. A line holding ``-----BEGIN `` anywhere
+    opens a block for this rule, since OpenSSL finds a BEGIN mid-line in a long line, and the block
+    runs to the next line starting ``-----END``. The exception is a lone BEGIN straight behind a
+    byte-order mark this keeps, which hides that block as above. Every line of a block is kept
+    exactly, so a non-ASCII byte there refuses. That is stricter than ``cafile=`` in at least three
+    measured shapes, though ``cafile=`` refuses others (``PEM lib``). The text is derived from
+    ``data`` alone and nothing here opens a file, which is the point.
 
     **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
     string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
@@ -621,7 +631,9 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     settings, and ``cadata=`` skips it without a word: measured, the lone block raises ``no start
     line``, and beside a plain block it would be dropped silently. Rewriting it as a plain block
     would drop a ``reject`` setting and so widen trust. ``openssl x509 -in <one cert> -out
-    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run.
+    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run. The full marker
+    ``-----BEGIN TRUSTED CERTIFICATE-----`` refuses anywhere on a line, even outside a block, as in
+    a comment.
 
     **Text the TLS library will not load refuses here** (BACKLOG #2025). The central preflight runs
     this and builds no context of its own to verify a peer with, so before this a reload passed a
@@ -665,43 +677,46 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     ``EC PRIVATE KEY``, passed every check and sat in a file the engine reads as public trust
     material. :func:`has_private_key_label` says what it matches; it reads the raw bytes, so a
     non-ASCII line the load never sees is checked here. A legacy-encrypted key is refused by the
-    header check first, with that check's text."""
+    header check first, with that check's text. Both checks run ahead of the non-ASCII refusal, so
+    a block that holds a non-ASCII byte as well still names the header or the key."""
     kept: list[bytes] = []
 
     inside = False
     blocks = 0
-    fresh = True  # the first line, or the line after an END line: where OpenSSL drops a BOM
-    for raw in data.splitlines(keepends=True):
+    fresh = True  # the first line, or the line after a block's END line: OpenSSL drops a BOM there
+    for raw in io.BytesIO(data):  # splits at LF alone; bytes.splitlines also splits at a lone CR
         line = raw[len(_UTF8_BOM) :] if fresh and raw.startswith(_UTF8_BOM) else raw
         fresh = False
-        if line.startswith(_PEM_TRUSTED):
+        if _PEM_TRUSTED in line:
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor {spec.path!r} holds an OpenSSL trusted-certificate block, "
-                "which the engine does not load. Re-export each certificate in it as a plain "
-                "CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> converts one "
-                "certificate per run"
+                f"{spec.setting}: the trust anchor {spec.path!r} names the trusted-certificate "
+                "BEGIN marker, even outside a block, as in a comment. Converting such a block "
+                "discards its trust settings, so confirm the CA should be trusted without them. "
+                "The engine does not load such a block. Remove a comment that names the marker, "
+                "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
+                "CERTIFICATE block per run"
             )
         if line.startswith(_PEM_BEGIN):
-            inside = True
             blocks += 1
+        # Any BEGIN, rather than a model of OpenSSL's 254-byte pieces. For the non-ASCII check that
+        # refuses more. But ``inside`` also decides ``fresh`` below, and there a BEGIN OpenSSL did
+        # not read can strip a mark OpenSSL keeps. A BEGIN straight behind a mark does not count.
+        opens = _PEM_BEGIN in line.removeprefix(_UTF8_BOM + _PEM_BEGIN)
+        inside = inside or opens
         if inside or line.isascii():
             kept.append(line)
         if line.startswith(_PEM_END):
-            inside = False
-            fresh = True
+            # A stray END closes nothing, so OpenSSL keeps a mark after it. An END and a BEGIN on
+            # one line leave a block open: OpenSSL may read that BEGIN past 254 bytes.
+            fresh = inside and not opens
+            inside = opens
     if not blocks:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust"
         )
-    try:
-        text = b"".join(kept).decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
-            "block, so it is not a readable certificate"
-        ) from exc
-    if has_encryption_header(text):
+    joined = b"".join(kept)
+    if has_encryption_header_bytes(joined):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
             "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
@@ -711,6 +726,14 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "or export the CA certificate as a plain CERTIFICATE block"
         )
     _refuse_a_private_key(data, spec)
+    try:
+        text = joined.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
+            "block, or on or below a line holding a -----BEGIN and above the next -----END line. "
+            "Remove that byte, or the -----BEGIN text if that line is a comment"
+        ) from exc
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
@@ -1716,18 +1739,35 @@ def database_ca_anchor_spec(
     ``None`` (module item 12, vault BACKLOG #3090 step 7).
 
     ``None`` when the connection names no ``sslca``, when its driver never reads it
-    (:func:`unread_ca_reason`), and when no spelling the build checks names an existing path other
-    than a directory: a missing file or a directory is left to the driver, as the build leaves it,
-    and a value that can name another host is never opened here, since the build refuses it. The
-    first spelling that names one is checked. A pipe or device is a spec, and
+    (:func:`unread_ca_reason`) and the value is not refused below, and when no spelling the build
+    checks names an existing path other than a directory: a missing file or a directory is left to
+    the driver, as the build leaves it. The first spelling that names one is checked. A pipe or device is a spec, and
     :func:`evaluate_anchor` refuses it unread. ``kind`` and ``label`` are
-    :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers."""
-    value = _generic_odbc_param(settings, "sslca")
-    if value is None or unread_ca_reason(settings) is not None:
-        return None
-    from messagefoundry.transports.database import driver_file_spellings
+    :func:`outbound_anchor_spec`'s. Module item 12 says what the check covers.
 
-    spellings = driver_file_spellings(value)
+    Raises ``ValueError`` when ``names_another_host`` refuses the value (BACKLOG #2705), in every
+    ``sslmode``. The value is judged here again, not taken from the build's judgement, and the
+    spellings checked come from this one judgement. The lane check turns the ``ValueError`` into a
+    refused setting, as it does a bad pin. ``docs/CONNECTIONS.md``, Generic ODBC, states that
+    check's limits."""
+    value = _generic_odbc_param(settings, "sslca")
+    if value is None:
+        return None
+    from messagefoundry.transports.database import (
+        driver_file_spellings,
+        file_keyword_verdicts,
+        names_another_host,
+    )
+
+    verdicts = file_keyword_verdicts(value)
+    if names_another_host(value, verdicts):
+        raise ValueError(
+            f"{kind} '{name}' odbc_params sslca must be a plain local path on this host: not a "
+            "share, a network drive, a link to one, or a path the check cannot read"
+        )
+    if unread_ca_reason(settings) is not None:
+        return None
+    spellings = driver_file_spellings(value, verdicts)
     path = next((p for p in spellings if os.path.exists(p) and not os.path.isdir(p)), None)
     if path is None:
         return None
@@ -2581,7 +2621,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and
     :class:`AnchorSettingRefused`, a ``ValueError``, for a ``tls_ca_pin`` that is blank, unread or
-    does not parse, or a CA path the OS will not take. Each names the connection. A lane with no
+    does not parse, a CA path the OS will not take, or a generic DATABASE ``sslca`` value
+    :func:`~messagefoundry.transports.database.names_another_host` refuses (BACKLOG #2705), in
+    every ``sslmode``. Each names the connection. A lane with no
     CA it reads is a no-op: no store call, no audit row. A store that refuses the audit read or
     write raises :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered
     below, so the next check reads the file again (BACKLOG #3091).
@@ -2609,7 +2651,7 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             else:
                 spec = lane_anchor_spec(direction, name, settings)
         except ValueError as exc:
-            # No file was read, so this is a refused setting, and the class says so.
+            # The spec refused the setting before any anchor was evaluated, and the class says so.
             raise AnchorSettingRefused(str(exc)) from exc
         if spec is None:
             refused.pop(f"{direction}:{name}", None)

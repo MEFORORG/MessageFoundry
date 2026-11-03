@@ -38,8 +38,15 @@ from typing import Any
 
 import pytest
 
+from tests import _spawn_lock
 from tests._bash_resolver import require_bash
-from tests._spawn_lock import run_single, single_spawn, spawn_burst
+from tests._spawn_lock import (
+    NativeCrashWarning,
+    run_retrying_a_native_crash,
+    run_single,
+    single_spawn,
+    spawn_burst,
+)
 from tests.test_blanket_stage_guard import bash
 from tests.test_claude_settings_contract import (
     _PLACEHOLDER,
@@ -49,6 +56,7 @@ from tests.test_claude_settings_contract import (
     matcher_selects,
 )
 from tests.test_install_gate_upstream_provenance import _psq
+from tests.test_spawn_lock import _scripted
 from tests.test_worktree_gate import assert_denied, run_gate
 
 DISPATCHER = _ROOT / "scripts" / "hooks" / "shell-guard-dispatch.ps1"
@@ -97,8 +105,10 @@ def _proc(
     argv: list[str], raw: str, *, burst: bool = False, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     # A single launch takes the shared side of the pwsh spawn lock (BACKLOG #1304). Inside a
-    # burst, which already holds the exclusive side, it must not wait on its own burst.
-    launch = subprocess.run if burst else run_single
+    # burst, which already holds the exclusive side, it must not wait on its own burst. Both paths
+    # launch pwsh once more if it dies on a native crash with no output (BACKLOG #2746): the
+    # equivalence test's burst launches are where that crash was last seen.
+    launch = run_retrying_a_native_crash if burst else run_single
     full = {**os.environ, **_HERMETIC, **(env or {})}
     return launch(argv, input=raw, capture_output=True, text=True, timeout=120, env=full)
 
@@ -468,6 +478,19 @@ def test_a_failed_native_command_inside_a_guard_is_not_a_failed_guard(tmp_path: 
 def test_an_unknown_option_is_reported_not_run() -> None:
     proc = _proc(_dispatch_argv(["--user-hook=../escape"]), json.dumps(bash("git status")))
     assert proc.returncode == 1 and "unknown option" in proc.stderr
+
+
+@pytest.mark.parametrize("burst", [True, False])
+def test_both_launch_paths_retry_a_silent_native_crash(
+    monkeypatch: pytest.MonkeyPatch, burst: bool
+) -> None:
+    """BACKLOG #2746: the burst path is where pwsh last died on SIGSEGV with no output, and it
+    called ``subprocess.run`` directly, past ``run_single``. Both paths now launch once more."""
+    calls = _scripted(monkeypatch, (-11, "", ""), (0, "ok", ""))
+    monkeypatch.setattr(_spawn_lock, "_ROOT", None)
+    with pytest.warns(NativeCrashWarning, match="SIGSEGV"):
+        assert _run(_dispatch_argv([]), "{}", burst=burst) == "ok"
+    assert len(calls) == 2
 
 
 # ================================================================== the account's worktree gate

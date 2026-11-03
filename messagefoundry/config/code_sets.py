@@ -711,11 +711,10 @@ def code_set(name: str) -> CodeSet:
             f"code_set({name!r}) called with no active code sets — code sets resolve only while a "
             "config bundle is being loaded or its graph is running (load it via load_config())"
         )
-    try:
-        return active[name]
-    except KeyError:
+    if name not in active:
         available = ", ".join(sorted(active)) or "(none)"
         raise CodeSetError(
             f"no such code set {name!r} — expected a file codesets/{name}.csv or "
             f"codesets/{name}.toml relative to the --config dir; available: {available}"
-        ) from None
+        )
+    return active[name]

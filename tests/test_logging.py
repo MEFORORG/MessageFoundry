@@ -2691,7 +2691,7 @@ def _alternating_growth[T](
     multiplies both endpoints by k, and k cancels. Load that is not uniform does not cancel.
 
     A KNOWN LIMIT, LEFT ON PURPOSE: this is the simpler sampler the access arm already used.
-    ``_growth_between`` in ``tests/test_log_redaction_secret_domain.py`` adds equal windows and a
+    ``_growth_between`` in ``tests/_growth.py`` adds equal windows and a
     random order per round, after measuring reds this form can show under a co-tenant on a 0.07 ms
     subject. The access arm's short emit costs only about 0.3 to 0.7 ms, so it is exposed to the
     same failure: a co-tenant that interrupts every long sample but lets short ones finish inflates
