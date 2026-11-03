@@ -5402,10 +5402,13 @@ class EgressSettings(_Section):
             except ValueError:
                 netloc = ""
             userinfo, at, _ = netloc.rpartition("@")
-            if at and userinfo.strip(":"):
-                raise refused from None
-            raise
-        return value
+            if not (at and userinfo.strip(":")):
+                raise
+        else:
+            return value
+        # Raised after the handler ends, not inside it with ``from None``: that would still leave the
+        # parse's error on ``__context__``, so neither chain may hold it (BACKLOG #1796).
+        raise refused
 
     @field_validator("allowed_recipient_domains", mode="after")
     @classmethod

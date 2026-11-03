@@ -784,6 +784,26 @@ def test_a_credential_in_egress_proxy_url_is_refused_at_load(proxy_url: str) -> 
         assert _USER not in text and _PASSWORD not in text, text
 
 
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        f"http://{_USER}@{_PROXY_HOST}:99999",
+        f"http://:{_PASSWORD}@{_PROXY_HOST}/path",
+        f"http://{_USER}@{_PROXY_HOST}?x",
+    ],
+    ids=["user-bad-port", "password-with-path", "user-with-query"],
+)
+def test_a_credential_beside_a_shape_fault_is_refused_with_no_chain(proxy_url: str) -> None:
+    """The credential refusal made after the parse refused the shape carries neither chain.
+    ``from None`` would clear ``__cause__`` and leave the parse's error on ``__context__``
+    (BACKLOG #1796), so the refusal is raised after that handler ends. Called on the validator
+    itself, because pydantic's wrapper would hide the chain this pins."""
+    with pytest.raises(ValueError, match=r"\[egress\]\.proxy_url holds a user") as refused:
+        EgressSettings._proxy_url_shape(proxy_url)
+    assert refused.value.__cause__ is None
+    assert refused.value.__context__ is None
+
+
 def test_a_credential_inherited_from_egress_proxy_url_fails_the_build() -> None:
     """``_dest_config`` copies ``[egress].proxy_url`` in before the connector is built, so the same
     check reads it. The load refuses that value first, so it is put past the load here, to pin that
