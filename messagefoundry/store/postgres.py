@@ -209,12 +209,15 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    GLOBAL_SESSION_EPOCH_MISSING,
+    GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
+    USER_READ_SQL,
     VIEWED_EVENT,
     AdMap,
     AdMapChange,
@@ -825,6 +828,14 @@ _SCHEMA: list[str] = [
         salt        TEXT NOT NULL,
         created_at  DOUBLE PRECISION NOT NULL
     )""",
+    # The store's global session epoch (BACKLOG #5091) -- see the SQLite `_SCHEMA`, and
+    # GLOBAL_SESSION_EPOCH_SQL in store.py for what it decides. One row, seeded here, so every open
+    # finds it. Non-secret: a counter.
+    """CREATE TABLE IF NOT EXISTS global_session_epoch (
+        id    INTEGER PRIMARY KEY CHECK (id = 1),
+        epoch INTEGER NOT NULL DEFAULT 0
+    )""",
+    "INSERT INTO global_session_epoch (id, epoch) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
     # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
     # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
     # cipher-covered (table, column); never deleted by the engine. Non-secret.
@@ -992,6 +1003,7 @@ _SCHEMA: list[str] = [
         auth_mechanism TEXT,
         idp_auth_time DOUBLE PRECISION,
         user_epoch   INTEGER NOT NULL DEFAULT 0,
+        global_epoch INTEGER NOT NULL DEFAULT 0,
         seal         TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
@@ -1196,6 +1208,9 @@ _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"
 _SCHEMA.append(_gated_add_column("sessions", "user_epoch", "INTEGER NOT NULL DEFAULT 0"))
 _SCHEMA.append(_gated_add_column("sessions", "seal", "TEXT NOT NULL DEFAULT ''"))
 _SCHEMA.append(_gated_add_column("users", "session_epoch", "INTEGER NOT NULL DEFAULT 0"))
+# BACKLOG #5091: the global epoch a session was minted under, for a table created before the
+# column. An existing session gets 0, which its seal never covered, so a keyed store refuses it.
+_SCHEMA.append(_gated_add_column("sessions", "global_epoch", "INTEGER NOT NULL DEFAULT 0"))
 # BACKLOG #2592: the passkey digest and the account's integrity seal. An existing account gets an
 # empty seal, which a keyed store refuses like a wrong one; store.py's report_unsealed_users says why
 # nothing seals it here.
@@ -1377,13 +1392,13 @@ def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
 _PG_SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
-    " user_epoch, seal)"
-    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11)"
+    " user_epoch, global_epoch, seal)"
+    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11,$12)"
 )
 _PG_SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=$1, user_id=$2, created_at=$3, expires_at=$4, revoked_at=$5,"
     " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
-    " user_epoch=$11, seal=$12 WHERE token_hash=$13 AND seal=$14"
+    " user_epoch=$11, global_epoch=$12, seal=$13 WHERE token_hash=$14 AND seal=$15"
 )
 # Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`. store.py says
 # which method runs each, and that no other statement names the table.
@@ -9272,7 +9287,7 @@ class PostgresStore:
         )
 
     async def get_user(self, user_id: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE id=$1", user_id)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
@@ -9416,13 +9431,13 @@ class PostgresStore:
         return int(row["n"]) if row else 0
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE username=$1", username)
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE username=$1", username)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
         # rather than the recyclable sAMAccountName. A lookup, not a scan: it is on the sign-in path.
-        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=$1", object_id)
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE directory_object_id=$1", object_id)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def set_user_username(
@@ -9530,12 +9545,12 @@ class PostgresStore:
         # issuer, so a subject-only match would refuse two unrelated people sharing an opaque
         # identifier at different IdPs.
         d = await self._fetchone(
-            "SELECT * FROM users WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
+            f"{USER_READ_SQL} WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
         )
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def list_users(self) -> list[UserRecord]:
-        rows = await self._fetchall("SELECT * FROM users ORDER BY username")
+        rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
         return [UserRecord.from_mapping(dict(r)) for r in rows]
 
     async def count_users(self) -> int:
@@ -9783,6 +9798,7 @@ class PostgresStore:
                     None if session is None else SessionRecord.from_mapping(dict(session)),
                     record,
                     await self._account_passkeys(conn, cred.user_id),
+                    global_epoch=await self._global_session_epoch(conn),
                 ):
                     return False
             await self._write_passkeys(
@@ -10494,16 +10510,22 @@ class PostgresStore:
         # An unguarded sign-in takes FOR SHARE: it still waits behind a revoke's users UPDATE, and
         # parallel sign-ins of one account do not wait on each other.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # The global epoch rides the same read (BACKLOG #5091). The lock clause covers only
+            # `users`, so it is a plain read: under any isolation it is a value some commit left,
+            # and a revoke still running has left none, so this session ends when that revoke
+            # commits. revoke_all_sessions says why that read never waits.
             if require_federated_subject is None:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
-                    " FOR SHARE",
+                    "SELECT oidc_issuer, oidc_subject, session_epoch,"
+                    f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=$1"
+                    " FOR SHARE OF users",
                     user_id,
                 )
             else:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
-                    " FOR UPDATE",
+                    "SELECT oidc_issuer, oidc_subject, session_epoch,"
+                    f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=$1"
+                    " FOR UPDATE OF users",
                     user_id,
                 )
             if require_federated_subject is not None:
@@ -10520,6 +10542,7 @@ class PostgresStore:
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
+                global_epoch=0 if row is None else int(row["global_epoch"]),
             )
             record = seal_session(self._row_sealer, record)
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
@@ -10547,6 +10570,10 @@ class PostgresStore:
         updated = seal_session(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
         return updated if _rowcount(status) > 0 else None
+
+    async def _global_session_epoch(self, conn: Any) -> int:
+        """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
+        return int(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
 
     async def _session_epoch(self, conn: Any, user_id: str) -> int:
         """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
@@ -10708,11 +10735,22 @@ class PostgresStore:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss."""
+        Raises the store's global session epoch first (BACKLOG #5091), which ends every session
+        minted before it whatever account it belongs to, then the epoch of each account its read of
+        the account list returns, then ends the sessions it finds and re-seals the kept one under
+        both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that leaves.
+
+        The raise is first so a second revoke of every account waits on that one row, holding
+        nothing, until this one commits. Nothing else locks the row: every reader of the global
+        epoch reads it without a lock clause, and under MVCC such a read never waits on a writer,
+        so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
+            current = await conn.fetchval(
+                "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+            )
+            if current is None:
+                raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
             for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
                 await self._bump_session_epoch(conn, str(row["id"]))
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
@@ -10722,8 +10760,11 @@ class PostgresStore:
                 )
                 if owner is not None:
                     epoch = await self._session_epoch(conn, str(owner))
+                    raised = int(current)
                     await self._write_session(
-                        conn, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                        conn,
+                        except_token_hash,
+                        lambda s: replace(s, user_epoch=epoch, global_epoch=raised),
                     )
         return _rowcount(status)
 

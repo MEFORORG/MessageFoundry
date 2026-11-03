@@ -1295,8 +1295,8 @@ SESSION_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
-    " user_epoch, seal)"
-    " VALUES (?,?,?,?,?,NULL,?,?,NULL,?,?,?,?)"
+    " user_epoch, global_epoch, seal)"
+    " VALUES (?,?,?,?,?,NULL,?,?,NULL,?,?,?,?,?)"
 )
 
 # BACKLOG #2592: the one statement that rewrites a session's sealed columns, used only by the store's
@@ -1305,8 +1305,30 @@ _SESSION_INSERT: Final = (
 _SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
     " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
-    " seal=? WHERE token_hash=? AND seal=?"
+    " global_epoch=?, seal=? WHERE token_hash=? AND seal=?"
 )
+
+# THE STORE'S GLOBAL SESSION EPOCH (BACKLOG #5091). One row, `global_session_epoch.epoch`, raised by
+# one by every every-account revoke (`revoke_all_sessions`), on all three backends. Each session is
+# stamped with it at mint, in its sealed `global_epoch` column beside `user_epoch`, and resolves
+# only while both stamps equal the current values (`session_epochs_current`). The revoke raises it
+# whatever account list it read, so a session of an account created while it runs, a session its
+# sweep missed, and a session of an account whose record fails its seal, whose own epoch the
+# revoke cannot raise, all end with it. The two stamps are compared apart, never summed: a sum
+# would let a lowered global value cancel a raised account epoch. The row itself is not sealed, so
+# whoever can write it could lower it and revive a session that only this epoch had ended. Every
+# user reader returns it beside the row (`USER_READ_SQL`), so the gate's compare costs no extra
+# statement and no cache, and every engine shard reads the one row.
+GLOBAL_SESSION_EPOCH_SQL: Final = "(SELECT epoch FROM global_session_epoch WHERE id = 1)"
+#: The head of every user reader, on every backend: the row, and the global epoch beside it.
+USER_READ_SQL: Final = f"SELECT *, {GLOBAL_SESSION_EPOCH_SQL} AS global_session_epoch FROM users"
+#: Raised, and the revoke rolled back, when the raise of the global epoch matched no row. Each
+#: schema seeds the row; without it no session could be ended this way, so the revoke refuses.
+GLOBAL_SESSION_EPOCH_MISSING: Final = (
+    "the store's global_session_epoch row is missing, so the every-account session revoke cannot"
+    " end every session; nothing was revoked"
+)
+
 
 # Vault BACKLOG #3028, ADR 0210: the session lineage's three statements, in `?` form for SQLite and
 # SQL Server; postgres.py respells them for `$n`. The INSERT runs only inside rotate_session's own
@@ -1336,6 +1358,7 @@ def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[objec
         new.auth_mechanism,
         new.idp_auth_time,
         new.user_epoch,
+        new.global_epoch,
         new.seal,
         old.token_hash,
         old.seal,
@@ -1355,6 +1378,7 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
         record.auth_mechanism,
         record.idp_auth_time,
         record.user_epoch,
+        record.global_epoch,
         record.seal,
     )
 
@@ -1392,6 +1416,7 @@ def new_session_record(
     auth_mechanism: str | None,
     idp_auth_time: float | None,
     user_epoch: int,
+    global_epoch: int,
 ) -> SessionRecord:
     """The row ``create_session`` writes, with every float as the backend will read it back, so the
     seal made over it verifies after the round trip (BACKLOG #2592).
@@ -1413,6 +1438,7 @@ def new_session_record(
         auth_mechanism=auth_mechanism,
         idp_auth_time=_opt_float(idp_auth_time),
         user_epoch=int(user_epoch),
+        global_epoch=int(global_epoch),
     )
 
 
@@ -1999,6 +2025,10 @@ class UserRecord:
     # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
+    # THE STORE'S GLOBAL SESSION EPOCH as this read found it (BACKLOG #5091), which a session's own
+    # ``global_epoch`` must equal too. Not a column of this row and not in its seal: every user reader
+    # selects it beside the row (``USER_READ_SQL``). ``GLOBAL_SESSION_EPOCH_SQL`` says why.
+    global_session_epoch: int = 0
     #: Every column of the row as it was read, for the integrity seal (BACKLOG #2592). Carries the
     #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared as a whole.
     #: Beyond the seal check and the store's write helper, at least the TOTP cell is read from it
@@ -2068,6 +2098,9 @@ class UserRecord:
             # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
             # session minted before a revoke also carries, so it is the OPEN direction.
             session_epoch=int(d["session_epoch"]),
+            # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
+            # mapping without the global epoch fails here rather than decode one nobody read.
+            global_session_epoch=int(d["global_session_epoch"]),
             row=UserRow.from_mapping(d),
         )
 
@@ -2147,6 +2180,10 @@ class SessionRecord:
     #: (BACKLOG #2592). A whole-user revoke raises the account's epoch, so a session that carries an
     #: older one resolves to nothing.
     user_epoch: int = 0
+    #: The store's global session epoch when this session was minted, or re-sealed by the
+    #: every-account revoke that kept it (BACKLOG #5091). That revoke raises the global epoch, so a
+    #: session that carries an older one resolves to nothing, whatever account it belongs to.
+    global_epoch: int = 0
     #: The row's integrity seal (``mfseal:v1:...``, BACKLOG #2592) over every field above except the
     #: ones :data:`SESSION_SEAL_EXCLUDED` names. Empty on a revoked row and on a keyless store.
     seal: str = ""
@@ -2167,6 +2204,7 @@ class SessionRecord:
             idp_auth_time=_opt_float(d.get("idp_auth_time")),
             # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
             user_epoch=int(d["user_epoch"]),
+            global_epoch=int(d["global_epoch"]),
             seal=d["seal"] or "",
         )
 
@@ -2510,11 +2548,20 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
 
 
+def session_epochs_current(session: SessionRecord, *, user_epoch: int, global_epoch: int) -> bool:
+    """Whether ``session`` carries both epochs a revoke would have raised past it: its account's
+    ``user_epoch`` (BACKLOG #2592) and the store's ``global_epoch`` (BACKLOG #5091). The one compare
+    every reader of a session's epochs makes; ``GLOBAL_SESSION_EPOCH_SQL`` says why there are two."""
+    return session.user_epoch == user_epoch and session.global_epoch == global_epoch
+
+
 def session_owes_unproven_factor(
     sealer: RowSealer | None,
     session: SessionRecord | None,
     record: UserAuthzRecord,
     passkeys: Sequence[WebAuthnCredential],
+    *,
+    global_epoch: int,
 ) -> bool:
     """Whether binding a new factor for ``record``'s account from ``session`` must be refused,
     because the account holds a second factor this session has not proven (BACKLOG #3014, #3690).
@@ -2525,6 +2572,7 @@ def session_owes_unproven_factor(
     account with no factor at all binds its first one from a pending session. So it encodes "no
     unproven factor", never "zero factors". Each factor term can only add a factor, as
     ``_second_factor_enrolled`` reads them: TOTP, a sealed passkey digest, or any passkey row.
+    ``global_epoch`` is the store's global session epoch, read in the same transaction.
 
     Fails closed (True) on a missing, revoked, foreign, stale-epoch or unsealed session, and on an
     unsealed account: nothing there can be shown to owe nothing. A missing account is the caller's
@@ -2533,7 +2581,9 @@ def session_owes_unproven_factor(
         session is None
         or session.revoked_at is not None
         or session.user_id != record.row.id
-        or session.user_epoch != record.row.session_epoch
+        or not session_epochs_current(
+            session, user_epoch=record.row.session_epoch, global_epoch=global_epoch
+        )
         or not session_seal_ok(sealer, session)
         or not user_seal_ok(sealer, record)
     ):
@@ -8387,6 +8437,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
     idp_auth_time REAL,                        -- the IdP's auth_time for an oidc session (BACKLOG #2143)
     user_epoch   INTEGER NOT NULL DEFAULT 0,   -- users.session_epoch at mint (BACKLOG #2592)
+    global_epoch INTEGER NOT NULL DEFAULT 0,   -- global_session_epoch.epoch at mint (BACKLOG #5091)
     seal         TEXT NOT NULL DEFAULT ''      -- integrity seal over the row; '' once revoked (#2592)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
@@ -8490,6 +8541,15 @@ CREATE TABLE IF NOT EXISTS secret_rotation_meta (
     tracked_since TEXT NOT NULL,      -- ISO YYYY-MM-DD first observed (tracked-since age floor)
     last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
 );
+
+-- BACKLOG #5091: the store's global session epoch, one row, raised by every every-account session
+-- revoke. A session resolves only while its global_epoch equals it; GLOBAL_SESSION_EPOCH_SQL in
+-- store.py says why. Seeded here, so every open finds the row. Non-secret: a counter.
+CREATE TABLE IF NOT EXISTS global_session_epoch (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO global_session_epoch (id, epoch) VALUES (1, 0);
 
 -- BACKLOG #2614: the restore marker. The same text as _RESTORE_MARKER_DDL, which a test pins;
 -- spelled here too, so this script stays one literal the BEGIN guard can read.
@@ -10386,6 +10446,13 @@ class MessageStore:
             )
         if "seal" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
+        # BACKLOG #5091: the global epoch a session was minted under. An existing row gets 0, the
+        # value the global row is seeded with, and its seal never covered the column, so a keyed
+        # store refuses it as it refuses any row whose seal does not verify.
+        if "global_epoch" not in session_cols:
+            await db.execute(
+                "ALTER TABLE sessions ADD COLUMN global_epoch INTEGER NOT NULL DEFAULT 0"
+            )
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -16256,7 +16323,7 @@ class MessageStore:
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
-            cur = await db.execute("SELECT * FROM users WHERE id=?", (user_id,))
+            cur = await db.execute(f"{USER_READ_SQL} WHERE id=?", (user_id,))
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
@@ -16421,7 +16488,7 @@ class MessageStore:
         # happen to share an opaque identifier at different IdPs.
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+                f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
             )
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
@@ -16432,13 +16499,13 @@ class MessageStore:
         # A lookup rather than a scan for the reason get_user_by_federated_subject gives: it sits on
         # the sign-in path, and list_users() would make every directory login O(accounts).
         async with self._read() as db:
-            cur = await db.execute("SELECT * FROM users WHERE directory_object_id=?", (object_id,))
+            cur = await db.execute(f"{USER_READ_SQL} WHERE directory_object_id=?", (object_id,))
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         async with self._read() as db:
-            cur = await db.execute("SELECT * FROM users WHERE username=?", (username,))
+            cur = await db.execute(f"{USER_READ_SQL} WHERE username=?", (username,))
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
@@ -16511,7 +16578,7 @@ class MessageStore:
 
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
-            cur = await db.execute("SELECT * FROM users ORDER BY username")
+            cur = await db.execute(f"{USER_READ_SQL} ORDER BY username")
             return [UserRecord.from_mapping(dict(r)) for r in await cur.fetchall()]
 
     async def count_users(self) -> int:
@@ -16810,6 +16877,7 @@ class MessageStore:
                 await self._read_session_row(for_session),
                 record,
                 await self._account_passkeys(cred.user_id),
+                global_epoch=await self._global_session_epoch(),
             ):
                 await self._db.rollback()  # only read; this closes the transaction
                 return False
@@ -17699,7 +17767,9 @@ class MessageStore:
         # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=?", (user_id,)
+                "SELECT oidc_issuer, oidc_subject, session_epoch,"
+                f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
+                (user_id,),
             )
             row = await cur.fetchone()
             if require_federated_subject is not None:
@@ -17717,6 +17787,7 @@ class MessageStore:
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
+                global_epoch=0 if row is None else int(row["global_epoch"]),
             )
             record = seal_session(self._row_sealer, record)
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
@@ -17933,14 +18004,19 @@ class MessageStore:
     async def _revoke_all_sessions_in_txn(self, except_token_hash: str | None, now: float) -> int:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
-        Every account's epoch is raised first, as :meth:`revoke_user_sessions` raises one, then
-        one sweep ends the rows and the kept row is re-sealed under its own account's new epoch.
+        The store's global session epoch is raised first (BACKLOG #5091), then every account's
+        epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
+        row is re-sealed under its own account's new epoch and the new global one.
 
-        The first statement is a write, which takes SQLite's write lock even when it matches no
-        row, so the reads below run under it: another process (an engine shard, or the engine
-        beside ``admin-revoke-sessions``) committing between a read and the first update would
-        otherwise fail the upgrade from a stale snapshot, which the busy timeout does not retry."""
-        await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
+        The first statement is a write, which takes SQLite's write lock, so the reads below run
+        under it: another process (an engine shard, or the engine beside
+        ``admin-revoke-sessions``) committing between a read and the first update would otherwise
+        fail the upgrade from a stale snapshot, which the busy timeout does not retry."""
+        cur = await self._db.execute(
+            "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1"
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
         for row in await cur.fetchall():
             await self._bump_session_epoch(str(row[0]))
@@ -17960,7 +18036,11 @@ class MessageStore:
         owner = await kept.fetchone()
         if owner is not None:
             epoch = await self._session_epoch(str(owner[0]))
-            await self._write_session(except_token_hash, lambda s: replace(s, user_epoch=epoch))
+            current = await self._global_session_epoch()
+            await self._write_session(
+                except_token_hash,
+                lambda s: replace(s, user_epoch=epoch, global_epoch=current),
+            )
         return revoked
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -18027,6 +18107,15 @@ class MessageStore:
         cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
         row = await cur.fetchone()
         return 0 if row is None else int(row["session_epoch"])
+
+    async def _global_session_epoch(self) -> int:
+        """The store's global session epoch (BACKLOG #5091), read on the writer connection inside
+        the caller's transaction."""
+        cur = await self._db.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
+        return int(row[0])
 
     async def _bump_session_epoch(self, user_id: str) -> None:
         """Raise the account's session epoch through the write helper, inside the caller's writer

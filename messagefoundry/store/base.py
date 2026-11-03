@@ -3147,10 +3147,14 @@ class AuthStore(Protocol):
         """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
         return how many it revoked (BACKLOG #2614).
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss. A kept session whose seal does not verify raises
-        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
+        In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
+        every session minted before it whatever account it belongs to, and the epoch of each
+        account its read of the account list returns. It then ends the sessions it finds and
+        re-seals the kept session under its account's new epoch and the new global one. store.py's
+        ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
+        *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal
+        does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError`, a store with
+        no global epoch row raises ``RuntimeError``, and either way the transaction rolls back."""
         ...
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
