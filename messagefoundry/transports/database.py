@@ -3717,7 +3717,11 @@ class DatabaseLookupExecutor:
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
             self._dsn[cname] = _build_dsn(
-                dict(s), read_only=True, attested=attested, connection=cname
+                # Named as the loosening reports name a lookup, so a refusal matches its row.
+                dict(s),
+                read_only=True,
+                attested=attested,
+                connection=f"db_lookup:{cname}",
             )
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"

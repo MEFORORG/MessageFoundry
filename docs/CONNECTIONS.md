@@ -1780,21 +1780,25 @@ driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `
 to its own default port, and the check cannot see that. Check that your driver reads the keyword.
 
 **On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
-string is built and by the egress check, so `messagefoundry check` refuses them too (BACKLOG
-#4873). This holds for all four database factories, since `db_lookup` and `DatabaseRef` build the
-preset. The preset sends `SERVER=<server>,<port>`, and the port pin and the host match assume the
-driver reads `,<port>` as the port and the text before it as one host. psqlODBC does not: it passes
-`SERVER` to libpq, which reads a comma as a list of hosts. There the port would be read as a second
-host name, which can resolve as a numeric address, and a comma in `server` could name any host.
+string is built and by the egress check (BACKLOG #4873). Both run when the engine starts or
+reloads, and in `messagefoundry check` where its build leg runs: with a `messagefoundry.toml` or
+`MEFOR_AI_ENVIRONMENT`, and for a `DatabaseRef` only once its `env()` values resolve. This holds
+for all four database factories, since `db_lookup` and `DatabaseRef` build the preset. The preset
+sends `SERVER=<server>,<port>`, and the port pin and the host match assume the driver reads
+`,<port>` as the port and the text before it as one host. psqlODBC does not: it passes `SERVER` to
+libpq, which reads a comma as a list of hosts. There the port would be read as a second host name,
+which can resolve as a numeric address, and a comma in `server` could name any host.
 
-- The `odbc_driver` name must hold `msodbcsql`, `sql server` or `sql native client`, in any case,
-  and none of `postgres`, `psqlodbc`, `mysql` or `mariadb`. A mixed name such as
-  `PostgreSQL via SQL Server gateway` is refused. For a driver that is not SQL Server's, use
-  `dialect="generic"` on `Database` or `DatabasePoll`; `db_lookup` and `DatabaseRef` take only a
-  SQL Server driver.
-- FreeTDS is refused. Its ODBC driver reads `,<port>` as the port, but the preset's TLS keywords,
-  `Encrypt` and `TrustServerCertificate`, are the Microsoft drivers', and the engine has no
-  evidence that FreeTDS reads them. A hop the engine reports as verifying TLS could then not verify.
+- The `odbc_driver` must be one of Microsoft's registered names, whole, in any case and spacing:
+  `ODBC Driver <n> for SQL Server` or `SQL Server Native Client <n>`. A path is accepted when its
+  file name is the Microsoft ODBC Driver library (`libmsodbcsql-18.so`, `libmsodbcsql.18.dylib`,
+  `msodbcsql18.dll`, with a version suffix allowed). Any other name is refused, at least a mixed
+  name such as `PostgreSQL via SQL Server gateway`, a vendor driver whose name mentions SQL Server,
+  FreeTDS, and the bare legacy `SQL Server`, which on Linux is commonly a FreeTDS alias. FreeTDS
+  reads `,<port>` as the port, but nothing shows it reads the preset's TLS keywords, `Encrypt` and
+  `TrustServerCertificate`, so a hop the engine reports as verifying TLS could then not verify.
+  For another driver, use `dialect="generic"` on `Database` or `DatabasePoll`; `db_lookup` and
+  `DatabaseRef` take only a Microsoft driver.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
 - `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
   the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
@@ -1814,8 +1818,8 @@ An entry with no port admits its host at any port. On the generic dialect the eg
   from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
 - The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
   The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
-  unless it also holds a SQL Server word (`msodbcsql`, `sql server` or `sql native client`): those
-  mark a SQL Server driver, which ignores `PORT`. For a name the preset accepts, use
+  unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
+  `PORT`. For a name the preset accepts, use
   `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A host-only entry
   still admits any driver.
 

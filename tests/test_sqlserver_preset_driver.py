@@ -37,9 +37,9 @@ PINNED = EgressSettings(allowed_db=[f"{HOST}:1433"])
 OPEN = EgressSettings(deny_by_default=False)
 STATEMENT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
 POLL = "SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id"
-DRIVER_REFUSAL = "name a SQL Server driver, or on Database or DatabasePoll use dialect"
+DRIVER_REFUSAL = "name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect"
 
-#: Not a SQL Server name, or one that also holds the word of a driver that reads PORT.
+#: Not a whole Microsoft SQL Server driver name or library file name.
 REFUSED_DRIVERS = [
     "PostgreSQL Unicode",
     "PostgreSQL",
@@ -48,13 +48,21 @@ REFUSED_DRIVERS = [
     "MariaDB ODBC 3.1",
     "Oracle 21",
     "",
-    # Mixed names: a SQL Server word no longer wins on the preset.
+    # Mixed names: a SQL Server word does not make a SQL Server driver on the preset.
     "PostgreSQL via SQL Server gateway",
     "MSODBCSQL-mariadb",
-    "/opt/mysql-compat/libmsodbcsql-18.so",
-    # FreeTDS: nothing shows it reads the preset's Encrypt and TrustServerCertificate keywords.
+    "FreeTDS SQL Server",
+    # FreeTDS, and the bare legacy name it is commonly registered under on Linux: nothing shows
+    # it reads the preset's Encrypt and TrustServerCertificate keywords.
     "FreeTDS",
     "/usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so",
+    "SQL Server",
+    # Vendor drivers that mention SQL Server but configure TLS with their own keywords.
+    "DataDirect 8.0 SQL Server Wire Protocol",
+    "Devart ODBC Driver for SQL Server",
+    "SQL Native Client",
+    # A no-break space folds to a space, but the driver manager reads it as written.
+    "ODBC Driver 18 for SQL\u00a0Server",
 ]
 
 ACCEPTED_DRIVERS = [
@@ -62,9 +70,12 @@ ACCEPTED_DRIVERS = [
     "ODBC Driver 17 for SQL Server",
     "odbc driver 18 for sql  server",
     "SQL Server Native Client 11.0",
-    "SQL Server",
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1",
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
-    "SQL Native Client",
+    # Only the file name is read: a directory cannot change the library that loads.
+    "/opt/mysql-compat/libmsodbcsql-18.so",
+    "/opt/homebrew/lib/libmsodbcsql.18.dylib",
+    r"C:\Windows\System32\msodbcsql18.dll",
 ]
 
 
@@ -178,7 +189,9 @@ def test_a_server_holding_a_comma_is_refused(check: Check, server: str) -> None:
         check(_preset(server=server), EgressSettings(allowed_db=[server]))
 
 
-@pytest.mark.parametrize("driver", ["ODBC Driver 18 for SQL Server", "SQL Server"])
+@pytest.mark.parametrize(
+    "driver", ["ODBC Driver 18 for SQL Server", "SQL Server Native Client 11.0"]
+)
 def test_a_server_holding_an_instance_name_is_refused(check: Check, driver: str) -> None:
     # The preset always sends a port, so an instance name is not what a Microsoft driver dials,
     # and a driver that reads it in place of the port (FreeTDS, even under a SQL Server alias)
@@ -206,7 +219,7 @@ def test_the_refusal_comes_before_the_attested_weakened_tls_audit(
 
 
 def test_a_lookup_refusal_names_the_lookup() -> None:
-    with pytest.raises(ValueError, match="'LK_ACME'"):
+    with pytest.raises(ValueError, match="'db_lookup:LK_ACME'"):
         DatabaseLookupExecutor({"LK_ACME": _preset(odbc_driver="PostgreSQL Unicode")}, egress=OPEN)
 
 
@@ -218,5 +231,5 @@ def test_the_refusal_leads_with_its_remedy_and_fits_a_stored_failure() -> None:
     with pytest.raises(ValueError) as raised:
         _build_dsn(_preset(odbc_driver="PostgreSQL Unicode"), connection="OB_ACME_LAB_RESULTS")
     message = str(raised.value)
-    assert message.index("name a SQL Server driver") < 80
+    assert message.index("name a Microsoft SQL Server driver") < 80
     assert len(message) < 200, len(message)

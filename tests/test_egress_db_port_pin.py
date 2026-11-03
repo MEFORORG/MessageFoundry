@@ -242,7 +242,7 @@ def test_generic_with_a_sql_server_driver_reads_no_port(check: Check) -> None:
     kw: dict[str, Any] = {"dialect": "generic", "server": HOST, "odbc_params": {"PORT": "5432"}}
     with pytest.raises(WiringError, match="use dialect sqlserver, or a driver that reads the PORT"):
         check(kw, PINNED)
-    for driver in ("sql server native client 11.0", "SQL  Server"):
+    for driver in ("sql server native client 11.0", "ODBC Driver 17 for SQL  Server"):
         with pytest.raises(WiringError, match="use dialect sqlserver"):
             check({**kw, "odbc_driver": driver}, PINNED)
     check(kw, HOST_ONLY)  # a host-only entry still admits it
@@ -351,9 +351,15 @@ def test_egress_port_agrees_with_the_hop_guard_port(server: str, params: dict[st
 )
 def test_a_sql_server_word_wins_over_a_known_driver_word(check: Check, driver: str) -> None:
     # The reviewer's path shape: a name holding mysql but naming msodbcsql. A SQL Server word in the
-    # name reads no port, so the pin refuses it; a host-only entry still admits it. The remedy does
-    # not name the preset, which refuses a mixed name (BACKLOG #4873).
+    # name reads no port, so the pin refuses it; a host-only entry still admits it. The remedy
+    # names the preset only for a name the preset accepts, here the Microsoft library file
+    # (BACKLOG #4873).
     kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
-    with pytest.raises(WiringError, match="use a driver known to read the PORT keyword"):
+    remedy = (
+        "use dialect sqlserver"
+        if driver.endswith("libmsodbcsql-18.so")
+        else "use a driver known to read the PORT keyword"
+    )
+    with pytest.raises(WiringError, match=remedy):
         check(kw, PINNED)
     check(kw, HOST_ONLY)
