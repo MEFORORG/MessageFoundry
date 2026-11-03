@@ -109,10 +109,10 @@ is down, no check refused the body. Usually no row is written. A fault after the
 committed row, so check the message log before you resend by hand. On MLLP,
 `MLLPSource._answer_handler_failure` records a `handler_error` connection event. A sender that
 expects replies gets a negative acknowledgment, and the connection closes. The raw-TCP and X12
-listeners record `handler_error` too, after retrying the handler in place, and then close the
-connection; the `SourceConnector` docstring in
-[`transports/base.py`](../messagefoundry/transports/base.py) states what each listener does for a
-sender that waits for no reply (BACKLOG #5022).
+listeners record `handler_error` too; the `SourceConnector` docstring in
+[`transports/base.py`](../messagefoundry/transports/base.py) states what each listener does with
+the frame. Those two retry the handler for a sender that waits for no reply, so a fault after the
+commit can leave more than one committed row for the frame (BACKLOG #5022).
 
 What the sender is told depends on the connector and the content type:
 

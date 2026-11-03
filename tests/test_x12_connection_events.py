@@ -31,9 +31,6 @@ import ast
 import asyncio
 from pathlib import Path
 
-import pytest
-
-import messagefoundry.transports.base as base_mod
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.transports.tcp import TcpSource
 from messagefoundry.transports.x12 import X12Source
@@ -254,12 +251,9 @@ async def test_an_over_cap_interchange_is_recorded_as_frame_oversize() -> None:
     assert events[1][2], "the over-cap event must carry a redacted reason, not an empty one"
 
 
-async def test_an_unexpected_handler_failure_is_recorded_as_handler_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_an_unexpected_handler_failure_is_recorded_as_handler_error() -> None:
     # BACKLOG #5022: was `framing_error`, though the reader had framed the interchange cleanly.
-    # tests/test_tcp_x12_handler_failure.py covers the retry and the close on both listeners.
-    monkeypatch.setattr(base_mod, "HANDLER_RETRY_DELAYS", (0.0,))
+    # tests/test_tcp_x12_handler_failure.py covers the retry, the close and the keep.
 
     async def explode(raw: bytes) -> None:
         raise ValueError("synthetic handler failure")

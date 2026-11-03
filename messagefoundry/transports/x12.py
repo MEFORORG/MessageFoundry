@@ -45,15 +45,17 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    HandlerFault,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
     encode_wire_body,
     float_setting,
-    handle_with_retry,
+    owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
+    recover_handler_fault,
     register_destination,
     register_source,
     wait_for_intake,
@@ -643,6 +645,9 @@ class X12Source(SourceConnector):
         self.host: str = str(s.get("host") or "127.0.0.1")
         self.port: int = port_setting(s["port"], transport="X12 source")
         self.encoding: str = declared_encoding(s.get("encoding"))
+        # Read only to tell whether a handler fault owes the sender a reply (BACKLOG #5022): the
+        # runner, not this listener, builds the reply.
+        self.ack_mode = config.ack_mode
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
         self.max_connections: int | None = positive_cap(
@@ -843,22 +848,30 @@ class X12Source(SourceConnector):
                         for interchange in decoder.feed(chunk):
                             decoded += 1
                             try:
-                                reply = await handle_with_retry(
+                                reply = await self._handler(interchange)
+                            except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
+                                # BACKLOG #5022: the reader framed this interchange cleanly, so
+                                # this is a handler fault, not a framing fault.
+                                outcome = await recover_handler_fault(
                                     self._handler,
                                     interchange,
+                                    exc,
+                                    owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
                                     transport="X12",
                                     peer=peer,
                                     log=logger,
+                                    stopped=lambda: self._admission.stopping,
                                 )
-                            except Exception as exc:  # noqa: BLE001 -- see handle_with_retry
-                                # BACKLOG #5022: the reader framed this interchange cleanly, so this
-                                # is a handler fault, not a framing fault. handle_with_retry logged
-                                # it. Record it, then close, as TcpSource does.
-                                await self._emit_event(
-                                    "handler_error", peer_host=peer_host, reason=safe_exc(exc)
-                                )
-                                failed = True  # handler_error already names why this closes
-                                break
+                                if isinstance(outcome, HandlerFault):
+                                    # Set before the emit, as the other arms do.
+                                    failed = outcome.close
+                                    await self._emit_event(
+                                        "handler_error", peer_host=peer_host, reason=outcome.reason
+                                    )
+                                    if failed:
+                                        break  # the sender waits for a reply: close, so it resends
+                                    continue  # it waits for none: read the interchanges behind it
+                                reply = outcome
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
                                 await self._drain_reply(writer)
