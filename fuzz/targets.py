@@ -660,7 +660,8 @@ def _binary_carriage(data: bytes) -> None:
       here would abort the whole pass, not just skip one row. Its docstring promises that a body it
       does not strip comes back unchanged;
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
-      document-detach scan, whose refusal is ``EscapedDocumentError`` -- and ``extract_obx_document``
+      document-detach scan, whose refusals are ``EscapedDocumentError`` and, for a handle a sender
+      wrote into ``OBX-5.5``, ``InboundDocRefError`` (BACKLOG #5099) -- and ``extract_obx_document``
       on every OBX, whose refusal is ``BinaryCarriageError``.
 
     The HL7 half carries the only carve-outs in this file, one per registered known finding: see

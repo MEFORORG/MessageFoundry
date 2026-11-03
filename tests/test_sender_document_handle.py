@@ -440,16 +440,20 @@ async def test_a_passthrough_child_holds_only_the_documents_its_body_names(
     assert list(await store.attachments_for(child)) == []
 
 
-async def test_an_edit_and_resubmit_child_delivers_the_origins_document(
+async def test_an_edit_and_resubmit_child_holds_only_the_document_its_obx_names(
     store: MessageStore,
 ) -> None:
     from tests._store_audit import no_operator_audit
 
-    doc = _b64(1500)
-    origin, ref, skeleton = await _detached_parent(store, doc)
-    # A foreign handle the operator typed in names an attachment the origin does not hold.
-    _other, foreign = await _held_document(store, _b64(1500, b"S"))
-    edited = skeleton + f"NTE|1||{foreign}\r"
+    ref = await store.put_attachment(chunk_b64(_b64(1500)), "application/pdf")
+    other = await store.put_attachment(chunk_b64(_b64(1500, b"S")), "application/pdf")
+    skeleton = _hl7(make_doc_ref(ref, "Application"))
+    origin = await store.enqueue_ingress(
+        channel_id="IB_STREAM", raw=skeleton, attachment_refs=[ref, other]
+    )
+    # The origin holds both. The operator's body names ``other`` only as text outside OBX-5.5,
+    # which delivery never resolves, so the child must not hold it.
+    edited = skeleton + f"NTE|1||{other}\r"
 
     outcome = await store.reingress(
         origin_message_id=origin, raw=edited, idempotency_key="k-5099", audit=no_operator_audit
@@ -459,7 +463,65 @@ async def test_an_edit_and_resubmit_child_delivers_the_origins_document(
     assert [r["attachment_id"] for r in await store.attachments_for(outcome.new_message_id)] == [
         ref
     ]
-    assert await _refcount(store, foreign) == 1  # never linked to the child
+    assert await _refcount(store, other) == 1  # the origin's reference alone
+
+
+async def test_a_child_holds_no_document_its_body_names_outside_obx_5_5(
+    store: MessageStore,
+) -> None:
+    """A content address the sender knows, written bare or as a copied handle into a field the
+    Handler passes through, names nothing delivery resolves, so the child must not hold it: its
+    channel could then download a document the Handler dropped."""
+    parent, ref, _skeleton = await _detached_parent(store, _b64(1500))
+    handle = make_doc_ref(ref, "Application")
+    body = _with_copy_in_nte(_hl7("plain text") + f"NTE|1||{ref}\r", handle)
+
+    child = await _passthrough_child(store, parent, body)
+
+    assert list(await store.attachments_for(child)) == []
+    assert await _refcount(store, ref) == 1
+
+
+def test_a_child_inherits_a_handle_its_delimiters_escape() -> None:
+    from messagefoundry.store.store import attachments_named
+
+    ref = hashlib.sha256(b"x").hexdigest()
+    msg = Message.parse(_hl7(_b64(10), msh2=":~\\&"))
+    msg.set("OBX-5.5", make_doc_ref(ref, "Application"))
+    escaped = msg.encode()
+    assert DOC_REF_MARKER not in escaped
+
+    assert attachments_named([ref], escaped) == [ref]
+    assert attachments_named([ref], _hl7("plain") + f"NTE|1||{ref}\r") == []
+    assert attachments_named([ref], f'{{"doc": "{make_doc_ref(ref, "x")}"}}') == []
+
+
+async def test_a_child_links_no_document_whose_header_a_purge_collected(
+    store: MessageStore,
+) -> None:
+    """The parent's linkage row was read, then a purge collected the header before the incref. A
+    link to no header would leave refcount below the live linkage rows."""
+    from tests._store_audit import no_operator_audit
+
+    origin, ref, skeleton = await _detached_parent(store, _b64(1500))
+    await store._db.execute("DELETE FROM attachment_chunk WHERE attachment_id=?", (ref,))
+    await store._db.execute("DELETE FROM attachment WHERE id=?", (ref,))
+    await store._db.commit()
+
+    outcome = await store.resend_to(
+        message_id=origin,
+        to=DEST,
+        idempotency_key="k-5099-gone",
+        body_override=skeleton,
+        audit=no_operator_audit,
+    )
+
+    assert outcome.status == "resent" and outcome.new_message_id is not None
+    cur = await store._db.execute(
+        "SELECT COUNT(*) FROM message_attachment WHERE message_id=?", (outcome.new_message_id,)
+    )
+    row = await cur.fetchone()
+    assert row is not None and int(row[0]) == 0
 
 
 async def test_an_edit_and_resend_child_delivers_the_origins_document(
@@ -548,3 +610,37 @@ async def test_a_held_document_whose_chunks_are_gone_is_never_sent_empty(
     assert col.deliveries == []  # never an empty OBX-5.5 on the wire
     assert [str(r["status"]) for r in rows] != [OutboxStatus.DONE.value]
     assert "document re-attach failed" in str(rows[0]["last_error"])
+
+
+async def test_a_handle_free_payload_whose_msh2_names_a_marker_char_is_delivered_unchanged(
+    store: MessageStore,
+) -> None:
+    """The gate opens on a header naming a marker character. With MSH-2 too short to name the
+    separators, no handle can be escaped in it, so the payload is carried as it was before the
+    gate read headers, not refused."""
+    payload = "MSH|:~|APP|FAC|RCV|RCVF|20260101120000||ADT:A01|MSGID002|P|2.5\rPID|1||123\r"
+    assert may_hold_doc_ref(payload)
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    _mid, rows = await _deliver(store, runner, payload)
+
+    assert col.deliveries == [payload]
+    assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+
+
+async def test_a_short_msh2_payload_carrying_the_marker_is_still_refused(
+    store: MessageStore,
+) -> None:
+    """The control: the same header with the marker in the raw text keeps its permanent refusal."""
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    payload = f"MSH|:~|APP|FAC|RCV|RCVF|20260101120000||ADT:A01|MSGID003|P|2.5\rNTE|1||{handle}\r"
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    _mid, rows = await _deliver(store, runner, payload)
+
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(rows)

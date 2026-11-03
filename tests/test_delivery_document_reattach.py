@@ -280,8 +280,10 @@ async def test_hydrate_retry_reads_identically_without_decref(store: MessageStor
     ref = await _store_doc(store, b64)
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     payload = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
-    first = await _hydrate(runner, store, payload)
-    second = await _hydrate(runner, store, payload)
+    # One message, hydrated twice: a retry of the same row, not a second message.
+    mid = await store.enqueue_message(channel_id="c1", raw=payload, deliveries=[], now=100.0)
+    first = await runner._hydrate_payload(payload, mid)
+    second = await runner._hydrate_payload(payload, mid)
     assert first == second  # identical frame on every attempt
     assert await _refcount(store, ref) == 1  # NOT decref'd by delivery
 

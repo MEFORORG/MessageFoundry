@@ -11677,7 +11677,8 @@ def _as_content_fault(exc: Exception | SystemExit) -> Exception:
 
 class _StoreReadFault(_RedactedFault):
     """A store READ that a delivery needed before its send failed in the store itself: the document
-    re-attach (``read_attachment``) or the ``dynamic_headers`` metadata (``message_metadata_json``).
+    re-attach (``read_attachment``, and ``attachments_for``, the linkage read that binds a handle to
+    its own message, BACKLOG #5099) or the ``dynamic_headers`` metadata (``message_metadata_json``).
     Vault BACKLOG #2756. Raised only by :func:`_read_from_store`.
 
     The classification is by ORIGIN, at the store call, not by exception type: a driver or pool error

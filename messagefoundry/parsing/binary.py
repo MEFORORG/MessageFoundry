@@ -98,6 +98,7 @@ __all__ = [
     "DETACH_CHUNK_BYTES",
     "strip_documents",
     "strip_documents_in_hl7",
+    "doc_ref_addresses_in_hl7",
     "reattach_documents_in_hl7",
 ]
 
@@ -623,6 +624,33 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
 # stays PURE (no store/I/O import) and unit-testable — the pipeline supplies the async `read_attachment`.
 
 
+def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
+    """The content addresses named by the well-formed document handles in an HL7 body's
+    ``OBX-5.5`` values, read as :func:`reattach_documents_in_hl7` reads them: the places delivery
+    splices (BACKLOG #5099). A handle anywhere else, or a bare content address, is not one, since
+    delivery never resolves it. Empty for a body that does not parse as HL7, or whose MSH-1 and
+    MSH-2 do not name its separators: delivery resolves no handle in either."""
+    # Local import, as reattach_documents_in_hl7 does: message.py imports this module.
+    from messagefoundry.parsing.message import Message
+    from messagefoundry.parsing.peek import HL7PeekError
+
+    try:
+        message = Message.parse(text)
+    except HL7PeekError:
+        return frozenset()
+    if len(message._raw_field("MSH", 1)) != 1 or len(message._raw_field("MSH", 2)) < 4:
+        return frozenset()
+    found: set[str] = set()
+    for occ in range(1, message.count_segments("OBX") + 1):
+        value = message.field("OBX-5.5", occurrence=occ) or ""
+        if is_doc_ref(value):
+            try:
+                found.add(parse_doc_ref(value)[0])
+            except DocRefError:
+                continue  # malformed: delivery refuses it, and it names nothing to hold
+    return frozenset(found)
+
+
 async def reattach_documents_in_hl7(
     text: str, reader: Callable[[str], Awaitable[str | None]], *, bound: Collection[str]
 ) -> str:
@@ -666,7 +694,7 @@ async def reattach_documents_in_hl7(
     # at a 64 MiB document and stayed about 0.1 s at 15 MiB: the splice's escape pass over the whole
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
-    def _handles() -> tuple[Message, list[tuple[int, str]], str]:
+    def _handles() -> tuple[Message, list[tuple[int, str]], str] | None:
         refused: str | None = None
         try:
             message = Message.parse(text)
@@ -681,6 +709,12 @@ async def reattach_documents_in_hl7(
         # The separators every OBX-5.5 read below needs, by the rule Message._encoding_chars applies:
         # an MSH-1 or MSH-2 that cannot name them is the payload's, and every read would raise on it.
         if len(message._raw_field("MSH", 1)) != 1 or len(message._raw_field("MSH", 2)) < 4:
+            if DOC_REF_MARKER not in text:
+                # The gate opened on a header naming a marker character, not on a handle. No
+                # handle can be escaped here, since Message.set refuses to write under these
+                # separators, so there is nothing to resolve: carried as it was before the gate
+                # read headers (BACKLOG #5099).
+                return None
             raise UnreattachableDocumentError(
                 "the payload's MSH-1 and MSH-2 do not name its separators"
             )
@@ -705,7 +739,10 @@ async def reattach_documents_in_hl7(
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, marker
 
-    message, handles, marker = await asyncio.to_thread(_handles)
+    scanned = await asyncio.to_thread(_handles)
+    if scanned is None:
+        return text
+    message, handles, marker = scanned
     for occ, sha256 in handles:
         if sha256 not in bound:
             raise UnreattachableDocumentError(

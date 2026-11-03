@@ -7105,12 +7105,18 @@ class PostgresStore:
             "SELECT attachment_id FROM message_attachment WHERE message_id=$1", parent_id
         )
         for ref in attachments_named([str(r["attachment_id"]) for r in rows], body):
+            # The incref first, and the link only where it found the header (the SQLite twin
+            # says why): under READ COMMITTED a purge can collect it after the read above.
+            status = await conn.execute(
+                "UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref
+            )
+            if _rowcount(status) != 1:
+                continue
             await conn.execute(
                 "INSERT INTO message_attachment (message_id, attachment_id) VALUES ($1,$2)",
                 child_id,
                 ref,
             )
-            await conn.execute("UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref)
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE

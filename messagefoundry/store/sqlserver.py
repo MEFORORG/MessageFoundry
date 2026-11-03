@@ -915,7 +915,11 @@ _SQL_SELECT_MESSAGE_ATTACHMENTS: Final[str] = (
 _SQL_INSERT_MESSAGE_ATTACHMENT: Final[str] = (
     "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)"
 )
-_SQL_INCREF_ATTACHMENT: Final[str] = "UPDATE attachment SET refcount = refcount + 1 WHERE id=?"
+# Reports through OUTPUT, which a session-wide SET NOCOUNT ON cannot hide, so the caller links
+# only an attachment whose header the incref found.
+_SQL_INCREF_ATTACHMENT: Final[str] = (
+    "UPDATE attachment SET refcount = refcount + 1 OUTPUT inserted.id WHERE id=?"
+)
 # The channel rides along because the metadata cell is bound to it (BACKLOG #2593).
 _SQL_SELECT_METADATA: Final[str] = "SELECT channel_id, metadata FROM messages WHERE id=?"
 _SQL_UPDATE_METADATA: Final[str] = (
@@ -11391,16 +11395,22 @@ class SqlServerStore:
         await cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
         held = [str(r[0]) for r in await cur.fetchall()]
         for ref in attachments_named(held, body):
-            await cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
+            # The incref first, and the link only where it found the header (the SQLite twin
+            # says why): under READ COMMITTED a purge can collect it after the read above.
             await cur.execute(_SQL_INCREF_ATTACHMENT, (ref,))
+            if await cur.fetchone() is None:
+                continue
+            await cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
 
     def _inherit_attachments_sync(self, cur: Any, child_id: str, parent_id: str, body: str) -> None:
         """Synchronous twin of :meth:`_inherit_attachments` (ADR 0071 B5)."""
         cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
         held = [str(r[0]) for r in cur.fetchall()]
         for ref in attachments_named(held, body):
-            cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
             cur.execute(_SQL_INCREF_ATTACHMENT, (ref,))
+            if cur.fetchone() is None:
+                continue
+            cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE

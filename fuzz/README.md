@@ -306,7 +306,7 @@ out" says why it does not.
 | `transports/http_listener.py` header-mode authentication (`_authorize_head`) | ruled out, for now | Needs a configured `HttpSource` with credentials. The next candidate on this surface. |
 | `parsing/compression.py`, all four decompressors | target `compression` | `gzip_decompress` runs on a File feed with `decompress="gzip"`; the rest are Handler-facing. |
 | `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced both known findings above. |
-| `parsing/binary.py` `reattach_documents_in_hl7` | ruled out | Delivery side: it runs on a skeleton the engine wrote, through an async store reader. |
+| `parsing/binary.py` `reattach_documents_in_hl7`, `may_hold_doc_ref`, `doc_ref_addresses_in_hl7` | not yet a target | Delivery side, through an async store reader. It is not out of reach of untrusted input: a sender's `OBX-5.5` text and its MSH, FHS and BHS headers reach all three (BACKLOG #5099). The candidate next to `binary_carriage`. |
 | `parsing/sniff.py` | ruled out as a target of its own | Prefix tests with no exception path. The archive-member checks run inside `zip_decompress`, so `compression` reaches them. |
 | `parsing/split.py` `split_batch` (File ingress batch split) | ruled out | A regex split and string operations on a `str`, with no exception path. |
 | `mllpcodec.build_ack` | ruled out | Its reads are the `Peek` accessors `hl7_peek` sweeps, and it wraps them in `except PEEK_READ_FAULTS`. |

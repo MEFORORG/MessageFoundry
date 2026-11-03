@@ -97,6 +97,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
@@ -1012,15 +1013,19 @@ _NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
 
 
 def attachments_named(held: Iterable[str], body: str) -> list[str]:
-    """The content addresses in ``held`` that ``body`` names, for a child message that inherits
-    its parent's documents (BACKLOG #5099). A content address is lowercase hex, which an HL7
-    delimiter escape rewrites only when MSH-2 names a hex digit, so a substring test finds a handle
-    wherever the body carries it and the store stays parsing-free. Where MSH-2 does name one, the
-    address is not found and delivery refuses the child's handle: it fails closed. Only a named
-    document is inherited: a child
-    whose Handler dropped the document holds none, so the child's channel cannot download it, and
-    retention is not kept waiting on a document no row of the child can deliver."""
-    return [ref for ref in held if ref in body]
+    """The content addresses in ``held`` that a document handle in ``body``'s ``OBX-5.5`` names, for
+    a child message that inherits its parent's documents (BACKLOG #5099). Read as delivery reads a
+    handle (:func:`~messagefoundry.parsing.binary.doc_ref_addresses_in_hl7`), so an escaped handle
+    still counts, and an address the body carries anywhere else, bare or as a copied handle, does
+    not: delivery never resolves one there. Only a named document is inherited: a child whose
+    Handler dropped the document holds none, so the child's channel cannot download it, and
+    retention is not kept waiting on a document no row of the child can deliver. The body is parsed
+    only when the parent holds a document."""
+    held = list(held)
+    if not held:
+        return []
+    named = _doc_ref_addresses_in_hl7(body)
+    return [ref for ref in held if ref in named]
 
 
 @dataclass(frozen=True)
@@ -10950,13 +10955,18 @@ class MessageStore:
         )
         held = [str(r["attachment_id"]) for r in await cur.fetchall()]
         for ref in attachments_named(held, body):
+            # The incref first, and the link only where it found the header: a purge that
+            # collected the document after the read above would otherwise leave a link to no
+            # header, and refcount would no longer equal the live linkage rows. The child then
+            # holds nothing, and delivery refuses its handle.
+            cur = await self._db.execute(
+                "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+            )
+            if cur.rowcount != 1:
+                continue
             await self._db.execute(
                 "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
                 (child_id, ref),
-            )
-            # The parent's live linkage row keeps the header at refcount >= 1, so it exists.
-            await self._db.execute(
-                "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
             )
 
     async def release_message_attachments(self, message_id: str) -> None:
