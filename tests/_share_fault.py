@@ -34,8 +34,17 @@ def unlistable_dir(tmp_path: Path) -> Iterator[Path]:
     """A real folder this process cannot list, with no patched call between it and the test: the
     unreachable share on Windows, and a mode-000 directory holding a module on POSIX, which
     ``Path.is_dir`` still answers ``True`` for. ``Path.glob`` answers ``[]`` for both (vault
-    BACKLOG #5117). Skipped where root would list the directory anyway."""
+    BACKLOG #5117). Skipped where root would list the directory anyway, and where this host's
+    redirector answers the share with an error other than the two that say it cannot be reached,
+    since the path then proves nothing."""
     if sys.platform == "win32":
+        try:
+            os.scandir(UNREACHABLE_SHARE).close()
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (53, 67):
+                pytest.skip(f"this host answers {exc!r}")
+        else:
+            pytest.skip("this host lists the share")
         yield UNREACHABLE_SHARE
         return
     if os.geteuid() == 0:

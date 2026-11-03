@@ -68,7 +68,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxWorkerRefused,
     graph_shape,
 )
-from tests._share_fault import _share_fault, unlistable_dir
+from tests._share_fault import UNREACHABLE_SHARE, _share_fault, unlistable_dir
 
 RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||900001||DOE^JANE\r"
 
@@ -916,7 +916,7 @@ def test_a_base_on_a_lost_share_at_the_first_check_is_a_fault(
 def test_a_share_windows_really_cannot_reach_is_a_fault() -> None:
     """The same answers from the operating system itself, with no double. Skipped where this
     host's redirector does not answer the two errors, since the path then proves nothing."""
-    share = Path(r"\\127.0.0.1\nosuchshare\cfg")
+    share = UNREACHABLE_SHARE
     with pytest.raises(OSError) as listing:
         os.scandir(share)
     if getattr(listing.value, "winerror", None) not in (53, 67):

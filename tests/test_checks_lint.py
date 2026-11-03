@@ -207,9 +207,6 @@ def test_raise_fstring_flags_call_wrapped_interpolation(tmp_path: Path) -> None:
 
 # --- vault BACKLOG #5117: a leg that cannot list the config dir says so --------------------------
 
-#: What each leg says when it scanned the directory and found nothing.
-_CLEAN = {"no interpolated raises", "no guard-filters", "no handler-security findings"}
-
 _LEGS = [_check_raise_fstring, _check_accepts_candidate, _check_handler_security]
 
 
@@ -246,9 +243,26 @@ def test_strict_handler_security_fails_a_config_dir_it_cannot_list(
 
 
 @pytest.mark.parametrize("check", _LEGS)
-def test_a_lint_leg_reports_no_clean_scan_of_a_real_folder_it_cannot_list(
+def test_a_lint_leg_names_a_real_folder_it_cannot_list(
     tmp_path: Path, check: Callable[[Path], CheckResult]
 ) -> None:
+    """Not a clean scan, and not "not a config dir" either, which ``Path.is_dir`` answered for the
+    share Windows cannot reach."""
     with unlistable_dir(tmp_path) as folder:
         result = check(folder)
-    assert result.skipped and result.detail not in _CLEAN
+    assert result.skipped and result.detail.startswith("could not list the config dir")
+
+
+def test_strict_handler_security_fails_a_real_folder_it_cannot_list(tmp_path: Path) -> None:
+    with unlistable_dir(tmp_path) as folder:
+        assert _check_handler_security(folder, strict=True).blocking
+
+
+@pytest.mark.parametrize("check", _LEGS)
+def test_a_lint_leg_still_skips_what_is_not_a_config_dir(
+    tmp_path: Path, check: Callable[[Path], CheckResult]
+) -> None:
+    _write(tmp_path / "cfg.py", "X = 1\n")
+    for target in (tmp_path / "absent", tmp_path / "cfg.py"):
+        result = check(target)
+        assert (result.ok, result.skipped, result.detail) == (True, True, "not a config dir")

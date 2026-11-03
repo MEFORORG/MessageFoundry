@@ -118,22 +118,28 @@ if TYPE_CHECKING:
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
 
-def _config_modules(base: Path) -> list[Path]:
-    """The config dir's ``*.py`` files, by the loader's own rule: a dot-named backup is never run, so
-    the static lints do not report on it either (vault BACKLOG #2781). Raises the ``OSError`` of a
-    directory it cannot list, which each lint reports by :func:`_unlisted` (vault BACKLOG #5117)."""
+def _config_modules(
+    name: str, config_dir: str | Path, *, required: bool = False
+) -> list[Path] | CheckResult:
+    """The config dir's ``*.py`` files for the lint ``name``, by the loader's own rule: a dot-named
+    backup is never run, so the static lints do not report on it either (vault BACKLOG #2781).
+
+    Or the lint's line where the directory cannot be listed: skipped as not a config dir where none
+    is there, and otherwise skipped as a fault it names, or failed where the lint is ``required``.
+    A listing fault once read as an empty directory, and ``Path.is_dir`` as no directory, so a share
+    Windows cannot reach was reported as a clean scan or as no config dir (vault BACKLOG #5117)."""
+    from messagefoundry.config.snapshot import is_missing_directory
     from messagefoundry.config.wiring import config_py_files
-
-    return config_py_files(base)
-
-
-def _unlisted(name: str, exc: OSError, *, required: bool = False) -> CheckResult:
-    """The line of a lint that could not list the config dir. It vetted nothing, so it is skipped,
-    and a required lint fails: a listing fault once read as an empty directory, which a lint
-    reported as a clean scan (vault BACKLOG #5117)."""
     from messagefoundry.redaction import safe_exc
 
-    detail = f"could not list the config dir: {safe_exc(exc)}"
+    try:
+        return config_py_files(Path(config_dir))
+    except OSError as exc:
+        if is_missing_directory(exc):
+            return CheckResult(
+                name, ok=True, required=False, skipped=True, detail="not a config dir"
+            )
+        detail = f"could not list the config dir: {safe_exc(exc)}"
     if required:
         return CheckResult(name, ok=False, required=True, detail=detail)
     return CheckResult(name, ok=True, required=False, skipped=True, detail=detail)
@@ -581,17 +587,12 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
     A malformed module never crashes the gate (anything in ``_UNPARSEABLE_MODULE`` → skip that file;
-    ``validate`` already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
+    ``validate`` already reports a broken module). A single file / non-dir ``config_dir`` → skip, and
+    so does one it cannot list, which it names (:func:`_config_modules`).
     """
-    base = Path(config_dir)
-    if not base.is_dir():
-        return CheckResult(
-            "raise-fstring", ok=True, required=False, skipped=True, detail="not a config dir"
-        )
-    try:
-        modules = _config_modules(base)
-    except OSError as exc:
-        return _unlisted("raise-fstring", exc)
+    modules = _config_modules("raise-fstring", config_dir)
+    if isinstance(modules, CheckResult):
+        return modules
     hits: list[str] = []
     for path in modules:
         try:
@@ -717,15 +718,9 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
     ``config_dir`` (helpers included), skips a broken/unreadable file, and is **advisory** (prints,
     never blocks — ``required=False`` keeps the gate's "0 iff no required check failed" exit policy).
     """
-    base = Path(config_dir)
-    if not base.is_dir():
-        return CheckResult(
-            "accepts-candidate", ok=True, required=False, skipped=True, detail="not a config dir"
-        )
-    try:
-        modules = _config_modules(base)
-    except OSError as exc:
-        return _unlisted("accepts-candidate", exc)
+    modules = _config_modules("accepts-candidate", config_dir)
+    if isinstance(modules, CheckResult):
+        return modules
     hits: list[str] = []
     for path in modules:
         try:
@@ -1621,21 +1616,15 @@ def _check_handler_security(
     **Advisory by default** (``required=False``, prints, never blocks); ``strict=True`` (the opt-in
     ``--strict-handler-security`` block mode) promotes any finding to a **blocking** failure for an org
     that wants a hard gate on its own CI. The runtime half is the opt-in ADR 0087 sandbox. Mirrors
-    :func:`_check_raise_fstring`: static ``ast`` only (never imports/executes the config), globs
+    :func:`_check_raise_fstring`: static ``ast`` only (never imports/executes the config), lists
     ``*.py`` under ``config_dir`` (helpers included), and skips a broken/unreadable file (``validate``
     reports those) so it never crashes the gate. ``impure-transform`` is scoped to ``@router``/``@handler``
     bodies (so an undecorated helper's wall-clock fallback is not a false positive); ``phi-to-log`` scans
     every function body — decorated or an undecorated ``_*`` transform helper — keying on the first
     positional parameter as the message symbol (BACKLOG #337); the other four scan the whole module."""
-    base = Path(config_dir)
-    if not base.is_dir():
-        return CheckResult(
-            "handler-security", ok=True, required=False, skipped=True, detail="not a config dir"
-        )
-    try:
-        modules = _config_modules(base)
-    except OSError as exc:
-        return _unlisted("handler-security", exc, required=strict)
+    modules = _config_modules("handler-security", config_dir, required=strict)
+    if isinstance(modules, CheckResult):
+        return modules
     # sibling config modules (the dir's own *.py stems) are first-party for the unvetted-import rule.
     local_modules = frozenset(p.stem for p in modules)
     # unvetted-import needs a trustworthy shipped-dep set to tell operator-added from shipped; if the

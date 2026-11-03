@@ -113,14 +113,13 @@ def config_py_files(directory: Path) -> list[Path]:
     ``Path.glob`` drops a listing error, so a share lost at that moment answered ``[]`` and ADR 0036's
     trust check vetted no module of a bundle the load then listed and ran (vault BACKLOG #5117)."""
     with os.scandir(directory) as entries:
-        names = [entry.name for entry in entries]
-    return sorted(directory / name for name in names if _covered_name(".", name))
+        return sorted(directory / e.name for e in entries if _covered_name(".", e.name))
 
 
 def _covered_name(folder: str, name: str) -> bool:
     """Whether a snapshot reads ``name`` from ``folder``. For the directory itself (``.``) that is
-    :func:`config_py_files`'s rule for one name: the suffix in the case the platform's glob matches
-    it, and not dot-named."""
+    :func:`config_py_files`'s rule for one name: the suffix in the case the platform matches it
+    (without case on Windows), and not dot-named."""
     if folder == ".":
         return os.path.normcase(name).endswith(".py") and not name.startswith(".")
     if folder == CODESETS_DIR_NAME:
