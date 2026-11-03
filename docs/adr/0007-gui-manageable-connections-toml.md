@@ -229,8 +229,8 @@ it could reach only its own copy.
    and no compatibility to keep.
 5. **Any connection in the running graph takes the flag**, code-first included. That is the branch
    the 2026-07-19 scope fork deferred. A name the running graph does not have is refused **409**,
-   and so is any toggle once a shutdown's drain has begun. A cluster node toggles like any other:
-   the store is the one thing the nodes share.
+   and so is a toggle that arrives once a shutdown's drain has begun; point 6 says what one already
+   queued answers. A cluster node toggles like any other: the store is the one thing the nodes share.
 6. **A toggle still writes `connection_flag_set`**, with its actor and client, in the same transaction
    as the flag. If the row fails the flag does not change, and the route answers **503**. A commit
    whose answer was lost answers 503 too, and then both may have landed. So does a write the store
@@ -245,11 +245,15 @@ it could reach only its own copy.
    lock across the store call, as the old TOML write did, so a write whose caller has gone keeps it.
    Without it, a clear running beside an uncommitted set could delete nothing on Postgres and still
    append the newest row. The wait for the lock has its own 10 seconds, and the store call then gets
-   a fresh 10, so a toggle queued behind a stuck one answers the same 503, having written nothing,
-   rather than meeting the request deadline, and time in the queue does not cut off a store call. A
-   toggle that reaches the lock once a shutdown's drain has begun answers 409. Unlike the old write,
-   the wait for the lock is in the tracked task too, so a drain sees a queued toggle, and a toggle
-   whose caller leaves while it queues still lands, with its row, under that caller's name.
+   a fresh 10, so a toggle's wall-clock ceiling is about two bounds plus the store's unwind, and time
+   in the queue does not cut off a store call. A toggle still queued when its wait runs out answers
+   the same 503, having written nothing, rather than meeting the request deadline. If the stuck
+   toggle ahead of it gives way first, the queued toggle reaches the store and can be cut off there,
+   close to 20 seconds after it arrived, with a commit that may land after the 503. A toggle that
+   reaches the lock once a shutdown's drain has begun answers 409, and one whose wait runs out first
+   answers the 503. Unlike the old write, the wait for the lock is in the tracked task too, so a
+   drain sees a queued toggle, and a toggle whose caller leaves while it queues can still land, with
+   its row, under that caller's name.
 7. **The route keeps `config:deploy`.** Its reason was the TOML write, and that reason is gone. Lowering
    a gate is a decision of its own, not a side effect of this move.
 8. **The engine writes no config file.** The flag was its only such write, so the machinery that kept

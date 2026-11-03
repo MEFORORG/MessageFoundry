@@ -178,8 +178,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # #131, BACKLOG #2623: the object-flag toggle. config:deploy + same-origin (like bulk-control);
         # NO step-up (no engine path reads it), so it registers no write-action. The reused JSON handler
-        # writes the store, and REFUSES with 409 a name the running graph does not have, and any
-        # toggle once a shutdown's drain has begun. We render that as a friendly notice.
+        # writes the store, and REFUSES with 409 a name the running graph does not have, and a toggle
+        # that arrives, or reaches the lock, once a shutdown's drain has begun; one whose wait for
+        # the lock runs out first is the 503 below. We render the 409 as a friendly notice.
         assert_same_origin(request)
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         direction = form.get("direction", "")

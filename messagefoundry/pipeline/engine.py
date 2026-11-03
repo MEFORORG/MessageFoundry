@@ -160,12 +160,14 @@ _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 #: milliseconds, so this is a stuck or saturated store. Well under the API's 120 s request deadline
 #: (``api/request_timeout.py``), so the caller hears the toggle's own refusal and the console shows
 #: its page, not the deadline's JSON. It bounds the wait for the engine's write lock and then,
-#: afresh, the store call: a toggle queued behind a stuck one is refused at this bound, and time in
-#: the queue never cuts off a store call that would have finished. It bounds nothing before them:
-#: the auth gate writes first, so a store stopped outright can still meet that deadline there. A
-#: refusal in the store call comes once that call has unwound, which a stalled store can stretch
-#: past this, by ``_ROLLBACK_TIMEOUT`` on SQLite. It sits inside the tracked write, so it also ends
-#: a write whose caller has gone. Read at call time.
+#: afresh, the store call, so a toggle's wall-clock ceiling is about two of these plus the unwind
+#: below. A toggle still queued behind a stuck one at this bound is refused, having written nothing.
+#: If the stuck one gives way first, the queued one reaches the store and can be cut off there in
+#: turn, and its change may still land. Time in the queue never cuts off a store call that would
+#: have finished. It bounds nothing before them: the auth gate writes first, so a store stopped
+#: outright can still meet that deadline there. A refusal in the store call comes once that call has
+#: unwound, which a stalled store can stretch past this, by ``_ROLLBACK_TIMEOUT`` on SQLite. It sits
+#: inside the tracked write, so it also ends a write whose caller has gone. Read at call time.
 CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS = 10.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
@@ -2560,9 +2562,10 @@ class Engine:
         Raises :class:`WiringError`, which the route answers with a 409, when the running graph has
         no such connection: the name has to be a real one, because the store would take any text.
         It raises the same once :meth:`drain_config_writes` has begun, including to a toggle that
-        reaches the lock below after that. Raises :class:`ConnectionFlagNotRecorded` when that lock
-        or the store did not answer within :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`, which each
-        gets in full.
+        reaches the lock below after that. Raises :class:`ConnectionFlagNotRecorded` when the store
+        call fails, whether at once or cut off at :data:`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS`, and
+        when the wait for that lock passes the same bound, which a toggle queued as a drain begins
+        can do before it reaches the lock. The wait and the store call each get the bound in full.
 
         The write runs as a tracked task the caller only waits on, so a caller cancelled from then
         on (a request deadline, a client that went away, a shutdown) stops waiting and does not stop
@@ -2679,9 +2682,10 @@ class Engine:
         #2623). One still running past ``timeout`` is logged, and it is lost if the store closes
         before it lands. The gate closes first, so a toggle that arrives from then on is refused
         rather than started as a write this drain never saw, and one still queued for the lock is
-        refused when it gets the lock. Waiting never cancels a write. The managed API lifespan calls
-        it under its shutdown budget (BACKLOG #3191), and :meth:`stop` calls it again, so a write
-        that drain left running gets one more short wait."""
+        refused when it gets the lock, or raises :class:`ConnectionFlagNotRecorded` if its wait for
+        the lock runs out first. Waiting never cancels a write. The managed API lifespan calls it
+        under its shutdown budget (BACKLOG #3191), and :meth:`stop` calls it again, so a write that
+        drain left running gets one more short wait."""
         self._config_writes_closed = True
         if not self._config_writes:
             return

@@ -779,10 +779,10 @@ async def test_time_in_the_queue_does_not_eat_the_bound_of_the_store_call(
     real: Callable[..., Awaitable[None]] = engine.store.set_connection_flag
 
     async def _slow(*args: object, **kwargs: object) -> None:
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(2.0)
         await real(*args, **kwargs)
 
-    monkeypatch.setattr(BOUND, 1.0)
+    monkeypatch.setattr(BOUND, 3.0)
     monkeypatch.setattr(engine.store, "set_connection_flag", _slow)
     await asyncio.gather(
         _flag(engine, "OB_TOML", "outbound"),
