@@ -675,7 +675,7 @@ becomes the bottleneck.
 - **PostgreSQL:** use your standard DB backups — `pg_dump` for logical backups and/or WAL archiving /
   PITR for point-in-time recovery. The engine is greenfield-only on server DBs, so the DB tier owns
   store-level DR here. A `.mfbak` taken against a server DB is **config-only** and cannot restore the
-  database.
+  database. A config-only pass with no config to archive, such as an empty config dir or `[backup].include_config = false`, fails instead of writing an archive, so it never takes the retention slot of a good one ([`CONFIGURATION.md`](CONFIGURATION.md) `[backup]` lists what it refuses).
 
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
 decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /

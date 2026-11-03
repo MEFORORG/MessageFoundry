@@ -78,12 +78,14 @@ async def _keyed_store(data_dir: Path, key_b64: str) -> MessageStore:
     return store
 
 
-def _runner(store: MessageStore, data_dir: Path, dest: Path, key_b64: str) -> BackupRunner:
+def _runner(
+    store: MessageStore, data_dir: Path, dest: Path, key_b64: str, config_dir: Path | None = None
+) -> BackupRunner:
     return BackupRunner(
         store,
         BackupSettings(enabled=True, destination=str(dest)),
         store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key_b64),
-        config_dir=None,
+        config_dir=config_dir,
         instance="dev",
     )
 
@@ -200,14 +202,20 @@ def _server_db_settings(key_b64: str) -> StoreSettings:
 
 async def _archive(tmp_path: Path, *, config_only: bool) -> tuple[Path, str]:
     """A real `.mfbak` in its own directory, and the key it is sealed under. ``config_only`` is the
-    archive a server-DB store's backup writes."""
+    archive a server-DB store's backup writes, which must carry a config file to be written at all
+    (vault BACKLOG #5220)."""
     key = generate_key()
     data_dir = tmp_path / "source"
     store = await _keyed_store(data_dir, key)
+    config_dir: Path | None = None
+    if config_only:
+        config_dir = tmp_path / "source_config"
+        config_dir.mkdir()
+        (config_dir / "feed.py").write_text("# synthetic router\n")
     try:
-        result = await _runner(store, data_dir, tmp_path / "archives", key).run_once(
-            now=1.0, force_config_only=config_only
-        )
+        result = await _runner(
+            store, data_dir, tmp_path / "archives", key, config_dir=config_dir
+        ).run_once(now=1.0, force_config_only=config_only)
     finally:
         await store.close()
     assert result is not None and result.config_only is config_only

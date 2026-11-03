@@ -7872,6 +7872,29 @@ class ServiceSettings(_InputHidingModel):
         )
 
     @model_validator(mode="after")
+    def _config_only_backup_bundles_config(self) -> ServiceSettings:
+        """A backup on a server-DB store is config-only, so with ``include_config = false`` every
+        archive it writes carries nothing to restore, yet each would take a keep-N slot. The run
+        refuses such a pass (vault BACKLOG #5220); this refuses the configuration that makes every
+        pass one, at load, where ``serve`` and ``check`` read it. Spans two sections, so it lives
+        here. A pass forced config-only on SQLite, or whose walk adds nothing, is judged at run time
+        only, because only the run knows it."""
+        if (
+            self.backup.enabled
+            and self.backup.config_only_on_server_db
+            and not self.backup.include_config
+            and self.store.backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
+        ):
+            raise ValueError(
+                "[backup].include_config = false cannot be combined with [store].backend = "
+                f"{self.store.backend.value!r}: the store backup there is DBA-delegated, so every "
+                "DR backup is config-only and would archive nothing. Set [backup].include_config = "
+                "true, or set [backup].config_only_on_server_db = false (or [backup].enabled = "
+                "false) to take no backup on this store"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _dr_activate_not_clustered(self) -> ServiceSettings:
         """A DR box coming up under the DR run-profile must not also be a ``[cluster]`` member (ADR 0096
         rider). The two govern DIFFERENT things — ``[dr].activate`` gates which *connections* start (the

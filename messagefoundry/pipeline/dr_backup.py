@@ -568,6 +568,16 @@ class BackupRunner:
                 f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
                 "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
             )
+        if config_only and (config_dir is None or not s.include_config):
+            # A config-only archive without its config holds nothing to restore, yet it would verify
+            # and take a keep-N slot from an archive that does (vault BACKLOG #5220). Refused before
+            # any I/O; a dir that cannot be listed, and a walk that adds no file, are refused below.
+            why = (
+                "no config dir is loaded"
+                if config_dir is None
+                else "[backup].include_config is false"
+            )
+            raise BackupError("snapshot", f"config-only backup: {why}; nothing to archive")
 
         ext = _ENCRYPTED_EXT if key is not None else _PLAINTEXT_EXT
         stamp = _utc_stamp(now)
@@ -718,7 +728,8 @@ class BackupRunner:
             bundle = await asyncio.to_thread(self._inspect_config, config_dir)
             if config_only and bundle.error is not None:
                 # A config-only archive without its config holds nothing to restore, yet it would
-                # verify and take a keep-N slot from an archive that does. It fails instead.
+                # verify and take a keep-N slot from an archive that does. It fails instead. A walk
+                # that adds no file is refused in the build, which is where the walk runs.
                 raise BackupError(
                     "snapshot",
                     f"config-only backup: the config dir {config_dir} could not be read "
@@ -1074,8 +1085,17 @@ class BackupRunner:
             with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
+                added = 0
                 if bundle.bundled and bundle.path is not None:
-                    self._add_config_dir(tar, bundle.path)
+                    added = self._add_config_dir(tar, bundle.path)
+                if config_only and added == 0:
+                    # Before the archive is written, so nothing is published or pruned: an archive of
+                    # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
+                    raise BackupError(
+                        "snapshot",
+                        f"config-only backup: the walk of the config dir {bundle.path} added no "
+                        "regular file; nothing to archive",
+                    )
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -1110,7 +1130,7 @@ class BackupRunner:
         archive_bytes = out_path.stat().st_size
         return snapshot_sha256, row_counts, archive_bytes
 
-    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> None:
+    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> int:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
         arbitrary host file into the archive, so only regular files are added and at least these are
@@ -1129,7 +1149,9 @@ class BackupRunner:
         candidate lives only for one validation, so one listed here may be gone by the add, and a
         killed editor's leftover is not config. So is the backup's own staging, which a data dir
         inside the config dir puts there (BACKLOG #1174): its plaintext snapshot and the tar being
-        written must not ride in the bundle."""
+        written must not ride in the bundle.
+
+        Returns how many files it added, which a config-only pass needs (vault BACKLOG #5220)."""
         pruned: list[str] = []
         found: list[Path] = []
         for dirpath, dirs, files in _walk_unfollowed(base, pruned):
@@ -1149,6 +1171,7 @@ class BackupRunner:
                     ", ".join(sorted(Path(p).relative_to(base).as_posix() for p in pruned))
                 ),
             )
+        added = 0
         # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
         for path in sorted(found):
             if path.is_symlink() or not path.is_file():
@@ -1157,6 +1180,8 @@ class BackupRunner:
             if _is_config_edit_artifact(rel):
                 continue
             tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
+            added += 1
+        return added
 
     # --- keep-N retention ----------------------------------------------------
 

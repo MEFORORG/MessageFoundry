@@ -25,7 +25,7 @@ import pytest
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline.cluster import NullCoordinator
-from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner, _day_key
+from messagefoundry.pipeline.dr_backup import BackupError, BackupResult, BackupRunner, _day_key
 from messagefoundry.store import MessageStore
 from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream, key_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -934,6 +934,120 @@ def test_a_directory_whose_lstat_fails_is_pruned_from_the_config_walk(
     monkeypatch.setattr(os, "lstat", refuse)
     assert dr._is_dir_link(str(tmp_path), unreadable=True) is True
     assert dr._is_dir_link(str(tmp_path)) is False
+
+
+# --- a config-only pass with no config publishes and prunes nothing (vault BACKLOG #5220) ---
+
+
+async def _prior_then_config_only(
+    tmp_path: Path, key_b64: str, *, config_dir: Path | None, **over: object
+) -> tuple[Path, Path, BackupResult | BackupError | None]:
+    """A good full archive at ``retention_keep = 1``, then a config-only pass over ``config_dir``.
+    Returns the destination, the prior archive, and the second pass's result or the exception it
+    raised."""
+    dest = tmp_path / "backups"
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    ss = _store_settings(tmp_path / "msg.db", key_b64)
+    try:
+        first = BackupRunner(
+            store, _settings(dest, key_b64, retention_keep=1), store_settings=ss, config_dir=None
+        )
+        good = await first.run_once(now=1000.0)
+        assert good is not None
+        second = BackupRunner(
+            store,
+            _settings(dest, key_b64, retention_keep=1, **over),
+            store_settings=ss,
+            config_dir=config_dir,
+        )
+        outcome: BackupResult | BackupError | None
+        try:
+            outcome = await second.run_once(now=2000.0, force_config_only=True)
+        except BackupError as exc:
+            outcome = exc
+    finally:
+        await store.close()
+    return dest, Path(good.archive_path), outcome
+
+
+def _config_holding_only(tmp_path: Path, shape: str) -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    if shape == "symlink-only":
+        target = tmp_path / "outside.py"
+        target.write_text("# outside the bundle\n")
+        try:
+            (cfg / "feed.py").symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("a symlink cannot be made here (Windows without the privilege)")
+    return cfg
+
+
+@pytest.mark.parametrize("shape", ["empty", "symlink-only"])
+async def test_a_config_only_pass_whose_walk_adds_nothing_is_refused(
+    tmp_path, key_b64, shape
+) -> None:
+    """The walk lists the dir but adds no regular file. The archive would hold a manifest alone,
+    verify PASS, and at ``retention_keep = 1`` prune the last good archive."""
+    cfg = _config_holding_only(tmp_path, shape)
+    dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=cfg)
+    assert isinstance(outcome, BackupError) and outcome.kind == "snapshot"
+    assert "added no regular file" in str(outcome)
+    # Nothing published, nothing pruned, and no staging or failed copy left at the destination.
+    assert sorted(p.name for p in dest.iterdir()) == [prior.name]
+
+
+@pytest.mark.parametrize("case", ["include_config off", "no config dir"])
+async def test_a_config_only_pass_with_nothing_to_bundle_is_refused(
+    tmp_path, key_b64, case
+) -> None:
+    """``_inspect_config`` bundles nothing with ``include_config`` off or no config dir loaded,
+    and reports no error, so the earlier guard let either pass publish an empty archive."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    if case == "include_config off":
+        dest, prior, outcome = await _prior_then_config_only(
+            tmp_path, key_b64, config_dir=cfg, include_config=False
+        )
+        expected = "[backup].include_config is false"
+    else:
+        dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=None)
+        expected = "no config dir is loaded"
+    assert isinstance(outcome, BackupError) and outcome.kind == "snapshot"
+    assert expected in str(outcome)
+    assert sorted(p.name for p in dest.iterdir()) == [prior.name]
+
+
+async def test_a_config_only_pass_with_one_config_file_still_publishes(tmp_path, key_b64) -> None:
+    """The control: one regular file is enough, and keep-N then prunes the prior as it should."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=cfg)
+    assert isinstance(outcome, BackupResult)
+    assert outcome.config_only and outcome.pruned == 1
+    assert sorted(p.name for p in dest.iterdir()) == [Path(outcome.archive_path).name]
+    assert not prior.exists()
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+def test_include_config_off_on_a_server_db_store_is_refused_at_load(backend) -> None:
+    """Every backup on a server-DB store is config-only, so with ``include_config = false`` each
+    would archive nothing; the settings refuse it where ``serve`` and ``check`` load them. The
+    controls: the same store with ``include_config`` on, or with the backup off, loads."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import ServiceSettings
+
+    store = {"backend": backend, "server": "db.invalid", "database": "mf", "username": "svc"}
+    backup = {"enabled": True, "destination": "D:/mefor-backups", "include_config": False}
+    with pytest.raises(ValidationError, match="include_config = false cannot be combined"):
+        ServiceSettings.model_validate({"store": store, "backup": backup})
+    ServiceSettings.model_validate({"store": store, "backup": {**backup, "include_config": True}})
+    ServiceSettings.model_validate({"store": store, "backup": {**backup, "enabled": False}})
+    # A SQLite store takes a full snapshot, so the same [backup] is not config-only there.
+    ServiceSettings.model_validate({"backup": backup})
 
 
 # --- AC-9/AC-10: failure alerts + preserves the prior good archive -----------
