@@ -2589,8 +2589,9 @@ class Engine:
             raise WiringError(f"the running graph has no {direction} connection {name!r}")
         # No await between this and the task joining the set, so a drain either sees the task or
         # this refuses it.
+        stopping = "the engine is stopping, so a connection flag cannot be set"
         if self._config_writes_closed:
-            raise WiringError("the engine is stopping, so a connection flag cannot be set")
+            raise WiringError(stopping)
         audit = AuditAppend(
             "connection_flag_set",
             actor=actor,
@@ -2615,9 +2616,7 @@ class Engine:
                 async with deadline, self._config_write_lock:
                     # The drain saw this task, but it may give up on it and close the store.
                     if self._config_writes_closed:
-                        raise WiringError(
-                            "the engine is stopping, so a connection flag cannot be set"
-                        )
+                        raise WiringError(stopping)
                     started = True
                     await self.store.set_connection_flag(
                         name, direction, flagged=flagged, audit=audit

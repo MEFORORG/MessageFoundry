@@ -670,13 +670,12 @@ class _SlowFirstWrite:
     """Holds the first flag write open until :attr:`release`, around the real store, and lets every
     later write through, so a later toggle nothing holds back overtakes it.
 
-    ``read_committed`` adds what SQLite's one writer rules out and a READ COMMITTED server does not:
-    a clear that runs during an uncommitted set sees no row, deletes nothing, and still appends its
-    audit row, after the set's, because that row waits on the audit lock the set holds."""
+    A clear that overtakes takes the one branch here that is not the real store, because SQLite's
+    one writer rules out what a READ COMMITTED server allows and no test here runs a server: a clear
+    during an uncommitted set sees no row, deletes nothing, and still appends its audit row, after
+    the set's, because that row waits on the audit lock the set holds."""
 
-    def __init__(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, *, read_committed: bool = False
-    ) -> None:
+    def __init__(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         self.entered, self.release, self.first_done = (asyncio.Event() for _ in range(3))
         self.calls = 0
         store = engine.store
@@ -691,7 +690,7 @@ class _SlowFirstWrite:
                 await self.release.wait()
                 await real(connection, direction, flagged=flagged, audit=audit)
                 self.first_done.set()
-            elif read_committed and not flagged and not self.first_done.is_set():
+            elif not flagged and not self.first_done.is_set():
                 await self.first_done.wait()
                 await store.record_audit(audit.action, actor=audit.actor, detail=audit.detail)
             else:
@@ -700,12 +699,20 @@ class _SlowFirstWrite:
         monkeypatch.setattr(store, "set_connection_flag", _write)
 
 
-async def _overlap(
-    engine: Engine, slow: _SlowFirstWrite, *, earlier: bool, later: bool, caller_goes: bool = False
-) -> tuple[bool, bool]:
-    """Two toggles of one connection, the earlier held in the store while the later arrives.
-    Returns what the newest ``connection_flag_set`` row says and whether the flag is stored."""
-    first = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound", earlier))
+@pytest.mark.parametrize("caller_goes", [False, True], ids=["caller-waits", "caller-went"])
+@pytest.mark.parametrize("later", [False, True], ids=["set-then-clear", "clear-then-set"])
+async def test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, later: bool, caller_goes: bool
+) -> None:
+    """The later toggle waits for the earlier, even one whose caller has gone, so the flag and the
+    newest row both say what the last toggle said, and the model's branch never runs.
+
+    RED with no lock, or one that a gone caller gives up, on either ordering. A clear that overtakes
+    a set leaves the flag stored under a newest row that says it is not, which is the disagreement,
+    through the modelled branch. A set that overtakes a clear agrees with its row, on the real store
+    alone, but both end on the EARLIER toggle. SQLite cannot show the disagreement unmodelled."""
+    slow = _SlowFirstWrite(engine, monkeypatch)
+    first = asyncio.ensure_future(_flag(engine, "OB_TOML", "outbound", not later))
     await asyncio.wait_for(slow.entered.wait(), 5)
     if caller_goes:
         first.cancel()
@@ -720,41 +727,8 @@ async def _overlap(
     rows = await engine.store.list_audit(action="connection_flag_set")
     assert len(rows) == 2
     newest = json.loads(str(rows[0]["detail"]))["flagged"]
-    return newest, ("OB_TOML", "outbound") in await engine.store.list_connection_flags()
-
-
-@pytest.mark.parametrize("caller_goes", [False, True], ids=["caller-waits", "caller-went"])
-@pytest.mark.parametrize("later", [False, True], ids=["set-then-clear", "clear-then-set"])
-async def test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, later: bool, caller_goes: bool
-) -> None:
-    """The later toggle waits for the earlier, even one whose caller has gone, so the last toggle is
-    the flag and the newest row. RED with no lock, or one that a gone caller gives up: the later
-    toggle lands first, and the flag and the newest row both end on the EARLIER toggle.
-
-    This tells arrival order from overtaking, in either direction. SQLite cannot show the flag and
-    the row disagreeing, because its one writer makes each toggle whole, so that assertion alone
-    passes here with no lock; the next test is the one that can fail on it."""
-    slow = _SlowFirstWrite(engine, monkeypatch)
-    newest, stored = await _overlap(
-        engine, slow, earlier=not later, later=later, caller_goes=caller_goes
-    )
-    assert stored is newest
+    assert (("OB_TOML", "outbound") in await engine.store.list_connection_flags()) is newest
     assert newest is later
-    assert slow.calls == 2
-
-
-async def test_a_clear_never_runs_during_a_set_it_could_miss(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The ordering behind the disagreement, with the server's behaviour modelled by
-    :class:`_SlowFirstWrite`, since no test here runs a server: an uncommitted set, a clear that
-    misses it, then both rows. RED with no lock: the flag is stored, and the newest row says it is
-    not. With the lock the clear starts after the set, so the model's branch never runs."""
-    slow = _SlowFirstWrite(engine, monkeypatch, read_committed=True)
-    newest, stored = await _overlap(engine, slow, earlier=True, later=False)
-    assert stored is newest
-    assert newest is False
 
 
 async def test_a_queue_behind_a_stuck_toggle_gets_the_refusal_at_its_own_bound(

@@ -314,8 +314,7 @@ for an approver, because the IDE promote pre-flight would stall on a second pers
 - **AC-6** — WHEN two toggles of one connection overlap in one engine process, THE SYSTEM SHALL land
   them in arrival order, so the flag matches the newest `connection_flag_set` row, whether or not
   the earlier caller is still waiting.
-  → `tests/test_connection_flag.py::test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row`,
-  `tests/test_connection_flag.py::test_a_clear_never_runs_during_a_set_it_could_miss`
+  → `tests/test_connection_flag.py::test_two_overlapping_toggles_leave_the_flag_matching_the_last_audit_row`
 
 ---
 
