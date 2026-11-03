@@ -135,8 +135,8 @@ def _pr(
                 }
             ]
         },
-        "comments": {"nodes": comments or []},
-        "reviews": {"nodes": reviews or []},
+        "comments": {"pageInfo": {"hasPreviousPage": False}, "nodes": comments or []},
+        "reviews": {"pageInfo": {"hasPreviousPage": False}, "nodes": reviews or []},
     }
 
 
@@ -255,11 +255,11 @@ def test_same_second_tie_goes_to_the_lander(
     head = _sha(8)
     hold = hpt.Event(NOW, _marker_body(head), bot=False, trusted=True)
     note = hpt.Event(NOW, SESSION + "looking now.", bot=False, trusted=True)
-    assert hpt.classify(head, [hold, note]) == ("LANDER", ["no-hold"])
-    assert hpt.classify(head, [note, hold]) == ("LANDER", ["no-hold"])
+    assert hpt.classify(head, [hold, note]) == ("LANDER", ["no-hold"], None)
+    assert hpt.classify(head, [note, hold]) == ("LANDER", ["no-hold"], None)
     # Two tied holds must both match the head.
     other = hpt.Event(NOW, _marker_body("f4f4dd470"), bot=False, trusted=True)
-    assert hpt.classify(head, [hold, other]) == ("LANDER", ["new-commit"])
+    assert hpt.classify(head, [hold, other]) == ("LANDER", ["new-commit"], None)
 
 
 def test_newer_non_hold_lander_comment_is_lander_turn(
@@ -409,13 +409,46 @@ def test_only_a_lander_seat_id_signs_a_hold(
 def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    full = _held(110, _ack("2026-10-28T13:00:00Z", _sha(110)))
+    full = _held(110, _ack("2026-10-28T17:00:00Z", _sha(110)))
     # A short, upper-cased SHA with a trailing space and CR, in the hold's own second.
     odd = f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing"
-    short = _held(111, _comment(odd, "2026-10-28T12:00:00Z"))
+    at = "2026-10-28T17:00:00Z"
+    short = _pr(111, comments=[_hold(at, _sha(111)), _comment(odd, at)])
     rows = _engine_rows(tmp_path, capsys, full, short)
     assert _turn(rows[110]) == ("AUTHOR", ["held", "acked"])
     assert _turn(rows[111]) == ("AUTHOR", ["held", "acked"])
+
+
+def test_an_ack_more_than_two_hours_old_hands_the_turn_to_the_lander(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NOW is 18:00. An ack 2h+1s old has expired; one 1h59m old, or exactly 2h old, has not. The
+    newest ack decides, and an expired ack on a cut page carries both flags."""
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(115, _ack("2026-10-28T15:59:59Z", _sha(115))),
+        _held(116, _ack("2026-10-28T16:01:00Z", _sha(116))),
+        _held(117, _ack("2026-10-28T16:00:00Z", _sha(117))),
+        _held(
+            118,
+            _ack("2026-10-28T12:30:00Z", _sha(118)),
+            _ack("2026-10-28T17:00:00Z", _sha(118)),
+        ),
+        _cut(_held(119, _ack("2026-10-28T15:00:00Z", _sha(119)))),
+        # Controls: rows that would not read AUTHOR acked do not change.
+        _held(114, _ack("2026-10-28T12:30:00Z", _sha(114)), _repair()),
+    )
+    assert _repair_row(rows[115]) == ("LANDER", ["held", "acked", "ack-expired"], None)
+    assert _repair_row(rows[116]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[117]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[118]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[119]) == (
+        "LANDER",
+        ["held", "acked", "ack-expired", "page-cut"],
+        None,
+    )
+    assert _repair_row(rows[114]) == ("REPAIR", ["held", "acked", "repair"], OWNER_ID)
 
 
 def test_anything_but_a_valid_ack_still_hands_the_turn_back(
@@ -470,6 +503,478 @@ def test_the_ack_marker_must_be_the_whole_first_line() -> None:
     # An ack is not a hold, and a hold is not an ack.
     assert hpt.hold_head(marker + "\n" + SESSION + "**Held.**") is None
     assert hpt.ack_head(_marker_body("abcdef1")) is None
+
+
+# ---- the repair contract -------------------------------------------------------------------------
+
+#: A made-up session id in the desktop app's shape: mixed case, an underscore, hyphens, 42 characters.
+OWNER_ID = "local_Ab12cd34-0000-4000-8000-000000000000"
+
+
+def _repair_body(session: str = OWNER_ID, signature: str = SESSION) -> str:
+    """The shared marker contract's shape: the marker line, then the Lander-signed transfer line."""
+    return (
+        f"<!-- repair-owner session={session} -->\n{signature}Repair owned by the Repair Manager"
+        " from 13:00Z; the original author stands down on this PR."
+    )
+
+
+def _repair(at: str = "2026-10-28T13:00:00Z", **kw: Any) -> dict[str, Any]:
+    return _comment(_repair_body(**kw), at)
+
+
+def _repair_row(row: dict[str, Any]) -> tuple[str, list[str], str | None]:
+    return row["turn"], row["flags"], row["repairOwner"]
+
+
+def test_a_repair_marker_after_a_standing_hold_is_the_repair_owners_turn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(130, _repair()),
+        # Seat-signed, with trailing space and CR on the marker line.
+        _held(
+            131,
+            _comment(
+                _repair_body(signature=SEAT).replace(" -->\n", " --> \r\n", 1),
+                "2026-10-28T13:00:00Z",
+            ),
+        ),
+        # An author's ack naming the head, before the transfer, is still not a reply.
+        _held(132, _ack("2026-10-28T12:30:00Z", _sha(132)), _repair()),
+        # A re-transfer: the newest marker names the owner.
+        _held(
+            133, _repair("2026-10-28T13:00:00Z", session="old-1"), _repair("2026-10-28T14:00:00Z")
+        ),
+    )
+    assert _repair_row(rows[130]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[131]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[132]) == ("REPAIR", ["held", "acked", "repair"], OWNER_ID)
+    assert _repair_row(rows[133]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    # A re-hold on the repair's new head, then a new marker after it: still the repair's.
+    rehold = _pr(
+        135,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _hold("2026-10-28T15:00:00Z", _sha(135)),
+            _repair("2026-10-28T15:00:01Z"),
+        ],
+    )
+    assert _repair_row(_engine_rows(tmp_path, capsys, rehold)[135]) == (
+        "REPAIR",
+        ["held", "repair"],
+        OWNER_ID,
+    )
+    # A third line, such as a note on ASVS record content, does not stop a marker qualifying.
+    third = _comment(
+        _repair_body() + "\nASVS record content: the Repair Manager may take it.",
+        "2026-10-28T13:00:00Z",
+    )
+    assert _repair_row(_engine_rows(tmp_path, capsys, _held(136, third))[136]) == (
+        "REPAIR",
+        ["held", "repair"],
+        OWNER_ID,
+    )
+    # A row that is not a repair carries a null owner, never a missing key.
+    assert _engine_rows(tmp_path, capsys, _held(134))[134]["repairOwner"] is None
+
+
+def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Controls: each of these MUST NOT read REPAIR. A marker is never a Lander event, so one that
+    does not qualify is an ordinary reply, and the turn is the Lander's, the safe direction."""
+    late = _held(140, _repair(), head=_sha(999))
+    outsider = _repair()
+    outsider["authorAssociation"] = "CONTRIBUTOR"
+    edited = _repair()
+    edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    as_review = _review(_repair_body(), "2026-10-28T13:00:00Z")
+    line_two = _comment(SESSION + "transfer.\n" + _repair_body(), "2026-10-28T13:00:00Z")
+    quoted = _comment("> " + _repair_body().replace("\n", "\n> "), "2026-10-28T13:00:00Z")
+    manager = _comment(_repair_body(signature="Lander (8a04c9f3): "), "2026-10-28T13:00:00Z")
+    unsigned = _comment(_repair_body(signature="Manager: "), "2026-10-28T13:00:00Z")
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        # A push after the hold, and so possibly after the marker: the head no longer starts with
+        # the hold's SHA. Only the SHA is read, never the committer date.
+        late,
+        # The marker in the hold's own second is not provably after it.
+        _held(141, _repair("2026-10-28T12:00:00Z")),
+        _held(142, outsider),
+        _held(144, edited),
+        _held(145, reviews=[as_review]),
+        _held(146, line_two),
+        _held(147, quoted),
+        _held(148, manager),
+        _held(149, unsigned),
+        # Any other reply after the hold still hands the turn back, marker or not.
+        _held(150, _repair(), _comment("Manager: I am back, fixing.", "2026-10-28T14:00:00Z")),
+        # Two sessions named in one second cannot be ordered.
+        _held(151, _repair(), _repair(session="other-session")),
+        # An ack after the transfer, or in its second, may be the stood-down author still working.
+        _held(152, _repair(), _ack("2026-10-28T14:00:00Z", _sha(152))),
+        _held(153, _repair(), _ack("2026-10-28T13:00:00Z", _sha(153))),
+    )
+    assert _repair_row(rows[140]) == ("LANDER", ["new-commit", "replied"], None)
+    for n in (141, 142, 145, 147, 148, 149, 150, 151, 152, 153):
+        assert _repair_row(rows[n]) == ("LANDER", ["replied", "no-new-commit"], None), n
+    # Signed on line one, it is a newer non-hold Lander comment, so no hold stands.
+    assert _repair_row(rows[146]) == ("LANDER", ["no-hold"], None)
+    assert _repair_row(rows[144]) == ("LANDER", ["replied", "edited", "no-new-commit"], None)
+
+
+def test_a_repair_marker_without_a_standing_hold_is_not_a_repair(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        # No hold at all: the marker alone is not a Lander event.
+        _pr(160, comments=[_repair()]),
+        # A marker older than the latest hold makes no REPAIR turn. Nor does the hold park the PR
+        # on its author: the hold the marker transferred may have fallen off the fetched page, so
+        # it reads LANDER repair-rehold, the safe direction.
+        _pr(
+            161,
+            comments=[_repair("2026-10-28T11:00:00Z"), _hold("2026-10-28T12:00:00Z", _sha(161))],
+        ),
+        # A newer non-hold Lander comment after the marker: the newest Lander event is no hold.
+        _held(162, _repair(), _comment(SESSION + "reviewing the repair.", "2026-10-28T14:00:00Z")),
+        # A legacy prose hold is no hold, so a marker after it is no repair.
+        _pr(163, comments=[_comment(SESSION + "**Held.**", "2026-10-28T12:00:00Z"), _repair()]),
+    )
+    # A bot marker is not read.
+    bot = _repair()
+    bot["author"] = {"__typename": "Bot", "login": "some-app"}
+    more = _engine_rows(tmp_path, capsys, _held(165, bot))
+    assert _repair_row(more[165]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[160]) == ("LANDER", ["no-hold"], None)
+    assert _repair_row(rows[161]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[162]) == ("LANDER", ["no-hold"], None)
+    assert _repair_row(rows[163]) == ("LANDER", ["no-hold"], None)
+
+
+def _transferred(n: int, *after_rehold: dict[str, Any]) -> dict[str, Any]:
+    """PR ``n`` held at noon on an old head, transferred at 13:00, re-held at 15:00 on its head."""
+    return _pr(
+        n,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _hold("2026-10-28T15:00:00Z", _sha(n)),
+            *after_rehold,
+        ],
+    )
+
+
+def test_a_rehold_on_a_transferred_pr_with_no_fresh_marker_is_the_landers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The original author was told to stand down, so a re-hold with no fresh marker must not
+    park the PR on them: the Lander's move is to post a fresh marker."""
+    two_owners = _pr(
+        168,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _repair("2026-10-28T13:00:00Z", session="other-session"),
+            _hold("2026-10-28T15:00:00Z", _sha(168)),
+        ],
+    )
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _transferred(164),
+        _transferred(166, _ack("2026-10-28T15:30:00Z", _sha(166))),
+        # A re-transfer before the re-hold: the newest earlier marker names the owner.
+        _pr(
+            167,
+            comments=[
+                _hold("2026-10-28T12:00:00Z", _sha(1)),
+                _repair("2026-10-28T13:00:00Z", session="old-1"),
+                _repair("2026-10-28T14:00:00Z"),
+                _hold("2026-10-28T15:00:00Z", _sha(167)),
+            ],
+        ),
+        two_owners,
+        # Control: a fresh qualifying marker after the re-hold is a REPAIR turn for its session.
+        _transferred(169, _repair("2026-10-28T15:00:01Z", session="new-owner")),
+        # Control: never a marker, so the re-hold stands for the author.
+        _pr(
+            172,
+            comments=[
+                _hold("2026-10-28T12:00:00Z", _sha(1)),
+                _hold("2026-10-28T15:00:00Z", _sha(172)),
+            ],
+        ),
+    )
+    assert _repair_row(rows[164]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[166]) == ("LANDER", ["held", "acked", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[167]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[168]) == ("LANDER", ["held", "repair-rehold"], None)
+    assert _repair_row(rows[169]) == ("REPAIR", ["held", "repair"], "new-owner")
+    assert _repair_row(rows[172]) == ("AUTHOR", ["held"], None)
+    # Hiding the superseded hold does not bring back the author's turn, and a marker from an
+    # outside account was never a transfer.
+    hidden_hold = _transferred(173)
+    hidden_hold["comments"]["nodes"][0]["isMinimized"] = True
+    outsider = _transferred(175)
+    outsider["comments"]["nodes"][1]["authorAssociation"] = "CONTRIBUTOR"
+    hidden = _engine_rows(tmp_path, capsys, hidden_hold, outsider)
+    assert _repair_row(hidden[173]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(hidden[175]) == ("AUTHOR", ["held"], None)
+    doc = {ENGINE: {"pages": [_page([_transferred(164)])], "required": ENGINE_REQUIRED}}
+    _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    line = next(x for x in out.splitlines() if x.startswith("LANDER"))
+    assert line.split()[:2] == ["LANDER", f"held,repair-rehold={OWNER_ID}"]
+
+
+def test_a_hold_after_any_marker_is_the_landers_whatever_came_before(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Any qualifying marker before the hold, and none after, reads LANDER ``repair-rehold``,
+    whether or not the hold it transferred was fetched or recognised."""
+    rehold = "2026-10-28T15:00:00Z"
+    dismissed = _review(_marker_body(_sha(1)), "2026-10-28T12:00:00Z", state="DISMISSED")
+    # More than COMMENT_PAGE comments after the marker push the earlier hold off the page; here
+    # the page simply starts at the marker.
+    truncated = _pr(190, comments=[_repair(), _hold(rehold, _sha(190))])
+    legacy = _pr(
+        191,
+        comments=[
+            _comment(SESSION + "**Held.**", "2026-10-28T12:00:00Z"),
+            _repair(),
+            _hold(rehold, _sha(191)),
+        ],
+    )
+    # The marker shares the earlier hold's second, so it is not provably after that hold.
+    same_second = _pr(
+        192,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T12:00:00Z"),
+            _hold(rehold, _sha(192)),
+        ],
+    )
+    dismissed_hold = _pr(193, comments=[_repair(), _hold(rehold, _sha(193))], reviews=[dismissed])
+    # Controls: an outside account's marker was never a transfer, and a fresh marker after the
+    # hold is a REPAIR turn.
+    outsider = _pr(194, comments=[_repair(), _hold(rehold, _sha(194))])
+    outsider["comments"]["nodes"][0]["authorAssociation"] = "CONTRIBUTOR"
+    fresh = _pr(
+        195, comments=[_repair(), _hold(rehold, _sha(195)), _repair("2026-10-28T15:00:01Z")]
+    )
+    never = _pr(196, comments=[_hold(rehold, _sha(196))])
+    rows = _engine_rows(
+        tmp_path, capsys, truncated, legacy, same_second, dismissed_hold, outsider, fresh, never
+    )
+    for n in (190, 191, 192, 193):
+        assert _repair_row(rows[n]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID), n
+    assert _repair_row(rows[194]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[195]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[196]) == ("AUTHOR", ["held"], None)
+
+
+def _minimized(comment: dict[str, Any]) -> dict[str, Any]:
+    comment["isMinimized"] = True
+    return comment
+
+
+def test_a_minimized_marker_is_a_cancelled_transfer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Minimizing the newest marker hands the PR back to its author: it never gives REPAIR and
+    never keeps a hold on the Lander, and the PR reads as if the marker had never been posted."""
+    before = _transferred(174)
+    _minimized(before["comments"]["nodes"][1])
+    # The newest marker before the re-hold is minimized; the older visible one still qualifies.
+    re_transfer = _pr(
+        176,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z", session="old-1"),
+            _minimized(_repair("2026-10-28T14:00:00Z")),
+            _hold("2026-10-28T15:00:00Z", _sha(176)),
+        ],
+    )
+    outsider = _minimized(_repair())
+    outsider["authorAssociation"] = "CONTRIBUTOR"
+    edited = _minimized(_repair())
+    edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        before,
+        re_transfer,
+        # Control: the same PR with its marker visible is the Lander's re-hold.
+        _transferred(177),
+        # After the hold: no REPAIR and no reply, so the hold stands for the author.
+        _held(178, _minimized(_repair())),
+        # A minimized marker in a visible one's second names no second session.
+        _held(179, _repair(), _minimized(_repair(session="other-session"))),
+        # The newest QUALIFYING marker wins: a newer minimized one does not displace it.
+        _held(180, _repair(session="old-1"), _minimized(_repair("2026-10-28T14:00:00Z"))),
+        # Controls: an outside account's minimized marker was never a marker, so it is a reply,
+        # and an edit to a minimized marker is an edit.
+        _held(181, outsider),
+        _held(182, edited),
+    )
+    assert _repair_row(rows[174]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[176]) == ("LANDER", ["held", "repair-rehold"], "old-1")
+    assert _repair_row(rows[177]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[178]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[179]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[180]) == ("REPAIR", ["held", "repair"], "old-1")
+    assert _repair_row(rows[181]) == ("LANDER", ["replied", "no-new-commit"], None)
+    assert _repair_row(rows[182]) == ("LANDER", ["edited", "no-new-commit"], None)
+    cancelled = hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=True)
+    assert cancelled.cancelled and cancelled.repair_by is None and not cancelled.lander
+    for not_cancelled in (
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=True, associated=True),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=False),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=True, review=True),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False, associated=True, dismissed=True),
+        hpt.Event(NOW, "Manager: I am back.", bot=False, trusted=False, associated=True),
+    ):
+        assert not not_cancelled.cancelled
+
+
+def _cut(pr: dict[str, Any], kind: str = "comments", info: object = None) -> dict[str, Any]:
+    """``pr`` with its ``kind`` page cut: ``info`` replaces ``pageInfo``, or "absent" drops it."""
+    if info == "absent":
+        del pr[kind]["pageInfo"]
+    else:
+        pr[kind]["pageInfo"] = {"hasPreviousPage": True} if info is None else info
+    return pr
+
+
+def test_a_cut_page_never_reads_author(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A marker before the hold, or an old comment edited into a reply, may be off a cut page, so
+    a row that would read AUTHOR reads LANDER ``page-cut``. So does one that would read REPAIR,
+    keeping ``repair`` and its owner: an author comment or a later hold off the page could have
+    ended the transfer. Nothing else changes."""
+    rehold = "2026-10-28T15:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        # The transfer that told the author to stand down is off the page: only the re-hold shows.
+        _cut(_pr(200, comments=[_hold(rehold, _sha(200))])),
+        _cut(_held(201), "reviews"),
+        _cut(_held(202, _ack("2026-10-28T17:30:00Z", _sha(202)))),
+        # A pageInfo that cannot say is no proof the page is whole.
+        _cut(_held(203), info="absent"),
+        _cut(_held(204), info={"hasPreviousPage": None}),
+        _cut(_held(205), "reviews", info="x"),
+        # A transfer on a cut page: whatever ended it may be off the page.
+        _cut(_held(207, _repair())),
+        _cut(_held(213, _ack("2026-10-28T12:30:00Z", _sha(213)), _repair()), "reviews"),
+        # Controls: an uncut page still reads AUTHOR or REPAIR, and LANDER rows do not change.
+        _held(206),
+        _held(214, _repair()),
+        _cut(_held(208, _comment("Manager: fixed.", "2026-10-28T13:00:00Z"))),
+        _cut(_transferred(209)),
+        _cut(_pr(210)),
+    )
+    for n in (200, 201, 203, 204, 205):
+        assert _repair_row(rows[n]) == ("LANDER", ["held", "page-cut"], None), n
+    assert _repair_row(rows[202]) == ("LANDER", ["held", "acked", "page-cut"], None)
+    assert _repair_row(rows[206]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[207]) == ("LANDER", ["held", "repair", "page-cut"], OWNER_ID)
+    assert _repair_row(rows[213]) == (
+        "LANDER",
+        ["held", "acked", "repair", "page-cut"],
+        OWNER_ID,
+    )
+    assert _repair_row(rows[214]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[208]) == ("LANDER", ["replied", "no-new-commit"], None)
+    assert _repair_row(rows[209]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[210]) == ("LANDER", ["no-hold"], None)
+    queued = _cut(_held(211))
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    assert _repair_row(_engine_rows(tmp_path, capsys, queued)[211]) == (
+        "LANDER",
+        ["held", "page-cut", "in-queue"],
+        None,
+    )
+    doc = {ENGINE: {"pages": [_page([_cut(_held(212))])], "required": ENGINE_REQUIRED}}
+    _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    line = next(x for x in out.splitlines() if x.startswith("LANDER"))
+    assert line.split()[:2] == ["LANDER", "held,page-cut"]
+
+
+def test_the_query_asks_whether_the_comment_and_review_pages_were_cut() -> None:
+    query = " ".join(hpt.QUERY.split())
+    for kind, page in (("comments", hpt.COMMENT_PAGE), ("reviews", hpt.REVIEW_PAGE)):
+        assert f"{kind}(last: {page}) {{ pageInfo {{ hasPreviousPage }} nodes {{" in query, kind
+
+
+def test_the_repair_marker_shape_is_exact() -> None:
+    assert hpt.repair_owner(_repair_body()) == OWNER_ID
+    assert hpt.repair_owner(_repair_body("a" * 64)) == "a" * 64
+    # As THE MARKER SHAPE says, nothing is required after ``Lander (session``, not even a space.
+    assert hpt.repair_owner(_repair_body(signature="Lander (sessionless) ")) == OWNER_ID
+    for bad in ("", "a" * 65, "has space", "dot.id", "slash/id", "colon:id"):
+        assert hpt.repair_owner(_repair_body(bad)) is None, bad
+    marker = f"<!-- repair-owner session={OWNER_ID} -->"
+    for body in (
+        marker,
+        marker + "\n",
+        " " + marker + "\n" + SESSION,
+        "\n" + marker + "\n" + SESSION,
+        marker + " trailing\n" + SESSION,
+        marker + "\n\n" + SESSION,
+        marker + "\u2028" + SESSION,
+        marker + "\x0b\n" + SESSION,
+        f"<!--repair-owner session={OWNER_ID}-->\n" + SESSION,
+    ):
+        assert hpt.repair_owner(body) is None, repr(body)
+    # A repair marker is neither a hold nor an ack, and a hold is not a repair marker.
+    assert hpt.hold_head(_repair_body()) is None
+    assert hpt.ack_head(_repair_body()) is None
+    assert hpt.repair_owner(_marker_body("abcdef1")) is None
+    event = hpt.Event(NOW, _repair_body(), bot=False, trusted=True)
+    assert not event.lander and event.repair_by == OWNER_ID
+    for gated in (
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=True, dismissed=True),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=True, review=True),
+    ):
+        assert gated.repair_by is None
+
+
+def test_a_queued_or_armed_repair_is_the_landers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queued = _held(170, _repair())
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    armed = _held(171, _repair())
+    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
+    rows = _engine_rows(tmp_path, capsys, queued, armed)
+    assert _repair_row(rows[170]) == ("LANDER", ["held", "repair", "in-queue"], OWNER_ID)
+    assert _repair_row(rows[171]) == ("LANDER", ["held", "repair", "auto-armed"], OWNER_ID)
+
+
+def test_repair_rows_sort_between_lander_and_author_and_show_the_owner(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prs = [_held(180), _held(181, _repair()), _pr(182)]
+    doc = {ENGINE: {"pages": [_page(prs)], "required": ENGINE_REQUIRED}}
+    _, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
+    assert [(r["turn"], r["number"]) for r in rows] == [
+        ("LANDER", 182),
+        ("REPAIR", 181),
+        ("AUTHOR", 180),
+    ]
+    code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    assert code == 0
+    line = next(x for x in out.splitlines() if x.startswith("REPAIR"))
+    assert line.split()[:4] == ["REPAIR", f"held,repair={OWNER_ID}", "MessageFoundry", "181"]
 
 
 # ---- the hold contract ---------------------------------------------------------------------------
@@ -728,6 +1233,8 @@ def test_overflowing_stamp_is_one_error_row_and_exit_zero(
     assert code == 0
     by = {r["number"]: r for r in rows}
     assert by[30]["turn"] == "ERROR" and "OverflowError" in by[30]["error"]
+    # Every row carries the key, an ERROR row's null, so a consumer never meets a KeyError.
+    assert by[30]["repairOwner"] is None
     assert "report defect" in by[30]["error"]
     assert by[31]["turn"] == "LANDER"
     code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
