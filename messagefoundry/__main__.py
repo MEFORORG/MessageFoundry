@@ -10478,7 +10478,16 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
     the backstop for one that goes away after this check."""
     import os
 
-    root = Path(uploads_dir).absolute()
+    try:
+        # Resolving a relative path reads the working directory, which can itself be gone.
+        root = Path(uploads_dir).absolute()
+    except OSError as exc:
+        return (
+            f"the uploads directory {uploads_dir} ([store].uploads_dir) is relative, and the "
+            f"directory this command runs in cannot be read ({exc.strerror or type(exc).__name__}), "
+            "so rotate-key changed nothing. Make uploads_dir absolute, or run from the directory "
+            "serve uses, and re-run."
+        )
     where = f"the uploads directory {root} ([store].uploads_dir)"
     try:
         with os.scandir(root):
@@ -10493,10 +10502,15 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
             "this run must re-seal. Fix the cause and re-run."
         )
     except OSError as exc:
+        # Not only a missing right: Windows raises PermissionError for a volume that is not ready
+        # (ERROR_NOT_READY), and a stale network mount (ESTALE) lands here too, so the message must
+        # not name one cause as the only one.
         return (
             f"{where} cannot be listed ({exc.strerror or type(exc).__name__}), so rotate-key "
-            "changed nothing. Give the account running rotate-key the right to list it, or fix "
-            "the cause, and re-run."
+            "changed nothing. The causes include at least an account that may not list it and a "
+            "volume that is offline, not mounted or a stale network mount, whose uploads may "
+            "still be under the prior key. Grant the account the right to list it, or bring the "
+            "volume back, and re-run."
         )
 
 

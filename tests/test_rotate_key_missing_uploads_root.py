@@ -17,6 +17,7 @@ only."""
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 from pathlib import Path
 
@@ -121,6 +122,51 @@ def test_an_uploads_root_it_cannot_list_is_refused_with_its_cause(
     assert refusal is not None
     assert "cannot be listed (Permission denied), so rotate-key changed nothing" in refusal
     assert "Create it" not in refusal
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Windows raises PermissionError for a volume that is not ready (ERROR_NOT_READY, 21).
+        PermissionError(errno.EACCES, "The device is not ready"),
+        OSError(getattr(errno, "ESTALE", 116), "Stale file handle"),
+    ],
+    ids=["volume not ready", "stale network mount"],
+)
+def test_a_root_it_cannot_list_names_an_offline_volume_as_a_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    """Either error can mean the volume is gone rather than a missing right, so the refusal names
+    both causes and does not send the operator to grant rights alone."""
+
+    def offline(path: object) -> object:
+        raise error
+
+    monkeypatch.setattr(os, "scandir", offline)
+    refusal = _uploads_root_refusal(str(tmp_path))
+    assert refusal is not None
+    assert f"cannot be listed ({error.strerror}), so rotate-key changed nothing" in refusal
+    assert "at least an account that may not list it and a volume that is offline" in refusal
+    assert "bring the volume back" in refusal
+    assert "Create it" not in refusal
+
+
+def test_a_relative_root_under_a_gone_working_directory_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolving a relative path reads the working directory; one that is gone is a refusal, not a
+    traceback."""
+
+    def gone() -> str:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(os, "getcwd", gone)
+    refusal = _uploads_root_refusal("uploads")
+    assert refusal is not None
+    assert (
+        "the uploads directory uploads ([store].uploads_dir) is relative, and the directory this "
+        "command runs in cannot be read (No such file or directory), so rotate-key changed nothing"
+    ) in refusal
 
 
 def test_a_relative_uploads_dir_is_named_as_read(

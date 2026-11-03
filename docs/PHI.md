@@ -635,9 +635,15 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    reads the same as one with no uploads, and its uploads may still be under the prior key. One that
    goes away during the run fails it as a skip does, and rolls the audit chain as a skip does. The
    directory is created on the first upload, so a site that has never stored one creates it, empty,
-   and re-runs. An empty directory completes, so at least an unmounted volume whose mount point is
-   an empty directory, and a directory an upload created while the volume was not mounted, are
-   still not caught. **A `serve` start does not stamp that key either (BACKLOG
+   and re-runs. **It refuses only a path it cannot list: it cannot tell a directory it can list from
+   the one that holds the uploads.** When `uploads_dir` names a listable directory other than that
+   one, it re-seals only what that directory holds, then prints OK, stamps the key and closes the
+   rotation record while the real uploads may still be under the prior key. At least these reach
+   that: a volume that is not mounted over an empty mount point, which reads as no uploads; a
+   directory an upload created at that path while the volume was not mounted, where it re-seals
+   that upload alone; and a relative `uploads_dir` read from a directory other than the one `serve`
+   uses, where the run prints a note naming the path it read. Before retiring the prior key, confirm
+   the volume is mounted and the path is the one `serve` uses. **A `serve` start does not stamp that key either (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
    (the store open can already have written under the key) and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. When a start finds that the key in
