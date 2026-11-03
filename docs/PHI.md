@@ -630,7 +630,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
    clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
-   step did not complete (BACKLOG #3181). **A `serve` start does not stamp that key either (BACKLOG
+   step did not complete (BACKLOG #3181). **It does the same when the configured `uploads_dir` is
+   not a directory (BACKLOG #4940),** because a volume that is not mounted reads the same as one
+   with no uploads, and its uploads may still be under the prior key. The directory is created on
+   the first upload, so a site that has never stored one creates it, empty, and re-runs. An empty
+   directory completes, so an unmounted volume whose mount point is an empty directory is still not
+   caught. **A `serve` start does not stamp that key either (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
    (the store open can already have written under the key) and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. When a start finds that the key in

@@ -647,6 +647,17 @@ class ResealResult:
     #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
     #: it is a skip.
     not_regular: int = 0
+    #: True when the uploads root is not a directory, so the pass read nothing (BACKLOG #4940). An
+    #: unmounted volume and a directory never created both look like this, and the pass cannot tell
+    #: them apart: read as zero uploads, an unmounted volume's uploads would stay under the prior key
+    #: while the run reported success. So it fails the run as a skip does. A site with no uploads has
+    #: an empty root, or no ``uploads_dir`` at all, and completes.
+    root_missing: bool = False
+
+    @property
+    def incomplete(self) -> bool:
+        """True when an upload may still be under the prior key, so the run must not complete."""
+        return bool(self.skipped) or self.root_missing
 
 
 class _Half(Enum):
@@ -2103,6 +2114,10 @@ class UploadStore:
         **Only a regular file is opened (BACKLOG #3737),** no link is followed, and no file larger
         than an upload can be is read whole. See :meth:`_reseal_half`.
 
+        **A root that is not a directory is not zero uploads (BACKLOG #4940).** It sets
+        ``root_missing``, which fails ``rotate-key``: an unmounted volume reads the same as a
+        directory nobody created.
+
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
 
@@ -2112,7 +2127,12 @@ class UploadStore:
         if not isinstance(cipher, AesGcmCipher):
             return ResealResult()  # identity / transit cipher — nothing this process can rotate
         if not self._root.is_dir():
-            return ResealResult()
+            # BACKLOG #4940: not zero uploads. The root is created on the first save, so a site
+            # that never stored one has none, but neither has an unmounted volume.
+            _log.warning(
+                "uploads root %s is not a directory; no uploaded file was read", self._root
+            )
+            return ResealResult(root_missing=True)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in self._iter_sidecars():
             try:

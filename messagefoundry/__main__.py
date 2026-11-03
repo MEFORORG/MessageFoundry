@@ -10651,11 +10651,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
             # Only once the whole rotation is done, so after the audit step (BACKLOG #3181). After a
-            # skipped upload, part of that file may still be under the prior key, and after a failed
+            # skipped upload, part of that file may still be under the prior key, so may every
+            # upload behind an uploads root that was not there (BACKLOG #4940), and after a failed
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.skipped:
+            if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.incomplete:
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
@@ -10734,7 +10735,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
     # uploaded file may still be under that key (BACKLOG #3181).
-    complete = rolled_ok and not uploads.skipped
+    complete = rolled_ok and not uploads.incomplete
     print(f"OK: {done}" if complete else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
@@ -10792,6 +10793,19 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
         )
+    if uploads.root_missing:
+        # BACKLOG #4940: read as zero uploads, an unmounted volume printed OK and closed the record
+        # with every upload on it still under the prior key. A directory nobody created looks the
+        # same, so the operator says which by creating it.
+        print(
+            f"error: the uploads directory {settings.store.uploads_dir} ([store].uploads_dir) does "
+            "not exist or is not a directory, so no uploaded file was re-sealed. If it is on a "
+            "volume that is not mounted, mount it and re-run rotate-key BEFORE retiring any prior "
+            "key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED): its uploads may still be under that key. If "
+            "this site has never stored an upload, create the directory, empty, and re-run. This "
+            "run did not stamp the key's rotation date.",
+            file=sys.stderr,
+        )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
         # the prior key, that range's key is missing, or the chain does not verify (BACKLOG #1945).
@@ -10804,9 +10818,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
-    if uploads.skipped:
-        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, so an operator who
-        # reads PARTIAL as "go back" must be told. Conditional, because this run cannot see whether
+    if uploads.incomplete:
+        # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, nor does a missing
+        # uploads root (#4940), so an operator who reads PARTIAL as "go back" must be told.
+        # Conditional, because this run cannot see whether
         # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
         # here, because the file skips the same way under it.
         print(
