@@ -3327,8 +3327,9 @@ class DatabaseSource(SourceConnector):
             await self._emit_event("row_undecodable", reason=reason)
         if batch.skip_budget_spent:
             logger.error(
-                "DATABASE source skipped %d undecodable rows in one poll and stopped fetching; the "
-                "rest of the result set is deferred to the next poll (nothing dropped or marked)",
+                "DATABASE source skipped %d rows it could not turn into a body in one poll and "
+                "stopped fetching; the rest of the result set is deferred to the next poll (nothing "
+                "dropped or marked)",
                 len(batch.skipped),
             )
         me = asyncio.current_task()
@@ -3462,6 +3463,11 @@ class DatabaseSource(SourceConnector):
                     ],
                     False,
                 )
+            # Only _mark reads a record once its body is made, so the batch need not hold the body
+            # twice, once in the record and once as raw, unless the mark binds that column.
+            drop_body = self._body_column
+            if drop_body is not None and drop_body in self._mark_names:
+                drop_body = None
             want = 0
             while True:
                 if ceiling is None:
@@ -3481,16 +3487,14 @@ class DatabaseSource(SourceConnector):
                     record = dict(zip(columns, row))  # noqa: B905
                     try:
                         raw = self._body(record)
-                    except (ValueError, TypeError) as exc:
+                    except (ValueError, TypeError, LookupError) as exc:
                         skipped.append(safe_exc(exc))
                         if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
                             budget_spent = True
                             break
                         continue
-                    if self._body_column is not None and self._body_column not in self._mark_names:
-                        # Only _mark reads the record from here on, so the batch need not hold the
-                        # body twice, once in the record and once as raw.
-                        del record[self._body_column]
+                    if drop_body is not None:
+                        del record[drop_body]
                     rows.append((record, raw))
                 if ceiling is None or budget_spent or len(batch) < want or len(rows) >= ceiling:
                     # A short batch means the driver is out of rows, so there is nothing to top up
@@ -3526,9 +3530,10 @@ class DatabaseSource(SourceConnector):
     def _body(self, record: dict[str, Any]) -> bytes:
         """The bytes the handler gets for one row: a single column verbatim (``body_column``) or the
         whole row as JSON, encoded in the configured ``encoding``. A row that cannot become them
-        raises ``ValueError`` or ``TypeError``, which :meth:`_select` skips. That includes a body
-        the encoding cannot carry (BACKLOG #4921), since every ``UnicodeError``, encode or decode,
-        is a ``ValueError``."""
+        raises ``ValueError``, ``TypeError`` or ``LookupError``, which :meth:`_select` skips. That
+        includes a body the encoding cannot carry (BACKLOG #4921), since every ``UnicodeError``,
+        encode or decode, is a ``ValueError``; ``LookupError`` is a codec the registry no longer
+        finds, which the build's codec check makes unlikely rather than impossible."""
         if self._body_column is not None:
             try:
                 value = record[self._body_column]

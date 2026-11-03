@@ -887,6 +887,21 @@ async def test_db_the_skip_budget_stops_one_poll_and_defers_the_rest(
     assert len(table.rows) == len(rows)  # deferred, not dropped and not marked
 
 
+async def test_db_the_batch_holds_each_body_once_unless_the_mark_binds_it() -> None:
+    """``_select`` hands back each body as the encoded bytes, so it drops the ``body_column`` value
+    from the record that ``_mark`` reads, unless the mark binds that column (BACKLOG #4921).
+
+    Red mutation: drop the ``del``. The first record then still holds the body."""
+    src = _db_source()
+    _attach(src, _FakeTable(1))
+    batch = await src._select()
+    assert batch.rows == [({"id": 0}, _ADT.format(n=0).encode())]
+    bound = _db_source(mark_statement="UPDATE mf_inbox SET status='DONE' WHERE payload=:payload")
+    _attach(bound, _FakeTable(1))
+    batch = await bound._select()
+    assert batch.rows == [({"id": 0, "payload": _ADT.format(n=0)}, _ADT.format(n=0).encode())]
+
+
 _PLAIN_UNICODE_ERROR_CODEC = "mefor_test_plain_unicode_error"
 
 
