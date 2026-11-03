@@ -2553,7 +2553,8 @@ def global_epoch_or_refuse(value: Any) -> int:
     """``value``, the global session epoch a read returned, as an int; a store with no row reads
     ``None`` and is refused with :data:`GLOBAL_SESSION_EPOCH_MISSING` (BACKLOG #5091).
 
-    Its callers: every user read, through :meth:`UserRecord.from_mapping`; SQLite
+    Its callers include every read that builds a :class:`UserRecord`, through
+    :meth:`UserRecord.from_mapping` (a write helper's raw ``SELECT * FROM users`` does not); SQLite
     ``create_session``'s account read; each store's ``_global_session_epoch``; and the raise in the
     Postgres and SQL Server ``revoke_all_sessions``, which reads the raised value back. SQLite's
     ``revoke_all_sessions`` reads nothing back from its raise, so the raise checks the ``UPDATE``'s
