@@ -205,5 +205,27 @@ def test_each_shard_uploads_its_junit_under_a_name_no_other_job_uses(job: str) -
     assert name not in others
 
 
-def test_ci_gate_needs_shard_two() -> None:
-    assert "test-shard2" in _jobs()["ci-gate"]["needs"]
+def test_shard_two_still_gates_a_merge() -> None:
+    """`continue-on-error` on the job, or on a step that runs the suite, the margin check or the
+    guard, would make `needs['test-shard2'].result` read success on a red run, so no ci-gate step
+    fires and half the engine suite stops blocking merges with every test here still green. The same
+    holds if ci-gate stops needing the job.
+
+    Falsified by `continue-on-error: true` on test-shard2's `Tests (pytest)` step, then on the job,
+    then by dropping `test-shard2` from ci-gate's `needs:`: RED each time. Restored."""
+    jobs = _jobs()
+    job = jobs["test-shard2"]
+    assert "continue-on-error" not in job, "the test-shard2 job carries continue-on-error"
+    gating = [
+        s
+        for s in job["steps"]
+        if any(
+            m in str(s.get("run", "")) for m in ("pytest", "step_margin.py", "--check-collection")
+        )
+    ]
+    names = [str(s.get("name")) for s in gating]
+    assert {_STEP, "Step margin -- engine suite"} <= set(names), names
+    assert any("--check-collection" in str(s.get("run")) for s in gating), names
+    softened = [n for n, s in zip(names, gating, strict=True) if "continue-on-error" in s]
+    assert not softened, f"test-shard2 steps carry continue-on-error: {softened}"
+    assert "test-shard2" in jobs["ci-gate"]["needs"]

@@ -6680,7 +6680,7 @@ jobs:
       # job's pytest-step condition, so this fails exactly where half the engine suite should have run
       # and did not report a pass. The two arms above already name a failure or a cancellation, and
       # the leading guards keep this one out of their way; it is for the `skipped` they let through.
-      # tests/test_ci_engine_suite_shards.py pins the match.
+      # tests/test_merge_gate_controls.py pins the match and grades the step.
       - name: Fail -- engine suite shard 2 did not succeed
         if: >-
           !contains(needs.*.result, 'failure') &&
