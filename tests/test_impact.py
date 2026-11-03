@@ -27,6 +27,7 @@ from messagefoundry.config.impact import (
 )
 from messagefoundry.config.reachability import Reference, build_reference_index
 from messagefoundry.config.wiring import WiringError, load_config
+from tests._share_fault import unlistable_dir
 
 # --- fixtures ----------------------------------------------------------------
 
@@ -372,6 +373,18 @@ def test_rename_lookup_rewrites_definition_and_referent(tmp_path: Path) -> None:
     assert 'DatabaseLookup("clarity2", server="db"' in text
     assert 'db_lookup("clarity2", "SELECT 1", ())' in text
     load_config(config_dir)
+
+
+def test_rename_refuses_a_config_dir_it_cannot_list(tmp_path: Path) -> None:
+    """The declaration is found by listing the directory's modules. A listing that failed read as
+    an empty directory, so the plan left the definition out with nothing said, and an apply would
+    rename only the referents (vault BACKLOG #5117)."""
+    registry = load_config(_write_config(tmp_path, {"mod.py": _LOOKUP_MOD}))
+    with (
+        unlistable_dir(tmp_path) as folder,
+        pytest.raises(WiringError, match="could not list the config dir"),
+    ):
+        plan_rename(registry, folder, "lookup", "clarity", "clarity2")
 
 
 def test_rename_reference_rewrites_definition_and_referent(tmp_path: Path) -> None:
