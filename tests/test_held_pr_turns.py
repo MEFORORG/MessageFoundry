@@ -687,6 +687,18 @@ def test_a_rehold_on_a_transferred_pr_with_no_fresh_marker_is_the_landers(
     assert _repair_row(rows[168]) == ("LANDER", ["held", "repair-rehold"], None)
     assert _repair_row(rows[169]) == ("REPAIR", ["held", "repair"], "new-owner")
     assert _repair_row(rows[172]) == ("AUTHOR", ["held"], None)
+    # Hiding the superseded hold or the earlier marker does not bring back the author's turn; a
+    # marker from an outside account was never a transfer.
+    hidden_hold = _transferred(173)
+    hidden_hold["comments"]["nodes"][0]["isMinimized"] = True
+    hidden_marker = _transferred(174)
+    hidden_marker["comments"]["nodes"][1]["isMinimized"] = True
+    outsider = _transferred(175)
+    outsider["comments"]["nodes"][1]["authorAssociation"] = "CONTRIBUTOR"
+    hidden = _engine_rows(tmp_path, capsys, hidden_hold, hidden_marker, outsider)
+    assert _repair_row(hidden[173]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(hidden[174]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(hidden[175]) == ("AUTHOR", ["held"], None)
     doc = {ENGINE: {"pages": [_page([_transferred(164)])], "required": ENGINE_REQUIRED}}
     _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
     line = next(x for x in out.splitlines() if x.startswith("LANDER"))

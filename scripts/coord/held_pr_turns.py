@@ -128,26 +128,30 @@ marker's session as ``repairOwner``, ONLY when ALL of these hold:
   sort out. An ack before the marker is history the transfer overrode, and is kept as ``acked``.
 
 Otherwise the PR is classified exactly as it was before this contract, with every marker an ordinary
-event, except that a re-hold with no fresh marker reads LANDER rather than AUTHOR (below). Under that reading a marker body starts with ``<!--``, not the signature, so it is not a
-Lander event, and one after the hold is a reply: the PR reads LANDER ``replied``, even when the
-marker is the only thing after the hold, so ``replied`` beside a marker can be the Lander's own
-transfer comment. So at least these fall back to the Lander: a marker on a PR whose newest Lander
-event is not a marker hold (``no-hold``: a marker is never a Lander event, so it cannot make one), a
-push after the marker (``new-commit``: the head no longer starts with the hold's
-SHA, which is how "no commit after the marker" is read, and is stricter, since it also catches a push
-between the hold and the marker), any other reply or any edit after the hold, an edit to the marker
-itself, an ack after the marker, and a newer non-hold Lander comment (``no-hold``).
+event, except that a re-hold with no fresh marker reads LANDER rather than AUTHOR (below). Under that
+reading a marker body starts with ``<!--``, not the signature, so it is not a Lander event, and one
+after the hold is a reply: the PR reads LANDER ``replied``, even when the marker is the only thing
+after the hold, so ``replied`` beside a marker can be the Lander's own transfer comment. So at least
+these fall back to the Lander: a marker on a PR whose newest Lander event is not a marker hold
+(``no-hold``: a marker is never a Lander event, so it cannot make one), a push after the marker
+(``new-commit``: the head no longer starts with the hold's SHA, which is how "no commit after the
+marker" is read, and is stricter, since it also catches a push between the hold and the marker), any
+other reply or any edit after the hold, an edit to the marker itself, an ack after the marker, and a
+newer non-hold Lander comment (``no-hold``).
 
 A MARKER OLDER THAN THE LATEST HOLD DOES NOT MAKE A REPAIR TURN. Each hold re-opens the turn, so a
 transfer that should outlive a new hold needs a new marker posted after it, in a later second, since
 one comment cannot be both; that new marker makes the PR REPAIR's, naming its session. A RE-HOLD ON
 A TRANSFERRED PR WITH NO FRESH MARKER IS THE LANDER'S: when the hold would otherwise stand, and a
-qualifying marker earlier than the hold's second was posted strictly after an earlier hold's second,
-the PR reads LANDER, flagged ``held`` and ``repair-rehold`` (and ``acked`` when an ack stands). The
+marker earlier than the hold's second was posted strictly after an earlier hold's second, the PR
+reads LANDER, flagged ``held`` and ``repair-rehold`` (and ``acked`` when an ack stands). The
 original author was told to stand down, so parking the PR on them is the unsafe direction, and the
-Lander's move is to post a fresh marker. ``repairOwner`` names the session of the newest such earlier
-marker, or is ``null`` when two sessions were named in that marker's second. A marker older than
-every hold was never a transfer, so a hold after it reads on its own: AUTHOR if it stands.
+Lander's move is to post a fresh marker. ``repairOwner`` names the session of the newest such
+earlier marker, or is ``null`` when two sessions were named in that marker's second. That earlier
+hold and marker are read under the association and dismissed gates, and the marker only from a
+comment, but a minimized one still counts: hiding a superseded hold or marker must not bring back
+the author's turn. A marker older than every hold the fetched page holds was never a transfer, so a
+hold after it reads on its own: AUTHOR if it stands.
 
 A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
@@ -404,6 +408,25 @@ class Event:
     #: A PR review, not an issue comment. A review is never an ack: its inline thread comments,
     #: which this script does not read, may hold the reply.
     review: bool = False
+    #: A trusted association, minimized or not; ``None`` reads as ``trusted``. Only an earlier
+    #: transfer is read through it (``past_hold``, ``past_repair_by``): hiding a superseded hold or
+    #: marker must not bring back the author's turn.
+    associated: bool | None = None
+
+    @property
+    def _standing(self) -> bool:
+        associated = self.trusted if self.associated is None else self.associated
+        return associated and not self.dismissed
+
+    @property
+    def past_hold(self) -> bool:
+        """A hold, minimized or not, for judging whether a transfer came before a re-hold."""
+        return self._standing and self._marker is not None
+
+    @property
+    def past_repair_by(self) -> str | None:
+        """``repair_by``, minimized or not, for judging whether a re-hold follows a transfer."""
+        return repair_owner(self.body) if self._standing and not self.review else None
 
     @property
     def latest(self) -> datetime:
@@ -485,6 +508,7 @@ def _events(pr: dict[str, Any]) -> list[Event]:
                     dismissed=node.get("state") == "DISMISSED",
                     edited=edited,
                     review=kind == "reviews",
+                    associated=node.get("authorAssociation") in TRUSTED_ASSOCIATIONS,
                 )
             )
     return out
@@ -496,15 +520,15 @@ def _earlier_transfer(turn_events: list[Event], hold: datetime) -> tuple[str | N
     ``None`` when there was no such transfer. The owner is the session the newest such marker
     names, or ``None`` when two sessions were named in that second and so neither can be ordered.
     """
-    holds = [e.when for e in turn_events if e.lander and e.held_at is not None and e.when < hold]
+    holds = [e.when for e in turn_events if e.past_hold and e.when < hold]
     if not holds:
         return None
     first = min(holds)
-    markers = [e for e in turn_events if e.repair_by is not None and first < e.when < hold]
+    markers = [e for e in turn_events if e.past_repair_by is not None and first < e.when < hold]
     if not markers:
         return None
     newest = max(e.when for e in markers)
-    owners = {e.repair_by for e in markers if e.when == newest}
+    owners = {e.past_repair_by for e in markers if e.when == newest}
     return (owners.pop() if len(owners) == 1 else None,)
 
 
