@@ -980,6 +980,8 @@ def _config_holding_only(tmp_path: Path, shape: str) -> Path:
             (cfg / "feed.py").symlink_to(target)
         except (OSError, NotImplementedError):
             pytest.skip("a symlink cannot be made here (Windows without the privilege)")
+    elif shape == "one-file":
+        (cfg / "feed.py").write_text("# router")
     return cfg
 
 
@@ -1083,6 +1085,40 @@ def test_include_config_off_on_a_server_db_store_is_refused_at_load(backend) -> 
     ServiceSettings.model_validate({"store": store, "backup": {**backup, "enabled": False}})
     # A SQLite store takes a full snapshot, so the same [backup] is not config-only there.
     ServiceSettings.model_validate({"backup": backup})
+
+
+@pytest.mark.parametrize("shape", ["empty", "symlink-only", "one-file"])
+async def test_a_full_pass_records_whether_its_walk_added_a_config_file(
+    tmp_path, key_b64, shape
+) -> None:
+    """``config_bundled`` used to say only that the walk was asked to run, so a full pass over a
+    dir it added nothing from recorded true. The manifest, the result and the audit row now agree
+    on what the archive carries; the one-file dir is the control."""
+    import base64
+
+    from messagefoundry.pipeline.dr_backup import CONFIG_WALK_ADDED_NOTHING
+
+    cfg = _config_holding_only(tmp_path, shape)
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    try:
+        result = await BackupRunner(
+            store,
+            _settings(tmp_path / "b", key_b64),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        ).run_once(now=1.0)
+        rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
+    finally:
+        await store.close()
+    assert result is not None and not result.config_only  # a full pass still succeeds
+    with open(result.archive_path, "rb") as src:
+        manifest = _manifest_from_tar_bytes(_decrypt_to_bytes(src, base64.b64decode(key_b64)))
+    (row,) = rows
+    detail = json.loads(row["detail"])
+    expected = (True, None) if shape == "one-file" else (False, CONFIG_WALK_ADDED_NOTHING)
+    assert (manifest["config_bundled"], manifest["config_bundle_error"]) == expected
+    assert (result.config_bundled, result.config_bundle_error) == expected
+    assert (detail["config_bundled"], detail["config_bundle_error"]) == expected
 
 
 # --- AC-9/AC-10: failure alerts + preserves the prior good archive -----------

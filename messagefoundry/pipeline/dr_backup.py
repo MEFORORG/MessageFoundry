@@ -284,15 +284,22 @@ class BackupResult:
     #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
     #: next backup's sweep retries the directory.
     staging_leftover: str | None = None
-    #: Whether the archive carries the config dir under ``config/``, the dir this pass read, and,
-    #: when it could not be read, the fault's class name (vault BACKLOG #3094). A full run with
-    #: ``config_bundled`` false and a fault still succeeds: the store snapshot is worth keeping.
+    #: Whether the archive carries a config file under ``config/``, the dir this pass read, and,
+    #: when it could not be read, the fault's class name (vault BACKLOG #3094), or
+    #: :data:`CONFIG_WALK_ADDED_NOTHING` when the walk added no regular file (vault BACKLOG #5220).
+    #: A full run with ``config_bundled`` false still succeeds: the store snapshot is worth keeping.
     config_bundled: bool = False
     config_dir: str | None = None
     config_bundle_error: str | None = None
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
     #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
+
+
+#: The ``config_bundle_error`` a pass records when its config walk added no regular file, as for an
+#: empty dir or one holding only links (vault BACKLOG #5220). Every other value there is an exception
+#: class name, so this one is spelled so it cannot be read as one.
+CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
 
 
 @dataclass(frozen=True)
@@ -306,6 +313,14 @@ class _ConfigBundle:
     #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
     #: of the whole bundle (vault BACKLOG #3765).
     left_out: tuple[str, ...] = ()
+
+    def after_walk(self, added: int) -> _ConfigBundle:
+        """This bundle as the record states it once the walk has run: a bundled pass whose walk
+        added no regular file carries no config, so it is recorded as not bundled, with
+        :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG #5220)."""
+        if self.bundled and added == 0:
+            return replace(self, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
+        return self
 
     def manifest_fields(self) -> dict[str, object]:
         """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
@@ -740,6 +755,7 @@ class BackupRunner:
                     snapshot_sha256,
                     row_counts,
                     archive_bytes,
+                    config_files_added,
                     staging_leftover,
                 ) = await asyncio.to_thread(
                     self._build_in_staging,
@@ -798,6 +814,8 @@ class BackupRunner:
         # every earlier archive that also passed — and nothing that failed (AC-6).
         pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
 
+        # What the archive carries, as its manifest records it (vault BACKLOG #5220).
+        bundle = bundle.after_walk(config_files_added)
         return BackupResult(
             archive_path=str(archive_path),
             archive_bytes=archive_bytes,
@@ -994,12 +1012,12 @@ class BackupRunner:
         now: float,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int, str | None]:
+    ) -> tuple[str, dict[str, int], int, int, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
-        thread. Returns the build's result plus the release's leftover sentence (``None`` when no file
-        in the directory still holds plaintext). Releasing here, not on the loop, is what makes a
-        cancelled build clean up after itself: it keeps running on this thread, and the directory goes
-        only once it has let go of the files."""
+        thread. Returns the build's four values, then the release's leftover sentence (``None`` when
+        no file in the directory still holds plaintext). Releasing here, not on the loop, is what
+        makes a cancelled build clean up after itself: it keeps running on this thread, and the
+        directory goes only once it has let go of the files."""
         if not work.claim():
             raise OSError(f"the backup staging directory {work.path} was released before the build")
         try:
@@ -1045,10 +1063,11 @@ class BackupRunner:
         secure: bool,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int]:
+    ) -> tuple[str, dict[str, int], int, int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
-        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a file in
+        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes, config_files_added)``, the
+        last the regular config files the walk added. The tar goes to a file in
         ``work_dir`` (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the
         archive. That tar is plaintext, so with ``secure`` it is locked to its owner before its first
         byte, the way the restore path locks its own staged tar.
@@ -1062,25 +1081,6 @@ class BackupRunner:
         if snap_path is not None:
             snapshot_sha256 = _sha256_file(snap_path)
             row_counts = _count_tables(snap_path)
-
-        manifest = {
-            "format": "mfbak",
-            # The .mfbak archive format version — parity with the AAD-bound codec header (ADR 0049
-            # "What's in the archive"). The header's value is authoritative for decode; this is the
-            # human-/tooling-readable copy inside the manifest.
-            "format_version": FORMAT_VERSION,
-            "engine_version": self._engine_version,
-            "instance": self._instance,
-            "created_utc": _utc_iso(now),
-            "snapshot_method": self._settings.snapshot_method,
-            "config_only": config_only,
-            "backend": self._backend_value(),
-            "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-            **bundle.manifest_fields(),
-            "snapshot_sha256": snapshot_sha256,
-            "row_counts": row_counts,
-        }
-        manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
 
         # In the run's own staging directory, which the caller releases on every exit.
         tar_path = work_dir / "archive.tar"
@@ -1102,6 +1102,26 @@ class BackupRunner:
                         "config-only backup: the config walk added no regular file, so there is "
                         f"nothing to archive (config dir {bundle.path})",
                     )
+                # Built after the walk, so `config_bundled` says whether a config file was added,
+                # not whether the walk was asked to run (vault BACKLOG #5220).
+                manifest = {
+                    "format": "mfbak",
+                    # The .mfbak archive format version — parity with the AAD-bound codec header
+                    # (ADR 0049 "What's in the archive"). The header's value is authoritative for
+                    # decode; this is the human-/tooling-readable copy inside the manifest.
+                    "format_version": FORMAT_VERSION,
+                    "engine_version": self._engine_version,
+                    "instance": self._instance,
+                    "created_utc": _utc_iso(now),
+                    "snapshot_method": self._settings.snapshot_method,
+                    "config_only": config_only,
+                    "backend": self._backend_value(),
+                    "key_id": key_id,  # one-way fingerprint, NEVER key bytes
+                    **bundle.after_walk(added).manifest_fields(),
+                    "snapshot_sha256": snapshot_sha256,
+                    "row_counts": row_counts,
+                }
+                manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -1134,7 +1154,7 @@ class BackupRunner:
             dst.flush()
             os.fsync(dst.fileno())
         archive_bytes = out_path.stat().st_size
-        return snapshot_sha256, row_counts, archive_bytes
+        return snapshot_sha256, row_counts, archive_bytes, added
 
     def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> int:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
