@@ -616,25 +616,81 @@ def test_a_repair_marker_without_a_standing_hold_is_not_a_repair(
         # A legacy prose hold is no hold, so a marker after it is no repair.
         _pr(163, comments=[_comment(SESSION + "**Held.**", "2026-10-28T12:00:00Z"), _repair()]),
     )
-    # A re-hold on a repaired head with no new marker after it reads as the hold alone (AUTHOR);
-    # the docstring names this, and the Lander re-posts the marker. A bot marker is not read.
-    rehold = _pr(
-        164,
-        comments=[
-            _hold("2026-10-28T12:00:00Z", _sha(1)),
-            _repair("2026-10-28T13:00:00Z"),
-            _hold("2026-10-28T15:00:00Z", _sha(164)),
-        ],
-    )
+    # A bot marker is not read.
     bot = _repair()
     bot["author"] = {"__typename": "Bot", "login": "some-app"}
-    more = _engine_rows(tmp_path, capsys, rehold, _held(165, bot))
-    assert _repair_row(more[164]) == ("AUTHOR", ["held"], None)
+    more = _engine_rows(tmp_path, capsys, _held(165, bot))
     assert _repair_row(more[165]) == ("AUTHOR", ["held"], None)
     assert _repair_row(rows[160]) == ("LANDER", ["no-hold"], None)
     assert _repair_row(rows[161]) == ("AUTHOR", ["held"], None)
     assert _repair_row(rows[162]) == ("LANDER", ["no-hold"], None)
     assert _repair_row(rows[163]) == ("LANDER", ["no-hold"], None)
+
+
+def _transferred(n: int, *after_rehold: dict[str, Any]) -> dict[str, Any]:
+    """PR ``n`` held at noon on an old head, transferred at 13:00, re-held at 15:00 on its head."""
+    return _pr(
+        n,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _hold("2026-10-28T15:00:00Z", _sha(n)),
+            *after_rehold,
+        ],
+    )
+
+
+def test_a_rehold_on_a_transferred_pr_with_no_fresh_marker_is_the_landers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The original author was told to stand down, so a re-hold with no fresh marker must not
+    park the PR on them: the Lander's move is to post a fresh marker."""
+    two_owners = _pr(
+        168,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _repair("2026-10-28T13:00:00Z", session="other-session"),
+            _hold("2026-10-28T15:00:00Z", _sha(168)),
+        ],
+    )
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _transferred(164),
+        _transferred(166, _ack("2026-10-28T15:30:00Z", _sha(166))),
+        # A re-transfer before the re-hold: the newest earlier marker names the owner.
+        _pr(
+            167,
+            comments=[
+                _hold("2026-10-28T12:00:00Z", _sha(1)),
+                _repair("2026-10-28T13:00:00Z", session="old-1"),
+                _repair("2026-10-28T14:00:00Z"),
+                _hold("2026-10-28T15:00:00Z", _sha(167)),
+            ],
+        ),
+        two_owners,
+        # Control: a fresh qualifying marker after the re-hold is a REPAIR turn for its session.
+        _transferred(169, _repair("2026-10-28T15:00:01Z", session="new-owner")),
+        # Control: never a marker, so the re-hold stands for the author.
+        _pr(
+            172,
+            comments=[
+                _hold("2026-10-28T12:00:00Z", _sha(1)),
+                _hold("2026-10-28T15:00:00Z", _sha(172)),
+            ],
+        ),
+    )
+    assert _repair_row(rows[164]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[166]) == ("LANDER", ["held", "acked", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[167]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
+    assert _repair_row(rows[168]) == ("LANDER", ["held", "repair-rehold"], None)
+    assert _repair_row(rows[169]) == ("REPAIR", ["held", "repair"], "new-owner")
+    assert _repair_row(rows[172]) == ("AUTHOR", ["held"], None)
+    doc = {ENGINE: {"pages": [_page([_transferred(164)])], "required": ENGINE_REQUIRED}}
+    _, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    line = next(x for x in out.splitlines() if x.startswith("LANDER"))
+    assert line.split()[:2] == ["LANDER", f"held,repair-rehold={OWNER_ID}"]
 
 
 def test_the_repair_marker_shape_is_exact() -> None:

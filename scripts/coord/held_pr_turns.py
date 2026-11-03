@@ -101,8 +101,9 @@ tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts wit
 ignoring case; no non-Lander event other than an ack (THE ACK CONTRACT) is at or after the hold's
 second (a tie is a reply, but a tied ack is not); and no comment or review, Lander or not and
 the hold itself included, was edited at or after the hold's second. Otherwise LANDER's. When all of
-these hold and a repair-owner marker also qualifies, the turn is REPAIR's instead (THE REPAIR
-CONTRACT).
+these hold and a repair-owner marker also qualifies, the turn is REPAIR's instead, and when they
+hold on a PR transferred before this hold with no marker after it, the turn is LANDER's,
+``repair-rehold`` (THE REPAIR CONTRACT).
 
 THE REPAIR CONTRACT. When a held author does not answer, the Lander may hand the repair to a Repair
 Manager session by posting, as an issue comment, ONLY this shape::
@@ -127,20 +128,26 @@ marker's session as ``repairOwner``, ONLY when ALL of these hold:
   sort out. An ack before the marker is history the transfer overrode, and is kept as ``acked``.
 
 Otherwise the PR is classified exactly as it was before this contract, with every marker an ordinary
-event. Under that reading a marker body starts with ``<!--``, not the signature, so it is not a
+event, except that a re-hold with no fresh marker reads LANDER rather than AUTHOR (below). Under that reading a marker body starts with ``<!--``, not the signature, so it is not a
 Lander event, and one after the hold is a reply: the PR reads LANDER ``replied``, even when the
 marker is the only thing after the hold, so ``replied`` beside a marker can be the Lander's own
-transfer comment. So at least these fall back to the Lander: a marker with no hold before it
-(``no-hold``), a push after the marker (``new-commit``: the head no longer starts with the hold's
+transfer comment. So at least these fall back to the Lander: a marker on a PR whose newest Lander
+event is not a marker hold (``no-hold``: a marker is never a Lander event, so it cannot make one), a
+push after the marker (``new-commit``: the head no longer starts with the hold's
 SHA, which is how "no commit after the marker" is read, and is stricter, since it also catches a push
 between the hold and the marker), any other reply or any edit after the hold, an edit to the marker
 itself, an ack after the marker, and a newer non-hold Lander comment (``no-hold``).
 
-A MARKER OLDER THAN THE LATEST HOLD IS NOT READ, so the hold reads on its own: AUTHOR if it stands.
-That is not a fall back to the Lander. It is how a re-hold reads: each hold re-opens the turn, and a
+A MARKER OLDER THAN THE LATEST HOLD DOES NOT MAKE A REPAIR TURN. Each hold re-opens the turn, so a
 transfer that should outlive a new hold needs a new marker posted after it, in a later second, since
-one comment cannot be both. A re-hold on a repaired PR that is not followed by a new marker parks the
-PR on the stood-down author.
+one comment cannot be both; that new marker makes the PR REPAIR's, naming its session. A RE-HOLD ON
+A TRANSFERRED PR WITH NO FRESH MARKER IS THE LANDER'S: when the hold would otherwise stand, and a
+qualifying marker earlier than the hold's second was posted strictly after an earlier hold's second,
+the PR reads LANDER, flagged ``held`` and ``repair-rehold`` (and ``acked`` when an ack stands). The
+original author was told to stand down, so parking the PR on them is the unsafe direction, and the
+Lander's move is to post a fresh marker. ``repairOwner`` names the session of the newest such earlier
+marker, or is ``null`` when two sessions were named in that marker's second. A marker older than
+every hold was never a transfer, so a hold after it reads on its own: AUTHOR if it stands.
 
 A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
@@ -178,14 +185,17 @@ merges without its author moving, so a hold on it reads LANDER with ``held`` kep
 on such a PR reads LANDER the same way, keeping ``repair`` and ``repairOwner``.
 
 SORTING. ERROR rows first, then LANDER, then REPAIR, then AUTHOR, each group oldest newest-event
-first. REPAIR sits after LANDER because it is not the Lander's move, and before AUTHOR because the
-Lander keeps the Repair Manager alive and so watches its rows more closely than an author's. The
-table's FLAGS cell shows ``repair=<session id>`` for the ``repair`` flag; the JSON carries the id as
-``repairOwner``, ``null`` on any row that is not a repair.
+first. REPAIR sits after LANDER because it is not the Lander's move. It sits before AUTHOR only as a
+reading order: this script does not check that the repair owner's session is alive or working, so a
+REPAIR row says only that a transfer stands. The table's FLAGS cell shows ``repair=<session id>``
+for the ``repair`` flag, and ``repair-rehold=<session id>`` for ``repair-rehold`` when an owner is
+named; the JSON carries the id as ``repairOwner``, ``null`` on any row with neither flag.
 
 FLAGS. ``held`` (a hold stands: AUTHOR's turn, or REPAIR's beside ``repair``, unless the PR is
-queued or armed); ``repair`` (beside ``held``: a repair-owner marker after the hold made it REPAIR's
-turn, so ``held`` alone never means the author owns a ``repair`` row); ``no-hold`` (no
+queued or armed, or LANDER's beside ``repair-rehold``); ``repair`` (beside ``held``: a repair-owner
+marker after the hold made it REPAIR's turn, so ``held`` alone never means the author owns a
+``repair`` row); ``repair-rehold`` (beside ``held``: a re-hold on a transferred PR with no fresh
+marker after it, so the Lander's move is to post one; THE REPAIR CONTRACT); ``no-hold`` (no
 Lander event, or the newest is not a marker hold); ``new-commit`` (the head does not start with the
 marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
 head); ``edited`` (a comment or review, of any author, the hold included,
@@ -480,8 +490,27 @@ def _events(pr: dict[str, Any]) -> list[Event]:
     return out
 
 
+def _earlier_transfer(turn_events: list[Event], hold: datetime) -> tuple[str | None] | None:
+    """``(owner,)`` when a repair-owner marker before ``hold``'s second followed an earlier hold.
+
+    ``None`` when there was no such transfer. The owner is the session the newest such marker
+    names, or ``None`` when two sessions were named in that second and so neither can be ordered.
+    """
+    holds = [e.when for e in turn_events if e.lander and e.held_at is not None and e.when < hold]
+    if not holds:
+        return None
+    first = min(holds)
+    markers = [e for e in turn_events if e.repair_by is not None and first < e.when < hold]
+    if not markers:
+        return None
+    newest = max(e.when for e in markers)
+    owners = {e.repair_by for e in markers if e.when == newest}
+    return (owners.pop() if len(owners) == 1 else None,)
+
+
 def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], str | None]:
-    """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` without a ``repair`` flag.
+    """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` without a ``repair`` or
+    ``repair-rehold`` flag, and may be ``None`` beside ``repair-rehold`` (``_earlier_transfer``).
 
     Pure; the module docstring states the rules.
     """
@@ -519,7 +548,13 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
                 flags = ["held", "acked", "repair"] if acks else ["held", "repair"]
                 return REPAIR, flags, owners.pop()
         if not replied:
-            return AUTHOR, ["held", "acked"] if acks else ["held"], None
+            flags = ["held", "acked"] if acks else ["held"]
+            transferred = _earlier_transfer(turn_events, when)
+            if transferred is not None:
+                # A re-hold on a transferred PR with no fresh marker: the author was told to stand
+                # down, so parking it on them is the unsafe direction. The Lander re-posts a marker.
+                return LANDER, [*flags, "repair-rehold"], transferred[0]
+            return AUTHOR, flags, None
     flags = ["new-commit"] if new_commit else []
     if replied:
         flags.append("replied")
@@ -776,7 +811,10 @@ def render(rows: list[dict[str, Any]]) -> str:
         if len(title) > TITLE_WIDTH:
             title = title[: TITLE_WIDTH - 3] + "..."
         owner = row.get("repairOwner")
-        flags = [f"repair={owner}" if f == "repair" and owner else f for f in row["flags"]]
+        flags = [
+            f"{f}={owner}" if f in ("repair", "repair-rehold") and owner else f
+            for f in row["flags"]
+        ]
         table.append(
             (
                 row["turn"],
