@@ -186,6 +186,8 @@ async def test_the_revoke_refuses_a_store_with_no_global_epoch_row(
     assert row is not None and row.revoked_at is None  # rolled back: nothing was revoked
     with pytest.raises(RuntimeError, match="global_session_epoch row is missing"):
         await store.get_user("b5091-gone")  # a user read refuses by the same name
+    with pytest.raises(RuntimeError, match="global_session_epoch row is missing"):
+        await _mint(store, "b5091-gone")  # and so does a sign-in, never a bare TypeError
 
 
 async def test_a_reopen_keeps_a_raised_global_epoch_and_seeds_a_missing_row(

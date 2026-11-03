@@ -117,10 +117,13 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     ended = await store.get_session(hash_token(unsealed))
     assert ended is not None and ended.revoked_at is not None  # refused, then ended
     # A valid seal copied from another row does not carry over: it covers that row's token hash.
+    # The copy carries global_epoch too (BACKLOG #5091), so on a store whose global epoch is above 0
+    # it is refused for its token hash, not for a stale global epoch.
     copied = mint_token()
     await raw(
         "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-        " client, reauth_at, auth_mechanism, user_epoch, seal) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " client, reauth_at, auth_mechanism, user_epoch, global_epoch, seal)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             hash_token(copied),
             row.user_id,
@@ -131,6 +134,7 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
             row.reauth_at,
             row.auth_mechanism,
             row.user_epoch,
+            row.global_epoch,
             row.seal,
         ),
     )
