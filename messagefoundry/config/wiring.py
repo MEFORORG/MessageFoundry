@@ -56,6 +56,8 @@ from pathlib import Path
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, TypeIs
 
+from pydantic import TypeAdapter
+
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -6187,6 +6189,13 @@ class AttestedHop:
     refused: bool
 
 
+# The field types Source and Destination declare for their cleartext and revocation pairs, so the
+# hop report reads a value set past the factory exactly as the build's model does: a lax bool flag
+# and a reason that must be a str (or None).
+_LAX_BOOL: Final = TypeAdapter(bool)
+_MODEL_REASON: Final = TypeAdapter(str | None)
+
+
 def _attested_reason_text(value: object) -> str | None:
     """The text of an attestation reason for a report, or ``None`` when none was recorded.
 
@@ -6239,32 +6248,51 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         return False
 
     def _typed_refused(
-        settings: Mapping[str, Any], attested: bool, reason: str | None, accepted: bool
+        settings: Mapping[str, Any],
+        attested: bool,
+        reason: str | None,
+        *,
+        accepted: object = False,
+        cleartext_reason: object = None,
+        revocation: object = False,
+        revocation_reason: object = None,
     ) -> bool:
-        # What _source_config and _dest_config refuse on a connection: a raw attestation key in its
-        # transport settings, then the typed pair by the settings carriers' own rule above (the flag
-        # type, a missing, blank or control-character reason, and the attested-plus-accepted pair,
-        # which outbound() and the Destination model refuse). Such an entry is a hop the engine
-        # never builds, however it got past the factory.
+        # What _source_config and _dest_config refuse on a connection's declarations: a raw
+        # attestation key in its transport settings, the cleartext and revocation pairs the Source
+        # and Destination validators check, then the typed attestation by the settings carriers'
+        # own rule above (the flag type, a missing, blank or control-character reason, and the
+        # attested-plus-accepted pair). Such an entry is a hop the engine never builds, however it
+        # got past the factory.
         #
-        # It does NOT read the cleartext or revocation pairs. The Source and Destination models
-        # coerce those flags as lax bool, so the strict require_flag rule would mark REFUSED a hop
-        # the build builds (an int 1 or 0), and a reason of a wrong type would reach .strip() here
-        # and crash the report. A wrong pair there is therefore listed as a hop crossed, which errs
-        # toward listing rather than toward hiding a hop the engine builds.
+        # The cleartext and revocation values are read the way those models read them: each flag
+        # is a lax pydantic bool and each reason a pydantic str, so an int 1 or the string "false"
+        # is the flag the build sees, and a reason of another type is refused as the model refuses
+        # it, never passed to the pair rule's .strip().
         try:
             refuse_raw_hop_attestation(settings, "")
-        except WiringError:
+            accepted_flag = _LAX_BOOL.validate_python(accepted)
+            _check_cleartext_acceptance(
+                accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
+            )
+            _check_revocation_attestation(
+                _LAX_BOOL.validate_python(revocation),
+                _MODEL_REASON.validate_python(revocation_reason),
+            )
+        except (WiringError, ValueError):
             return True
         pair = {"tls_hop_attested": attested, "tls_hop_attested_reason": reason}
-        return _refused("", pair, accepted)
+        return _refused("", pair, accepted_flag)
 
     out = [
         AttestedHop(
             inbound_record_name(ic.name),
             _attested_reason_text(ic.tls_hop_attested_reason),
             _typed_refused(
-                ic.spec.settings, ic.tls_hop_attested, ic.tls_hop_attested_reason, False
+                ic.spec.settings,
+                ic.tls_hop_attested,
+                ic.tls_hop_attested_reason,
+                revocation=ic.tls_revocation_attested,
+                revocation_reason=ic.tls_revocation_attested_reason,
             ),
         )
         for ic in registry.inbound.values()
@@ -6278,7 +6306,10 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
                 oc.spec.settings,
                 oc.tls_hop_attested,
                 oc.tls_hop_attested_reason,
-                oc.cleartext_accepted,
+                accepted=oc.cleartext_accepted,
+                cleartext_reason=oc.cleartext_reason,
+                revocation=oc.tls_revocation_attested,
+                revocation_reason=oc.tls_revocation_attested_reason,
             ),
         )
         for oc in registry.outbound.values()

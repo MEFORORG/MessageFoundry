@@ -242,55 +242,106 @@ def test_a_site_proxy_credential_is_refused_for_it_before_its_shape() -> None:
         )
 
 
-# --- review round 3: the report reads only what the build reads ---------------------------------
+# --- review rounds 2 and 3: the report marks REFUSED exactly what the build refuses -------------
 
 _ATTEST: dict[str, Any] = {"tls_hop_attested": True, "tls_hop_attested_reason": REASON}
 
+# Declarations written past the factory. The Source and Destination models read each flag as a lax
+# bool and each reason as a str, so some of these build and some do not.
+_REVOCATION_CASES: dict[str, dict[str, Any]] = {
+    "revocation-int-1": {"tls_revocation_attested": 1, "tls_revocation_attested_reason": "pki"},
+    "revocation-str-true": {
+        "tls_revocation_attested": "true",
+        "tls_revocation_attested_reason": "pki",
+    },
+    "revocation-str-false": {"tls_revocation_attested": "false"},
+    "revocation-int-0": {"tls_revocation_attested": 0},
+    "revocation-no-reason": {"tls_revocation_attested": True},
+    "revocation-false-with-reason": {
+        "tls_revocation_attested": "false",
+        "tls_revocation_attested_reason": "pki",
+    },
+    "revocation-int-2": {"tls_revocation_attested": 2, "tls_revocation_attested_reason": "pki"},
+    "revocation-int-reason": {"tls_revocation_attested": True, "tls_revocation_attested_reason": 5},
+    "revocation-list-reason": {
+        "tls_revocation_attested": True,
+        "tls_revocation_attested_reason": ["x"],
+    },
+}
+_CLEARTEXT_CASES: dict[str, dict[str, Any]] = {
+    "cleartext-int-0": {"cleartext_accepted": 0},
+    "cleartext-str-false": {"cleartext_accepted": "false"},
+    "cleartext-str-no": {"cleartext_accepted": "no"},
+    "cleartext-reason-without-flag": {"cleartext_reason": "why"},
+    "cleartext-int-reason": {"cleartext_accepted": True, "cleartext_reason": 5},
+    "cleartext-int-reason-no-flag": {"cleartext_reason": 5},
+}
 
-def test_a_hop_the_build_builds_with_an_int_flag_is_not_marked_refused() -> None:
-    """The Source and Destination models coerce the revocation and cleartext flags as lax bool, so
-    the build builds a hop that sets one to an int. The report must not call that hop refused."""
-    from messagefoundry.config.settings import EgressSettings
-    from messagefoundry.pipeline.wiring_runner import _dest_config, _source_config
 
-    spec = File(directory=".")
-    revoke: dict[str, Any] = {"tls_revocation_attested": 1, "tls_revocation_attested_reason": "pki"}
-    clear: dict[str, Any] = {"cleartext_accepted": 0}
-    outbounds = [
-        OutboundConnection("OB_REVOKE_INT", spec, **revoke, **_ATTEST),
-        OutboundConnection("OB_CLEAR_INT", spec, **clear, **_ATTEST),
-    ]
-    inbound = InboundConnection("IB_REVOKE_INT", spec, "R", **revoke, **_ATTEST)
-    # The premise: the build builds each of them.
-    for oc in outbounds:
-        _dest_config(oc, {}, None, EgressSettings())
-    _source_config(inbound, "127.0.0.1", {})
+def _build_refuses(build: Any) -> bool:
+    from messagefoundry.config.wiring import WiringError
 
-    reg = Registry()
-    for oc in outbounds:
-        reg.add_outbound(oc)
-    reg.add_inbound(inbound)
-    records = {hop.name: hop.refused for hop in attested_secure_hop_records(reg)}
-    assert len(records) == 3
-    assert not any(records.values()), records
+    try:
+        build()
+    except (WiringError, ValueError):
+        return True
+    return False
 
 
 @pytest.mark.parametrize(
     "extra",
-    [
-        {"cleartext_accepted": True, "cleartext_reason": 5},
-        {"tls_revocation_attested": True, "tls_revocation_attested_reason": 5},
-        {"tls_revocation_attested": True, "tls_revocation_attested_reason": ["x"]},
-    ],
-    ids=["cleartext-int", "revocation-int", "revocation-list"],
+    [*_REVOCATION_CASES.values(), *_CLEARTEXT_CASES.values()],
+    ids=[*_REVOCATION_CASES, *_CLEARTEXT_CASES],
 )
-def test_a_non_str_declaration_reason_does_not_crash_the_report(extra: dict[str, Any]) -> None:
-    """A reason of a wrong type, set past the factory, must not raise out of the report that
-    ``messagefoundry check`` and ``/security/posture`` both render."""
-    spec = File(directory=".")
+def test_an_outbound_is_marked_refused_exactly_when_the_build_refuses_it(
+    extra: dict[str, Any],
+) -> None:
+    """An int 1, ``"true"`` or ``"false"`` flag is a flag the build reads and builds, so it is no
+    REFUSED mark; a reason of a wrong type is refused as the model refuses it, and never crashes
+    the report that ``messagefoundry check`` and ``/security/posture`` render."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    oc = OutboundConnection("OB_CASE", File(directory="."), **extra, **_ATTEST)
+    refused = _build_refuses(lambda: _dest_config(oc, {}, None, EgressSettings()))
     reg = Registry()
-    reg.add_outbound(OutboundConnection("OB_ODD", spec, **extra, **_ATTEST))
-    if "cleartext_accepted" not in extra:
-        reg.add_inbound(InboundConnection("IB_ODD", spec, "R", **extra, **_ATTEST))
-    names = [hop.name for hop in attested_secure_hop_records(reg)]
-    assert "OB_ODD" in names
+    reg.add_outbound(oc)
+    assert [(h.name, h.refused) for h in attested_secure_hop_records(reg)] == [("OB_CASE", refused)]
+
+
+@pytest.mark.parametrize("extra", list(_REVOCATION_CASES.values()), ids=list(_REVOCATION_CASES))
+def test_an_inbound_is_marked_refused_exactly_when_the_build_refuses_it(
+    extra: dict[str, Any],
+) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    ic = InboundConnection("IB_CASE", File(directory="."), "R", **extra, **_ATTEST)
+    refused = _build_refuses(lambda: _source_config(ic, "127.0.0.1", {}))
+    reg = Registry()
+    reg.add_inbound(ic)
+    records = [(h.name, h.refused) for h in attested_secure_hop_records(reg)]
+    assert len(records) == 1 and "IB_CASE" in records[0][0]
+    assert records[0][1] is refused
+
+
+def test_control_the_cases_cover_both_build_outcomes() -> None:
+    """Without this the agreement tests could pass with every case on one side."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    outcomes = {
+        name: _build_refuses(
+            lambda extra=extra: _dest_config(
+                OutboundConnection("OB_CASE", File(directory="."), **extra, **_ATTEST),
+                {},
+                None,
+                EgressSettings(),
+            )
+        )
+        for name, extra in {**_REVOCATION_CASES, **_CLEARTEXT_CASES}.items()
+    }
+    built = {name for name, refused in outcomes.items() if not refused}
+    assert {"revocation-int-1", "revocation-str-false", "cleartext-str-false"} <= built
+    assert {"revocation-int-reason", "cleartext-int-reason", "revocation-no-reason"} <= (
+        set(outcomes) - built
+    )
