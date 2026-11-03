@@ -409,13 +409,46 @@ def test_only_a_lander_seat_id_signs_a_hold(
 def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    full = _held(110, _ack("2026-10-28T13:00:00Z", _sha(110)))
+    full = _held(110, _ack("2026-10-28T17:00:00Z", _sha(110)))
     # A short, upper-cased SHA with a trailing space and CR, in the hold's own second.
     odd = f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing"
-    short = _held(111, _comment(odd, "2026-10-28T12:00:00Z"))
+    at = "2026-10-28T17:00:00Z"
+    short = _pr(111, comments=[_hold(at, _sha(111)), _comment(odd, at)])
     rows = _engine_rows(tmp_path, capsys, full, short)
     assert _turn(rows[110]) == ("AUTHOR", ["held", "acked"])
     assert _turn(rows[111]) == ("AUTHOR", ["held", "acked"])
+
+
+def test_an_ack_more_than_two_hours_old_hands_the_turn_to_the_lander(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NOW is 18:00. An ack 2h+1s old has expired; one 1h59m old, or exactly 2h old, has not. The
+    newest ack decides, and an expired ack on a cut page carries both flags."""
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(115, _ack("2026-10-28T15:59:59Z", _sha(115))),
+        _held(116, _ack("2026-10-28T16:01:00Z", _sha(116))),
+        _held(117, _ack("2026-10-28T16:00:00Z", _sha(117))),
+        _held(
+            118,
+            _ack("2026-10-28T12:30:00Z", _sha(118)),
+            _ack("2026-10-28T17:00:00Z", _sha(118)),
+        ),
+        _cut(_held(119, _ack("2026-10-28T15:00:00Z", _sha(119)))),
+        # Controls: rows that would not read AUTHOR acked do not change.
+        _held(114, _ack("2026-10-28T12:30:00Z", _sha(114)), _repair()),
+    )
+    assert _repair_row(rows[115]) == ("LANDER", ["held", "acked", "ack-expired"], None)
+    assert _repair_row(rows[116]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[117]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[118]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[119]) == (
+        "LANDER",
+        ["held", "acked", "ack-expired", "page-cut"],
+        None,
+    )
+    assert _repair_row(rows[114]) == ("REPAIR", ["held", "acked", "repair"], OWNER_ID)
 
 
 def test_anything_but_a_valid_ack_still_hands_the_turn_back(
@@ -823,7 +856,9 @@ def _cut(pr: dict[str, Any], kind: str = "comments", info: object = None) -> dic
 
 def test_a_cut_page_never_reads_author(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A marker before the hold, or an old comment edited into a reply, may be off a cut page, so
-    a row that would read AUTHOR reads LANDER ``page-cut``. Nothing else changes."""
+    a row that would read AUTHOR reads LANDER ``page-cut``. So does one that would read REPAIR,
+    keeping ``repair`` and its owner: an author comment or a later hold off the page could have
+    ended the transfer. Nothing else changes."""
     rehold = "2026-10-28T15:00:00Z"
     rows = _engine_rows(
         tmp_path,
@@ -831,15 +866,17 @@ def test_a_cut_page_never_reads_author(tmp_path: Path, capsys: pytest.CaptureFix
         # The transfer that told the author to stand down is off the page: only the re-hold shows.
         _cut(_pr(200, comments=[_hold(rehold, _sha(200))])),
         _cut(_held(201), "reviews"),
-        _cut(_held(202, _ack("2026-10-28T12:30:00Z", _sha(202)))),
+        _cut(_held(202, _ack("2026-10-28T17:30:00Z", _sha(202)))),
         # A pageInfo that cannot say is no proof the page is whole.
         _cut(_held(203), info="absent"),
         _cut(_held(204), info={"hasPreviousPage": None}),
         _cut(_held(205), "reviews", info="x"),
-        # Controls: an uncut page still reads AUTHOR, and rows that would not read AUTHOR do not
-        # change.
-        _held(206),
+        # A transfer on a cut page: whatever ended it may be off the page.
         _cut(_held(207, _repair())),
+        _cut(_held(213, _ack("2026-10-28T12:30:00Z", _sha(213)), _repair()), "reviews"),
+        # Controls: an uncut page still reads AUTHOR or REPAIR, and LANDER rows do not change.
+        _held(206),
+        _held(214, _repair()),
         _cut(_held(208, _comment("Manager: fixed.", "2026-10-28T13:00:00Z"))),
         _cut(_transferred(209)),
         _cut(_pr(210)),
@@ -848,7 +885,13 @@ def test_a_cut_page_never_reads_author(tmp_path: Path, capsys: pytest.CaptureFix
         assert _repair_row(rows[n]) == ("LANDER", ["held", "page-cut"], None), n
     assert _repair_row(rows[202]) == ("LANDER", ["held", "acked", "page-cut"], None)
     assert _repair_row(rows[206]) == ("AUTHOR", ["held"], None)
-    assert _repair_row(rows[207]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[207]) == ("LANDER", ["held", "repair", "page-cut"], OWNER_ID)
+    assert _repair_row(rows[213]) == (
+        "LANDER",
+        ["held", "acked", "repair", "page-cut"],
+        OWNER_ID,
+    )
+    assert _repair_row(rows[214]) == ("REPAIR", ["held", "repair"], OWNER_ID)
     assert _repair_row(rows[208]) == ("LANDER", ["replied", "no-new-commit"], None)
     assert _repair_row(rows[209]) == ("LANDER", ["held", "repair-rehold"], OWNER_ID)
     assert _repair_row(rows[210]) == ("LANDER", ["no-hold"], None)

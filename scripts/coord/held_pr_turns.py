@@ -96,6 +96,11 @@ plain-prose acknowledgement, with no marker, is a reply and the Lander's turn. T
 only "still my move"; anything the Lander must read or answer goes in a comment WITHOUT the
 marker, which hands the turn back.
 
+AN ACK EXPIRES 2 HOURS AFTER IT. A row that would read AUTHOR with ``acked`` reads LANDER, flagged
+``ack-expired`` after ``acked``, when its newest qualifying ack is more than ``ACK_TTL`` (2 hours)
+older than the run's ``now``. The hold then counts as unacknowledged. AUTHOR already requires the
+head to start with the hold's SHA, which is how "no author commit since" is read.
+
 AUTHOR's turn only when ALL of these hold: the newest Lander event is a marker hold (a same-second
 tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts with the marker's SHA,
 ignoring case; no non-Lander event other than an ack (THE ACK CONTRACT) is at or after the hold's
@@ -178,9 +183,10 @@ A CUT PAGE IS THE LANDER'S. Only the latest ``COMMENT_PAGE`` comments and ``REVI
 are fetched, so a marker before the hold, or an old comment edited into a reply, may be off the
 page.
 When either connection's ``pageInfo.hasPreviousPage`` is true, or its ``pageInfo`` cannot say, a row
-that would read AUTHOR reads LANDER instead, ``page-cut`` following its ``held`` (and ``acked``)
-flags and preceding ``in-queue`` or ``auto-armed``. No other
-row changes: REPAIR, and every LANDER row, read as they would on an uncut page.
+that would read AUTHOR or REPAIR reads LANDER instead, ``page-cut`` following its other flags and
+preceding ``in-queue`` or ``auto-armed``. A REPAIR row keeps ``repair`` and ``repairOwner``: an
+author comment or a later hold off the page could have ended the transfer. No other row changes:
+every LANDER row reads as it would on an uncut page.
 
 A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
@@ -233,14 +239,16 @@ queued or armed, or LANDER's beside at least ``repair-rehold`` or ``page-cut``);
 never means the author owns a ``repair`` row); ``repair-rehold`` (beside ``held``: a hold with a
 marker before it and none after it, so the Lander's move is to post one; THE REPAIR CONTRACT);
 ``no-hold`` (no Lander event, or the newest is not a marker hold); ``new-commit`` (the head does
-not start with the marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
-head); ``edited`` (a comment or review, of any author, the hold included,
+not start with the marker's SHA); ``replied`` (a non-Lander event at or after the hold, other
+than an ack naming the head); ``edited`` (a comment or review, of any author, the hold included,
 edited at or after the hold); ``acked`` (beside ``held``: an author's ack naming the head stands
 after the hold; alone, it kept the turn the author's; beside ``repair``, it came before the
 transfer; beside ``repair-rehold``, it did not keep the turn, which is still the Lander's);
 ``no-new-commit`` (replied or edited, but the head still matches the marker: the Lander must read
-the reply or edit, but can bounce it fast); ``page-cut`` (beside ``held``: the row would read
-AUTHOR, but a comment or review page was cut, so it is the Lander's; THE REPAIR CONTRACT);
+the reply or edit, but can bounce it fast); ``ack-expired`` (beside ``acked``: the row would read
+AUTHOR, but the newest ack is over 2 hours old, so it is the Lander's; AN ACK EXPIRES);
+``page-cut`` (beside ``held``: the row would read AUTHOR or REPAIR, but a comment or review page
+was cut, so it is the Lander's; THE REPAIR CONTRACT);
 ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
 
 Stdlib only.
@@ -255,7 +263,7 @@ import re
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from pathlib import Path
 from types import ModuleType
@@ -283,6 +291,8 @@ CONTEXT_PAGE = 100
 COMMENT_PAGE = 100
 REVIEW_PAGE = 50
 TITLE_WIDTH = 50
+#: How long an author's hold-ack keeps the turn the author's (AN ACK EXPIRES 2 HOURS AFTER IT).
+ACK_TTL = timedelta(hours=2)
 
 #: How every Lander comment begins: ``Lander (session <id>)``, or ``Lander (lander-<id>), ``. A
 #: Manager's ``Lander (<id>): ...`` matches neither; WHY THE SIGNATURE IS NARROW says why. Bounded,
@@ -557,6 +567,17 @@ def page_cut(pr: dict[str, Any]) -> bool:
     return False
 
 
+def _ack_expired(head_oid: str, events: Iterable[Event], now: datetime) -> bool:
+    """Whether the newest ack naming the head is more than ``ACK_TTL`` older than ``now``.
+
+    Call only on a row ``classify`` read as AUTHOR ``acked``: every ack it counted is at or after
+    the hold and every other ack naming the head is older, so the newest one here is a counted one.
+    """
+    head = head_oid.lower()
+    acks = [e.latest for e in events if not e.bot and (a := e.acked_at) and head.startswith(a)]
+    return bool(acks) and now - max(acks) > ACK_TTL
+
+
 def _earlier_transfer(turn_events: list[Event], hold: datetime) -> tuple[str | None] | None:
     """``(owner,)`` when any repair-owner marker came before ``hold``'s second, else ``None``.
 
@@ -600,7 +621,7 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
     """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` without a ``repair`` or
     ``repair-rehold`` flag, and may be ``None`` beside ``repair-rehold`` (``_earlier_transfer``).
 
-    Pure; the module docstring states the rules. ``page-cut`` is ``_row``'s, not this one's.
+    Pure; the module docstring states the rules. ``page-cut`` and ``ack-expired`` are ``_row``'s, not this one's.
     """
     turn_events = [e for e in events if not e.bot]
     landers = [e for e in turn_events if e.lander]
@@ -696,8 +717,14 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
     committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
     events = _events(pr)
     turn, flags, owner = classify(head_oid, events)
-    if turn == AUTHOR and page_cut(pr):
-        # A marker before the hold, or a reply by editing an old comment, may be off the page.
+    would = turn
+    if would == AUTHOR and "acked" in flags and _ack_expired(head_oid, events, now):
+        # An ack says "still my move" for 2 hours; after that the hold reads unacknowledged.
+        turn = LANDER
+        flags.append("ack-expired")
+    if would in (AUTHOR, REPAIR) and page_cut(pr):
+        # A marker before the hold, a reply by editing an old comment, or an author comment or a
+        # later hold that ended a transfer, may be off the page.
         turn = LANDER
         flags.append("page-cut")
     if pr.get("mergeQueueEntry"):
