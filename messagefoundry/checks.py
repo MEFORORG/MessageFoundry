@@ -132,13 +132,14 @@ def _config_modules(
     from messagefoundry.config.wiring import config_py_files
     from messagefoundry.redaction import safe_exc
 
+    not_dir = CheckResult(name, ok=True, required=False, skipped=True, detail="not a config dir")
     try:
         return config_py_files(Path(config_dir))
+    except ValueError:
+        return not_dir  # an embedded NUL, which os.scandir refuses outright
     except OSError as exc:
         if is_missing_directory(exc):
-            return CheckResult(
-                name, ok=True, required=False, skipped=True, detail="not a config dir"
-            )
+            return not_dir
         detail = f"could not list the config dir: {safe_exc(exc)}"
     if required:
         return CheckResult(name, ok=False, required=True, detail=detail)

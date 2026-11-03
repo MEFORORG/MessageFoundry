@@ -998,7 +998,30 @@ def test_the_glob_this_replaced_swallows_a_listing_fault(tmp_path: Path) -> None
 def test_config_py_files_raises_on_a_real_folder_it_cannot_list(tmp_path: Path) -> None:
     with unlistable_dir(tmp_path) as folder, pytest.raises(OSError) as refused:
         config_py_files(folder)
-    assert not isinstance(refused.value, ConfigDirMissing)
+    # What the lint legs and the load tell a fault from a missing directory by.
+    assert not is_missing_directory(refused.value)
+
+
+def test_a_config_dir_moved_away_before_the_trust_check_is_still_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trust check now lists the directory itself, so it is the first to meet one moved away
+    after the load's own check. It answers missing as that check would, which a reload maps to
+    not_found (BACKLOG #3157), rather than a refusal or a digest it could not take."""
+    cfg = _config(tmp_path / "cfg")
+    real = wiring._require_config_dir
+
+    def then_moved(directory: Path, *, strict: bool) -> None:
+        real(directory, strict=strict)
+        if directory.exists():
+            directory.rename(tmp_path / "moved")
+
+    monkeypatch.setattr(wiring, "_require_config_dir", then_moved)
+    with pytest.raises(ConfigDirMissing):
+        read_trusted_snapshot(cfg, strict=False)
+    (tmp_path / "moved").rename(cfg)
+    with pytest.raises(ConfigDirMissing):
+        read_trusted_snapshot(cfg, strict=True)
 
 
 def test_config_py_files_raises_on_a_missing_directory(tmp_path: Path) -> None:

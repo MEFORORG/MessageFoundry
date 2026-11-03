@@ -54,6 +54,12 @@ def unlistable_dir(tmp_path: Path) -> Iterator[Path]:
     (folder / "graph.py").write_text("X = 1\n", encoding="utf-8")
     folder.chmod(0)
     try:
+        try:
+            os.scandir(folder).close()
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("this process lists a mode-000 directory")
         yield folder
     finally:
         folder.chmod(0o700)  # so the tmp_path cleanup can remove it

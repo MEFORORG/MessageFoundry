@@ -8651,6 +8651,8 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     _require_config_dir(directory, strict=strict)
     try:
         _assert_safe_config_source(directory)
+    except ConfigDirMissing:
+        raise
     except OSError as exc:
         # Its walk raises what it cannot list, and a path it could not vet must not load. Outside
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
@@ -8701,7 +8703,7 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
         _refuse_config_dir(
             directory,
             PermissionError(
-                errno.EACCES, "config directory lists but is not vetted", str(directory)
+                errno.EACCES, "config directory lists but is_dir says no", str(directory)
             ),
             strict=strict,
         )
@@ -9576,10 +9578,17 @@ def _assert_safe_config_source(directory: Path) -> None:
     A directory it cannot list raises that ``OSError``, a missing one included, and each caller
     refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
     for a share Windows cannot reach (vault BACKLOG #5117)."""
-    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
-    # writable/foreign-owned helper is just as much an injection vector (review M-21).
+    try:
+        # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
+        # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
+        paths = config_source_trust_paths(directory)
+    except OSError as exc:
+        if is_missing_directory(exc):
+            # Moved away since the caller's own check: missing, as that check answers (#3157).
+            _require_config_dir(directory, strict=True)
+        raise
     _check_trusted_paths(
-        config_source_trust_paths(directory),
+        paths,
         lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
         first_is_required=True,
