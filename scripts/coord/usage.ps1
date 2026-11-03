@@ -26,11 +26,14 @@
          it changed, or a session that had just called the API reported it. An idle session's repeat
          does not count; usage-collect.ps1 says why.
       2. DO NOT LET A STALE NUMBER CLEAR ANYTHING. Past -MaxAgeMinutes the window's state is UNKNOWN,
-         not a last-known value dressed up as current. Two things still stop work on it. A level_floor at
-         the ceiling sets CRITICAL, as "at least this"; below the ceiling a floor is only a lower bound,
-         so the verdict stays UNKNOWN. And a rate from its history rows that projects a run-out before
-         the reset, or with no reset, sets CRITICAL. Below two samples in the current window there is no
-         rate and no projection, and the percentage bands still grade the reading.
+         not a last-known value dressed up as current. At least these still stop work on it:
+           - a level_floor at the ceiling, which sets CRITICAL, as "at least this";
+           - a level_floor at the gate's own level (HoldAt), which Get-DecisionCostRung reads for itself
+             while this verdict stays UNKNOWN, because below the ceiling a floor is only a lower bound;
+           - a rate from its history rows that projects a run-out, counted from now, before the reset or
+             with no reset, which sets CRITICAL.
+         Below two samples in the current window there is no rate and no projection, and the percentage
+         bands still grade the reading.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -102,7 +105,7 @@ param(
     [string]$StateDir,
     # Machine-readable, for the coordinator.
     [switch]$Json,
-    # Older than this and a reading is reported but NOT projected from.
+    # Older than this and a reading is stale: reported, and projected only to find a run-out (rule 2).
     [int]$MaxAgeMinutes = 20,
     # Rate is measured over at most this much recent history.
     [int]$RateWindowMinutes = 90,
@@ -571,7 +574,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         reason           = ""
     }
 
-    # RULE 2: stale readings are reported, never projected from.
+    # RULE 2: a stale reading is reported, and projected only to find a run-out. It clears nothing.
     #
     # The lower bound is not defensive tidying. An age is a subtraction of two clocks, and any bug or skew
     # that makes it negative would pass an `age -gt max` test unconditionally -- the staleness guard would
@@ -596,15 +599,23 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # A PROJECTED RUN-OUT STILL STOPS WORK ON A STALE READING. Its history rows are as real as they
         # were, and the code before the weekly amendment restamped an idle repeat as fresh and projected
         # from this same number. Short of a run-out nothing is projected, so a stale number clears nothing.
+        #
+        # COUNTED FROM NOW, NOT FROM THE READING. The reset and the gate's HoldMin are counted from now,
+        # so the run-out is too: the reading's age is taken off. A run-out already past is 0, which the
+        # gate hits on, and its reason says it has passed rather than naming a moment already gone.
         if ($age -gt $MaxAgeMinutes) {
             $rate = Get-Rate -CurrentResetEpoch $resetEpoch
             if ($rate -and $rate.PctPerHour -gt 0) {
-                $toEmpty = [math]::Round((100.0 - $pct) / $rate.PctPerHour * 60.0, 0)
+                $fromReading = (100.0 - $pct) / $rate.PctPerHour * 60.0
+                $toEmpty = [math]::Max(0, [math]::Round($fromReading - $age, 0))
                 if ($null -eq $minsToReset -or $toEmpty -lt $minsToReset) {
                     $o.state = "CRITICAL"
                     $o.rate_pct_per_hr = $rate.PctPerHour
                     $o.minutes_to_empty = $toEmpty
-                    $o.reason = "projected to hit 100% in ~$toEmpty min from its history rows; $($o.reason)"
+                    $o.reason = if ($toEmpty -le 0) {
+                        "projected from its history rows to have already hit 100%, about $([math]::Round($age - $fromReading, 0)) min ago; $($o.reason)"
+                    }
+                    else { "projected from its history rows to hit 100% about $toEmpty min from now; $($o.reason)" }
                 }
             }
         }
@@ -700,9 +711,9 @@ if ($seven.Contains('level_floor') -and -not $seven.dated_ahead -and $seven.leve
 # an unchanged reading is still CRITICAL, so the exit code and the advice must say so. BELOW THE CEILING
 # THE VERDICT STAYS UNKNOWN: the number is only a lower bound, so "commit at your next stop" would grade
 # a number nothing fresh backs. Get-DecisionCostRung reads level_floor for itself and hits at its rung
-# whatever this says, and the spawn hook prints the number and why. The window stays UNKNOWN because
-# nothing fresh backs a rate or a clear, and that is what the gate reads below the rung, so this cannot
-# loosen it.
+# whatever this says, and the spawn hook prints the number and why. The window stays UNKNOWN, unless its
+# history rows project a run-out, because nothing fresh backs a clear, and that is what the gate reads
+# below the rung, so this cannot loosen it.
 if ($null -ne $seven.level_floor -and $seven.level_floor -ge $CeilingPct) { $overall = "CRITICAL" }
 
 # A READING THIS ROOT MAY NOT TRUST IS UNKNOWN, which is what the exit-code contract promises. The

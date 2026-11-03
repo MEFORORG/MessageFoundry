@@ -342,6 +342,55 @@ def test_a_floor_dated_after_now_says_the_clock_looks_wrong(tmp_path: Path) -> N
     assert "a stale reading" not in ctx, ctx
 
 
+def test_a_stale_projected_run_out_gets_the_notes_and_its_reason(tmp_path: Path) -> None:
+    """A Desktop session halted on a stale run-out must be told why and that it cannot refresh, as on a
+    floor. With a floor too, the line keeps the run-out's reason."""
+    state = tmp_path / "s"
+    stale_stamped_reading(state, 92.0)
+    epoch = json.loads((state / "latest.json").read_text(encoding="utf-8"))["seven_day"][
+        "resets_at_epoch"
+    ]
+    old = (datetime.now(UTC) - timedelta(minutes=60)).isoformat().replace("+00:00", "Z")
+    recent = (datetime.now(UTC) - timedelta(minutes=25)).isoformat().replace("+00:00", "Z")
+    (state / "history.jsonl").write_text(
+        json.dumps({"at": old, "seven_day": 60.0, "seven_reset": epoch})
+        + "\n"
+        + json.dumps({"at": recent, "seven_day": 92.0, "seven_reset": epoch})
+        + "\n",
+        encoding="utf-8",
+    )
+    env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
+    payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
+    ctx = context_of(state, env_extra=env, extra_args=steward_files(tmp_path), payload=payload)
+    assert "verdict: CRITICAL" in ctx and "at least 92.0%" in ctx, ctx
+    assert "CRITICAL -- projected" in ctx, ctx
+    assert PUBLISHER_NOTE in ctx and FALLBACK_LABEL in ctx, ctx
+
+
+def test_a_stale_projected_run_out_with_no_floor_gets_the_notes(tmp_path: Path) -> None:
+    """No stamp, so no floor below the ceiling: the run-out alone makes it CRITICAL."""
+    state = tmp_path / "s"
+    collect(state, reading(seven=92.0))
+    age_document(state, minutes=25)
+    epoch = json.loads((state / "latest.json").read_text(encoding="utf-8"))["seven_day"][
+        "resets_at_epoch"
+    ]
+    old = (datetime.now(UTC) - timedelta(minutes=60)).isoformat().replace("+00:00", "Z")
+    recent = (datetime.now(UTC) - timedelta(minutes=25)).isoformat().replace("+00:00", "Z")
+    (state / "history.jsonl").write_text(
+        json.dumps({"at": old, "seven_day": 60.0, "seven_reset": epoch})
+        + "\n"
+        + json.dumps({"at": recent, "seven_day": 92.0, "seven_reset": epoch})
+        + "\n",
+        encoding="utf-8",
+    )
+    env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
+    payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
+    ctx = context_of(state, env_extra=env, extra_args=steward_files(tmp_path), payload=payload)
+    assert "verdict: CRITICAL" in ctx and "at least" not in ctx.split("Ages")[0], ctx
+    assert PUBLISHER_NOTE in ctx and FALLBACK_LABEL in ctx, ctx
+
+
 def test_a_live_session_repeating_a_spent_reading_prints_it_as_current(tmp_path: Path) -> None:
     """The counter rose, so the session has just called the API and the old age is gone."""
     state = tmp_path / "s"

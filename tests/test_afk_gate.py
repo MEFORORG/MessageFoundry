@@ -775,6 +775,25 @@ def test_an_idle_stale_reading_with_a_rate_halts(sb: Sandbox, tmp_path: Path, pi
     assert code == HALT and "Projected to run out" in why(doc), why(doc)
 
 
+def test_a_stale_run_out_inside_holdmin_from_now_halts(sb: Sandbox, tmp_path: Path) -> None:
+    """80 with rows at 85 and 25 minutes ago runs out about 67 minutes after the reading, past the
+    rung's 60, but that was 25 minutes ago, so it runs out in about 42 minutes from now."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + 14400
+    assert _fire(sb, state, {"used_percentage": 80, "resets_at": resets}, env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=25).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    _set_rows(state, [(ago(minutes=85), 62), (ago(minutes=25), 80)], resets)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == HALT and "Projected to run out" in why(doc), why(doc)
+
+
 def test_a_burn_dated_after_now_with_no_reset_halts_and_names_the_clock(
     sb: Sandbox, tmp_path: Path
 ) -> None:

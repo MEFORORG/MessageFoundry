@@ -48,7 +48,8 @@
     endpoint returns 429 PER ENDPOINT rather than per caller, proven inside one process, so the
     design wants exactly one caller and this is not it.
 
-    AN ABSENT, STALE OR UNREADABLE SOURCE IS UNKNOWN -- NEVER ZERO, AND NEVER SILENCE. A confident
+    AN ABSENT OR UNREADABLE SOURCE IS UNKNOWN, AND SO IS A STALE ONE UNLESS usage.ps1 GRADES IT
+    (its rule 2) -- NEVER ZERO, AND NEVER SILENCE. A confident
     number derived from a failed read is worse than no number: it converts "I should check" into "I
     already know". Every failure path below says what failed and prints UNKNOWN. The reader's own
     absence is included: an empty answer and a broken probe are byte-identical unless you test the
@@ -725,6 +726,8 @@ function Format-Window($w) {
             $m = [int]$w.minutes_to_reset
             $line += ("   resets in {0}h{1:00}m" -f [math]::Floor($m / 60), ($m % 60))
         }
+        # A run-out projected beside the floor is the reason the verdict is CRITICAL, so it is printed too.
+        if ([string]$w.state -eq "CRITICAL") { $line += "   CRITICAL -- " + (Get-Folded $w.reason 200) }
         return $line
     }
     if ([string]$w.state -eq "UNKNOWN" -or $null -eq $w.used_percentage) {
@@ -759,10 +762,12 @@ if ((Get-Folded $j.provenance) -eq "UNVERIFIED") {
 }
 
 # A READING THAT CAME BACK UNKNOWN GETS ITS CAUSE, for the same reason the no-window path does. SO DOES
-# A FLOOR, WHATEVER ITS VERDICT. It is a stale number too, and at the ceiling the verdict is CRITICAL, so
-# testing UNKNOWN alone would leave a session the gate has halted with no word of why, or that nothing it
-# does can refresh the file.
-$unconfirmed = $state -eq "UNKNOWN" -or $null -ne $j.seven_day.level_floor
+# A FLOOR, WHATEVER ITS VERDICT, AND SO DOES A STALE READING CRITICAL BY A PROJECTED RUN-OUT. Each is a
+# stale number, and the verdict can be CRITICAL, so testing UNKNOWN alone would leave a session the gate
+# has halted with no word of why, or that nothing it does can refresh the file.
+$staleAge = $j.seven_day.reading_age_min -as [double]
+$unconfirmed = $state -eq "UNKNOWN" -or $null -ne $j.seven_day.level_floor -or
+    ($null -ne $j.seven_day.reading_age_min -and $staleAge -gt $MaxAgeMinutes)
 if ($unconfirmed) {
     $lines += @(Get-CauseNote $j)
 }

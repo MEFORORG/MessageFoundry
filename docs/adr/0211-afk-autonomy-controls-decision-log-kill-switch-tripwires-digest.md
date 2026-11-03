@@ -410,7 +410,8 @@ roster alias of the Lander.
 > prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
 > missing reset must not loosen the rung.
 >
-> **The age therefore counts from the last confirmation, and only a level or ceiling hit survives age.**
+> **The age therefore counts from the last confirmation, and a stale reading stops work at least through
+> a floor or a projected run-out.**
 > The payload carries no time of its own, so an idle session's cached number looks like a live flat one.
 > Restamping an equal reading let one idle terminal keep a frozen number fresh, and the rung read OK on
 > it. So an equal reading refreshes the age only when the session reporting it has just called the API:
@@ -436,8 +437,8 @@ roster alias of the Lander.
 > because a fresh reading there stops work on any provenance, and an idle session's equal reading does
 > not refresh its age: the same number would otherwise read REVIEW 21 minutes later with nothing changed. A document or
 > window stamped with another root is still refused. The rung is then hit at the 90 percent level or the
-> ceiling. Every other stale reading answers REVIEW at any level, including at least
-> an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
+> ceiling. Short of a projected run-out, every other stale reading answers REVIEW at any level, including
+> at least an undateable one, a stale one with no reset, and one below the ceiling with no verified stamp. So a
 > fresh 95 with no rate on such a root is hit, and the same reading once stale answers REVIEW. A Desktop
 > session on a root holding such a floor gets HALT, which narrows the gap this section names. A floor at
 > the ceiling also sets `usage.ps1`'s verdict and exit code to CRITICAL (11). Below the ceiling the verdict
@@ -453,9 +454,11 @@ roster alias of the Lander.
 >
 > **A stale reading keeps a projected run-out, and nothing short of one.** Its history rows still give a
 > rate, and a projection to run out before the reset, or with no reset, makes the window CRITICAL, so the
-> gate hits on it within its 60 minutes as it would on a fresh reading. The code before this amendment
-> reached the same answer by restamping an idle repeat. Short of a run-out nothing is projected: a fresh
-> 70 percent whose rate does not reach the rung reads OK, and once stale it answers REVIEW. From 90 to 97
+> gate hits on it within the rung's minutes (`HoldMin`, 60 by default) as it would on a fresh reading. The
+> run-out is counted from now, with the reading's age taken off, so one already past hits. The code
+> before this amendment reached the same answer by restamping an idle repeat. Short of a run-out nothing
+> is projected: a fresh 70 percent whose rate does not run it out before the reset reads OK, and once
+> stale it answers REVIEW. From 90 to 97
 > percent the level decides instead: the rung is hit even where a fresher reading's rate would have
 > cleared it, because the window resets first. That departs from the rate-governs rule for stale readings
 > and for readings dated after now.
@@ -464,7 +467,7 @@ roster alias of the Lander.
 > when it was taken, so OK and WARN cannot come from it. But a small backward clock step dates a real
 > reading ahead, so it keeps a `level_floor` at its number on any provenance, unless its reset has passed.
 > A projection to run out before the reset stays CRITICAL, and with no reset any projection does. The gate
-> halts on a projection only inside its 60 minutes, and answers REVIEW beyond that. Any
+> halts on a projection only inside `HoldMin`, 60 minutes by default, and answers REVIEW beyond that. Any
 > distance ahead counts, with no tolerance: the collector stamps before it writes, and the reader opens the
 > document before it reads the clock. A history row dated ahead stays in the rate at its own date. When the
 > gate halts on such a reading, its reason and the spawn hook's line say the machine's clock looks wrong.

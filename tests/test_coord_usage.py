@@ -560,7 +560,7 @@ def test_no_data_at_all_is_unknown_and_says_how_to_fix_it(tmp_path: Path) -> Non
     assert code == UNKNOWN
 
 
-def test_a_stale_reading_is_reported_but_never_projected_from(tmp_path: Path) -> None:
+def test_a_stale_reading_with_no_rate_is_reported_and_projects_nothing(tmp_path: Path) -> None:
     """A dead publisher is the expected steady state here: the statusLine does not run headless, so the
     coordinator itself can never publish. Extrapolating from an hour-old number would be a confident
     answer about a window that may already have reset."""
@@ -642,7 +642,8 @@ def test_a_stale_reading_whose_rows_project_a_run_out_is_critical(
     tmp_path: Path, pct: float, rows: list[tuple[float, float]], stamped: bool
 ) -> None:
     """An idle repeat leaves the age counting, so these go stale. The code before restamped them and
-    projected about 19 minutes to empty, a stop. Returning before the rate turned that into REVIEW."""
+    projected about 19 minutes to empty, a stop. Returning before the rate turned that into REVIEW.
+    Counted from now, those 19 minutes have passed, so it reads as already run out."""
     epoch = int(time.time()) + 14400
     publish(tmp_path, seven=pct, age_min=rows[-1][0], seven_epoch=epoch)
     if stamped:
@@ -650,7 +651,20 @@ def test_a_stale_reading_whose_rows_project_a_run_out_is_critical(
     write_history(tmp_path, rows, epoch)
     code, doc = read(tmp_path)
     assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
-    assert doc["seven_day"]["minutes_to_empty"] == pytest.approx(19, abs=1), doc
+    assert doc["seven_day"]["minutes_to_empty"] == 0, doc
+    assert "already hit 100%" in doc["seven_day"]["reason"], doc
+
+
+def test_a_stale_run_out_already_past_is_critical_and_says_so(tmp_path: Path) -> None:
+    """Counted from the reading, 89 runs out about 19 minutes after it was taken, which is 6 minutes ago,
+    and after the reset 10 minutes from now. Counted from now it has already run out, before the reset."""
+    epoch = int(time.time()) + 600
+    publish(tmp_path, seven=89.0, age_min=25, seven_epoch=epoch)
+    write_history(tmp_path, [(89.0, 51.0), (25.0, 89.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
+    assert doc["seven_day"]["minutes_to_empty"] == 0, doc
+    assert "already" in doc["seven_day"]["reason"] and "in ~" not in doc["seven_day"]["reason"], doc
 
 
 def test_a_stale_reading_whose_rows_do_not_reach_a_run_out_stays_unknown(tmp_path: Path) -> None:

@@ -1472,7 +1472,8 @@ because a live pool is running out, which is not an account that has none.
 `UNKNOWN` is a real answer here and is returned when the reading is stale, undateable, dated after now
 or past its window's reset. The exceptions are in `usage.ps1`'s header: at least a stale or dated-ahead
 number at the ceiling, and a stale or dated-ahead reading whose history projects a run-out before the
-reset, or with no reset, return `CRITICAL`. The gate halts on such a projection only inside 60 minutes.
+reset, or with no reset, return `CRITICAL`. The gate halts on such a projection only inside its
+`HoldMin`, 60 minutes by default.
 Short of that a percentage is never extrapolated from a dead publisher, and every number is printed with
 its own age. **Do not read a missing bucket as an empty one.** Two more states return it: a document
 stamped with a config root other than the one it sits under is **refused** rather than reported as this
