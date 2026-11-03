@@ -6238,28 +6238,32 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             return True
         return False
 
+    def _typed_refused(attested: bool, reason: str | None, accepted: bool) -> bool:
+        # The rules _source_config and _dest_config run on a connection's typed pair (the flag type,
+        # a missing, blank or control-character reason), and the attested-plus-accepted pair, which
+        # outbound() and the Destination model refuse. A declaration either refuses is a hop the
+        # engine never builds, however it got past the factory.
+        try:
+            _hop_attestation_entries("", attested, reason)
+            check_attested_and_accepted(True, accepted)
+        except (WiringError, ValueError):
+            return True
+        return False
+
     out = [
         AttestedHop(
-            inbound_record_name(ic.name), _attested_reason_text(ic.tls_hop_attested_reason), False
+            inbound_record_name(ic.name),
+            _attested_reason_text(ic.tls_hop_attested_reason),
+            _typed_refused(ic.tls_hop_attested, ic.tls_hop_attested_reason, False),
         )
         for ic in registry.inbound.values()
         if _listed(ic.tls_hop_attested)
     ]
-
-    def _pair_refused(name: str, accepted: bool) -> bool:
-        # outbound() refuses the pair, and the Destination model refuses an OutboundConnection
-        # built directly with it, so such an entry is a hop the engine never builds.
-        try:
-            _refuse_attested_and_accepted(name, True, accepted)
-        except WiringError:
-            return True
-        return False
-
     out += [
         AttestedHop(
             oc.name,
             _attested_reason_text(oc.tls_hop_attested_reason),
-            _pair_refused(oc.name, oc.cleartext_accepted),
+            _typed_refused(oc.tls_hop_attested, oc.tls_hop_attested_reason, oc.cleartext_accepted),
         )
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)

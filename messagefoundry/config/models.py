@@ -393,8 +393,10 @@ def _check_revocation_attestation(attested: bool, reason: str | None) -> None:
     )
 
 
-class Source(BaseModel):
-    """An inbound connector endpoint."""
+class Source(_InputHidingModel):
+    """An inbound connector endpoint.
+
+    Input-hiding for the reason :class:`Destination` is: ``settings`` holds resolved secrets."""
 
     type: ConnectorType
     # The declaring inbound connection's name, carried so a connector can NAME itself in an operator-
@@ -440,7 +442,10 @@ class Source(BaseModel):
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Source:
-        _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        # The reason is written into WARNING lines, so a CR or LF in it could forge one.
+        _check_hop_attestation(
+            self.tls_hop_attested, require_hop_reason(self.tls_hop_attested_reason)
+        )
         _check_revocation_attestation(
             self.tls_revocation_attested, self.tls_revocation_attested_reason
         )
@@ -699,7 +704,7 @@ class SignatureAlgorithm(str, Enum):  # noqa: UP042
     ES384 = "ES384"  # ECDSA P-384 (secp384r1) + SHA-384 (EC key; randomized) — SMART Backend Services (ADR 0024)
 
 
-class OutboundSigning(BaseModel):
+class OutboundSigning(_InputHidingModel):
     """Opt-in per-connection message signing for a **REST/SOAP outbound** (ASVS 4.1.5, ADR 0018).
 
     OFF unless configured. When set, the connector mints a **detached JWS** (RFC 7515 Appendix F) over
@@ -752,7 +757,7 @@ class OutboundSigning(BaseModel):
         return cls.model_validate(data)
 
 
-class WindowsCredential(BaseModel):
+class WindowsCredential(_InputHidingModel):
     """A per-endpoint **alternate Windows / network-share credential** for a File (UNC/SMB) endpoint
     (ADR 0132, BACKLOG #111).
 
@@ -881,7 +886,11 @@ class Destination(_InputHidingModel):
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Destination:
-        _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        # The reason is written into WARNING lines (at least the MLLP, DICOM, email and database
+        # guards log it), so a CR or LF in it could forge one; the settings copy is checked below.
+        _check_hop_attestation(
+            self.tls_hop_attested, require_hop_reason(self.tls_hop_attested_reason)
+        )
         _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         # The settings-driven seams (at least the anonymous-FTP guard) read the attestation from
         # ``settings``, where _dest_config mirrors the typed field. So that carrier is held to the

@@ -298,22 +298,26 @@ def _proxy_hop(
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
     ``targets`` the hop is reported, because nothing says it is bypassed.
 
-    The credential is the ``proxy_user``/``proxy_password`` pair, or a user and password in the
-    proxy URL itself (:func:`_proxy_url_sends_userinfo`). The label is built from parsed parts, so the
-    userinfo never reaches it."""
+    The credential is the ``proxy_user``/``proxy_password`` pair. A user and password in the proxy
+    URL itself (:func:`_proxy_url_sends_userinfo`) is not a hop: the connector's build refuses it.
+    The label is built from parsed parts, so no userinfo reaches it."""
     proxy_url = settings.get("proxy_url") or site_proxy
-    in_url = _proxy_url_sends_userinfo(proxy_url)
-    if not in_url and not (settings.get("proxy_user") or settings.get("proxy_password")):
+    if _proxy_url_sends_userinfo(proxy_url):
+        # The connector's build refuses a credential in the proxy URL in every posture and under
+        # every declaration (vault BACKLOG #3007), so the hop never runs. Listing it would advise
+        # naming it in static_credential_accepted, which cannot make it run, and audit a hop that
+        # does not exist.
+        return None
+    if not (settings.get("proxy_user") or settings.get("proxy_password")):
         return None
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
     no_proxy = settings.get("proxy_no_proxy") or site_no_proxy
     if targets and all(_proxy_bypasses(target, no_proxy) for target in targets):
         return None  # every address bypasses the proxy: the credential is never sent
-    # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
-    # reported as Basic, which is what urllib makes of it, whatever proxy_auth_type says; the
-    # connector then refuses it at build. Otherwise the type is read the way the transport reads it.
-    kind = "basic" if in_url else str(settings.get("proxy_auth_type") or "basic").strip().lower()
+    # From a closed set, not echoed: only a known scheme name reaches the detail. The type is read
+    # the way the transport reads it.
+    kind = str(settings.get("proxy_auth_type") or "basic").strip().lower()
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(

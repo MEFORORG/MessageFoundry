@@ -47,6 +47,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config.models import ConnectorType, Destination
@@ -763,12 +764,32 @@ def test_a_fhir_lookup_refuses_it_too() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "proxy_url",
+    [_CREDENTIALED, f"http://{_USER}@{_PROXY_HOST}", f"http://:{_PASSWORD}@{_PROXY_HOST}"],
+    ids=["user-and-password", "user-only", "password-only"],
+)
+def test_a_credential_in_egress_proxy_url_is_refused_at_load(proxy_url: str) -> None:
+    """Refused once, naming the setting, rather than on each inheriting build or not at all when
+    nothing inherits it. Neither the value nor its parts reach the error, however it is rendered."""
+    with pytest.raises(ValueError) as refused:
+        EgressSettings(
+            deny_by_default=False, proxy_url=proxy_url, allowed_proxy=["proxy-marker.invalid"]
+        )
+    rendered = [str(refused.value), repr(refused.value)]
+    if isinstance(refused.value, ValidationError):
+        rendered += [str(refused.value.errors()), refused.value.json()]
+    assert "[egress].proxy_url holds a user or a password" in rendered[0]
+    for text in rendered:
+        assert _USER not in text and _PASSWORD not in text, text
+
+
 def test_a_credential_inherited_from_egress_proxy_url_fails_the_build() -> None:
     """``_dest_config`` copies ``[egress].proxy_url`` in before the connector is built, so the same
-    check reads it. A connection whose own value wins inherits nothing and builds."""
-    egress = EgressSettings(
-        deny_by_default=False, proxy_url=_CREDENTIALED, allowed_proxy=["proxy-marker.invalid"]
-    )
+    check reads it. The load refuses that value first, so it is put past the load here, to pin that
+    the build still refuses it. A connection whose own value wins inherits nothing and builds."""
+    egress = EgressSettings(deny_by_default=False, allowed_proxy=["proxy-marker.invalid"])
+    egress = egress.model_copy(update={"proxy_url": _CREDENTIALED})
     inherited = _dest_config(OutboundConnection("OB", Rest(url=_HTTPS_TARGET)), {}, None, egress)
     _refused_at_build(lambda: build_destination(inherited, egress=egress))
 

@@ -34,7 +34,11 @@ from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.bounded_read import build_strict_opener
 from messagefoundry.transports.egress import check_egress_allowed, check_fhir_lookup_allowed
 from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_urllib
-from messagefoundry.transports.rest import PROXY_DEFAULT, proxy_config_from_settings
+from messagefoundry.transports.rest import (
+    PROXY_DEFAULT,
+    proxy_config_from_settings,
+    proxy_url_sends_userinfo,
+)
 
 LISTED = "proxy.listed.invalid"
 UNLISTED = "other.unlisted.invalid"
@@ -151,11 +155,11 @@ def test_the_site_proxy_url_is_refused_at_load_for_its_shape(proxy_url: str) -> 
 
 @pytest.mark.parametrize(
     "proxy_url",
-    [PLAIN, PLAIN + "/", "default", "DEFAULT", f"http://u:p@{LISTED}:3128"],
+    [PLAIN, PLAIN + "/", "default", "DEFAULT", f"http://@{LISTED}:3128", f"http://:@{LISTED}:3128"],
 )
 def test_control_a_site_proxy_url_the_parse_accepts_loads(proxy_url: str) -> None:
-    """A userinfo is the parse's to accept: each inheriting connection's build refuses a user and
-    password (vault BACKLOG #3007), and the static-credential report still lists it. The
+    """An empty userinfo holds no credential, so it loads; one that holds a user or a password is
+    refused at load (vault BACKLOG #3007, tests/test_proxy_url_credentials_refused.py). The
     validator writes the sentinel out, so this pins that it is the transport's."""
     assert EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED]).proxy_url == proxy_url
     assert PROXY_DEFAULT == "default"
@@ -373,8 +377,13 @@ def test_the_static_hop_label_names_the_dialled_host() -> None:
     assert plain is not None and f"{LISTED}:3128" in plain.detail
     for proxy_url in SPLIT_SHAPES:
         hop = _proxy_hop("OB", {"proxy_url": proxy_url, **keyed}, None)
+        if proxy_url_sends_userinfo(proxy_url):
+            # A credential in the URL fails the build, so it is no hop to accept (vault BACKLOG #3007).
+            assert hop is None, proxy_url
+            continue
         assert hop is not None and _WITHHELD_PEER in hop.detail, proxy_url
         _assert_names_no_part(hop.detail)
+    assert any(proxy_url_sends_userinfo(proxy_url) for proxy_url in SPLIT_SHAPES)
 
 
 @pytest.mark.parametrize(

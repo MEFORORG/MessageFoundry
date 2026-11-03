@@ -5277,10 +5277,9 @@ class EgressSettings(_Section):
     # the environment proxy urllib reads on its own). "default" = the OS default web
     # proxy (getproxies()); an http(s):// address = an explicit proxy. A loopback host is never
     # proxied, whichever of these named the proxy (vault BACKLOG #2579). Put proxy credentials on each
-    # connection (secrets via env()). Its shape is checked at load by _proxy_url_shape below. A
-    # user or a password written in it passes that check and is inherited with the URL; each connection
-    # that inherits it then fails to build (vault BACKLOG #3007), and docs/CONFIGURATION.md [egress]
-    # says what else applies. Env: MEFOR_EGRESS_PROXY_URL.
+    # connection (secrets via env()). Its shape is checked at load by _proxy_url_shape below, which
+    # also refuses a user or a password written in it (vault BACKLOG #3007); docs/CONFIGURATION.md
+    # [egress] says what else applies. Env: MEFOR_EGRESS_PROXY_URL.
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
@@ -5363,9 +5362,9 @@ class EgressSettings(_Section):
         out rather than read from ``transports.rest.PROXY_DEFAULT``, so this import stays off the
         sentinel's path; a test pins that the two agree. The refusal is the parse's fixed text,
         which names no part of the value; the base model also hides the input. A user or a password
-        passes here, as the parse allows a userinfo: the build of each inheriting connection
-        refuses it (vault BACKLOG #3007). The static-credential report lists a user and a password
-        together, which is what urllib would send, and not either one alone."""
+        in the URL is refused here too, naming this setting: the build of each inheriting connection
+        would refuse it anyway (vault BACKLOG #3007), and a value no connection inherits would
+        otherwise load with a credential written in it."""
         if value is None:
             return None
         proxy = value.strip()
@@ -5380,7 +5379,12 @@ class EgressSettings(_Section):
         # It is imported only when a site proxy URL is set.
         from messagefoundry.transports.proxy_address import parse_proxy_url
 
-        parse_proxy_url(proxy)
+        if parse_proxy_url(proxy).holds_credential:
+            raise ValueError(
+                "[egress].proxy_url holds a user or a password; refused, with no escape. Take it "
+                "out of the URL, and put proxy_user and proxy_password on each connection that "
+                "logs in to the proxy (secrets via env())"
+            )
         return value
 
     @field_validator("allowed_recipient_domains", mode="after")
