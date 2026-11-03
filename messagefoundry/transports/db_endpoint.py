@@ -8,8 +8,10 @@ The two dialects send the port by different routes. The SQL Server preset writes
 setting into ``SERVER={server},{port}``. The generic dialect writes ``SERVER={server}`` and never
 reads ``port``, so the only port it sends as a port is the ``PORT`` keyword in ``odbc_params``. An
 allowlist entry that pins a port means something only while the check reads the port the connection
-string sends, so :func:`database_dial_endpoint` reads it per dialect. What a driver does with that
-string is outside this module: docs/CONNECTIONS.md says so once.
+string sends, so :func:`database_dial_endpoint` reads it per dialect, and the preset refuses a
+driver name or a ``server`` that would not read its ``,port`` as the port
+(:func:`sqlserver_preset_refusal`). What a driver does with that string is outside this module:
+docs/CONNECTIONS.md says so once.
 
 A leaf module on purpose. :mod:`messagefoundry.transports.egress` and
 :mod:`messagefoundry.transports.database` both read it, and it imports neither, so neither has to
@@ -148,7 +150,10 @@ _PORT_KEYWORD_DRIVERS = ("postgres", "psqlodbc", "mysql", "mariadb")
 #: Words that mark a Microsoft SQL Server driver, which ignores ``PORT``. On the generic dialect
 #: they win over the words above, so a name holding both reads no port; the SQL Server preset
 #: refuses such a name (:func:`sqlserver_preset_refusal`).
-_SQLSERVER_DRIVER_WORDS = ("msodbcsql", "sql server")
+_SQLSERVER_DRIVER_WORDS = ("msodbcsql", "sql server", "sql native client")
+
+#: The driver the SQL Server preset names when ``odbc_driver`` is not set.
+SQLSERVER_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
 
 
 def _names_any(name: object, words: tuple[str, ...]) -> bool:
@@ -164,15 +169,10 @@ def _sqlserver_driver_name(name: object) -> bool:
     return _names_any(name, _SQLSERVER_DRIVER_WORDS)
 
 
-#: Words that mark the FreeTDS ODBC driver: its usual registered name, and its library,
-#: ``libtdsodbc``. FreeTDS reads ``SERVER=host,port`` as a SQL Server driver does: its ODBC
-#: ``parse_server`` takes a positive number after the last comma as the port, and looks the text
-#: before it up as one host. A ``\`` in ``server`` turns that off: the text after it, comma and
-#: port included, becomes an instance name, so the ``port`` setting is not sent as the port.
-_FREETDS_DRIVER_WORDS = ("freetds", "tdsodbc")
-
-#: The driver the SQL Server preset names when ``odbc_driver`` is not set.
-SQLSERVER_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
+def _preset_driver(name: object) -> bool:
+    """Whether the SQL Server preset accepts ``odbc_driver``, as written: a SQL Server word and
+    no word of a driver known to read ``PORT``."""
+    return _sqlserver_driver_name(name) and not _names_any(name, _PORT_KEYWORD_DRIVERS)
 
 
 def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
@@ -180,19 +180,14 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
     ``None`` (BACKLOG #4873). The connection-string build and the ``[egress].allowed_db`` check
     both call it, so ``messagefoundry check`` refuses what the build would.
 
-    The preset is only sound where the driver reads ``,port`` as the port and the text before it
-    as one host, which the ``port`` pin and the host match both assume. psqlODBC passes ``SERVER``
-    to libpq, which reads a comma as a host list, so ``db,6432`` there can name a second host the
-    check never sees. So the ``odbc_driver`` name must hold a SQL Server word
-    (:data:`_SQLSERVER_DRIVER_WORDS`) or a FreeTDS word (:data:`_FREETDS_DRIVER_WORDS`), and no
-    word of a driver known to read ``PORT`` (:data:`_PORT_KEYWORD_DRIVERS`): a mixed name is
-    refused, not read as SQL Server. The engine reads the name, not the library it loads.
-
-    ``server`` must hold no comma, since the preset adds its own ``,port``; and on FreeTDS no
-    ``\\``, which FreeTDS reads as an instance name in place of the port. Short, remedy first: a
-    stored failure keeps about its first 200 characters."""
-    driver = settings.get("odbc_driver", SQLSERVER_DEFAULT_DRIVER)
-    if not _preset_driver(driver):
+    The ``port`` pin and the host match both assume the driver reads ``,port`` as the port and
+    the text before it as one host. So the ``odbc_driver`` name must pass :func:`_preset_driver`:
+    a mixed name is refused, not read as SQL Server. ``server`` must hold no comma, since the
+    preset adds its own ``,port``, and no ``\\``, since a driver can read an instance name there
+    in place of the port. Why each is refused, and what a name cannot tell, is in
+    docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds*. Short, remedy first: a stored
+    failure keeps about its first 200 characters."""
+    if not _preset_driver(settings.get("odbc_driver", SQLSERVER_DEFAULT_DRIVER)):
         return (
             'name a SQL Server driver, or on Database or DatabasePoll use dialect="generic": the '
             "preset sends server,port, which another driver can read as a host list"
@@ -203,20 +198,12 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
             f"name one host in server and put the port in the port setting: server {server!r} "
             "holds a comma, and the SQL Server preset adds its own ,port"
         )
-    if "\\" in server and _names_any(driver, _FREETDS_DRIVER_WORDS):
+    if "\\" in server:
         return (
-            "name the host alone in server and set port to the instance's port: FreeTDS reads "
-            f"an instance name in server {server!r} in place of the port setting"
+            "name the host alone in server and set port to the instance's port: the preset "
+            f"sends the port, so the instance name in server {server!r} is not what is dialled"
         )
     return None
-
-
-def _preset_driver(name: object) -> bool:
-    """Whether the SQL Server preset accepts ``odbc_driver``, as written: it holds a SQL Server
-    or FreeTDS word and no word of a driver known to read ``PORT``."""
-    return not _names_any(name, _PORT_KEYWORD_DRIVERS) and (
-        _sqlserver_driver_name(name) or _names_any(name, _FREETDS_DRIVER_WORDS)
-    )
 
 
 def _reads_port_keyword(name: object) -> bool:
@@ -254,7 +241,7 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     engine knows reads ``PORT`` (:func:`_reads_port_keyword`, which says what a name cannot tell).
     The factory default, ``ODBC Driver 18 for SQL Server``, is one: the SQL Server drivers ignore
     ``PORT`` and dial their own default, and the generic dialect gives them no way to send a port,
-    so for a SQL Server name the remedy names the SQL Server preset.
+    so for a name the preset accepts the remedy names the SQL Server preset.
 
     The host is the whole ``server`` text on both dialects, as the check read it before this
     change, so an entry is matched on its host as written."""
@@ -306,7 +293,7 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     if not _reads_port_keyword(driver):
         # Point at the preset only for a name the preset accepts, so neither dialect's remedy
         # names the other for a mixed name that both refuse.
-        sqlserver = _sqlserver_driver_name(driver) and _preset_driver(driver)
+        sqlserver = _preset_driver(driver)
         return DialEndpoint(
             host,
             None,

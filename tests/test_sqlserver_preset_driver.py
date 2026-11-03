@@ -13,6 +13,7 @@ refuses what the build refuses. Nothing here opens a connection.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -20,6 +21,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.transports.database import DatabaseLookupExecutor, _build_dsn
 from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
@@ -37,7 +39,7 @@ STATEMENT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
 POLL = "SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id"
 DRIVER_REFUSAL = "name a SQL Server driver, or on Database or DatabasePoll use dialect"
 
-#: Not a SQL Server or FreeTDS name, or one that also holds the word of a driver that reads PORT.
+#: Not a SQL Server name, or one that also holds the word of a driver that reads PORT.
 REFUSED_DRIVERS = [
     "PostgreSQL Unicode",
     "PostgreSQL",
@@ -50,7 +52,9 @@ REFUSED_DRIVERS = [
     "PostgreSQL via SQL Server gateway",
     "MSODBCSQL-mariadb",
     "/opt/mysql-compat/libmsodbcsql-18.so",
-    "FreeTDS for PostgreSQL",
+    # FreeTDS: nothing shows it reads the preset's Encrypt and TrustServerCertificate keywords.
+    "FreeTDS",
+    "/usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so",
 ]
 
 ACCEPTED_DRIVERS = [
@@ -60,8 +64,7 @@ ACCEPTED_DRIVERS = [
     "SQL Server Native Client 11.0",
     "SQL Server",
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
-    "FreeTDS",
-    "/usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so",
+    "SQL Native Client",
 ]
 
 
@@ -124,7 +127,7 @@ def test_a_driver_that_is_not_a_sql_server_driver_is_refused_at_check(
 
 
 @pytest.mark.parametrize("driver", ACCEPTED_DRIVERS)
-def test_a_sql_server_or_freetds_driver_is_accepted(check: Check, driver: str) -> None:
+def test_a_sql_server_driver_is_accepted(check: Check, driver: str) -> None:
     assert f"SERVER={HOST},1433;" in _build_dsn(_preset(odbc_driver=driver))
     check(_preset(odbc_driver=driver), PINNED)
 
@@ -175,17 +178,36 @@ def test_a_server_holding_a_comma_is_refused(check: Check, server: str) -> None:
         check(_preset(server=server), EgressSettings(allowed_db=[server]))
 
 
-def test_freetds_with_an_instance_name_is_refused(check: Check) -> None:
-    # FreeTDS reads the text after a backslash, comma and port included, as an instance name, so
-    # the `port` setting is not what it dials.
+@pytest.mark.parametrize("driver", ["ODBC Driver 18 for SQL Server", "SQL Server"])
+def test_a_server_holding_an_instance_name_is_refused(check: Check, driver: str) -> None:
+    # The preset always sends a port, so an instance name is not what a Microsoft driver dials,
+    # and a driver that reads it in place of the port (FreeTDS, even under a SQL Server alias)
+    # dials a port the check never compared. An entry naming the whole server text matched it.
     server = f"{HOST}\\SQLEXPRESS"
-    for driver in ("FreeTDS", "libtdsodbc.so"):
-        with pytest.raises(ValueError, match="set port to the instance's port"):
-            _build_dsn(_preset(server=server, odbc_driver=driver))
-        with pytest.raises(WiringError, match="set port to the instance's port"):
-            check(_preset(server=server, odbc_driver=driver), EgressSettings(allowed_db=[server]))
-    # A Microsoft driver is unchanged.
-    check(_preset(server=server), EgressSettings(allowed_db=[server]))
+    with pytest.raises(ValueError, match="set port to the instance's port"):
+        _build_dsn(_preset(server=server, odbc_driver=driver))
+    with pytest.raises(WiringError, match="set port to the instance's port"):
+        check(_preset(server=server, odbc_driver=driver), EgressSettings(allowed_db=[server]))
+
+
+def test_the_refusal_comes_before_the_attested_weakened_tls_audit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A refused connection must leave no audit line saying its weakened hop was permitted. The
+    # line is written only on an enforcing posture; the control shows it is written there.
+    weakened = _preset(encrypt=False)
+    with caplog.at_level(logging.WARNING), active_hop_posture(HopPosture(enforcing=True)):
+        _build_dsn(weakened, attested=True)
+        assert "tls_hop_attested" in caplog.text
+        caplog.clear()
+        with pytest.raises(ValueError, match=DRIVER_REFUSAL):
+            _build_dsn({**weakened, "odbc_driver": "PostgreSQL Unicode"}, attested=True)
+    assert "tls_hop_attested" not in caplog.text
+
+
+def test_a_lookup_refusal_names_the_lookup() -> None:
+    with pytest.raises(ValueError, match="'LK_ACME'"):
+        DatabaseLookupExecutor({"LK_ACME": _preset(odbc_driver="PostgreSQL Unicode")}, egress=OPEN)
 
 
 # --- the refusal text ---------------------------------------------------------------------------

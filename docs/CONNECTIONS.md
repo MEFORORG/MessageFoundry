@@ -1696,7 +1696,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
-| `odbc_driver` | `ODBC Driver 18 for SQL Server` | the ODBC driver name. On the SQL Server preset it must name a SQL Server driver or FreeTDS, or the connection is refused (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
+| `odbc_driver` | `ODBC Driver 18 for SQL Server` | the ODBC driver name. On the SQL Server preset it must name a Microsoft SQL Server driver, or the connection is refused (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
@@ -1779,22 +1779,26 @@ dialects send it differently (vault BACKLOG #2704):
 driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `SERVER`, connects
 to its own default port, and the check cannot see that. Check that your driver reads the keyword.
 
-**On the `sqlserver` preset, the driver and `server` are refused** when the connection string is
-built and by the egress check, so `messagefoundry check` refuses them too (BACKLOG #4873). This
-holds for all four database factories, since `db_lookup` and `DatabaseRef` build the preset. The
-preset sends `SERVER=<server>,<port>`, which is sound only where the driver reads `,<port>` as the
-port and the text before it as one host. psqlODBC passes `SERVER` to libpq, which reads a comma as
-a list of hosts, so there a large `port` could name a second host the check never sees.
+**On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
+string is built and by the egress check, so `messagefoundry check` refuses them too (BACKLOG
+#4873). This holds for all four database factories, since `db_lookup` and `DatabaseRef` build the
+preset. The preset sends `SERVER=<server>,<port>`, and the port pin and the host match assume the
+driver reads `,<port>` as the port and the text before it as one host. psqlODBC does not: it passes
+`SERVER` to libpq, which reads a comma as a list of hosts. There the port would be read as a second
+host name, which can resolve as a numeric address, and a comma in `server` could name any host.
 
-- The `odbc_driver` name must hold `msodbcsql`, `sql server`, `freetds` or `tdsodbc`, in any case,
-  and none of `postgres`, `psqlodbc`, `mysql` or `mariadb`. So a mixed name such as
+- The `odbc_driver` name must hold `msodbcsql`, `sql server` or `sql native client`, in any case,
+  and none of `postgres`, `psqlodbc`, `mysql` or `mariadb`. A mixed name such as
   `PostgreSQL via SQL Server gateway` is refused. For a driver that is not SQL Server's, use
   `dialect="generic"` on `Database` or `DatabasePoll`; `db_lookup` and `DatabaseRef` take only a
-  SQL Server driver. FreeTDS is accepted because its ODBC driver reads a positive number after the
-  comma as the port and looks up the text before it as one host, as the Microsoft drivers do.
+  SQL Server driver.
+- FreeTDS is refused. Its ODBC driver reads `,<port>` as the port, but the preset's TLS keywords,
+  `Encrypt` and `TrustServerCertificate`, are the Microsoft drivers', and the engine has no
+  evidence that FreeTDS reads them. A hop the engine reports as verifying TLS could then not verify.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
-- On FreeTDS, `server` must hold no `\`. FreeTDS reads the text after it, comma and port included,
-  as an instance name, so the `port` setting is not the port it dials.
+- `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
+  the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
+  dial a port the check never compared. Set `port` to the instance's port.
 
 As on the generic dialect, the engine reads the driver name, not the library it loads.
 
@@ -1810,9 +1814,10 @@ An entry with no port admits its host at any port. On the generic dialect the eg
   from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
 - The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
   The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
-  unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
-  `PORT`, so use `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A
-  host-only entry still admits any driver.
+  unless it also holds a SQL Server word (`msodbcsql`, `sql server` or `sql native client`): those
+  mark a SQL Server driver, which ignores `PORT`. For a name the preset accepts, use
+  `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A host-only entry
+  still admits any driver.
 
 The check reads the driver **name** as written, an odbcinst alias or a library path included, and
 cannot see which library that name loads. A name that misdescribes its driver, such as a path

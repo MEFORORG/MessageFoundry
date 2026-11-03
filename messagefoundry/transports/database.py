@@ -235,6 +235,10 @@ def _build_dsn(
     reads it, it changes nothing. A statement guard is a shape test on text. The control that
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
+    # First, so a refused connection writes no attested-weakened-TLS audit line.
+    refusal = sqlserver_preset_refusal(s)
+    if refusal is not None:
+        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
@@ -265,9 +269,6 @@ def _build_dsn(
         raise ValueError(
             "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
         )
-    refusal = sqlserver_preset_refusal(s)
-    if refusal is not None:
-        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {refusal}")
     port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
     parts = [
         f"DRIVER={odbc_brace(str(s.get('odbc_driver', SQLSERVER_DEFAULT_DRIVER)))}",
@@ -3715,7 +3716,9 @@ class DatabaseLookupExecutor:
             attested = hop_attestation_from_settings(s)
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
-            self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
+            self._dsn[cname] = _build_dsn(
+                dict(s), read_only=True, attested=attested, connection=cname
+            )
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )
