@@ -11372,6 +11372,7 @@ def _restore(args: argparse.Namespace) -> int:
 
     from messagefoundry.pipeline.alerts import utc_or_unknown
     from messagefoundry.pipeline.dr_backup import restored_accounts_notice
+    from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 
     payload = {
         "archive": result.archive_path,
@@ -11379,6 +11380,9 @@ def _restore(args: argparse.Namespace) -> int:
         "archive_created_at": utc_or_unknown(result.archive_created_at),
         "last_audit_at": utc_or_unknown(result.last_audit_at),
         "sessions_revoked": result.sessions_revoked,
+        # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
+        # prints it.
+        "rollback_notice": RESTORE_ROLLBACK_NOTICE,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,

@@ -695,17 +695,24 @@ start.
 row is undone, and the engine does not re-apply any of it. Re-apply by hand at least these:
 
 - account creations, disables, enables and deletes;
+- account locks and unlocks;
 - role changes and custom roles;
-- password resets and password changes, self-service ones included;
-- MFA and passkey enrolments and removals, and recovery codes issued or used. A factor or passkey
-  removed after the archive is live again on the restored store;
+- password resets and password changes, self-service ones included: force a reset where the
+  user's own change cannot be replayed;
+- MFA and passkey enrolments and removals. A factor or passkey removed after the archive is live
+  again on the restored store;
+- recovery codes issued or used: reissue them;
+- federated sign-in (OIDC) bindings and unbindings;
 - notify-email changes;
 - channel scopes;
-- AD group-to-role and AD group-to-scope maps.
+- AD group-to-role and AD group-to-scope maps;
+- dual-control approval decisions.
 
-Read the source's audit log, or its off-host copy, for the changes themselves. The
-`store_restored` alert, the `restore` summary, its age refusal and the `--allow-old-archive` help
-all print this list.
+Messages received after the archive was taken are not in the restored store either. Read the
+source's audit log, or its off-host copy, for the changes themselves. The `restore` summary (its
+`rollback_notice` under `--json`), its age refusal, the `--allow-old-archive` help and the
+`store_restored` alert's log line and event print this list; the alert list in the web console
+keeps only the start of it.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,

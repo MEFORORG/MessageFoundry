@@ -14,6 +14,7 @@ restore section names every class it lists.
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import time
 from pathlib import Path
@@ -27,9 +28,12 @@ from messagefoundry.pipeline.dr_backup import (
     _refuse_an_old_archive,
     restored_accounts_notice,
 )
+from messagefoundry.redaction import safe_text
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_CLASSES, RESTORE_ROLLBACK_NOTICE
 
-_GUIDE = Path(__file__).resolve().parent.parent / "docs" / "EARLY-ADOPTER-GUIDE.md"
+_ROOT = Path(__file__).resolve().parent.parent
+_GUIDE = _ROOT / "docs" / "EARLY-ADOPTER-GUIDE.md"
+_LEAF = _ROOT / "messagefoundry" / "restore_notice.py"
 
 
 def _flat(text: str) -> str:
@@ -55,6 +59,10 @@ def test_the_statement_names_the_classes_the_old_notices_left_out() -> None:
         "custom role",
         "channel scope",
         "AD group",
+        "lock",
+        "OIDC",
+        "dual-control",
+        "Messages received",
     ):
         assert word in RESTORE_ROLLBACK_NOTICE, word
     # A floor, not a census: the restore replaces the whole store.
@@ -70,8 +78,11 @@ def test_the_alert_carries_the_statement() -> None:
         revoked=2,
     )
     assert RESTORE_ROLLBACK_NOTICE in detail
-    # The reason column keeps about the first 200 characters, so the age and the count lead.
-    assert detail.index("3.0 days old") < detail.index("2 session(s)") < 200
+    # The alert instance's reason column keeps what this bound keeps (the store's own call), so
+    # the age, the count and the instruction to re-apply must all survive it.
+    kept = safe_text(detail, limit=200)
+    assert "3.0 days old" in kept and "2 session(s)" in kept
+    assert "must be re-applied by hand" in kept
 
 
 def test_the_cli_summary_carries_the_statement() -> None:
@@ -95,7 +106,17 @@ def test_the_allow_old_archive_help_carries_the_statement() -> None:
     assert RESTORE_ROLLBACK_NOTICE in flag.help
 
 
-def test_the_guide_names_every_class() -> None:
+def test_the_guide_restore_section_names_every_class() -> None:
     guide = _flat(_GUIDE.read_text(encoding="utf-8"))
+    start = guide.index("**What a restore rolls back")
+    section = guide[start : guide.index("**`restore` refuses", start)]
     for cls in RESTORE_ROLLBACK_CLASSES:
-        assert cls in guide, cls
+        assert cls in section, cls
+
+
+def test_the_statement_is_a_leaf() -> None:
+    # The CLI builds its parser from it on every run, and the startup import budget that names it
+    # is advisory on 3.14, so an import added here is refused here.
+    tree = ast.parse(_LEAF.read_text(encoding="utf-8"))
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert [getattr(n, "module", None) for n in imports] == ["__future__"]

@@ -114,6 +114,7 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     assert payload["last_audit_at"].startswith("20") and payload["last_audit_at"].endswith("Z")
     assert len(payload["archive_sha256"]) == 64
     assert payload["sessions_revoked"] == 0
+    assert payload["rollback_notice"] == RESTORE_ROLLBACK_NOTICE  # BACKLOG #5094
 
 
 def test_an_archive_that_does_not_say_when_it_was_taken_is_refused() -> None:

@@ -235,22 +235,24 @@ def store_restored_detail(
     restored_at: float,
     revoked: int,
 ) -> str:
-    """The one-line description of a ``store_restored`` alert both sinks show (BACKLOG #2614).
-    A time in UTC, an age in days and a count: nothing read from a row's content.
+    """The description of a ``store_restored`` alert both sinks show (BACKLOG #2614). An age in
+    days, a count, the fixed :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE`
+    (BACKLOG #5094) and a time in UTC: nothing read from a row's content.
 
     The alert instance's reason column keeps only about the first 200 characters, and the store's
-    redaction turns the time in it into ``[redacted]``. So the age and the count lead, and the
-    line names the ``store_restored`` audit row, which carries the time whole. What to re-apply is
-    :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE`, whole (BACKLOG #5094)."""
+    redaction turns the time in it into ``[redacted]``. So the age, the count and the notice's
+    re-apply instruction come first, and the time comes last, naming the ``store_restored`` audit
+    row, which carries the time whole. The notice's list is whole only in the log line and the
+    event, not in that column."""
     age = (
         "of unknown age"
         if archive_created_at is None
         else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
     )
     return (
-        f"started on a store restored from an archive {age}; {revoked} session(s) revoked; "
-        f"its newest audit row is {utc_or_unknown(last_audit_at)} (also in the store_restored "
-        f"audit row). {RESTORE_ROLLBACK_NOTICE}"
+        f"started on a store restored from an archive {age}; {revoked} session(s) revoked. "
+        f"{RESTORE_ROLLBACK_NOTICE} The archive's newest audit row is "
+        f"{utc_or_unknown(last_audit_at)} (also in the store_restored audit row)."
     )
 
 
@@ -1029,8 +1031,8 @@ class AlertSink(Protocol):
         :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094).
 
         ``name`` is :data:`STORE_RESTORED_SUBJECT`. ``detail`` is built by
-        :func:`store_restored_detail`: a time, an age and a count, no PHI. ``last_audit_at`` is
-        that time on its own, as ISO 8601 UTC or ``unknown``, because the store's redaction turns
+        :func:`store_restored_detail`: an age, a count, fixed words and a time, no PHI.
+        ``last_audit_at`` is that time on its own, as ISO 8601 UTC or ``unknown``, because the store's redaction turns
         a date in the alert instance's reason column into ``[redacted]``; the event carries it
         whole. Raised once per restore, by the start that consumed the marker. Nothing resolves
         it automatically."""

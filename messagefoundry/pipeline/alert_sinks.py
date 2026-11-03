@@ -1703,7 +1703,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
         # BACKLOG #2614: the first start on a restored store revoked every session. The subject
         # stands in for "connection". `last_audit_at` rides whole because the reason column
-        # redacts a date; both are times, an age and a count, never a row's content.
+        # redacts a date; both are an age, a count, times and fixed words (BACKLOG #5094), never a
+        # row's content.
         self._emit(
             {
                 "type": "store_restored",
