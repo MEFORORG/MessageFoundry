@@ -5,7 +5,10 @@
 Each test fails on the PR's head before the repair: a typed attestation reason with a CR or LF, the
 anonymous-FTP guard's inbound read of the settings pair, a settings secret in a ``Source``,
 ``OutboundSigning`` or ``WindowsCredential`` validation error, and the ``check`` report marking an
-outbound hop the build refuses for its reason as one the engine crosses. Every value is synthetic.
+outbound hop the build refuses for its reason as one the engine crosses. A later repair added a
+test that a refused ``[egress].proxy_url`` credential leaves no urlsplit cache key (vault BACKLOG
+#3454). One strict xfail is not a repair: it holds a gap that was on ``main`` before this PR, and
+fails until that gap is fixed. Every value is synthetic.
 """
 
 from __future__ import annotations
@@ -388,13 +391,13 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
         built = {name for name, refused in outcomes.items() if not refused}
         assert "revocation-int-1" in built
         assert {"revocation-int-reason", "revocation-no-reason"} <= set(outcomes) - built
-    # The cleartext family on both sides too.
+    # The cleartext family (outbound only) on both build outcomes too.
     assert not outbound["cleartext-int-0"]
     assert outbound["cleartext-int-reason"]
 
 
 _LAX_FALSE_GAP = (
-    "pre-existing on main and owed by a separate row: a lax-false string flag ('false', 'no', "
+    "pre-existing on main, its row not yet filed: a lax-false string flag ('false', 'no', "
     "'off', '0') builds as False, but the settings mirror reads it as set, because "
     "_mirror_declarations tests the raw value by truthiness"
 )
@@ -427,7 +430,7 @@ def test_a_lax_false_string_flag_is_not_mirrored_as_set(extra: dict[str, Any]) -
             None,
             EgressSettings(),
         )
-    except ValueError:
+    except (ValueError, TypeError):
         return  # the string is refused, at construction or build: the gap is closed that way
     (key,) = extra
     assert not dest.settings.get(key)
