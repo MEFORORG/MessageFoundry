@@ -1780,8 +1780,10 @@ driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `
 to its own default port, and the check cannot see that. Check that your driver reads the keyword.
 
 **On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
-string is built and by the egress check (BACKLOG #4873). This holds for all four database
-factories, since `db_lookup` and `DatabaseRef` build the preset. When each runs:
+string is built and by the egress check (BACKLOG #4873). This holds for every factory that builds
+the preset, at least `Database`, `DatabasePoll`, `db_lookup` and `DatabaseRef`. The egress check
+reads the refusal only when `[egress].allowed_db` has an entry; under the audited opt-out with an
+empty list, the build alone refuses. When each runs:
 
 - For `Database`, `DatabasePoll` and `db_lookup`, both run when the engine starts or reloads, and
   in `messagefoundry check` where its build leg runs, with a `messagefoundry.toml` or
