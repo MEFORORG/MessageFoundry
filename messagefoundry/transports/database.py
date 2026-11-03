@@ -235,7 +235,8 @@ def _build_dsn(
     reads it, it changes nothing. A statement guard is a shape test on text. The control that
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
-    # First, so a refused connection writes no attested-weakened-TLS audit line.
+    # Before the attested-weakened-TLS audit line, so this refusal never follows one. The auth,
+    # server and port refusals below still run after that line.
     refusal = sqlserver_preset_refusal(s)
     if refusal is not None:
         raise ValueError(f"{hop_name_prefix(connection)}DATABASE {refusal}")

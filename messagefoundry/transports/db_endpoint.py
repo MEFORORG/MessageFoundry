@@ -166,24 +166,11 @@ _PRESET_DRIVER_NAMES = re.compile(
 
 #: The file name, in lower case, of the Microsoft ODBC Driver library, for an ``odbc_driver`` given
 #: as a path: ``libmsodbcsql-18.3.so.3.1`` on Linux, ``libmsodbcsql.18.dylib`` on macOS and
-#: ``msodbcsql18.dll`` on Windows. Only the file name is read; the directories are not. Case is
-#: folded because Windows and macOS look a library file up in any case.
+#: ``msodbcsql18.dll`` on Windows. Only the file name is read, in any case; the directories are
+#: not. docs/CONNECTIONS.md says what a name cannot tell about the library that loads.
 _PRESET_DRIVER_LIBRARIES = re.compile(
     r"libmsodbcsql[-.][0-9]+(?:\.[0-9]+)*\.(?:so|dylib)(?:\.[0-9]+)*|msodbcsql[0-9]+\.dll"
 )
-
-
-def _names_any(name: object, words: tuple[str, ...]) -> bool:
-    """Whether ``odbc_driver``, as written and folded as :func:`odbc_keyword_name` folds it, holds
-    any of ``words``: the word test the generic dialect's driver readings use."""
-    folded = odbc_keyword_name(str(name or ""))
-    return any(word in folded for word in words)
-
-
-def _sqlserver_driver_name(name: object) -> bool:
-    """Whether ``odbc_driver``, as written, names a SQL Server driver
-    (:data:`_SQLSERVER_DRIVER_WORDS`)."""
-    return _names_any(name, _SQLSERVER_DRIVER_WORDS)
 
 
 def _preset_driver(name: object) -> bool:
@@ -191,11 +178,10 @@ def _preset_driver(name: object) -> bool:
     :data:`_PRESET_DRIVER_NAMES`, or a path whose file name is in
     :data:`_PRESET_DRIVER_LIBRARIES`, in any case.
 
-    Blanks are NOT folded, unlike :func:`odbc_keyword_name`: the driver manager looks a name up as
-    written, so ``SQL  Server``, a tab or a trailing blank could name an alias registered under
-    that spelling. So the text must be ASCII, which refuses a no-break space, and printable, which
-    refuses a tab and the ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks. The strip
-    test is for a path: the file-name pattern does not see a blank that leads its directory."""
+    Blanks are NOT folded, unlike :func:`odbc_keyword_name` (docs/CONNECTIONS.md says why). The
+    text must be ASCII, which refuses a no-break space, and printable, which refuses a tab and the
+    ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks. The strip test is for a path:
+    the file-name pattern does not see a blank that leads its directory."""
     text = str(name or "")
     if not (text.isascii() and text.isprintable()) or text != text.strip():
         return False
@@ -223,13 +209,13 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
     server = str(settings.get("server", ""))
     if "," in server:
         return (
-            f"name one host in server and put the port in the port setting: server {server!r} "
-            "holds a comma, and the SQL Server preset adds its own ,port"
+            "name one host in server and put the port in the port setting: server holds a "
+            "comma, and the SQL Server preset adds its own ,port"
         )
     if "\\" in server:
         return (
             "name the host alone in server and set port to the instance's port: the preset "
-            f"sends the port, so the instance name in server {server!r} is not what is dialled"
+            "sends the port, so the instance name in server is not what is dialled"
         )
     return None
 
@@ -242,7 +228,10 @@ def _reads_port_keyword(name: object) -> bool:
     by its words like any name; which library it loads is not visible here. A name that misdescribes
     its driver, such as a path holding ``mysql`` to a library that ignores ``PORT``, is outside what
     this check can catch."""
-    return not _sqlserver_driver_name(name) and _names_any(name, _PORT_KEYWORD_DRIVERS)
+    folded = odbc_keyword_name(str(name or ""))
+    return not any(word in folded for word in _SQLSERVER_DRIVER_WORDS) and any(
+        word in folded for word in _PORT_KEYWORD_DRIVERS
+    )
 
 
 def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> DialEndpoint:
