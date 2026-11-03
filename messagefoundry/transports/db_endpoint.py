@@ -8,10 +8,9 @@ The two dialects send the port by different routes. The SQL Server preset writes
 setting into ``SERVER={server},{port}``. The generic dialect writes ``SERVER={server}`` and never
 reads ``port``, so the only port it sends as a port is the ``PORT`` keyword in ``odbc_params``. An
 allowlist entry that pins a port means something only while the check reads the port the connection
-string sends, so :func:`database_dial_endpoint` reads it per dialect, and the preset refuses a
-driver name or a ``server`` that would not read its ``,port`` as the port
-(:func:`sqlserver_preset_refusal`). What a driver does with that string is outside this module:
-docs/CONNECTIONS.md says so once.
+string sends, so :func:`database_dial_endpoint` reads it per dialect, and the preset refuses some
+driver names and ``server`` values (:func:`sqlserver_preset_refusal`). What a driver does with
+that string is outside this module: docs/CONNECTIONS.md says so once.
 
 A leaf module on purpose. :mod:`messagefoundry.transports.egress` and
 :mod:`messagefoundry.transports.database` both read it, and it imports neither, so neither has to
@@ -156,22 +155,21 @@ _SQLSERVER_DRIVER_WORDS = ("msodbcsql", "sql server")
 #: The driver the SQL Server preset names when ``odbc_driver`` is not set.
 SQLSERVER_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
 
-#: The ``odbc_driver`` names the SQL Server preset accepts, whole, folded as
-#: :func:`odbc_keyword_name` folds them: Microsoft's registered names for its ODBC Driver and its
-#: SQL Server Native Client, which read ``SERVER=host,port`` and the preset's ``Encrypt`` and
-#: ``TrustServerCertificate`` keywords. Whole names on purpose, as the password escape list in
-#: :mod:`messagefoundry.transports.database` reads them: a vendor name that merely mentions SQL
-#: Server, the bare legacy ``SQL Server`` (on Linux commonly a FreeTDS alias), and a mixed name
-#: are not known to read those keywords (BACKLOG #4873).
+#: The ``odbc_driver`` names the SQL Server preset accepts, whole, in lower case and spelled with
+#: single spaces: Microsoft's registered names for its ODBC Driver (``13.1`` included) and its SQL
+#: Server Native Client. Whole names on purpose, as the password escape list in
+#: :mod:`messagefoundry.transports.database` reads them. Why another name is refused is in
+#: docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds* (BACKLOG #4873).
 _PRESET_DRIVER_NAMES = re.compile(
-    r"odbc driver [0-9]+ for sql server|sql server native client [0-9]+(?:\.[0-9]+)?"
+    r"odbc driver [0-9]+(?:\.[0-9]+)? for sql server|sql server native client [0-9]+(?:\.[0-9]+)?"
 )
 
-#: The file name, folded, of the Microsoft ODBC Driver library, for an ``odbc_driver`` given as a
-#: path: ``libmsodbcsql-18.3.so.3.1`` on Linux, ``libmsodbcsql.18.dylib`` on macOS and
-#: ``msodbcsql18.dll`` on Windows. Only the file name is read; the directories are not.
+#: The file name, in lower case, of the Microsoft ODBC Driver library, for an ``odbc_driver`` given
+#: as a path: ``libmsodbcsql-18.3.so.3.1`` on Linux, ``libmsodbcsql.18.dylib`` on macOS and
+#: ``msodbcsql18.dll`` on Windows. Only the file name is read; the directories are not. Case is
+#: folded because Windows and macOS look a library file up in any case.
 _PRESET_DRIVER_LIBRARIES = re.compile(
-    r"libmsodbcsql[-.][0-9][0-9.]*(?:so|dylib)(?:\.[0-9][0-9.]*)?|msodbcsql[0-9]+\.dll"
+    r"libmsodbcsql[-.][0-9]+(?:\.[0-9]+)*\.(?:so|dylib)(?:\.[0-9]+)*|msodbcsql[0-9]+\.dll"
 )
 
 
@@ -191,15 +189,20 @@ def _sqlserver_driver_name(name: object) -> bool:
 def _preset_driver(name: object) -> bool:
     """Whether the SQL Server preset accepts ``odbc_driver``, as written: a whole name in
     :data:`_PRESET_DRIVER_NAMES`, or a path whose file name is in
-    :data:`_PRESET_DRIVER_LIBRARIES`. ASCII only, since the fold reads a no-break space as a space
-    and the driver manager does not."""
+    :data:`_PRESET_DRIVER_LIBRARIES`, in any case.
+
+    Blanks are NOT folded, unlike :func:`odbc_keyword_name`: the driver manager looks a name up as
+    written, so ``SQL  Server``, a tab or a trailing blank could name an alias registered under
+    that spelling. So the text must be ASCII, which refuses a no-break space, and printable, which
+    refuses a tab and the ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks. The strip
+    test is for a path: the file-name pattern does not see a blank that leads its directory."""
     text = str(name or "")
-    if not text.isascii():
+    if not (text.isascii() and text.isprintable()) or text != text.strip():
         return False
-    folded = odbc_keyword_name(text)
+    lowered = text.lower()
     return bool(
-        _PRESET_DRIVER_NAMES.fullmatch(folded)
-        or _PRESET_DRIVER_LIBRARIES.fullmatch(re.split(r"[\\/]", folded)[-1])
+        _PRESET_DRIVER_NAMES.fullmatch(lowered)
+        or _PRESET_DRIVER_LIBRARIES.fullmatch(re.split(r"[\\/]", lowered)[-1])
     )
 
 
@@ -208,11 +211,8 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
     ``None`` (BACKLOG #4873). The connection-string build and the ``[egress].allowed_db`` check
     both call it, so the egress check refuses what the build would.
 
-    The ``port`` pin and the host match both assume the driver reads ``,port`` as the port and
-    the text before it as one host. So the ``odbc_driver`` name must pass :func:`_preset_driver`:
-    any other name is refused. ``server`` must hold no comma, since the
-    preset adds its own ``,port``, and no ``\\``, since a driver can read an instance name there
-    in place of the port. Why each is refused, and what a name cannot tell, is in
+    It refuses an ``odbc_driver`` that fails :func:`_preset_driver`, and a ``server`` holding a
+    comma or a ``\\``. Why each is refused, and what a name cannot tell, is stated once in
     docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds*. Short, remedy first: a stored
     failure keeps about its first 200 characters."""
     if not _preset_driver(settings.get("odbc_driver", SQLSERVER_DEFAULT_DRIVER)):

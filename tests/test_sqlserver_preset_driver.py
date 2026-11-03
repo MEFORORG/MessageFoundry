@@ -30,6 +30,7 @@ from messagefoundry.transports.egress import (
     check_lookup_allowed,
     check_source_allowed,
 )
+from tests._phi_log_capture import filtered_sink
 
 HOST = "db.test.invalid"
 HOST_ONLY = EgressSettings(allowed_db=[HOST])
@@ -61,14 +62,26 @@ REFUSED_DRIVERS = [
     "DataDirect 8.0 SQL Server Wire Protocol",
     "Devart ODBC Driver for SQL Server",
     "SQL Native Client",
-    # A no-break space folds to a space, but the driver manager reads it as written.
+    # Blanks are read as written, as the driver manager reads them: a doubled space, a tab, a
+    # no-break space, a str.split separator or a blank at either end could name another alias.
+    "ODBC Driver 18 for SQL  Server",
+    "ODBC Driver 18 for SQL\tServer",
     "ODBC Driver 18 for SQL\u00a0Server",
+    *(f"ODBC Driver 18 for SQL{sep}Server" for sep in "\x1c\x1d\x1e\x1f"),
+    " ODBC Driver 18 for SQL Server",
+    "ODBC Driver 18 for SQL Server ",
+    "ODBC Driver 18 for SQL Server\n",
+    "ODBC Driver 18. for SQL Server",
+    # A library file name needs its dot before the extension.
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18so",
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18..so",
 ]
 
 ACCEPTED_DRIVERS = [
     "ODBC Driver 18 for SQL Server",
     "ODBC Driver 17 for SQL Server",
-    "odbc driver 18 for sql  server",
+    "odbc driver 18 for sql server",
+    "ODBC Driver 13.1 for SQL Server",
     "SQL Server Native Client 11.0",
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1",
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
@@ -76,6 +89,8 @@ ACCEPTED_DRIVERS = [
     "/opt/mysql-compat/libmsodbcsql-18.so",
     "/opt/homebrew/lib/libmsodbcsql.18.dylib",
     r"C:\Windows\System32\msodbcsql18.dll",
+    # Case is folded on a path too: Windows and macOS look a library file up in any case.
+    r"C:\WINDOWS\SYSTEM32\MSODBCSQL18.DLL",
 ]
 
 
@@ -221,6 +236,29 @@ def test_the_refusal_comes_before_the_attested_weakened_tls_audit(
 def test_a_lookup_refusal_names_the_lookup() -> None:
     with pytest.raises(ValueError, match="'db_lookup:LK_ACME'"):
         DatabaseLookupExecutor({"LK_ACME": _preset(odbc_driver="PostgreSQL Unicode")}, egress=OPEN)
+
+
+def _logged_refusal(name: str) -> str:
+    """The lookup refusal for ``name`` as the engine's log handlers emit it, scrubs applied."""
+    with pytest.raises(ValueError) as raised:
+        DatabaseLookupExecutor({name: _preset(odbc_driver="PostgreSQL Unicode")}, egress=OPEN)
+    logger_name = "test_sqlserver_preset_driver.scrub"
+    with filtered_sink(logger_name) as sink:
+        logging.getLogger(logger_name).warning("%s", raised.value)
+    return sink.text
+
+
+@pytest.mark.parametrize("name", ["LK_ACME", "LK_PASSWORD", "LK_TOKEN", "ACME_LAB", "Lk-Secret"])
+def test_the_log_scrubs_keep_a_lookup_name_inside_the_name_pattern(name: str) -> None:
+    # The refusal names its lookup as 'db_lookup:<name>'; the credential and name-run scrubs must
+    # leave a name the connection-name pattern admits whole.
+    assert f"'db_lookup:{name}';" in _logged_refusal(name)
+
+
+def test_the_log_scrubs_can_blank_a_lookup_name_outside_the_name_pattern() -> None:
+    # The control for the test above: the scrubs do run on this line. add_lookup does not hold a
+    # lookup name to the connection-name pattern, so a two-word name is read as a person's name.
+    assert "'db_lookup:[redacted]';" in _logged_refusal("Acme Lab")
 
 
 # --- the refusal text ---------------------------------------------------------------------------
