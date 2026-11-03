@@ -1322,11 +1322,12 @@ _SESSION_RESEAL: Final = (
 GLOBAL_SESSION_EPOCH_SQL: Final = "(SELECT epoch FROM global_session_epoch WHERE id = 1)"
 #: The head of every user reader, on every backend: the row, and the global epoch beside it.
 USER_READ_SQL: Final = f"SELECT *, {GLOBAL_SESSION_EPOCH_SQL} AS global_session_epoch FROM users"
-#: Raised, and the revoke rolled back, when the raise of the global epoch matched no row. Each
-#: schema seeds the row; without it no session could be ended this way, so the revoke refuses.
+#: Raised by every read or raise of the global epoch that finds no row, so a sign-in, a session
+#: check and an every-account revoke all refuse the same way; a revoke rolls back. Each schema
+#: seeds the row.
 GLOBAL_SESSION_EPOCH_MISSING: Final = (
-    "the store's global_session_epoch row is missing, so the every-account session revoke cannot"
-    " end every session; nothing was revoked"
+    "the store's global_session_epoch row is missing, so no session can be stamped or checked and"
+    " the every-account session revoke cannot end every session"
 )
 
 
@@ -2100,7 +2101,7 @@ class UserRecord:
             session_epoch=int(d["session_epoch"]),
             # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
             # mapping without the global epoch fails here rather than decode one nobody read.
-            global_session_epoch=int(d["global_session_epoch"]),
+            global_session_epoch=_global_epoch_of(d),
             row=UserRow.from_mapping(d),
         )
 
@@ -2546,6 +2547,14 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
                 continue
             parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
+
+
+def _global_epoch_of(d: Mapping[str, Any]) -> int:
+    """The global epoch a user read selected beside the row, refusing a store with no row."""
+    value = d["global_session_epoch"]
+    if value is None:
+        raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
+    return int(value)
 
 
 def session_epochs_current(session: SessionRecord, *, user_epoch: int, global_epoch: int) -> bool:

@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.store import GLOBAL_SESSION_EPOCH_SQL
 
 _HASH = "a" * 64
 _OTHER = "b" * 64
@@ -122,6 +123,10 @@ _LIVE_SESSION = (
 )
 
 
+#: The global session epoch read (BACKLOG #5091), which the fakes answer with epoch 0.
+_GLOBAL_EPOCH_READ = f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"
+
+
 def _reads_session_row(sql: str) -> bool:
     return sql.startswith("SELECT * FROM sessions")
 
@@ -145,7 +150,7 @@ class _MssqlCursor:
     async def fetchall(self) -> list[Any]:
         if _reads_session_row(self._last):
             return [_LIVE_SESSION]
-        if self._last.startswith("SELECT session_epoch"):
+        if self._last.startswith(("SELECT session_epoch", _GLOBAL_EPOCH_READ)):
             return [(0,)]
         return self._other_rows()
 
@@ -357,7 +362,7 @@ class _PgConn:
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         self._seen.append((sql, args))
-        return None
+        return 0 if sql.startswith(_GLOBAL_EPOCH_READ) else None
 
     def transaction(self) -> Any:
         @asynccontextmanager

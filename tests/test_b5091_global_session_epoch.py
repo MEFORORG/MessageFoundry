@@ -90,6 +90,9 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
     # --- the revoke raised the global epoch, and the kept session carries the new one ----------
     carol_after = await store.get_user(carol)
     assert carol_after is not None and carol_after.global_session_epoch == epoch + 1
+    # The account loop still raises each account it read: the backstop if the unsealed global
+    # row is ever lowered, which nothing else here would notice going missing.
+    assert carol_after.session_epoch == carol_before.session_epoch + 1
     survivor = await store.get_session(hash_token(kept))
     assert survivor is not None and survivor.global_epoch == epoch + 1
     assert session_seal_ok(sealer, survivor)
@@ -104,25 +107,28 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
     assert session_seal_ok(sealer, replayed)  # the old seal holds...
     assert restored is not None and replayed.user_epoch == restored.session_epoch  # ...so does
     assert replayed.global_epoch != restored.global_session_epoch  # ...all but the global epoch
-    assert await service.list_sessions(carol) == []
-    assert await service.identity_for_token(missed) is None
+    assert await service.identity_for_token(missed) is None  # the gate, before anything ends it
     fresh = await _mint(store, carol)
     assert await service.identity_for_token(fresh) is not None  # control: the account verifies
 
     # --- and so does one of an account whose record verifies again after the revoke ------------
     await _put_back_account(raw, erin_before.row)
     await _put_back_session(raw, failing, failing_before.seal)
+    assert await service.list_sessions(erin) == []  # the session list, before the gate ends it
     later = await _mint(store, erin)
     assert await service.identity_for_token(later) is not None  # control: the record verifies
+    assert [r.token_hash for r in await service.list_sessions(erin)] == [hash_token(later)]
     assert await service.identity_for_token(failing) is None
 
 
 async def assert_revoke_all_races_sign_ins(
     store: Any, *, rounds: int = 3, accounts: int = 6
 ) -> None:
-    """A revoke of every account racing sign-ins finishes, and every session minted in the race
-    either ended or carries the global epoch the revoke left. A lock-order cycle between the two
-    would surface here as the server's deadlock error, raised out of the gather."""
+    """A revoke of every account racing sign-ins finishes, and no sign-in in the race is minted
+    dead: an unrevoked session stamped with its account's current epoch carries the current
+    global epoch too, and resolves. A sign-in that waited behind the revoke and read the two
+    epochs from different moments would break that. A lock-order cycle would surface here as the
+    server's deadlock error, raised out of the gather."""
     service = AuthService(store, AuthSettings())
     run = uuid.uuid4().hex[:8]
     ids = [f"b5091-r{n}-{run}" for n in range(accounts)]
@@ -132,14 +138,13 @@ async def assert_revoke_all_races_sign_ins(
         results = await asyncio.gather(
             store.revoke_all_sessions(), *(_mint(store, user_id) for user_id in ids)
         )
-        tokens = [str(t) for t in results[1:]]
-        current = await store.get_user(ids[0])
-        assert current is not None
-        for token in tokens:
+        for user_id, token in zip(ids, (str(t) for t in results[1:]), strict=True):
             row = await store.get_session(hash_token(token))
-            assert row is not None
-            if await service.identity_for_token(token) is not None:
-                assert row.global_epoch == current.global_session_epoch
+            account = await store.get_user(user_id)
+            assert row is not None and account is not None
+            if row.revoked_at is None and row.user_epoch == account.session_epoch:
+                assert row.global_epoch == account.global_session_epoch
+                assert await service.identity_for_token(token) is not None
 
 
 @pytest.fixture
@@ -179,10 +184,15 @@ async def test_the_revoke_refuses_a_store_with_no_global_epoch_row(
         await store.revoke_all_sessions()
     row = await store.get_session(hash_token(token))
     assert row is not None and row.revoked_at is None  # rolled back: nothing was revoked
+    with pytest.raises(RuntimeError, match="global_session_epoch row is missing"):
+        await store.get_user("b5091-gone")  # a user read refuses by the same name
 
 
-async def test_a_reopen_seeds_the_global_epoch_row_again(tmp_path: Path) -> None:
-    """The schema seeds the row on every open, and keeps a raised value."""
+async def test_a_reopen_keeps_a_raised_global_epoch_and_seeds_a_missing_row(
+    tmp_path: Path,
+) -> None:
+    """The schema's seed keeps a raised value, and an open after the row was deleted seeds it
+    again, so the revoke works there."""
     path = tmp_path / "seed.db"
     store = await MessageStore.open(path)
     try:
@@ -195,6 +205,16 @@ async def test_a_reopen_seeds_the_global_epoch_row_again(tmp_path: Path) -> None
         await _user(store, "b5091-seed")
         user = await store.get_user("b5091-seed")
         assert user is not None and user.global_session_epoch == 2
+    finally:
+        await store.close()
+    await _sqlite_raw(path)("DELETE FROM global_session_epoch", ())
+    store = await MessageStore.open(path)
+    try:
+        user = await store.get_user("b5091-seed")
+        assert user is not None and user.global_session_epoch == 0  # seeded again
+        await store.revoke_all_sessions()
+        user = await store.get_user("b5091-seed")
+        assert user is not None and user.global_session_epoch == 1
     finally:
         await store.close()
 

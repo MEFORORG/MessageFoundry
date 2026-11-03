@@ -13935,6 +13935,8 @@ class SqlServerStore:
         transaction."""
         await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         rows = await cur.fetchall()
+        if not rows or rows[0][0] is None:
+            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         return int(rows[0][0])
 
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
@@ -15220,18 +15222,17 @@ class SqlServerStore:
             try:
                 # An unguarded sign-in takes a shared lock held to the commit (HOLDLOCK): it still
                 # waits behind a revoke's users UPDATE, and parallel sign-ins of one account do not
-                # wait on each other. The global epoch rides the same read with no hint of its own
-                # (BACKLOG #5091); revoke_all_sessions says why that read cannot close a cycle.
+                # wait on each other.
                 if require_federated_subject is None:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch,"
-                        f" {GLOBAL_SESSION_EPOCH_SQL} FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
+                        " WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
                         (user_id,),
                     )
                 else:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch,"
-                        f" {GLOBAL_SESSION_EPOCH_SQL} FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
+                        " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (user_id,),
                     )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
@@ -15252,7 +15253,10 @@ class SqlServerStore:
                     auth_mechanism=auth_mechanism,
                     idp_auth_time=idp_auth_time,
                     user_epoch=0 if not rows else int(rows[0][2]),
-                    global_epoch=0 if not rows else int(rows[0][3]),
+                    # BACKLOG #5091: its own statement, after the row lock, for the reason
+                    # postgres.py's create_session gives; revoke_all_sessions says why it cannot
+                    # close a cycle.
+                    global_epoch=await self._global_session_epoch(cur),
                 )
                 record = seal_session(self._row_sealer, record)
                 await cur.execute(_SESSION_INSERT, session_insert_params(record))

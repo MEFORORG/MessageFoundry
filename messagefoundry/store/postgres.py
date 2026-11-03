@@ -10510,22 +10510,16 @@ class PostgresStore:
         # An unguarded sign-in takes FOR SHARE: it still waits behind a revoke's users UPDATE, and
         # parallel sign-ins of one account do not wait on each other.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            # The global epoch rides the same read (BACKLOG #5091). The lock clause covers only
-            # `users`, so it is a plain read: under any isolation it is a value some commit left,
-            # and a revoke still running has left none, so this session ends when that revoke
-            # commits. revoke_all_sessions says why that read never waits.
             if require_federated_subject is None:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch,"
-                    f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=$1"
-                    " FOR SHARE OF users",
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
+                    " FOR SHARE",
                     user_id,
                 )
             else:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch,"
-                    f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=$1"
-                    " FOR UPDATE OF users",
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
+                    " FOR UPDATE",
                     user_id,
                 )
             if require_federated_subject is not None:
@@ -10542,7 +10536,11 @@ class PostgresStore:
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
-                global_epoch=0 if row is None else int(row["global_epoch"]),
+                # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
+                # behind a revoke reads that revoke's global epoch beside its account epoch. A
+                # subquery in the locked read would keep its pre-wait snapshot, and the session
+                # would be minted dead. revoke_all_sessions says why this read never waits.
+                global_epoch=await self._global_session_epoch(conn),
             )
             record = seal_session(self._row_sealer, record)
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
@@ -10573,7 +10571,10 @@ class PostgresStore:
 
     async def _global_session_epoch(self, conn: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
-        return int(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
+        value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        if value is None:
+            raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
+        return int(value)
 
     async def _session_epoch(self, conn: Any, user_id: str) -> int:
         """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""

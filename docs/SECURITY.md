@@ -4717,15 +4717,17 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `tests/test_b5091_global_session_epoch.py` replays the first and third cases on each store,
   the Postgres leg also runs a sign-in that commits inside a revoke, and both server legs run a
   revoke racing sign-ins. The SQL Server store raises the global epoch last, after its sweep, for
-  the lock-order reason its `revoke_all_sessions` states. That reasoning was read from the code,
-  and the only test of it is that race. The global row is not sealed, so whoever can write the database
-  could lower it and revive a session that only the global epoch had ended.
-  **The exception,** for every sweep this bullet names: a request from a missed session,
-  accepted just before the sweep commits, waits for it and then stamps the session with the
-  account's new epoch, so it stays usable. Against the every-account revoke, that request must be
-  a second every-account revoke, which needs `users:manage` and a step-up, because only that
-  revoke stamps the global epoch. A request to end the user's own other sessions stamps the
-  account's epoch alone, so the session still ends.
+  the lock-order reason its `revoke_all_sessions` states: a cycle on a database running without
+  `READ_COMMITTED_SNAPSHOT`. That reasoning was read from the code and has not been run, because
+  the CI database runs with `READ_COMMITTED_SNAPSHOT` on, where the race cannot form that cycle.
+  The global row is not sealed, so whoever can write the database could lower it and revive a
+  session that only the global epoch had ended.
+  **The exception,** for every sweep this bullet names: a request from a missed session to end
+  the user's other sessions, accepted just before the sweep commits, waits for it and then stamps
+  the session with the account's new epoch, so it stays usable. Against the every-account revoke
+  that request stamps the account's epoch alone, so the session still ends. There the only
+  request that keeps a missed session is a second every-account revoke, which needs
+  `users:manage` and a step-up, because only that revoke stamps the global epoch.
   **At least three things are also wrong about a refused one.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. The report is rate-limited per session, and the alert goes through the alert notifier's
