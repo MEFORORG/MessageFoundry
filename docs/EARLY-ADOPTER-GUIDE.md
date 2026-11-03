@@ -691,8 +691,9 @@ its age and the time of its newest audit row, and raises a `store_restored` aler
 in again. Other commands that open the store, such as `provision-admin`, leave the marker for that
 start.
 
-**What a restore rolls back (BACKLOG #5094).** Every change made after the archive's newest audit
-row is undone, and the engine does not re-apply any of it. Re-apply by hand at least these:
+**What a restore rolls back (BACKLOG #5094).** A restore undoes every change made to the store
+after the archive's newest audit row, and the engine does not re-apply any of it. Re-apply by hand
+at least these, and re-apply the removals before users can reach the restored engine:
 
 - account creations, disables, enables and deletes;
 - account locks and unlocks;
@@ -706,13 +707,15 @@ row is undone, and the engine does not re-apply any of it. Re-apply by hand at l
 - notify-email changes;
 - channel scopes;
 - AD group-to-role and AD group-to-scope maps;
-- dual-control approval decisions.
+- dual-control approval decisions: a request decided after the archive is pending again, so
+  reject it rather than approve it a second time.
 
-Messages received after the archive was taken are not in the restored store either. Read the
-source's audit log, or its off-host copy, for the changes themselves. The `restore` summary (its
-`rollback_notice` under `--json`), its age refusal, the `--allow-old-archive` help and the
-`store_restored` alert's log line and event print this list; the alert list in the web console
-keeps only the start of it.
+Messages received after the archive was taken, later reference-set syncs and later transform state
+are not in a restored store either. Read the source's audit log, or its off-host copy, for the
+changes themselves. The `restore` summary (its `rollback_notice` under `--json`), its age refusal,
+the `--allow-old-archive` help and the full `store_restored` alert print this list. The alert's
+reason in the web console keeps only about its first 200 characters, which say to re-apply and
+point here.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,

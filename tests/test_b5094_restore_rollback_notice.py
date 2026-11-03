@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 import re
 import time
 from pathlib import Path
@@ -22,14 +23,14 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import _build_parser
-from messagefoundry.pipeline.alerts import store_restored_detail
+from messagefoundry.pipeline.alerts import STORE_RESTORED_SUBJECT, store_restored_detail
 from messagefoundry.pipeline.dr_backup import (
     BackupError,
     _refuse_an_old_archive,
     restored_accounts_notice,
 )
-from messagefoundry.redaction import safe_text
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_CLASSES, RESTORE_ROLLBACK_NOTICE
+from messagefoundry.store.store import MessageStore
 
 _ROOT = Path(__file__).resolve().parent.parent
 _GUIDE = _ROOT / "docs" / "EARLY-ADOPTER-GUIDE.md"
@@ -63,6 +64,8 @@ def test_the_statement_names_the_classes_the_old_notices_left_out() -> None:
         "OIDC",
         "dual-control",
         "Messages received",
+        "reject it",
+        "before users can reach",
     ):
         assert word in RESTORE_ROLLBACK_NOTICE, word
     # A floor, not a census: the restore replaces the whole store.
@@ -78,11 +81,42 @@ def test_the_alert_carries_the_statement() -> None:
         revoked=2,
     )
     assert RESTORE_ROLLBACK_NOTICE in detail
-    # The alert instance's reason column keeps what this bound keeps (the store's own call), so
-    # the age, the count and the instruction to re-apply must all survive it.
-    kept = safe_text(detail, limit=200)
-    assert "3.0 days old" in kept and "2 session(s)" in kept
-    assert "must be re-applied by hand" in kept
+    assert "3.0 days old" in detail and "2 session(s)" in detail
+
+
+@pytest.mark.parametrize(
+    ("created", "revoked"), [(1_000_000.0, 2), (None, 999_999)], ids=["short", "longest-lead"]
+)
+def test_the_stored_alert_reason_keeps_the_instruction(
+    tmp_path: Path, created: float | None, revoked: int
+) -> None:
+    """The alert instance's reason column keeps only the start of the detail: written and read
+    back through the store, the instruction and the pointer to the whole list must survive."""
+    detail = store_restored_detail(
+        archive_created_at=created,
+        last_audit_at=999_000.0,
+        restored_at=1_300_000.0,
+        revoked=revoked,
+    )
+
+    async def _kept() -> str | None:
+        store = await MessageStore.open(tmp_path / "msg.db")
+        try:
+            await store.upsert_alert_instance(
+                event_type="store_restored",
+                connection=STORE_RESTORED_SUBJECT,
+                severity="warning",
+                reason=detail,
+            )
+            (row,) = await store.list_active_alert_instances(allowed_channels=None)
+            return row.reason
+        finally:
+            await store.close()
+
+    kept = asyncio.run(_kept())
+    assert kept is not None and len(kept) < len(detail)  # control: the column did cut it
+    assert "Re-apply by hand what this restore undid" in kept
+    assert "EARLY-ADOPTER-GUIDE.md" in kept
 
 
 def test_the_cli_summary_carries_the_statement() -> None:
@@ -104,6 +138,8 @@ def test_the_allow_old_archive_help_carries_the_statement() -> None:
     flag = next(a for a in restore._actions if "--allow-old-archive" in a.option_strings)
     assert flag.help is not None
     assert RESTORE_ROLLBACK_NOTICE in flag.help
+    # argparse %-formats help when it renders it, so a "%" in the notice would break --help.
+    assert "must be re-applied by hand" in _flat(restore.format_help())
 
 
 def test_the_guide_restore_section_names_every_class() -> None:

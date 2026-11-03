@@ -228,6 +228,14 @@ def utc_or_unknown(ts: float | None) -> str:
         return "unknown"
 
 
+#: What the alert instance's reason column must keep of a ``store_restored`` detail: the
+#: instruction, and where the whole list is (BACKLOG #5094).
+_STORE_RESTORED_LEAD = (
+    "Re-apply by hand what this restore undid; the whole list is in the full alert and in the "
+    "restore section of EARLY-ADOPTER-GUIDE.md."
+)
+
+
 def store_restored_detail(
     *,
     archive_created_at: float | None,
@@ -235,23 +243,23 @@ def store_restored_detail(
     restored_at: float,
     revoked: int,
 ) -> str:
-    """The description of a ``store_restored`` alert both sinks show (BACKLOG #2614). An age in
-    days, a count, the fixed :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE`
-    (BACKLOG #5094) and a time in UTC: nothing read from a row's content.
+    """The description of a ``store_restored`` alert both sinks show (BACKLOG #2614). Fixed
+    words, an age in days, a count, the fixed
+    :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094) and a time in
+    UTC: nothing read from a row's content.
 
     The alert instance's reason column keeps only about the first 200 characters, and the store's
-    redaction turns the time in it into ``[redacted]``. So the age, the count and the notice's
-    re-apply instruction come first, and the time comes last, naming the ``store_restored`` audit
-    row, which carries the time whole. The notice's list is whole only in the log line and the
-    event, not in that column."""
+    redaction turns the time in it into ``[redacted]``. So a short fixed instruction leads, with
+    where to read the whole list, whatever the age and count words grow to; the time comes last,
+    naming the ``store_restored`` audit row, which carries it whole."""
     age = (
         "of unknown age"
         if archive_created_at is None
         else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
     )
     return (
-        f"started on a store restored from an archive {age}; {revoked} session(s) revoked. "
-        f"{RESTORE_ROLLBACK_NOTICE} The archive's newest audit row is "
+        f"{_STORE_RESTORED_LEAD} Started on a store restored from an archive {age}; {revoked} "
+        f"session(s) revoked. {RESTORE_ROLLBACK_NOTICE} The archive's newest audit row is "
         f"{utc_or_unknown(last_audit_at)} (also in the store_restored audit row)."
     )
 

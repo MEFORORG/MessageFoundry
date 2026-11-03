@@ -3,13 +3,14 @@
 """What a store restore rolls back, said once (BACKLOG #5094).
 
 ``messagefoundry restore`` places the archive's whole store, so every change written to the store
-after the archive was taken is gone from the one it places. The post-restore notices carry
-:data:`RESTORE_ROLLBACK_NOTICE` whole, and the adopter guide's restore section names every class in
-:data:`RESTORE_ROLLBACK_CLASSES`; ``tests/test_b5094_restore_rollback_notice.py`` pins them.
+after the archive was taken is gone from the one it places. Every restore notice carries
+:data:`RESTORE_ROLLBACK_NOTICE` whole: the ones shown after a restore and the ones shown before
+one, such as the age refusal and the ``--allow-old-archive`` help. The adopter guide's restore
+section names every class in :data:`RESTORE_ROLLBACK_CLASSES`.
+``tests/test_b5094_restore_rollback_notice.py`` pins all of that, and refuses an import here.
 
-A leaf with no imports, because the CLI builds its parser from it and the CLI's startup import
-budget (``tests/test_startup_import_budget.py``) names each engine module it loads. The same test
-file refuses an import here.
+A leaf with no imports, because the CLI builds its parser from it on every run. The notice is
+rendered as argparse help, so it must never hold a ``%``; the same test renders that help.
 """
 
 from __future__ import annotations
@@ -17,10 +18,10 @@ from __future__ import annotations
 __all__ = ["RESTORE_ROLLBACK_CLASSES", "RESTORE_ROLLBACK_NOTICE"]
 
 #: The account and security changes a restore undoes, worded as what an operator does about each.
-#: Read off the store's account and approval tables (``users``, ``roles``, ``user_roles``,
+#: Drawn from the store's account and approval tables (``users``, ``roles``, ``user_roles``,
 #: ``ad_group_role_map``, ``ad_group_scope_map``, ``webauthn_credentials``,
-#: ``pending_approvals``). The notice says "at least" because the restore replaces every other
-#: table too, and a column added later joins none of these by itself.
+#: ``pending_approvals``). Not a census: the restore replaces every other table too, and a column
+#: added later joins none of these by itself, hence the notice's "at least".
 RESTORE_ROLLBACK_CLASSES: tuple[str, ...] = (
     "account creations, disables, enables and deletes",
     "account locks and unlocks",
@@ -33,15 +34,17 @@ RESTORE_ROLLBACK_CLASSES: tuple[str, ...] = (
     "notify-email changes",
     "channel scopes",
     "AD group-to-role and AD group-to-scope maps",
-    "dual-control approval decisions",
+    "dual-control approval decisions: a request decided after the archive is pending again, so "
+    "reject it rather than approve it a second time",
 )
 
-#: The statement every post-restore notice carries whole. It leads with the instruction, because
-#: the alert instance's reason column keeps only about the first 200 characters of the alert's
-#: detail, and the instruction must survive that cut.
+#: The statement every restore notice carries whole. Worded for a restore in general, because the
+#: age refusal shows it before anything was written.
 RESTORE_ROLLBACK_NOTICE = (
-    "Every change made after the archive's newest audit row is undone and must be re-applied by "
-    "hand, at least: "
+    "A restore undoes every change made to the store after the archive's newest audit row, and "
+    "each must be re-applied by hand, at least: "
     + "; ".join(RESTORE_ROLLBACK_CLASSES)
-    + ". Messages received after the archive was taken are not in the restored store either."
+    + ". Re-apply the removals before users can reach the restored engine. Messages received "
+    "after the archive was taken, later reference-set syncs and later transform state are not in "
+    "a restored store either."
 )
