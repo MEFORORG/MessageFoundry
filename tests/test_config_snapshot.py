@@ -68,7 +68,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxWorkerRefused,
     graph_shape,
 )
-from tests._share_fault import _share_fault
+from tests._share_fault import _share_fault, unlistable_dir
 
 RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||900001||DOE^JANE\r"
 
@@ -771,22 +771,28 @@ def test_a_load_goes_on_past_a_value_folder_on_a_lost_share_and_the_digest_says_
     assert partial is not None and partial[1] == ("environments",)
 
 
+@pytest.mark.parametrize(
+    ("after", "refusal"),
+    [(1, "could not vet it"), (2, r"could not read \.")],
+    ids=["lost-before-the-trust-check", "lost-before-the-read"],
+)
 def test_a_load_refuses_a_base_directory_on_a_lost_share_rather_than_run_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after: int, refusal: str
 ) -> None:
-    """The first check lists it, and it still answers ``is_dir``, so only the read can refuse. It
-    read as an empty bundle before, and with ``allow_empty`` that returned an empty graph."""
+    """The first check lists it, and it still answers ``is_dir``, so only a later listing can
+    refuse: the trust check's (vault BACKLOG #5117), or past that the read's. It read as an empty
+    bundle before, and with ``allow_empty`` that returned an empty graph."""
     cfg = _config(tmp_path / "cfg")
-    _lost_share(monkeypatch, cfg, answers_is_dir=True, after=1)
-    with pytest.raises(WiringError, match=r"could not read \."):
+    _lost_share(monkeypatch, cfg, answers_is_dir=True, after=after)
+    with pytest.raises(WiringError, match=refusal):
         load_config(cfg, allow_empty=True)
 
 
 def test_a_directory_that_lists_but_is_not_a_directory_to_is_dir_runs_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The trust check vets nothing where ``is_dir`` says no, so such a directory must not reach
-    the load that runs its modules. ``_lost_share`` with every listing allowed is that case."""
+    """``is_dir`` and the listing disagree about such a directory, so it must not reach the load
+    that runs its modules. ``_lost_share`` with every listing allowed is that case."""
     cfg = _config(tmp_path / "cfg")
     ran = tmp_path / "ran.txt"
     (cfg / "graph.py").write_text(f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8")
@@ -977,3 +983,57 @@ def test_the_engine_takes_no_gating_digest_of_a_bundle_on_a_lost_share(
     _lost_share(monkeypatch, cfg / folder)
     assert Engine._content_digest_blocking(cfg) is None
     assert Engine._reload_snapshot_blocking(cfg) is None
+
+
+# --- vault BACKLOG #5117: the trust check's listing raises what it cannot list --------------------
+
+
+def test_the_glob_this_replaced_swallows_a_listing_fault(tmp_path: Path) -> None:
+    """The premise, measured: a ``Path.glob`` of a folder that cannot be listed answers ``[]``
+    with nothing raised, the same answer as an empty folder."""
+    with unlistable_dir(tmp_path) as folder:
+        assert list(folder.glob("*.py")) == []
+
+
+def test_config_py_files_raises_on_a_real_folder_it_cannot_list(tmp_path: Path) -> None:
+    with unlistable_dir(tmp_path) as folder, pytest.raises(OSError) as refused:
+        config_py_files(folder)
+    assert not isinstance(refused.value, ConfigDirMissing)
+
+
+def test_config_py_files_raises_on_a_missing_directory(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        config_py_files(tmp_path / "absent")
+
+
+def test_config_py_files_keeps_the_dot_and_case_rules(tmp_path: Path) -> None:
+    """The listing changed and the rule did not: the old glob-and-filter answer, on each
+    platform, is the control (vault BACKLOG #2781 for the dot rule)."""
+    for name in ("b.py", "_helpers.py", ".IB_OLD.py", "._a.py", "UPPER.PY", "notes.txt"):
+        (tmp_path / name).write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "pkg.py").mkdir()  # a folder the glob matched too
+    old = sorted(p for p in tmp_path.glob("*.py") if not p.name.startswith("."))
+    assert config_py_files(tmp_path) == old
+    assert tmp_path / "b.py" in old and tmp_path / ".IB_OLD.py" not in old  # the control
+
+
+def test_the_trust_check_refuses_a_folder_it_cannot_list(tmp_path: Path) -> None:
+    """It returned with nothing vetted: on Windows ``is_dir`` answers ``False`` for the share and
+    the check stopped there, and on POSIX the glob listed no module, so only the folder was
+    vetted while a load would list and run what is in it."""
+    with unlistable_dir(tmp_path) as folder, pytest.raises(OSError):
+        wiring._assert_safe_config_source(folder)
+
+
+def test_the_trust_check_refuses_a_folder_listed_by_nothing_but_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the load's own directory check passed, a folder lost before the trust check lists it
+    refuses the load rather than vetting nothing."""
+    cfg = _config(tmp_path / "cfg")
+    monkeypatch.setattr(wiring, "_require_config_dir", lambda directory, *, strict: None)
+    _lost_share(monkeypatch, cfg)
+    with pytest.raises(WiringError, match="could not vet it"):
+        load_config(cfg, allow_empty=True)
+    with pytest.raises(OSError):
+        read_trusted_snapshot(cfg, strict=True)
