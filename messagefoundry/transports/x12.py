@@ -847,18 +847,22 @@ class X12Source(SourceConnector):
                         decoded = 0
                         for interchange in decoder.feed(chunk):
                             decoded += 1
+                            fault: str | None = None
                             try:
                                 reply = await self._handler(interchange)
                             except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
                                 # BACKLOG #5022: the reader framed this interchange cleanly, so this
-                                # is a handler fault, not a framing fault. `failed` is set until it
-                                # is recovered, so a cancel inside the recovery is no clean close.
+                                # is a handler fault, not a framing fault. Only the scrubbed text
+                                # leaves this clause; recover_handler_fault says why.
+                                fault = safe_exc(exc)
+                            if fault is not None:
+                                # Set until recovered, so a cancel inside it is no clean close.
                                 failed = True
                                 try:
                                     reply = await recover_handler_fault(
                                         self._handler,
                                         interchange,
-                                        exc,
+                                        fault,
                                         owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
                                         transport="X12",
                                         peer=peer,

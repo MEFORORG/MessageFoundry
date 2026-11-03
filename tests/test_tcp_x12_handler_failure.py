@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -205,7 +206,55 @@ async def test_a_stop_past_its_grace_during_a_blocked_retry_names_the_loss(
     assert _kinds(events) == ["established", "handler_error"]
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1 and errors[0].startswith(f"{transport} message")
-    assert "nor is any frame behind it" in errors[0] and "task was cancelled" in errors[0]
+    # The cancel cut off attempt 2 inside the handler, which may have committed before the cut.
+    assert (
+        "may or may not be recorded" in errors[0]
+        and "inside attempt 2, after 1 failed" in errors[0]
+    )
+    assert "No frame behind it on this connection is recorded" in errors[0]
+
+
+@pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
+async def test_a_retry_runs_outside_the_first_faults_except_clause(
+    transport: str, build: Build, wire: bytes, body: bytes
+) -> None:
+    # A hold can last hours. Run inside the listener's `except` arm, it would keep the first fault,
+    # its traceback and the message locals that traceback references, alive the whole time.
+    handling: list[object] = []
+
+    async def fail_then_look(raw: bytes) -> None:
+        if not handling:
+            handling.append(None)
+            raise RuntimeError("synthetic store outage")
+        handling.append(sys.exc_info()[1])
+
+    events = await _drive(_no_reply(build), _ThenEof(wire), _Peer(), handler=fail_then_look)
+    assert handling == [None, None], "no exception is being handled while the retry runs"
+    assert _kinds(events) == ["established", "closed"]
+
+
+@pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
+async def test_a_stop_gets_one_last_attempt_that_can_record_the_frame(
+    caplog: pytest.LogCaptureFixture, transport: str, build: Build, wire: bytes, body: bytes
+) -> None:
+    # stop() gives a client task a grace to finish its commit. A stop that reaches the hold cuts its
+    # pause short for one last attempt at once, so a fault that has cleared loses nothing.
+    source = _no_reply(build)
+    seen: list[bytes] = []
+
+    async def stop_then_recover(raw: bytes) -> None:
+        seen.append(raw)
+        if len(seen) == 1:
+            source._admission.stopping = True
+            raise RuntimeError("synthetic store outage")
+
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(wire), _Peer(), handler=stop_then_recover)
+    assert seen == [body] * 2
+    assert _kinds(events) == ["established", "closed"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "no `retrying in` line once stopping, and nothing is lost"
+    )
 
 
 @pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
