@@ -148,7 +148,8 @@ WHY A MARKER IS NOT A LANDER EVENT. It is Lander-signed, but it is not the Lande
 a Lander event it would become the newest one, which is no hold, and so erase the hold that the
 REPAIR turn rests on. Read as a reply it would hand the turn back to the Lander, which is what the
 marker means to prevent. So a qualifying marker is set aside while the hold is judged, and is then
-the one thing that turns AUTHOR into REPAIR; a marker that does not qualify is set aside for nothing.
+the one thing that turns AUTHOR into REPAIR. A marker that does not qualify is not set aside at all:
+it is an ordinary reply, so it hands the turn to the Lander.
 A Repair Manager pushing its fix moves the head, which hands the turn to the Lander to review, as
 any author's push does.
 
@@ -344,15 +345,21 @@ def _first_line_sha(pattern: re.Pattern[str], first_line: str) -> str | None:
     return marker.group(1).lower() if marker else None
 
 
+def _signed_marker(pattern: re.Pattern[str], body: str) -> re.Match[str] | None:
+    """``pattern`` matched against the whole first line, when the second carries the signature."""
+    lines = body.split("\n", 2)
+    if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
+        return None
+    return pattern.fullmatch(lines[0].rstrip(_TRAILING))
+
+
 def hold_head(body: str) -> str | None:
     """The SHA a marker hold names, lower-cased; ``None`` when ``body`` has no hold's shape.
 
     The shape only. The association, minimized and dismissed gates are ``Event``'s.
     """
-    lines = body.split("\n", 2)
-    if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
-        return None
-    return _first_line_sha(_HOLD_MARKER, lines[0])
+    marker = _signed_marker(_HOLD_MARKER, body)
+    return marker.group(1).lower() if marker else None
 
 
 def ack_head(body: str) -> str | None:
@@ -369,10 +376,7 @@ def repair_owner(body: str) -> str | None:
     The shape only, as ``hold_head``: the marker's first line, then the Lander's signature on the
     second. The gates are ``Event``'s.
     """
-    lines = body.split("\n", 2)
-    if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
-        return None
-    marker = _REPAIR_MARKER.fullmatch(lines[0].rstrip(_TRAILING))
+    marker = _signed_marker(_REPAIR_MARKER, body)
     return marker.group(1) if marker else None
 
 
@@ -504,9 +508,9 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
         # THE REPAIR CONTRACT: a marker strictly after the hold is set aside as a reply only to ask
         # whether the hold would otherwise stand; anything that fails here reads as before it.
         repairs = [e for e in after if e.when > when and e.repair_by is not None]
-        # A marker's first line is never an ack's, so no event is in both lists.
-        others = [e for e in after if e not in acks and e not in repairs]
-        if repairs and not others:
+        # A marker's first line is never an ack's, so the two lists are disjoint and their lengths
+        # add up to ``after``'s exactly when nothing else came after the hold.
+        if repairs and len(acks) + len(repairs) == len(after):
             newest = max(e.when for e in repairs)
             owners = {e.repair_by for e in repairs if e.when == newest}
             # Two sessions named in one second cannot be ordered, so neither owns the repair; an

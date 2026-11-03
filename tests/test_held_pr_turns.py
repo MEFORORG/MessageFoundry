@@ -474,8 +474,8 @@ def test_the_ack_marker_must_be_the_whole_first_line() -> None:
 
 # ---- the repair contract -------------------------------------------------------------------------
 
-#: A real-shaped Repair Manager session id: mixed case, an underscore and hyphens, 42 characters.
-OWNER_ID = "local_Da3cd1cf-c30b-4e68-9a0e-2991b9d0974d"
+#: A made-up session id in the desktop app's shape: mixed case, an underscore, hyphens, 42 characters.
+OWNER_ID = "local_Ab12cd34-0000-4000-8000-000000000000"
 
 
 def _repair_body(session: str = OWNER_ID, signature: str = SESSION) -> str:
@@ -531,6 +531,16 @@ def test_a_repair_marker_after_a_standing_hold_is_the_repair_owners_turn(
         ],
     )
     assert _repair_row(_engine_rows(tmp_path, capsys, rehold)[135]) == (
+        "REPAIR",
+        ["held", "repair"],
+        OWNER_ID,
+    )
+    # A third line, such as a note on ASVS record content, does not stop a marker qualifying.
+    third = _comment(
+        _repair_body() + "\nASVS record content: the Repair Manager may take it.",
+        "2026-10-28T13:00:00Z",
+    )
+    assert _repair_row(_engine_rows(tmp_path, capsys, _held(136, third))[136]) == (
         "REPAIR",
         ["held", "repair"],
         OWNER_ID,
@@ -606,6 +616,21 @@ def test_a_repair_marker_without_a_standing_hold_is_not_a_repair(
         # A legacy prose hold is no hold, so a marker after it is no repair.
         _pr(163, comments=[_comment(SESSION + "**Held.**", "2026-10-28T12:00:00Z"), _repair()]),
     )
+    # A re-hold on a repaired head with no new marker after it reads as the hold alone (AUTHOR);
+    # the docstring names this, and the Lander re-posts the marker. A bot marker is not read.
+    rehold = _pr(
+        164,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(1)),
+            _repair("2026-10-28T13:00:00Z"),
+            _hold("2026-10-28T15:00:00Z", _sha(164)),
+        ],
+    )
+    bot = _repair()
+    bot["author"] = {"__typename": "Bot", "login": "some-app"}
+    more = _engine_rows(tmp_path, capsys, rehold, _held(165, bot))
+    assert _repair_row(more[164]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(more[165]) == ("AUTHOR", ["held"], None)
     assert _repair_row(rows[160]) == ("LANDER", ["no-hold"], None)
     assert _repair_row(rows[161]) == ("AUTHOR", ["held"], None)
     assert _repair_row(rows[162]) == ("LANDER", ["no-hold"], None)
