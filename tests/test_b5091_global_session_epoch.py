@@ -186,6 +186,97 @@ async def test_the_revoke_refuses_a_store_with_no_global_epoch_row(
     assert row is not None and row.revoked_at is None  # rolled back: nothing was revoked
     with pytest.raises(RuntimeError, match="global_session_epoch row is missing"):
         await store.get_user("b5091-gone")  # a user read refuses by the same name
+    with pytest.raises(RuntimeError, match="global_session_epoch row is missing"):
+        await _mint(store, "b5091-gone")  # and so does a sign-in, never a bare TypeError
+
+
+class _Straddle:
+    """An owner with a kept session and a second session, through an every-account revoke that
+    keeps the first. ``serve_stale_once`` makes the next read of the kept session, by the gate or
+    by the session list, return its row from BEFORE the revoke, as a request that straddles the
+    revoke's commit reads it; every later read is the store's own."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        self.service = AuthService(store, AuthSettings())
+        self.owner = f"b5091-s-{uuid.uuid4().hex[:8]}"
+
+    async def set_up(self) -> None:
+        await _user(self.store, self.owner)
+        self.kept = await _mint(self.store, self.owner)
+        self.other = await _mint(self.store, self.owner)
+        self.kept_before = await self.store.get_session(hash_token(self.kept))
+        self.other_before = await self.store.get_session(hash_token(self.other))
+        assert self.kept_before is not None and self.other_before is not None
+        await self.store.revoke_all_sessions(except_token_hash=hash_token(self.kept))
+
+    def serve_stale_once(self, monkeypatch: pytest.MonkeyPatch, *, list_view: bool) -> None:
+        left = [1]
+        stale = self.kept_before
+        if list_view:
+            real_list = self.store.list_sessions
+
+            async def list_once(user_id: str, **kwargs: Any) -> Any:
+                rows = await real_list(user_id, **kwargs)
+                if left[0]:
+                    left[0] = 0
+                    return [stale if r.token_hash == stale.token_hash else r for r in rows]
+                return rows
+
+            monkeypatch.setattr(self.store, "list_sessions", list_once)
+        else:
+            real_get = self.store.get_session
+
+            async def get_once(token_hash: str) -> Any:
+                if left[0] and token_hash == stale.token_hash:
+                    left[0] = 0
+                    return stale
+                return await real_get(token_hash)
+
+            monkeypatch.setattr(self.store, "get_session", get_once)
+
+
+@pytest.mark.parametrize("list_view", [False, True], ids=["gate", "session-list"])
+async def test_a_request_straddling_the_revoke_keeps_the_re_stamped_session(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, list_view: bool
+) -> None:
+    """Round 2, finding 1 (BACKLOG #5091): the gate and the session list read the session before
+    the account, so a request straddling an every-account revoke's commit saw the kept session's
+    old stamps beside the account's new epochs and ended a session the revoke had kept. Both now
+    re-read the row and run the whole gate on it before ending it. RED when either ends it on the
+    first read. This narrows the race; docs/SECURITY.md says what is left."""
+    store, _path = keyed
+    case = _Straddle(store)
+    await case.set_up()
+    case.serve_stale_once(monkeypatch, list_view=list_view)
+    if list_view:
+        listed = await case.service.list_sessions(case.owner)
+        assert [r.token_hash for r in listed] == [hash_token(case.kept)]
+    else:
+        assert await case.service.identity_for_token(case.kept) is not None
+    monkeypatch.undo()
+    row = await store.get_session(hash_token(case.kept))
+    assert row is not None and row.revoked_at is None  # the kept session was not ended
+    assert await case.service.identity_for_token(case.kept) is not None
+
+
+async def test_a_genuinely_stale_session_still_ends_after_the_re_read(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """The control for the re-read: a session the revoke ended, put back unrevoked with its old
+    seal, is stale on the re-read too, so the gate still refuses it and ends it."""
+    store, path = keyed
+    case = _Straddle(store)
+    await case.set_up()
+    await _sqlite_raw(path)(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (case.other_before.seal, hash_token(case.other)),
+    )
+    replayed = await store.get_session(hash_token(case.other))
+    assert replayed is not None and replayed.revoked_at is None
+    assert await case.service.identity_for_token(case.other) is None
+    ended = await store.get_session(hash_token(case.other))
+    assert ended is not None and ended.revoked_at is not None  # still ended
 
 
 async def test_a_reopen_keeps_a_raised_global_epoch_and_seeds_a_missing_row(
