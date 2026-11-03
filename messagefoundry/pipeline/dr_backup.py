@@ -1139,17 +1139,19 @@ class BackupRunner:
     def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> int:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
-        arbitrary host file into the archive, so only regular files are added and at least these are
-        NOT followed: a symlinked file, a symlinked directory, and on Windows a junction or volume
-        mount point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads them. A
-        filesystem mounted below ``base`` on POSIX is not a link, and is walked. ``base`` itself is
-        the operator's configured directory and is walked whatever it is. At least each directory
-        link the walk lists as a directory is named in one WARNING, since the loader and the config
-        digest may read through it.
+        arbitrary host file into the archive, so the walk aims to add only regular files and does
+        NOT follow at least: a symlinked file, a symlinked directory, and on Windows a junction or
+        volume mount point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads
+        them. A filesystem mounted below ``base`` on POSIX is not a link, and is walked. ``base``
+        itself is the operator's configured directory and is walked whatever it is. At least each
+        directory link the walk lists as a directory is named in one WARNING, since the loader and
+        the config digest may read through it.
 
-        Not covered: a path swapped for a link after the walk read it, because the walk lists and
-        ``tar.add`` opens by name. ``tar.add`` is not recursive, so such a swap adds at most one
-        member, never the tree behind it.
+        Not covered, at least: the walk reads each entry, then lists or opens it by name, so a path
+        swapped for a link in between is followed. A directory swapped for a junction in that gap is
+        descended, as :func:`_walk_unfollowed` says, and every file behind it is bundled. A swapped
+        file adds one member, since ``tar.add`` is not recursive. Either swap needs write access to
+        the config dir.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
