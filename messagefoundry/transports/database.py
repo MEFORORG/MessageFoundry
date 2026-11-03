@@ -120,10 +120,12 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
     generic_hop_endpoint,
     odbc_keyword_name,
     odbc_param,
+    sqlserver_preset_refusal,
 )
 from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -211,6 +213,10 @@ def _build_dsn(
 ) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
+    It refuses settings under which the driver might not read ``SERVER={server},{port}`` as one
+    host and its port (:func:`~messagefoundry.transports.db_endpoint.sqlserver_preset_refusal`,
+    BACKLOG #4873).
+
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
     ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
     authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
@@ -259,9 +265,12 @@ def _build_dsn(
         raise ValueError(
             "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
         )
+    refusal = sqlserver_preset_refusal(s)
+    if refusal is not None:
+        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {refusal}")
     port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
     parts = [
-        f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
+        f"DRIVER={odbc_brace(str(s.get('odbc_driver', SQLSERVER_DEFAULT_DRIVER)))}",
         f"SERVER={server},{port}",
         f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).

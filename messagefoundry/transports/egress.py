@@ -137,7 +137,8 @@ def check_lookup_allowed(
         )
     if egress.allowed_db:
         # Both callers build the SQL Server preset whatever `settings` say (neither DatabaseLookup
-        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting.
+        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting, and a driver the
+        # preset refuses is refused here too (BACKLOG #4873).
         refusal = _database_refusal(settings, egress.allowed_db, dialect="sqlserver")
         if refusal is not None:
             log.warning("connect denied: %s %r %s", label, name, refusal)

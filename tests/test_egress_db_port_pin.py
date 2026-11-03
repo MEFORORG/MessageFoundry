@@ -308,8 +308,9 @@ def test_generic_server_port_suffix_does_not_loosen_the_host(
 def test_lookup_reads_the_port_setting_whatever_the_dialect_setting_says(label: str) -> None:
     # db_lookup and the DatabaseRef sync call the SQL Server builder directly, which sends
     # `server,port` and never reads odbc_params. So a `dialect="generic"` in their settings changes
-    # nothing the check reads: the `port` setting is the port sent.
-    settings = _generic(server=HOST, port=5432, odbc_params={"PORT": "6432"})
+    # nothing the check reads: the `port` setting is the port sent. The driver is the default SQL
+    # Server one, since the preset refuses any other (BACKLOG #4873).
+    settings = {"dialect": "generic", "server": HOST, "port": 5432, "odbc_params": {"PORT": "6432"}}
     check_lookup_allowed("LK", settings, PINNED, label=label)
     with pytest.raises(WiringError, match=f"{label} 'LK': server .* at port 6432"):
         check_lookup_allowed("LK", {**settings, "port": 6432}, PINNED, label=label)
@@ -350,8 +351,9 @@ def test_egress_port_agrees_with_the_hop_guard_port(server: str, params: dict[st
 )
 def test_a_sql_server_word_wins_over_a_known_driver_word(check: Check, driver: str) -> None:
     # The reviewer's path shape: a name holding mysql but naming msodbcsql. A SQL Server word in the
-    # name reads no port, so the pin refuses it; a host-only entry still admits it.
+    # name reads no port, so the pin refuses it; a host-only entry still admits it. The remedy does
+    # not name the preset, which refuses a mixed name (BACKLOG #4873).
     kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
-    with pytest.raises(WiringError, match="use dialect sqlserver, or a driver that reads the PORT"):
+    with pytest.raises(WiringError, match="use a driver known to read the PORT keyword"):
         check(kw, PINNED)
     check(kw, HOST_ONLY)
