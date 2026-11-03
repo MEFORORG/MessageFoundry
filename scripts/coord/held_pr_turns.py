@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Whose move is each open pull request: the Lander's or its author's, from GitHub state alone.
+"""Whose move is each open pull request: the Lander's, its author's or its repair owner's.
+
+All from GitHub state alone.
 
 WHY THIS EXISTS. The Lander holds dozens of PRs across three repositories. Tracking holds from
 memory failed after a context compaction: PRs kept reading as held with their authors hours after
@@ -16,8 +18,9 @@ itself is (an event with no time), and ``a report defect`` where this script fai
 did not foresee (a missing field, a crafted stamp whose offset overflows the date range), so a bug
 here is never chased as a GitHub outage. A bad command line still exits 2, argparse's usage error.
 
-THE UNSAFE DIRECTION. Marking a PR AUTHOR's turn when it is really the Lander's is the failure this
-script exists to prevent. So AUTHOR needs a positive, machine-readable hold, and everything else,
+THE UNSAFE DIRECTION. Marking a PR AUTHOR's or REPAIR's turn when it is really the Lander's is the
+failure this script exists to prevent. So AUTHOR needs a positive, machine-readable hold, REPAIR
+needs that hold AND a positive, machine-readable repair-owner marker after it, and everything else,
 including every case this script cannot read, is LANDER's.
 
 WHY PYTHON, AND WHAT IT REUSES. ``pr_state.py`` beside it says why coord tooling reading GitHub is
@@ -97,7 +100,46 @@ AUTHOR's turn only when ALL of these hold: the newest Lander event is a marker h
 tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts with the marker's SHA,
 ignoring case; no non-Lander event other than an ack (THE ACK CONTRACT) is at or after the hold's
 second (a tie is a reply, but a tied ack is not); and no comment or review, Lander or not and
-the hold itself included, was edited at or after the hold's second. Otherwise LANDER's.
+the hold itself included, was edited at or after the hold's second. Otherwise LANDER's. When all of
+these hold and a repair-owner marker also qualifies, the turn is REPAIR's instead (THE REPAIR
+CONTRACT).
+
+THE REPAIR CONTRACT. When a held author does not answer, the Lander may hand the repair to a Repair
+Manager session by posting, as an issue comment, ONLY this shape::
+
+    <!-- repair-owner session=<session id> -->
+    Lander (<session or seat id>), <date>. Repair owned by the Repair Manager from <time>; ...
+
+The first line is read exactly as the hold marker's is (a full match, only trailing spaces, tabs and
+carriage returns stripped, a line feed the only line break), the session id is 1 to 64 of
+``[0-9A-Za-z_-]``, kept in its own case, and the second line starts with the Lander's signature in
+the same narrow forms a hold's does. The association, minimized and dismissed gates are a hold's, and
+a review is never a marker, as it is never an ack. The PR is REPAIR's turn, its row naming the
+marker's session as ``repairOwner``, ONLY when ALL of these hold:
+
+* every AUTHOR condition above holds, reading every qualifying marker as neither a reply nor a Lander
+  event, so REPAIR is never reached from a state that would not otherwise be AUTHOR's;
+* at least one qualifying marker was posted strictly after the hold's second (a same-second marker
+  is not provably after the hold, so it does not qualify);
+* the qualifying markers in the newest marker second all name one session.
+
+Otherwise the PR is classified exactly as it was before this contract, with every marker an ordinary
+event. Under that reading a marker body starts with ``<!--``, not the signature, so it is not a
+Lander event, and one after the hold is a reply: the PR reads LANDER ``replied``. So at least these
+fall back to the Lander: a marker with no hold before it (``no-hold``), a marker older than the
+latest hold (the hold's own state, AUTHOR if it stands, because each new hold re-opens the author's
+turn and needs a new marker), a push after the marker (``new-commit``: the head no longer starts with
+the hold's SHA, which is how "no commit after the marker" is read, and is stricter, since it also
+catches a push between the hold and the marker), any other reply or any edit after the hold, an
+edit to the marker itself, and a newer non-hold Lander comment (``no-hold``).
+
+WHY A MARKER IS NOT A LANDER EVENT. It is Lander-signed, but it is not the Lander answering: read as
+a Lander event it would become the newest one, which is no hold, and so erase the hold that the
+REPAIR turn rests on. Read as a reply it would hand the turn back to the Lander, which is what the
+marker means to prevent. So a qualifying marker is set aside while the hold is judged, and is then
+the one thing that turns AUTHOR into REPAIR; a marker that does not qualify is set aside for nothing.
+A Repair Manager pushing its fix moves the head, which hands the turn to the Lander to review, as
+any author's push does.
 
 WHAT COUNTS AS AN EVENT. Issue comments and submitted PR reviews. A review with an empty body is a
 non-Lander event, because an inline-only review is how an author answers a finding in its thread;
@@ -120,9 +162,17 @@ read. Only the latest ``COMMENT_PAGE`` issue comments and ``REVIEW_PAGE`` review
 
 A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with auto-merge armed,
 merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
-``in-queue`` or ``auto-armed`` flag: dequeuing or disarming it is the Lander's move.
+``in-queue`` or ``auto-armed`` flag: dequeuing or disarming it is the Lander's move. A REPAIR turn
+on such a PR reads LANDER the same way, keeping ``repair`` and ``repairOwner``.
 
-FLAGS. ``held`` (a hold stands: AUTHOR's turn, unless the PR is queued or armed); ``no-hold`` (no
+SORTING. ERROR rows first, then LANDER, then REPAIR, then AUTHOR, each group oldest newest-event
+first. REPAIR sits after LANDER because it is not the Lander's move, and before AUTHOR because the
+Lander keeps the Repair Manager alive and so watches its rows more closely than an author's. The
+table's FLAGS cell shows ``repair=<session id>`` for the ``repair`` flag; the JSON carries the id as
+``repairOwner``, ``null`` on any row that is not a repair.
+
+FLAGS. ``held`` (a hold stands: AUTHOR's turn, unless the PR is queued or armed); ``repair`` (beside
+``held``: a repair-owner marker after the hold made it REPAIR's turn); ``no-hold`` (no
 Lander event, or the newest is not a marker hold); ``new-commit`` (the head does not start with the
 marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
 head); ``edited`` (a comment or review, of any author, the hold included,
@@ -183,10 +233,14 @@ TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _HOLD_MARKER = re.compile(r"<!-- lander-hold head=([0-9a-fA-F]{7,40}) -->")
 #: An author's hold acknowledgement, matched the same way as the hold marker.
 _ACK_MARKER = re.compile(r"<!-- hold-ack head=([0-9a-fA-F]{7,40}) -->")
+#: The Lander's repair-owner marker, matched the same way as the hold marker. The session id keeps
+#: its case; one bounded repeat, so it cannot backtrack catastrophically.
+_REPAIR_MARKER = re.compile(r"<!-- repair-owner session=([0-9A-Za-z_-]{1,64}) -->")
 #: What may trail the marker on its line. Only these: a Unicode space is not stripped.
 _TRAILING = " \t\r"
 
 LANDER = "LANDER"
+REPAIR = "REPAIR"
 AUTHOR = "AUTHOR"
 ERROR = "ERROR"
 
@@ -296,6 +350,19 @@ def ack_head(body: str) -> str | None:
     return _first_line_sha(_ACK_MARKER, body.split("\n", 1)[0])
 
 
+def repair_owner(body: str) -> str | None:
+    """The session a Lander repair-owner marker names; ``None`` when ``body`` is not one.
+
+    The shape only, as ``hold_head``: the marker's first line, then the Lander's signature on the
+    second. The gates are ``Event``'s.
+    """
+    lines = body.split("\n", 2)
+    if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
+        return None
+    marker = _REPAIR_MARKER.fullmatch(lines[0].rstrip(_TRAILING))
+    return marker.group(1) if marker else None
+
+
 @dataclass(frozen=True)
 class Event:
     when: datetime
@@ -336,6 +403,13 @@ class Event:
         if not self.trusted or self.dismissed or self.review:
             return None
         return ack_head(self.body)
+
+    @property
+    def repair_by(self) -> str | None:
+        """The session a repair-owner marker comment names, else ``None``. Never a review."""
+        if not self.trusted or self.dismissed or self.review:
+            return None
+        return repair_owner(self.body)
 
 
 _nodes = pr_state._nodes
@@ -391,16 +465,25 @@ def _events(pr: dict[str, Any]) -> list[Event]:
 
 def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str]]:
     """``(turn, flags)`` for one PR. Pure; the module docstring states the rules."""
+    turn, flags, _owner = turn_of(head_oid, events)
+    return turn, flags
+
+
+def turn_of(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], str | None]:
+    """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` unless the turn is REPAIR.
+
+    Pure; the module docstring states the rules.
+    """
     turn_events = [e for e in events if not e.bot]
     landers = [e for e in turn_events if e.lander]
     if not landers:
-        return LANDER, ["no-hold"]
+        return LANDER, ["no-hold"], None
     # Every Lander event in the newest second is read together, so list order never decides.
     when = max(e.when for e in landers)
     tied = [e.held_at for e in landers if e.when == when]
     heads = [h for h in tied if h is not None]
     if len(heads) < len(tied):
-        return LANDER, ["no-hold"]
+        return LANDER, ["no-hold"], None
     head = head_oid.lower()
     new_commit = not all(head.startswith(h) for h in heads)
     after = [e for e in turn_events if e.latest >= when and not e.lander]
@@ -410,8 +493,18 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str]]:
     # Every seat posts under one login, so who edited cannot be told: any edit from the hold's
     # second on, of the hold itself or of an older Lander comment too, hands the turn back.
     edited = any(e.edited is not None and e.edited >= when for e in turn_events)
+    # THE REPAIR CONTRACT: a marker strictly after the hold is set aside as a reply only to ask
+    # whether the hold would otherwise stand. A marker is never an ack, so the two lists are
+    # disjoint, and anything that fails here falls through to the reading without the contract.
+    repairs = [e for e in after if e.when > when and e.repair_by is not None]
+    if repairs and not new_commit and not edited and len(acks) + len(repairs) == len(after):
+        newest = max(e.when for e in repairs)
+        owners = {e.repair_by for e in repairs if e.when == newest}
+        # Two sessions named in one second cannot be ordered, so neither owns the repair.
+        if len(owners) == 1:
+            return REPAIR, ["held", "acked", "repair"] if acks else ["held", "repair"], owners.pop()
     if not new_commit and not replied and not edited:
-        return AUTHOR, ["held", "acked"] if acks else ["held"]
+        return AUTHOR, ["held", "acked"] if acks else ["held"], None
     flags = ["new-commit"] if new_commit else []
     if replied:
         flags.append("replied")
@@ -419,7 +512,7 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str]]:
         flags.append("edited")
     if not new_commit:
         flags.append("no-new-commit")
-    return LANDER, flags
+    return LANDER, flags, None
 
 
 def age_text(seconds: float) -> str:
@@ -473,13 +566,13 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
     on_head = head.get("oid") == head_oid
     committed = pr_state.parse_iso(head.get("committedDate")) if on_head else None
     events = _events(pr)
-    turn, flags = classify(head_oid, events)
+    turn, flags, owner = turn_of(head_oid, events)
     if pr.get("mergeQueueEntry"):
         flags.append("in-queue")
     if pr.get("autoMergeRequest"):
         flags.append("auto-armed")
-    if turn == AUTHOR and ("in-queue" in flags or "auto-armed" in flags):
-        # Queued or armed, a held PR merges with no move from its author.
+    if turn in (AUTHOR, REPAIR) and ("in-queue" in flags or "auto-armed" in flags):
+        # Queued or armed, a held PR merges with no move from its author or its repair owner.
         turn = LANDER
     green, verdict = _required_green(pr, head, read)
     stamps = [e.latest for e in events] + ([committed] if committed else [])
@@ -499,6 +592,7 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
         },
         "turn": turn,
         "flags": flags,
+        "repairOwner": owner,
         "newestEvent": pr_state.iso(newest) if newest else None,
         "age": age_text(age) if age is not None else "?",
         "ageSeconds": age,
@@ -528,13 +622,13 @@ def build_rows(repo: str, read: RepoRead, now: datetime) -> list[dict[str, Any]]
 
 
 def sort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """ERROR rows first (never missed), then LANDER, then AUTHOR; oldest newest-event first."""
-    order = {ERROR: 0, LANDER: 1, AUTHOR: 2}
+    """ERROR rows first (never missed), then LANDER, REPAIR, AUTHOR; oldest newest-event first."""
+    order = {ERROR: 0, LANDER: 1, REPAIR: 2, AUTHOR: 3}
 
     def key(row: dict[str, Any]) -> tuple[int, int, str, int]:
         age = row.get("ageSeconds")
         return (
-            order.get(row["turn"], 3),
+            order.get(row["turn"], 4),
             # An undatable PR may be the stalest, so it sorts first in its group, not last.
             -(age if isinstance(age, int) else sys.maxsize),
             row["repo"],
@@ -665,10 +759,12 @@ def render(rows: list[dict[str, Any]]) -> str:
         title = row["title"]
         if len(title) > TITLE_WIDTH:
             title = title[: TITLE_WIDTH - 3] + "..."
+        owner = row.get("repairOwner")
+        flags = [f"repair={owner}" if f == "repair" and owner else f for f in row["flags"]]
         table.append(
             (
                 row["turn"],
-                ",".join(row["flags"]),
+                ",".join(flags),
                 short,
                 str(row["number"]),
                 row["requiredGreen"],
@@ -722,7 +818,9 @@ def main(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> int:
     ap = argparse.ArgumentParser(
-        description="Whose move is each open, non-draft PR: the Lander's or its author's."
+        description=(
+            "Whose move is each open, non-draft PR: the Lander's, its author's or its repair owner's."
+        )
     )
     ap.add_argument("--repo", choices=REPOS, help="restrict to one repository")
     ap.add_argument("--json", action="store_true", help="emit a JSON list of objects")

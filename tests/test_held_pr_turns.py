@@ -472,6 +472,188 @@ def test_the_ack_marker_must_be_the_whole_first_line() -> None:
     assert hpt.ack_head(_marker_body("abcdef1")) is None
 
 
+# ---- the repair contract -------------------------------------------------------------------------
+
+#: A real-shaped Repair Manager session id: mixed case, an underscore and hyphens, 42 characters.
+OWNER_ID = "local_Da3cd1cf-c30b-4e68-9a0e-2991b9d0974d"
+
+
+def _repair_body(session: str = OWNER_ID, signature: str = SESSION) -> str:
+    """The shared marker contract's shape: the marker line, then the Lander-signed transfer line."""
+    return (
+        f"<!-- repair-owner session={session} -->\n{signature}Repair owned by the Repair Manager"
+        " from 13:00Z; the original author stands down on this PR."
+    )
+
+
+def _repair(at: str = "2026-10-28T13:00:00Z", **kw: Any) -> dict[str, Any]:
+    return _comment(_repair_body(**kw), at)
+
+
+def _repair_row(row: dict[str, Any]) -> tuple[str, list[str], str | None]:
+    return row["turn"], row["flags"], row["repairOwner"]
+
+
+def test_a_repair_marker_after_a_standing_hold_is_the_repair_owners_turn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(130, _repair()),
+        # Seat-signed, with trailing space and CR on the marker line.
+        _held(
+            131,
+            _comment(
+                _repair_body(signature=SEAT).replace(" -->\n", " --> \r\n", 1),
+                "2026-10-28T13:00:00Z",
+            ),
+        ),
+        # An author's ack naming the head, before the transfer, is still not a reply.
+        _held(132, _ack("2026-10-28T12:30:00Z", _sha(132)), _repair()),
+        # A re-transfer: the newest marker names the owner.
+        _held(
+            133, _repair("2026-10-28T13:00:00Z", session="old-1"), _repair("2026-10-28T14:00:00Z")
+        ),
+    )
+    assert _repair_row(rows[130]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[131]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[132]) == ("REPAIR", ["held", "acked", "repair"], OWNER_ID)
+    assert _repair_row(rows[133]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    # A row that is not a repair carries a null owner, never a missing key.
+    assert _engine_rows(tmp_path, capsys, _held(134))[134]["repairOwner"] is None
+
+
+def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Controls: each of these MUST NOT read REPAIR. A marker is never a Lander event, so one that
+    does not qualify is an ordinary reply, and the turn is the Lander's, the safe direction."""
+    late = _held(140, _repair(), head=_sha(999))
+    outsider = _repair()
+    outsider["authorAssociation"] = "CONTRIBUTOR"
+    hidden = _repair()
+    hidden["isMinimized"] = True
+    edited = _repair()
+    edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    as_review = _review(_repair_body(), "2026-10-28T13:00:00Z")
+    line_two = _comment(SESSION + "transfer.\n" + _repair_body(), "2026-10-28T13:00:00Z")
+    quoted = _comment("> " + _repair_body().replace("\n", "\n> "), "2026-10-28T13:00:00Z")
+    manager = _comment(_repair_body(signature="Lander (8a04c9f3): "), "2026-10-28T13:00:00Z")
+    unsigned = _comment(_repair_body(signature="Manager: "), "2026-10-28T13:00:00Z")
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        # A commit pushed after the marker: the head no longer starts with the hold's SHA.
+        late,
+        # The marker in the hold's own second is not provably after it.
+        _held(141, _repair("2026-10-28T12:00:00Z")),
+        _held(142, outsider),
+        _held(143, hidden),
+        _held(144, edited),
+        _held(145, reviews=[as_review]),
+        _held(146, line_two),
+        _held(147, quoted),
+        _held(148, manager),
+        _held(149, unsigned),
+        # Any other reply after the hold still hands the turn back, marker or not.
+        _held(150, _repair(), _comment("Manager: I am back, fixing.", "2026-10-28T14:00:00Z")),
+        # Two sessions named in one second cannot be ordered.
+        _held(151, _repair(), _repair(session="other-session")),
+    )
+    assert _repair_row(rows[140]) == ("LANDER", ["new-commit", "replied"], None)
+    for n in (141, 142, 143, 145, 147, 148, 149, 150, 151):
+        assert _repair_row(rows[n]) == ("LANDER", ["replied", "no-new-commit"], None), n
+    # Signed on line one, it is a newer non-hold Lander comment, so no hold stands.
+    assert _repair_row(rows[146]) == ("LANDER", ["no-hold"], None)
+    assert _repair_row(rows[144]) == ("LANDER", ["replied", "edited", "no-new-commit"], None)
+
+
+def test_a_repair_marker_without_a_standing_hold_is_not_a_repair(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        # No hold at all: the marker alone is not a Lander event.
+        _pr(160, comments=[_repair()]),
+        # A marker older than the latest hold: the newer hold re-opens the author's turn.
+        _pr(
+            161,
+            comments=[_repair("2026-10-28T11:00:00Z"), _hold("2026-10-28T12:00:00Z", _sha(161))],
+        ),
+        # A newer non-hold Lander comment after the marker: the newest Lander event is no hold.
+        _held(162, _repair(), _comment(SESSION + "reviewing the repair.", "2026-10-28T14:00:00Z")),
+        # A legacy prose hold is no hold, so a marker after it is no repair.
+        _pr(163, comments=[_comment(SESSION + "**Held.**", "2026-10-28T12:00:00Z"), _repair()]),
+    )
+    assert _repair_row(rows[160]) == ("LANDER", ["no-hold"], None)
+    assert _repair_row(rows[161]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[162]) == ("LANDER", ["no-hold"], None)
+    assert _repair_row(rows[163]) == ("LANDER", ["no-hold"], None)
+
+
+def test_the_repair_marker_shape_is_exact() -> None:
+    assert hpt.repair_owner(_repair_body()) == OWNER_ID
+    assert hpt.repair_owner(_repair_body("a" * 64)) == "a" * 64
+    for bad in ("", "a" * 65, "has space", "dot.id", "slash/id", "colon:id"):
+        assert hpt.repair_owner(_repair_body(bad)) is None, bad
+    marker = f"<!-- repair-owner session={OWNER_ID} -->"
+    for body in (
+        marker,
+        marker + "\n",
+        " " + marker + "\n" + SESSION,
+        "\n" + marker + "\n" + SESSION,
+        marker + " trailing\n" + SESSION,
+        marker + "\n\n" + SESSION,
+        marker + " " + SESSION,
+        marker + "\x0b\n" + SESSION,
+        f"<!--repair-owner session={OWNER_ID}-->\n" + SESSION,
+    ):
+        assert hpt.repair_owner(body) is None, repr(body)
+    # A repair marker is neither a hold nor an ack, and a hold is not a repair marker.
+    assert hpt.hold_head(_repair_body()) is None
+    assert hpt.ack_head(_repair_body()) is None
+    assert hpt.repair_owner(_marker_body("abcdef1")) is None
+    event = hpt.Event(NOW, _repair_body(), bot=False, trusted=True)
+    assert not event.lander and event.repair_by == OWNER_ID
+    for gated in (
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=False),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=True, dismissed=True),
+        hpt.Event(NOW, _repair_body(), bot=False, trusted=True, review=True),
+    ):
+        assert gated.repair_by is None
+
+
+def test_a_queued_or_armed_repair_is_the_landers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queued = _held(170, _repair())
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    armed = _held(171, _repair())
+    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
+    rows = _engine_rows(tmp_path, capsys, queued, armed)
+    assert _repair_row(rows[170]) == ("LANDER", ["held", "repair", "in-queue"], OWNER_ID)
+    assert _repair_row(rows[171]) == ("LANDER", ["held", "repair", "auto-armed"], OWNER_ID)
+
+
+def test_repair_rows_sort_between_lander_and_author_and_show_the_owner(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prs = [_held(180), _held(181, _repair()), _pr(182)]
+    doc = {ENGINE: {"pages": [_page(prs)], "required": ENGINE_REQUIRED}}
+    _, rows = _run(tmp_path, doc, capsys, "--repo", ENGINE)
+    assert [(r["turn"], r["number"]) for r in rows] == [
+        ("LANDER", 182),
+        ("REPAIR", 181),
+        ("AUTHOR", 180),
+    ]
+    code, out = _run(tmp_path, doc, capsys, "--repo", ENGINE, json_out=False)
+    assert code == 0
+    line = next(x for x in out.splitlines() if x.startswith("REPAIR"))
+    assert line.split()[:4] == ["REPAIR", f"held,repair={OWNER_ID}", "MessageFoundry", "181"]
+
+
 # ---- the hold contract ---------------------------------------------------------------------------
 
 
