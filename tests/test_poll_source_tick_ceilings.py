@@ -23,7 +23,8 @@ import inspect
 import logging
 import posixpath
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -904,51 +905,112 @@ async def test_db_the_batch_holds_each_body_once_unless_the_mark_binds_it() -> N
 
 _REFUSING_CODEC = "mefor_test_refusing_codec"
 
+#: Synthetic stand-in for a row value a codec's own message quotes. Plain letters and digits, so no
+#: redaction pattern touches it, which is the case a third-party codec's message is.
+_CODEC_SENTINEL = "ZQXSENTINEL4921"
+
 
 def _refusing_codec(exc_type: type[Exception]) -> Callable[[str], codecs.CodecInfo | None]:
-    """A codec search function for a text codec whose encoder raises ``exc_type`` on every
-    non-empty input. It passes the build's ``"".encode(...)`` probe."""
+    """A codec search function for a text codec whose encoder and decoder raise ``exc_type`` on
+    every non-empty input, with a message that quotes :data:`_CODEC_SENTINEL`. It passes the
+    build's ``"".encode(...)`` probe."""
 
     def search(name: str) -> codecs.CodecInfo | None:
         if name != _REFUSING_CODEC:
             return None
 
-        def encode(text: str, errors: str = "strict") -> tuple[bytes, int]:
-            if text:
-                raise exc_type("refused")
-            return b"", 0
+        def refuse(value: Any, errors: str = "strict") -> Any:
+            if value:
+                raise exc_type(f"refused the value {_CODEC_SENTINEL}")
+            return (b"" if isinstance(value, str) else ""), 0
 
-        return codecs.CodecInfo(encode, codecs.lookup("ascii").decode, name=_REFUSING_CODEC)
+        return codecs.CodecInfo(refuse, refuse, name=_REFUSING_CODEC)
 
     return search
 
 
-@pytest.mark.parametrize("exc_type", [UnicodeError, LookupError, RuntimeError])
-async def test_db_a_codec_that_raises_something_else_skips_the_row(
-    exc_type: type[Exception],
-) -> None:
-    """A codec need not raise ``UnicodeEncodeError``. Whatever it raises, ``_select`` skips the row
-    and the poll goes on, rather than the error ending the poll as a poll failure that recurs on
-    every tick (BACKLOG #4921). The reason names the exception type, not the value.
-
-    Red mutation: catch only ``UnicodeEncodeError`` around the encode, and every case reds. Second
-    red mutation: drop the conversion in ``_through_codec``, and the ``LookupError`` and
-    ``RuntimeError`` cases red."""
+@contextmanager
+def _refusing_codec_source(
+    exc_type: type[Exception], value: object
+) -> Iterator[tuple[DatabaseSource, _RecordingHandler, _CapturingSink, _FakeTable]]:
+    """A source over two rows holding ``value``, whose ``encoding`` is :func:`_refusing_codec`,
+    registered for the ``with`` block only."""
     search = _refusing_codec(exc_type)
     codecs.register(search)
     try:
-        table = _FakeTable(0, rows=[(0, "A"), (1, "B")])
+        table = _FakeTable(0, rows=[(0, value), (1, value)])
         src = _db_source(encoding=_REFUSING_CODEC)
         _attach(src, table)
         sink = _CapturingSink()
         src.on_connection_event = sink
         handler = _RecordingHandler()
         src._handler = handler
-        await src._poll_once()
+        yield src, handler, sink, table
     finally:
         codecs.unregister(search)
+
+
+_CODEC_STEPS = pytest.mark.parametrize(
+    ("value", "step"),
+    [pytest.param("A", "encode", id="encode"), pytest.param(b"A", "decode", id="decode")],
+)
+
+
+@_CODEC_STEPS
+@pytest.mark.parametrize("exc_type", [UnicodeError, ValueError, LookupError, TypeError])
+async def test_db_a_codec_failure_skips_the_row_without_the_codec_message(
+    exc_type: type[Exception], value: object, step: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A codec need not raise ``UnicodeEncodeError``. For each failure a codec raises on a value it
+    cannot convert, ``_select`` skips the row and the poll goes on, rather than the error ending
+    the poll as a poll failure that recurs on every tick (BACKLOG #4921).
+
+    The codec's message, which here quotes a synthetic value, must not reach the reason, the event
+    or the log record: a ``row_undecodable`` reason never carries a row value (docs/PHI.md section
+    7, row 7). A ``UnicodeError`` is rendered by ``safe_exc`` from its attributes, a bare one as
+    its class alone; anything else becomes fixed text naming the step and the class.
+
+    Red mutation: re-raise a plain ``ValueError`` unchanged in ``_through_codec``, and the sentinel
+    reaches the reason in the ``ValueError`` cases. Second red mutation: drop ``LookupError`` or
+    ``TypeError`` from its catch, and that case ends the poll instead."""
+    with (
+        _refusing_codec_source(exc_type, value) as (src, handler, sink, table),
+        caplog.at_level(logging.DEBUG, logger=_DB_LOGGER),
+    ):
+        await src._poll_once()
     assert handler.bodies == []
     assert [kind for kind, _peer, _reason in sink.events] == ["row_undecodable", "row_undecodable"]
+    reasons = [reason or "" for _kind, _peer, reason in sink.events]
+    if exc_type is UnicodeError:
+        assert reasons == ["UnicodeError", "UnicodeError"]
+    else:
+        fixed = f"the configured encoding could not {step} the row ({exc_type.__name__})"
+        assert all(fixed in reason for reason in reasons)
+    assert all(_CODEC_SENTINEL not in reason for reason in reasons)
+    assert _CODEC_SENTINEL not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert len(table.rows) == 2  # not marked
+
+
+@pytest.mark.parametrize("value", [pytest.param("A", id="encode"), pytest.param(b"A", id="decode")])
+@pytest.mark.parametrize("exc_type", [RuntimeError, RecursionError, MemoryError])
+async def test_db_a_codec_fault_that_is_no_conversion_failure_ends_the_poll(
+    exc_type: type[Exception], value: object
+) -> None:
+    """Only what a codec raises for a value it cannot convert is a skip (CLAUDE.md section 6). A
+    codec's own bug or a resource failure propagates out of ``_poll_once``, which the poll loop
+    logs as a poll failure and retries next tick; nothing is handed off, emitted or marked
+    (BACKLOG #4921).
+
+    Red mutation: widen ``_through_codec``'s catch back to ``Exception``. The poll then skips the
+    rows and this reds."""
+    with (
+        _refusing_codec_source(exc_type, value) as (src, handler, sink, table),
+        pytest.raises(exc_type),
+    ):
+        await src._poll_once()
+    assert handler.bodies == []
+    assert sink.events == []
     assert len(table.rows) == 2  # not marked
 
 

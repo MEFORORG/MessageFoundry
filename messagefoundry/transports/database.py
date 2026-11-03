@@ -2643,8 +2643,9 @@ async def _probe_db(
 
 def _json_default(value: Any) -> Any:
     """JSON-serialize DB column types ``json.dumps`` can't handle natively (dates, ``Decimal``, bytes),
-    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError`` (surfaced as a
-    poll error and logged) rather than silently dropping data."""
+    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError``, which
+    :meth:`DatabaseSource._select` skips and reports as ``row_undecodable``, rather than silently
+    dropping data."""
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -3532,8 +3533,8 @@ class DatabaseSource(SourceConnector):
         """The bytes the handler gets for one row: a single column verbatim (``body_column``) or the
         whole row as JSON, encoded in the configured ``encoding``. A row that cannot become them
         raises ``ValueError`` or ``TypeError``, which :meth:`_select` skips. That includes a body
-        the encoding cannot carry (BACKLOG #4921): :meth:`_through_codec` makes every codec failure
-        a ``ValueError``."""
+        the encoding cannot carry (BACKLOG #4921): :meth:`_through_codec` makes each codec failure
+        it lists a ``ValueError``."""
         if self._body_column is not None:
             try:
                 value = record[self._body_column]
@@ -3550,18 +3551,23 @@ class DatabaseSource(SourceConnector):
         return self._through_codec(text.encode)
 
     def _through_codec[T](self, call: Callable[[str], T]) -> T:
-        """Run one decode or encode in the configured ``encoding``, so that whatever the codec
-        raises is a ``ValueError`` and :meth:`_select` skips the row (BACKLOG #4921). Any other
-        exception would end the poll instead, on every tick while the row stays. A ``UnicodeError``
-        is a ``ValueError`` already; the conversion covers a codec that raises something else,
-        such as a ``LookupError`` once the registry no longer finds it. It wraps only the codec
-        call, so a fault elsewhere in :meth:`_body` still surfaces as a poll failure."""
+        """Run one ``decode`` or ``encode`` in the configured ``encoding``, so that a codec's failure
+        on this row is a ``ValueError`` that :meth:`_select` skips (BACKLOG #4921).
+
+        A ``UnicodeError`` goes through as it is: ``safe_exc`` renders it from its attributes, never
+        its message. Any other ``ValueError``, a ``LookupError`` (a non-text or unregistered codec)
+        or a ``TypeError`` (a codec returning the wrong type) becomes fixed text naming the step and
+        the class, because a third-party codec's message can quote the value it refused, and a
+        ``row_undecodable`` reason never carries a row value. Anything else, such as ``MemoryError``
+        or a codec's own bug, propagates and ends the poll (CLAUDE.md section 6)."""
         try:
             return call(self._encoding)
-        except ValueError:
+        except UnicodeError:
             raise
-        except Exception as exc:  # noqa: BLE001 - a codec's failure is this row's, never the poll's
-            raise ValueError(f"the {self._encoding!r} codec raised {type(exc).__name__}") from exc
+        except (ValueError, LookupError, TypeError) as exc:
+            raise ValueError(
+                f"the configured encoding could not {call.__name__} the row ({type(exc).__name__})"
+            ) from None
 
     async def _mark(self, record: dict[str, Any]) -> None:
         if self._mark_sql is None:
