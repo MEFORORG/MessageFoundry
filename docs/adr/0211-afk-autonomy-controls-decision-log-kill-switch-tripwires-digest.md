@@ -424,7 +424,8 @@ roster alias of the Lander.
 > the age counting. This does not make a mark monotonic: at least unlocked writes on one shared session
 > id, which can land the lower counter last, and a pruned mark, which takes whichever counter fires next,
 > can each still cost one false refresh, and neither loops. A pool nobody has called for 20
-> minutes goes stale and reads UNKNOWN, so a healthy live flat account stays fresh and an idle one does
+> minutes goes stale and reads UNKNOWN unless a floor or a projected run-out holds it, so a healthy live
+> flat account stays fresh and an idle one does
 > not. The statusLine docs list the counter, as read on 2026-11-01. No real payload on this box was checked
 > for it; with no counter, nothing refreshes and the account goes stale as before. Whether a call that failed
 > still moves the counter is also unmeasured; such a call could confirm the old number. `usage.ps1`
@@ -449,13 +450,14 @@ roster alias of the Lander.
 > Desktop or SDK session only. So a halted Desktop session on a correctly wired root is told why and that
 > it cannot refresh the file. On a wiring fault that note replaces the publisher note, so the session is
 > told about the wiring instead. A terminal session on a correctly wired root gets the number with neither
-> note. The window's own state stays UNKNOWN, which is what the
+> note. The window's own state stays UNKNOWN, unless its history projects a run-out, which is what the
 > gate reads below the rung, so the verdict cannot clear anything.
 >
 > **A stale reading keeps a projected run-out, and nothing short of one.** Its history rows still give a
 > rate, and a projection to run out before the reset, or with no reset, makes the window CRITICAL, so the
 > gate hits on it within the rung's minutes (`HoldMin`, 60 by default) as it would on a fresh reading. The
-> run-out is counted from now, with the reading's age taken off, so one already past hits. The code
+> run-out is counted from now, with the reading's age taken off, for a fresh reading and a stale one alike,
+> so one already past hits. The code
 > before this amendment reached the same answer by restamping an idle repeat. Short of a run-out nothing
 > is projected: a fresh 70 percent whose rate does not run it out before the reset reads OK, and once
 > stale it answers REVIEW. From 90 to 97

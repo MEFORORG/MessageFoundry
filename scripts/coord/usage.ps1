@@ -606,14 +606,15 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         if ($age -gt $MaxAgeMinutes) {
             $rate = Get-Rate -CurrentResetEpoch $resetEpoch
             if ($rate -and $rate.PctPerHour -gt 0) {
-                $fromReading = (100.0 - $pct) / $rate.PctPerHour * 60.0
-                $toEmpty = [math]::Max(0, [math]::Round($fromReading - $age, 0))
-                if ($null -eq $minsToReset -or $toEmpty -lt $minsToReset) {
+                # The tense is chosen on the unrounded value, so a run-out seconds ahead is not "already".
+                $fromNow = (100.0 - $pct) / $rate.PctPerHour * 60.0 - $age
+                $toEmpty = [math]::Max(0.0, [math]::Round($fromNow, 0))
+                if ($null -eq $minsToReset -or $fromNow -lt $minsToReset) {
                     $o.state = "CRITICAL"
                     $o.rate_pct_per_hr = $rate.PctPerHour
                     $o.minutes_to_empty = $toEmpty
-                    $o.reason = if ($toEmpty -le 0) {
-                        "projected from its history rows to have already hit 100%, about $([math]::Round($age - $fromReading, 0)) min ago; $($o.reason)"
+                    $o.reason = if ($fromNow -le 0) {
+                        "projected from its history rows to have already hit 100%, about $([math]::Abs([math]::Round($fromNow, 0))) min ago; $($o.reason)"
                     }
                     else { "projected from its history rows to hit 100% about $toEmpty min from now; $($o.reason)" }
                 }
@@ -622,14 +623,18 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         return $o
     }
 
+    # A FRESH READING IS PROJECTED FROM NOW TOO, as the stale branch above is: the reset and the gate's
+    # HoldMin are counted from now, so the minutes since the reading come off the run-out and onto the
+    # burn to the reset. A reading dated ahead takes nothing off.
+    $elapsed = [math]::Max(0.0, [double]$age)
     $rate = Get-Rate -CurrentResetEpoch $resetEpoch
     if ($rate) {
         $o.rate_pct_per_hr = $rate.PctPerHour
         if ($null -ne $minsToReset -and $minsToReset -gt 0) {
-            $o.projected_at_reset = [math]::Round([math]::Min(100.0, $pct + $rate.PctPerHour * ($minsToReset / 60.0)), 1)
+            $o.projected_at_reset = [math]::Round([math]::Min(100.0, $pct + $rate.PctPerHour * (($minsToReset + $elapsed) / 60.0)), 1)
         }
         if ($rate.PctPerHour -gt 0) {
-            $o.minutes_to_empty = [math]::Round((100.0 - $pct) / $rate.PctPerHour * 60.0, 0)
+            $o.minutes_to_empty = [math]::Max(0.0, [math]::Round((100.0 - $pct) / $rate.PctPerHour * 60.0 - $elapsed, 0))
         }
     }
     else {
@@ -873,7 +878,7 @@ if ($dx.state -in $dxUntrusted) {
 # POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
 # reading on a box that does not use bash survives. Without this arm, a stale one fell through both
 # warnings and the operator saw no cause and no fix.
-elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN" -and -not (Test-WindowResetPassed $doc.seven_day)) {
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and ($seven.state -eq "UNKNOWN" -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
     Write-Host ""
     Write-Host "  WARNING -- this reading has not been confirmed lately, and the wiring may be why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
@@ -891,7 +896,7 @@ elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and $seven.state -eq "UNKNOWN" 
 # fresh" is the window's state. The three CAUSES are offered as alternatives, never asserted, because
 # nothing here can tell them apart.
 # NOT FOR A GONE WINDOW: that reading can be seconds old, so neither cause below is in play.
-elseif ($dx.state -eq "WIRED_HERE" -and $seven.state -eq "UNKNOWN" -and -not (Test-WindowResetPassed $doc.seven_day)) {
+elseif ($dx.state -eq "WIRED_HERE" -and ($seven.state -eq "UNKNOWN" -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
     # THE COLLECTOR CLAUSE IS CONDITIONAL, because WIRED_HERE does not always mean one was checked: a
     # wired command carrying a -StateDir but no recognisable collector assignment yields a null
     # collector path, which skips the Test-Path guard entirely. Asserting it exists would be asserting

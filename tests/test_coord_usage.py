@@ -562,8 +562,8 @@ def test_no_data_at_all_is_unknown_and_says_how_to_fix_it(tmp_path: Path) -> Non
 
 def test_a_stale_reading_with_no_rate_is_reported_and_projects_nothing(tmp_path: Path) -> None:
     """A dead publisher is the expected steady state here: the statusLine does not run headless, so the
-    coordinator itself can never publish. Extrapolating from an hour-old number would be a confident
-    answer about a window that may already have reset."""
+    coordinator itself can never publish. With no history rows there is no rate, and nothing is
+    projected from the number alone. A stale reading whose rows project a run-out is the other case."""
     publish(tmp_path, seven=71.0, age_min=75)
     code, d = read(tmp_path)
     assert code == UNKNOWN
@@ -665,6 +665,29 @@ def test_a_stale_run_out_already_past_is_critical_and_says_so(tmp_path: Path) ->
     assert code == CRITICAL and doc["seven_day"]["state"] == "CRITICAL", doc
     assert doc["seven_day"]["minutes_to_empty"] == 0, doc
     assert "already" in doc["seven_day"]["reason"] and "in ~" not in doc["seven_day"]["reason"], doc
+
+
+def test_a_stale_run_out_ahead_is_counted_from_now(tmp_path: Path) -> None:
+    """80 with rows at 85 and 25 minutes ago runs out about 67 minutes after the reading, so about 42
+    minutes from now."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=80.0, age_min=25, seven_epoch=epoch)
+    write_history(tmp_path, [(85.0, 62.0), (25.0, 80.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["minutes_to_empty"] == pytest.approx(42, abs=1), (
+        doc
+    )
+    assert "min from now" in doc["seven_day"]["reason"], doc
+
+
+def test_a_fresh_run_out_is_counted_from_now(tmp_path: Path) -> None:
+    """19 minutes old at 80 percent an hour from 80 runs out 15 minutes after the reading, so 4 minutes
+    ago, before the reset 10 minutes from now. Counted from the reading it read OK."""
+    epoch = int(time.time()) + 600
+    publish(tmp_path, seven=80.0, age_min=19, seven_epoch=epoch)
+    write_history(tmp_path, [(34.0, 60.0), (19.0, 80.0)], epoch)
+    code, doc = read(tmp_path)
+    assert code == CRITICAL and doc["seven_day"]["minutes_to_empty"] == 0, doc
 
 
 def test_a_stale_reading_whose_rows_do_not_reach_a_run_out_stays_unknown(tmp_path: Path) -> None:

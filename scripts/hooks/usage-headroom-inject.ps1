@@ -85,10 +85,10 @@
 
     A DESKTOP SESSION GETS A SECOND, LABELLED SOURCE (BACKLOG #1459; seat decision under owner
     delegation 2026-10-08, not an owner ruling). A Desktop or SDK session never runs a statusLine, so
-    on a Desktop-only config root the statusLine reading stays UNKNOWN for good. When it is UNKNOWN for
-    such a session, or stale but held as a level_floor under any verdict, the hook also reads the
-    Steward's out-of-repo `status.json` and prints it as its own block. Four rules keep it from passing
-    as a statusLine reading:
+    on a Desktop-only config root the statusLine reading stays UNKNOWN for good. For such a session the
+    hook also reads the Steward's out-of-repo `status.json` and prints it as its own block, at least when
+    the reading is UNKNOWN, held as a level_floor, or stale under any verdict; `$unconfirmed` below is the
+    test. Four rules keep it from passing as a statusLine reading:
 
       Its own label. Every line it prints says where it came from, and its verdict line never
       replaces the statusLine verdict above it.

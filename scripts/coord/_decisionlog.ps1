@@ -871,7 +871,8 @@ function Get-DecisionCostRung {
       usage.ps1 gives it a level_floor at its number on any provenance unless its reset has passed, and
       a projection stays CRITICAL with its rate, so the rate branch below can hit too.
 
-      UNKNOWN when the reading is missing, stale and not a floor at the rung, refused, past its reset (it
+      UNKNOWN when the reading is missing, stale with neither a floor at the rung nor a projected
+      run-out inside HoldMin, refused, past its reset (it
       describes a window that is gone, so it neither clears nor halts), below the rung with no reset
       time (it cannot prove which window it belongs to), or usage.ps1 calls it UNKNOWN overall (its
       overall UNKNOWN also carries its refusal of a statusLine wired to another root, which the
@@ -947,7 +948,8 @@ function Get-DecisionCostRung {
     } elseif ($null -ne $rate -and [double]$rate -gt 0) {
         $cut = $null -ne $toEmpty -and ($null -eq $toReset -or [double]$toEmpty -lt [double]$toReset)
         if ($cut -and [double]$toEmpty -le $lv.HoldMin) {
-            New-DecisionRung 'HIT' "$at. Projected to run out in about $toEmpty min, before the window resets"
+            $when = if ([double]$toEmpty -le 0) { "Projected to have run out already" } else { "Projected to run out in about $toEmpty min" }
+            New-DecisionRung 'HIT' "$at. $when, before the window resets"
         } else {
             New-DecisionRung 'OK' "$at. The burn rate governs, and it does not reach the rung"
         }

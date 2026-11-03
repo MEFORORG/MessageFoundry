@@ -755,7 +755,7 @@ def _set_rows(state: Path, rows: list[tuple[datetime, int]], resets: int | None)
 @pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
 def test_an_idle_stale_reading_with_a_rate_halts(sb: Sandbox, tmp_path: Path, pinned: bool) -> None:
     """89 with rows at 89 and 25 minutes ago, then an idle repeat through the real collector. The code
-    before restamped it and HALTed on about 19 minutes to empty."""
+    before restamped it and HALTed on about 19 minutes to empty, which have passed."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
@@ -772,7 +772,7 @@ def test_an_idle_stale_reading_with_a_rate_halts(sb: Sandbox, tmp_path: Path, pi
     assert _fire(sb, state, seven, fire_env).returncode == 0
     seed_vault(sb, calibrated("manager"))
     code, doc = _real_gate(sb, env)
-    assert code == HALT and "Projected to run out" in why(doc), why(doc)
+    assert code == HALT and "Projected to have run out already" in why(doc), why(doc)
 
 
 def test_a_stale_run_out_inside_holdmin_from_now_halts(sb: Sandbox, tmp_path: Path) -> None:
