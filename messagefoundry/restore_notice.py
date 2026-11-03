@@ -4,11 +4,8 @@
 
 ``messagefoundry restore`` places the archive's whole store, so every change written to the store
 after the archive was taken is gone from the one it places. Every notice an operator acts on after
-a restore carries :data:`RESTORE_ROLLBACK_NOTICE` whole: the ``store_restored`` alert
-(``pipeline.alerts.store_restored_detail``), the ``restore`` command's summary and its age refusal
-(``pipeline.dr_backup``), and the ``--allow-old-archive`` help. The restore section of
-``docs/EARLY-ADOPTER-GUIDE.md`` names every class in :data:`RESTORE_ROLLBACK_CLASSES`, and
-``tests/test_b5094_restore_rollback_notice.py`` pins all of them to this module.
+a restore carries :data:`RESTORE_ROLLBACK_NOTICE` whole, and the adopter guide's restore section
+names every class in :data:`RESTORE_ROLLBACK_CLASSES`; a test pins both.
 
 A leaf with no imports, because the CLI builds its parser from it and the CLI's startup import
 budget (``tests/test_startup_import_budget.py``) names each engine module it loads.

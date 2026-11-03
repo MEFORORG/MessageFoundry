@@ -101,7 +101,6 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 0
     out = capsys.readouterr().out
     assert "newest audit row in it 20" in out
-    assert "must be re-applied by hand" in out
     assert RESTORE_ROLLBACK_NOTICE in out  # BACKLOG #5094: the CLI prints the one statement whole
     # Worded from the restore's own count (none here: the archive holds no session), never as
     # "every session" whether or not its revoke ran.

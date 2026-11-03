@@ -683,17 +683,16 @@ decrypts it, and writes the store. It **refuses to overwrite** an existing store
 `--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
 with `messagefoundry restore-verify <archive>`.
 
-**A restore brings back the archive's accounts as they were (BACKLOG #2614)**: users, password
-hashes, roles, second factors and sessions. So the restore ends every session in the store it
+**A restore brings back the archive's whole store, accounts and sessions included (BACKLOG
+#2614).** So the restore ends every session in the store it
 places and writes a marker into it. The first `serve` on that store, wherever it has been moved,
 revokes every session again, writes one `store_restored` audit row naming the archive's SHA-256,
 its age and the time of its newest audit row, and raises a `store_restored` alert. Every user signs
 in again. Other commands that open the store, such as `provision-admin`, leave the marker for that
-start. The engine does not re-apply
-changes made after the archive was taken.
+start.
 
-**What a restore rolls back (BACKLOG #5094).** A restore puts back the archive's whole store, so
-every change made after its newest audit row is undone. Re-apply by hand at least these:
+**What a restore rolls back (BACKLOG #5094).** Every change made after the archive's newest audit
+row is undone, and the engine does not re-apply any of it. Re-apply by hand at least these:
 
 - account creations, disables, enables and deletes;
 - role changes and custom roles;
@@ -704,10 +703,9 @@ every change made after its newest audit row is undone. Re-apply by hand at leas
 - channel scopes;
 - AD group-to-role and AD group-to-scope maps.
 
-Read the source's audit log, or its off-host copy, for the changes themselves. The source of record
-for this list is `messagefoundry/restore_notice.py`. The `store_restored` alert, the `restore`
-summary, its age refusal and the `--allow-old-archive` help all print it from there, and a test
-fails if this list misses a class it names.
+Read the source's audit log, or its off-host copy, for the changes themselves. The
+`store_restored` alert, the `restore` summary, its age refusal and the `--allow-old-archive` help
+all print this list.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,

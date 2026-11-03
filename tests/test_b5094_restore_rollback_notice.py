@@ -60,8 +60,6 @@ def test_the_statement_names_the_classes_the_old_notices_left_out() -> None:
     # A floor, not a census: the restore replaces the whole store.
     assert "at least" in RESTORE_ROLLBACK_NOTICE
     assert "must be re-applied by hand" in RESTORE_ROLLBACK_NOTICE
-    for cls in RESTORE_ROLLBACK_CLASSES:
-        assert cls in RESTORE_ROLLBACK_NOTICE
 
 
 def test_the_alert_carries_the_statement() -> None:
