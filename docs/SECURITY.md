@@ -4723,15 +4723,16 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   The global row is not sealed, so whoever can write the database could lower it and revive a
   session that only the global epoch had ended. Deleting the row takes the same write access, the
   same threat, and what follows it differs by store. On SQLite the next writable open seeds the
-  row again at 0, which revives such a session the same way. On Postgres and SQL Server an
-  ordinary open skips the schema batch while its `schema_meta` marker matches (ADR 0064), so the
-  row stays missing until that batch runs again. At least these run it, and each seeds the row at
-  0 with the same effect, reporting nothing about it: `provision-schema`, in either
-  `schema_management` mode; and under `auto`, an open after `DELETE FROM schema_meta`, or the
-  first open of a build whose schema batch differs. While the row is missing, at least every user
-  read refuses with an error naming it, and so does every every-account revoke. So does a
-  sign-in or a session check that reaches the account read; a session check that ends a lapsed
-  session, or a row that fails its seal, returns before that read.
+  row again at 0, which revives such a session if it was stamped 0. On Postgres and SQL Server
+  both an ordinary open and `provision-schema` skip the schema batch while its `schema_meta`
+  marker matches (ADR 0064), so the row stays missing until that batch runs again. At least these
+  run it, and each seeds the row at 0 with the same effect, reporting nothing about it:
+  `provision-schema` once `DELETE FROM schema_meta` has cleared the marker, and under
+  `schema_management = auto` an open after that delete, or the first open of a build whose
+  schema batch differs. This was read from the code and has not been run against a server. While
+  the row is missing, at least these refuse with an error naming it: a read of an existing
+  account's user record that a sign-in or a session check makes, and every every-account revoke.
+  A request that returns before that read is refused as it would be anyway.
   **The exception,** for every sweep this bullet names: a request from a missed session to end
   the user's other sessions, accepted just before the sweep commits, waits for it and then stamps
   the session with the account's new epoch, so it stays usable. Against the every-account revoke
@@ -4743,9 +4744,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   account, so such a request can see a session's old stamps beside the account's new epochs. On
   the session the revoke kept, at least the revoker's own under the every-account revoke and the
   caller's under a per-account revoke that keeps it, it ends that session. On a session the revoke
-  had already ended, its end changes nothing. Both are reported as a seal failure, as below. The account's own epoch
-  already did this before the global epoch was added. The fix is a single read that joins the
-  session to both epochs; it is not yet filed.
+  had already ended, its end changes nothing. Both are reported as a seal failure, as below. The
+  account's own epoch already did this before the global epoch was added. The fix is a single
+  read that joins the session to both epochs; it is not yet filed.
   **At least three things are also wrong about a refused one.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. The report is rate-limited per session, and the alert goes through the alert notifier's
@@ -4757,8 +4758,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
   until the session is presented or listed, the store still holds it as live. A follow-up row,
   not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
-  session, so no rotated session is missed. That would not change the -1 count. The Postgres store follows a rotated row and the SQLite store runs one writer at a
-  time, so neither misses a rotated session. The rotation miss was read from the code and has not
+  session, so no rotated session is missed. That would not change the -1 count. The Postgres
+  store follows a rotated row and the SQLite store runs one writer at a time, so neither misses a
+  rotated session. The rotation miss was read from the code and has not
   been reproduced against a server. A bind ends sessions only: an engine factor already enrolled
   on the account stays.
 - **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
