@@ -1780,25 +1780,35 @@ driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `
 to its own default port, and the check cannot see that. Check that your driver reads the keyword.
 
 **On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
-string is built and by the egress check (BACKLOG #4873). Both run when the engine starts or
-reloads, and in `messagefoundry check` where its build leg runs: with a `messagefoundry.toml` or
-`MEFOR_AI_ENVIRONMENT`, and for a `DatabaseRef` only once its `env()` values resolve. This holds
-for all four database factories, since `db_lookup` and `DatabaseRef` build the preset. The preset
-sends `SERVER=<server>,<port>`, and the port pin and the host match assume the driver reads
-`,<port>` as the port and the text before it as one host. psqlODBC does not: it passes `SERVER` to
-libpq, which reads a comma as a list of hosts. There the port would be read as a second host name,
-which can resolve as a numeric address, and a comma in `server` could name any host.
+string is built and by the egress check (BACKLOG #4873). This holds for all four database
+factories, since `db_lookup` and `DatabaseRef` build the preset. When each runs:
 
-- The `odbc_driver` must be one of Microsoft's registered names, whole, in any case and spacing:
-  `ODBC Driver <n> for SQL Server` or `SQL Server Native Client <n>`. A path is accepted when its
-  file name is the Microsoft ODBC Driver library (`libmsodbcsql-18.so`, `libmsodbcsql.18.dylib`,
-  `msodbcsql18.dll`, with a version suffix allowed). Any other name is refused, at least a mixed
-  name such as `PostgreSQL via SQL Server gateway`, a vendor driver whose name mentions SQL Server,
-  FreeTDS, and the bare legacy `SQL Server`, which on Linux is commonly a FreeTDS alias. FreeTDS
-  reads `,<port>` as the port, but nothing shows it reads the preset's TLS keywords, `Encrypt` and
-  `TrustServerCertificate`, so a hop the engine reports as verifying TLS could then not verify.
-  For another driver, use `dialect="generic"` on `Database` or `DatabasePoll`; `db_lookup` and
-  `DatabaseRef` take only a Microsoft driver.
+- For `Database`, `DatabasePoll` and `db_lookup`, both run when the engine starts or reloads, and
+  in `messagefoundry check` where its build leg runs, with a `messagefoundry.toml` or
+  `MEFOR_AI_ENVIRONMENT`.
+- For a `DatabaseRef`, both run at each sync, and the first sync runs at start. The build also
+  runs at a reload, a dry run included, and in that `messagefoundry check` leg, once its `env()`
+  values resolve, so each case below still fails there. The egress check runs only at sync.
+
+The preset sends `SERVER=<server>,<port>`, and the port pin and the host match assume the driver
+reads `,<port>` as the port and the text before it as one host. psqlODBC does not: it passes
+`SERVER` to libpq, which reads a comma as a list of hosts. There the port would be read as a
+second host name, which can resolve as a numeric address, and a comma in `server` could name any
+host.
+
+- The `odbc_driver` must be one of Microsoft's registered names, whole, in any case:
+  `ODBC Driver <n> for SQL Server` or `SQL Server Native Client <n>`, where `<n>` is a version
+  such as `18`, `13.1` or `11.0`. Blanks are read as written, since the driver manager looks a
+  name up as written and another spelling can be a separate alias: one space between words, none
+  at either end, and no tab or other control character. A path is accepted when its file name,
+  in any case, is the Microsoft ODBC Driver library (`libmsodbcsql-18.so`,
+  `libmsodbcsql.18.dylib`, `msodbcsql18.dll`, with a version suffix allowed). Any other name is
+  refused, at least a mixed name such as `PostgreSQL via SQL Server gateway`, a vendor driver
+  whose name mentions SQL Server, FreeTDS, and the bare legacy `SQL Server`, which on Linux is
+  commonly a FreeTDS alias. FreeTDS reads `,<port>` as the port, but nothing shows it reads the
+  preset's TLS keywords, `Encrypt` and `TrustServerCertificate`, so a hop the engine reports as
+  verifying TLS could then not verify. For another driver, use `dialect="generic"` on `Database`
+  or `DatabasePoll`; `db_lookup` and `DatabaseRef` take only a Microsoft driver.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
 - `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
   the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
