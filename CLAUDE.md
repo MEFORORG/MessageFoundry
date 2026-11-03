@@ -464,20 +464,20 @@ Manager proposal, the owner answered *"Tiers 1 and 2"*). This covers a hold the 
 does not take, so the Repair Manager is the spawned Manager that paragraph sends a non-trivial fix
 or a second hold to. An acknowledgement is an author comment or commit; the `hold-ack` marker
 `scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every seat acts as the
-owner's GitHub identity, only the original author's own comment or commit counts: one from the
-Lander, another seat or a workflow is not one, including the Lander's branch updates. The author may
-also hand the PR over sooner. The PR must not be queued or carry an armed auto-merge request. The
-Lander spawns one Manager for repairs in its own CCD instance, so `send_message` can wake it, and
-keeps it alive, respawning it if it dies. The transfer is, in order: the repair-owner marker
-`<!-- repair-owner session=<id> -->` on the PR, mail to the original author's seat-record
-worktree where it has one, and the hold's URL sent to the Repair Manager as its brief. At least
-stacks, landing order, author intent and anything already waiting on an owner ruling stay with
-the original author. Like the Lander and the Watchdog, the Repair Manager
-never uses `AskUserQuestion`; an owner question its own repair raises goes in a table. It never
-opens a PR, enqueues or merges. Its Builders fetch before they push, never force-push, and stop
-if the head moved since the hold. Every repair head it pushes takes the Lander's own independent
-review the paragraph above requires, before the merge. The procedure is in korus
-`roles/LANDER.md` and `roles/MANAGER.md`.
+owner's GitHub identity, only the original author's comment or commit counts, a commit its own
+Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
+branch updates included. The author may also hand the PR over sooner. The PR must not be queued
+or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own CCD
+instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
+transfer is, in order: the repair-owner marker `<!-- repair-owner session=<id> -->` on the PR,
+mail to the original author's seat-record worktree where it has one, and the hold's URL sent to
+the Repair Manager as its brief. At least stacks, landing order, author intent and anything
+already waiting on an owner ruling stay with the original author. Like the Lander and the
+Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
+raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
+push, never force-push, and stop if the head moved, as the paragraph above says. Every repair
+head it pushes takes the Lander's own independent review the paragraph above requires, before
+the merge. The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
@@ -491,8 +491,9 @@ session start. While it is on, the grants this section takes from the plan are o
 plan waits for the owner's go again, and the two class A acts and the cache-only `-Force` in
 `docs/WORKTREES.md` go back to the owner. A delegated question (the merge bullet below) is the
 owner's own answer, and the switch does not touch it. The Lander, the Watchdog and the Repair
-Manager keep their exemption: they never use `AskUserQuestion`, and put an owner question in a table instead. A
-Builder still gets one turn: it puts an owner question in its report, never in `AskUserQuestion`.
+Manager keep their exemption: they never use `AskUserQuestion`, and put an owner question in a
+table instead. A Builder still gets one turn: it puts an owner question in its report, never in
+`AskUserQuestion`.
 
 The brief is disposable. The BACKLOG item is the record.
 
