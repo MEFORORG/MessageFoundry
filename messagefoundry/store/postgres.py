@@ -6426,20 +6426,14 @@ class PostgresStore:
         ):
             await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
             await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(bound * 1000))
+            sql = (
+                "INSERT INTO connection_flag (connection, direction) VALUES ($1, $2)"
+                " ON CONFLICT (connection, direction) DO NOTHING"
+                if flagged
+                else "DELETE FROM connection_flag WHERE connection=$1 AND direction=$2"
+            )
             try:
-                if flagged:
-                    await conn.execute(
-                        "INSERT INTO connection_flag (connection, direction) VALUES ($1, $2)"
-                        " ON CONFLICT (connection, direction) DO NOTHING",
-                        connection,
-                        direction,
-                    )
-                else:
-                    await conn.execute(
-                        "DELETE FROM connection_flag WHERE connection=$1 AND direction=$2",
-                        connection,
-                        direction,
-                    )
+                await conn.execute(sql, connection, direction)
             except Exception as exc:
                 if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
                     raise ConnectionFlagLockTimeout(self.backend, bound) from exc
