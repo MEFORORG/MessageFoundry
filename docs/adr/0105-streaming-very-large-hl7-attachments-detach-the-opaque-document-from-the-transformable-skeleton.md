@@ -275,15 +275,20 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   permanently by the binding below.
 - **A handle resolves only to its own message's attachment (BACKLOG #5099, added 2026-11-03).** The
   delivery seam reads the content addresses the row's message holds (`attachments_for`, the
-  `message_attachment` linkage the ingress commit writes; replay and resend keep the message id) and
+  `message_attachment` linkage the ingress commit writes; replay and an unedited resend keep the
+  message id) and
   passes them to the re-attach as `bound`. A handle that is malformed, names any other address, or
   sits where the splice does not reach (`NTE-3`, a second `OBX-5.5` repetition), raises
   `UnreattachableDocumentError` before any read, so the row dead-letters alone rather than
   re-pending on a strict-FIFO lane. The ingress detach refuses a received body whose `OBX-5.5`
   already holds a handle (`InboundDocRefError`, an `ERROR` row and an `AR` before the ACK) instead
-  of skipping it as already detached. An edit-and-resend body is a new child message that holds no
-  attachment, so a handle in it is refused at delivery. A `mfdoc:v1:pruned:` tombstone resolves
-  nothing and is carried as text.
+  of skipping it as already detached. A pass-through child, an edit-and-resubmit child and an
+  edit-and-resend child each carry a body under a new message id, so the store links each child
+  to the parent's documents its body names, with one reference of its own, in the commit that
+  makes it (`_inherit_attachments`). Purging either message then releases only its own reference.
+  A handle naming a document the parent does not hold is not linked, and is refused at delivery.
+  An operator upload and a loopback reply are new bodies, not a parent's, and inherit nothing. A
+  `mfdoc:v1:pruned:` tombstone resolves nothing and is carried as text.
 - **Delivery is a pure READ — never a decref.** A message fans out to multiple outbounds and is
   replayable, so each send **reads** the immutable, content-addressed attachment per-send and leaves the
   refcount untouched; the refcount is released **only** at retention/purge (below). This makes retry

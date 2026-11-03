@@ -1011,6 +1011,18 @@ _NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
 )
 
 
+def attachments_named(held: Iterable[str], body: str) -> list[str]:
+    """The content addresses in ``held`` that ``body`` names, for a child message that inherits
+    its parent's documents (BACKLOG #5099). A content address is lowercase hex, which an HL7
+    delimiter escape rewrites only when MSH-2 names a hex digit, so a substring test finds a handle
+    wherever the body carries it and the store stays parsing-free. Where MSH-2 does name one, the
+    address is not found and delivery refuses the child's handle: it fails closed. Only a named
+    document is inherited: a child
+    whose Handler dropped the document holds none, so the child's channel cannot download it, and
+    retention is not kept waiting on a document no row of the child can deliver."""
+    return [ref for ref in held if ref in body]
+
+
 @dataclass(frozen=True)
 class ReingressOutcome:
     """The result of a :meth:`QueueStore.reingress` (edit-and-resubmit re-route, ADR 0090 §9,
@@ -10925,6 +10937,28 @@ class MessageStore:
             f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}) AND {_NOT_PT_MARKER_Q})))"
         )
 
+    async def _inherit_attachments(self, child_id: str, parent_id: str, body: str) -> None:
+        """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
+        in the CALLER's transaction (BACKLOG #5099). A pass-through, edit-and-resubmit or
+        edit-and-resend child carries its parent's skeleton under a new message id, and delivery
+        resolves a handle only against the row's own message, so the child must hold the documents
+        it carries. Each holder keeps its own reference, so purging either releases only its own and
+        ``refcount`` still equals the live linkage rows. :func:`attachments_named` says why only a
+        named document is inherited."""
+        cur = await self._db.execute(
+            "SELECT attachment_id FROM message_attachment WHERE message_id=?", (parent_id,)
+        )
+        held = [str(r["attachment_id"]) for r in await cur.fetchall()]
+        for ref in attachments_named(held, body):
+            await self._db.execute(
+                "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
+                (child_id, ref),
+            )
+            # The parent's live linkage row keeps the header at refcount >= 1, so it exists.
+            await self._db.execute(
+                "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+            )
+
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
         transaction — the standalone form of the retention decref (#149, ADR 0105 Phase 3a). Idempotent: a
@@ -12633,6 +12667,7 @@ class MessageStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
+            await self._inherit_attachments(new_mid, parent_id, body)
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
             # Hoist the row id so the ingress payload binds to its own row tag.
@@ -13979,6 +14014,7 @@ class MessageStore:
                     origin=MessageOrigin.OPERATOR_EDIT,
                     origin_actor=actor,
                 )
+                await self._inherit_attachments(child_mid, message_id, body)
                 await self._event(
                     child_mid, "received", None, f"edit-resend from {message_id}", now
                 )
@@ -14184,6 +14220,7 @@ class MessageStore:
                     origin=MessageOrigin.OPERATOR_EDIT,
                     origin_actor=actor,
                 )
+                await self._inherit_attachments(new_mid, origin_message_id, raw)
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
                 # Hoist the row id so the payload binds to its own row tag.
                 resubmit_row_id = uuid4().hex

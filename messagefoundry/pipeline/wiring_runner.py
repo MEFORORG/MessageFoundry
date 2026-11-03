@@ -9064,8 +9064,11 @@ class RegistryRunner:
 
         A handle resolves only to an attachment ``message_id`` holds, read from the store's
         ``message_attachment`` linkage (BACKLOG #5099). The detach writes that linkage in the
-        ingress commit, and replay and resend keep the message id, so every handle the engine wrote
-        stays resolvable. A handle naming anything else, or a malformed one, is the payload's text
+        ingress commit. Replay and an unedited resend keep the message id. A pass-through child, an
+        edit-and-resubmit child and an edit-and-resend child carry the body under a new id, and the
+        store links each to the parent's documents that body names, in the commit that makes it. So
+        every handle the engine wrote stays resolvable. A handle naming anything else, or a
+        malformed one, is the payload's text
         and a permanent refusal of this row alone, so it never holds a strict-FIFO lane on retries.
         The gate opens on an escaped marker too
         (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), so a payload whose delimiters

@@ -342,3 +342,162 @@ async def test_a_sender_tombstone_resolves_nothing_and_rides_as_text(store: Mess
     _mid, _rows = await _deliver(store, runner, body)
 
     assert col.deliveries == [body]
+
+
+# --- a child the engine makes holds the documents its body names ------------------------------
+#
+# A pass-through child, an edit-and-resubmit child and an edit-and-resend child each carry an
+# earlier message's skeleton under a NEW message id. The binding resolves a handle only against
+# the row's own message, so each child must hold the documents its body names, or every detached
+# document routed through such a path dead-letters at delivery.
+
+
+async def _detached_parent(store: MessageStore, doc: str) -> tuple[str, str, str]:
+    """A message the ingress detach made: it holds ``doc`` as an attachment and its raw is the
+    skeleton. Returns ``(message_id, ref, skeleton)``."""
+    ref = await store.put_attachment(chunk_b64(doc), "application/pdf")
+    skeleton = _hl7(make_doc_ref(ref, "Application"))
+    mid = await store.enqueue_ingress(channel_id="IB_STREAM", raw=skeleton, attachment_refs=[ref])
+    return mid, ref, skeleton
+
+
+async def _refcount(store: MessageStore, ref: str) -> int | None:
+    cur = await store._db.execute("SELECT refcount FROM attachment WHERE id=?", (ref,))
+    row = await cur.fetchone()
+    return None if row is None else int(row[0])
+
+
+async def _deliver_queued(store: MessageStore, runner: RegistryRunner, message_id: str) -> None:
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None and item.message_id == message_id
+    await runner._process_delivery_item(DEST, item)
+
+
+async def _passthrough_child(store: MessageStore, parent: str, body: str) -> str:
+    """Hand ``body`` from ``parent`` into a pass-through inbound, as a Handler's ``Send`` does,
+    then route and transform the child to ``DEST``. Returns the child's message id."""
+    ingress = await store.claim_next_fifo("IB_STREAM", stage="ingress")
+    assert ingress is not None and ingress.message_id == parent
+    assert await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=parent,
+        channel_id="IB_STREAM",
+        handlers=[("h", body)],
+        disposition=MessageStatus.ROUTED,
+    )
+    routed = await store.claim_next_fifo("IB_STREAM", stage="routed")
+    assert routed is not None
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=parent,
+        channel_id="IB_STREAM",
+        deliveries=[],
+        pt_deliveries=[("PT_NEXT", body)],
+    )
+    child_ingress = await store.claim_next_fifo("PT_NEXT", stage="ingress")
+    assert child_ingress is not None and child_ingress.message_id != parent
+    child = child_ingress.message_id
+    assert await store.route_handoff(
+        ingress_id=child_ingress.id,
+        message_id=child,
+        channel_id="PT_NEXT",
+        handlers=[("h_child", body)],
+        disposition=MessageStatus.ROUTED,
+    )
+    child_routed = await store.claim_next_fifo("PT_NEXT", stage="routed")
+    assert child_routed is not None
+    await store.transform_handoff(
+        routed_id=child_routed.id,
+        message_id=child,
+        channel_id="PT_NEXT",
+        deliveries=[(DEST, body)],
+    )
+    return child
+
+
+async def test_a_passthrough_child_delivers_the_document_its_parent_detached(
+    store: MessageStore,
+) -> None:
+    doc = _b64(1500)
+    parent, ref, skeleton = await _detached_parent(store, doc)
+    child = await _passthrough_child(store, parent, skeleton)
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    await _deliver_queued(store, runner, child)
+
+    assert [Message.parse(d).field("OBX-5.5") for d in col.deliveries] == [doc]
+    assert [r["attachment_id"] for r in await store.attachments_for(child)] == [ref]
+
+
+async def test_a_child_holds_its_own_reference_so_either_purge_keeps_the_count(
+    store: MessageStore,
+) -> None:
+    parent, ref, skeleton = await _detached_parent(store, _b64(1500))
+    child = await _passthrough_child(store, parent, skeleton)
+    assert await _refcount(store, ref) == 2
+
+    await store.release_message_attachments(parent)
+    assert await _refcount(store, ref) == 1  # the child still holds the document
+    assert [r["attachment_id"] for r in await store.attachments_for(child)] == [ref]
+
+    await store.release_message_attachments(child)
+    assert await _refcount(store, ref) is None  # the last holder gone, the document is collected
+
+
+async def test_a_passthrough_child_holds_only_the_documents_its_body_names(
+    store: MessageStore,
+) -> None:
+    parent, _ref, _skeleton = await _detached_parent(store, _b64(1500))
+    # The Handler dropped the document: the child's body names none, so the child holds none.
+    child = await _passthrough_child(store, parent, _hl7("plain text"))
+    assert list(await store.attachments_for(child)) == []
+
+
+async def test_an_edit_and_resubmit_child_delivers_the_origins_document(
+    store: MessageStore,
+) -> None:
+    from tests._store_audit import no_operator_audit
+
+    doc = _b64(1500)
+    origin, ref, skeleton = await _detached_parent(store, doc)
+    # A foreign handle the operator typed in names an attachment the origin does not hold.
+    _other, foreign = await _held_document(store, _b64(1500, b"S"))
+    edited = skeleton + f"NTE|1||{foreign}\r"
+
+    outcome = await store.reingress(
+        origin_message_id=origin, raw=edited, idempotency_key="k-5099", audit=no_operator_audit
+    )
+
+    assert outcome.status == "resubmitted"
+    assert [r["attachment_id"] for r in await store.attachments_for(outcome.new_message_id)] == [
+        ref
+    ]
+    assert await _refcount(store, foreign) == 1  # never linked to the child
+
+
+async def test_an_edit_and_resend_child_delivers_the_origins_document(
+    store: MessageStore,
+) -> None:
+    from tests._store_audit import no_operator_audit
+
+    doc = _b64(1500)
+    origin, ref, skeleton = await _detached_parent(store, doc)
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    outcome = await store.resend_to(
+        message_id=origin,
+        to=DEST,
+        idempotency_key="k-5099-direct",
+        body_override=skeleton,
+        audit=no_operator_audit,
+    )
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None and item.message_id != origin
+    await runner._process_delivery_item(DEST, item)
+
+    assert outcome.status == "resent"
+    assert [Message.parse(d).field("OBX-5.5") for d in col.deliveries] == [doc]

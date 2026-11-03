@@ -289,6 +289,7 @@ from messagefoundry.store.store import (
     approval_fails_seal,
     approval_tombstone,
     approval_update,
+    attachments_named,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -907,6 +908,14 @@ _SQL_SELECT_MESSAGE_STATUS: Final[str] = (
 )
 _SQL_UPDATE_MESSAGE_STATUS: Final[str] = "UPDATE messages SET status=? WHERE id=?"
 _SQL_SELECT_MESSAGE_EXISTS: Final[str] = "SELECT 1 FROM messages WHERE id=?"
+# A child message inherits the documents its body names (BACKLOG #5099, _inherit_attachments).
+_SQL_SELECT_MESSAGE_ATTACHMENTS: Final[str] = (
+    "SELECT attachment_id FROM message_attachment WHERE message_id=?"
+)
+_SQL_INSERT_MESSAGE_ATTACHMENT: Final[str] = (
+    "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)"
+)
+_SQL_INCREF_ATTACHMENT: Final[str] = "UPDATE attachment SET refcount = refcount + 1 WHERE id=?"
 # The channel rides along because the metadata cell is bound to it (BACKLOG #2593).
 _SQL_SELECT_METADATA: Final[str] = "SELECT channel_id, metadata FROM messages WHERE id=?"
 _SQL_UPDATE_METADATA: Final[str] = (
@@ -6285,6 +6294,7 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
+            await self._inherit_attachments(cur, new_mid, parent_id, body)
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             await cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
@@ -6376,6 +6386,7 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
+            self._inherit_attachments_sync(cur, new_mid, parent_id, body)
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
@@ -11371,6 +11382,26 @@ class SqlServerStore:
             f" AND {_NOT_PT_MARKER_Q})))"
         )
 
+    async def _inherit_attachments(
+        self, cur: Any, child_id: str, parent_id: str, body: str
+    ) -> None:
+        """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
+        in the CALLER's transaction (BACKLOG #5099). SQL Server twin of
+        :meth:`MessageStore._inherit_attachments`, which says why."""
+        await cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
+        held = [str(r[0]) for r in await cur.fetchall()]
+        for ref in attachments_named(held, body):
+            await cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
+            await cur.execute(_SQL_INCREF_ATTACHMENT, (ref,))
+
+    def _inherit_attachments_sync(self, cur: Any, child_id: str, parent_id: str, body: str) -> None:
+        """Synchronous twin of :meth:`_inherit_attachments` (ADR 0071 B5)."""
+        cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
+        held = [str(r[0]) for r in cur.fetchall()]
+        for ref in attachments_named(held, body):
+            cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
+            cur.execute(_SQL_INCREF_ATTACHMENT, (ref,))
+
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
         transaction — the standalone form of the retention decref (#149, ADR 0105). Idempotent: a re-run
@@ -11828,6 +11859,7 @@ class SqlServerStore:
                             ),
                         )
                         self.body_copies += 1  # A1: the child messages.raw copy
+                        await self._inherit_attachments(cur, child_mid, message_id, body)
                         await self._event(
                             cur, child_mid, "received", None, f"edit-resend from {message_id}", now
                         )
@@ -12083,6 +12115,7 @@ class SqlServerStore:
                                 actor,
                             ),
                         )
+                        await self._inherit_attachments(cur, new_mid, origin_message_id, raw)
                         # Hoist the row id so the payload binds to its own row tag.
                         resubmit_row_id = uuid4().hex
                         await cur.execute(

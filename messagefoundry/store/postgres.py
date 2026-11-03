@@ -289,6 +289,7 @@ from messagefoundry.store.store import (
     approval_fails_seal,
     approval_tombstone,
     approval_update,
+    attachments_named,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -3998,6 +3999,7 @@ class PostgresStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
+            await self._inherit_attachments(conn, new_mid, parent_id, body)
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
             # Hoist the row id so the payload binds to its own row tag.
@@ -7093,6 +7095,23 @@ class PostgresStore:
         ]
         return where, params
 
+    async def _inherit_attachments(
+        self, conn: Any, child_id: str, parent_id: str, body: str
+    ) -> None:
+        """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
+        in the CALLER's transaction (BACKLOG #5099). Postgres twin of
+        :meth:`MessageStore._inherit_attachments`, which says why."""
+        rows = await conn.fetch(
+            "SELECT attachment_id FROM message_attachment WHERE message_id=$1", parent_id
+        )
+        for ref in attachments_named([str(r["attachment_id"]) for r in rows], body):
+            await conn.execute(
+                "INSERT INTO message_attachment (message_id, attachment_id) VALUES ($1,$2)",
+                child_id,
+                ref,
+            )
+            await conn.execute("UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref)
+
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
         transaction — the standalone form of the retention decref (#149, ADR 0105). Idempotent: a re-run
@@ -7566,6 +7585,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
+                    await self._inherit_attachments(conn, child_mid, message_id, body)
                     await self._event(
                         conn, child_mid, "received", None, f"edit-resend from {message_id}", now
                     )
@@ -7754,6 +7774,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
+                    await self._inherit_attachments(conn, new_mid, origin_message_id, raw)
                     # Hoist the row id so the payload binds to its own row tag.
                     resubmit_row_id = uuid4().hex
                     await conn.execute(
