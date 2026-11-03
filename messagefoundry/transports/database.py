@@ -2961,8 +2961,8 @@ def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> st
     the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, would mark every row it
     matches, but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the
     rows past the ceiling would be marked and never ingested, and so would at least a row whose
-    handler failed (:meth:`DatabaseSource._poll_once` goes on to the next row) and the rows a stop
-    leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
+    handler failed, the rows behind it (:meth:`DatabaseSource._poll_once` stops the batch there,
+    BACKLOG #4921) and the rows a stop leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
     the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
@@ -3337,30 +3337,47 @@ class DatabaseSource(SourceConnector):
             # unwinding late cannot clear the flag of a task a later start() made.
             self._row_step_task = me
             try:
-                await self._ingest_row(record, body)
+                handed_off = await self._ingest_row(record, body)
             finally:
                 if self._row_step_task is me:
                     self._row_step_task = None
+            if not handed_off:
+                # BACKLOG #4921. Stop at the first handler failure: no later row of this poll is
+                # handed off or marked. A high-water-mark mark_statement would otherwise run on the
+                # next row and move the cursor past the failed one, which the next poll would then
+                # never select. The failed row and every row behind it wait for the next poll, so
+                # a row that fails every time holds back the rows behind it (head-of-line).
+                break
 
-    async def _ingest_row(self, record: dict[str, Any], body: str) -> None:
-        """Hand one row to the pipeline, then mark it. A cancelled stop() lets this step run for up
-        to :data:`_ROW_STEP_GRACE_S` before it cuts it, so the step is NOT atomic under shutdown."""
+    async def _ingest_row(self, record: dict[str, Any], body: str) -> bool:
+        """Hand one row to the pipeline, then mark it. Returns False when the handler raised, and
+        True once the row was handed off, whether or not its mark then failed. A cancelled stop()
+        lets this step run for up to :data:`_ROW_STEP_GRACE_S` before it cuts it, so the step is
+        NOT atomic under shutdown."""
         assert self._handler is not None
         try:
             await self._handler(body.encode(self._encoding))
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
-            # returns, so an exception here is an infrastructure failure (the durable store write
-            # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
-            # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            # returns, so an exception here is usually an infrastructure failure (the durable store
+            # write failed), but it can be row-specific too, such as SQL Server's 2628 truncation in
+            # the store write. Leave the row UNMARKED so the next poll re-emits it (at-least-once) —
+            # marking it now would drop a received-but-unrecorded message (mirrors the File source's
+            # M-15). The event makes the stall visible when the row fails every time (#4921).
             # _safe_db_error: on a server store the handler's write is itself a driver call, and a
             # rejection quotes the value it refused, as SQL Server's 2628 truncation and asyncpg's
             # DETAIL line do (#1661).
+            reason = _safe_db_error(exc)
             logger.warning(
-                "DATABASE source handler failed (row left unmarked, will retry): %s",
-                _safe_db_error(exc),
+                "DATABASE source handler failed (row left unmarked, will retry; the rest of this "
+                "poll's rows are left for the next poll): %s",
+                reason,
             )
-            return
+            await self._emit_event(
+                "handler_error",
+                reason=f"{reason}; row left unmarked, poll stopped, retried next poll",
+            )
+            return False
         try:
             await self._mark(record)
         except Exception as exc:
@@ -3373,6 +3390,7 @@ class DatabaseSource(SourceConnector):
                 "DATABASE source mark failed (row will re-emit, a duplicate): %s",
                 _safe_db_error(exc),
             )
+        return True
 
     async def _select(self) -> _PolledBatch:
         """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most

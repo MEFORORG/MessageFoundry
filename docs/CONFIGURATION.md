@@ -2809,10 +2809,10 @@ and failover recovery rather than concurrent multi-node draining). The brief ove
 transition (the old leader's last in-flight poll vs. the new leader's first) is bounded by the same
 at-least-once guarantees that cover a crash mid-poll — the file rename, the database source's
 mark-after-hand-off, and the downstream queue's idempotent handoff make a re-read a tolerated
-duplicate, never data loss. For a `database` source at least two shapes break that: a
-`poll_statement` that writes, which the read-only test on it does not always catch, and a
-high-water-mark `mark_statement`, whose mark on a later row advances the cursor past a row whose
-handler failed; see the [Database source](CONNECTIONS.md#database-source--databasepoll) section. The
+duplicate, never data loss. For a `database` source at least one shape breaks that: a
+`poll_statement` that writes, which the read-only test on it does not always catch. How a
+high-water-mark `mark_statement` meets a failed or unreadable row is in the
+[Database source](CONNECTIONS.md#database-source--databasepoll) section. The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.

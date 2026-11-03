@@ -956,13 +956,16 @@ def _src(**over: Any) -> DatabaseSource:
 
 
 class _RecordingHandler:
-    def __init__(self, exc: Exception | None = None) -> None:
+    """Records each body; raises ``exc`` for every body, or only those in ``fail_on`` when given."""
+
+    def __init__(self, exc: Exception | None = None, *, fail_on: set[bytes] | None = None) -> None:
         self.bodies: list[bytes] = []
         self._exc = exc
+        self._fail_on = fail_on
 
     async def __call__(self, raw: bytes) -> str | None:
         self.bodies.append(raw)
-        if self._exc is not None:
+        if self._exc is not None and (self._fail_on is None or raw in self._fail_on):
             raise self._exc
         return None
 
@@ -1107,6 +1110,67 @@ async def test_source_handler_failure_leaves_row_unmarked() -> None:
     cur = await _run_poll(src, ["id", "payload"], [(1, "AAA")], h)
     assert h.bodies == [b"AAA"]  # handler was attempted
     assert cur.marks == []  # but the row is NOT marked → it re-emits next poll (at-least-once)
+
+
+class _EventSink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None, str | None]] = []
+
+    async def __call__(self, kind: str, peer_host: str | None, reason: str | None) -> None:
+        self.events.append((kind, peer_host, reason))
+
+
+async def test_source_handler_failure_stops_the_batch_so_no_later_row_is_marked() -> None:
+    """BACKLOG #4921. With a high-water-mark ``mark_statement``, a later row's mark advances the
+    cursor past an earlier row whose handler failed, and the next poll never selects that row
+    again. So a handler failure stops the poll: the row before it is handed off and marked, and no
+    row after it is handed off or marked.
+
+    Red mutation: drop the ``break`` on a failed hand-off in ``_poll_once``. Row 3 is then handed
+    off and marked, and both assertions red."""
+    src = _src(body_column="payload")
+    h = _RecordingHandler(RuntimeError("store write failed"), fail_on={b"B"})
+    cur = await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B"), (3, "C")], h)
+    assert h.bodies == [b"A", b"B"]  # row 3 is never handed off this poll
+    assert cur.marks == [("UPDATE mf_inbox SET status='DONE' WHERE id=?", (1,))]
+
+
+async def test_source_handler_failure_emits_a_handler_error_event() -> None:
+    """BACKLOG #4921, the visibility half. Stopping the batch means one row that fails every time
+    holds the feed, so the failure must reach the event log, not only a WARNING. One event per
+    poll, NULL peer (a poll source dials out), and a reason that names the driver error but never
+    the value it quotes.
+
+    Red mutation: delete the ``_emit_event`` call in ``_ingest_row``. Reds here."""
+    truncated = (
+        "[22001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]String or binary data would "
+        "be truncated in table 'mf.dbo.messages', column 'control_id'. Truncated value: "
+        f"'MRN{_SYNTHETIC_ID}'. (2628) (SQLExecDirectW)"
+    )
+    src = _src(body_column="payload")
+    sink = _EventSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler(exc=_driver_exc("22001", truncated))  # every row would fail
+    await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B")], h)
+    assert [(kind, peer) for kind, peer, _reason in sink.events] == [("handler_error", None)]
+    reason = sink.events[0][2] or ""
+    assert "[22001] driver error 2628" in reason
+    assert "poll stopped" in reason
+    assert _SYNTHETIC_ID not in reason
+
+
+async def test_source_success_and_mark_failure_emit_no_handler_error_event() -> None:
+    """Only a handler failure emits the event: a clean row and a row whose mark failed (the row
+    was ingested, so the batch goes on) emit nothing."""
+    src = _src(body_column="payload")
+    sink = _EventSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler()
+    await _run_poll(
+        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
+    )
+    assert h.bodies == [b"A", b"B"]
+    assert sink.events == []
 
 
 async def test_source_mark_failure_does_not_abort_batch_tail() -> None:

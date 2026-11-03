@@ -2286,11 +2286,21 @@ just runs whatever statement you declare, bound from the row.
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
-**unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
-`poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
-`mark_statement`. After a handler failure the poller goes on to the next row, and that row's mark
-advances the cursor past the failed one, so the failed row is never read again. Where that matters,
-mark with a status column or a delete-from-queue. A `poll_statement` the read-only test refuses never
+**unmarked** so it retries — never marked-and-dropped. A `poll_statement` that writes breaks that
+(see the `poll_statement` row above). **A handler failure also stops the poll at that row** (BACKLOG
+#4921): no later row of the same poll is handed off or marked, and the next poll starts again from
+what is still unmarked. That keeps a high-water-mark `mark_statement` from moving the cursor past
+a failed row: a later row's mark would otherwise do so, and the poll would never select the failed
+row again. **The trade-off is head-of-line blocking.** A row whose handler fails on every attempt,
+such as one whose value a server store rejects as too long, holds back every row `poll_statement`
+returns after it, on every poll and whatever the mark shape; with an `ORDER BY` on the cursor or key
+that is the whole feed. Each failure logs a WARNING and emits a `handler_error` connection event,
+once per poll. Its reason renders the error the way the log line does: a driver error as its type,
+SQLSTATE and native error number, never its message. Repair or remove that row to release the feed.
+**A row the source cannot decode is different:** it is skipped rather than stopped at (see
+[per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
+still moves the cursor past it, and its `row_undecodable` event is the record of it.
+A `poll_statement` the read-only test refuses never
 reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
 run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
 kills the poller; it retries next interval.
