@@ -31,7 +31,7 @@ import base64
 import binascii
 import re
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -74,6 +74,7 @@ __all__ = [
     "BinaryCarriageError",
     "DocRefError",
     "EscapedDocumentError",
+    "InboundDocRefError",
     "UnreattachableDocumentError",
     "encode",
     "decode",
@@ -83,6 +84,7 @@ __all__ = [
     "is_document_tombstone",
     "make_document_tombstone",
     "is_doc_ref",
+    "may_hold_doc_ref",
     "make_doc_ref",
     "parse_doc_ref",
     "iter_obx_documents",
@@ -124,11 +126,22 @@ class EscapedDocumentError(ValueError):
     message instead. The text names the OBX occurrence only, never a byte of the value."""
 
 
+class InboundDocRefError(ValueError):
+    """A received body's ``OBX-5.5`` already holds a live ``mfdoc:v1:ref:`` document handle
+    (BACKLOG #5099). Only the engine's own detach writes a handle, after the body is received, so
+    one that arrives with the body is the sender's text. The ingress detach refuses the message
+    rather than treat the value as already detached. The text names the OBX occurrence only, never
+    a byte of the value."""
+
+
 class UnreattachableDocumentError(ValueError):
-    """The payload itself stops a re-attach (vault BACKLOG #2809). Two shapes only: the parser
-    refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault`` set), or its
-    MSH-1 and MSH-2 do not name its separators. The same payload fails the same way on every
-    attempt, so the delivery path refuses it permanently. Every other
+    """The payload itself stops a re-attach (vault BACKLOG #2809, BACKLOG #5099). At least these
+    shapes: the parser refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault``
+    set); its MSH-1 and MSH-2 do not name its separators; an ``OBX-5.5`` handle is malformed; a
+    handle names an attachment its own message does not hold; or a handle sits somewhere the
+    re-attach does not splice, such as ``NTE-3`` or a second ``OBX-5.5`` repetition. The same
+    payload fails the same way on every attempt, so the delivery path refuses it permanently.
+    Every other
     ``ValueError`` in the re-attach may be an engine fault and stays the outbound's internal-error
     policy to judge, at least a parser fault and a stored document that holds a CR or LF. The
     ingress detach refuses an escape and a raw LF ends the segment, so no payload can leave a stored
@@ -295,6 +308,32 @@ def is_doc_ref(value: str) -> bool:
     return value.startswith(DOC_REF_MARKER)
 
 
+#: Every character of the handle marker. A payload whose MSH-1 or MSH-2 names one of them as a
+#: separator or the escape character carries an engine handle escaped, so the marker is not in its
+#: raw text (BACKLOG #5099).
+_DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
+
+
+def may_hold_doc_ref(text: str) -> bool:
+    """Whether a delivery payload may carry a live document handle the re-attach must resolve
+    (BACKLOG #5099). The delivery path's cheap gate ahead of a parse.
+
+    True when the marker is in the raw text. Also true for an HL7 payload whose MSH-1 or MSH-2
+    names a character of the marker: there an engine handle written into ``OBX-5.5`` is escaped,
+    so the raw text never holds the marker, and a substring test alone let the handle reach the
+    wire unresolved. A handle hidden by any other escape cannot be the engine's, which escapes
+    only the delimiters, so it is the sender's text and resolves nothing unless the gate opens for
+    another handle, where the re-attach parses and checks it. False otherwise."""
+    if DOC_REF_MARKER in text:
+        return True
+    head = text.lstrip()[:16]
+    if not head.startswith("MSH") or len(head) < 4:
+        return False
+    end = head.find(head[3], 4)
+    delimiters = head[3:end] if end != -1 else head[3:]
+    return not _DOC_REF_MARKER_CHARS.isdisjoint(delimiters)
+
+
 def make_doc_ref(sha256: str, content_type: str) -> str:
     """Build a live document handle ``mfdoc:v1:ref:<sha256>:<content-type>`` (#149, ADR 0105) for a
     detached, content-addressed document. ``sha256`` is the content address (the SHA-256 hex of the
@@ -382,16 +421,26 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
     ``message`` whose base64 length is at least ``min_b64_len`` (#149, ADR 0105 Phase 1a).
 
     Mirrors :func:`strip_documents_in_hl7`'s qualifying-embed scan (``OBX-2 == "ED"``, ``OBX-5.4`` is
-    ``"Base64"``, ``OBX-5.5`` non-empty and not already a tombstone **or** a live ``mfdoc:v1:ref:``
-    handle — a re-scan of an already-detached skeleton yields nothing, so a re-run is a no-op). The
+    ``"Base64"``, ``OBX-5.5`` non-empty and not already a tombstone). It runs once, on the received
+    body, never on a skeleton, so a live ``mfdoc:v1:ref:`` handle is refused below rather than
+    skipped as already detached (BACKLOG #5099). The
     ``content_type`` is the ED type-of-data component (``OBX-5.2``), the same label the tombstone uses.
     Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``.
 
     Raises :class:`EscapedDocumentError` when any ED Base64 ``OBX-5.5`` holds the escape character,
-    whose value would be decoded rather than verbatim (vault BACKLOG #2809). Every document is checked
-    before the first is yielded, so a caller that stores each one as it goes has stored none of them
-    when the refusal comes."""
+    whose value would be decoded rather than verbatim (vault BACKLOG #2809), and
+    :class:`InboundDocRefError` when any ``OBX-5.5``, ED or not, already holds a live handle: only
+    this detach writes one, so a received one is the sender's (BACKLOG #5099). Every OBX is checked
+    before the first document is yielded, so a caller that stores each one as it goes has stored
+    none of them when the refusal comes."""
     count = message.count_segments("OBX")
+    for occ in range(1, count + 1):
+        # Every OBX, as the delivery re-attach resolves a handle in any OBX-5.5 first repetition.
+        if is_doc_ref(message.field("OBX-5.5", occurrence=occ) or ""):
+            raise InboundDocRefError(
+                f"OBX occurrence {occ}: OBX-5.5 already holds a document handle, which only the "
+                "engine writes; refusing a received value that would name a stored attachment"
+            )
     occurrences = [occ for occ in range(1, count + 1) if _is_base64_ed(message, occ)]
     for occ in occurrences:
         if _obx_5_5_holds_escape(message, occ):
@@ -402,8 +451,8 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
             )
     for occ in occurrences:
         data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
-        if not data_b64 or is_document_tombstone(data_b64) or is_doc_ref(data_b64):
-            continue  # empty / already-stripped / already-detached — idempotent
+        if not data_b64 or is_document_tombstone(data_b64):
+            continue  # empty / already-stripped: a tombstone resolves nothing, so it rides as text
         if len(data_b64) < min_b64_len:
             continue
         ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
@@ -544,7 +593,7 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
 
 
 async def reattach_documents_in_hl7(
-    text: str, reader: Callable[[str], Awaitable[str | None]]
+    text: str, reader: Callable[[str], Awaitable[str | None]], *, bound: Collection[str]
 ) -> str:
     """Re-materialize every detached document handle in an HL7 body — the delivery-side inverse of the
     ingress detach (#149, ADR 0105 Phase 1b, Approach B — VERBATIM).
@@ -562,15 +611,22 @@ async def reattach_documents_in_hl7(
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
     :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
-    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The two
+    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The
     payload-caused shapes :class:`UnreattachableDocumentError` names raise it; every other
-    ``ValueError`` propagates as it is, a stored document holding a CR or LF included."""
+    ``ValueError`` propagates as it is, a stored document holding a CR or LF included.
+
+    ``bound`` is the content addresses the payload's own message holds, which the caller reads from
+    the store's ``message_attachment`` linkage (BACKLOG #5099). A handle naming any other address is
+    refused before ``reader`` runs, so a value the sender wrote cannot name another message's
+    document. When ``bound`` is not empty, an escaped handle marker anywhere the splice does not reach
+    is refused too, so a handle a Handler copied elsewhere is never emitted."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
     # there, and only the engine calls this function.
     import asyncio
 
+    from messagefoundry.parsing._builtin_hl7 import escape_leaf
     from messagefoundry.parsing.message import Message
     from messagefoundry.parsing.peek import HL7PeekError
 
@@ -580,7 +636,7 @@ async def reattach_documents_in_hl7(
     # at a 64 MiB document and stayed about 0.1 s at 15 MiB: the splice's escape pass over the whole
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
-    def _handles() -> tuple[Message, list[tuple[int, str]]]:
+    def _handles() -> tuple[Message, list[tuple[int, str]], int]:
         refused: str | None = None
         try:
             message = Message.parse(text)
@@ -602,11 +658,32 @@ async def reattach_documents_in_hl7(
         for occ in range(1, message.count_segments("OBX") + 1):
             value = message.field("OBX-5.5", occurrence=occ) or ""
             if is_doc_ref(value):
-                # DocRefError on a malformed handle -> fail loud, before any read.
-                found.append((occ, parse_doc_ref(value)[0]))
-        return message, found
+                try:
+                    found.append((occ, parse_doc_ref(value)[0]))
+                except DocRefError:
+                    # The payload's own text, refused the same way on every attempt (BACKLOG
+                    # #5099), and before any read. Raised after the handler, so the error, which
+                    # quotes the value, is on no chain.
+                    refused = f"OBX-5.5 occurrence {occ} holds a malformed document handle"
+                if refused is not None:
+                    raise UnreattachableDocumentError(refused)
+        # The marker as Message.set writes it under this payload's delimiters: a handle the engine
+        # wrote, or a Handler copied, carries exactly this text wherever it sits.
+        field_sep, comp_sep, rep_sep, esc, sub_sep = message._encoding_chars()
+        marker = escape_leaf(DOC_REF_MARKER, (field_sep, comp_sep, rep_sep, sub_sep, esc))
+        return message, found, text.count(marker)
 
-    message, handles = await asyncio.to_thread(_handles)
+    message, handles, markers = await asyncio.to_thread(_handles)
+    for occ, sha256 in handles:
+        if sha256 not in bound:
+            raise UnreattachableDocumentError(
+                f"the document handle in OBX-5.5 occurrence {occ} names an attachment its message "
+                "does not hold"
+            )
+    if bound and markers > len(handles):
+        raise UnreattachableDocumentError(
+            "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
+        )
     if not handles:
         # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
         # DOC_REF_MARKER substring gate may pass on a marker sitting outside an OBX-5.5 ED value; that is

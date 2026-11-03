@@ -133,13 +133,14 @@ from messagefoundry.parsing import (
     validate,
 )
 from messagefoundry.parsing.binary import (
-    DOC_REF_MARKER,
     DocRefError,
     EscapedDocumentError,
+    InboundDocRefError,
     UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
+    may_hold_doc_ref,
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
@@ -935,6 +936,7 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     StreamingAttachmentsUnsupported,
     DocRefError,
     EscapedDocumentError,
+    InboundDocRefError,
 )
 
 
@@ -8541,6 +8543,8 @@ class RegistryRunner:
                 # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
+                elif isinstance(exc, InboundDocRefError):
+                    nak_code, nak_text = "AR", "document handle in OBX-5.5"
                 else:
                     nak_code, nak_text = "AE", "streaming detach failed"
                 ack = (
@@ -9035,7 +9039,7 @@ class RegistryRunner:
             return None
         return {str(k): v for k, v in loaded.items() if isinstance(v, str)}
 
-    async def _hydrate_payload(self, payload: str) -> str:
+    async def _hydrate_payload(self, payload: str, message_id: str) -> str:
         """Re-attach any detached very-large document into ``payload`` at the terminal egress, just
         before it hits the wire (#149, ADR 0105 Phase 1b). A delivery/skeleton row carries a small
         ``mfdoc:v1:ref:`` handle in ``OBX-5.5``; splice the stored VERBATIM base64 back in (Approach B —
@@ -9056,9 +9060,19 @@ class RegistryRunner:
         :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
         other ``ValueError`` propagates to the outbound's internal-error policy, a stored document
         holding a CR or LF included: no payload can cause one, so it is store corruption or an
-        engine bug."""
-        if DOC_REF_MARKER not in payload:
+        engine bug.
+
+        A handle resolves only to an attachment ``message_id`` holds, read from the store's
+        ``message_attachment`` linkage (BACKLOG #5099). The detach writes that linkage in the
+        ingress commit, and replay and resend keep the message id, so every handle the engine wrote
+        stays resolvable. A handle naming anything else, or a malformed one, is the payload's text
+        and a permanent refusal of this row alone, so it never holds a strict-FIFO lane on retries.
+        The gate opens on an escaped marker too
+        (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), so a payload whose delimiters
+        escape the engine's own handle is re-attached rather than sent with the handle in it."""
+        if not may_hold_doc_ref(payload):
             return payload  # no detached document → byte-identical, no store read (the common path)
+        bound = {str(row["attachment_id"]) for row in await self.store.attachments_for(message_id)}
 
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces
@@ -9069,16 +9083,18 @@ class RegistryRunner:
             return await _read_from_store("attachment read", _join)
 
         try:
-            return await reattach_documents_in_hl7(payload, _reader)
+            return await reattach_documents_in_hl7(payload, _reader, bound=bound)
         except (DocRefError, KeyError, StreamingAttachmentsUnsupported) as exc:
-            # A missing/GC'd attachment (KeyError), a malformed handle (DocRefError), or an unsupported
-            # backend — surface as a retryable DeliveryError (the message reached NEITHER wire nor peer),
+            # A missing/GC'd attachment the message still holds (KeyError, or DocRefError when the read
+            # comes back empty), or an unsupported backend — surface as a retryable DeliveryError (the message reached NEITHER wire nor peer),
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only these two failures, which the MESSAGE causes: the payload does not parse as HL7, or its
-            # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809). The same payload fails
+            # Only failures the MESSAGE causes: the payload does not parse as HL7, or its MSH-1 and
+            # MSH-2 do not name its separators (vault BACKLOG #2809), or a handle is malformed, names
+            # an attachment its message does not hold, or sits outside the splice (BACKLOG #5099).
+            # The same payload fails
             # the same way on every attempt, so a retry could never succeed: refuse it permanently,
             # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
             # fault in the re-attach, a stored document holding a CR or LF included, still reaches
@@ -9209,7 +9225,9 @@ class RegistryRunner:
                 # live (vault #2756).
                 if _frames(connector):
                     try:
-                        connector.check_frame(await self._hydrate_payload(item.payload))
+                        connector.check_frame(
+                            await self._hydrate_payload(item.payload, item.message_id)
+                        )
                     except NegativeAckError:
                         raise
                     except DeliveryError as exc:
@@ -9228,7 +9246,7 @@ class RegistryRunner:
                 # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
                 # payload with no handle is returned byte-identical; a missing attachment raises a
                 # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
-                payload = await self._hydrate_payload(item.payload)
+                payload = await self._hydrate_payload(item.payload, item.message_id)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
                     # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
@@ -9614,7 +9632,7 @@ class RegistryRunner:
             unhydratable: list[_RefusedMember] = []
             for it in items:
                 try:
-                    hydrated.append(await self._hydrate_payload(it.payload))
+                    hydrated.append(await self._hydrate_payload(it.payload, it.message_id))
                 except NegativeAckError as exc:
                     unhydratable.append((it.id, safe_exc(exc), exc.with_traceback(None)))
                 else:
