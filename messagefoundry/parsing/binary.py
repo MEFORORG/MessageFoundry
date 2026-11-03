@@ -34,6 +34,12 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Iterator
 from typing import TYPE_CHECKING
 
+from messagefoundry.parsing._builtin_hl7 import (
+    _SEPARATOR_HEAD,
+    _extract_separators,
+    _whitespace_end,
+)
+
 if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
     # is one-way (message.py imports binary.py, never the reverse) and there is no import cycle.
@@ -313,9 +319,13 @@ def is_doc_ref(value: str) -> bool:
 #: raw text (BACKLOG #5099).
 _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
-#: The whitespace before a payload's first segment, matched rather than stripped so the gate never
-#: copies a large payload.
-_LEADING_SPACE = re.compile(r"\s*")
+#: The first MSH segment after a batch header, the one ``Message.set`` escapes by.
+_FIRST_MSH = re.compile(r"[\r\n]MSH")
+
+#: The re-attach's refusal of a handle left where the splice does not reach (BACKLOG #5099).
+_UNSPLICED_HANDLE = (
+    "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
+)
 
 
 def may_hold_doc_ref(text: str) -> bool:
@@ -332,8 +342,7 @@ def may_hold_doc_ref(text: str) -> bool:
     re-attach parses and checks it. False otherwise."""
     if DOC_REF_MARKER in text:
         return True
-    space = _LEADING_SPACE.match(text)
-    lead = space.end() if space else 0
+    lead = _whitespace_end(text, 0, len(text))
     head = text[lead : lead + 3]
     if head == "MSH":
         return _header_names_marker_char(text, lead)
@@ -341,21 +350,18 @@ def may_hold_doc_ref(text: str) -> bool:
         return False
     if _header_names_marker_char(text, lead):
         return True
-    starts = [i for i in (text.find("\rMSH", lead), text.find("\nMSH", lead)) if i != -1]
-    return bool(starts) and _header_names_marker_char(text, min(starts) + 1)
+    first_msh = _FIRST_MSH.search(text, lead)
+    return first_msh is not None and _header_names_marker_char(text, first_msh.start() + 1)
 
 
 def _header_names_marker_char(text: str, start: int) -> bool:
-    """Whether the MSH, FHS or BHS segment at ``start`` names a character of the marker in its
-    field separator or its four encoding characters. A segment with no complete set of four is
-    False: ``Message.set`` refuses such a payload, so no engine handle can be in it."""
-    window = text[start + 3 : start + 16]
-    if not window:
+    """Whether the MSH, FHS or BHS segment at ``start`` names a character of the marker as a
+    separator or the escape character, read as the parser reads them (its defaults fill a short
+    MSH-2, which only opens the gate wider)."""
+    line = text[start : start + _SEPARATOR_HEAD]
+    if len(line) < 4:
         return False
-    end = window.find(window[0], 1)
-    if end - 1 < 4:
-        return False
-    return not _DOC_REF_MARKER_CHARS.isdisjoint(window[:end])
+    return not _DOC_REF_MARKER_CHARS.isdisjoint(_extract_separators(line))
 
 
 def make_doc_ref(sha256: str, content_type: str) -> str:
@@ -457,15 +463,16 @@ def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tu
     this detach writes one, so a received one is the sender's (BACKLOG #5099). Every OBX is checked
     before the first document is yielded, so a caller that stores each one as it goes has stored
     none of them when the refusal comes."""
-    count = message.count_segments("OBX")
-    for occ in range(1, count + 1):
+    occurrences: list[int] = []
+    for occ in range(1, message.count_segments("OBX") + 1):
         # Every OBX, as the delivery re-attach resolves a handle in any OBX-5.5 first repetition.
         if is_doc_ref(message.field("OBX-5.5", occurrence=occ) or ""):
             raise InboundDocRefError(
                 f"OBX occurrence {occ}: OBX-5.5 already holds a document handle, which only the "
                 "engine writes; refusing a received value that would name a stored attachment"
             )
-    occurrences = [occ for occ in range(1, count + 1) if _is_base64_ed(message, occ)]
+        if _is_base64_ed(message, occ):
+            occurrences.append(occ)
     for occ in occurrences:
         if _obx_5_5_holds_escape(message, occ):
             raise EscapedDocumentError(
@@ -650,7 +657,6 @@ async def reattach_documents_in_hl7(
     # there, and only the engine calls this function.
     import asyncio
 
-    from messagefoundry.parsing._builtin_hl7 import escape_leaf
     from messagefoundry.parsing.message import Message
     from messagefoundry.parsing.peek import HL7PeekError
 
@@ -693,8 +699,10 @@ async def reattach_documents_in_hl7(
                     raise UnreattachableDocumentError(refused)
         # The marker as Message.set writes it under this payload's delimiters: a handle the engine
         # wrote, or a Handler copied, carries exactly this text wherever it sits.
-        field_sep, comp_sep, rep_sep, esc, sub_sep = message._encoding_chars()
-        marker = escape_leaf(DOC_REF_MARKER, (field_sep, comp_sep, rep_sep, sub_sep, esc))
+        marker = Message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
+        if bound and not found and marker in text:
+            # No handle to splice, so the text is what would be sent: a marker in it is a copy.
+            raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, marker
 
     message, handles, marker = await asyncio.to_thread(_handles)
@@ -704,10 +712,6 @@ async def reattach_documents_in_hl7(
                 f"the document handle in OBX-5.5 occurrence {occ} names an attachment its message "
                 "does not hold"
             )
-    if bound and text.count(marker) > len(handles):
-        raise UnreattachableDocumentError(
-            "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
-        )
     if not handles:
         # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
         # gate may pass on a marker sitting outside an OBX-5.5 value of a message that holds no
@@ -739,14 +743,12 @@ async def reattach_documents_in_hl7(
 
     def _encode() -> str:
         spliced = message.encode()
-        # The count check above is cheap but can be offset: a handle the parser reads through a
-        # hex escape is a handle the raw text does not hold as the marker, so one copy elsewhere
-        # would pass it. Every handle has now been replaced by base64, which holds no ':' and no
-        # escape character, so any marker left is a copy the splice did not reach (BACKLOG #5099).
+        # Every handle has now been replaced by base64, which holds no ':' and no escape
+        # character, so any marker left is a copy the splice did not reach (BACKLOG #5099). Read
+        # from the spliced text, not counted beforehand: a handle the parser reads through a hex
+        # escape is not the marker in the raw text, so a count could be offset by one copy.
         if marker in spliced:
-            raise UnreattachableDocumentError(
-                "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
-            )
+            raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return spliced
 
     return await asyncio.to_thread(_encode)

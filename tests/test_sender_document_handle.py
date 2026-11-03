@@ -132,9 +132,7 @@ async def _deliver(store: MessageStore, runner: RegistryRunner, payload: str) ->
     mid = await store.enqueue_message(
         channel_id="IB_SENDER", raw=payload, deliveries=[(DEST, payload)], now=100.0
     )
-    item = await store.claim_next_fifo(DEST)
-    assert item is not None and item.message_id == mid
-    await runner._process_delivery_item(DEST, item)
+    await _deliver_queued(store, runner, mid)
     return mid, list(await store.outbox_for(mid))
 
 
@@ -291,8 +289,11 @@ async def _deliver_holding(
     return list(await store.outbox_for(mid))
 
 
-async def _route_to_dest(store: MessageStore, mid: str, channel: str, body: str) -> None:
-    """Drain ``mid``'s ingress row through the router and transform stages to one ``DEST`` row."""
+async def _route_to_dest(
+    store: MessageStore, mid: str, channel: str, body: str, *, into_pt: str | None = None
+) -> None:
+    """Drain ``mid``'s ingress row through the router and transform stages to one ``DEST`` row,
+    or, with ``into_pt``, into that pass-through inbound as a Handler's ``Send`` does."""
     ingress = await store.claim_next_fifo(channel, stage="ingress")
     assert ingress is not None and ingress.message_id == mid
     assert await store.route_handoff(
@@ -305,7 +306,11 @@ async def _route_to_dest(store: MessageStore, mid: str, channel: str, body: str)
     routed = await store.claim_next_fifo(channel, stage="routed")
     assert routed is not None and routed.message_id == mid
     await store.transform_handoff(
-        routed_id=routed.id, message_id=mid, channel_id=channel, deliveries=[(DEST, body)]
+        routed_id=routed.id,
+        message_id=mid,
+        channel_id=channel,
+        deliveries=[] if into_pt else [(DEST, body)],
+        pt_deliveries=[(into_pt, body)] if into_pt else [],
     )
 
 
@@ -387,42 +392,11 @@ async def _deliver_queued(store: MessageStore, runner: RegistryRunner, message_i
 async def _passthrough_child(store: MessageStore, parent: str, body: str) -> str:
     """Hand ``body`` from ``parent`` into a pass-through inbound, as a Handler's ``Send`` does,
     then route and transform the child to ``DEST``. Returns the child's message id."""
-    ingress = await store.claim_next_fifo("IB_STREAM", stage="ingress")
-    assert ingress is not None and ingress.message_id == parent
-    assert await store.route_handoff(
-        ingress_id=ingress.id,
-        message_id=parent,
-        channel_id="IB_STREAM",
-        handlers=[("h", body)],
-        disposition=MessageStatus.ROUTED,
-    )
-    routed = await store.claim_next_fifo("IB_STREAM", stage="routed")
-    assert routed is not None
-    await store.transform_handoff(
-        routed_id=routed.id,
-        message_id=parent,
-        channel_id="IB_STREAM",
-        deliveries=[],
-        pt_deliveries=[("PT_NEXT", body)],
-    )
-    child_ingress = await store.claim_next_fifo("PT_NEXT", stage="ingress")
-    assert child_ingress is not None and child_ingress.message_id != parent
-    child = child_ingress.message_id
-    assert await store.route_handoff(
-        ingress_id=child_ingress.id,
-        message_id=child,
-        channel_id="PT_NEXT",
-        handlers=[("h_child", body)],
-        disposition=MessageStatus.ROUTED,
-    )
-    child_routed = await store.claim_next_fifo("PT_NEXT", stage="routed")
-    assert child_routed is not None
-    await store.transform_handoff(
-        routed_id=child_routed.id,
-        message_id=child,
-        channel_id="PT_NEXT",
-        deliveries=[(DEST, body)],
-    )
+    await _route_to_dest(store, parent, "IB_STREAM", body, into_pt="PT_NEXT")
+    children = await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)
+    assert len(children) == 1
+    child = str(children[0]["id"])
+    await _route_to_dest(store, child, "PT_NEXT", body)
     return child
 
 

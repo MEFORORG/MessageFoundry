@@ -9054,8 +9054,9 @@ class RegistryRunner:
         only on retention/purge, never on delivery), so every send and every retry re-derives the
         IDENTICAL frame. **Fail-loud:** a held attachment whose read fails (a ``KeyError`` from the
         read, or a ``StreamingAttachmentsUnsupported``) is turned into a :class:`DeliveryError` so the
-        row takes the normal ERROR/retry path and the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, an
+        row takes the normal ERROR/retry path and the connector **never** receives an un-hydrated
+        handle (which would deliver ``mfdoc:v1:ref:…`` into the partner's ``OBX-5.5`` = silent
+        corruption). A failure the payload itself causes, an
         :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
         :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
         other ``ValueError`` propagates to the outbound's internal-error policy, a stored document
@@ -9068,9 +9069,8 @@ class RegistryRunner:
         edit-and-resubmit child and an edit-and-resend child carry the body under a new id, and the
         store links each to the parent's documents that body names, in the commit that makes it. So
         every handle the engine wrote stays resolvable. A handle naming anything else, or a
-        malformed one, is the payload's text
-        and a permanent refusal of this row alone, so it never holds a strict-FIFO lane on retries.
-        The gate opens on an escaped marker too
+        malformed one, is the payload's text and a permanent refusal of this row alone, so it never
+        holds a strict-FIFO lane on retries. The gate opens on an escaped marker too
         (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), so a payload whose delimiters
         escape the engine's own handle is re-attached rather than sent with the handle in it."""
         if not may_hold_doc_ref(payload):
@@ -9103,8 +9103,8 @@ class RegistryRunner:
             # Only failures the MESSAGE causes: the payload does not parse as HL7, or its MSH-1 and
             # MSH-2 do not name its separators (vault BACKLOG #2809), or a handle is malformed, names
             # an attachment its message does not hold, or sits outside the splice (BACKLOG #5099).
-            # The same payload fails
-            # the same way on every attempt, so a retry could never succeed: refuse it permanently,
+            # The same payload fails the same way on every attempt, so a retry could never succeed:
+            # refuse it permanently,
             # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
             # fault in the re-attach, a stored document holding a CR or LF included, still reaches
             # the outbound's internal-error policy, and STOP still stops the lane. Raised after the
