@@ -1807,8 +1807,12 @@ host.
   a separate alias.
 - A path is accepted when its file name, in any case, is the Microsoft ODBC Driver library:
   `libmsodbcsql-18.so`, `libmsodbcsql.18.dylib` or `msodbcsql18.dll`, with a version suffix
-  allowed. A path that opens with two separators, such as a UNC path, or holds `://` is refused,
-  since it can name a library on another host.
+  allowed. A path that opens with two separators or a device prefix, such as a UNC path or
+  `\??\UNC\`, or holds `://` is refused, since it can name a library on another host.
+- The preset's `odbc_driver` may hold no `;`, `{`, `}` or `=`, anywhere in a path included. The
+  driver is sent braced, but whether every driver manager reads the brace escape there is
+  unmeasured, and an unread one would let the rest of the path add keywords to the connection
+  string.
 - Any other name is refused. That is at least a mixed name such as `PostgreSQL via SQL Server
   gateway`, a vendor driver that names SQL Server, FreeTDS, and the bare legacy `SQL Server`. On
   Linux that last name is commonly a FreeTDS alias. FreeTDS reads `,<port>` as the port. But
