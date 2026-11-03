@@ -80,8 +80,8 @@ def test_the_statement_names_the_classes_the_old_notices_left_out() -> None:
         "Messages received",
         "reject it",
         "before users can reach",
-        # Round 4: what an operator can do about the reach, and what a restore brings back
-        # rather than undoes.
+        # How to keep users off the engine while re-applying, what the offline commands cannot
+        # do, and what a restore brings back or sends again rather than undoes.
         "[security].local_access_only = true",
         "reverse proxy",
         "admin-unlock",
@@ -165,7 +165,7 @@ def test_the_logging_sink_logs_the_statement_whole(caplog: pytest.LogCaptureFixt
     [
         (1_000_000.0, 2, "3.0 days old"),
         (None, 9_999_999, "of unknown age"),
-        # The longest age written as a number, and a crafted manifest time past it.
+        # The longest age written as a number, and a marker time planted past it.
         (_RESTORED_AT - 99_999 * 86400, 9_999_999, "99999.0 days old"),
         (-1e300, 9_999_999, "over 99999 days old"),
         # Dated after the restore, past the refusal's skew: not "0.0 days old".
@@ -175,7 +175,7 @@ def test_the_logging_sink_logs_the_statement_whole(caplog: pytest.LogCaptureFixt
         "short",
         "unknown-age-longest-count",
         "longest-age-longest-count",
-        "crafted-past-age",
+        "planted-marker-age",
         "crafted-future-age",
     ],
 )
@@ -253,6 +253,13 @@ def test_the_guide_restore_section_names_every_class() -> None:
     section = guide[start : guide.index("**`restore` refuses", start)]
     for cls in RESTORE_ROLLBACK_CLASSES:
         assert cls in section, cls
+    # Both ways: the guide's list is the classes, in order, so a class narrowed or dropped from
+    # the statement cannot stay behind in the guide.
+    bullets = [b.strip() for b in section.split(" - ")[1:]]
+    bullets[-1] = bullets[-1].split(". ", 1)[0]
+    assert len(bullets) == len(RESTORE_ROLLBACK_CLASSES)
+    for bullet, cls in zip(bullets, RESTORE_ROLLBACK_CLASSES, strict=True):
+        assert bullet.startswith(cls), (bullet, cls)
 
 
 def test_the_statement_is_a_leaf() -> None:

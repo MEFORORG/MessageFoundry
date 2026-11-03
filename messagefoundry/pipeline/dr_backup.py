@@ -3405,8 +3405,9 @@ def _refuse_an_old_archive(
     # point is that nothing was written. The CLI adds how to override it.
     raise BackupError(
         kind,
-        f"Nothing was written: {taken}. Its newest audit row is {newest}, and every change made "
-        f"after it would have to be re-applied by hand. {RESTORE_NOTICE_POINTER}",
+        f"Nothing was written: {taken}. Its newest audit row is {newest}. A restore undoes what "
+        "was changed after the archive was taken, and that must be re-applied by hand. "
+        f"{RESTORE_NOTICE_POINTER}",
     )
 
 

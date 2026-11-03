@@ -228,10 +228,11 @@ def utc_or_unknown(ts: float | None) -> str:
         return "unknown"
 
 
-#: The oldest archive age, in days, :func:`store_restored_detail` writes as a number. An archive's
-#: time is not always authenticated, and ``--allow-old-archive`` restores one of any age, so a
-#: crafted manifest time could otherwise print hundreds of digits and push the count and the
-#: pointer past the reason column's cut (BACKLOG #5094).
+#: The oldest archive age, in days, :func:`store_restored_detail` writes as a number. A manifest's
+#: time parses as a calendar date, so its age is at most about 739,000 days, but the time the
+#: start reads is the store's restore marker, where a value written outside ``restore`` can be any
+#: finite float and print hundreds of digits. Capped, the count and the pointer still fit the
+#: reason column's cut (BACKLOG #5094).
 _STORE_RESTORED_MAX_AGE_DAYS = 99_999
 #: How far after the restore an archive's time may fall and still read as an age: the hour of
 #: clock skew ``restore``'s age refusal allows (``dr_backup._ARCHIVE_CLOCK_SKEW_SECONDS``, which

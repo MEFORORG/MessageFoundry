@@ -46,8 +46,9 @@ RESTORE_ROLLBACK_CLASSES: tuple[str, ...] = (
 
 #: The statement every restore notice that has the room carries whole. Worded for a restore in
 #: general, because ``restore --help`` shows it before anything was written. The audited changes
-#: are bounded by the archive's newest audit row, which every notice prints; anything unaudited
-#: written between that row and the snapshot is in the archive and is not undone.
+#: are bounded by the archive's newest audit row, which the ``restore`` summary, the age refusal
+#: and the alert print beside it; anything unaudited written between that row and the snapshot is
+#: in the archive and is not undone.
 RESTORE_ROLLBACK_NOTICE = (
     "A restore undoes every change made to the store after the archive was taken. Each audited "
     "change after the archive's newest audit row must be re-applied by hand, at least: "
@@ -61,9 +62,11 @@ RESTORE_ROLLBACK_NOTICE = (
     "changes a role. A restore can also send again: messages still queued when the archive was "
     "taken are processed and delivered again, those delivered since included, and an inbound that "
     "leaves files in place (after_read = leave), local or remote, ingests again the files it took "
-    "since, so a partner can receive duplicates. Where [integrity].audit_anchor_file holds an "
-    "anchor taken after the archive, the start-up audit walk, where it runs, reports the "
-    "restored log as truncated (an audit-chain-truncated alert): expect it, and take a new anchor "
+    "since, so a partner can receive duplicates. Serving the restored store starts its "
+    "connections at once, so those go out before any re-apply can finish. Where "
+    "[integrity].audit_anchor_file holds an anchor taken after the archive, the start-up audit "
+    "walk, where it runs, reports the restored log as truncated (an integrity_drift alert on "
+    "audit-chain-truncated): expect it, and take a new anchor "
     "once the restore is confirmed. Messages received after the archive was taken, later "
     "reference-set syncs and later transform state are not in a restored store either."
 )
