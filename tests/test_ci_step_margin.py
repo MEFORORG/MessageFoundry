@@ -66,6 +66,8 @@ _BASELINE_FILE = _ROOT / "scripts" / "ci" / "step_margin_baseline.toml"
 _GATED: dict[str, tuple[str, str, str]] = {
     # job name: (gated step name, its step-cap matrix key, that job's job-cap matrix key)
     "test": ("Tests (pytest)", "step_timeout", "job_timeout"),
+    # BACKLOG #5247: the engine suite's second shard, its own job with the same step, caps and check.
+    "test-shard2": ("Tests (pytest)", "step_timeout", "job_timeout"),
     "webconsole": (
         "Web console tests (pytest)",
         "webconsole_step_timeout",
@@ -1064,6 +1066,8 @@ def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_sui
 
     Falsified by restoring `timeout-minutes: matrix.step_timeout` on that step: RED. Restored.
     """
+    # Keyed by SUITE (the gated step's name), because the engine suite's two shards (BACKLOG #5247)
+    # are one suite in two jobs: they share a cap by design, and only the suites must not.
     caps: dict[str, str] = {}
     for job_name, (gated, step_key, _) in _GATED.items():
         steps = _job(job_name)["steps"]
@@ -1073,17 +1077,20 @@ def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_sui
             f"{gated!r} in {job_name} must be capped by {expected}, found "
             f"{step.get('timeout-minutes')!r}"
         )
-        caps[gated] = str(step["timeout-minutes"])
+        cap = str(step["timeout-minutes"])
+        assert caps.setdefault(gated, cap) == cap, f"one suite, two caps: {gated!r} {caps} {cap}"
 
     # STRONGER THAN BEFORE, not weaker. The two suites no longer merely carry DIFFERENT caps inside one
     # job -- they are in DIFFERENT JOBS, so neither can spend the other's wall-clock at all. Assert the
     # separation structurally as well as by cap name, since the cap names alone would still pass if the
     # console step were moved back beside the engine one with its own knob.
-    assert len(set(caps.values())) == len(caps), f"gated steps share a cap expression: {caps}"
-    owners = {gated: job for job, (gated, _, _) in _GATED.items()}
-    assert len(set(owners.values())) == len(owners), (
-        f"two gated steps share a job, so one is again queued behind the other: {owners}"
-    )
+    assert len(caps) >= 2, f"fewer than two gated suites read a cap, so nothing is compared: {caps}"
+    assert len(set(caps.values())) == len(caps), f"gated suites share a cap expression: {caps}"
+    # Each gated job holds one gated step, so no suite is queued behind another in one job.
+    for job_name, (gated, _, _) in _GATED.items():
+        names = [s.get("name") for s in _job(job_name)["steps"]]
+        others = [g for g in caps if g != gated and g in names]
+        assert not others, f"{job_name} holds {gated!r} and also {others}"
 
 
 def test_every_leg_sizes_each_gated_step_inside_its_own_job_cap() -> None:
@@ -1167,6 +1174,7 @@ _EXPECTED_LEGS: frozenset[str] = frozenset({"ubuntu-latest", "windows-2022", "wi
 _MARGIN_CAP_SOURCE: dict[str, tuple[str, bool]] = {
     # job: (matrix knob feeding --cap-minutes, is that knob also the kill?)
     "test": ("step_timeout", True),
+    "test-shard2": ("step_timeout", True),
     "webconsole": ("webconsole_margin_cap", False),
 }
 

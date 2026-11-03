@@ -153,6 +153,9 @@
 #                        over the real artifacts; path-gated on packaging config, forced on push-to-main)
 #   NOT path-gated -- these RUN ON EVERY PULL REQUEST and are the two most likely to report:
 #     webconsole, tooling
+#   THE ENGINE SUITE'S SECOND SHARD (BACKLOG #5247) -- runs wherever a `test` leg runs its suite,
+#   and there the roll-up also fails when it did not succeed, so a skip there is a red too:
+#     test-shard2
 #
 # NO COUNT IS WRITTEN HERE ON PURPOSE. This block said "EIGHT legs" until `packaging-build` made it
 # nine, and a number in prose is a second claim about the `needs:` list that nothing reconciles --
