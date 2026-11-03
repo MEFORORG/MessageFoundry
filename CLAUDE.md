@@ -441,17 +441,61 @@ text moved in wave 2*.
 
 **The Lander may send a repair Builder subagent to a held PR whose author has gone quiet**
 (decided by the Lander under the owner's delegation of 2026-10-29, decision
-d20261029T165610526-c13ae6). All of these must hold: 4 hours with no author comment or commit since
-the hold; the Lander mailed the author's seat-record worktree path and had no reply; the author's
-claim and seat record show no live session; the PR is not queued and has no armed auto-merge
-request; the hold names one determinate fix, not a question of intent, of an owner ruling or of
-behaviour; and the PR is not ASVS record content, which stays a Manager's. The Builder fetches
-before it pushes, never force-pushes, stops if the head moved, and makes only the fixes the hold
-names. One repair per PR; a second hold goes to a spawned Manager. Every other non-trivial fix
-still goes to a spawned Manager session, as the paragraph above says. The Lander merges only once a
-code-review fork at `xhigh` that the Lander starts itself, on the repair head, covers it, its tag
-read with `review_tag.py`; the repair Builder's own QA does not count. That independent review is
-what keeps authoring apart from landing.
+d20261029T165610526-c13ae6; the owner ruling of 2026-11-03 in the next paragraph cut the window
+from 4 hours to 2 and added the suspended-author case). All of these must hold: 2 hours with no
+author comment or commit since the hold, an expired `hold-ack` (next paragraph) counting as none;
+the Lander mailed the author's seat-record worktree path
+and had no reply; the author's claim and seat record show no live session, or the author's
+transcript ENDS on a question unanswered for more than 2 hours, which counts as no live session
+whatever its running state (the Lander reads this with `list_events` or korus
+`scripts/board/seatstate.py`, and confirms the question is the transcript's last turn rather than
+an older orphaned ask); the PR is not queued and has no armed auto-merge request; the hold names
+one determinate fix, not a question of intent, of an owner ruling or of behaviour; and the PR is
+not ASVS record content, which stays a Manager's. The Builder fetches before it pushes, never
+force-pushes, stops if the head moved, and makes only the fixes the hold names. One repair per
+PR; a second hold goes to a spawned Manager. Every other non-trivial fix still goes to a spawned
+Manager session, as the paragraph above says. The Lander merges only once a code-review fork at
+`xhigh` that the Lander starts itself, on the repair head, covers it, its tag read with
+`review_tag.py`; the repair Builder's own QA does not count. That independent review is what keeps
+authoring apart from landing.
+
+**A held PR whose author has not acknowledged the hold within 2 hours transfers to the Repair
+Manager** (owner ruling 2026-11-03: asked *"Which tiers do you want to adopt?"* of the Repair
+Manager proposal, the owner answered *"Tiers 1 and 2"*). This covers a hold the paragraph above
+does not take, so the Repair Manager is the spawned Manager that paragraph sends a non-trivial fix
+or a second hold to. An acknowledgement is an author comment or commit; the `hold-ack` marker
+`scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every seat acts as the
+owner's GitHub identity, only the original author's comment or commit counts, a commit its own
+Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
+branch updates included. A `hold-ack` expires 2 hours after it while it is still the original
+author's newest event since the hold and no commit by the original author has landed since it
+(decided by the Lander under the owner's delegation of 2026-11-03, record
+d20261103T190111765-2aa8b6: asked *"should a hold-ack expire 2h after it"*, the owner answered
+*"/driver"*). The hold then counts as unacknowledged, which
+`scripts/coord/held_pr_turns.py` shows as the Lander's turn, flagged `ack-expired` only while the
+head is unchanged; any other head move already reads as the Lander's turn. A transfer on an
+expired `hold-ack` also needs the author to read not live: no live session, or a transcript that
+ends on a question unanswered for more than 2 hours, read as the paragraph above says. An author
+commit or ordinary reply hands the turn back to the Lander, and nothing expires then. The author
+may also hand the PR over sooner. The PR must not be queued or carry an armed auto-merge request.
+The Lander spawns one Manager for repairs in its own CCD
+instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
+transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief;
+no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
+`<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair Manager's CCD `local_` id
+copied whole; the hold's URL sent to it again; and mail to the original author's seat-record
+worktree where it has one, naming the PR URL and that id. A Repair Manager that does not find the
+marker stops and waits to be woken. It never briefs a Builder without the marker naming it.
+Minimizing the newest marker, and any older one still unminimized, cancels the transfer and hands
+the PR back to the original author. At least stacks, landing order, author intent and anything
+already waiting on an owner ruling stay with the original author. Like the Lander and the
+Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
+raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
+push, never force-push, and stop if the head moved, as the paragraph above says. That head-moved
+check binds repair Builders, which are briefed with it. A Builder already in flight for the
+original author does not read the marker and may have no such check. Every repair
+head it pushes takes the Lander's own independent review the paragraph above requires, before
+the merge. The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
@@ -464,9 +508,10 @@ with `scripts/coord/afk-kill.ps1 -Status` (ADR 0211) before a class A or B act, 
 session start. While it is on, the grants this section takes from the plan are off too: a routine
 plan waits for the owner's go again, and the two class A acts and the cache-only `-Force` in
 `docs/WORKTREES.md` go back to the owner. A delegated question (the merge bullet below) is the
-owner's own answer, and the switch does not touch it. The Lander and the Watchdog keep their
-exemption: they never use `AskUserQuestion`, and put an owner question in a table instead. A
-Builder still gets one turn: it puts an owner question in its report, never in `AskUserQuestion`.
+owner's own answer, and the switch does not touch it. The Lander, the Watchdog and the Repair
+Manager keep their exemption: they never use `AskUserQuestion`, and put an owner question in a
+table instead. A Builder still gets one turn: it puts an owner question in its report, never in
+`AskUserQuestion`.
 
 The brief is disposable. The BACKLOG item is the record.
 
