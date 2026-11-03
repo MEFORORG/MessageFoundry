@@ -534,27 +534,6 @@ class BackupRunner:
 
     async def _do_backup(self, now: float, *, force_config_only: bool = False) -> BackupResult:
         s = self._settings
-        dest_dir = Path(s.destination)
-        self._ensure_destination(dest_dir)
-
-        # The key SOURCE is the existing store DEK (ADR 0019). Resolve it the same way open_store does.
-        key = self._resolve_key()
-        if key is None and not s.allow_unencrypted:
-            # Fail-closed: a no-key instance refuses to write a cleartext archive unless the explicit,
-            # audited [backup].allow_unencrypted escape is set (parallel to [store].allow_unencrypted_phi).
-            raise BackupError(
-                "encrypt",
-                "no store encryption key is configured; refusing to write an UNENCRYPTED .mfbak archive "
-                "(configure a store encryption key, such as MEFOR_STORE_ENCRYPTION_KEY, or set "
-                "[backup].allow_unencrypted=true to accept a cleartext archive, which can hold PHI)",
-            )
-        key_id = key_fingerprint(key) if key is not None else None
-        # ADR 0196: seal the frames under the live store's data sub-key (the header records the salt,
-        # so the DR site derives it from the DEK alone). The build charges them to THAT key's row (AC-6).
-        # A store on the frozen v1 writer has no salt: the frames are then sealed under the DEK and
-        # charged to the DEK's row, which is where that store's own values are counted too.
-        salt = self._store_salt() if key is not None else None
-
         # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
         # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
         # --config-only flag forces config-only even on SQLite.
@@ -578,6 +557,27 @@ class BackupRunner:
                 else "[backup].include_config is false"
             )
             raise BackupError("snapshot", f"config-only backup: {why}; nothing to archive")
+
+        dest_dir = Path(s.destination)
+        self._ensure_destination(dest_dir)
+
+        # The key SOURCE is the existing store DEK (ADR 0019). Resolve it the same way open_store does.
+        key = self._resolve_key()
+        if key is None and not s.allow_unencrypted:
+            # Fail-closed: a no-key instance refuses to write a cleartext archive unless the explicit,
+            # audited [backup].allow_unencrypted escape is set (parallel to [store].allow_unencrypted_phi).
+            raise BackupError(
+                "encrypt",
+                "no store encryption key is configured; refusing to write an UNENCRYPTED .mfbak archive "
+                "(configure a store encryption key, such as MEFOR_STORE_ENCRYPTION_KEY, or set "
+                "[backup].allow_unencrypted=true to accept a cleartext archive, which can hold PHI)",
+            )
+        key_id = key_fingerprint(key) if key is not None else None
+        # ADR 0196: seal the frames under the live store's data sub-key (the header records the salt,
+        # so the DR site derives it from the DEK alone). The build charges them to THAT key's row (AC-6).
+        # A store on the frozen v1 writer has no salt: the frames are then sealed under the DEK and
+        # charged to the DEK's row, which is where that store's own values are counted too.
+        salt = self._store_salt() if key is not None else None
 
         ext = _ENCRYPTED_EXT if key is not None else _PLAINTEXT_EXT
         stamp = _utc_stamp(now)
@@ -1019,6 +1019,10 @@ class BackupRunner:
             leftover = work.release()
             if leftover is None:
                 raise
+            if isinstance(exc, BackupError):
+                # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
+                # same reason, and a note would not reach the audit row or the alert.
+                raise BackupError(exc.kind, f"{leftover}; the build failed: {exc}") from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
@@ -1091,10 +1095,11 @@ class BackupRunner:
                 if config_only and added == 0:
                     # Before the archive is written, so nothing is published or pruned: an archive of
                     # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
+                    # The verdict leads, so the failure record's 200-character cut keeps it.
                     raise BackupError(
                         "snapshot",
-                        f"config-only backup: the walk of the config dir {bundle.path} added no "
-                        "regular file; nothing to archive",
+                        "config-only backup: the config walk added no regular file, so there is "
+                        f"nothing to archive (config dir {bundle.path})",
                     )
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
@@ -1151,7 +1156,8 @@ class BackupRunner:
         inside the config dir puts there (BACKLOG #1174): its plaintext snapshot and the tar being
         written must not ride in the bundle.
 
-        Returns how many files it added, which a config-only pass needs (vault BACKLOG #5220)."""
+        Returns how many regular files it added, which a config-only pass needs (vault BACKLOG
+        #5220)."""
         pruned: list[str] = []
         found: list[Path] = []
         for dirpath, dirs, files in _walk_unfollowed(base, pruned):
@@ -1180,7 +1186,10 @@ class BackupRunner:
             if _is_config_edit_artifact(rel):
                 continue
             tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
-            added += 1
+            # Counted from the member tar wrote, so a path swapped for a link or a folder after the
+            # check above does not count as a file.
+            if tar.getmembers()[-1].isreg():
+                added += 1
         return added
 
     # --- keep-N retention ----------------------------------------------------

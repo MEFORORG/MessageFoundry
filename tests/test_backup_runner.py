@@ -1020,7 +1020,9 @@ async def test_a_config_only_pass_with_nothing_to_bundle_is_refused(
 
 
 async def test_a_config_only_pass_with_one_config_file_still_publishes(tmp_path, key_b64) -> None:
-    """The control: one regular file is enough, and keep-N then prunes the prior as it should."""
+    """The control: one regular file is enough to publish. Keep-N then prunes the prior as it does
+    after any published archive; whether a config-only archive should take a full archive's slot
+    is not this row's question."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text("# router")
@@ -1029,6 +1031,37 @@ async def test_a_config_only_pass_with_one_config_file_still_publishes(tmp_path,
     assert outcome.config_only and outcome.pruned == 1
     assert sorted(p.name for p in dest.iterdir()) == [Path(outcome.archive_path).name]
     assert not prior.exists()
+
+
+async def test_a_server_db_pass_whose_walk_adds_nothing_keeps_the_last_archive(
+    tmp_path, key_b64
+) -> None:
+    """The server-DB store is where every pass is config-only. Its staging lives under the
+    destination, so only the archives there are compared."""
+    from messagefoundry.config.settings import StoreBackend
+
+    dest = tmp_path / "backups"
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    try:
+        object.__setattr__(store, "backend", StoreBackend.POSTGRES)
+        runner = BackupRunner(
+            store,
+            _settings(dest, key_b64, retention_keep=1),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        )
+        good = await runner.run_once(now=1000.0)
+        assert good is not None and good.config_only  # the control: a file is enough
+        (cfg / "feed.py").unlink()
+        with pytest.raises(BackupError, match="added no regular file") as exc:
+            await runner.run_once(now=2000.0)
+        assert exc.value.kind == "snapshot"
+    finally:
+        await store.close()
+    assert sorted(p.name for p in dest.glob("mefor-backup-*")) == [Path(good.archive_path).name]
 
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
