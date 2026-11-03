@@ -795,6 +795,10 @@ def steward_files(
     record.write_text(json.dumps(login), encoding="utf-8")
     sessions = tmp_path / "claude-code-sessions"
     sessions.mkdir(exist_ok=True)
+    # The home whose .claude-desktop-* roots are searched too. Always named, so no test here can fall
+    # through to the real per-account roots under this box's own home.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
     return [
         "-StewardStatusFile",
         str(status),
@@ -802,6 +806,8 @@ def steward_files(
         str(record),
         "-DesktopSessionsDir",
         str(sessions),
+        "-DesktopHomeDir",
+        str(home),
     ]
 
 
@@ -809,13 +815,33 @@ SID = "44444444-aaaa-4bbb-8ccc-000000000004"
 APP_ACCT = "55555555-aaaa-4bbb-8ccc-000000000005"
 
 
+def session_record(
+    sessions: Path,
+    acct: str,
+    org: str,
+    sid: str = SID,
+    name: str = "local_fixture.json",
+    mtime: float | None = None,
+) -> Path:
+    """One desktop-app session record under a claude-code-sessions root: the two parent directories
+    ARE the identity (watch.py). `mtime` sets its write time, which orders the scan."""
+    where = sessions / acct / org
+    where.mkdir(parents=True, exist_ok=True)
+    path = where / name
+    path.write_text(json.dumps({"sessionId": path.stem, "cliSessionId": sid}), encoding="utf-8")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
 def desktop_record(tmp_path: Path, acct: str, org: str, sid: str = SID) -> None:
-    """A desktop-app session record: the two parent directories ARE the identity (watch.py)."""
-    where = tmp_path / "claude-code-sessions" / acct / org
-    where.mkdir(parents=True)
-    (where / "local_fixture.json").write_text(
-        json.dumps({"sessionId": "local_fixture", "cliSessionId": sid}), encoding="utf-8"
-    )
+    """A desktop-app session record in the app-wide root the tests name with -DesktopSessionsDir."""
+    session_record(tmp_path / "claude-code-sessions", acct, org, sid)
+
+
+def account_root(tmp_path: Path, n: int, home: str = "home") -> Path:
+    """The claude-code-sessions root of one per-account desktop config, ~/.claude-desktop-<n>."""
+    return tmp_path / home / f".claude-desktop-{n}" / "claude-code-sessions"
 
 
 def desktop_context(
@@ -923,25 +949,139 @@ def test_a_fallback_that_cannot_name_this_pool_is_refused(
     assert _PERCENTAGE.search(ctx) is None, f"a number was printed anyway: {ctx}"
 
 
+def two_pools() -> dict[str, Any]:
+    """Two fresh entries, built per test so their read times are relative to the run."""
+    return {
+        ORG: steward_entry(weekly=22.4),
+        OTHER: steward_entry(weekly=11.5, org=OTHER, account=APP_ACCT),
+    }
+
+
+ORG_WEEKLY = "22.4%"  # pool ORG, which the pinned root's login record names
+OTHER_WEEKLY = "11.5%"  # pool OTHER
+BY_RECORD = "named by the desktop app's record for this session"
+BY_LOGIN = "named by this config root's login record"
+
+
+def pool_read(ctx: str) -> tuple[str, str]:
+    """(the weekly figure printed, what named the pool). Exactly one pool may be read."""
+    figures = [w for w in (ORG_WEEKLY, OTHER_WEEKLY) if w in ctx]
+    named_by = [h for h in (BY_RECORD, BY_LOGIN) if h in ctx]
+    assert len(figures) == 1 and len(named_by) == 1, ctx
+    return figures[0], named_by[0]
+
+
 def test_the_desktop_record_names_the_pool_before_the_login_record(tmp_path: Path) -> None:
     """watch.py names a Desktop session's pool from the app's own record first: the login record is
     the CLI's login, measured naming one account while the session billed another. The two pools carry
     different numbers, so the output says which one was read."""
-    pools = {
-        ORG: steward_entry(weekly=22.4),
-        OTHER: steward_entry(weekly=11.5, org=OTHER, account=APP_ACCT),
-    }
-    args = steward_files(tmp_path, pools)
+    args = steward_files(tmp_path, two_pools())
     desktop_record(tmp_path, acct=APP_ACCT, org=OTHER)
-
-    ctx = desktop_context(tmp_path, args)
-    assert "11.5%" in ctx, ctx
-    assert "22.4%" not in ctx, "the login record's pool was read for a session the app recorded"
-    assert "named by the desktop app's record for this session" in ctx, ctx
+    assert pool_read(desktop_context(tmp_path, args)) == (OTHER_WEEKLY, BY_RECORD)
 
     # Control: another session's id finds no record, so the pinned root's login record names the pool.
     other = desktop_context(tmp_path, args, session_id="not-this-session")
-    assert "22.4%" in other and "named by this config root's login record" in other, other
+    assert pool_read(other) == (ORG_WEEKLY, BY_LOGIN)
+
+
+# --- the desktop records live per account now (watch.py _session_records) -------------------------
+
+
+@pytest.mark.parametrize(
+    ("dirname", "named_by"),
+    [(".claude-desktop-2", BY_RECORD), (".claude-other-2", BY_LOGIN)],
+    ids=["per-account-root", "control-unmatched-name"],
+)
+def test_a_record_only_under_a_per_account_root_resolves(
+    tmp_path: Path, dirname: str, named_by: str
+) -> None:
+    """The app-wide directory no longer exists on a current box: the records live in each
+    ~/.claude-desktop-N root. A record there names the pool. The control puts the same record under a
+    home directory the glob does not match, and the login record names the pool instead."""
+    args = steward_files(tmp_path, two_pools())
+    session_record(tmp_path / "home" / dirname / "claude-code-sessions", APP_ACCT, OTHER)
+    assert pool_read(desktop_context(tmp_path, args))[1] == named_by
+
+
+def test_the_app_wide_root_still_resolves_beside_the_per_account_roots(tmp_path: Path) -> None:
+    """An install that still writes %APPDATA%\\Claude keeps resolving, with per-account roots present
+    and holding only other sessions' records."""
+    args = steward_files(tmp_path, two_pools())
+    session_record(account_root(tmp_path, 1), ACCT, ORG, sid="some-other-session")
+    desktop_record(tmp_path, acct=APP_ACCT, org=OTHER)
+    assert pool_read(desktop_context(tmp_path, args)) == (OTHER_WEEKLY, BY_RECORD)
+
+
+@pytest.mark.parametrize("newer", ["app-wide", "per-account"])
+def test_the_newest_record_wins_across_roots(tmp_path: Path, newer: str) -> None:
+    """Two records carry this session's id in two roots and name different pools. The newer one
+    names the pool, whichever root it is in, so neither root wins by its place in the list."""
+    args = steward_files(tmp_path, two_pools())
+    now = time.time()
+    app_wide, per_account = (now, now - 3600) if newer == "app-wide" else (now - 3600, now)
+    session_record(tmp_path / "claude-code-sessions", APP_ACCT, OTHER, mtime=app_wide)
+    session_record(account_root(tmp_path, 4), ACCT, ORG, mtime=per_account)
+    want = OTHER_WEEKLY if newer == "app-wide" else ORG_WEEKLY
+    assert pool_read(desktop_context(tmp_path, args)) == (want, BY_RECORD)
+
+
+def crowded_roots(tmp_path: Path, junk: int) -> tuple[list[str], Path]:
+    """`junk` other sessions' records in root 1, written now, and this session's record in root 2, an
+    hour older. Returns the hook arguments and root 1."""
+    args = steward_files(tmp_path, two_pools())
+    crowded = account_root(tmp_path, 1) / ACCT / ORG
+    crowded.mkdir(parents=True)
+    for i in range(junk):
+        (crowded / f"local_junk{i}.json").write_text(f'{{"cliSessionId": "other-{i}"}}')
+    session_record(account_root(tmp_path, 2), APP_ACCT, OTHER, mtime=time.time() - 3600)
+    return args, account_root(tmp_path, 1)
+
+
+@pytest.mark.parametrize(("junk", "named_by"), [(399, BY_RECORD), (400, BY_LOGIN)])
+def test_the_scan_cap_is_400_records_across_every_root(
+    tmp_path: Path, junk: int, named_by: str
+) -> None:
+    """The cap is on the total, as watch.py's SCAN_LIMIT is: newer records in one root push an older
+    match in another root out of the newest 400. 399 leave room for it and 400 do not."""
+    args, _ = crowded_roots(tmp_path, junk)
+    assert pool_read(desktop_context(tmp_path, args))[1] == named_by
+
+
+@pytest.mark.parametrize("spelling", ["same", "upper-case-trailing-separator"])
+def test_a_root_named_twice_is_scanned_once(tmp_path: Path, spelling: str) -> None:
+    """-DesktopSessionsDir names a per-account root the home glob also finds, spelled as watch.py's
+    normcase(abspath) folds it. Scanned twice, its 201 newer records would count 402 and push the older
+    match in another root out of the newest 400. Scanned once they count 201, and the match is read."""
+    args, dup = crowded_roots(tmp_path, 201)
+    args[args.index("-DesktopSessionsDir") + 1] = (
+        str(dup) if spelling == "same" else str(dup).upper() + os.sep
+    )
+    assert pool_read(desktop_context(tmp_path, args)) == (OTHER_WEEKLY, BY_RECORD)
+
+
+CONTRADICTED_WEEKLY = 66.6
+
+
+@pytest.mark.parametrize(
+    ("org_entry", "expect"),
+    [
+        pytest.param(None, "has no entry for pool", id="alone"),
+        pytest.param({"age_s": 301}, "past the Steward's own TTL", id="beside-a-stale-org-entry"),
+        pytest.param({}, "fallback verdict: READ", id="beside-a-fresh-org-entry"),
+    ],
+)
+def test_a_contradicted_entry_is_never_served(
+    tmp_path: Path, org_entry: dict[str, Any] | None, expect: str
+) -> None:
+    """watch.py caches a read its own session contradicts under `<org>|contradicted`, for that session
+    alone. The hook reads the org's key exactly, so that entry is never served. It is fresh here, the
+    one case where serving it would print a number; a stale one is refused on its age anyway."""
+    pools = {f"{ORG}|contradicted": steward_entry(weekly=CONTRADICTED_WEEKLY)}
+    if org_entry is not None:
+        pools[ORG] = steward_entry(**org_entry)
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, pools))
+    assert expect in ctx, ctx
+    assert f"{CONTRADICTED_WEEKLY}%" not in ctx, ctx
 
 
 def test_an_unpinned_desktop_session_with_no_record_is_refused(tmp_path: Path) -> None:
@@ -976,10 +1116,12 @@ def test_a_missing_or_zero_ttl_means_the_stewards_default(tmp_path: Path) -> Non
     assert "fallback verdict: READ" in ctx and "its TTL is 5 min" in ctx, ctx
 
 
-def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("where", ["appdata", "per-account"])
+def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path, where: str) -> None:
     """No -StateDir and no file parameters: the hook finds status.json, the login record and the
-    desktop record the way it does on a real box, through MEFOR_USAGE_DIR, CLAUDE_CONFIG_DIR and
-    APPDATA, all pointed at tmp_path so nothing real is read."""
+    desktop record the way it does on a real box, through MEFOR_USAGE_DIR, CLAUDE_CONFIG_DIR, APPDATA
+    and USERPROFILE, all pointed at tmp_path so nothing real is read. The record sits either in the
+    app-wide root under APPDATA or only in a per-account root under the home; both resolve."""
     usage = tmp_path / "usage"
     usage.mkdir()
     (usage / "usage-now.py").write_text("# stand-in: watch.py keeps DIR only beside it\n")
@@ -989,13 +1131,20 @@ def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) ->
     root.mkdir()
     (usage / "login.json").rename(root / ".claude.json")
     appdata = tmp_path / "appdata"
-    desktop_record(appdata / "Claude", acct=APP_ACCT, org=OTHER)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    if where == "appdata":
+        desktop_record(appdata / "Claude", acct=APP_ACCT, org=OTHER)
+    else:
+        session_record(account_root(tmp_path, 3, home="profile"), APP_ACCT, OTHER)
 
     env = {
         **DESKTOP,
         "MEFOR_USAGE_DIR": str(usage),
         "CLAUDE_CONFIG_DIR": str(root),
         "APPDATA": str(appdata),
+        # pwsh's $HOME follows USERPROFILE, as watch.py's expanduser does on Windows.
+        "USERPROFILE": str(profile),
     }
     payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
     # -DedupDir only, so a re-run of this test cannot meet its own last-printed state in the real
@@ -1088,7 +1237,7 @@ def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Pat
         tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "cli"}
     )
 
-    for named in (args[:2], args[:4]):
+    for named in (args[:2], args[:4], args[:6], args[:4] + args[6:]):
         assert FALLBACK_LABEL not in desktop_context(tmp_path, named), (
             "under -StateDir the hook must not fall through to a real login record or session store"
         )
