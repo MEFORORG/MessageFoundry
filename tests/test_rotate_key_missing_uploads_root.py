@@ -204,6 +204,9 @@ def test_an_uploads_root_gone_mid_run_fails_it_and_leaves_the_record_open(
     assert "PARTIAL:" in captured.out and "OK: re-encrypted" not in captured.out
     assert "could not be by its uploads pass, so no uploaded file was re-sealed" in captured.err
     assert "do not create an empty one" in captured.err  # it was there when the run started
+    # Any listing error lands here, so the remedy is not "mount it" alone.
+    assert "at least a volume that went offline or was unmounted" in captured.err
+    assert "a right to list it that was taken away" in captured.err
     assert "remove the two files" not in captured.out  # that remedy is a skip's, not this
     assert "you cannot go back to the prior key" in captured.out
     rows = asyncio.run(_rows(db, key_b, key_a))
@@ -215,6 +218,40 @@ def test_an_uploads_root_gone_mid_run_fails_it_and_leaves_the_record_open(
     monkeypatch.setattr(MessageStore, "reencrypt_to_active", reencrypt)
     unmounted.rename(uploads)
     _completes_once_mounted(db, uploads, key_b)
+
+
+def test_a_relative_root_gone_mid_run_with_its_working_directory_still_warns(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Printing the path must not need the working directory: one gone mid-run used to raise there,
+    after PARTIAL, and lose the error and the note that the chain has rolled."""
+    db, uploads, key_a, key_b = rig
+    reencrypt = MessageStore.reencrypt_to_active
+    getcwd = os.getcwd
+
+    def gone() -> str:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+    async def lose_the_working_directory(self: MessageStore) -> int:
+        uploads.rename(uploads.with_name("uploads-elsewhere"))
+        monkeypatch.setattr(os, "getcwd", gone)
+        return await reencrypt(self)
+
+    monkeypatch.setattr(MessageStore, "reencrypt_to_active", lose_the_working_directory)
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=Path(uploads.name))
+    try:
+        code = main(["rotate-key", "--db", str(db)])
+    finally:
+        monkeypatch.setattr(os, "getcwd", getcwd)
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "PARTIAL:" in captured.out
+    assert f"the uploads directory {uploads.absolute()} ([store].uploads_dir) could be" in (
+        captured.err
+    )
+    assert "you cannot go back to the prior key" in captured.out
 
 
 @pytest.mark.parametrize("uploads_dir", ["empty", "unset"])

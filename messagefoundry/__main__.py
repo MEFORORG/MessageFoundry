@@ -10471,6 +10471,15 @@ def _sqlite_store_held_elsewhere(path: str) -> _OfflineProbe:
     return _OfflineProbe()
 
 
+def _shown_path(path: str) -> str:
+    """``path`` made absolute for a message, or as configured when the working directory a relative
+    path resolves against cannot be read, so printing a path never raises (BACKLOG #4940)."""
+    try:
+        return str(Path(path).absolute())
+    except OSError:
+        return path
+
+
 def _uploads_root_refusal(uploads_dir: str) -> str | None:
     """Why ``rotate-key`` refuses the configured uploads directory, or ``None`` (BACKLOG #4940).
     Checked before anything is written, so a refusal costs nothing, the audit roll included. Why a
@@ -10482,9 +10491,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         # Resolving a relative path reads the working directory, which can itself be gone.
         root = Path(uploads_dir).absolute()
     except OSError as exc:
+        cause = exc.strerror or type(exc).__name__
         return (
             f"the uploads directory {uploads_dir} ([store].uploads_dir) is relative, and the "
-            f"directory this command runs in cannot be read ({exc.strerror or type(exc).__name__}), "
+            f"directory this command runs in cannot be read ({cause}), "
             "so rotate-key changed nothing. Make uploads_dir absolute, or run from the directory "
             "serve uses, and re-run."
         )
@@ -10637,17 +10647,19 @@ def _rotate_key(args: argparse.Namespace) -> int:
         unchecked = probe.unchecked
     else:
         unchecked = f"it is a {settings.store.backend.value} store"
+    uploads_shown = ""  # the uploads directory as checked, resolved once for every message
     if settings.store.uploads_dir:
         refusal = _uploads_root_refusal(settings.store.uploads_dir)
         if refusal is not None:
             print(f"error: {refusal}", file=sys.stderr)
             return 2
+        uploads_shown = _shown_path(settings.store.uploads_dir)
         if not Path(settings.store.uploads_dir).is_absolute():
             # An empty directory of the same name where this command runs passes the check, and
             # serve, under NSSM, reads the path from its own AppDirectory.
             print(
                 f"note: [store].uploads_dir is relative, so it was read here as "
-                f"{Path(settings.store.uploads_dir).absolute()}. Confirm that is the directory "
+                f"{uploads_shown}. Confirm that is the directory "
                 "serve uses: an empty one elsewhere reads as no uploads.",
                 file=sys.stderr,
             )
@@ -10853,14 +10865,16 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if uploads.root_missing:
-        # BACKLOG #4940: the directory passed the check before the store opened and was gone by the
-        # uploads pass. See ResealResult.root_missing.
+        # BACKLOG #4940: the directory passed the check before the store opened and could not be
+        # listed by the uploads pass, for any OSError. See ResealResult.root_missing.
         print(
-            f"error: the uploads directory {Path(settings.store.uploads_dir or '').absolute()} "
+            f"error: the uploads directory {uploads_shown} "
             "([store].uploads_dir) could be listed when this run started and could not be by its "
             "uploads pass, so no uploaded file was re-sealed, and its uploads may still be under "
             "the prior key. The log names the cause. It was there at the start, so do not create "
-            "an empty one: mount the volume or put the directory back, and re-run rotate-key "
+            "an empty one. The causes include at least a volume that went offline or was "
+            "unmounted, a directory that was moved and a right to list it that was taken away: "
+            "fix the cause, and re-run rotate-key "
             "BEFORE retiring any prior key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). This run did not "
             "stamp the key's rotation date.",
             file=sys.stderr,

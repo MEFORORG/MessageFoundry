@@ -648,11 +648,11 @@ class ResealResult:
     #: it is a skip.
     not_regular: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory,
-    #: so the pass read nothing (BACKLOG #4940). An
-    #: unmounted volume and a directory never created both look like this, and the pass cannot tell
-    #: them apart: read as zero uploads, an unmounted volume's uploads would stay under the prior key
-    #: while the run reported success. ``rotate-key`` refuses such a root before it writes anything,
-    #: so this is the backstop for one that goes away mid-run, and it fails the run as a skip does.
+    #: so the pass read nothing (BACKLOG #4940). An unmounted volume and a directory never created
+    #: both look like this, and the pass cannot tell them apart: read as zero uploads, an unmounted
+    #: volume's uploads would stay under the prior key while the run reported success.
+    #: ``rotate-key`` refuses such a root before it writes anything, so this is the backstop for one
+    #: that goes away mid-run, and it fails the run as a skip does.
     #: A root it can list is never missing, empty or not; what that leaves uncaught is in
     #: docs/PHI.md, at the ``rotate-key`` passage.
     root_missing: bool = False
@@ -934,12 +934,13 @@ class UploadStore:
         )
 
     def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
-        """Every ``(file_id, sidecar path)`` pair in the uploads root — the ONE definition of "a file
-        of ours". The listing scan consumes it, and the re-seal pass consumes the :meth:`_walk_sidecars` it
-        wraps, so the id shape and the sidecar suffix cannot drift apart between them. Anything else in the directory (an operator's
-        stray file, a temp file, an id that fails the strict 32-hex shape) is not ours and is skipped
-        without being opened. A root that is not a directory yields nothing, since the first save
-        creates it."""
+        """Every ``(file_id, sidecar path)`` pair in the uploads root, as :meth:`_walk_sidecars`
+        yields them, which holds the ONE definition of "a file of ours". The listing scan consumes
+        this, and the re-seal pass consumes :meth:`_walk_sidecars` itself, so the id shape and the
+        sidecar suffix cannot drift apart between them. Anything else in the directory (an
+        operator's stray file, a temp file, an id that fails the strict 32-hex shape) is not ours
+        and is skipped without being opened. A root that is not a directory yields nothing here,
+        since the first save creates it."""
         if self._root.is_dir():
             yield from self._walk_sidecars()
 
@@ -2635,11 +2636,11 @@ class UploadStore:
 
         Two shapes, both meaning a write that started and never landed: a ``.<id>.<suffix>.<tag>.tmp``
         whose ``os.replace`` never ran, and an ``<id>.blob`` whose sidecar was never written. Neither is
-        reachable through :meth:`_iter_sidecars` or the :meth:`_walk_sidecars` it wraps, which yield ``.meta``
-        names only, so :meth:`list_files`, :meth:`prune_expired` and :meth:`reseal_to_active` all walk straight past
-        them: a partial body would otherwise sit in the uploads root for the life of the directory,
-        outside the retention window this module promises, and (under a configured key) as ciphertext
-        ``rotate-key`` would never re-seal.
+        reachable through :meth:`_walk_sidecars`, which yields ``.meta`` names only, so
+        :meth:`list_files`, :meth:`prune_expired` and :meth:`reseal_to_active` all walk straight
+        past them: a partial body would otherwise sit in the uploads root for the life of the
+        directory, outside the retention window this module promises, and (under a configured key)
+        as ciphertext ``rotate-key`` would never re-seal.
 
         **This pass UNLINKS, so it refuses anything it cannot positively identify as ours.** A name
         matching neither exact shape is an operator's own file and is never touched, the same way
@@ -3166,9 +3167,10 @@ def _atomic_write_text(root: Path, path: Path, text: str) -> None:
     write that raises — disk full is the realistic trigger and the blob is the large write — leaves a
     partial, PHI-bearing ciphertext in the uploads root that NO sweep can reach: ``list_files``,
     ``prune_expired`` and ``reseal_to_active`` all walk ``_walk_sidecars`` (the first two through
-    ``_iter_sidecars``), which yields ``.meta`` names only. Catching ``BaseException`` is deliberate, as in ``config/atomic_edit.py``'s
-    candidate cleanup: a cancellation must clean up too, and the original failure is re-raised untouched. The
-    unlink's own errors are suppressed so a cleanup problem can never mask the real cause.
+    ``_iter_sidecars``), which yields ``.meta`` names only. Catching ``BaseException`` is
+    deliberate, as in ``config/atomic_edit.py``'s candidate cleanup: a cancellation must clean up
+    too, and the original failure is re-raised untouched. The unlink's own errors are suppressed so
+    a cleanup problem can never mask the real cause.
 
     The name is held in ``_inflight_names`` for the whole window, so a concurrent orphan sweep in this
     process skips it by identity instead of guessing from its age."""
