@@ -226,12 +226,38 @@ def test_a_site_proxy_credential_is_refused_for_it_before_its_shape() -> None:
     """The connector asks the credential first, so the load does too, and names the setting."""
     from messagefoundry.config.settings import EgressSettings
 
-    with pytest.raises(ValidationError, match=r"\[egress\]\.proxy_url holds a user or a password"):
-        EgressSettings(
-            proxy_url="http://u:p@proxy.example.org:3128/x", allowed_proxy=["proxy.example.org"]
-        )
+    for url in (
+        "http://u:p@proxy.example.org:3128/x",
+        "http://svc@proxy.example.org:3128/x",  # a user alone beside the shape fault
+        "http://:pw@proxy.example.org:3128/x",  # a password alone
+    ):
+        with pytest.raises(
+            ValidationError, match=r"\[egress\]\.proxy_url holds a user or a password"
+        ):
+            EgressSettings(proxy_url=url, allowed_proxy=["proxy.example.org"])
     # Control: the same shape fault with no credential keeps the parse's own refusal.
     with pytest.raises(ValidationError, match="2965"):
         EgressSettings(
             proxy_url="http://proxy.example.org:3128/x", allowed_proxy=["proxy.example.org"]
         )
+
+
+# --- review round 2 ------------------------------------------------------------------------------
+
+
+def test_a_connection_another_declaration_pair_refuses_is_marked_refused() -> None:
+    """The Source and Destination validators also refuse the revocation and cleartext pairs, so a
+    hop refused for one of them is never built and is marked refused."""
+    reg = Registry()
+    spec = File(directory=".")
+    attest: dict[str, Any] = {"tls_hop_attested": True, "tls_hop_attested_reason": REASON}
+    reg.add_outbound(OutboundConnection("OB_REVOKE", spec, tls_revocation_attested=True, **attest))
+    reg.add_outbound(OutboundConnection("OB_CLEAR", spec, cleartext_reason="why", **attest))
+    reg.add_outbound(OutboundConnection("OB_GOOD", spec, **attest))
+    reg.add_inbound(
+        InboundConnection("IB_REVOKE", spec, "R", tls_revocation_attested=True, **attest)
+    )
+    records = {hop.name: hop.refused for hop in attested_secure_hop_records(reg)}
+    assert records["OB_REVOKE"] is True and records["OB_CLEAR"] is True
+    assert records["OB_GOOD"] is False
+    assert [refused for name, refused in records.items() if "IB_REVOKE" in name] == [True]

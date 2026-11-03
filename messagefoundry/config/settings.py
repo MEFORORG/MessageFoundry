@@ -5377,18 +5377,35 @@ class EgressSettings(_Section):
         # Lazy, as config/static_credentials.py does: the transport owns how a proxy URL is read,
         # and importing the transports package when this module loads would tie the two together.
         # It is imported only when a site proxy URL is set.
+        import urllib.parse
+
         from messagefoundry.transports.proxy_address import parse_proxy_url
         from messagefoundry.transports.rest import proxy_url_holds_credential
 
+        refused = ValueError(
+            "[egress].proxy_url holds a user or a password; refused, with no escape. Take it out of "
+            "the URL, and put proxy_user and proxy_password on each connection that logs in to the "
+            "proxy (secrets via env())"
+        )
         # The credential first, as the connector's build asks it, so a URL that holds one is refused
         # for it, naming this setting, even where the parse below would refuse its shape too.
         if proxy_url_holds_credential(proxy):
-            raise ValueError(
-                "[egress].proxy_url holds a user or a password; refused, with no escape. Take it "
-                "out of the URL, and put proxy_user and proxy_password on each connection that "
-                "logs in to the proxy (secrets via env())"
-            )
-        parse_proxy_url(proxy)
+            raise refused
+        try:
+            parse_proxy_url(proxy)
+        except ValueError:
+            # A user or a password alone beside a shape fault: the parse's own text says a URL
+            # credential fails the connection's build, which is not where this setting is refused.
+            # Read from the authority urlsplit sees, so a value urllib alone splits at a later '@'
+            # (the #2965 shapes) keeps the parse's refusal for its shape.
+            try:
+                netloc = urllib.parse.urlsplit(proxy).netloc
+            except ValueError:
+                netloc = ""
+            userinfo, at, _ = netloc.rpartition("@")
+            if at and userinfo.strip(":"):
+                raise refused from None
+            raise
         return value
 
     @field_validator("allowed_recipient_domains", mode="after")

@@ -38,7 +38,6 @@ from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
     proxy_config_from_settings,
     proxy_url_holds_credential,
-    proxy_url_sends_userinfo,
 )
 
 LISTED = "proxy.listed.invalid"
@@ -382,13 +381,13 @@ def test_the_static_hop_label_names_the_dialled_host() -> None:
     assert plain is not None and f"{LISTED}:3128" in plain.detail
     for proxy_url in SPLIT_SHAPES:
         hop = _proxy_hop("OB", {"proxy_url": proxy_url, **keyed}, None)
-        if proxy_url_sends_userinfo(proxy_url):
+        if proxy_url_holds_credential(proxy_url):
             # A credential in the URL fails the build, so it is no hop to accept (vault BACKLOG #3007).
             assert hop is None, proxy_url
             continue
         assert hop is not None and _WITHHELD_PEER in hop.detail, proxy_url
         _assert_names_no_part(hop.detail)
-    assert any(proxy_url_sends_userinfo(proxy_url) for proxy_url in SPLIT_SHAPES)
+    assert any(proxy_url_holds_credential(proxy_url) for proxy_url in SPLIT_SHAPES)
 
 
 @pytest.mark.parametrize(
