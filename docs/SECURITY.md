@@ -4721,13 +4721,21 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `READ_COMMITTED_SNAPSHOT`. That reasoning was read from the code and has not been run, because
   the CI database runs with `READ_COMMITTED_SNAPSHOT` on, where the race cannot form that cycle.
   The global row is not sealed, so whoever can write the database could lower it and revive a
-  session that only the global epoch had ended.
+  session that only the global epoch had ended. Deleting the row does the same at the next
+  writable open, which seeds it again at 0. That also takes write access to the database, the
+  same threat. Until that open, every sign-in, session check and every-account revoke refuses
+  with an error naming the missing row.
   **The exception,** for every sweep this bullet names: a request from a missed session to end
   the user's other sessions, accepted just before the sweep commits, waits for it and then stamps
   the session with the account's new epoch, so it stays usable. Against the every-account revoke
-  that request stamps the account's epoch alone, so the session still ends. There the only
-  request that keeps a missed session is a second every-account revoke, which needs
-  `users:manage` and a step-up, because only that revoke stamps the global epoch.
+  that request stamps the account's epoch alone, so the session still ends. There at least a
+  second every-account revoke keeps a missed session, which needs `users:manage` and a step-up,
+  because that revoke stamps the global epoch.
+  **A request that straddles a revoke's commit is narrowed, not fixed.** The gate and the
+  session list read a session before its account, so a request on a session the revoke kept can
+  see its old stamps beside the account's new epochs. Each now reads the session again and runs
+  the whole gate on that row before it ends the session. A revoke that commits between that
+  second read and the end still ends a session it had just re-stamped, and reports it as below.
   **At least three things are also wrong about a refused one.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. The report is rate-limited per session, and the alert goes through the alert notifier's
