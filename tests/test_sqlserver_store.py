@@ -1024,6 +1024,24 @@ async def test_overlapping_toggles_from_two_handles_leave_the_flag_matching_the_
         await second.close()
 
 
+async def test_a_foreign_lock_on_the_flag_table_holds_the_audit_chain_only_for_the_bound(
+    store,
+) -> None:
+    """BACKLOG #2623 on the real SQL Server backend: the toggle waits for its row holding the
+    audit applock, so a session holding a lock on ``connection_flag`` must cost the toggle its typed
+    refusal within ``LOCK_TIMEOUT``, error 1222 unretried, and leave an audit append from another
+    handle unblocked."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._operator_audit_atomic_contract import assert_flag_lock_wait_bounded
+
+    second = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    try:
+        await assert_flag_lock_wait_bounded(store, second)
+    finally:
+        await second.close()
+
+
 async def test_approval_release_outcome_contract(store) -> None:
     """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
     ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""

@@ -309,8 +309,15 @@ toggle there was always whole. A database writer outside the store is still the 
 above. The order follows from the code: when this was written the live cross-handle test (AC-7) ran
 only on SQLite, and its Postgres and SQL Server legs run on hosted CI alone. The fix has a cost: a
 toggle now waits on its flag statement holding the audit lock, so a foreign lock on
-`connection_flag` would hold every audit append in the store until it clears or the toggle times
-out.
+`connection_flag` would hold every audit append in the store while it waits. That wait is bounded
+at `CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, 5 s, under the engine's 10 s bound on the store call:
+`lock_timeout` local to the toggle's transaction on Postgres, kept where the role or database sets
+a stricter one, and `SET LOCK_TIMEOUT` on SQL Server, put back to -1 after the statement or after
+the rollback. Past it the toggle raises `ConnectionFlagLockTimeout`, which is never retried, rolls
+back and releases the audit lock, having written nothing, and the API answers 503. Before the bound
+each such wait ran to the driver's query timeout, 30 s by default, and without end at
+`command_timeout = 0`. Its live test, a foreign transaction holding the row while an audit append
+runs from another handle, runs on the Postgres and SQL Server legs, hosted CI only.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.

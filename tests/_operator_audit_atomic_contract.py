@@ -29,14 +29,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
+from messagefoundry.config.settings import StoreBackend
+from messagefoundry.store.base import (
+    CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
+    ConnectionFlagLockTimeout,
+)
 from messagefoundry.store.store import AuditAppend, MessageOrigin
 
 _RAW = (
@@ -388,6 +393,96 @@ async def assert_connection_flag_ordered_across_stores(first: Any, second: Any) 
     on one database, so neither shares the other's in-process locks."""
     for case in _OVERLAP_CASES:
         await _assert_overlapping_toggles_ordered(first, second, *case)
+
+
+#: How far past the store's bound the toggle's refusal may come: the opener, the audit lock, the
+#: rollback and, on SQL Server, the reset. The driver's query timeout, 30 s by default, is well past.
+_REFUSAL_SLACK = 5.0
+
+#: How long an audit append from another handle gets once the toggle has given up, with the foreign
+#: lock still held. Without the bound the toggle would still hold the audit lock here.
+_APPEND_PROMPT = 5.0
+
+
+@asynccontextmanager
+async def _foreign_flag_lock(holder: Any, conn: str, *, stored: bool) -> AsyncIterator[None]:
+    """A transaction on ``holder`` that is no toggle and holds a lock on ``conn``'s outbound flag
+    row until the block exits, then rolls back: an update lock on the stored row when ``stored``,
+    else an uncommitted insert of it. Raw SQL on the backend's own connection, so neither the
+    audit lock nor any lock of the store's own is taken."""
+    if holder.backend is StoreBackend.POSTGRES:
+        async with holder._timed_acquire(record=False) as raw:
+            tx = raw.transaction()
+            await tx.start()
+            try:
+                if stored:
+                    await raw.execute(
+                        "SELECT 1 FROM connection_flag"
+                        " WHERE connection=$1 AND direction='outbound' FOR UPDATE",
+                        conn,
+                    )
+                else:
+                    await raw.execute(
+                        "INSERT INTO connection_flag (connection, direction)"
+                        " VALUES ($1, 'outbound')",
+                        conn,
+                    )
+                yield
+            finally:
+                await tx.rollback()
+    elif holder.backend is StoreBackend.SQLSERVER:
+        async with holder._acquire() as raw:
+            try:
+                async with holder._cursor(raw) as cur:
+                    if stored:
+                        await cur.execute(
+                            "SELECT 1 FROM connection_flag WITH (UPDLOCK, HOLDLOCK, ROWLOCK)"
+                            " WHERE connection=? AND direction='outbound'",
+                            (conn,),
+                        )
+                        await cur.fetchall()
+                    else:
+                        await cur.execute(
+                            "INSERT INTO connection_flag (connection, direction)"
+                            " VALUES (?, 'outbound')",
+                            (conn,),
+                        )
+                    yield
+            finally:
+                await raw.rollback()
+    else:
+        raise AssertionError(f"no foreign lock is written for {holder.backend}")
+
+
+async def assert_flag_lock_wait_bounded(toggler: Any, other: Any) -> None:
+    """A foreign lock on ``connection_flag`` costs the audit chain only the store's bound (BACKLOG
+    #2623). The toggle holds the audit lock while its flag statement waits, so ``toggler``'s set and
+    clear each meet a lock ``other`` holds outside any toggle. Each must raise the typed refusal
+    within the bound, write neither the flag nor its row, and leave ``other`` free to append an
+    audit row at once while that lock is still held. Server backends only."""
+    for stored in (False, True):
+        conn = f"OB_L{uuid4().hex[:8]}"
+        action = f"contract.flag-lock.{uuid4().hex[:8]}"
+        if stored:
+            await toggler.set_connection_flag(
+                conn, "outbound", flagged=True, audit=AuditAppend("contract.flag-lock-seed")
+            )
+        async with _foreign_flag_lock(other, conn, stored=stored):
+            refused = toggler.set_connection_flag(
+                conn, "outbound", flagged=not stored, audit=AuditAppend(action, actor="contract-op")
+            )
+            with pytest.raises(ConnectionFlagLockTimeout):
+                await asyncio.wait_for(
+                    refused, CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS + _REFUSAL_SLACK
+                )
+            appended = f"contract.flag-lock-after.{uuid4().hex[:8]}"
+            await asyncio.wait_for(
+                other.record_audit(appended, actor="contract-op"), _APPEND_PROMPT
+            )
+        assert len(await _rows(other, appended)) == 1
+        assert await _rows(toggler, action) == [], "a refused toggle left its audit row"
+        flagged = (conn, "outbound") in await toggler.list_connection_flags()
+        assert flagged is stored, "a refused toggle changed the flag"
 
 
 async def _assert_alert_mutations_atomic(store: Any, tag: str) -> None:

@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import re
 import textwrap
 from collections.abc import Awaitable, Callable
@@ -35,8 +36,15 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.engine import ConnectionFlagNotRecorded
+from messagefoundry.pipeline.engine import (
+    CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS,
+    ConnectionFlagNotRecorded,
+)
 from messagefoundry.store import postgres as postgres_store
+from messagefoundry.store.base import (
+    CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
+    ConnectionFlagLockTimeout,
+)
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._operator_audit_atomic_contract import AppendFailed, failing_append
@@ -909,24 +917,37 @@ async def test_a_stored_row_refuses_neither_a_start_nor_a_reload(tmp_path: Path)
         await second.stop()
 
 
-@pytest.mark.parametrize("flagged", [True, False], ids=["set", "clear"])
-async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statement(
-    flagged: bool,
-) -> None:
-    """Offline, against a recording connection: the order the live cross-handle contract in
-    ``tests/test_postgres_store.py`` depends on. The lock taken only at the append let a clear run
-    beside another engine shard's uncommitted set at READ COMMITTED, delete nothing, and append
-    the newer row. Pinned to READ COMMITTED, since a REPEATABLE READ snapshot would predate the lock wait."""
-    log: list[str] = []
+class _LockNotAvailable(Exception):
+    """What asyncpg raises when a statement waits out ``lock_timeout``, read by its SQLSTATE."""
+
+    sqlstate = "55P03"
+
+
+#: The ``lock_timeout`` the Postgres toggle sets, in ms, as the recording connection logs it.
+_PG_BOUND = f"LOCK_TIMEOUT {math.ceil(CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS * 1000)}"
+
+
+def _recording_postgres_store(log: list[str], fail: BaseException | None = None) -> PostgresStore:
+    """A Postgres store over a recording connection, for the toggle's statement order. The flag
+    statement raises ``fail`` when one is given."""
 
     class _Conn:
         @contextlib.asynccontextmanager
         async def transaction(self, **kwargs: Any) -> Any:
             log.append(f"BEGIN {kwargs.get('isolation')}")
-            yield None
+            try:
+                yield None
+            except BaseException:
+                log.append("ROLLBACK")
+                raise
 
-        async def execute(self, sql: str, *_params: Any) -> str:
+        async def execute(self, sql: str, *params: Any) -> str:
+            if sql == postgres_store._DDL_LOCK_TIMEOUT_SQL:
+                log.append(f"LOCK_TIMEOUT {params[0]}")
+                return "OK"
             log.append(sql.split()[0])
+            if fail is not None:
+                raise fail
             return "OK"
 
     store = object.__new__(PostgresStore)
@@ -948,11 +969,49 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
         _advisory_lock=_advisory_lock,
         _append_operator_audit=_append_operator_audit,
     )
+    return store
+
+
+@pytest.mark.parametrize("flagged", [True, False], ids=["set", "clear"])
+async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statement(
+    flagged: bool,
+) -> None:
+    """Offline, against a recording connection: the order the live cross-handle contract in
+    ``tests/test_postgres_store.py`` depends on. The lock taken only at the append let a clear run
+    beside another engine shard's uncommitted set at READ COMMITTED, delete nothing, and append
+    the newer row. Pinned to READ COMMITTED, since a REPEATABLE READ snapshot would predate the lock
+    wait. The flag statement holds the audit lock while it waits for its row, so its lock waits are
+    bounded, after the audit lock and before the statement. RED with the bound removed."""
+    log: list[str] = []
+    store = _recording_postgres_store(log)
     await store.set_connection_flag(
         "OB_A", "outbound", flagged=flagged, audit=AuditAppend("connection_flag_set")
     )
     statement = "INSERT" if flagged else "DELETE"
-    assert log == ["BEGIN read_committed", "LOCK audit", statement, "APPEND"]
+    assert log == ["BEGIN read_committed", "LOCK audit", _PG_BOUND, statement, "APPEND"]
+
+
+async def test_a_postgres_flag_statement_that_waits_out_the_bound_is_refused() -> None:
+    """SQLSTATE 55P03 from the flag statement raises the typed refusal, and the transaction rolls
+    back, which releases the audit lock, with nothing appended. ``lock_timeout`` is local to that
+    transaction, so nothing is left to put back. RED when the refusal is left untyped."""
+    log: list[str] = []
+    waited = _LockNotAvailable("canceling statement due to lock timeout")
+    store = _recording_postgres_store(log, fail=waited)
+    with pytest.raises(ConnectionFlagLockTimeout) as caught:
+        await store.set_connection_flag(
+            "OB_A", "outbound", flagged=False, audit=AuditAppend("connection_flag_set")
+        )
+    assert caught.value.__cause__ is waited
+    assert caught.value.timeout == CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
+    assert log == ["BEGIN read_committed", "LOCK audit", _PG_BOUND, "DELETE", "ROLLBACK"]
+
+
+def test_the_flag_lock_bound_sits_under_the_engine_bound() -> None:
+    """The store's bound on the flag statement's lock wait is under the engine's bound on the whole
+    store call, so a toggle held by a foreign lock reaches its caller as the store's own refusal,
+    and the session holding the audit lock ends its wait before the engine stops waiting."""
+    assert 0 < CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS < CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS
 
 
 #: A statement that writes the flag table, as a SQL string literal spells it: at least the Postgres,
