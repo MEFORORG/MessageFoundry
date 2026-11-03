@@ -32,18 +32,21 @@ Validate = Callable[[Path], None]
 
 
 class SecurityEditError(ValueError):
-    """A ``[security]`` edit was rejected: a malformed update or a file that wouldn't load (e.g. a value
-    that fails validation, or a relocated legacy key). Raised with an operator-facing message."""
+    """A ``[security]`` edit was rejected: a malformed update, a file that wouldn't load (e.g. a value
+    that fails validation, or a relocated legacy key), or a file system that refused the edit. Raised
+    with an operator-facing message."""
 
 
 def read_security(service_config: str | Path) -> dict[str, Any]:
     """The ``[security]`` table as authored in ``service_config`` (``{}`` if the file or the ``[security]``
     table is absent). These are the EXPLICITLY-set switches — a caller resolves the secure defaults for
     the unset ones. Comment/format trivia is not returned (values only)."""
-    path = Path(service_config)
-    if not path.is_file():
+    text, _crlf = atomic_edit.read_text_if_present(
+        Path(service_config), refused_error=SecurityEditError
+    )
+    if text is None:
         return {}
-    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc = tomlkit.parse(text)
     sec = doc.get("security")
     return dict(sec.unwrap()) if sec is not None else {}
 
@@ -58,8 +61,8 @@ def set_security(
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
-    with atomic_edit.edit_lock(path, busy_error=SecurityEditError):
-        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
+    with atomic_edit.edit_lock(path, busy_error=SecurityEditError, refused_error=SecurityEditError):
+        original, crlf = atomic_edit.read_text_if_present(path, refused_error=SecurityEditError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         sec = doc.get("security")
@@ -105,4 +108,4 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
         except Exception as exc:
             raise SecurityEditError(str(exc)) from exc
 
-    atomic_edit.replace_validated(path, data, checked)
+    atomic_edit.replace_validated(path, data, checked, refused_error=SecurityEditError)

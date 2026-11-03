@@ -114,8 +114,8 @@ _DENIAL_ACTIONS: Final = frozenset(
 #: imported from
 #: ``auth/``; a test pins it to ``DIRECTORY_LOCKED_REFUSAL_DETAIL``.
 _DIRECTORY_LOCKED_DETAIL: Final = json.dumps({"provider": "ad", "reason": "locked"}, sort_keys=True)
-#: ``CONFIG_BASELINE_UNCHECKED_KEY``, spelled here so this module need not import the engine; a test
-#: pins the two together.
+#: ``_BASELINE_UNCHECKED`` in ``api/app.py``, which writes the mark, at least on a ``config_loaded``
+#: row. Spelled here because ``pipeline/`` never imports ``api/``; a test pins the two together.
 _BASELINE_UNCHECKED: Final = "baseline_unchecked"
 #: The marks on a start's ``config_loaded`` row that keep an empty loosenings list from resolving an
 #: open ``posture_loosened``. The list is read off the graph the start's snapshot took, so a reload

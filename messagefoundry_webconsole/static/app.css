@@ -229,8 +229,8 @@ table.grid th:has(> [data-mf-conns-all]), table.grid td:has(> .rowcb) {
 }
 .rowcb { margin: 0; cursor: pointer; }
 
-/* Object-of-interest flag (#131): a per-row toggle button (TOML-managed) or a read-only glyph
-   (code-first). Amber when flagged (the brand accent), muted outline otherwise. */
+/* Object-of-interest flag (#131): a per-row toggle button, or the marker alone on a draining
+   row. Amber when flagged (the brand accent), muted outline otherwise. */
 .flagbtn {
   background: transparent; border: 0; cursor: pointer; padding: 0 0.2rem; line-height: 1;
   color: var(--muted); font-size: 1rem; border-radius: 4px;

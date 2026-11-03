@@ -31,6 +31,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._operator_audit_atomic_contract import (
+    assert_connection_flag_ordered_across_stores,
     assert_operator_audit_atomic,
     failing_append,
 )
@@ -49,6 +50,21 @@ async def test_sqlite_operator_mutations_commit_with_their_audit_rows(
         await assert_operator_audit_atomic(store)
     finally:
         await store.close()
+
+
+async def test_sqlite_overlapping_toggles_from_two_handles_stay_ordered(tmp_path: Path) -> None:
+    """The cross-handle flag contract the Postgres and SQL Server suites run (BACKLOG #2623). Here
+    SQLite's single writer is the lock: the second handle's flag statement waits for the first's
+    commit, so it holds with no lock of the store's own."""
+    first = await MessageStore.open(tmp_path / "two.db")
+    try:
+        second = await MessageStore.open(tmp_path / "two.db")
+        try:
+            await assert_connection_flag_ordered_across_stores(first, second)
+        finally:
+            await second.close()
+    finally:
+        await first.close()
 
 
 @pytest.fixture

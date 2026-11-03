@@ -68,6 +68,7 @@ export type ProbeOutcome =
  *  - `unverified`   — a session exists, but it has not been proven able to do anything
  *  - `blocked`      — authenticated and REFUSED (must-change password / missing permission / MFA / step-up)
  *  - `drifted`      — usable, but the engine's loaded config differs from what is on disk
+ *  - `notCompared`  — usable, but the engine took no reading of the config on disk to compare
  *  - `ok`           — verified usable, within the freshness window
  */
 export type LinkState =
@@ -78,6 +79,7 @@ export type LinkState =
   | "unverified"
   | "blocked"
   | "drifted"
+  | "notCompared"
   | "ok";
 
 /** Why an authenticated caller was refused. Sub-classified from the engine's 403 `detail` string,
@@ -452,7 +454,22 @@ export function classifyDeep(outcome: ProbeOutcome, prior: EngineLink, now: numb
       verifiedAt: now,
     };
   }
+  if (body.drift === null) {
+    // The 200 proved the session, but the engine compared nothing: that earns no green.
+    return {
+      ...base,
+      state: "notCompared",
+      blocked: undefined,
+      reason: "the engine could not fingerprint its config, so it compared nothing; its log says why",
+      verifiedAt: now,
+    };
+  }
   return { ...base, state: "ok", reason: undefined, blocked: undefined, verifiedAt: now };
+}
+
+/** The states only a deep probe can earn, which carry `verifiedAt`. */
+export function isEarnedState(state: LinkState): boolean {
+  return state === "ok" || state === "drifted" || state === "notCompared";
 }
 
 /**
@@ -460,7 +477,7 @@ export function classifyDeep(outcome: ProbeOutcome, prior: EngineLink, now: numb
  * item cannot sit on a stale "everything's fine" for hours after the session it verified has died.
  */
 export function withStaleness(link: EngineLink, now: number): EngineLink {
-  if (link.state !== "ok" && link.state !== "drifted") {
+  if (!isEarnedState(link.state)) {
     return link;
   }
   if (link.verifiedAt !== undefined && now - link.verifiedAt <= VERIFY_TTL_MS) {
@@ -532,6 +549,8 @@ function headline(state: LinkState): string {
       return "Engine up — this account is blocked";
     case "drifted":
       return "Engine up — config has drifted";
+    case "notCompared":
+      return "Engine up — config not compared";
     case "ok":
       return "Engine ready";
   }
@@ -553,6 +572,8 @@ function icon(state: LinkState): string {
       return "$(warning)";
     case "drifted":
       return "$(git-compare)";
+    case "notCompared":
+      return "$(question)";
     case "ok":
       return "$(pass-filled)";
   }
@@ -573,6 +594,7 @@ function background(state: LinkState): StatusBackground {
       return "error";
     case "blocked":
     case "drifted":
+    case "notCompared":
       return "warning";
     default:
       return undefined;
@@ -818,6 +840,16 @@ export function planActions(
         detail: `${l.target.url}/ui`,
         command: CMD.openConsole,
       });
+      break;
+
+    case "notCompared":
+      // Nothing says the config differs, so no promote is offered.
+      actions.push({
+        label: "$(link-external) Open the web console",
+        detail: `${l.target.url}/ui`,
+        command: CMD.openConsole,
+      });
+      actions.push({ label: "$(sign-out) Sign out", command: CMD.signOut });
       break;
 
     case "ok":

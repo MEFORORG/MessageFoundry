@@ -87,6 +87,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     encode_wire_body,
     float_setting,
+    port_setting,
     register_destination,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -437,7 +438,7 @@ class EmailDestination(DestinationConnector):
         if not isinstance(sender, str) or not sender:
             raise ValueError("Email destination requires a 'sender' setting")
         self.host = host
-        self.port = int(s.get("port", 587))
+        self.port = port_setting(s.get("port", 587), transport="Email destination")
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
         self.subject = str(s.get("subject", ""))

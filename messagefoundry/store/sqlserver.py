@@ -88,8 +88,10 @@ from messagefoundry.redaction import codec_safe_str, safe_text
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
+    ConnectionFlagLockTimeout,
     SchemaDdlLockTimeout,
     SchemaLockTimeout,
     SchemaNotProvisionedError,
@@ -531,13 +533,18 @@ _CIPHER_MERGE_BACKOFF = 0.05
 
 
 async def _retry_idempotent_merge[T](
-    op: Callable[[], Awaitable[T]], *, on_retry: Callable[[], Awaitable[None]] | None = None
+    op: Callable[[], Awaitable[T]],
+    *,
+    on_retry: Callable[[], Awaitable[None]] | None = None,
+    statement: str = "insert-if-absent MERGE",
 ) -> T:
-    """Run an IDEMPOTENT insert-if-absent MERGE, retrying a transient write conflict with backoff.
+    """Run an IDEMPOTENT write, by default an insert-if-absent MERGE, retrying a transient write
+    conflict with backoff.
 
     Only for a statement a re-run cannot double-apply; an increment such as
     :meth:`SqlServerStore.add_cipher_invocations` needs its own no-double-count guard instead.
-    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back."""
+    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back.
+    ``statement`` is what the retry's log line calls it."""
     for attempt in range(1, _CIPHER_MERGE_ATTEMPTS + 1):
         try:
             return await op()
@@ -545,7 +552,8 @@ async def _retry_idempotent_merge[T](
             if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS:
                 raise
             log.debug(
-                "insert-if-absent MERGE hit a %s, attempt %d of %d; retrying",
+                "%s hit a %s, attempt %d of %d; retrying",
+                statement,
                 "lock timeout (HYT00)" if "HYT00" in str(exc) else "deadlock (1205)",
                 attempt,
                 _CIPHER_MERGE_ATTEMPTS,
@@ -2550,6 +2558,15 @@ _SCHEMA: list[str] = [
         CONSTRAINT pk_known_login_addresses PRIMARY KEY (user_id, address),
         CONSTRAINT fk_known_login_addresses_user FOREIGN KEY (user_id)
             REFERENCES users(id) ON DELETE CASCADE)""",
+    # The object-of-interest flag (BACKLOG #2623) -- mirrors the SQLite `connection_flag` table
+    # (store/store.py), whose comment gives the reasons: a row IS the flag. BIN2 so key equality is
+    # a byte comparison, as on SQLite and Postgres: a case-insensitive default collation would give
+    # two connections whose names differ by case one flag. Adding this DDL moves _schema_hash() --
+    # the ADR 0064 bump.
+    """IF OBJECT_ID('connection_flag','U') IS NULL CREATE TABLE connection_flag (
+        connection NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        direction NVARCHAR(16) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        CONSTRAINT pk_connection_flag PRIMARY KEY (connection, direction))""",
     # Captured request/response replies (ADR 0013) — an IMMUTABLE ARTIFACT table (composite PK), NOT a
     # queue stage, so it is invisible to _maybe_finalize's `FROM queue` scan. response_seq is replay-
     # stable (1+MAX per (message_id,destination_name)). body + detail are BOTH ciphertext at rest for
@@ -4796,7 +4813,7 @@ class SqlServerStore:
                         _detach_connection(conn)
                     raise
                 if lock_bounded:
-                    await self._reset_schema_lock_timeout(conn)
+                    await self._reset_lock_timeout(conn, after="a failed schema batch")
                 raise
 
     async def _verify_live_schema(self, cur: Any) -> None:
@@ -4852,14 +4869,16 @@ class SqlServerStore:
             unusable,
         )
 
-    async def _reset_schema_lock_timeout(self, conn: Any) -> None:
-        """After a failed schema batch has rolled back, put the session's LOCK_TIMEOUT back to -1
-        (BACKLOG #1726), so the pooled connection keeps the default. A ``SET`` is not undone by a
-        rollback, so the reset runs alone and is followed by a second rollback, which ends any
-        implicit transaction it opened. It runs under ``command_timeout`` again, like any other
-        statement on a borrowed connection: the batch had lifted the connection's query timeout. A
-        failed reset is logged, not raised, so it cannot mask the batch's own error, and the
-        connection is discarded rather than pooled with a LOCK_TIMEOUT nobody else expects."""
+    async def _reset_lock_timeout(self, conn: Any, *, after: str) -> None:
+        """After a failed write that set a LOCK_TIMEOUT has rolled back, put the session's
+        LOCK_TIMEOUT back to -1, so the pooled connection keeps the default: the schema batch
+        (BACKLOG #1726) and the connection flag toggle (BACKLOG #2623). ``after`` names the write in
+        the log line. A ``SET`` is not undone by a rollback, so the reset runs alone and is followed
+        by a second rollback, which ends any implicit transaction it opened. It runs under
+        ``command_timeout`` again, like any other statement on a borrowed connection: the schema
+        batch had lifted the connection's query timeout. A failed reset is logged, not raised, so it
+        cannot mask the write's own error, and the connection is discarded rather than pooled with a
+        LOCK_TIMEOUT nobody else expects."""
         raw = getattr(conn, "_conn", None)
         if raw is not None:
             raw.timeout = self._settings.command_timeout
@@ -4871,8 +4890,9 @@ class SqlServerStore:
             await conn.rollback()
         except Exception:  # noqa: BLE001 - a reset failure must not mask the real outcome
             log.warning(
-                "sqlserver: could not %s after a failed schema batch; discarding the connection",
+                "sqlserver: could not %s after %s; discarding the connection",
                 step,
+                after,
                 exc_info=True,
             )
             # Its future is deliberately not awaited, as in _rollback_or_discard.
@@ -7913,6 +7933,105 @@ class SqlServerStore:
             suspended_until=(None if r["suspended_until"] is None else float(r["suspended_until"])),
             escalation_tier=int(r["escalation_tier"]),
         )
+
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`.
+
+        The audit applock comes FIRST, before the flag statement, and holds to the commit, so two
+        toggles from any engine shard or node run one after the other. Taken at the append instead,
+        a clear that matched no row locks nothing at READ COMMITTED, so a set beside it could commit
+        first and the clear's row would still be the newer. Only toggles write ``connection_flag``,
+        and each holds the applock first, so a key lock under it cannot cycle. ``HOLDLOCK`` stays
+        on the MERGE, though the applock already keeps two toggles off the key at once.
+
+        Only the flag statement is retried, as :meth:`_claim_keyed_surface` retries its MERGE. The
+        rollback before a re-run releases the applock, so the backoff sleeps holding nothing, and
+        the re-run opens a transaction and takes it again first. A wait for the applock that fails,
+        at the first take or a re-take, is never retried: it raises, as it did when the append took
+        the applock.
+
+        The flag statement runs under ``SET LOCK_TIMEOUT``, at
+        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, because it holds the
+        applock while it waits. Without it a foreign lock on ``connection_flag`` would hold every
+        audit append until the driver's query timeout, and for ever at ``command_timeout = 0``.
+        Error 1222 is treated as a failed applock wait: it raises
+        :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, not retried, and the
+        transaction rolls back. The setting is session-scoped and survives a rollback, so it is put
+        back to -1 right after the statement, or after the rollback on a failure, so a pooled
+        connection never carries it into other work."""
+        now = time.time() if now is None else now
+        bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
+        if flagged:
+            statement = "connection flag MERGE"
+            sql = (
+                "MERGE connection_flag WITH (HOLDLOCK) AS t"
+                " USING (SELECT ? AS connection, ? AS direction) AS s"
+                " ON t.connection = s.connection AND t.direction = s.direction"
+                " WHEN NOT MATCHED THEN INSERT (connection, direction)"
+                " VALUES (s.connection, s.direction);"
+            )
+        else:
+            statement = "connection flag DELETE"
+            sql = "DELETE FROM connection_flag WHERE connection=? AND direction=?"
+        async with AuditedWrite(now) as written, self._acquire() as conn:
+            bounded = False
+            try:
+                async with self._cursor(conn) as cur:
+                    locked = False
+
+                    async def write_flag() -> None:
+                        nonlocal locked, bounded
+                        if not locked:
+                            try:
+                                await self._open_under_audit_applock(cur)
+                            except Exception as exc:
+                                # Not a transient conflict to the retry, whatever the driver said.
+                                raise RuntimeError(
+                                    "the audit applock was not granted to a connection flag write"
+                                ) from exc
+                            locked = True
+                        # Raised first: a SET the server applied whose round trip then failed must
+                        # still be reset.
+                        bounded = True
+                        await cur.execute(f"SET LOCK_TIMEOUT {math.ceil(bound * 1000)}")
+                        try:
+                            await cur.execute(sql, (connection, direction))
+                        except Exception as exc:
+                            if _is_lock_timeout(exc):
+                                # Not transient either: a retry would hold the applock again
+                                # behind the same holder.
+                                raise ConnectionFlagLockTimeout(self.backend, bound) from exc
+                            raise
+                        await cur.execute(_LOCK_TIMEOUT_RESET)
+                        bounded = False
+
+                    async def release() -> None:
+                        nonlocal locked
+                        await conn.rollback()
+                        locked = False
+
+                    await _retry_idempotent_merge(write_flag, on_retry=release, statement=statement)
+                    await self._append_operator_audit(cur, written, if_applied(audit), True)
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
+                await self._rollback_or_discard(conn)
+                if bounded:
+                    await self._reset_lock_timeout(conn, after="a failed connection flag write")
+                raise
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
+        rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
+        return {(str(d["connection"]), str(d["direction"])) for d in rows}
 
     async def _alert_write(
         self, sql: str, params: tuple[Any, ...], audit: AuditAppend, now: float
@@ -13610,9 +13729,10 @@ class SqlServerStore:
 
         It does NOT take the in-process ``_audit_lock``. That lock is only the cheap near gate
         :meth:`record_audit` describes; ``_AUDIT_APPEND_LOCK`` is what serialises the chain, and it
-        is taken here, at the tail, after the mutation's own writes. Holding ``_audit_lock`` across a
-        whole mutation would queue every audit write in this process, sign-ins included, behind a
-        bulk replay or purge."""
+        is taken here, at the tail, after the mutation's own writes, except by
+        :meth:`set_connection_flag`, which takes it before its write and says why. Holding
+        ``_audit_lock`` across a whole mutation would queue every audit write in this process,
+        sign-ins included, behind a bulk replay or purge."""
         audits = operator_audits(audit, result)
         written.add(audits, await self._append_audits(cur, audits, now=written.now))
 

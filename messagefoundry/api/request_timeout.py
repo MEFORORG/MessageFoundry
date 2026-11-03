@@ -22,7 +22,8 @@ release and config reload (inline, from ``/ui``, and released through the approv
 operation through :class:`~messagefoundry.api.outlive.OutlivingOperations`,
 so cancelling the handler here leaves the operation running to its own outcome row rather than half
 done (vault BACKLOG #2751-#2753). At least the approval gate's outcome writes shield themselves the
-same way; anything a route does not shield is cancelled with the handler.
+same way, and the engine runs a connection flag write as its own task. Anything nobody shields is
+cancelled with the handler.
 
 Being outside the app's ``_security_headers`` middleware, the refusal sets the baseline response
 headers itself rather than shipping a 503 with none of them — the same reason

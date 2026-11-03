@@ -156,6 +156,26 @@ def _unreadable(
     monkeypatch.setattr(Path, "read_bytes", _read)
 
 
+def _unlistable(
+    monkeypatch: pytest.MonkeyPatch, path: Path, *, when: dict[str, bool] | None = None
+) -> None:
+    """Make ``os.scandir`` of ``path`` fail as an access-denied listing does, always or while
+    ``when["on"]``. A target may be a file descriptor, as ``shutil.rmtree`` passes on Linux, and
+    ``Path`` of that raises."""
+    real = os.scandir
+
+    def _scandir(target: Any = ".") -> Any:
+        if (
+            (when is None or when["on"])
+            and isinstance(target, str | os.PathLike)
+            and Path(target) == path
+        ):
+            raise PermissionError(13, "Permission denied", str(target))
+        return real(target)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+
+
 @pytest.mark.parametrize("name", ["cfg.py", "dev.toml"])
 def test_strict_refuses_a_file_it_cannot_read_where_the_default_skips_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str

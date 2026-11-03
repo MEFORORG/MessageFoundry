@@ -107,6 +107,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    refuse_capture_conflicts,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
@@ -2212,6 +2213,7 @@ class RegistryRunner:
                 # so the inherited max_attempts is that default policy's — not a separate scalar.
                 retry_max_attempts=self._delivery_defaults.max_attempts,
             ),
+            env_values=self._env_values,
         )
         settings = ic.spec.settings
         metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
@@ -2987,9 +2989,9 @@ class RegistryRunner:
         self, *, now: datetime | None = None
     ) -> Callable[[InboundConnection], bool]:
         """Which inbound listeners this runner would bind, as a predicate over a snapshot of what is
-        listening now (vault BACKLOG #2622 item 1). :meth:`build_check` and an engine's flag toggle
-        run the inbound exposure gates only where it holds, so neither refuses a config for a
-        listener the engine leaves unbound.
+        listening now (vault BACKLOG #2622 item 1). :meth:`build_check` runs the inbound exposure
+        gates only where it holds, so it does not refuse a config for a listener the engine leaves
+        unbound.
 
         It reads :meth:`_listener_skip`, the one copy of the skips :meth:`start` and
         :meth:`reload` apply, without their side effects (vault BACKLOG #3063 item 12). It holds for
@@ -3005,22 +3007,19 @@ class RegistryRunner:
         is refused before the disaster rather than during it (vault BACKLOG #3140).
 
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
-        worker thread (the flag toggle validates off the event loop). The DR threshold, default
+        worker thread. The DR threshold, default
         tier and schedule clock are read through ``self`` when it runs. The tier is set only at
         construction; the threshold is set there and by :meth:`set_dr_threshold`. ``now`` pins
         the schedule clock instead: :meth:`reload` passes the time its listener loop also reads,
         so a window that opens during the quiesce cannot make the two disagree.
 
-        **At least two callers take the snapshot outside the reload lock, and that window is accepted**
-        (vault BACKLOG #3063 item 5): a dry-run reload, through :meth:`build_check`, and an
-        engine's flag toggle. The lock is an ``asyncio.Lock``, which the worker thread cannot take,
-        and holding it on the loop across the toggle's file write would stall every reload behind
-        it. A snapshot taken during a reload's quiesce can miss a listener an operator started, so
-        the dry run or toggle passes a config the reload then refuses. Or it can keep one an
-        operator has just stopped, so it refuses one the reload would pass. Neither path binds
-        anything: a dry run applies nothing, and a toggle writes only the cosmetic ``flagged``
-        field. A reload takes its own snapshot under the lock and runs the gates on it, and a
-        start runs them on the listener itself, so the window never admits a bind."""
+        **A dry-run reload takes the snapshot outside the reload lock, through :meth:`build_check`,
+        and that window is accepted** (vault BACKLOG #3063 item 5). A snapshot taken during a
+        reload's quiesce can miss a listener an operator started, so the dry run passes a config
+        the reload then refuses. Or it can keep one an operator has just stopped, so it refuses one
+        the reload would pass. A dry run binds nothing and applies nothing. A reload takes its own
+        snapshot under the lock and runs the gates on it, and a start runs them on the listener
+        itself, so the window never admits a bind."""
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
@@ -11863,13 +11862,19 @@ def _dest_config(
     # Resolve env() first so any signing key/password ref is materialized here, then assemble the
     # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
-    # is the single choke point feeding start/check/dry-run, so a bad key fails loud at all three.
+    # is the single choke point feeding start, check and a reload's dry run, so a bad key fails loud at
+    # all three. `messagefoundry dryrun` builds no connector, so it never reaches here.
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
     # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
     # unread-CA check never sees.
     refuse_resolved_verify_off(oc.spec.type, settings, f"outbound connection {oc.name!r}")
-    # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
-    # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
+    # BACKLOG #3724: the build read an env() flag as undecided, so its capture and no_ack checks run
+    # again here on the value the connector will read.
+    refuse_capture_conflicts(
+        oc.spec.type, settings, f"outbound connection {oc.name!r}", batched=oc.batch is not None
+    )
+    # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This same choke
+    # point means every caller builds the same effective proxy.
     _apply_egress_proxy_default(settings, egress)
     # ADR 0153 / ADR 0173: the connectors read the typed Destination fields below, but the deep
     # settings-driven seams read a settings mapping, so the declarations and the name are mirrored.
@@ -11954,7 +11959,7 @@ def build_check_registry(
     ``posture`` (#200, ADR 0092) is the instance's derived security posture (PHI? production?), stamped
     as the active hop posture for the whole connector-construction block so each cell keys its
     posture-keyed insecure-hop refusal on the LOADED config's posture rather than guessing — the ENFORCED
-    construction-time gate that fires at ``messagefoundry check`` / dry-run / reload. ``None`` (an
+    construction-time gate that fires at ``messagefoundry check`` and on a reload, dry run included. ``None`` (an
     embedding/test that doesn't derive a posture) leaves the posture unstamped: a cell then fail-closes
     (treats each hop as prod-PHI). Every ``serve``/``reload`` caller passes the config's real posture.
 
@@ -11965,14 +11970,14 @@ def build_check_registry(
     ``allow_insecure_bind`` is the cleartext-listener escape the four inbound exposure gates read
     (vault BACKLOG #2622 item 1): ``serve --allow-insecure-bind`` folded with
     ``[security].require_encryption_for_remote = false``, exactly as ``serve`` folds them. Pass the
-    value the caller really has. A running engine passes its own, so a reload or flag toggle accepts
-    the listener the engine already accepted; ``messagefoundry check`` has no such flag and passes the
+    value the caller really has. A running engine passes its own, so a reload accepts the listener
+    the engine already accepted; ``messagefoundry check`` has no such flag and passes the
     setting half alone. The default ``False`` is the strict side: it refuses, never admits.
 
     ``exposure_gated`` picks the inbound listeners those four gates run on. ``None`` means
     :func:`inbound_listener_starts`, the deployed-and-auto-start test engine start applies, which is
-    all an offline caller (``check``, ``connection``) can know. A live runner, and an engine's flag
-    toggle, pass :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip meets
+    all an offline caller (``check``, ``connection``) can know. A live runner passes
+    :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip meets
     them when it would be bound. An operator start of an ``auto_start = false`` listener runs the
     same gates. A ``deployed = false`` listener cannot be started (the start raises
     :class:`NotDeployedError`); the reload that deploys it meets the gates if the engine would then
@@ -12086,7 +12091,7 @@ def _build_check_connectors(
         source_cfg = _source_config(ic, inbound_bind_host, env_values, trust_anchor_policy)
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
-        check_http_sync_reply(ic, registry, delivery=delivery)
+        check_http_sync_reply(ic, registry, delivery=delivery, env_values=env_values)
         # Vault BACKLOG #2622 item 1: the four inbound exposure gates, through the one function
         # _start_inbound_unsafe also calls. Before this they ran only at start, so
         # `messagefoundry check` passed a cleartext off-loopback listener that serve then refused.
@@ -12128,7 +12133,8 @@ def _build_check_connectors(
         build_destination(dest, egress=egress)  # runs the fail-closed egress allowlist (WP-11c)
         # ADR 0013 Increment 2: reingress_to must name an existing Loopback() inbound. This is a
         # CROSS-registry fact (build_outbound_connection is registry-blind), enforced here so it
-        # fails at `check`/dry-run with no store, like every other connector validation.
+        # fails at `check` and in a reload's dry run with no store, like every other connector
+        # validation.
         target = oc.spec.settings.get("reingress_to")
         if target is not None:
             if str(target) not in loopbacks:
@@ -12158,8 +12164,8 @@ def _build_check_connectors(
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
         DatabaseLookupExecutor(resolved_lookups, egress=egress)  # checks each server first
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
-    # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
-    # than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
+    # posture, so weakened TLS that every sync would refuse fails check and a reload, dry run included,
+    # rather than only surfacing as a failed sync after start. The egress allowlist stays at sync; the
     # read-only statement test runs here and again at sync (BACKLOG #2617). Builds no pool and opens
     # no socket. A source whose env() values do not resolve here is left to its sync, as before, so
     # one unprovisioned set does not refuse the whole graph.
@@ -12700,12 +12706,13 @@ def check_http_sync_reply(
     registry: Registry,
     *,
     delivery: DeliverySettings | None = None,
+    env_values: Mapping[str, Any] | None = None,
 ) -> None:
     """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
 
     These are the facts one ``Http()`` call cannot know, because they are about the *other*
-    connection. Runs with no store, so it fires at ``messagefoundry check`` and in dry-run exactly as
-    at serve.
+    connection. Runs with no store, so it fires at ``messagefoundry check`` and in a reload's dry run
+    as well as at serve.
 
     The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
     warnings because together they make the feature's headline use case unserviceable.
@@ -12729,6 +12736,10 @@ def check_http_sync_reply(
     exists to catch. When ``delivery`` is not supplied the caller could not resolve them either, so
     that arm is **skipped rather than guessed**; the runner re-checks at start, where the resolved
     values always exist.
+
+    ``env_values`` is the same contract. Left ``None``, a target's ``env()`` capture flag is not read
+    at all, default included, so it passes as undecided. A mapping resolves it, so an empty one reads
+    a ref with no default as missing.
     """
     settings = ic.spec.settings
     reply_from = settings.get("reply_from")
@@ -12747,7 +12758,14 @@ def check_http_sync_reply(
             f"inbound connection {name!r}: reply_from names {target!r}, which is declared "
             "deployed=False — it will never run, so every HTTP turn could only time out"
         )
-    if not oc.spec.settings.get("capture_response"):
+    # BACKLOG #3724: read once resolved, as refuse_capture_conflicts reads them. An env() ref is truthy
+    # whatever it resolves to, and the connector captures on either flag.
+    capture_flags = {
+        key: oc.spec.settings.get(key) for key in ("capture_response", "capture_out_params")
+    }
+    if env_values is not None:
+        capture_flags = resolve_env_settings(capture_flags, env_values, connection=target)
+    if not any(capture_flags.values()):
         raise WiringError(
             f"inbound connection {name!r}: reply_from names {target!r}, which does not set "
             "capture_response=True — with no captured reply there is nothing to return, and every "

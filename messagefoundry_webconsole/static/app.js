@@ -201,6 +201,7 @@
     var select = toolbar.querySelector("[data-mf-conns-action]");
     var applyBtn = toolbar.querySelector("[data-mf-conns-apply]");
     var feedback = toolbar.querySelector("[data-mf-conns-feedback]");
+    var flaggedOnly = document.querySelector("[data-mf-conns-flagged]"); // un-polled, as toolbar is
     var selected = new Set(); // keyed by checkbox .value (the stable _row_key)
 
     function rowCheckboxes() {
@@ -296,17 +297,40 @@
       if (applyBtn) applyBtn.disabled = eligible < 1;
     }
 
-    // Recompute the select-all header checkbox's checked/indeterminate from the live Set.
+    // Whether select-all takes this row. It takes the VISIBLE rows only, so the operator never sweeps
+    // in — and then Stop/Restart/Reset — connections they can't see. The row's own style, not
+    // offsetParent, because this runs on every swap and a layout read would force a table layout. A
+    // failed flag read leaves every row on screen under Flagged only, and none of them is known to
+    // be flagged, so one transient error must not widen a selection scoped to flagged rows to every
+    // connection. The operator can still tick such a row by hand.
+    function selectAllTakes(cb) {
+      if (cb.closest("tr").style.display === "none") return false;
+      return !(flaggedOnly && flaggedOnly.checked) || cb.getAttribute("data-flagged") === "1";
+    }
+
+    // Recompute the select-all header checkbox's checked/indeterminate from the live Set. Ticked
+    // means every row a click can take is taken, not every rendered row: a filtered select-all must
+    // stay ticked, because its next click is the uncheck that clears the selection. So a selection
+    // with no row to take reads ticked too, or no click on the box could clear it.
     function syncSelectAll() {
       var box = selectAllBox();
       if (!box) return;
       var cbs = rowCheckboxes();
       var checked = 0;
+      var takeable = 0;
+      var taken = 0;
       for (var i = 0; i < cbs.length; i++) {
-        if (selected.has(cbs[i].value)) checked++;
+        var isSelected = selected.has(cbs[i].value);
+        if (isSelected) checked++;
+        if (selectAllTakes(cbs[i])) {
+          takeable++;
+          if (isSelected) taken++;
+        }
       }
-      box.checked = cbs.length > 0 && checked === cbs.length;
-      box.indeterminate = checked > 0 && checked < cbs.length;
+      box.checked = checked > 0 && taken === takeable;
+      // A selection that holds a row select-all could not take keeps its mark, ticked or not, since
+      // that row is still acted on. Ticked, the next click clears it too; unticked, it stays.
+      box.indeterminate = box.checked ? checked > taken : checked > 0;
     }
 
     // After every swap (poll tick AND ws push): re-apply cb.checked from the Set, recompute select-all,
@@ -352,7 +376,8 @@
     }
 
     // Delegated to the persistent [data-poll] node (only its children are swapped): a row checkbox
-    // toggles its .value in the Set; the select-all box checks/unchecks every rendered row + syncs.
+    // toggles its .value in the Set; the select-all box checks the rows selectAllTakes allows, or
+    // unchecks every rendered row, + syncs.
     poll.addEventListener("change", function (ev) {
       var t = ev.target;
       if (!t || !t.hasAttribute) return;
@@ -364,14 +389,14 @@
       } else if (t.hasAttribute("data-mf-conns-all")) {
         var cbs = rowCheckboxes();
         for (var i = 0; i < cbs.length; i++) {
-          // Select-all applies to the VISIBLE rows only: when checking, skip a row the filter has hidden
-          // (offsetParent is null for a display:none row) so the operator never sweeps in — and then
-          // Stop/Restart/Reset — connections they can't see. Unchecking still clears every row.
-          if (t.checked && cbs[i].offsetParent === null) continue;
+          // Unchecking still clears every row.
+          if (t.checked && !selectAllTakes(cbs[i])) continue;
           cbs[i].checked = t.checked;
           if (t.checked) selected.add(cbs[i].value);
           else selected.delete(cbs[i].value);
         }
+        // At once, so a click that took nothing does not leave the box ticked over no selection.
+        syncSelectAll();
         refresh();
       }
     });
@@ -406,6 +431,9 @@
     // Re-hydrate on every #conns swap (poll + ws), and once now (the fragment is already rendered).
     new MutationObserver(rehydrate).observe(poll, { childList: true, subtree: true });
     rehydrate();
+    // The filter's observer runs after that one, so fresh rows are not hidden yet when rehydrate
+    // judges the box. The filter says when they are.
+    poll.addEventListener("mf:conns-filtered", syncSelectAll);
   });
 
   // --- L5a: WebAuthn passkey ceremonies (ADR 0068 §6) -----------------------------------------
@@ -1030,9 +1058,12 @@
   // --- Connections filter box: hide rows that don't match the typed query + the Flagged-only toggle ---
   // Both controls live in the un-polled shell, so their state survives the ~1s live swap; app.js filters
   // the table's rows and re-applies after each poll/ws swap (MutationObserver on [data-poll]). A row is
-  // visible iff (text query matches) AND (Flagged-only off OR the row's selection checkbox is
-  // data-flagged="1", #131). display:none only — the server still sends every row and a hidden row's
-  // checkbox stays in the selection Set (the filter is view-only). Coexists with sort + column resize.
+  // visible iff (text query matches) AND (Flagged-only off OR the row's selection checkbox is not
+  // data-flagged="0", #131: "unknown" is a failed read, and hiding on it would empty the page). A
+  // row with no checkbox stays hidden under Flagged-only. display:none only — the server still sends
+  // every row and a hidden row's checkbox stays in the selection Set. Select-all skips a hidden row,
+  // so this filter does shape a bulk action's target set (ADR 0007, 2026-10-31 amendment). Coexists
+  // with sort + column resize.
   feature("[data-mf-conns-filter]", function (input) {
     var poll = document.querySelector("[data-poll]");
     if (!poll) return; // no live table on this page
@@ -1044,9 +1075,10 @@
       for (var i = 0; i < rows.length; i++) {
         var textHit = !q || rows[i].textContent.toLowerCase().indexOf(q) !== -1;
         var cb = rows[i].querySelector("[data-mf-conns-cb]");
-        var flagHit = !onlyFlagged || (cb && cb.getAttribute("data-flagged") === "1");
+        var flagHit = !onlyFlagged || (cb && cb.getAttribute("data-flagged") !== "0");
         rows[i].style.display = textHit && flagHit ? "" : "none";
       }
+      poll.dispatchEvent(new Event("mf:conns-filtered")); // select-all's box reads what is hidden
     }
     input.addEventListener("input", apply);
     if (flaggedOnly) flaggedOnly.addEventListener("change", apply);

@@ -12,6 +12,7 @@ and refuses an unknown spelling with the same value-withheld diagnostic."""
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib
 import inspect
 import textwrap
@@ -21,21 +22,31 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.trust_anchors import registry_anchor_specs
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     _COMPOSER_BOOL_SETTINGS,
+    Database,
     EnvRef,
     Ftp,
+    Http,
     Rest,
     WiringError,
     _bool_settings,
+    build_inbound_connection,
+    build_outbound_connection,
     env,
     load_config,
     resolve_env_settings,
 )
-from messagefoundry.pipeline.wiring_runner import _dest_config
+from messagefoundry.pipeline.wiring_runner import (
+    _dest_config,
+    build_check_registry,
+    check_http_sync_reply,
+)
 from messagefoundry.transports.http_auth import oauth2_auth_configured
 from messagefoundry.transports.smart import smart_auth_configured
+from tests._ast_sites import calls_to, parse_source
 
 SPELLINGS = [(s, False) for s in ["false", "0", "no", "off", "False", " OFF "]] + [
     (s, True) for s in ["true", "1", "yes", "on", "TRUE"]
@@ -498,3 +509,293 @@ def test_a_ca_beside_an_env_plain_ftp_is_refused_once_resolved(
     with pytest.raises(WiringError, match="Ftp tls_ca_file would never be read"):
         build("false")
     assert build("true") is not None
+
+
+# --- the capture and no_ack checks, read on the resolved flag (#3724 item 2) ------------------------
+#
+# An EnvRef is truthy whatever it resolves to. So build_outbound_connection, which runs before any
+# value is known, refused a graph whose flag resolved False, and passed a capture whose expect_reply
+# resolved False. Each case below holds one flag behind env(): (factory, spec, the spelling that spec
+# is refused on, what the refusal says). Both spellings are tried, because one carries the refusal
+# the old read never made or the other carries the false refusal it did.
+
+_OUTBOUND = "from messagefoundry import {factory}, env, outbound\noutbound('OB_X', {spec})\n"
+
+_CAPTURE_CASES = [
+    pytest.param(
+        "MLLP",
+        "MLLP(host='h.example.org', port=1, capture_response=True, no_ack=env('flag'))",
+        "true",
+        "no ACK to capture",
+        id="mllp-no_ack-env",
+    ),
+    pytest.param(
+        "MLLP",
+        "MLLP(host='h.example.org', port=1, no_ack=True, capture_response=env('flag'))",
+        "true",
+        "no ACK to capture",
+        id="mllp-capture-env",
+    ),
+    pytest.param(
+        "MLLP",
+        "MLLP(host='h.example.org', port=1, verify_ack_control_id=True, no_ack=env('flag'))",
+        "true",
+        "MSA-2 to match against the sent MSH-10",
+        id="mllp-verify-no_ack-env",
+    ),
+    pytest.param(
+        "Tcp",
+        "Tcp(host='h.example.org', port=1, capture_response=True, expect_reply=env('flag'))",
+        "false",
+        "TCP capture_response=True requires expect_reply=True",
+        id="tcp-expect_reply-env",
+    ),
+    pytest.param(
+        "Tcp",
+        "Tcp(host='h.example.org', port=1, capture_response=env('flag'))",
+        "true",
+        "TCP capture_response=True requires expect_reply=True",
+        id="tcp-capture-env",
+    ),
+    pytest.param(
+        "X12",
+        "X12(host='h.example.org', port=1, capture_response=True, expect_reply=env('flag'))",
+        "false",
+        "X12 capture_response=True requires expect_reply=True",
+        id="x12-expect_reply-env",
+    ),
+    pytest.param(
+        "Database",
+        "Database(server='db.example.org', database='d', statement='INSERT INTO t VALUES (1)', "
+        "capture_response=env('flag'))",
+        "true",
+        "requires a RETURNING/OUTPUT clause",
+        id="database-capture-env",
+    ),
+    pytest.param(
+        "Database",
+        "Database(server='db.example.org', database='d', statement='INSERT INTO t VALUES (1)', "
+        "capture_out_params=env('flag'))",
+        "true",
+        "capture_out_params=True requires the statement to be a stored-procedure call",
+        id="database-out-params-env",
+    ),
+]
+
+
+def _outbound_graph(tmp_path: Path, factory: str, spec: str) -> Any:
+    source = _OUTBOUND.format(factory=factory, spec=spec)
+    (tmp_path / "cfg.py").write_text(source, encoding="utf-8")
+    return load_config(tmp_path)
+
+
+@pytest.mark.parametrize(("factory", "spec", "refused_on", "says"), _CAPTURE_CASES)
+def test_a_capture_check_reads_the_flag_the_connector_will_read(
+    tmp_path: Path, factory: str, spec: str, refused_on: str, says: str
+) -> None:
+    reg = _outbound_graph(tmp_path, factory, spec)  # loading decides nothing about an env() flag
+    with pytest.raises(WiringError, match=says):
+        _dest(reg, "OB_X", {"flag": refused_on})
+    other = "false" if refused_on == "true" else "true"
+    assert _dest(reg, "OB_X", {"flag": other}) is not None
+
+
+def test_a_literal_conflict_is_still_refused_at_load(tmp_path: Path) -> None:
+    with pytest.raises(WiringError, match="no ACK to capture"):
+        _outbound_graph(
+            tmp_path,
+            "MLLP",
+            "MLLP(host='h.example.org', port=1, no_ack=True, capture_response=True)",
+        )
+
+
+def test_a_batched_mllp_capture_reads_the_resolved_flag(tmp_path: Path) -> None:
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import MLLP, env, outbound\n"
+        "from messagefoundry.config.models import BatchConfig\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, capture_response=env('flag')), "
+        "batch=BatchConfig(max_count=2, max_wait_ms=100))\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path)
+    with pytest.raises(
+        WiringError, match="batch aggregation is incompatible with capture_response"
+    ):
+        _dest(reg, "OB_X", {"flag": "true"})
+    assert _dest(reg, "OB_X", {"flag": "false"}) is not None
+
+
+def test_an_env_out_params_flag_that_resolves_false_does_not_force_capture(tmp_path: Path) -> None:
+    # The build used to write a literal capture_response=True for any truthy flag, ref included, and
+    # a literal has nothing left to resolve. The control: a literal flag still forces it.
+    reg = _outbound_graph(
+        tmp_path,
+        "Database",
+        "Database(server='db.example.org', database='d', statement='EXEC p', "
+        "capture_out_params=env('flag'))",
+    )
+    off = _dest(reg, "OB_X", {"flag": "false"})
+    assert off["capture_response"] is False and off["capture_out_params"] is False
+    forced = Database(server="s", database="d", statement="EXEC p", capture_out_params=True)
+    assert build_outbound_connection("OB_Y", forced).spec.settings["capture_response"] is True
+
+
+@pytest.mark.parametrize(
+    ("spec", "key"),
+    [
+        (Rest(url="https://partner.example.org/in"), "capture_response"),
+        (
+            Database(server="db.example.org", database="d", statement="EXEC p"),
+            "capture_out_params",
+        ),
+    ],
+    ids=["capture_response", "capture_out_params"],
+)
+def test_a_reply_from_target_is_read_by_its_resolved_flag(spec: Any, key: str) -> None:
+    # An EnvRef was truthy here, so an outbound that captures nothing passed, and every HTTP call
+    # would have blocked until reply_timeout. The control: the flag resolving True.
+    settings = {**spec.settings, key: env("flag")}
+    registry = wiring.Registry()
+    registry.outbound["OB_X"] = build_outbound_connection(
+        "OB_X", dataclasses.replace(spec, settings=settings)
+    )
+    listener = Http(port=0, reply_from="OB_X", reply_content_type="application/json")
+    inbound = build_inbound_connection("IB_X", listener, router="r")
+    with pytest.raises(WiringError, match="does not set capture_response=True"):
+        check_http_sync_reply(inbound, registry, env_values={"flag": "false"})
+    check_http_sync_reply(inbound, registry, env_values={"flag": "true"})
+
+
+def test_a_reply_from_target_is_undecided_with_no_env_values() -> None:
+    # A caller holding no values cannot read the flag, so it must not report it as missing. The
+    # controls: a literal False is refused all the same, and an environment that defines nothing is
+    # a real miss.
+    spec = Rest(url="https://partner.example.org/in")
+    registry = wiring.Registry()
+    registry.outbound["OB_X"] = build_outbound_connection(
+        "OB_X", dataclasses.replace(spec, settings={**spec.settings, "capture_response": env("f")})
+    )
+    registry.outbound["OB_Y"] = build_outbound_connection("OB_Y", spec)
+
+    def replying_from(target: str) -> Any:
+        listener = Http(port=0, reply_from=target, reply_content_type="application/json")
+        return build_inbound_connection("IB_X", listener, router="r")
+
+    check_http_sync_reply(replying_from("OB_X"), registry)
+    with pytest.raises(WiringError, match="does not set capture_response=True"):
+        check_http_sync_reply(replying_from("OB_Y"), registry)
+    with pytest.raises(WiringError, match="missing: f"):
+        check_http_sync_reply(replying_from("OB_X"), registry, env_values={})
+
+
+def test_a_set_capture_response_stays_beside_an_env_out_params_flag(tmp_path: Path) -> None:
+    # Capture is on either way, so which statement rule applies follows the flag. The connector ORs
+    # the two, so the proc-call rule applies only when the flag resolves True.
+    reg = _outbound_graph(
+        tmp_path,
+        "Database",
+        "Database(server='db.example.org', database='d', "
+        "statement='INSERT INTO t OUTPUT INSERTED.id VALUES (1)', capture_response=True, "
+        "capture_out_params=env('flag'))",
+    )
+    assert _dest(reg, "OB_X", {"flag": "false"})["capture_response"] is True
+    with pytest.raises(WiringError, match="requires the statement to be a stored-procedure call"):
+        _dest(reg, "OB_X", {"flag": "true"})
+
+
+_CAPTURE_TOML = """
+[[outbound]]
+name = "OB_SYNTH_TCP"
+transport = "tcp"
+  [outbound.settings]
+  host = "h.example.org"
+  port = 1
+  framing = "stx_etx"
+  capture_response = true
+  expect_reply = { env = "flag" }
+"""
+
+
+def test_connections_toml_reads_an_env_expect_reply_once_resolved(tmp_path: Path) -> None:
+    (tmp_path / "connections.toml").write_text(textwrap.dedent(_CAPTURE_TOML), encoding="utf-8")
+    reg = load_config(tmp_path, allow_empty=True)
+    with pytest.raises(WiringError, match="requires expect_reply=True"):
+        _dest(reg, "OB_SYNTH_TCP", {"flag": "false"})
+    assert _dest(reg, "OB_SYNTH_TCP", {"flag": "true"}) is not None
+
+
+def test_the_build_check_refuses_a_capture_with_no_reply_once_resolved(tmp_path: Path) -> None:
+    # `messagefoundry check` reaches the second pass through build_check_registry.
+    reg = _outbound_graph(
+        tmp_path,
+        "Tcp",
+        "Tcp(host='h.example.org', port=1, capture_response=True, expect_reply=env('flag'))",
+    )
+
+    def check(spelling: str) -> None:
+        build_check_registry(
+            reg,
+            inbound_bind_host="127.0.0.1",
+            env_values={"flag": spelling},
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    with pytest.raises(WiringError, match="requires expect_reply=True"):
+        check("false")
+    check("true")
+
+
+# --- the factories the bool scan must find (#3724 item 3) -------------------------------------------
+
+
+def _settings_spec_classes() -> set[str]:
+    """Every dataclass in ``wiring`` that carries a ``settings`` mapping."""
+    return {
+        name
+        for name, obj in vars(wiring).items()
+        if dataclasses.is_dataclass(obj)
+        and isinstance(obj, type)
+        and obj.__module__ == wiring.__name__
+        and "settings" in {field.name for field in dataclasses.fields(obj)}
+    }
+
+
+def _functions_building_a_settings_spec() -> set[str]:
+    """Every module-level function under ``messagefoundry/`` that constructs one of those classes,
+    read from the source, so a factory is found by what it builds and not by the annotation the scan
+    keys on. Only a file that names a class is parsed."""
+    specs = _settings_spec_classes()
+    root = Path(wiring.__file__).parents[1]
+    found: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if not any(f"{spec}(" in source for spec in specs):
+            continue
+        for node in parse_source(source).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and calls_to(
+                node, specs, bare_only=True
+            ):
+                found.add(node.name)
+    return found
+
+
+def test_the_bool_scan_reads_every_function_that_builds_a_settings_spec() -> None:
+    # The scan finds a factory by its return annotation, and a factory that scan misses reads its
+    # flags as text again, with nothing reporting it. Reading the source instead finds a factory
+    # with a new return annotation, one in another module, and a new spec class. The controls: the
+    # census sees all four spec classes in use, a registering factory and a returning one.
+    census = _functions_building_a_settings_spec()
+    assert _settings_spec_classes() == {
+        "ConnectionSpec",
+        "DatabaseLookupSpec",
+        "FhirLookupSpec",
+        "ReferenceSourceSpec",
+    }
+    assert {"MLLP", "DatabaseLookup", "FhirLookup", "FileRef"} <= census
+    assert _bool_settings().factories == census
+
+
+def test_the_bool_scan_reads_every_connections_toml_transport() -> None:
+    from messagefoundry.config.connections_file import _TRANSPORTS
+
+    assert {factory.__name__ for factory in _TRANSPORTS.values()} <= _bool_settings().factories

@@ -7,7 +7,7 @@ the upload inject each take an :data:`~messagefoundry.store.store.OperatorAudit`
 the row it builds inside the mutation's own transaction. Before #2624 the API wrote the row in a
 second transaction, so a crash between the two kept the change and lost who made it. The four
 operator alert mutations (ack, resolve, suspend, resume) take one ``AuditAppend`` the same way
-(vault BACKLOG #3217).
+(vault BACKLOG #3217), and so does the connection flag (BACKLOG #2623).
 
 Each case runs twice. First the audit append is made to fail, and the case asserts the store change
 rolled back with it: neither committed. Then it runs clean and asserts both committed, the row
@@ -26,16 +26,22 @@ inside a test function. Every name it writes is unique per run, so a shared serv
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
+from messagefoundry.config.settings import StoreBackend
+from messagefoundry.store.base import (
+    CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
+    ConnectionFlagLockTimeout,
+)
 from messagefoundry.store.store import AuditAppend, MessageOrigin
 
 _RAW = (
@@ -50,14 +56,15 @@ class AppendFailed(RuntimeError):
 
 
 @contextmanager
-def failing_append(store: Any, action: str | None) -> Iterator[None]:
-    """Make ``store``'s audit append raise for ``action``, and only for it, or for every action
-    when it is ``None``."""
+def _hooked_append(
+    store: Any, before: Callable[[tuple[Any, ...]], Awaitable[None]]
+) -> Iterator[None]:
+    """Run ``before`` with each of ``store``'s audit appends' positional arguments, ahead of the
+    real append."""
     real = store._append_audit_row
 
     async def _append(*args: Any, **kwargs: Any) -> Any:
-        if action is None or action in args:
-            raise AppendFailed(action)
+        await before(args)
         return await real(*args, **kwargs)
 
     store._append_audit_row = _append
@@ -65,6 +72,19 @@ def failing_append(store: Any, action: str | None) -> Iterator[None]:
         yield
     finally:
         del store._append_audit_row
+
+
+@contextmanager
+def failing_append(store: Any, action: str | None) -> Iterator[None]:
+    """Make ``store``'s audit append raise for ``action``, and only for it, or for every action
+    when it is ``None``."""
+
+    async def _refuse(args: tuple[Any, ...]) -> None:
+        if action is None or action in args:
+            raise AppendFailed(action)
+
+    with _hooked_append(store, _refuse):
+        yield
 
 
 class CommitFailed(RuntimeError):
@@ -196,6 +216,273 @@ async def _check(
     assert len(rows) == 1, f"{label}: the clean run committed {len(rows)} audit rows"
     row = rows[0]
     assert (row["actor"], row["channel_id"], row["client"]) == ("contract-op", channel, _CLIENT)
+
+
+async def _assert_connection_flag_atomic(store: Any, tag: str) -> None:
+    """The object-of-interest flag commits with its row, and a row IS the flag (BACKLOG #2623): a
+    set, a repeat that adds no second row, a clear, and a clear of nothing, which still audits."""
+    conn = f"OB_F{tag}"
+
+    async def is_clear() -> None:
+        assert (conn, "outbound") not in await store.list_connection_flags()
+
+    async def is_flagged() -> None:
+        assert (conn, "outbound") in await store.list_connection_flags()
+
+    async def was_flagged(_result: Any) -> None:
+        await is_flagged()
+
+    async def was_cleared(_result: Any) -> None:
+        await is_clear()
+
+    def setter(flagged: bool) -> Callable[[Callable[[Any], AuditAppend | None]], Awaitable[Any]]:
+        async def run(audit: Callable[[Any], AuditAppend | None]) -> None:
+            built = audit(flagged)
+            assert built is not None
+            await store.set_connection_flag(conn, "outbound", flagged=flagged, audit=built)
+
+        return run
+
+    await _check(
+        store,
+        label="flag-set",
+        channel=None,
+        run=setter(True),
+        unchanged=is_clear,
+        changed=was_flagged,
+    )
+    await _check(
+        store,
+        label="flag-repeat",
+        channel=None,
+        run=setter(True),
+        unchanged=is_flagged,
+        changed=was_flagged,
+    )
+    await _check(
+        store,
+        label="flag-clear",
+        channel=None,
+        run=setter(False),
+        unchanged=is_flagged,
+        changed=was_cleared,
+    )
+    await _check(
+        store,
+        label="flag-clear-none",
+        channel=None,
+        run=setter(False),
+        unchanged=is_clear,
+        changed=was_cleared,
+    )
+    # The direction is part of the key, so the same name on the other side stays unflagged.
+    built = AuditAppend("contract.flag-in", actor="contract-op")
+    await store.set_connection_flag(conn, "inbound", flagged=True, audit=built)
+    await is_clear()
+    assert (conn, "inbound") in await store.list_connection_flags()
+    await store.set_connection_flag(conn, "inbound", flagged=False, audit=built)
+
+
+#: How long the second toggle gets to reach its audit append while the first is held open. Under the
+#: audit lock taken first it waits at the database and never gets there, whatever this is. Without
+#: that lock, a server slower than this to run one statement would let the old order pass here; the
+#: offline order tests in test_connection_flag.py and test_sqlserver_cipher_retry.py do not wait.
+_OVERLAP_WINDOW = 1.0
+
+
+@contextmanager
+def _held_append(
+    store: Any, action: str, reached: asyncio.Event, release: asyncio.Event
+) -> Iterator[None]:
+    """Hold ``store``'s first append for ``action`` until ``release`` is set, and set ``reached``
+    as it starts. The flag statement has run by then and the transaction is still open."""
+
+    async def _hold(args: tuple[Any, ...]) -> None:
+        if action in args and not reached.is_set():
+            reached.set()
+            await release.wait()
+
+    with _hooked_append(store, _hold):
+        yield
+
+
+#: (label, initial, first_sets, second_sets, second_commits_first): each a pair the old order, the
+#: lock taken only at the append, let through. On Postgres at READ COMMITTED all three did; on SQL
+#: Server the no-op clear did, since it locks nothing.
+_OVERLAP_CASES = (
+    # A set, then a clear that cannot see it: the clear deleted nothing and appended last.
+    ("setclear", False, True, False, False),
+    # A clear of nothing, then a set it does not block, which commits first.
+    ("clearset", False, False, True, True),
+    # A set of a flag already set changes no row, so a clear beside it commits first.
+    ("resetclear", True, True, False, True),
+)
+
+
+async def _assert_overlapping_toggles_ordered(
+    first: Any,
+    second: Any,
+    label: str,
+    initial: bool,
+    first_sets: bool,
+    second_sets: bool,
+    second_commits_first: bool,
+) -> None:
+    """Two store handles, standing in for two engine shards, toggle one connection. The first is
+    held open between its flag statement and its commit while the second runs, then whichever
+    ``second_commits_first`` names commits first. The flag must match the newest row after."""
+    conn = f"OB_X{label}{uuid4().hex[:8]}"
+    action = "connection_flag_set"
+
+    async def toggle(store: Any, flagged: bool) -> None:
+        detail = json.dumps({"connection": conn, "flagged": flagged})
+        audit = AuditAppend(action, actor="contract-op", detail=detail, client=_CLIENT)
+        await store.set_connection_flag(conn, "outbound", flagged=flagged, audit=audit)
+
+    if initial:
+        await toggle(first, True)
+    a_reached, a_release, b_reached, b_release = (asyncio.Event() for _ in range(4))
+    tasks: list[asyncio.Task[None]] = []
+    with (
+        _held_append(first, action, a_reached, a_release),
+        _held_append(second, action, b_reached, b_release),
+    ):
+        try:
+            a = asyncio.create_task(toggle(first, first_sets))
+            tasks.append(a)
+            await asyncio.wait_for(a_reached.wait(), 30)
+            b = asyncio.create_task(toggle(second, second_sets))
+            tasks.append(b)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(b_reached.wait(), _OVERLAP_WINDOW)
+            overlapped = b_reached.is_set()
+            if second_commits_first:
+                b_release.set()
+                if overlapped:
+                    await b
+                a_release.set()
+            else:
+                a_release.set()
+                await a
+                b_release.set()
+            await asyncio.gather(a, b)
+        finally:
+            a_release.set()
+            b_release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    flagged = (conn, "outbound") in await first.list_connection_flags()
+    rows = [
+        r
+        for r in await first.list_audit(action=action, limit=50)
+        if json.loads(str(r["detail"]))["connection"] == conn
+    ]
+    newest = json.loads(str(max(rows, key=lambda r: int(r["id"]))["detail"]))["flagged"]
+    assert flagged is newest, (
+        f"{label}: the flag is {'set' if flagged else 'clear'} under a newest row that says"
+        f" {'set' if newest else 'clear'}"
+    )
+    # What makes that hold: the second toggle could not reach its append, which follows its flag
+    # statement, until the first had committed.
+    assert not overlapped, f"{label}: the second toggle ran its flag statement beside the first"
+
+
+async def assert_connection_flag_ordered_across_stores(first: Any, second: Any) -> None:
+    """Two processes' toggles of one connection land one after the other (BACKLOG #2623): each
+    takes the audit lock before its flag statement and holds it to the commit, so the stored flag
+    always matches the newest ``connection_flag_set`` row. ``first`` and ``second`` are two handles
+    on one database, so neither shares the other's in-process locks."""
+    for case in _OVERLAP_CASES:
+        await _assert_overlapping_toggles_ordered(first, second, *case)
+
+
+#: How far past the store's bound the toggle's refusal may come: the opener, the audit lock, the
+#: rollback and, on SQL Server, the reset. The driver's query timeout, 30 s by default, is well past.
+_REFUSAL_SLACK = 5.0
+
+#: How long an audit append from another handle gets once the toggle has given up, with the foreign
+#: lock still held. Without the bound the toggle would still hold the audit lock here.
+_APPEND_PROMPT = 5.0
+
+
+@asynccontextmanager
+async def _foreign_flag_lock(holder: Any, conn: str, *, stored: bool) -> AsyncIterator[None]:
+    """A transaction on ``holder`` that is no toggle and holds a lock on ``conn``'s outbound flag
+    row until the block exits, then rolls back: an update lock on the stored row when ``stored``,
+    else an uncommitted insert of it. Raw SQL on the backend's own connection, so neither the
+    audit lock nor any lock of the store's own is taken."""
+    if holder.backend is StoreBackend.POSTGRES:
+        async with holder._timed_acquire(record=False) as raw:
+            tx = raw.transaction()
+            await tx.start()
+            try:
+                if stored:
+                    await raw.execute(
+                        "SELECT 1 FROM connection_flag"
+                        " WHERE connection=$1 AND direction='outbound' FOR UPDATE",
+                        conn,
+                    )
+                else:
+                    await raw.execute(
+                        "INSERT INTO connection_flag (connection, direction)"
+                        " VALUES ($1, 'outbound')",
+                        conn,
+                    )
+                yield
+            finally:
+                await tx.rollback()
+    elif holder.backend is StoreBackend.SQLSERVER:
+        async with holder._acquire() as raw:
+            try:
+                async with holder._cursor(raw) as cur:
+                    if stored:
+                        await cur.execute(
+                            "SELECT 1 FROM connection_flag WITH (UPDLOCK, HOLDLOCK, ROWLOCK)"
+                            " WHERE connection=? AND direction='outbound'",
+                            (conn,),
+                        )
+                        await cur.fetchall()
+                    else:
+                        await cur.execute(
+                            "INSERT INTO connection_flag (connection, direction)"
+                            " VALUES (?, 'outbound')",
+                            (conn,),
+                        )
+                    yield
+            finally:
+                await raw.rollback()
+    else:
+        raise AssertionError(f"no foreign lock is written for {holder.backend}")
+
+
+async def assert_flag_lock_wait_bounded(toggler: Any, other: Any) -> None:
+    """A foreign lock on ``connection_flag`` costs the audit chain only the store's bound (BACKLOG
+    #2623). The toggle holds the audit lock while its flag statement waits, so ``toggler``'s set and
+    clear each meet a lock ``other`` holds outside any toggle. Each must raise the typed refusal
+    within the bound, write neither the flag nor its row, and leave ``other`` free to append an
+    audit row at once while that lock is still held. Server backends only."""
+    for stored in (False, True):
+        conn = f"OB_L{uuid4().hex[:8]}"
+        action = f"contract.flag-lock.{uuid4().hex[:8]}"
+        if stored:
+            await toggler.set_connection_flag(
+                conn, "outbound", flagged=True, audit=AuditAppend("contract.flag-lock-seed")
+            )
+        async with _foreign_flag_lock(other, conn, stored=stored):
+            refused = toggler.set_connection_flag(
+                conn, "outbound", flagged=not stored, audit=AuditAppend(action, actor="contract-op")
+            )
+            with pytest.raises(ConnectionFlagLockTimeout):
+                await asyncio.wait_for(
+                    refused, CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS + _REFUSAL_SLACK
+                )
+            appended = f"contract.flag-lock-after.{uuid4().hex[:8]}"
+            await asyncio.wait_for(
+                other.record_audit(appended, actor="contract-op"), _APPEND_PROMPT
+            )
+        assert len(await _rows(other, appended)) == 1
+        assert await _rows(toggler, action) == [], "a refused toggle left its audit row"
+        flagged = (conn, "outbound") in await toggler.list_connection_flags()
+        assert flagged is stored, "a refused toggle changed the flag"
 
 
 async def _assert_alert_mutations_atomic(store: Any, tag: str) -> None:
@@ -479,6 +766,7 @@ async def assert_operator_audit_atomic(store: Any) -> None:
     )
 
     await _assert_alert_mutations_atomic(store, tag)
+    await _assert_connection_flag_atomic(store, tag)
 
     # The rows joined the hash chain the way record_audit's do: the chain still verifies.
     ok, message = await store.verify_audit_chain()

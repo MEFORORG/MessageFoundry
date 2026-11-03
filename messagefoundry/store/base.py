@@ -1405,6 +1405,39 @@ class QueueStore(StoreLifecycle, Protocol):
         """
         ...
 
+    async def set_connection_flag(
+        self,
+        connection: str,
+        direction: str,
+        *,
+        flagged: bool,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> None:
+        """Set or clear the operator's object-of-interest flag on ``connection`` in ``direction``
+        (BACKLOG #2623), with ``audit`` appended in the same transaction, so a failed append changes
+        nothing. Setting a flag already set, or clearing one that is not, still appends the row: the
+        audit log records what the operator asked for.
+
+        Two calls, from any process on the store, run one after the other: a server backend takes
+        its audit lock before the flag statement and holds it to the commit, and SQLite has one
+        writer. So the flag matches the newest row a call appended, unless something outside the
+        store writes the table (ADR 0007, amendment of 2026-10-31).
+
+        On a server backend the flag statement waits at most
+        :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` for a lock on the table, since the audit lock is
+        held while it waits. Past that it raises :class:`ConnectionFlagLockTimeout`, having rolled
+        back and released the audit lock, with nothing written."""
+        ...
+
+    async def list_connection_flags(self) -> set[tuple[str, str]]:
+        """Every ``(connection, direction)`` holding the flag (BACKLOG #2623).
+
+        The dashboard rows are the one reader, and ``tests/test_connection_flag_readers.py`` fails on
+        a second it can see. No engine path acts on a row, so nothing here checks one against the
+        graph: a row that names no connection matches no dashboard row."""
+        ...
+
     # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The
     # row is appended in the mutation's own transaction, and only when the change applied, so a
     # failed append changes nothing and an unknown or resolved id writes no row.
@@ -3537,6 +3570,37 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
             "store table, from another engine shard, cluster node or session, may be blocking it. "
             "Nothing was applied. Start again once that transaction ends, or raise "
             "[store].schema_lock_timeout"
+        )
+
+
+#: How long a server backend's connection flag toggle waits for a lock on ``connection_flag``
+#: (BACKLOG #2623). The toggle holds the store's audit lock while it waits, so this also bounds how
+#: long a foreign lock on that table can hold every audit append. Under the engine's
+#: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so the toggle's own
+#: refusal arrives before the engine stops waiting for it.
+CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+class ConnectionFlagLockTimeout(RuntimeError):
+    """A server backend's flag statement did not get its lock on ``connection_flag`` within
+    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` (BACKLOG #2623). Only toggles write the table, and
+    they run one at a time under the audit lock, so the holder is something outside the store.
+
+    Raised inside the toggle's transaction, which then rolls back with nothing written and releases
+    the audit lock. It is never retried there, since a retry would hold the audit lock again behind
+    the same holder."""
+
+    def __init__(self, backend: StoreBackend, timeout: float) -> None:
+        self.backend = backend
+        self.timeout = timeout
+        stricter = (
+            " (or the role's or database's own lock_timeout, if that is stricter)"
+            if backend is StoreBackend.POSTGRES
+            else ""
+        )
+        super().__init__(
+            f"{backend.value}: a connection flag statement did not get its row lock within "
+            f"{timeout:.15g} s{stricter}; another session holds one. Nothing was written"
         )
 
 

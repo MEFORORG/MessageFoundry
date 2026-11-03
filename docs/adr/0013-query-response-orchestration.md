@@ -578,6 +578,12 @@ batch that reports those via a trailing readback `SELECT` (`DECLARE @rv INT; EXE
   OUT-param proc captures, while the flag can never silently mask a plain `INSERT`/`UPDATE` whose result-set
   would re-run non-idempotently. `capture_out_params=True` **implies** `capture_response=True` (the connector
   self-consistently captures when out-params are requested, regardless of whether the wiring gate ran).
+
+  > **Update (2026-11-01, BACKLOG #3724):** that holds for a literal `True`, which forces `capture_response`
+  > at load. A flag behind `env()` forces nothing, or capture would stay on after it resolved False: each
+  > reader treats either resolved flag as capture, and the stored-proc requirement above is judged on the
+  > resolved flag, when the connector is built.
+
 - **Same-cursor, pre-commit read only.** The OUT/return values are read back from the **same cursor before the
   existing `commit()`**, exactly like the result-set path — **never** a separate post-commit `SELECT` (which
   would re-execute the non-idempotent proc on an at-least-once re-run and read *different* state). Because

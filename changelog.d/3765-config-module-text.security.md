@@ -76,7 +76,6 @@
   start failure reads it to name the module and line, and because the loader's own frames on it would
   still reach those values through the load's snapshot of the files and through its registry. Any
   other refusal the loader rebuilds has no frame of the module on it, so its text opens with
-  `error loading config module <file>:`, which is how a logged start failure, the reload WARNING and
-  the flag route's 409 name it. That is the module being loaded: not its line, nor a helper the
-  refusal came from. A refusal that stands as raised has no such opening, so that WARNING and that
-  409 do not name its module.
+  `error loading config module <file>:`, which is how a logged start failure and the reload WARNING
+  name it. That is the module being loaded: not its line, nor a helper the refusal came from. A
+  refusal that stands as raised has no such opening, so that WARNING does not name its module.

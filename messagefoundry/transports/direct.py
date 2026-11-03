@@ -84,6 +84,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     encode_wire_body,
     float_setting,
+    port_setting,
     register_destination,
 )
 from messagefoundry.transports.email import (
@@ -313,7 +314,7 @@ class DirectDestination(DestinationConnector):
         if not isinstance(sender, str) or not sender:
             raise ValueError("Direct destination requires a 'sender' setting")
         self.host = host
-        self.port = int(s.get("port", 587))
+        self.port = port_setting(s.get("port", 587), transport="Direct destination")
         self.sender = sender
         # The Email destination's address rule, for the sender and each recipient, with the headers
         # built from the checked text. MAIL FROM and RCPT TO are then passed explicitly at send, so a
