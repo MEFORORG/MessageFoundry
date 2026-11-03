@@ -117,8 +117,10 @@ hold, and the newest qualifying marker wins:
   carriage returns stripped and nothing stripped from its start, fully matches
   ``<!-- repair-owner session=<id> -->``, where ``<id>`` is 1 to 64 of ``[0-9A-Za-z_-]``, kept in
   its own case (the regular expression ``<!-- repair-owner session=([0-9A-Za-z_-]{1,64}) -->``);
-* its SECOND line starts with the Lander's signature, ``Lander (session `` or
-  ``Lander (lander-<1 to 40 of [0-9a-z-]>), `` (WHY THE SIGNATURE IS NARROW);
+* its SECOND line starts with the Lander's signature, matched from the line's start by the regular
+  expression ``Lander \\((?:session|lander-[0-9a-z-]{1,40}\\), )`` (``_LANDER_SIGNATURE``): the
+  text ``Lander (session`` with nothing required after it, not even a space, or
+  ``Lander (lander-``, 1 to 40 of ``[0-9a-z-]``, then ``), `` (WHY THE SIGNATURE IS NARROW);
 * its ``authorAssociation`` is OWNER, MEMBER or COLLABORATOR;
 * it is an issue comment, never a review (as an ack is never a review), and not a bot's;
 * it is NOT minimized.
@@ -126,11 +128,13 @@ hold, and the newest qualifying marker wins:
 A MINIMIZED MARKER IS A CANCELLED TRANSFER. A comment meeting every condition but the last is set
 aside entirely: it is no transfer, no reply and no Lander event, so it never gives REPAIR and never
 keeps a hold on the Lander (``repair-rehold``). The PR reads as if it had never been posted.
-MINIMIZING THE NEWEST MARKER IS THE HAND-BACK TO THE ORIGINAL AUTHOR: with no other marker, a hold
-that stands reads AUTHOR again. (An earlier round counted a minimized marker for ``repair-rehold``,
-so that hiding a superseded marker could not bring back the author's turn. That is now intended: it
-is the hand-back. A superseded marker the Lander wants kept as history is left visible.) An edit to
-a minimized marker at or after the hold still hands the turn back, as any edit does.
+MINIMIZING THE NEWEST MARKER IS THE HAND-BACK TO THE ORIGINAL AUTHOR, but only once it leaves no
+qualifying marker on the PR: a hold that stands then reads AUTHOR again. While an older marker is
+still visible, that one is the newest qualifying marker and is read instead (REPAIR or
+``repair-rehold`` naming its session), so a full hand-back minimizes every marker. Hiding a
+superseded marker therefore can bring back the author's turn; that is intended, because a minimized
+marker is the hand-back, so a marker the Lander means to keep as a transfer is left visible. An edit
+to a minimized marker at or after the hold still hands the turn back, as any edit does.
 
 The PR is REPAIR's turn, its row naming the marker's session as ``repairOwner``, ONLY when ALL of
 these hold:
@@ -145,8 +149,9 @@ these hold:
   stood-down author saying "still my move", so two seats may be working one fix: the Lander's to
   sort out. An ack before the marker is history the transfer overrode, and is kept as ``acked``.
 
-Otherwise the PR is classified exactly as it was before this contract, with every marker but a
-cancelled one an ordinary event, except that a hold with a marker before it reads LANDER rather than AUTHOR (below). Under that
+Otherwise the PR is classified as it was before this contract, with every marker but a cancelled one
+an ordinary event, except at least that a hold with a marker before it reads LANDER rather than
+AUTHOR (below), and that a cut page does too (A CUT PAGE IS THE LANDER'S). Under that
 reading a marker body starts with ``<!--``, not the signature, so it is not a Lander event, and one
 after the hold is a reply: the PR reads LANDER ``replied``, even when the marker is the only thing
 after the hold, so ``replied`` beside a marker can be the Lander's own transfer comment. So at least
@@ -170,7 +175,8 @@ session of the newest such marker, or is ``null`` when two sessions were named i
 second. These are qualifying markers (THE MARKER SHAPE), so a minimized one is not read.
 
 A CUT PAGE IS THE LANDER'S. Only the latest ``COMMENT_PAGE`` comments and ``REVIEW_PAGE`` reviews
-are fetched, so a marker before the hold, or an old comment edited into a reply, may be off the page.
+are fetched, so a marker before the hold, or an old comment edited into a reply, may be off the
+page.
 When either connection's ``pageInfo.hasPreviousPage`` is true, or its ``pageInfo`` cannot say, a row
 that would read AUTHOR reads LANDER instead, ``page-cut`` following its ``held`` (and ``acked``)
 flags and preceding ``in-queue`` or ``auto-armed``. No other
@@ -222,12 +228,12 @@ for the ``repair`` flag, and ``repair-rehold=<session id>`` for ``repair-rehold`
 named; the JSON carries the id as ``repairOwner``, ``null`` on any row with neither flag.
 
 FLAGS. ``held`` (a hold stands: AUTHOR's turn, or REPAIR's beside ``repair``, unless the PR is
-queued or armed, or LANDER's beside ``repair-rehold``); ``repair`` (beside ``held``: a repair-owner
-marker after the hold made it REPAIR's turn, so ``held`` alone never means the author owns a
-``repair`` row); ``repair-rehold`` (beside ``held``: a hold with a marker before it and none after
-it, so the Lander's move is to post one; THE REPAIR CONTRACT); ``no-hold`` (no
-Lander event, or the newest is not a marker hold); ``new-commit`` (the head does not start with the
-marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
+queued or armed, or LANDER's beside at least ``repair-rehold`` or ``page-cut``); ``repair``
+(beside ``held``: a repair-owner marker after the hold made it REPAIR's turn, so ``held`` alone
+never means the author owns a ``repair`` row); ``repair-rehold`` (beside ``held``: a hold with a
+marker before it and none after it, so the Lander's move is to post one; THE REPAIR CONTRACT);
+``no-hold`` (no Lander event, or the newest is not a marker hold); ``new-commit`` (the head does
+not start with the marker's SHA); ``replied`` (a non-Lander event at or after the hold, other than an ack naming the
 head); ``edited`` (a comment or review, of any author, the hold included,
 edited at or after the hold); ``acked`` (beside ``held``: an author's ack naming the head stands
 after the hold; alone, it kept the turn the author's; beside ``repair``, it came before the
@@ -824,6 +830,9 @@ def from_input(doc: object, repo: str) -> RepoRead:
     Shape: ``{"<owner/name>": {"pages": [<gh api graphql reply>, ...], "required": [...]}}``, or
     ``{"<owner/name>": {"error": "<reason>"}}`` to stand for a failed read. ``required`` is read
     only for a repository with no hard-coded list; leaving it out reads as an unreadable list.
+    Each PR's ``comments`` and ``reviews`` need ``pageInfo.hasPreviousPage`` as ``QUERY`` fetches
+    it: a reply captured without it reads as a cut page, so a row that would read AUTHOR reads
+    LANDER ``page-cut``.
     """
     if not isinstance(doc, dict) or repo not in doc:
         raise ReadError(f"{repo} is not in the input file")

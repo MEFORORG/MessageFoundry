@@ -557,8 +557,6 @@ def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
     late = _held(140, _repair(), head=_sha(999))
     outsider = _repair()
     outsider["authorAssociation"] = "CONTRIBUTOR"
-    hidden = _repair()
-    hidden["isMinimized"] = True
     edited = _repair()
     edited["lastEditedAt"] = "2026-10-28T14:00:00Z"
     as_review = _review(_repair_body(), "2026-10-28T13:00:00Z")
@@ -575,7 +573,6 @@ def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
         # The marker in the hold's own second is not provably after it.
         _held(141, _repair("2026-10-28T12:00:00Z")),
         _held(142, outsider),
-        _held(143, hidden),
         _held(144, edited),
         _held(145, reviews=[as_review]),
         _held(146, line_two),
@@ -593,8 +590,6 @@ def test_a_repair_marker_that_does_not_qualify_falls_back_to_the_lander(
     assert _repair_row(rows[140]) == ("LANDER", ["new-commit", "replied"], None)
     for n in (141, 142, 145, 147, 148, 149, 150, 151, 152, 153):
         assert _repair_row(rows[n]) == ("LANDER", ["replied", "no-new-commit"], None), n
-    # A minimized marker is a cancelled transfer: set aside, so the hold reads as it did before.
-    assert _repair_row(rows[143]) == ("AUTHOR", ["held"], None)
     # Signed on line one, it is a newer non-hold Lander comment, so no hold stands.
     assert _repair_row(rows[146]) == ("LANDER", ["no-hold"], None)
     assert _repair_row(rows[144]) == ("LANDER", ["replied", "edited", "no-new-commit"], None)
@@ -785,7 +780,7 @@ def test_a_minimized_marker_is_a_cancelled_transfer(
         re_transfer,
         # Control: the same PR with its marker visible is the Lander's re-hold.
         _transferred(177),
-        # After the hold: no REPAIR, the hold stands for the author.
+        # After the hold: no REPAIR and no reply, so the hold stands for the author.
         _held(178, _minimized(_repair())),
         # A minimized marker in a visible one's second names no second session.
         _held(179, _repair(), _minimized(_repair(session="other-session"))),
@@ -879,6 +874,8 @@ def test_the_query_asks_whether_the_comment_and_review_pages_were_cut() -> None:
 def test_the_repair_marker_shape_is_exact() -> None:
     assert hpt.repair_owner(_repair_body()) == OWNER_ID
     assert hpt.repair_owner(_repair_body("a" * 64)) == "a" * 64
+    # As THE MARKER SHAPE says, nothing is required after ``Lander (session``, not even a space.
+    assert hpt.repair_owner(_repair_body(signature="Lander (sessionless) ")) == OWNER_ID
     for bad in ("", "a" * 65, "has space", "dot.id", "slash/id", "colon:id"):
         assert hpt.repair_owner(_repair_body(bad)) is None, bad
     marker = f"<!-- repair-owner session={OWNER_ID} -->"
