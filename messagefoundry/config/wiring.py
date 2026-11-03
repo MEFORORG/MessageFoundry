@@ -4470,9 +4470,11 @@ def DatabasePoll(
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
     # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
     # this module at its top level.
-    # A dialect that is not a literal (an env() ref) is tested as generic, the permissive superset:
-    # it refuses every write the strict test does and admits only the INSERT(/TRUNCATE( calls, which
-    # the build re-tests with the resolved dialect. So no dialect is guessed into a false refusal.
+    # A dialect that is not a literal (an env() ref) is tested as generic: it refuses every write the
+    # sqlserver test does, admitting more only for the INSERT(/TRUNCATE( calls, which the build
+    # re-tests with the resolved dialect. It is not a pure superset (BACKLOG #5259): its MySQL comment
+    # scan and its bare-CALL refusal can refuse a read that a resolved sqlserver dialect would admit,
+    # at least a `--x` comment holding a write keyword. That false refusal fails closed.
     if isinstance(poll_statement, str) and poll_statement:
         from messagefoundry.transports.database import _read_only_poll_refusal
 
