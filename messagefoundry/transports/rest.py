@@ -2362,6 +2362,28 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     return bool(user and password)
 
 
+def proxy_url_holds_credential(proxy_url: object) -> bool:
+    """Is this ``proxy_url`` refused at build for a credential it holds (vault BACKLOG #3007)?
+
+    The two credential tests :func:`proxy_config_from_settings` runs, in its order: a user and a
+    password urllib would send (:func:`proxy_url_sends_userinfo`), then, on a value the one proxy
+    parse accepts, a user or a password alone (:attr:`ProxyAddress.holds_credential`). For the
+    readers that must agree with the build without building: the static-credential report and the
+    ``[egress].proxy_url`` load check. A value refused for its shape or its scheme first answers
+    ``False``, as the build refuses it for that. Never raises."""
+    if proxy_url_sends_userinfo(proxy_url):
+        return True
+    if not isinstance(proxy_url, str):
+        return False
+    proxy = proxy_url.strip()
+    try:
+        if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
+            return False
+        return parse_proxy_url(proxy).holds_credential
+    except ValueError:
+        return False
+
+
 def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
     """Does :meth:`ProxyConfig.for_host` bypass ``host`` under a ``proxy_no_proxy`` value
     (BACKLOG #1989)?

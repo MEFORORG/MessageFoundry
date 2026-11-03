@@ -37,6 +37,7 @@ from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_u
 from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
     proxy_config_from_settings,
+    proxy_url_holds_credential,
     proxy_url_sends_userinfo,
 )
 
@@ -145,10 +146,14 @@ def test_the_gate_refuses_a_split_value_at_load(proxy_url: str) -> None:
 def test_the_site_proxy_url_is_refused_at_load_for_its_shape(proxy_url: str) -> None:
     """``[egress].proxy_url`` takes the same parse, at settings load, so the fault names the
     setting and is caught even when no connection inherits the value. The refusal names no part
-    of it, and pydantic does not echo the input."""
+    of it, and pydantic does not echo the input. A value urllib would read a user and a password
+    out of is refused for that first, as the connector's build refuses it (vault BACKLOG #3007)."""
     with pytest.raises(ValueError) as refused:
         EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED])
-    assert "2965" in str(refused.value) and "proxy_url" in str(refused.value)
+    if proxy_url_holds_credential(proxy_url):
+        assert "[egress].proxy_url holds a user or a password" in str(refused.value)
+    else:
+        assert "2965" in str(refused.value) and "proxy_url" in str(refused.value)
     _assert_names_no_part(str(refused.value))
     assert LISTED not in str(refused.value)
 

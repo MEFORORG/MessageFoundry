@@ -340,7 +340,7 @@ B462-R1, R2 and R4 of the vault's `OWNER-RULINGS-2026-10-30-BATCH462.md` add to 
 a proxy credential, so `cleartext_accepted` with a reason is the one declaration left. A credential
 in a connection's own `proxy_url` now fails the connection's build whatever it declares, and one in
 `[egress].proxy_url` fails the config load, which is stricter than the 2026-10-05 text. The rule stays
-in two seams, the build and the send, because an environment proxy is known only at send.
+in three seams, the config load, the build and the send, because an environment proxy is known only at send.
 [CONNECTIONS.md](../CONNECTIONS.md) states it.
 
 ## Deviations from the phase doc

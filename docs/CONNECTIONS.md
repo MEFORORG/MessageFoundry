@@ -2187,7 +2187,7 @@ opt-out. That is expected, and the table says which they are.
 | `FhirLookup(...)` | `fhir_lookup:<name>` | yes: SMART Backend Services |
 | `Soap(...)` | `<name>` | yes: client certificate, or OAuth2 |
 | `DICOMweb(...)` | `<name>` | **no** (static bearer or Basic only) |
-| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`; a user or a password in the proxy URL is not listed, because it fails the connection's build, or for `[egress].proxy_url` the config load) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup | **no** (Basic or Digest only) |
+| forward-proxy credential on any HTTP connection (`proxy_user`/`proxy_password`; a user or a password in the proxy URL is not listed, because it fails the connection's build, or for `[egress].proxy_url` the config load) | `proxy:<name>`, or `proxy:fhir_lookup:<name>` for a lookup, which `FhirLookup()` gives no proxy credential, so it appears only for a pair written into the lookup's settings after the factory ran | **no** (Basic or Digest only) |
 | `MLLP(...)`, `DICOM(...)` outbound | `<name>` | yes: `tls=True` with `tls_cert_file` |
 | `Tcp(...)`, `X12(...)` outbound | `<name>` | **no** (no credential of any kind) |
 | `Email(...)`, `Direct(...)` SMTP AUTH | `<name>` | **no** |

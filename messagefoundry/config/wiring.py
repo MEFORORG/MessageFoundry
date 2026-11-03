@@ -6238,23 +6238,28 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             return True
         return False
 
-    def _typed_refused(attested: bool, reason: str | None, accepted: bool) -> bool:
-        # The rules _source_config and _dest_config run on a connection's typed pair (the flag type,
-        # a missing, blank or control-character reason), and the attested-plus-accepted pair, which
-        # outbound() and the Destination model refuse. A declaration either refuses is a hop the
-        # engine never builds, however it got past the factory.
+    def _typed_refused(
+        settings: Mapping[str, Any], attested: bool, reason: str | None, accepted: bool
+    ) -> bool:
+        # What _source_config and _dest_config refuse on a connection: a raw attestation key in its
+        # transport settings, then the typed pair by the settings carriers' own rule above (the flag
+        # type, a missing, blank or control-character reason, and the attested-plus-accepted pair,
+        # which outbound() and the Destination model refuse). Such an entry is a hop the engine
+        # never builds, however it got past the factory.
         try:
-            _hop_attestation_entries("", attested, reason)
-            check_attested_and_accepted(True, accepted)
-        except (WiringError, ValueError):
+            refuse_raw_hop_attestation(settings, "")
+        except WiringError:
             return True
-        return False
+        pair = {"tls_hop_attested": attested, "tls_hop_attested_reason": reason}
+        return _refused("", pair, accepted)
 
     out = [
         AttestedHop(
             inbound_record_name(ic.name),
             _attested_reason_text(ic.tls_hop_attested_reason),
-            _typed_refused(ic.tls_hop_attested, ic.tls_hop_attested_reason, False),
+            _typed_refused(
+                ic.spec.settings, ic.tls_hop_attested, ic.tls_hop_attested_reason, False
+            ),
         )
         for ic in registry.inbound.values()
         if _listed(ic.tls_hop_attested)
@@ -6263,7 +6268,12 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         AttestedHop(
             oc.name,
             _attested_reason_text(oc.tls_hop_attested_reason),
-            _typed_refused(oc.tls_hop_attested, oc.tls_hop_attested_reason, oc.cleartext_accepted),
+            _typed_refused(
+                oc.spec.settings,
+                oc.tls_hop_attested,
+                oc.tls_hop_attested_reason,
+                oc.cleartext_accepted,
+            ),
         )
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)

@@ -412,7 +412,6 @@ PROBE_SECRETS = ("S3CRET", "sk_live_ABC123", "sk_live_KEY9", "CAPSECRET", "servi
 #: What each probe's detail must still name, so a label that emitted nothing would not pass.
 PROBE_PEERS = {
     "proxy:OB_PROBE_PROXY": "(proxy.corp.invalid:3128)",
-    "proxy:OB_PROBE_KEY": "(http://proxy2.example.invalid:3128)",
     "OB_PROBE_KEY_HOST": "(mllp.example.invalid:2575)",
     "OB_PROBE_PATH": "(https://hooks.example.invalid)",
 }
@@ -433,6 +432,9 @@ def probe_hops(tmp_path_factory: pytest.TempPathFactory) -> dict[str, StaticCred
 
 def test_no_probe_secret_reaches_a_detail(probe_hops: dict[str, StaticCredentialHop]) -> None:
     assert set(PROBE_PEERS) | {"OB_PROBE_QUERY_AT"} <= set(probe_hops)
+    # Probe 2's key-only userinfo fails the connector's build (vault BACKLOG #3007), so its proxy
+    # hop is not listed at all, which keeps the key out of every detail too.
+    assert "proxy:OB_PROBE_KEY" not in probe_hops
     for hop in probe_hops.values():
         for secret in PROBE_SECRETS:
             assert secret not in hop.detail, hop
@@ -658,7 +660,7 @@ def test_the_userinfo_reader_answers_what_the_engine_sends(url: str, sent: bool)
     """``ProxyHandler`` sends a header exactly when ``_parse_proxy`` yields a user and a password,
     and the transport reaches the handler only for an http(s) URL it can parse. The reader calls a
     private stdlib function, so the shapes where it matters are pinned here."""
-    from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
+    from messagefoundry.transports.rest import proxy_url_sends_userinfo as _proxy_url_sends_userinfo
 
     assert _proxy_url_sends_userinfo(url) is sent
 
@@ -669,7 +671,7 @@ def test_the_reader_pairs_with_urllibs_own_parser() -> None:
     import urllib.parse
     import urllib.request
 
-    from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
+    from messagefoundry.transports.rest import proxy_url_sends_userinfo as _proxy_url_sends_userinfo
 
     for url, _ in _PROXY_SHAPES:
         proxy = url.strip()
@@ -878,10 +880,15 @@ outbound("OB_DICOMWEB_BYPASSED", DICOMweb(url="https://i.example.invalid/dw",
                                           proxy_no_proxy=["i.example.invalid"], **_PROXY))
 outbound("OB_DICOMWEB_PROXIED", DICOMweb(url="https://j.example.invalid/dw", **_PROXY))
 # A lookup takes no proxy of its own: the inherited [egress] proxy and bypass list are its only ones.
-FhirLookup("lk_bypassed", url="https://k.site.invalid/fhir")
-with_smart_backend(FhirLookup("lk_smart_proxied", url="https://l.site.invalid/fhir"),
-                   token_url="https://idp5.example.invalid/token", client_id="c",
+# FhirLookup() takes no proxy credential either, and a credential in [egress].proxy_url is refused
+# at load, so the pair is written into each lookup's settings past the factory, which the executor
+# reads, to keep the lookup bypass decision under test.
+_LK_LOGIN = dict(proxy_user="pu", proxy_password="pp")
+FhirLookup("lk_bypassed", url="https://k.site.invalid/fhir").settings.update(_LK_LOGIN)
+_lk = FhirLookup("lk_smart_proxied", url="https://l.site.invalid/fhir")
+with_smart_backend(_lk, token_url="https://idp5.example.invalid/token", client_id="c",
                    private_key=env("key"))
+_lk.settings.update(_LK_LOGIN)
 """
 
 
@@ -916,10 +923,8 @@ def test_a_proxy_every_address_bypasses_is_not_a_hop(bypass_registry: Registry) 
     assert "proxy:OB_SMART_PROXIED" in names
     assert "proxy:OB_DICOMWEB_BYPASSED" not in names
     assert "proxy:OB_DICOMWEB_PROXIED" in names
-    # A lookup takes no proxy credential of its own, and the site proxy can carry none, so neither
-    # lookup presents one, bypassed or not.
     assert "proxy:fhir_lookup:lk_bypassed" not in names
-    assert "proxy:fhir_lookup:lk_smart_proxied" not in names
+    assert "proxy:fhir_lookup:lk_smart_proxied" in names
 
 
 def test_the_proxy_targets_are_what_each_transport_routes_through_the_proxy() -> None:

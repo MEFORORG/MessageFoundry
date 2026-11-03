@@ -173,15 +173,65 @@ def test_an_inbound_whose_reason_the_build_refuses_is_marked_refused() -> None:
 # --- item 5: a credential in a proxy URL is not a static-credential hop to accept --------------
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://u:p@proxy.example.org:3128",
+        "http://u@proxy.example.org:3128",  # a user alone, which urllib sends nothing for
+        "http://:p@proxy.example.org:3128",  # a password alone
+        "http://u:p@proxy.example.org:3128/x",  # refused for its credential before its shape
+    ],
+)
 @pytest.mark.parametrize("login", [{}, {"proxy_user": "pu", "proxy_password": "pp"}])
-def test_a_credential_in_a_proxy_url_is_no_hop_to_accept(login: dict[str, str]) -> None:
+def test_a_credential_in_a_proxy_url_is_no_hop_to_accept(url: str, login: dict[str, str]) -> None:
     """The connector's build refuses the URL, so advising ``static_credential_accepted`` for it,
-    or auditing it, would describe a hop that never runs."""
+    or auditing it, would describe a hop that never runs. The report asks the build's own test."""
     from messagefoundry.config.static_credentials import _proxy_hop
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.transports.rest import proxy_config_from_settings
 
-    url = "http://u:p@proxy.example.org:3128"
+    with pytest.raises(InsecureHopRefused):
+        proxy_config_from_settings(
+            {"proxy_url": url, **login}, dest_scheme="https", connection="OB"
+        )
     assert _proxy_hop("OB", {"proxy_url": url, **login}, None) is None
-    assert _proxy_hop("OB", {}, url) is None  # inherited from [egress]
+    assert _proxy_hop("OB", login, url) is None  # inherited from [egress]
     # Control: a proxy_user pair on a URL with no userinfo is still a hop.
     hop = _proxy_hop("OB", {"proxy_url": "http://proxy.example.org:3128", "proxy_user": "pu"}, None)
     assert hop is not None and hop.name == "proxy:OB"
+
+
+# --- review round 1 ------------------------------------------------------------------------------
+
+
+def test_an_outbound_with_a_raw_attestation_key_in_its_settings_is_marked_refused() -> None:
+    """``_dest_config`` refuses a raw ``tls_hop_attested*`` key in the transport settings, so the
+    report marks that connection refused too. The control is the same connection without it."""
+    reg = Registry()
+    raw = File(directory=".")
+    raw.settings["tls_hop_attested_reason"] = REASON
+    reg.add_outbound(
+        OutboundConnection("OB_RAW", raw, tls_hop_attested=True, tls_hop_attested_reason=REASON)
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB_TYPED", File(directory="."), tls_hop_attested=True, tls_hop_attested_reason=REASON
+        )
+    )
+    records = {hop.name: hop.refused for hop in attested_secure_hop_records(reg)}
+    assert records == {"OB_RAW": True, "OB_TYPED": False}
+
+
+def test_a_site_proxy_credential_is_refused_for_it_before_its_shape() -> None:
+    """The connector asks the credential first, so the load does too, and names the setting."""
+    from messagefoundry.config.settings import EgressSettings
+
+    with pytest.raises(ValidationError, match=r"\[egress\]\.proxy_url holds a user or a password"):
+        EgressSettings(
+            proxy_url="http://u:p@proxy.example.org:3128/x", allowed_proxy=["proxy.example.org"]
+        )
+    # Control: the same shape fault with no credential keeps the parse's own refusal.
+    with pytest.raises(ValidationError, match="2965"):
+        EgressSettings(
+            proxy_url="http://proxy.example.org:3128/x", allowed_proxy=["proxy.example.org"]
+        )
