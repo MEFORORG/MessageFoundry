@@ -2293,8 +2293,8 @@ pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefl
 cursor column that is not unique (below).
 **With a `mark_statement`, a handler failure also stops the
 poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
-next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on, since
-every row is read again next poll anyway. That keeps a high-water-mark `mark_statement` from moving the cursor past
+next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on: no
+mark can move past the failed row, so stopping would not make a later poll any likelier to read it. That keeps a high-water-mark `mark_statement` from moving the cursor past
 a row whose handler failed, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
 column): a later row's mark would otherwise do so, and the poll would never select the failed row
 again. Without that order, a row with a higher key handed off earlier in the same poll has already
