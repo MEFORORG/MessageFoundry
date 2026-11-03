@@ -173,13 +173,13 @@ def test_an_empty_ta1_code_is_not_recorded_as_a() -> None:
 
 
 @pytest.mark.parametrize("code", ["R ", " R", " r "])
-def test_a_padded_ta1_reject_is_still_a_permanent_reject(code: str) -> None:
+@pytest.mark.parametrize("capturing", [True, False])
+def test_a_padded_ta1_reject_is_still_a_permanent_reject(code: str, capturing: bool) -> None:
     # BACKLOG #5018: TA1-04 was upper-cased but not stripped, so "R " fell through to the accepted
     # default and a rejected interchange was recorded as delivered. Both modes now dead-letter it.
-    for capturing in (True, False):
-        with pytest.raises(NegativeAckError) as ei:
-            _dest(capture_response=capturing)._check_ta1(_ta1(code), payload=EDI)
-        assert ei.value.permanent is True and ei.value.code == "AR"
+    with pytest.raises(NegativeAckError) as ei:
+        _dest(capture_response=capturing)._check_ta1(_ta1(code), payload=EDI)
+    assert ei.value.permanent is True and ei.value.code == "AR"
 
 
 def test_a_padded_ta1_error_logs_the_accepted_with_errors_warning(

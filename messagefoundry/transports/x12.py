@@ -543,12 +543,11 @@ class X12Destination(DestinationConnector):
             # carry none of it: the store's scrub does not catch every identifier (BACKLOG #2984).
             if ta104 == "A":
                 detail = "TA1*A"
+            elif not ta104:
+                detail = "TA1 with no TA1-04 code"
             else:
-                detail = (
-                    "TA1 with no TA1-04 code"
-                    if not ta104
-                    else "TA1 with a TA1-04 outside A, E and R"
-                )
+                detail = "TA1 with a TA1-04 outside A, E and R"
+            if ta104 != "A":
                 logger.warning(
                     "X12 %s:%d returned a %s (TA1-01=%s); recorded as delivered, not retried",
                     self.host,
