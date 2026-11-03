@@ -382,16 +382,41 @@ def test_posix_raises_and_leaves_nothing_when_the_mode_does_not_read_back(
 ) -> None:
     # A filesystem that ignores modes reports something broader than was asked for.
     path = tmp_path / "store.key"
-    real_fstat = os.fstat
+    real_open, real_fstat, real_close = os.open, os.fstat, os.close
+    created: set[int] = set()
+    forged: list[int] = []
 
-    class _Broad:
-        def __init__(self, real: os.stat_result) -> None:
-            self.st_mode = stat.S_IFREG | 0o644
-            self.st_uid = real.st_uid
+    # Forward the call untouched rather than re-declare os.open's signature: a copied default
+    # mode can drift from os.open's own, and CodeQL flags a hand-written 0o777.
+    def opening(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        if os.fspath(kwargs["path"] if "path" in kwargs else args[0]) == os.fspath(path):
+            created.add(fd)
+        return fd
 
-    monkeypatch.setattr(os, "fstat", lambda fd: _Broad(real_fstat(fd)))
-    with pytest.raises(RestrictedFileError, match="owner alone"):
+    def closing(fd: int) -> None:
+        created.discard(fd)  # a later descriptor that reuses the number reads back as it is
+        real_close(fd)
+
+    # Only the descriptor of the file under test reads back broad. Every other one is the real
+    # status, because other code calls os.fstat while the patch is in place: pytest 9.2's capture
+    # reads st_size from it.
+    def broad(fd: int) -> os.stat_result:
+        result = real_fstat(fd)
+        if fd not in created:
+            return result
+        forged.append(fd)
+        # __reduce__ carries the fields the sequence leaves out (st_mtime_ns and the rest).
+        reduced: Any = result.__reduce__()
+        fields, extras = reduced[1]
+        return os.stat_result((stat.S_IFREG | 0o644, *fields[1:]), extras)
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "fstat", broad)
+    monkeypatch.setattr(os, "close", closing)
+    with pytest.raises(RestrictedFileError, match="mode 0644"):
         write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
+    assert forged  # control: the refusal read the forged status
     assert not path.exists()
 
 
