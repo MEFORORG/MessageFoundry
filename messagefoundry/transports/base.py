@@ -64,9 +64,11 @@ __all__ = [
     "intake_open",
     "wait_for_intake",
     "HANDLER_RETRY_DELAYS",
-    "HandlerFault",
+    "HANDLER_FAULT_REPORT_AFTER",
+    "HandlerFaultUnrecovered",
+    "hold_and_retry",
+    "log_owed_reply_fault",
     "owes_hl7_reply",
-    "recover_handler_fault",
     "InboundReply",
     "ReplyOutcome",
     "SyncReplyResolver",
@@ -594,13 +596,17 @@ async def wait_for_intake(
     return True
 
 
-#: The pauses between attempts when the inbound handler raises on a frame a listener read cleanly
-#: and owes no reply for (BACKLOG #5022). Such a fault is an infrastructure failure, most often a
-#: store write that did not commit (:class:`SourceConnector` says so), and a sender that waits for no
-#: reply never resends, so the frame in hand is the only copy. A store blip is the common case, and
-#: retrying in place recovers it with nothing lost and order kept. Short and bounded, because the
-#: connection reads nothing while it waits.
-HANDLER_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
+#: The pause before each further attempt, for :func:`hold_and_retry`; the last repeats until the
+#: frame is recorded or the listener stops. Short at first, since a store blip is the common case,
+#: then backing off, so a long outage costs the store one attempt per connection per 30 s.
+HANDLER_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+
+#: Failed attempts after which :func:`hold_and_retry` reports the fault (``handler_error`` and an
+#: ERROR line). A blip the first retries recover leaves WARNING lines only.
+HANDLER_FAULT_REPORT_AFTER = 4
+
+#: How often a held retry looks at its ``stopped`` predicate while it pauses.
+_HOLD_STOP_POLL_SECONDS = 0.25
 
 
 def owes_hl7_reply(ack_mode: AckMode, content_type: ContentType | None) -> bool:
@@ -613,91 +619,112 @@ def owes_hl7_reply(ack_mode: AckMode, content_type: ContentType | None) -> bool:
     return ack_mode is not AckMode.NONE and content_type in (None, ContentType.HL7V2)
 
 
-@dataclass(frozen=True)
-class HandlerFault:
-    """A frame the inbound handler faulted on and :func:`recover_handler_fault` could not recover.
-
-    ``reason`` is ``safe_exc``-scrubbed, for the listener's ``handler_error`` event. ``close`` is
-    True when the sender waits for a reply: the listener closes, so that sender resends.
-    """
-
-    reason: str
-    close: bool
+class HandlerFaultUnrecovered(Exception):
+    """:func:`hold_and_retry` gave up because the listener is stopping. It has already logged the
+    loss and reported ``handler_error``; the caller closes the connection."""
 
 
-async def recover_handler_fault(
+async def hold_and_retry(
     handler: InboundHandler,
     frame: bytes,
     fault: Exception,
     *,
-    owes_reply: bool,
     transport: str,
     peer: object,
     log: logging.Logger,
     stopped: Callable[[], bool],
-) -> str | None | HandlerFault:
-    """Answer a fault the inbound handler raised on ``frame`` (BACKLOG #5022), for the raw-TCP and
-    X12 listeners. Returns the handler's reply when a retry recovers the frame, else a
-    :class:`HandlerFault` for the caller to record as ``handler_error``. Logs scrubbed, never the
-    frame.
+    report: Callable[[str], Awaitable[None]],
+) -> str | None:
+    """Retry ``handler`` on a frame it faulted on, for a listener whose sender waits for no reply
+    (BACKLOG #5022), and return its reply once one attempt succeeds.
 
-    * **A reply is owed** (``owes_reply``): no retry. The caller closes the connection with no
-      reply, so the sender resends this frame and every one it pipelined behind it, in order. A
-      retry here would hold the sender past its own reply timeout, and its resend would then race
-      a late commit.
-    * **No reply is owed:** the sender never resends, so the handler is retried in place after each
-      :data:`HANDLER_RETRY_DELAYS` pause, ending early once ``stopped()`` turns True. If it still
-      faults the frame may not be recorded, and the caller keeps the connection and reads on.
-      Closing would not recover this frame, and it would also lose every frame the sender had
-      already sent behind it, still in the decoder or the socket buffer; keeping on limits the loss
-      to the one frame, which the ERROR line names.
+    That sender never resends, so the frame in hand is its only copy. It is held, and the handler
+    retried after each :data:`HANDLER_RETRY_DELAYS` pause, until it is recorded or ``stopped()``
+    turns True. Nothing is read meanwhile, so TCP flow control stalls the sender rather than the
+    listener taking frames it cannot record: the frames behind this one wait in the socket, not in
+    a log line. After :data:`HANDLER_FAULT_REPORT_AFTER` failed attempts it calls ``report`` with
+    the scrubbed reason, once, for the caller's ``handler_error`` event. A fault that never clears
+    holds the connection until the listener stops, and the WARNING per attempt says so.
 
-    ``CancelledError`` is not caught. A fault that came after the commit means a retry commits
-    another copy, which at-least-once delivery allows. Nothing is acknowledged here, so the
-    ACK-after-commit rule holds.
+    When ``stopped()`` turns True it logs at ERROR that the frame is not recorded, reports if it
+    has not yet, and raises :class:`HandlerFaultUnrecovered`. ``CancelledError`` is not caught. A
+    fault that came after the commit means a retry commits another copy, which at-least-once
+    delivery allows. Nothing is acknowledged here, so the ACK-after-commit rule holds. Every line is
+    scrubbed with ``safe_exc``, never the frame.
     """
-    if owes_reply:
+    attempts = 1
+    reported = False
+    while True:
         reason = safe_exc(fault)
-        log.error(
-            "%s message from %s failed in the inbound handler: %s (this inbound sends a reply, so "
-            "closing the connection for the sender to resend)",
-            transport,
-            peer,
-            reason,
-        )
-        return HandlerFault(reason=reason, close=True)
-    attempts = len(HANDLER_RETRY_DELAYS) + 1
-    attempt = 1
-    for delay in HANDLER_RETRY_DELAYS:
-        if stopped():
-            break
+        if attempts == HANDLER_FAULT_REPORT_AFTER:
+            log.error(
+                "%s message from %s failed in the inbound handler %d times: %s (this inbound "
+                "sends no reply, so the frame is held and retried until it is recorded or the "
+                "listener stops; the sender is stalled meanwhile)",
+                transport,
+                peer,
+                attempts,
+                reason,
+            )
+            await report(reason)
+            reported = True
+        delay = HANDLER_RETRY_DELAYS[min(attempts, len(HANDLER_RETRY_DELAYS)) - 1]
         log.warning(
-            "%s message from %s failed in the inbound handler (attempt %d of %d): %s; "
-            "retrying in %.2fs",
+            "%s message from %s failed in the inbound handler (attempt %d): %s; retrying in %.2fs",
             transport,
             peer,
-            attempt,
             attempts,
-            safe_exc(fault),
+            reason,
             delay,
         )
-        await asyncio.sleep(delay)
-        attempt += 1
+        waited = 0.0
+        while waited < delay and not stopped():
+            step = min(_HOLD_STOP_POLL_SECONDS, delay - waited)
+            await asyncio.sleep(step)
+            waited += step
+        if stopped():
+            log.error(
+                "%s message from %s is not recorded: the inbound handler failed %d times and the "
+                "listener is stopping: %s (closing the connection)",
+                transport,
+                peer,
+                attempts,
+                reason,
+            )
+            if not reported:
+                await report(reason)
+            raise HandlerFaultUnrecovered
+        attempts += 1
         try:
-            return await handler(frame)
+            reply = await handler(frame)
         except Exception as exc:  # noqa: BLE001 -- any escape is a handler fault; see the docstring
             fault = exc
-    reason = safe_exc(fault)
+            continue
+        if reported:
+            log.warning(
+                "%s message from %s was recorded on attempt %d after the inbound handler faults",
+                transport,
+                peer,
+                attempts,
+            )
+        return reply
+
+
+def log_owed_reply_fault(
+    exc: Exception, *, transport: str, peer: object, log: logging.Logger
+) -> str:
+    """Log a handler fault on a frame whose sender waits for a reply, and return the scrubbed reason
+    for the caller's ``handler_error`` event. The caller closes with no reply, so the sender resends
+    this frame and those behind it, in order; a retry would hold it past its own reply timeout."""
+    reason = safe_exc(exc)
     log.error(
-        "%s message from %s failed in the inbound handler after %d attempt(s) and may not be "
-        "recorded: %s (this inbound sends no reply, so the sender will not resend it; keeping the "
-        "connection for the frames behind it)",
+        "%s message from %s failed in the inbound handler: %s (this inbound sends a reply, so "
+        "closing the connection for the sender to resend)",
         transport,
         peer,
-        attempt,
         reason,
     )
-    return HandlerFault(reason=reason, close=False)
+    return reason
 
 
 class ReplyOutcome(str, Enum):  # noqa: UP042 - matches MessageStatus/OutboxStatus house style
@@ -1312,15 +1339,13 @@ class SourceConnector(abc.ABC):
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
     answer; the raw-TCP and X12 listeners close with no reply for such a sender. A sender that
-    waits for none cannot be told to resend, so the frame in hand is the only copy, and every one
-    of these listeners records ``handler_error`` and keeps the connection, so the frames sent behind
-    it are still handled. They differ on the frame itself:
+    waits for none cannot be told to resend, so the frame in hand is its only copy. At least the
+    socket listeners differ there:
 
-    * the raw-TCP and X12 listeners retry the handler in place on it a bounded number of times
-      first (:func:`recover_handler_fault`, BACKLOG #5022). Only a fault that outlasts the retries
-      loses it, and their ERROR line says so;
-    * the MLLP listener does not retry, so the failed frame is lost. That is a gap in the shipped
-      code, not a pattern to copy."""
+    * the raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or
+      the listener stops (:func:`hold_and_retry`, BACKLOG #5022), so only a stop loses it;
+    * the MLLP listener records ``handler_error``, drops the frame with no retry and reads on. That
+      is a gap in the shipped code, not a pattern to copy. Other sources may have one too."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False

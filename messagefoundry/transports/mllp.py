@@ -36,7 +36,6 @@ from typing import Any, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import (
     ConnectorType,
-    ContentType,
     Destination,
     Source,
     bool_setting,
@@ -102,6 +101,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     float_setting,
     intake_open,
+    owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
@@ -2279,10 +2279,7 @@ class MLLPSource(SourceConnector):
         ``content_type`` is injected by the runner; ``None`` (a direct build, as in tests) reads as
         HL7, the MLLP default.
         """
-        return self.ack_mode is not AckMode.NONE and self.content_type in (
-            None,
-            ContentType.HL7V2,
-        )
+        return owes_hl7_reply(self.ack_mode, self.content_type)
 
     def _handler_failure_nak(self, message: bytes) -> bytes | None:
         """The framed ``AE`` NAK (``CE`` in enhanced mode) for a frame the inbound handler faulted

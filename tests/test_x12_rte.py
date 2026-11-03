@@ -176,7 +176,8 @@ def test_an_empty_ta1_code_is_not_recorded_as_a() -> None:
 @pytest.mark.parametrize("capturing", [True, False])
 def test_a_padded_ta1_reject_is_still_a_permanent_reject(code: str, capturing: bool) -> None:
     # BACKLOG #5018: TA1-04 was upper-cased but not stripped, so "R " fell through to the accepted
-    # default and a rejected interchange was recorded as delivered. Both modes now dead-letter it.
+    # default and a rejected interchange would have been recorded as delivered. Both modes now
+    # dead-letter it.
     with pytest.raises(NegativeAckError) as ei:
         _dest(capture_response=capturing)._check_ta1(_ta1(code), payload=EDI)
     assert ei.value.permanent is True and ei.value.code == "AR"
@@ -185,7 +186,8 @@ def test_a_padded_ta1_reject_is_still_a_permanent_reject(code: str, capturing: b
 def test_a_padded_ta1_error_logs_the_accepted_with_errors_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # BACKLOG #5018: a padded "E " used to skip the accepted-with-errors arm and its warning.
+    # BACKLOG #5018: in the shipped code a padded "E " skipped the accepted-with-errors arm and
+    # its warning.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.x12"):
         r = _dest(capture_response=True)._check_ta1(_ta1("E "), payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.detail == "TA1*E accepted-with-errors"
@@ -205,7 +207,7 @@ def test_a_padded_ta1_error_logs_the_accepted_with_errors_warning(
 def test_an_empty_or_unknown_ta1_code_logs_a_fixed_warning(
     caplog: pytest.LogCaptureFixture, code: str, phrase: str, capturing: bool
 ) -> None:
-    # BACKLOG #5018: an empty or out-of-set TA1-04 was accepted with no log line at all. It stays
+    # BACKLOG #5018: an empty or out-of-set TA1-04 would have been accepted with no log line. It stays
     # accepted (a retry could re-send an interchange the partner accepted, ADR 0016), but now logs a
     # WARNING whose text is a fixed phrase carrying none of the partner's value. Synthetic values.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.x12"):

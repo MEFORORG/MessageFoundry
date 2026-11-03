@@ -45,17 +45,18 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
-    HandlerFault,
+    HandlerFaultUnrecovered,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
     encode_wire_body,
     float_setting,
+    hold_and_retry,
+    log_owed_reply_fault,
     owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
-    recover_handler_fault,
     register_destination,
     register_source,
     wait_for_intake,
@@ -849,29 +850,34 @@ class X12Source(SourceConnector):
                             decoded += 1
                             try:
                                 reply = await self._handler(interchange)
-                            except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
-                                # BACKLOG #5022: the reader framed this interchange cleanly, so
-                                # this is a handler fault, not a framing fault.
-                                outcome = await recover_handler_fault(
-                                    self._handler,
-                                    interchange,
-                                    exc,
-                                    owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
-                                    transport="X12",
-                                    peer=peer,
-                                    log=logger,
-                                    stopped=lambda: self._admission.stopping,
-                                )
-                                if isinstance(outcome, HandlerFault):
-                                    # Set before the emit, as the other arms do.
-                                    failed = outcome.close
-                                    await self._emit_event(
-                                        "handler_error", peer_host=peer_host, reason=outcome.reason
+                            except Exception as exc:  # noqa: BLE001 -- see hold_and_retry
+                                # BACKLOG #5022: the reader framed this interchange cleanly, so this
+                                # is a handler fault, not a framing fault.
+                                if owes_hl7_reply(self.ack_mode, self.content_type):
+                                    failed = True  # set before the emit, as the other arms do
+                                    reason = log_owed_reply_fault(
+                                        exc, transport="X12", peer=peer, log=logger
                                     )
-                                    if failed:
-                                        break  # the sender waits for a reply: close, so it resends
-                                    continue  # it waits for none: read the interchanges behind it
-                                reply = outcome
+                                    await self._emit_event(
+                                        "handler_error", peer_host=peer_host, reason=reason
+                                    )
+                                    break  # close, so the sender resends
+                                try:
+                                    reply = await hold_and_retry(
+                                        self._handler,
+                                        interchange,
+                                        exc,
+                                        transport="X12",
+                                        peer=peer,
+                                        log=logger,
+                                        stopped=lambda: self._admission.stopping,
+                                        report=lambda reason: self._emit_event(
+                                            "handler_error", peer_host=peer_host, reason=reason
+                                        ),
+                                    )
+                                except HandlerFaultUnrecovered:
+                                    failed = True  # hold_and_retry recorded handler_error
+                                    break
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
                                 await self._drain_reply(writer)
