@@ -3,11 +3,13 @@
 """What a store restore rolls back, said once (BACKLOG #5094).
 
 ``messagefoundry restore`` places the archive's whole store, so every change written to the store
-after the archive was taken is gone from the one it places. Every restore notice carries
-:data:`RESTORE_ROLLBACK_NOTICE` whole: the ones shown after a restore and the ones shown before
-one, such as the age refusal and the ``--allow-old-archive`` help. The adopter guide's restore
-section names every class in :data:`RESTORE_ROLLBACK_CLASSES`.
-``tests/test_b5094_restore_rollback_notice.py`` pins all of that, and refuses an import here.
+after the archive was taken is gone from the one it places. :data:`RESTORE_ROLLBACK_NOTICE` is the
+statement. The ``restore`` summary, its ``--json`` payload, the ``--allow-old-archive`` help and the
+``store_restored`` alert's ``rollback_notice`` key carry it whole. The places too short for it, the
+alert's ``detail`` and the age refusal, carry :data:`RESTORE_NOTICE_POINTER` instead, which names
+the command that prints it on an installed engine. The adopter guide's restore section names every
+class in :data:`RESTORE_ROLLBACK_CLASSES`. ``tests/test_b5094_restore_rollback_notice.py`` pins all
+of that, and refuses an import here.
 
 A leaf with no imports, because the CLI builds its parser from it on every run. The notice is
 rendered as argparse help, so it must never hold a ``%``; the same test renders that help.
@@ -15,13 +17,14 @@ rendered as argparse help, so it must never hold a ``%``; the same test renders 
 
 from __future__ import annotations
 
-__all__ = ["RESTORE_ROLLBACK_CLASSES", "RESTORE_ROLLBACK_NOTICE"]
+__all__ = ["RESTORE_NOTICE_POINTER", "RESTORE_ROLLBACK_CLASSES", "RESTORE_ROLLBACK_NOTICE"]
 
 #: The account and security changes a restore undoes, worded as what an operator does about each.
-#: Drawn from the store's account and approval tables (``users``, ``roles``, ``user_roles``,
-#: ``ad_group_role_map``, ``ad_group_scope_map``, ``webauthn_credentials``,
-#: ``pending_approvals``). Not a census: the restore replaces every other table too, and a column
-#: added later joins none of these by itself, hence the notice's "at least".
+#: Drawn from the store's account, approval and attestation tables (``users``, ``roles``,
+#: ``user_roles``, ``ad_group_role_map``, ``ad_group_scope_map``, ``webauthn_credentials``,
+#: ``pending_approvals``, ``transit_bound_attestation``). Not a census: the restore replaces every
+#: other table too, and a column added later joins none of these by itself, hence the notice's
+#: "at least".
 RESTORE_ROLLBACK_CLASSES: tuple[str, ...] = (
     "account creations, disables, enables and deletes",
     "account locks and unlocks",
@@ -36,15 +39,29 @@ RESTORE_ROLLBACK_CLASSES: tuple[str, ...] = (
     "AD group-to-role and AD group-to-scope maps",
     "dual-control approval decisions: a request decided after the archive is pending again, so "
     "reject it rather than approve it a second time",
+    "the vault_transit bound attestation: one withdrawn since (store withdraw-transit-bound) is "
+    "live again, and one recorded since (store attest-transit-bound) is gone, so serve refuses "
+    "under [security].enforcement = enforce until it is recorded again",
 )
 
-#: The statement every restore notice carries whole. Worded for a restore in general, because the
-#: age refusal shows it before anything was written.
+#: The statement every restore notice that has the room carries whole. Worded for a restore in
+#: general, because the ``--allow-old-archive`` help shows it before anything was written.
 RESTORE_ROLLBACK_NOTICE = (
     "A restore undoes every change made to the store after the archive's newest audit row, and "
     "each must be re-applied by hand, at least: "
     + "; ".join(RESTORE_ROLLBACK_CLASSES)
-    + ". Re-apply the removals before users can reach the restored engine. Messages received "
-    "after the archive was taken, later reference-set syncs and later transform state are not in "
-    "a restored store either."
+    + ". Re-apply the removals before users can reach the restored engine: keep [api].host on "
+    "loopback, its default, or the API port behind a closed firewall until they are done. Most "
+    "of them need the web console or the API of a serving engine; the offline commands, at least "
+    "admin-unlock, admin-reset-totp, admin-set-notify-email and admin-revoke-sessions, act on the "
+    "store without one. A restore can also send again: messages still queued when the archive "
+    "was taken are processed and delivered again, those delivered since included, and a file "
+    "inbound with after_read = leave ingests again the files it took since, so a partner can "
+    "receive duplicates. Messages received after the archive was taken, later reference-set "
+    "syncs and later transform state are not in a restored store either."
 )
+
+#: Where to read :data:`RESTORE_ROLLBACK_NOTICE` from a place too short to hold it. ``restore
+#: --help`` builds its parser only, so it prints the notice on any installed engine, with no
+#: config, store or running engine.
+RESTORE_NOTICE_POINTER = "messagefoundry restore --help lists what a restore rolls back."

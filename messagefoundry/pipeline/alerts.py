@@ -25,7 +25,7 @@ from typing import Protocol
 
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.redaction import log_timestamp
-from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
+from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 
 __all__ = [
     "INTAKE_DEPTH_REASON",
@@ -228,12 +228,11 @@ def utc_or_unknown(ts: float | None) -> str:
         return "unknown"
 
 
-#: What the alert instance's reason column must keep of a ``store_restored`` detail: the
-#: instruction, and where the whole list is (BACKLOG #5094).
-_STORE_RESTORED_LEAD = (
-    "Re-apply by hand what this restore undid; the whole list is in the full alert and in the "
-    "restore section of EARLY-ADOPTER-GUIDE.md."
-)
+#: The oldest archive age, in days, :func:`store_restored_detail` writes as a number. An archive's
+#: time is not always authenticated, and ``--allow-old-archive`` restores one of any age, so a
+#: crafted manifest time could otherwise print hundreds of digits and push the count and the
+#: pointer past the reason column's cut (BACKLOG #5094).
+_STORE_RESTORED_MAX_AGE_DAYS = 99_999
 
 
 def store_restored_detail(
@@ -244,23 +243,28 @@ def store_restored_detail(
     revoked: int,
 ) -> str:
     """The description of a ``store_restored`` alert both sinks show (BACKLOG #2614). Fixed
-    words, an age in days, a count, the fixed
-    :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094) and a time in
+    words, an age in days, a count,
+    :data:`~messagefoundry.restore_notice.RESTORE_NOTICE_POINTER` (BACKLOG #5094) and a time in
     UTC: nothing read from a row's content.
 
     The alert instance's reason column keeps only about the first 200 characters, and the store's
-    redaction turns the time in it into ``[redacted]``. So a short fixed instruction leads, with
-    where to read the whole list, whatever the age and count words grow to; the time comes last,
-    naming the ``store_restored`` audit row, which carries it whole."""
-    age = (
-        "of unknown age"
-        if archive_created_at is None
-        else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
-    )
+    redaction turns the time in it into ``[redacted]``. So the age and the count lead and the
+    pointer follows, all three short enough to fit that cut whole, and the time comes last, naming
+    the ``store_restored`` audit row, which carries it whole. The notice itself rides the event as
+    its own ``rollback_notice`` key."""
+    if archive_created_at is None:
+        age = "of unknown age"
+    else:
+        days = max(0.0, restored_at - archive_created_at) / 86400
+        age = (
+            f"{days:.1f} days old"
+            if days <= _STORE_RESTORED_MAX_AGE_DAYS
+            else f"over {_STORE_RESTORED_MAX_AGE_DAYS} days old"
+        )
     return (
-        f"{_STORE_RESTORED_LEAD} Started on a store restored from an archive {age}; {revoked} "
-        f"session(s) revoked. {RESTORE_ROLLBACK_NOTICE} The archive's newest audit row is "
-        f"{utc_or_unknown(last_audit_at)} (also in the store_restored audit row)."
+        f"Started on a store restored from an archive {age}; {revoked} session(s) revoked. "
+        f"Re-apply what it undid: {RESTORE_NOTICE_POINTER} The archive's newest audit row "
+        f"is {utc_or_unknown(last_audit_at)} (also in the store_restored audit row)."
     )
 
 
@@ -1036,14 +1040,15 @@ class AlertSink(Protocol):
         """The engine started on a store that ``messagefoundry restore`` placed, and recorded it:
         every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614).
         What the restore undid, which an operator must apply again, is
-        :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094).
+        :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094), which
+        each sink shows whole beside ``detail``: fixed text, no PHI.
 
         ``name`` is :data:`STORE_RESTORED_SUBJECT`. ``detail`` is built by
         :func:`store_restored_detail`: an age, a count, fixed words and a time, no PHI.
-        ``last_audit_at`` is that time on its own, as ISO 8601 UTC or ``unknown``, because the store's redaction turns
-        a date in the alert instance's reason column into ``[redacted]``; the event carries it
-        whole. Raised once per restore, by the start that consumed the marker. Nothing resolves
-        it automatically."""
+        ``last_audit_at`` is that time on its own, as ISO 8601 UTC or ``unknown``, because the
+        store's redaction turns a date in the alert instance's reason column into
+        ``[redacted]``; the event carries it whole. Raised once per restore, by the start that
+        consumed the marker. Nothing resolves it automatically."""
         ...
 
 
@@ -1543,7 +1548,8 @@ class LoggingAlertSink:
         )
 
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
-        log.warning("ALERT store_restored: %r %s", name, detail)
+        # BACKLOG #5094: the notice is fixed text, so the log line carries it whole.
+        log.warning("ALERT store_restored: %r %s %s", name, detail, RESTORE_ROLLBACK_NOTICE)
 
     def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
         log.warning(

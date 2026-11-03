@@ -693,7 +693,7 @@ start.
 
 **What a restore rolls back (BACKLOG #5094).** A restore undoes every change made to the store
 after the archive's newest audit row, and the engine does not re-apply any of it. Re-apply by hand
-at least these, and re-apply the removals before users can reach the restored engine:
+at least these:
 
 - account creations, disables, enables and deletes;
 - account locks and unlocks;
@@ -708,21 +708,39 @@ at least these, and re-apply the removals before users can reach the restored en
 - channel scopes;
 - AD group-to-role and AD group-to-scope maps;
 - dual-control approval decisions: a request decided after the archive is pending again, so
-  reject it rather than approve it a second time.
+  reject it rather than approve it a second time;
+- the vault_transit bound attestation: one withdrawn since (store withdraw-transit-bound) is
+  live again, and one recorded since (store attest-transit-bound) is gone, so serve refuses
+  under [security].enforcement = enforce until it is recorded again.
 
-Messages received after the archive was taken, later reference-set syncs and later transform state
-are not in a restored store either. Read the source's audit log, or its off-host copy, for the
-changes themselves. The `restore` summary (its `rollback_notice` under `--json`), its age refusal,
-the `--allow-old-archive` help and the full `store_restored` alert print this list. The alert's
-reason in the web console keeps only about its first 200 characters, which say to re-apply and
-point here.
+Re-apply the removals before users can reach the restored engine: keep `[api].host` on loopback,
+its default, or the API port behind a closed firewall until they are done. Most of them need the
+web console or the API of a serving engine; the offline commands, at least `admin-unlock`,
+`admin-reset-totp`, `admin-set-notify-email` and `admin-revoke-sessions`, act on the store without
+one.
+
+A restore can also send again. Messages still queued when the archive was taken are processed and
+delivered again, those delivered since included, and a file inbound with `after_read = "leave"`
+ingests again the files it took since, so a partner can receive duplicates. Messages received after
+the archive was taken, later reference-set syncs and later transform state are not in a restored
+store either. Read the source's audit log, or its off-host copy, for the changes themselves.
+
+`messagefoundry restore --help` prints this list on any installed engine, under
+`--allow-old-archive`, with no config or store. The `restore` summary (its `rollback_notice` under
+`--json`) carries it whole too, and so does the `store_restored` alert: as its `rollback_notice`
+key in the webhook JSON and the default email body, and, with no `[alerts]` transport configured,
+in the engine log's `ALERT store_restored` line. A custom email template cannot name that key, and
+a rule with `transports = []` sends nothing. For those, the alert's reason in the web console's
+alert list keeps the archive's age, the count of sessions ended and a pointer to `messagefoundry
+restore --help`, all inside the about 200 characters it keeps.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,
 is refused too, and raising `--max-age-days` does not change that: only `--allow-old-archive`
-restores it. The refusal, and every successful restore, print the time of the archive's newest
-audit row and the list above of what a restore rolls back. To restore an older archive
-on purpose, pass `--allow-old-archive`, or raise `--max-age-days` past its age.
+restores it. The refusal, whose reason opens with `Nothing was written`, prints the time of the
+archive's newest audit row and points at `messagefoundry restore --help` for the list above; every
+successful restore prints the time and the list. To restore an older archive on purpose, pass
+`--allow-old-archive`, or raise `--max-age-days` past its age.
 
 **Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
 same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI

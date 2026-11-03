@@ -66,7 +66,7 @@ from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
+from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
@@ -3358,9 +3358,9 @@ def restored_accounts_notice(sessions_revoked: int) -> str:
     already did. Worded from the count the restore's own revoke returned, so it never claims more
     than it ended."""
     return (
-        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
-        "placed, and the first engine start on this store ends every session again and records "
-        "the restore."
+        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the "
+        "store it placed, and the first engine start on this store ends every session again and "
+        "records the restore."
     )
 
 
@@ -3401,9 +3401,12 @@ def _refuse_an_old_archive(
             f"the archive was taken {utc_or_unknown(archive_created_at)}, "
             f"{age / 86400:.1f} days ago, past the {max_age_seconds / 86400:g}-day limit"
         )
+    # Short, and pointing at the notice rather than carrying it (BACKLOG #5094): the refusal's
+    # point is that nothing was written. The CLI adds how to override it.
     raise BackupError(
         kind,
-        f"{taken}. Its newest audit row is {newest}. {RESTORE_ROLLBACK_NOTICE} Nothing was written.",
+        f"Nothing was written: {taken}. Its newest audit row is {newest}, and every change made "
+        f"after it would have to be re-applied by hand. {RESTORE_NOTICE_POINTER}",
     )
 
 
