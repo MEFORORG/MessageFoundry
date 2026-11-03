@@ -662,8 +662,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._add_config_dir": Site(
         2,
         OPERATOR,
-        "Names found walking the operator's config directory, never through a link or a junction "
-        "(BACKLOG #5221), and the parents of those files.",
+        "Names found walking the operator's config directory (each directory is checked for "
+        "staging, each file is added); the walk prunes a link or a junction it reads (BACKLOG "
+        "#5221).",
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._build_archive_blocking": Site(
         1, INTERNAL, "A fixed name in a work directory this module made."
