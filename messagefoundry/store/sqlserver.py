@@ -7965,8 +7965,11 @@ class SqlServerStore:
         Error 1222 is treated as a failed applock wait: it raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, not retried, and the
         transaction rolls back. The setting is session-scoped and survives a rollback, so it is put
-        back to -1 right after the statement, or after the rollback on a failure, so a pooled
-        connection never carries it into other work."""
+        back to -1 right after the statement, after a retry's rollback, or after the rollback on a
+        failure, so neither a re-take of the applock nor a pooled connection's other work runs under
+        it. A ``command_timeout`` at or under the bound fires first as HYT00, which the retry
+        re-runs as it did before the bound; each attempt then holds the applock for at most that
+        timeout."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         if flagged:
@@ -8014,9 +8017,14 @@ class SqlServerStore:
                         bounded = False
 
                     async def release() -> None:
-                        nonlocal locked
+                        nonlocal locked, bounded
                         await conn.rollback()
                         locked = False
+                        if bounded:
+                            # The rollback does not undo the SET, and the re-take's opener and
+                            # applock must wait under their own bounds, not this one.
+                            await cur.execute(_LOCK_TIMEOUT_RESET)
+                            bounded = False
 
                     await _retry_idempotent_merge(write_flag, on_retry=release, statement=statement)
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
@@ -8024,7 +8032,8 @@ class SqlServerStore:
             except Exception:
                 # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
                 await self._rollback_or_discard(conn)
-                if bounded:
+                # A connection that discard took out of the pool closes with its session.
+                if bounded and not getattr(conn, "closed", False):
                     await self._reset_lock_timeout(conn, after="a failed connection flag write")
                 raise
 

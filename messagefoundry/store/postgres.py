@@ -6408,15 +6408,17 @@ class PostgresStore:
 
         The flag statement holds the audit lock while it waits for its row, so its lock waits are
         bounded by ``lock_timeout``, at
-        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`. Nothing else bounds
-        them: the pool sets no server ``statement_timeout``, and asyncpg's client-side
-        ``command_timeout`` is 30 s by default and absent at 0, so a foreign lock on
-        ``connection_flag`` would hold every audit append that long. It is set after the advisory
-        lock, whose wait keeps its own bound, and only tightens, as the schema batch's does. It is
-        local to the transaction, so it ends with it, and it covers the append too, which waits on
-        no lock the audit lock does not already serialise. SQLSTATE 55P03 raises
+        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`. The pool sets no
+        server ``statement_timeout``, so without it the wait would run to asyncpg's client-side
+        ``command_timeout``, or without end at 0, unless the role or database set a bound of its
+        own; a foreign lock on ``connection_flag`` would hold every audit append that long. It is
+        set after the advisory lock, whose wait keeps its own bound, and only tightens, as the
+        schema batch's does. It is local to the transaction, so it ends with it. It also bounds the
+        append's lock waits, so a lock on ``audit_log`` held past it, such as a schema change's,
+        fails the toggle with the driver's own 55P03 rather than the typed refusal. SQLSTATE 55P03
+        from the flag statement raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
-        back."""
+        back. A ``command_timeout`` at or under the bound fires first, as asyncpg's own timeout."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (

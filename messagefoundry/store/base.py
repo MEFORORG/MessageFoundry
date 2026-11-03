@@ -129,6 +129,8 @@ __all__ = [
     "AdminStore",
     "AuditStore",
     "AuthStore",
+    "CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS",
+    "ConnectionFlagLockTimeout",
     "ContentSearchError",
     "DbaDelegatedError",
     "DEFAULT_SCAN_LIMIT",
@@ -1426,8 +1428,11 @@ class QueueStore(StoreLifecycle, Protocol):
 
         On a server backend the flag statement waits at most
         :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` for a lock on the table, since the audit lock is
-        held while it waits. Past that it raises :class:`ConnectionFlagLockTimeout`, having rolled
-        back and released the audit lock, with nothing written."""
+        held while it waits. Past that it raises :class:`ConnectionFlagLockTimeout`, with nothing
+        written, once the transaction has rolled back and released the audit lock. Where that
+        rollback fails, the connection is discarded instead, and the audit lock is held until the
+        server ends that session. A ``command_timeout`` at or under the bound fires first, and its
+        refusal is the driver's own, as before the bound."""
         ...
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -3575,20 +3580,23 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
 
 #: How long a server backend's connection flag toggle waits for a lock on ``connection_flag``
 #: (BACKLOG #2623). The toggle holds the store's audit lock while it waits, so this also bounds how
-#: long a foreign lock on that table can hold every audit append. Under the engine's
-#: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so the toggle's own
-#: refusal arrives before the engine stops waiting for it.
+#: long a foreign lock on that table can hold every audit append, per attempt. It sits under the
+#: engine's ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so a toggle
+#: that gets the audit lock at once hears this refusal before the engine stops waiting. A toggle
+#: that first queued for the audit lock can still be cut off by the engine instead; this bound then
+#: still ends the store's wait, and its hold on the audit lock, soon after.
 CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 class ConnectionFlagLockTimeout(RuntimeError):
     """A server backend's flag statement did not get its lock on ``connection_flag`` within
-    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` (BACKLOG #2623). Only toggles write the table, and
-    they run one at a time under the audit lock, so the holder is something outside the store.
+    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` (BACKLOG #2623). Toggles run one at a time under
+    the audit lock, so the holder is something other than a toggle: at least a writer outside the
+    store, or a schema change holding a lock on the table.
 
-    Raised inside the toggle's transaction, which then rolls back with nothing written and releases
-    the audit lock. It is never retried there, since a retry would hold the audit lock again behind
-    the same holder."""
+    Raised inside the toggle's transaction, which then rolls back with nothing written; the store
+    method's docstring says what happens where that rollback fails. It is never retried there,
+    since a retry would hold the audit lock again behind the same holder."""
 
     def __init__(self, backend: StoreBackend, timeout: float) -> None:
         self.backend = backend
@@ -3599,8 +3607,9 @@ class ConnectionFlagLockTimeout(RuntimeError):
             else ""
         )
         super().__init__(
-            f"{backend.value}: a connection flag statement did not get its row lock within "
-            f"{timeout:.15g} s{stricter}; another session holds one. Nothing was written"
+            f"{backend.value}: a connection flag statement did not get its lock on the flag table "
+            f"within {timeout:.15g} s{stricter}; another session, or a schema change, holds one. "
+            "Nothing was written"
         )
 
 
