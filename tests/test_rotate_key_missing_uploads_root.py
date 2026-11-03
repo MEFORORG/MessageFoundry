@@ -17,17 +17,26 @@ only."""
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
+from messagefoundry.__main__ import _uploads_root_refusal, main
 from messagefoundry.pipeline.secret_rotation import ROTATION_RECORD_ID, dek_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import ResealResult, UploadStore
 from tests.test_cli import _rotate_env
-from tests.test_rotate_key_rotation_record import _DEK, _OLD_DATE, _key_id, _open, _rows, _seed
+from tests.test_rotate_key_rotation_record import (
+    _DEK,
+    _MSG,
+    _OLD_DATE,
+    _key_id,
+    _open,
+    _rows,
+    _seed,
+)
 
 
 @pytest.fixture
@@ -86,11 +95,44 @@ def test_an_unmounted_uploads_root_is_refused_before_anything_is_written(
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
     assert rows[_DEK].last_rotated == _OLD_DATE
     assert ROTATION_RECORD_ID not in rows
+    # The chain did not roll: key A alone still verifies it.
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_a)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED")
+    assert main(["audit-verify", "--db", str(db)]) == 0, capsys.readouterr()
+    capsys.readouterr()
 
     if shape == "a file":
         uploads.unlink()
     unmounted.rename(uploads)
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     _completes_once_mounted(db, uploads, key_b)
+
+
+def test_an_uploads_root_it_cannot_list_is_refused_with_its_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that is there but cannot be listed is not told to be created."""
+
+    def denied(path: object) -> object:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "scandir", denied)
+    refusal = _uploads_root_refusal(str(tmp_path))
+    assert refusal is not None
+    assert "cannot be listed (Permission denied), so rotate-key changed nothing" in refusal
+    assert "Create it" not in refusal
+
+
+def test_a_relative_uploads_dir_is_named_as_read(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Read from the command's own directory, which need not be serve's, so the run says where."""
+    db, uploads, key_a, key_b = rig
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=Path(uploads.name))
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    assert f"relative, so it was read here as {uploads.absolute()}" in capsys.readouterr().err
 
 
 def test_an_uploads_root_gone_mid_run_fails_it_and_leaves_the_record_open(
@@ -114,7 +156,8 @@ def test_an_uploads_root_gone_mid_run_fails_it_and_leaves_the_record_open(
     assert main(["rotate-key", "--db", str(db)]) == 1
     captured = capsys.readouterr()
     assert "PARTIAL:" in captured.out and "OK: re-encrypted" not in captured.out
-    assert "went away during the run, so no uploaded file was re-sealed" in captured.err
+    assert "could not be by its uploads pass, so no uploaded file was re-sealed" in captured.err
+    assert "do not create an empty one" in captured.err  # it was there when the run started
     assert "remove the two files" not in captured.out  # that remedy is a skip's, not this
     assert "you cannot go back to the prior key" in captured.out
     rows = asyncio.run(_rows(db, key_b, key_a))
@@ -171,3 +214,18 @@ async def test_reseal_reports_a_root_that_is_not_a_directory(tmp_path: Path, sha
     assert result == ResealResult(root_missing=missing)
     assert result.incomplete is missing
     assert root.is_dir() is not missing  # the pass creates nothing
+
+
+async def test_reseal_reports_a_root_it_cannot_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that is there but cannot be listed is read as nothing, so it is missing too."""
+    root = tmp_path / "uploads"
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=1 << 20)
+    await store.save(data=_MSG.encode(), filename="a.hl7", uploader="op", uploader_id="u")
+
+    def denied(self: Path) -> object:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "iterdir", denied)
+    assert await store.reseal_to_active() == ResealResult(root_missing=True)

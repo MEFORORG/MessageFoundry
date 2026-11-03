@@ -10471,21 +10471,11 @@ def _sqlite_store_held_elsewhere(path: str) -> _OfflineProbe:
     return _OfflineProbe()
 
 
-#: Why a configured uploads directory may be unreadable to ``rotate-key`` (BACKLOG #4940).
-_UPLOADS_ROOT_CAUSES = (
-    "The causes include at least a volume that is not mounted, a path that is wrong or is "
-    "relative (it is read from the directory this command runs in) and, since the directory is "
-    "created on the first upload, a site that has never stored one. Create it, empty, only in "
-    "that last case: anywhere else an empty directory hides the uploads this run must re-seal."
-)
-
-
 def _uploads_root_refusal(uploads_dir: str) -> str | None:
-    """What stops ``rotate-key`` listing the configured uploads directory, or ``None`` (BACKLOG
-    #4940). A directory the pass cannot read is not zero uploads: behind an unmounted volume every
-    upload is still under the prior key. Checked before anything is written, so a refusal costs
-    nothing, the audit roll included. :attr:`ResealResult.root_missing` is the backstop for a
-    directory that goes away after this check."""
+    """Why ``rotate-key`` refuses the configured uploads directory, or ``None`` (BACKLOG #4940).
+    Checked before anything is written, so a refusal costs nothing, the audit roll included. Why a
+    directory it cannot list is not zero uploads is on :attr:`ResealResult.root_missing`, which is
+    the backstop for one that goes away after this check."""
     import os
 
     root = Path(uploads_dir).absolute()
@@ -10494,9 +10484,20 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         with os.scandir(root):
             return None
     except (FileNotFoundError, NotADirectoryError):
-        return f"{where} does not exist or is not a directory"
+        return (
+            f"{where} does not exist or is not a directory, so rotate-key changed nothing. The "
+            "causes include at least a volume that is not mounted, a path that is wrong or is "
+            "relative (it is read from the directory this command runs in) and, since the "
+            "directory is created on the first upload, a site that has never stored one. Create "
+            "it, empty, only in that last case: anywhere else an empty directory hides the uploads "
+            "this run must re-seal. Fix the cause and re-run."
+        )
     except OSError as exc:
-        return f"{where} cannot be listed: {exc.strerror or type(exc).__name__}"
+        return (
+            f"{where} cannot be listed ({exc.strerror or type(exc).__name__}), so rotate-key "
+            "changed nothing. Give the account running rotate-key the right to list it, or fix "
+            "the cause, and re-run."
+        )
 
 
 def _rotate_key(args: argparse.Namespace) -> int:
@@ -10625,12 +10626,17 @@ def _rotate_key(args: argparse.Namespace) -> int:
     if settings.store.uploads_dir:
         refusal = _uploads_root_refusal(settings.store.uploads_dir)
         if refusal is not None:
+            print(f"error: {refusal}", file=sys.stderr)
+            return 2
+        if not Path(settings.store.uploads_dir).is_absolute():
+            # An empty directory of the same name where this command runs passes the check, and
+            # serve, under NSSM, reads the path from its own AppDirectory.
             print(
-                f"error: {refusal}, so rotate-key changed nothing. {_UPLOADS_ROOT_CAUSES} Fix the "
-                "cause and re-run.",
+                f"note: [store].uploads_dir is relative, so it was read here as "
+                f"{Path(settings.store.uploads_dir).absolute()}. Confirm that is the directory "
+                "serve uses: an empty one elsewhere reads as no uploads.",
                 file=sys.stderr,
             )
-            return 2
     if unchecked is not None:
         print(
             f"note: rotate-key could not check for a running engine: {unchecked}. Confirm every "
@@ -10837,10 +10843,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # uploads pass. See ResealResult.root_missing.
         print(
             f"error: the uploads directory {Path(settings.store.uploads_dir or '').absolute()} "
-            "([store].uploads_dir) went away during the run, so no uploaded file was re-sealed, "
-            "and its uploads may still be under the prior key. Fix the cause and re-run rotate-key "
-            "BEFORE retiring any prior key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). "
-            f"{_UPLOADS_ROOT_CAUSES} This run did not stamp the key's rotation date.",
+            "([store].uploads_dir) could be listed when this run started and could not be by its "
+            "uploads pass, so no uploaded file was re-sealed, and its uploads may still be under "
+            "the prior key. The log names the cause. It was there at the start, so do not create "
+            "an empty one: mount the volume or put the directory back, and re-run rotate-key "
+            "BEFORE retiring any prior key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). This run did not "
+            "stamp the key's rotation date.",
             file=sys.stderr,
         )
     if not rolled_ok:
