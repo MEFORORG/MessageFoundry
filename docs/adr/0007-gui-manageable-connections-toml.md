@@ -305,8 +305,12 @@ earlier toggle has committed, and its row is the newer, from any process and whe
 call's caller stopped waiting. Only toggles write `connection_flag`, and each takes the audit lock
 first, so the row lock under it cannot cycle; `tests/test_connection_flag.py` fails on another
 writer it can see in the engine's Python. SQLite's writer runs one transaction at a time, so a
-toggle there was always whole. Nothing of this gap remains open; a database writer outside the store
-is the accepted residual above.
+toggle there was always whole. A database writer outside the store is still the accepted residual
+above. The order follows from the code: when this was written the live cross-handle test (AC-7) ran
+only on SQLite, and its Postgres and SQL Server legs run on hosted CI alone. The fix has a cost: a
+toggle now waits on its flag statement holding the audit lock, so a foreign lock on
+`connection_flag` would hold every audit append in the store until it clears or the toggle times
+out.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.

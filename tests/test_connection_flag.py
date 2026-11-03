@@ -955,34 +955,55 @@ async def test_the_postgres_toggle_takes_the_audit_lock_before_its_flag_statemen
     assert log == ["BEGIN read_committed", "LOCK audit", statement, "APPEND"]
 
 
-#: A statement that writes the flag table, as a SQL string literal spells it.
+#: A statement that writes the flag table, as a SQL string literal spells it: at least the Postgres,
+#: SQLite and T-SQL verb forms, a schema prefix, and a bracketed or quoted name.
 _FLAG_WRITE = re.compile(
-    r"\b(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE|MERGE|TRUNCATE\s+TABLE)\s+connection_flag\b", re.I
+    r"\b(?:INSERT(?:\s+INTO)?|DELETE(?:\s+\w+)?(?:\s+FROM)?|UPDATE|MERGE(?:\s+INTO)?"
+    r"|TRUNCATE(?:\s+TABLE)?)\s+(?:\w+\.)?[\[\"]?connection_flag\b",
+    re.I,
 )
 
 
+def _flag_writers(tree: ast.AST, scope: str = "<module>") -> set[str]:
+    """The innermost function, or ``<module>``, around each literal that writes the flag table."""
+    found: set[str] = set()
+    for child in ast.iter_child_nodes(tree):
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+            found |= _flag_writers(child, child.name)
+        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+            if _FLAG_WRITE.search(child.value):
+                found.add(scope)
+        else:
+            found |= _flag_writers(child, scope)
+    return found
+
+
 def test_only_the_toggle_writes_the_flag_table() -> None:
-    """The cross-process order rests on this: every writer of ``connection_flag`` takes the audit
-    lock before its statement, so no row lock is ever held while the audit lock is awaited. A
-    writer that appended at the tail instead could deadlock a toggle, and let the flag and its
-    newest row disagree again. This finds a writer in a string literal in the engine's Python,
-    by enclosing function; one built from parts, or in another language, it cannot see."""
+    """The cross-process order rests on this: the toggle is the only writer of
+    ``connection_flag``, and on the server backends it takes the audit lock before its statement
+    (SQLite has one writer), so no row lock is ever held while the audit lock is awaited. A writer
+    that appended at the tail instead could deadlock a toggle, and let the flag and its newest row
+    disagree again. This reads every string literal in the engine's Python, module constants
+    included. A statement built from parts, or in another language, it cannot see."""
     root = Path(__file__).resolve().parents[1] / "messagefoundry"
-    writers: set[tuple[str, str]] = set()
-    for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for fn in ast.walk(tree):
-            if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            for node in ast.walk(fn):
-                if (
-                    isinstance(node, ast.Constant)
-                    and isinstance(node.value, str)
-                    and _FLAG_WRITE.search(node.value)
-                ):
-                    writers.add((path.name, fn.name))
-    assert writers == {
-        ("postgres.py", "set_connection_flag"),
-        ("sqlserver.py", "set_connection_flag"),
-        ("store.py", "set_connection_flag"),
+    writers = {
+        (path.relative_to(root).as_posix(), scope)
+        for path in sorted(root.rglob("*.py"))
+        for scope in _flag_writers(ast.parse(path.read_text(encoding="utf-8")))
     }
+    assert writers == {
+        ("store/postgres.py", "set_connection_flag"),
+        ("store/sqlserver.py", "set_connection_flag"),
+        ("store/store.py", "set_connection_flag"),
+    }
+    # The pattern's own control: the spellings a writer could take that the old one missed.
+    for spelled in (
+        "MERGE INTO connection_flag",
+        "DELETE connection_flag WHERE",
+        "DELETE f FROM connection_flag f",
+        "INSERT [connection_flag]",
+        'TRUNCATE "connection_flag"',
+        "UPDATE dbo.connection_flag SET",
+    ):
+        assert _FLAG_WRITE.search(spelled), spelled
+    assert not _FLAG_WRITE.search("SELECT connection, direction FROM connection_flag")

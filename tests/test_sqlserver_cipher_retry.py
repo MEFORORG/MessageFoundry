@@ -301,8 +301,9 @@ async def test_a_flag_write_whose_applock_wait_fails_is_not_retried(retake: bool
         store = _FlagStore([_DEADLOCK, None], applock=[None, _HYT00])
     else:
         store = _FlagStore([None], applock=[_HYT00])
-    with pytest.raises(Exception, match="HYT00"):
+    with pytest.raises(RuntimeError, match="audit applock was not granted") as caught:
         await _set_flag(store, flagged=False)
+    assert caught.value.__cause__ is _HYT00
     expected = ["APPLOCK", "DELETE", "ROLLBACK", "APPLOCK"] if retake else ["APPLOCK"]
     assert [sql.split()[0] for sql in store.statements] == expected
     assert (store.audits, store.commits, store.discards) == (0, 0, 1)

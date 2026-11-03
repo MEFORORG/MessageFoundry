@@ -7948,9 +7948,10 @@ class SqlServerStore:
         on the MERGE, though the applock already keeps two toggles off the key at once.
 
         Only the flag statement is retried, as :meth:`_claim_keyed_surface` retries its MERGE. The
-        rollback before a re-run releases the applock, so the re-run opens a transaction and takes
-        it again first. A wait for the applock that fails, at the first take or a re-take, is never
-        retried: it raises, as it did when the append took the applock."""
+        rollback before a re-run releases the applock, so the backoff sleeps holding nothing, and
+        the re-run opens a transaction and takes it again first. A wait for the applock that fails,
+        at the first take or a re-take, is never retried: it raises, as it did when the append took
+        the applock."""
         now = time.time() if now is None else now
         if flagged:
             statement = "connection flag MERGE"
@@ -7967,16 +7968,27 @@ class SqlServerStore:
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
+                    locked = False
 
                     async def write_flag() -> None:
+                        nonlocal locked
+                        if not locked:
+                            try:
+                                await self._open_under_audit_applock(cur)
+                            except Exception as exc:
+                                # Not a transient conflict to the retry, whatever the driver said.
+                                raise RuntimeError(
+                                    "the audit applock was not granted to a connection flag write"
+                                ) from exc
+                            locked = True
                         await cur.execute(sql, (connection, direction))
 
-                    async def reopen() -> None:
+                    async def release() -> None:
+                        nonlocal locked
                         await conn.rollback()
-                        await self._open_under_audit_applock(cur)
+                        locked = False
 
-                    await self._open_under_audit_applock(cur)
-                    await _retry_idempotent_merge(write_flag, on_retry=reopen, statement=statement)
+                    await _retry_idempotent_merge(write_flag, on_retry=release, statement=statement)
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
                     await self._commit(conn)
             except Exception:
