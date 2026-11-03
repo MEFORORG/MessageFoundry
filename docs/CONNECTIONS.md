@@ -2286,25 +2286,29 @@ just runs whatever statement you declare, bound from the row.
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
-**unmarked** so it retries — never marked-and-dropped. A `poll_statement` that writes breaks that
-(see the `poll_statement` row above). **With a `mark_statement`, a handler failure also stops the
+**unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
+`poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
+`mark_statement` over a `poll_statement` that does not return rows in cursor order (below).
+**With a `mark_statement`, a handler failure also stops the
 poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
 next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on, since
 every row is read again next poll anyway. That keeps a high-water-mark `mark_statement` from moving the cursor past
-a failed row, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
+a row whose handler failed, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
 column): a later row's mark would otherwise do so, and the poll would never select the failed row
 again. Without that order, a row with a higher key handed off earlier in the same poll has already
 moved the cursor past it. **The trade-off is head-of-line blocking.** A row whose handler fails on
 every attempt, such as one whose value a server store rejects as too long, holds back every row
 `poll_statement` returns after it, on every poll and whatever the mark shape, a status column or a
 delete-from-queue included; with an `ORDER BY` that is the whole feed. Each failure logs a WARNING
-and, when connection events are captured, emits a `handler_error` connection event, once per poll.
-Its reason renders the error the way the log line does: a driver error as its type, SQLSTATE and
+and, when connection events are captured, emits a `handler_error` connection event. With a
+`mark_statement` that is at most one event per poll, since the poll stops at the failure; with none
+it is one per failing row. Its reason renders the error the way the log line does: a driver error as its type, SQLSTATE and
 native error number, without its message, and any other error as the scrubbed, bounded text of
 `safe_exc`, which is a bound rather than a guarantee that no value survives. Repair or remove that
 row to release the feed.
-**A row the source cannot decode is different,** and so is a body the configured `encoding` cannot
-carry, which never reaches the handler: it is skipped rather than stopped at (see
+**The stop closes only the handler-failure path, not high-water-mark loss outright.** A row the
+source cannot decode is different, and so is a body the configured `encoding` cannot carry; neither
+reaches the handler. Each is skipped rather than stopped at (see
 [per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
 still moves the cursor past it, and its `row_undecodable` event is the record of it.
 A `poll_statement` the read-only test refuses never
@@ -4252,7 +4256,8 @@ to prevent.
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
 left in place. The database ceiling is charged at the **fetch**, for the memory reason above, so the
-row has to be decoded under the open cursor and replaced from the same cursor — the shortfall is
+row has to be decoded, and its body encoded in the configured `encoding` (BACKLOG #4921), under the
+open cursor and replaced from the same cursor — the shortfall is
 re-fetched, never the whole result set. Do not read this as parity of mechanism; what the two share is
 that a budget can only be charged by something that makes progress. Two bounds keep the replacement
 from becoming a log flood: a `body_column` that names no column `poll_statement` selects is **static**

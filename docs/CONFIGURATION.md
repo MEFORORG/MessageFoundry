@@ -2812,8 +2812,11 @@ mark-after-hand-off, and the downstream queue's idempotent handoff make a re-rea
 duplicate, never data loss. For a `database` source at least two shapes break that: a
 `poll_statement` that writes, which the read-only test on it does not always catch, and a
 high-water-mark `mark_statement` over a `poll_statement` that does not return rows in cursor order.
-In cursor order, each node stops its poll at a row whose handler failed (BACKLOG #4921), so a node
-marks a later row only after it has handed that row off itself; see the
+In cursor order, each node stops its poll at a row whose handler failed (BACKLOG #4921), so a node's
+mark moves the cursor past no row whose hand-off failed on that node. That closes the
+handler-failure path only, not high-water-mark loss outright: a node's mark still moves the cursor
+past a row it skipped, one the source could not decode or whose body the configured `encoding`
+cannot carry, which no node handed off. See the
 [Database source](CONNECTIONS.md#database-source--databasepoll) section. The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
