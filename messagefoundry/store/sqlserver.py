@@ -81,6 +81,7 @@ from messagefoundry.odbc_call_gate import call_gate as _call_gate
 from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
 from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
 from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
+from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -5492,7 +5493,9 @@ class SqlServerStore:
         the cancelled statement may still be running on an executor thread, and closing the cursor
         beside it frees the handle the statement returns to. Every ``_cursor`` sits inside
         :meth:`_acquire`, which quarantines the connection on the same exit, so the cursor is closed
-        there, after the statement returns. No await here, so the cancellation propagates at once."""
+        there, after the statement returns. No await here, so the cancellation propagates at once.
+        A cursor with no raw pyodbc cursor is closed below instead, and on a real aioodbc cursor
+        :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs that once (BACKLOG #5005)."""
         cur = await conn.cursor()
         abandoned = False
         try:
@@ -5500,7 +5503,7 @@ class SqlServerStore:
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 gate = _call_gate(conn)
-                raw_cur = getattr(cur, "_impl", None)
+                raw_cur = _raw_cursor(cur)
                 if gate is not None and raw_cur is not None:
                     gate.abandon(raw_cur)
                     abandoned = True
