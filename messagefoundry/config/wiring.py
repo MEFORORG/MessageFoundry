@@ -6265,9 +6265,12 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # got past the factory.
         #
         # The cleartext and revocation values are read the way those models read them: each flag
-        # is a lax pydantic bool and each reason a pydantic str, so an int 1 or the string "false"
-        # is the flag the build sees, and a reason of another type is refused as the model refuses
-        # it, never passed to the pair rule's .strip().
+        # is a lax pydantic bool and each reason a pydantic str. So an int 1 or the string "false"
+        # is the flag the typed Source or Destination holds, the build builds it and it is no
+        # refusal, and a reason of another type is refused as the model refuses it, never passed to
+        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". It does
+        # not say the build reads one value: _dest_config's settings mirror tests the raw flag by
+        # truthiness, so for a string "false" the settings-driven seams can read the flag set.
         try:
             refuse_raw_hop_attestation(settings, "")
             accepted_flag = _LAX_BOOL.validate_python(accepted)

@@ -325,23 +325,55 @@ def test_an_inbound_is_marked_refused_exactly_when_the_build_refuses_it(
 
 
 def test_control_the_cases_cover_both_build_outcomes() -> None:
-    """Without this the agreement tests could pass with every case on one side."""
+    """Without this the agreement tests could pass with every case on one side, outbound or
+    inbound. It pins the build as it is today: a build that refused a non-bool flag outright would
+    move the lax cases to the refused side, and this control, not the agreement tests, would need
+    updating."""
     from messagefoundry.config.settings import EgressSettings
-    from messagefoundry.pipeline.wiring_runner import _dest_config
+    from messagefoundry.pipeline.wiring_runner import _dest_config, _source_config
 
-    outcomes = {
+    spec = File(directory=".")
+    outbound = {
         name: _build_refuses(
             lambda extra=extra: _dest_config(
-                OutboundConnection("OB_CASE", File(directory="."), **extra, **_ATTEST),
-                {},
-                None,
-                EgressSettings(),
+                OutboundConnection("OB_CASE", spec, **extra, **_ATTEST), {}, None, EgressSettings()
             )
         )
         for name, extra in {**_REVOCATION_CASES, **_CLEARTEXT_CASES}.items()
     }
-    built = {name for name, refused in outcomes.items() if not refused}
-    assert {"revocation-int-1", "revocation-str-false", "cleartext-str-false"} <= built
-    assert {"revocation-int-reason", "cleartext-int-reason", "revocation-no-reason"} <= (
-        set(outcomes) - built
+    inbound = {
+        name: _build_refuses(
+            lambda extra=extra: _source_config(
+                InboundConnection("IB_CASE", spec, "R", **extra, **_ATTEST), "127.0.0.1", {}
+            )
+        )
+        for name, extra in _REVOCATION_CASES.items()
+    }
+    for outcomes in (outbound, inbound):
+        built = {name for name, refused in outcomes.items() if not refused}
+        assert {"revocation-int-1", "revocation-str-false"} <= built
+        assert {"revocation-int-reason", "revocation-no-reason"} <= set(outcomes) - built
+    assert "cleartext-str-false" in outbound and not outbound["cleartext-str-false"]
+    assert outbound["cleartext-int-reason"]
+
+
+def test_a_plain_attested_hop_beside_refused_siblings_is_not_marked_refused() -> None:
+    """A baseline with no extra declaration, in one registry with refused entries, so a refusal
+    cannot taint a sibling."""
+    spec = File(directory=".")
+    reg = Registry()
+    reg.add_outbound(OutboundConnection("OB_GOOD", spec, **_ATTEST))
+    reg.add_outbound(
+        OutboundConnection("OB_BAD", spec, **_REVOCATION_CASES["revocation-no-reason"], **_ATTEST)
     )
+    reg.add_inbound(InboundConnection("IB_GOOD", spec, "R", **_ATTEST))
+    reg.add_inbound(
+        InboundConnection(
+            "IB_BAD", spec, "R", **_REVOCATION_CASES["revocation-list-reason"], **_ATTEST
+        )
+    )
+    records = {h.name: h.refused for h in attested_secure_hop_records(reg)}
+    assert len(records) == 4
+    assert records["OB_GOOD"] is False and records["OB_BAD"] is True
+    assert [records[n] for n in sorted(records) if "IB_GOOD" in n] == [False]
+    assert [records[n] for n in sorted(records) if "IB_BAD" in n] == [True]
