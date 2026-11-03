@@ -470,24 +470,25 @@ Builders push included; one from the Lander, another seat or a workflow is not o
 branch updates included. A `hold-ack` expires 2 hours after it while it is still the original
 author's newest event since the hold and no commit by the original author has landed since it, and
 the hold then counts as unacknowledged, which `scripts/coord/held_pr_turns.py` shows as the
-Lander's turn, flagged `ack-expired`; an author commit or ordinary reply hands the turn back to the
-Lander, and nothing expires then. The author may also hand the PR over sooner. The PR must not be
-queued or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own
-CCD instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
-transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief,
-and no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
+Lander's turn, flagged `ack-expired` only while the head is unchanged; any other head move already
+reads as the Lander's turn. An author commit or ordinary reply hands the turn back to the Lander,
+and nothing expires then. The author may also hand the PR over sooner. The PR must not be queued
+or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own CCD
+instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
+transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief;
+no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
 `<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair Manager's CCD `local_` id
-copied whole; and mail to the original author's seat-record worktree where it has one, naming the
-PR URL and that id. A Repair Manager that does not find the marker re-reads once after its
-research, and otherwise reports to the Lander and stops. Minimizing the newest marker, and any
-older one still unminimized, cancels the transfer and hands the PR back to the original author.
-At least stacks, landing order, author intent and anything
+copied whole; the hold's URL sent to it again; and mail to the original author's seat-record
+worktree where it has one, naming the PR URL and that id. A Repair Manager that does not find the
+marker stops and waits to be woken. It never briefs a Builder without the marker naming it.
+Minimizing the newest marker, and any older one still unminimized, cancels the transfer and hands
+the PR back to the original author. At least stacks, landing order, author intent and anything
 already waiting on an owner ruling stay with the original author. Like the Lander and the
 Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
 raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
-push, never force-push, and stop if the head moved, as the paragraph above says. A Builder already
-in flight for the original author does not read the marker, so the head-moved check is its only
-collision control. Every repair
+push, never force-push, and stop if the head moved, as the paragraph above says. That head-moved
+check binds repair Builders, which are briefed with it. A Builder already in flight for the
+original author does not read the marker and may have no such check. Every repair
 head it pushes takes the Lander's own independent review the paragraph above requires, before
 the merge. The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`.
 
