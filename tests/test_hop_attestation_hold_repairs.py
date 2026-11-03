@@ -242,6 +242,36 @@ def test_a_site_proxy_credential_is_refused_for_it_before_its_shape() -> None:
         )
 
 
+def test_a_refused_site_proxy_credential_leaves_no_key_in_the_urlsplit_cache() -> None:
+    """The load check reads ``[egress].proxy_url`` only through the uncached split (vault BACKLOG
+    #3454), so a refused password is no key in urllib's process-wide cache. The control is a cached
+    split of the same value, which does add one, so a zero here is not a cache that never counts."""
+    import urllib.parse
+
+    from messagefoundry.config.settings import EgressSettings
+
+    cache_info = getattr(urllib.parse.urlsplit, "cache_info", None)
+    cache_clear = getattr(urllib.parse.urlsplit, "cache_clear", None)
+    if cache_info is None or cache_clear is None:
+        pytest.skip("urllib.parse.urlsplit is not cached on this interpreter")
+    for url in (
+        "http://svc:SYNTHPW@proxy.example.org:3128",  # refused for the credential alone
+        "http://svc:SYNTHPW@proxy.example.org:3128/x",  # beside a shape fault: the fallback read
+        "http://:SYNTHPW@proxy.example.org:3128/x",  # a password alone beside a shape fault
+    ):
+        # Emptied first, so a full cache evicting as it inserts cannot hide an insert.
+        cache_clear()
+        with pytest.raises(
+            ValidationError, match=r"\[egress\]\.proxy_url holds a user or a password"
+        ):
+            EgressSettings(proxy_url=url, allowed_proxy=["proxy.example.org"])
+        assert cache_info().currsize == 0, url
+        # Control: the cached split of the same value is a key.
+        urllib.parse.urlsplit(url)
+        assert cache_info().currsize == 1, url
+    cache_clear()
+
+
 # --- review rounds 2 and 3: the report marks REFUSED exactly what the build refuses -------------
 
 _ATTEST: dict[str, Any] = {"tls_hop_attested": True, "tls_hop_attested_reason": REASON}
@@ -328,7 +358,8 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
     """Without this the agreement tests could pass with every case on one side, outbound or
     inbound. It pins the build as it is today: a build that refused a non-bool flag outright would
     move the lax cases to the refused side, and this control, not the agreement tests, would need
-    updating."""
+    updating. A string ``"false"`` flag is left out on purpose: that it builds is a known gap, held
+    by :func:`test_a_string_false_flag_is_not_mirrored_as_set`, not an outcome to pin."""
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline.wiring_runner import _dest_config, _source_config
 
@@ -351,10 +382,42 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
     }
     for outcomes in (outbound, inbound):
         built = {name for name, refused in outcomes.items() if not refused}
-        assert {"revocation-int-1", "revocation-str-false"} <= built
+        assert "revocation-int-1" in built
         assert {"revocation-int-reason", "revocation-no-reason"} <= set(outcomes) - built
-    assert "cleartext-str-false" in outbound and not outbound["cleartext-str-false"]
     assert outbound["cleartext-int-reason"]
+
+
+_STRING_FALSE_GAP = (
+    "pre-existing on main and owed by a separate row: a string 'false' flag builds, and the "
+    "settings mirror reads it as set (_mirror_declarations tests the raw value by truthiness)"
+)
+
+
+@pytest.mark.xfail(strict=True, reason=_STRING_FALSE_GAP)
+@pytest.mark.parametrize(
+    "extra",
+    [{"tls_revocation_attested": "false"}, {"cleartext_accepted": "false"}],
+    ids=["revocation-str-false", "cleartext-str-false"],
+)
+def test_a_string_false_flag_is_not_mirrored_as_set(extra: dict[str, Any]) -> None:
+    """Known gap, not the behaviour wanted: ``Destination`` reads ``"false"`` as ``False`` while
+    the settings mirror the token seams read holds ``True``. Strict, so the fix -- refusing the
+    string at build, or mirroring the typed value -- turns this into a pass that must drop the
+    mark. Either fix passes: a refused build, or a mirror that does not read the flag as set."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    try:
+        dest = _dest_config(
+            OutboundConnection("OB_CASE", File(directory="."), **extra, **_ATTEST),
+            {},
+            None,
+            EgressSettings(),
+        )
+    except ValueError:
+        return  # the build refuses the string: the gap is closed that way
+    (key,) = extra
+    assert not dest.settings.get(key)
 
 
 def test_a_plain_attested_hop_beside_refused_siblings_is_not_marked_refused() -> None:

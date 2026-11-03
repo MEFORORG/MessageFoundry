@@ -25,8 +25,10 @@ module. Other proxy-URL readers exist and do not, at least ``ambient_proxy``'s l
 ``requests``/``hvac`` path in ``strict_requests``.
 
 ``urlsplit`` is called here with its cache taken off, as ``strict_requests`` does (vault BACKLOG
-#3454), so this parse adds no key to the process-wide cache. That is all it does: every caller
-reads the scheme first through the cached function, so the value is a cache key all the same.
+#3454), so this parse adds no key to the process-wide cache. That is all it does: a caller that
+reads the scheme first through the cached function makes the value a cache key all the same. The
+``[egress].proxy_url`` load check reads only through this split, so a value it refuses for a
+credential is no key.
 
 Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
 cycle.

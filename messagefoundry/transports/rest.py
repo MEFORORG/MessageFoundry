@@ -102,7 +102,11 @@ from messagefoundry.transports.bounded_read import (
     proxy_credential_header_name_shown,
     read_2xx_reply_text,
 )
-from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_urllib
+from messagefoundry.transports.proxy_address import (
+    _UNCACHED_URLSPLIT,
+    parse_proxy_url,
+    read_like_urllib,
+)
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
@@ -2353,7 +2357,9 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     if proxy.lower() == PROXY_DEFAULT:
         return False
     try:
-        if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
+        # Uncached, so a URL that holds a credential leaves no key in urlsplit's process-wide
+        # cache (vault BACKLOG #3454): the [egress].proxy_url load check asks this.
+        if _UNCACHED_URLSPLIT(proxy).scheme.lower() not in ("http", "https"):
             return False
         # The parser ProxyHandler.proxy_open runs; a test pins the pairing.
         _, user, password, _ = read_like_urllib(proxy)
@@ -2377,7 +2383,9 @@ def proxy_url_holds_credential(proxy_url: object) -> bool:
         return False
     proxy = proxy_url.strip()
     try:
-        if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
+        # Uncached, so a URL that holds a credential leaves no key in urlsplit's process-wide
+        # cache (vault BACKLOG #3454): the [egress].proxy_url load check asks this.
+        if _UNCACHED_URLSPLIT(proxy).scheme.lower() not in ("http", "https"):
             return False
         return parse_proxy_url(proxy).holds_credential
     except ValueError:

@@ -5377,9 +5377,7 @@ class EgressSettings(_Section):
         # Lazy, as config/static_credentials.py does: the transport owns how a proxy URL is read,
         # and importing the transports package when this module loads would tie the two together.
         # It is imported only when a site proxy URL is set.
-        import urllib.parse
-
-        from messagefoundry.transports.proxy_address import parse_proxy_url
+        from messagefoundry.transports.proxy_address import _UNCACHED_URLSPLIT, parse_proxy_url
         from messagefoundry.transports.rest import proxy_url_holds_credential
 
         refused = ValueError(
@@ -5397,9 +5395,10 @@ class EgressSettings(_Section):
             # A user or a password alone beside a shape fault: the parse's own text says a URL
             # credential fails the connection's build, which is not where this setting is refused.
             # Read from the authority urlsplit sees, so a value urllib alone splits at a later '@'
-            # (the #2965 shapes) keeps the parse's refusal for its shape.
+            # (the #2965 shapes) keeps the parse's refusal for its shape. Uncached, as every read
+            # here is, so a refused password leaves no key in urlsplit's cache (vault BACKLOG #3454).
             try:
-                netloc = urllib.parse.urlsplit(proxy).netloc
+                netloc = _UNCACHED_URLSPLIT(proxy).netloc
             except ValueError:
                 netloc = ""
             userinfo, at, _ = netloc.rpartition("@")
