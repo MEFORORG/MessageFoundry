@@ -330,8 +330,11 @@ def may_hold_doc_ref(text: str) -> bool:
     if not head.startswith("MSH") or len(head) < 4:
         return False
     end = head.find(head[3], 4)
-    delimiters = head[3:end] if end != -1 else head[3:]
-    return not _DOC_REF_MARKER_CHARS.isdisjoint(delimiters)
+    if end - 4 < 4:
+        # No complete MSH-2 of four characters: Message.set refuses such a payload, so no engine
+        # handle can be in it, escaped or not.
+        return False
+    return not _DOC_REF_MARKER_CHARS.isdisjoint(head[3:end])
 
 
 def make_doc_ref(sha256: str, content_type: str) -> str:

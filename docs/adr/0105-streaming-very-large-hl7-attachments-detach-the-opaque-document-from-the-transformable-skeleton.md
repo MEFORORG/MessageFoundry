@@ -252,8 +252,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   **byte-identical** passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
   deliveries are unchanged. When a handle is present it hydrates via `reattach_documents_in_hl7` with an
   async reader over `store.read_attachment` (off the event loop, chunk-by-chunk). **Fail-loud:** a missing
-  / GC'd attachment the message still holds (`KeyError`, or `DocRefError` on an empty read) or an
-  unsupported backend (`StreamingAttachmentsUnsupported`) is turned into a retryable `DeliveryError` — exactly like the
+  attachment the message holds whose read then fails (`KeyError`, or `StreamingAttachmentsUnsupported`
+  at read time) is turned into a retryable `DeliveryError` — exactly like the
   pre-send `encoding_characters` / `hl7_raw_separators` failures — so the row takes the normal
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
@@ -270,7 +270,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   policy judges it, as it judges a parser fault: `continue` dead-letters, and `stop` stops the
   connection with a `connection_stopped` alert. On a batched outbound that policy applies to the
   whole batch, so under `continue` every member of the batch still present is dead-lettered with it.
-  A missing attachment the message holds stays the retryable `DeliveryError` above.
+  A held attachment whose read fails stays the retryable `DeliveryError` above. One GC'd with its
+  header, or on a backend without the substrate, is linked to no message, so its handle is refused
+  permanently by the binding below.
 - **A handle resolves only to its own message's attachment (BACKLOG #5099, added 2026-11-03).** The
   delivery seam reads the content addresses the row's message holds (`attachments_for`, the
   `message_attachment` linkage the ingress commit writes; replay and resend keep the message id) and

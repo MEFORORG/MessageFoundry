@@ -9052,9 +9052,9 @@ class RegistryRunner:
         Hydration is a **pure READ** off the immutable, content-addressed attachment; it does **not**
         decref (the message may fan out to several outbounds and is replayable — the refcount is released
         only on retention/purge, never on delivery), so every send and every retry re-derives the
-        IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
-        support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
-        the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
+        IDENTICAL frame. **Fail-loud:** a held attachment whose read fails (a ``KeyError`` from the
+        read, or a ``StreamingAttachmentsUnsupported``) is turned into a :class:`DeliveryError` so the
+        row takes the normal ERROR/retry path and the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
         into the partner's ``OBX-5.5`` = silent corruption). A failure the payload itself causes, an
         :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
         :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
@@ -9089,8 +9089,10 @@ class RegistryRunner:
         try:
             return await reattach_documents_in_hl7(payload, _reader, bound=bound)
         except (DocRefError, KeyError, StreamingAttachmentsUnsupported) as exc:
-            # A missing/GC'd attachment the message still holds (KeyError, or DocRefError when the read
-            # comes back empty), or an unsupported backend — surface as a retryable DeliveryError (the message reached NEITHER wire nor peer),
+            # A held attachment whose read fails (KeyError, a race with the links read), or an
+            # unsupported backend at read time — surface as a retryable DeliveryError (the message
+            # reached NEITHER wire nor peer). An attachment GC'd with its header is not held, so it
+            # is the permanent refusal below.
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc

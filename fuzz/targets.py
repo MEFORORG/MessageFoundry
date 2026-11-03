@@ -77,6 +77,7 @@ from messagefoundry.parsing.binary import (
     BinaryCarriageError,
     DocRefError,
     EscapedDocumentError,
+    InboundDocRefError,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -687,7 +688,7 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    with contextlib.suppress(EscapedDocumentError):
+    with contextlib.suppress(EscapedDocumentError, InboundDocRefError):
         list(iter_obx_documents(message))
     for occurrence in range(1, message.count_segments("OBX") + 1):
         with contextlib.suppress(BinaryCarriageError):

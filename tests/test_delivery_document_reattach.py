@@ -258,13 +258,19 @@ async def test_hydrate_splices_verbatim(store: MessageStore) -> None:
     assert _obx5_5(hydrated) == b64
 
 
-async def test_hydrate_missing_attachment_raises_delivery_error(store: MessageStore) -> None:
-    # A handle whose attachment was never stored / has been GC'd → DeliveryError (retryable), never a
-    # payload carrying the raw handle. Fail-loud: the connector must NEVER see mfdoc:v1:ref:.
+async def test_hydrate_a_never_stored_attachment_is_a_permanent_refusal(
+    store: MessageStore,
+) -> None:
+    # A handle whose attachment was never stored, or has been GC'd with its header, is linked to no
+    # message (attachments_for joins the header), so it is refused permanently before any read
+    # (BACKLOG #5099), never a payload carrying the raw handle. Fail-loud: the connector must NEVER
+    # see mfdoc:v1:ref:. The retryable arm, a held attachment whose read fails, is
+    # test_delivery_fault_classification's control.
     missing = make_doc_ref(hashlib.sha256(b"gone").hexdigest(), "application/pdf")
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
-    with pytest.raises(DeliveryError):
+    with pytest.raises(NegativeAckError) as ei:
         await _hydrate(runner, store, _hl7_with_value(missing))
+    assert ei.value.permanent is True
 
 
 async def test_hydrate_retry_reads_identically_without_decref(store: MessageStore) -> None:
