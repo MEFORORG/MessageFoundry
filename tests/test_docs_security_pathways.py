@@ -3428,7 +3428,8 @@ _SIGN_IN_OFF = re.compile(
 _DEFAULTED = r"(?:by default|out of the box|as shipped)"
 _REQUIRED = r"(?:required|mandatory|enforced|needed)"
 _BE = r"(?:is|are|be|stays|remains)"
-_WORD = r"[\w'.-]+"
+#: A word, a backticked name such as `serve`, or a path such as /ui.
+_WORD = r"[\w'.`/-]+"
 #: A word that opens a second clause. A subject never runs across one, so "binds 127.0.0.1 by
 #: default and requires auth" ties the default to the bind.
 _JOIN = r"(?:and|or|but|then|which|that|while|when|if|unless|so)"
@@ -3442,14 +3443,16 @@ _UP_TO_TWO = rf"(?:{_NOT_JOIN}{_WORD} ){{0,2}}?"
 _SIGN_IN_DEFAULT = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        # "authentication is required by default", "sign-in is mandatory (by default)"
-        rf"\b{_NOUN}(?: {_BE})? {_REQUIRED},? \(?{_DEFAULTED}\b",
+        # "authentication is required by default", "Authentication: required (by default)"
+        rf"\b{_NOUN}:?(?: {_BE})? {_REQUIRED},? \(?{_DEFAULTED}\b",
         # "authentication is, by default, required"
         rf"\b{_NOUN} {_BE},? {_DEFAULTED},? {_REQUIRED}\b",
-        # "by default, authentication is required"
-        rf"\b{_DEFAULTED},? (?:(?:the|an?|every|all|any) )?{_NOUN} {_BE} {_REQUIRED}\b",
-        # "requires a sign-in by default", "requires authentication and TLS (by default)"
-        rf"\brequire[sd]? {_UP_TO_TWO}{_NOUN},? (?:(?:and|or) {_WORD},? )?\(?{_DEFAULTED}\b",
+        # "by default, authentication is required", "by default sign-in required"
+        rf"\b{_DEFAULTED},? (?:(?:the|an?|every|all|any) )?{_NOUN}(?: {_BE})? {_REQUIRED}\b",
+        # "requires a sign-in by default", "requires authentication and TLS (by default)",
+        # "requires authentication for every route by default"
+        rf"\brequire[sd]? {_UP_TO_TWO}{_NOUN}(?: (?:and|or) {_WORD})?"
+        rf"(?: {_NOT_JOIN}{_WORD}){{0,3}}?,? \(?{_DEFAULTED}\b",
         # "requires users to sign in by default"
         rf"\brequire[sd]? (?:{_NOT_JOIN}{_WORD} ){{1,2}}to (?P<noun>sign|log) ?in\b,? \(?{_DEFAULTED}\b",
         # "by default the engine's API requires sign-in", "the API by default requires sign-in"
@@ -3458,8 +3461,9 @@ _SIGN_IN_DEFAULT = tuple(
         # "authentication defaults to on", "the default is to require sign-in"
         rf"\b{_NOUN} defaults? to (?:on|required|enabled|mandatory|true)\b",
         rf"\bthe default is to require {_UP_TO_TWO}{_NOUN}",
-        # "every request is authenticated by default"
+        # "every request is authenticated by default", "requests are, by default, authenticated"
         rf"\b{_BE} (?P<noun>authenticated),? \(?{_DEFAULTED}\b",
+        rf"\b{_BE},? {_DEFAULTED},? (?P<noun>authenticated)\b",
     )
 )
 
@@ -3478,16 +3482,17 @@ _OTHER_SYSTEMS = (
     "OIDC",
     "SSO",
 )
-
-
-def _any_word(words: tuple[str, ...]) -> re.Pattern[str]:
-    return re.compile(r"\b(?:" + "|".join(words) + r")\b", re.IGNORECASE)
-
-
-_OTHER_SYSTEM = _any_word(_OTHER_SYSTEMS)
+#: Another system as a whole word of the subject, or a possessive: "the SMTP relay", "Vault's
+#: server". Not a part of a compound: "the SSO-enabled API" is the engine's API.
+_OTHER_SYSTEM = re.compile(
+    r"(?<!\S)(?:" + "|".join(_OTHER_SYSTEMS) + r")(?:'s)?(?!\S)", re.IGNORECASE
+)
 #: A leg or another system named as the word right before the sign-in noun: "two-factor
-#: authentication", "LDAP authentication", "proxy authentication".
-_ONE_LEG = _any_word((*_SIGN_IN_LEGS, *_OTHER_SYSTEMS))
+#: authentication", "LDAP authentication", "SQL Server authentication". A count of failures is
+#: not a sign-in requirement: "the lockout requires five failed logins by default".
+_ONE_LEG = re.compile(
+    r"\b(?:" + "|".join((*_SIGN_IN_LEGS, *_OTHER_SYSTEMS, "failed")) + r")(?:'s)?$", re.IGNORECASE
+)
 
 
 def _stretch(c: str, end: int) -> str:
@@ -3496,27 +3501,35 @@ def _stretch(c: str, end: int) -> str:
 
 
 def _subject_ahead(c: str, end: int) -> str:
-    """The last three words of ``c`` before ``end``, in its stretch and after its last join word:
-    the subject a verb at ``end`` reads as. In "the engine reads Vault and requires sign-in" the
-    subject of "requires" is the engine, so this is empty there."""
-    words = _stretch(c, end).split()
+    """The last three words of ``c`` before ``end``, in its stretch and after its last join word,
+    with any closed bracket left out: the subject a verb at ``end`` reads as. In "the engine reads
+    Vault and requires sign-in" the subject of "requires" is the engine, so this is empty there,
+    and in "the API (unlike Vault) requires sign-in" it is "the API"."""
+    unbracketed = re.sub(r"\([^()]*\)", " ", c[:end])
+    words = _stretch(unbracketed, len(unbracketed)).split()
     start = max((i + 1 for i, w in enumerate(words) if re.fullmatch(_JOIN, w, re.I)), default=0)
     return " ".join(words[start:][-3:])
 
 
 def _about_another_leg_or_system(c: str, m: re.Match[str]) -> bool:
-    """Whether a ``_SIGN_IN_DEFAULT`` match is about a leg's or another system's sign-in.
+    """Whether a ``_SIGN_IN_DEFAULT`` match is about a leg's or another system's sign-in, or a
+    second factor's.
 
-    Yes when the word right before the noun names a leg or system ("LDAP authentication is
-    required by default"), or when the subject names another system: the last words ahead of the
-    match ("the proxy requires authentication by default") or the subject the pattern read ("by
-    default PostgreSQL requires a login"). A leg is never a subject: "the local API requires
-    sign-in by default" is about the engine's API."""
-    before_noun = c[: m.start("noun")].split()
-    if before_noun and _ONE_LEG.search(before_noun[-1]):
+    Yes when the words right before the noun end in a leg or system ("LDAP authentication is
+    required by default"), or when the subject names another system or a second factor: the last
+    words ahead of the match ("the proxy requires authentication by default", "MFA is required
+    for sign-in by default"; "Vault, by default, requires a token login") or the subject the
+    pattern read ("by default PostgreSQL requires a login"). A leg that is not also a listed
+    system is never a subject: "the local API requires sign-in by default" is about the engine's
+    API."""
+    before_noun = " ".join(c[: m.start("noun")].split()[-2:])
+    if _ONE_LEG.search(before_noun):
         return True
-    subject = m.groupdict("").get("subject", "")
-    return bool(_OTHER_SYSTEM.search(_subject_ahead(c, m.start())) or _OTHER_SYSTEM.search(subject))
+    ahead = c[: m.start()]
+    if re.match(_DEFAULTED, m.group(0), re.IGNORECASE):
+        ahead = ahead.rstrip(", ")
+    subject = _subject_ahead(ahead, len(ahead)) + " " + m.groupdict("").get("subject", "")
+    return bool(_OTHER_SYSTEM.search(subject) or _SECOND_FACTOR.search(subject))
 
 
 #: A denial just ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
@@ -3540,7 +3553,9 @@ def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
     ``_SIGN_IN_DEFAULT`` is read apart: no denial clears it, and ``_about_another_leg_or_system``
     does. It flags every match of its patterns that does not name a listed leg or system in the
     places that function reads. So it reds a true sentence about a system
-    ``_OTHER_SYSTEMS`` does not list ("the Redis cache requires authentication by default"). What
+    ``_OTHER_SYSTEMS`` does not list ("the Redis cache requires authentication by default"), and
+    one whose system sits ahead of a relative clause ("a proxy that the engine trusts requires
+    authentication by default"). What
     it misses is at least a claim in other words ("sign-in is the default"), one whose subject
     runs across a join word ("by default the web console and the API require sign-in"), and one
     that names a leg as the noun's modifier or a system in its subject ("the API requires a
@@ -3637,6 +3652,16 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "On Windows the API requires sign-in by default.",
         # A system named before a join word is not the subject of the verb after it.
         "The engine reads its key from Vault and requires sign-in by default.",
+        # Code review round 1: a backticked subject, a system in brackets or in a compound, more
+        # words between the noun and the default, and a colon or no verb.
+        "By default `serve` requires sign-in.",
+        "By default the `/ui` console requires sign-in.",
+        "The API (unlike Vault) requires sign-in by default.",
+        "The SSO-enabled API requires sign-in by default.",
+        "The API requires authentication for every route by default.",
+        "Authentication: required by default.",
+        "By default sign-in required.",
+        "Requests are, by default, authenticated.",
         # A denial in an earlier stretch of the clause is about something else.
         "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
         "TLS is not needed on loopback, where sign-in is optional.",
@@ -3677,6 +3702,12 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "PostgreSQL requires password authentication by default.",
         "By default PostgreSQL requires a login.",
         "By default the engine binds loopback and requires sign-in.",
+        # Code review round 1: a system set off by commas or as a two-word modifier, and a second
+        # factor or a failure count, which are real defaults.
+        "Vault, by default, requires a token login.",
+        "The store requires SQL Server authentication by default.",
+        "MFA is required for sign-in by default.",
+        "The account lockout requires five failed logins by default.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
     assert _says_sign_in_can_be_off(denied) == []
@@ -3794,6 +3825,7 @@ _CONFIGURATION_TRUE_SIGN_IN_PHRASES = (
         ("docs/USER-GUIDE.md", 600, ()),
         ("docs/CLOUD-DEPLOYMENT.md", 250, ()),
         ("docs/CLOUD-PHI-HIPAA.md", 110, ()),
+        ("docker/README.md", 150, ()),
         ("docs/CONFIGURATION.md", 6400, _CONFIGURATION_TRUE_SIGN_IN_PHRASES),
     ],
 )
@@ -3808,17 +3840,20 @@ def test_these_docs_do_not_say_sign_in_can_be_off(
     docs/CLOUD-PHI-HIPAA.md section 6 states the posture; docs/CLOUD-DEPLOYMENT.md states none, so
     for it this is a floor against a claim arriving. A table row is read whole, but the patterns
     need their words side by side, so a claim split across cells ("| Sign-in | optional |") still
-    passes. ``true_phrases`` are cut out of the units before the scan, and each must still be in
-    the file and still red the scan by itself, so the list cannot go stale or carry a phrase the
-    scan never flagged. Each floor sits below the file's count on 2026-10-26, docs/CONFIGURATION.md's
-    on 2026-11-03."""
+    passes. ``true_phrases`` are cut out of the units before the scan. Each must sit in a unit of
+    the file that the scan reds, and must red the scan by itself, so the list cannot go stale or
+    carry a phrase the scan no longer flags there. Each floor sits below the file's count on
+    2026-10-26, docs/CONFIGURATION.md's and docker/README.md's on 2026-11-03."""
     clauses = _clauses_and_rows(_doc(name))
     assert len(clauses) >= floor, (
         f"{name} cut into {len(clauses)} clause(s) and row(s), floor {floor}: the sign-in scan reads "
         "too little to clear it."
     )
+    flagged = _says_sign_in_can_be_off(clauses)
     for phrase in true_phrases:
-        assert any(phrase in c for c in clauses), f"{name} no longer holds {phrase!r}; drop it here"
+        assert any(phrase in c for c in flagged), (
+            f"no unit of {name} holding {phrase!r} reds the sign-in scan now; drop it here"
+        )
         assert _says_sign_in_can_be_off([phrase]) == [phrase], (
             f"the sign-in scan no longer reds {phrase!r} by itself; drop it here"
         )

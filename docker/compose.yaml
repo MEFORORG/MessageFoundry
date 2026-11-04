@@ -85,7 +85,7 @@ services:
       MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"   # paths (not secrets) — mounted read-only below
       MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
       MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
-      # --- production guardrails (each comment says what the engine refuses) ---
+      # --- production guardrails ---
       MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce
       MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
       # --- deny-by-default egress (prod posture) — list YOUR graph's outbound destinations ---
