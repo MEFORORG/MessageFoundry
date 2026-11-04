@@ -2615,15 +2615,16 @@ class RemoteFileSource(SourceConnector):
         """Stop polling, bounded even when a remote call is blocked (BACKLOG #4685).
 
         The poll task sees the stop signal between files and between a batch file's hand-offs, so
-        it usually returns at once. It cannot leave a remote call early: every connect, listing,
-        retrieve and move runs on a thread, bounded only by the client's own socket timeouts. So
+        it usually returns at once. It cannot leave a remote call early: at least every connect,
+        listing, retrieve, move and scan runs on a thread, bounded only by its own timeouts. So
         after :data:`POLL_STOP_GRACE_S` the task is cancelled and the abandonment is logged, as
         ``FileSource.stop()`` does. The thread finishes on its own. A file is moved only after every
         one of its messages is handed off, so an interrupted file is read again whole on the next
         start (at-least-once).
 
-        **This bound never cancels a store call**: a pipeline hand-off, or a leave-mode ledger read
-        or write; :class:`PollStopGuard` says how long stop() then waits. A cancel of stop() itself
+        **This bound never cancels a store call**, that is, any await wrapped in
+        ``_stop_guard.store_call()``: at least a pipeline hand-off and a leave-mode ledger read or
+        write. :class:`PollStopGuard` says how long stop() then waits. A cancel of stop() itself
         still cancels the task at once, wherever it is, as the ``gather`` join before this bound
         did (ADR 0157 Amendment B; BACKLOG #4686 holds that case)."""
         self._stop.set()
@@ -2634,6 +2635,8 @@ class RemoteFileSource(SourceConnector):
             finished = await self._stop_guard.join(task, POLL_STOP_GRACE_S)
         except asyncio.CancelledError:
             task.cancel()
+            # Joined, as the gather join was, so the task has unwound before stop() raises.
+            await asyncio.gather(task, return_exceptions=True)
             raise
         if not finished:
             task.cancel()
@@ -2934,8 +2937,7 @@ class RemoteFileSource(SourceConnector):
                 continue
             if stopped:
                 # A stop arrived before the file's last message: the whole file stays, and the next
-                # start hands it over again (at-least-once, as the File source does). Break, not
-                # return, so the prune below still bounds what this poll recorded.
+                # start hands it over again (at-least-once, as the File source does).
                 break
             await self._after_processing(path, name, len(raw))
             disposed += 1

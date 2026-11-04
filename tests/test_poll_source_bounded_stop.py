@@ -35,11 +35,11 @@ _REMOTE_LOGGER = "messagefoundry.transports.remotefile"
 
 
 async def test_the_guard_gives_a_full_grace_after_a_store_call() -> None:
-    """The store call lasts 1.5 graces and the task ends 0.75 grace after it. The guard must wait
+    """The store call lasts 1.5 graces and the task ends 0.6 grace after it. The guard must wait
     for that, because the task always gets a full grace after a store call to reach its next stop
     check. Mutation: drop the ``max(deadline, ended + grace)`` restart. Red: the guard gives up at
     2 graces, before the task ends."""
-    grace = 0.5
+    grace = 1.0  # long, so the 0.4 grace margin outlasts a loaded runner's jitter
     guard = PollStopGuard()
     entered = asyncio.Event()
 
@@ -47,7 +47,7 @@ async def test_the_guard_gives_a_full_grace_after_a_store_call() -> None:
         with guard.store_call():
             entered.set()
             await asyncio.sleep(1.5 * grace)
-        await asyncio.sleep(0.75 * grace)  # the next step, which the stop check follows
+        await asyncio.sleep(0.6 * grace)  # the next step, which the stop check follows
 
     task = asyncio.create_task(poll())
     await entered.wait()

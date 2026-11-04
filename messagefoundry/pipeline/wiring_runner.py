@@ -6145,8 +6145,8 @@ class RegistryRunner:
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge engine shutdown, and the reload, re-promotion and connection API calls
         queued behind its lock, for as long as a wedged
-        File/Database ``stop()`` runs. (File, BACKLOG #1620, and Database, BACKLOG #4685, cut a
-        poll task blocked on an external call after a grace, but still wait without a bound while
+        File/Database/RemoteFile ``stop()`` runs. (File, BACKLOG #1620, and Database and
+        RemoteFile, BACKLOG #4685, cut a poll task blocked on an external call after a grace, but still wait without a bound while
         that task is inside a store call. Once cancelled, Database lets a row's hand-off and mark
         run for a bounded grace, which a non-leader skips, then cuts the task and bounds both the
         join and the pool close.)

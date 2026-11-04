@@ -1230,6 +1230,8 @@ class PollStopGuard:
 
         Waits through :func:`asyncio.wait`, so a cancel of the caller is not forwarded into
         ``task``; the caller decides what a cancel does to it."""
+        if grace <= 0:
+            raise ValueError("a stop grace must be positive")  # zero would spin in a store call
         deadline = time.monotonic() + grace
         while True:
             done, _pending = await asyncio.wait(

@@ -1333,10 +1333,12 @@ At least these, read 2026-10-26:
   the poll task, then cuts it, logs a WARNING, and joins and closes the pool as a cancelled stop
   does, bounded by `_CUT_JOIN_TIMEOUT_S` and `_POOL_CLOSE_TIMEOUT_S`. It never cuts the handler
   call: while the task is inside one it keeps waiting a grace at a time, and the grace restarts
-  when the call ends, so that wait is only as bounded as the store. A mark it cuts leaves its
-  committed row unmarked, a duplicate. The cancel path above is unchanged. So the fence
-  paragraph's *an uncancelled DEMOTE stop still lets its in-flight row step finish* now holds for
-  the hand-off and for a mark that ends within a grace of it; a longer mark is cut.
+  when the call ends, so that wait is only as bounded as the store. As on the cancel path, a cut
+  ends the task's awaits only: a mark `UPDATE` already running on a driver thread can still commit
+  there, and a row whose mark does not commit re-emits, a duplicate. The cancel path above is
+  unchanged. So the fence paragraph's *an uncancelled DEMOTE stop still lets its in-flight row
+  step finish* now holds for the hand-off and for a mark that ends within a grace of it; the
+  task's wait on a longer mark is cut.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
   `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.
