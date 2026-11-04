@@ -364,20 +364,19 @@ included, in Python config and `connections.toml` alike (BACKLOG #2431). A name 
 check, on a graph that skipped it, is a **configuration refusal** at run time. What each source
 does with it, at least:
 
-- **MLLP, TCP and X12 listeners** record each body as an `ERROR` row. Where the inbound sends HL7
-  replies, the answer is `AE`; an X12 or other non-HL7 inbound gets no `AE` from the engine.
+- **MLLP and TCP listeners** record each body as an `ERROR` row. Where the inbound sends HL7
+  replies, the answer is `AE`; a non-HL7 inbound gets no `AE`. **An `X12()` listener** records the
+  row too, but sends no `AE`: it encodes its reply in the inbound's own charset, which fails.
 - **`Http()`** records the row and answers `503` with **no** `Retry-After`.
 - **A DICOM SCP** whose inbound declares a text `content_type` records the row and answers Out of
   Resources (`0xA700`). One that keeps a binary type such as `dicom` never decodes.
-- **A `File()` or remote-file source**, for a name no codec answers to, records the row, which
-  stores its input whole, and consumes the input. A name that refuses every conversion, such as
-  `undefined`, fails before the hand-off instead: no row is written, the file stays in place, and
-  each scan logs a handler failure and tries again.
+- **A `File()` or remote-file source** records the row, which stores its input whole, and consumes
+  the input; it does not hold the file for the fix.
 - **A `DatabasePoll()` or `Timer()` source** fails to build on such a name, so it never starts.
 
 Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. Why:
 the [ADR 0154 amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal)
-(BACKLOG #5102). Each inbound `encoding` row below points here.
+(BACKLOG #5102). At least the inbound `encoding` rows of the sources above point here.
 
 ### MLLP — `MLLP(...)`
 
@@ -3303,7 +3302,7 @@ scheduled query a Handler fans out. **Source-only** (it generates, never deliver
 | `run_once` | `false` | fire a **single** time, then idle until stop. |
 | `cron_expression` | — | a calendar schedule (ADR 0011 amendment, #160) — a standard **5-field** expression (`minute hour day-of-month month day-of-week`) with `*`, lists, ranges and steps; day-of-week is `0-6`, **Sunday = 0** (`7` also accepted). When *both* day-of-month and day-of-week are restricted, a match on **either** fires (the Vixie OR rule). Unlike the interval heartbeat, cron does **not** fire at t=0 — the first fire is the next scheduled minute. Named months/weekdays are out of scope (numeric only). |
 | `timezone` | — (system-local) | an IANA zone name (e.g. `"America/New_York"`) the cron schedule matches against, DST-aware. **Only** valid together with `cron_expression`. |
-| `encoding` | `utf-8` | charset `body` is encoded with |
+| `encoding` | `utf-8` | charset `body` is encoded with; [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 
 Exactly one of `interval_seconds` / `run_once` / `cron_expression`: the three are **mutually exclusive** and
 declaring none is an error, so a mis-scheduled timer fails at `messagefoundry check` — as does an

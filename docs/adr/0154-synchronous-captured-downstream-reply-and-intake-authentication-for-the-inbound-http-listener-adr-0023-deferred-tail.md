@@ -1542,9 +1542,10 @@ object is never decoded, so the SCP never sees it. A decode failure in a usable 
 permanent. A sender that honours `Retry-After` re-sends every 5 seconds until the name is fixed,
 leaving one `ERROR` row per attempt.)*
 
-*(Note 2026-11-04, BACKLOG #5101, #5102: two sentences of the note above no longer hold. The codec
-name is no longer temporary and no longer carries `Retry-After`: it is a configuration refusal,
-`503` with no `Retry-After`, per the
+*(Note 2026-11-04, BACKLOG #5101, #5102: at least four sentences of the note above no longer
+hold: that the decode failure is temporary, that `Http()` answers it with `Retry-After`, that a
+sender honouring `Retry-After` re-sends every 5 seconds, and that a DICOM object is never decoded.
+The codec name is a configuration refusal, `503` with no `Retry-After`, per the
 [amendment of 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
 And "a DICOM object is never decoded" holds only for an SCP whose inbound keeps a binary
 `content_type` such as `dicom`. The receipt handler decodes any body whose inbound declares a text
@@ -1685,15 +1686,20 @@ decoded-text, streaming-detach and strict-timeout arms. The parse and strict-fai
 | --- | --- | --- | --- | --- |
 | an inbound `encoding` that sets up no decode | configuration | `503` with no `Retry-After` | Out of Resources (`0xA700`) | `AE` |
 
-* **No `Retry-After`.** `Retry-After` is the engine's only hint that a re-send soon will be
-  taken, so leaving it out means the engine no longer invites one for an operator fault. It does
-  not stop a sender from re-sending: one that retries a `503` on its own schedule still does, at
+* **No `Retry-After`.** On the answer to a body the engine read and refused, `Retry-After` is the
+  engine's only hint that a re-send soon will be taken, so leaving it out means the engine no longer
+  invites one for an operator fault. The header alone does not tell this `503` from every other:
+  the pre-ingress at-capacity `503` carries none either, and the JSON body and the `ERROR` row's
+  tag are what tell them apart. Nor does it stop a sender from re-sending: one that retries a `503` on its own schedule still does, at
   its own pace, and may re-send sooner than 5 seconds, leaving one `ERROR` row each time. The
   engine's own `Rest()` outbound never read the header, so on an engine-to-engine hop it retries
   this `503` under its `RetryPolicy` and dead-letters the row after `max_attempts`, as for a
   temporary one.
 * **DICOM and MLLP keep the re-send class.** Neither protocol has a status that says "after an
-  operator acts", and their final classes tell a sender to drop the object or message.
+  operator acts", and their final classes tell a sender to drop the object or message. So on these
+  two a configuration refusal invites the same re-send a temporary one does; only `Http()` tells the
+  two apart on the wire. An `X12()` listener sends no `AE` for it, since its reply is encoded in the
+  inbound's own unusable charset.
 * **The row says which.** The receipt path's `ERROR` row opens `[refusal kind: configuration]`.
 * **A backend that cannot stream stays permanent.** `StreamingAttachmentsUnsupported` is also the
   operator's choice of store, but it refuses only a body at or over the streaming threshold, and
@@ -1704,9 +1710,9 @@ decoded-text, streaming-detach and strict-timeout arms. The parse and strict-fai
   fail to build on such a name. A poll source's refused input is stored whole, since it is exempt
   from the refused-body allowance. Holding the input instead would need a receipt contract on every
   poll source, and config load already refuses the name, so only a graph that skipped that check
-  reaches it. A name that refuses every conversion, such as `undefined`, raises in the file and
-  remote-file sources' own batch split before the hand-off, so there no row is written and the file
-  stays in place, retried on every scan. What each source does is listed once in
+  reaches it. Those two sources' batch split now passes a name that refuses every conversion, such
+  as `undefined`, to the same row; it used to raise there, before the hand-off, so no row was
+  written and the file was retried on every scan. What each source does is listed once in
   [`docs/CONNECTIONS.md`](../CONNECTIONS.md#an-inbound-encoding-follows-one-rule-on-every-source).
 
 **MLLP's split for a streaming-detach budget is settled.** A body alone over the whole in-flight
