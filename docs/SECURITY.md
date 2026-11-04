@@ -4704,7 +4704,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   limit too. That is a reading by likeness to the per-account sweep, not one traced for the
   table-wide statement, and the lock-order bullet below does not cover its every-account lock
   footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592),
-  except at least where the unsealed global row is lowered, as below. Each of these raises the
+  within the limits the rest of this bullet states. Each of these raises the
   account's session epoch in the same transaction, and a rotation keeps the epoch the session was
   sealed under. So the gate refuses and ends the session, and the user's own session list hides
   it and ends it the same way.
@@ -4734,10 +4734,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the row is missing, at least these refuse with an error naming it: a read of an existing
   account's user record that a sign-in or a session check makes, and every every-account revoke.
   A request that returns before that read is refused as it would be anyway.
-  **A revoke that keeps a missed session does not make it usable again** (BACKLOG #4975). The
-  case is a request from that session to end the user's other sessions, accepted just before the
-  sweep commits, which waits for it and then runs; a second every-account revoke that keeps it is
-  another. A revoke that keeps a session, the per-account one or the every-account one, stamps
+  **A revoke that keeps a missed session does not make it usable again** (BACKLOG #4975). At
+  least two cases reach this: a request from that session to end the user's other sessions,
+  accepted just before the sweep commits, which waits for it and then runs, and an every-account
+  revoke that keeps a session an earlier sweep missed. A revoke that keeps a session, the per-account one or the every-account one, stamps
   the new epochs onto it only when it carried the epochs that revoke's own raises replaced: its
   account's epoch, taken from the record the raise read under the account's lock, and for the
   every-account revoke the global epoch too. A kept session behind on an epoch that revoke checks
@@ -4747,9 +4747,14 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   on the global epoch only, for example one an every-account revoke missed on an account its read
   did not return, gets the new account epoch there and is still refused on the global one. The
   revoke still ends the user's other sessions, current ones included. All three stores make this
-  check. The service reads the kept session back against both epochs, so it does not call such a
-  session kept: `DELETE /sessions` then answers that it was not kept and audits scope `all`, and
-  ending the user's other sessions audits scope `self_all`, even with nothing else ended.
+  check. The service reads the kept session back against both epochs after the revoke commits,
+  so it does not call such a session kept: `DELETE /sessions` then answers that it was not kept
+  and audits scope `all`, and ending the user's other sessions audits scope `self_all`, even with
+  nothing else ended. That read-back is two reads, so a second revoke committing between them can
+  make it report a kept session as not kept, and a read it cannot make reports not kept. The
+  reply to `DELETE /me/sessions` still says only how many other sessions ended. The session left
+  unstamped stays unrevoked until it is presented, and its refusal then is reported as a seal
+  failure, as below.
   `tests/_session_seal_contract.py` tests the per-account revoke, a seal failure included;
   `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on both epochs and
   on one behind on its account's epoch alone; and `tests/test_b5091_global_session_epoch.py` one

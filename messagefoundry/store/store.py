@@ -2846,11 +2846,11 @@ class EpochBump:
 def global_epoch_raise(after: int) -> EpochRaise:
     """The raise of the store's global session epoch that wrote ``after`` (BACKLOG #4975, #5091).
 
-    Exact, where the per-account raise must read the value it replaced: the global raise is one
-    ``UPDATE`` that adds one to the row it holds locked, and one that matches no row refuses the
-    whole revoke. So no revoke goes on with that epoch unmoved, the case Lander decision
-    d20261101T013132231-ef9540 rules out ``after - 1`` for on the per-account raise, whose seal
-    failure leaves the epoch where it was and lets the revoke go on."""
+    Exact: the global raise is one ``UPDATE`` that adds one to the row it holds locked, and one
+    that matches no row refuses the whole revoke, so no revoke goes on with that epoch unmoved.
+    The per-account raise instead keeps the value it replaced (:class:`EpochBump`), as Lander
+    decision d20261101T013132231-ef9540 asks of its guard, so that guard rests on no assumption
+    about what ``bump_epoch`` adds or about which failures stop the write."""
     return EpochRaise(after - 1, after)
 
 

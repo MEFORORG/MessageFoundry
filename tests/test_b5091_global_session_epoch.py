@@ -157,6 +157,26 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
     assert stamped.global_epoch == frank_after.global_session_epoch
     assert await service.identity_for_token(current) is not None
 
+    # --- the per-account revoke on a session behind on the global epoch alone (BACKLOG #4975) --
+    # It raises and checks the account's epoch only, so it stamps the new account epoch and
+    # leaves the old global stamp: the session is still refused.
+    lagging = await _mint(store, frank)
+    account_before = await store.get_user(frank)
+    lagging_before = await store.get_session(hash_token(lagging))
+    assert account_before is not None and account_before.row is not None
+    assert lagging_before is not None
+    assert await store.revoke_all_sessions() >= 1
+    await _put_back_account(raw, account_before.row)
+    await _put_back_session(raw, lagging, lagging_before.seal)
+    await store.revoke_user_sessions(frank, except_token_hash=hash_token(lagging))
+    left = await store.get_session(hash_token(lagging))
+    account_now = await store.get_user(frank)
+    assert left is not None and left.revoked_at is None and account_now is not None
+    assert left.user_epoch == account_now.session_epoch == account_before.session_epoch + 1
+    assert left.global_epoch == lagging_before.global_epoch  # the global stamp is left
+    assert left.global_epoch == account_now.global_session_epoch - 1
+    assert await service.identity_for_token(lagging) is None
+
 
 async def assert_revoke_all_races_sign_ins(
     store: Any, *, rounds: int = 3, accounts: int = 6

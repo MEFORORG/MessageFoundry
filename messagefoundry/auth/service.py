@@ -11712,12 +11712,23 @@ class AuthService:
         """Whether the session a revoke kept still resolves on its epochs: unrevoked, sealed, and
         carrying its account's epoch and the store's global one (BACKLOG #4975). A revoke leaves
         a kept session an earlier sweep missed unstamped, so the gate refuses it at its next
-        request, and a reply or audit row that called it kept would be wrong. Read back after the
-        revoke committed; a revoke landing after this read can still end it."""
-        session = await self._load_session(token_hash)
-        if session is None:
+        request, and a reply or audit row that called it kept would be wrong.
+
+        Read back after the revoke committed, in two reads, so a second revoke committing between
+        them can make a kept session read as not kept, and one landing after them can still end
+        it. Not a pure check: the two loaders end and report a row that fails its seal, as they do
+        for every reader. A refused read answers ``False`` and is logged rather than raised, so
+        the committed revoke still gets its audit row; its scope then names the wider act."""
+        try:
+            session = await self._load_session(token_hash)
+            if session is None:
+                return False
+            user = await self._load_user(session.user_id)
+        except AUDIT_WRITE_DEFECTS:
+            raise
+        except store_call_errors():
+            _log.exception("reading back the session a revoke kept failed; reported as not kept")
             return False
-        user = await self._load_user(session.user_id)
         return user is not None and session_epochs_current(
             session, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
         )
