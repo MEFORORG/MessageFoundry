@@ -2314,10 +2314,12 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 **Mark mechanism — your choice via `mark_statement`.** You can mark with a **status column** (lead
 pattern: `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue**
 (`DELETE … WHERE id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor); the
-connector just runs whatever statement you declare, bound from the row. They are not equally safe: a
-high-water mark can still pass a row that was never handed off, in at least the cases *Reliability*
-below names, even with the poll's stop at a failed row (BACKLOG #4921). Where that matters, mark with
-a status column or a delete-from-queue.
+connector just runs whatever statement you declare, bound from the row. They are not equally safe. A
+high-water mark can move its cursor past a row that was never handed off, even with the poll's stop
+at a failed row (BACKLOG #4921): at least in the cases *Reliability* below names, and when a row
+commits after a row with a higher cursor value was already polled and marked, as concurrent inserts
+into an identity or sequence column can do. Unless the feed can afford to lose such a row, mark with a
+status column or a delete-from-queue whose `WHERE` matches only the row handed off, by a unique key.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
