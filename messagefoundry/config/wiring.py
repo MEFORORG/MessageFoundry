@@ -212,6 +212,7 @@ __all__ = [
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
+    "ech_cleartext_sidecar_hops",
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
@@ -6995,6 +6996,45 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
         for spec in registry.fhir_lookups.values()
         if spec.tls_revocation_attested
     )
+    return sorted(out)
+
+
+def ech_cleartext_sidecar_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every ``REST`` outbound that sends through an ECH sidecar at an ``http://`` URL, as
+    ``(name, note)`` (ADR 0139).
+
+    The single reader of that set, on the contract of :func:`path_form_fhir_updates`:
+    ``messagefoundry check`` and ``GET /security/posture`` (the ``ech_sidecar`` entry of
+    ``security_loosenings()``) both read it, so they cannot disagree. Sorted by name.
+
+    Such a hop is loopback, because the sidecar resolver refuses any other, so no cleartext-hop
+    gate refuses it. It still carries the request body and every request header, a credential
+    included, unencrypted on this host, and nothing named it until this reader and the
+    construction WARNING in ``transports.rest``. Both apply one rule,
+    ``transports.rest.ech_sidecar_is_cleartext``, imported lazily for the one-way rule.
+
+    Only the ``REST`` destination honours ``ech_egress``; every other connector refuses it at
+    build, so only ``REST`` outbounds are walked. An ``env()`` value for either key cannot be read
+    before it resolves, so such a connection is listed with a note saying so rather than left off.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.rest import ech_sidecar_is_cleartext
+
+    out: list[tuple[str, str]] = []
+    for oc in registry.outbound.values():
+        if oc.spec.type != ConnectorType.REST:
+            continue
+        settings = oc.spec.settings
+        egress, sidecar = settings.get("ech_egress"), settings.get("ech_sidecar")
+        if not egress:
+            continue
+        sidecar_unread = isinstance(sidecar, EnvRef)
+        # A literal https sidecar is never cleartext, whatever an env() ech_egress resolves to.
+        if not (sidecar_unread or ech_sidecar_is_cleartext(sidecar)):
+            continue
+        unread = sidecar_unread or isinstance(egress, EnvRef)
+        note = "an env() value this reading does not resolve" if unread else "an http:// sidecar"
+        out.append((oc.name, note))
     return sorted(out)
 
 

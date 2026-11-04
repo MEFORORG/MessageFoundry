@@ -88,6 +88,7 @@ def _pairs(
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
     path_form_hops: tuple[str, ...] = (),
+    ech_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
     cert_monitor: CertMonitorSettings | None = None,
@@ -110,6 +111,7 @@ def _pairs(
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
         path_form_fhir_hops=path_form_hops,
+        ech_cleartext_sidecar_hops=ech_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
         cert_monitor=cert_monitor or CertMonitorSettings(),
@@ -169,6 +171,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -208,6 +211,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -244,6 +248,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -366,6 +371,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -541,6 +547,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2185,6 +2192,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2774,6 +2782,75 @@ async def test_posture_route_does_not_name_a_transaction_form_update(engine: Eng
     assert body["loosenings_scope"] is None
 
 
+def _ech_sidecar_registry(*, named: bool = True) -> Any:
+    """REST outbounds through an ECH sidecar. ``OB_ECH_HTTP`` and ``OB_ECH_ENV`` are named, and
+    are left out when ``named`` is false; the https sidecar, the switched-off key and the plain REST
+    beside them are the controls."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        env,
+    )
+
+    url = {"url": "https://partner.example.org/ingest"}
+    shapes: dict[str, dict[str, object]] = {
+        "OB_ECH_HTTPS": {"ech_egress": True, "ech_sidecar": "https://127.0.0.1:8123"},
+        "OB_ECH_OFF": {"ech_egress": False, "ech_sidecar": "http://127.0.0.1:8123"},
+        "OB_PLAIN": {},
+    }
+    if named:
+        shapes["OB_ECH_HTTP"] = {"ech_egress": True, "ech_sidecar": "HTTP://127.0.0.1:8123"}
+        shapes["OB_ECH_ENV"] = {"ech_egress": True, "ech_sidecar": env("ECH_SIDECAR")}
+    reg = Registry()
+    for name, extra in shapes.items():
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.REST, settings={**url, **extra})
+            )
+        )
+    return reg
+
+
+def test_the_ech_cleartext_sidecar_is_actually_wired() -> None:
+    """ADR 0139: driven through its reader AND through ``security_loosenings``. The https sidecar,
+    the switched-off key and the plain REST connection are the controls that must not be named."""
+    from messagefoundry.config.wiring import ech_cleartext_sidecar_hops
+
+    found = ech_cleartext_sidecar_hops(_ech_sidecar_registry())
+    assert found == [
+        ("OB_ECH_ENV", "an env() value this reading does not resolve"),
+        ("OB_ECH_HTTP", "an http:// sidecar"),
+    ]
+    risk = dict(_pairs(ech_hops=tuple(name for name, _ in found)))["ech_sidecar"]
+    assert "OB_ECH_HTTP" in risk and "OB_ECH_ENV" in risk
+    assert "OB_ECH_HTTPS" not in risk and "OB_ECH_OFF" not in risk and "OB_PLAIN" not in risk
+    assert "CLEARTEXT" in risk and "every request header" in risk
+    assert "ech_sidecar" not in _names()  # control: nothing declared, nothing named
+
+
+async def test_posture_route_names_an_http_ech_sidecar(engine: Engine) -> None:
+    """``GET /security/posture`` reads the set off the live graph."""
+    engine.add_registry(_ech_sidecar_registry())
+    body = await _posture_body(engine)
+    entry = next(
+        e
+        for e in body["loosenings"]  # type: ignore[union-attr]
+        if e["switch"] == "ech_sidecar"
+    )
+    assert "OB_ECH_HTTP" in entry["risk"] and "OB_ECH_HTTPS" not in entry["risk"]
+
+
+async def test_posture_route_does_not_name_an_https_ech_sidecar(engine: Engine) -> None:
+    """The control for the test above: with the http sidecar and the env() one removed, the https
+    sidecar beside them names nothing."""
+    engine.add_registry(_ech_sidecar_registry(named=False))
+    body = await _posture_body(engine)
+    assert "ech_sidecar" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    assert body["loosenings_scope"] is None
+
+
 def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
     """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
     for every listed hop. It now conditions that on the hop leaving the name check on."""
@@ -2917,6 +2994,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2968,6 +3046,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -3010,6 +3089,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -3053,6 +3133,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),

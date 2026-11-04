@@ -403,6 +403,9 @@ def run_checks(
         # vault BACKLOG #2570: every path-form update that declares no If-Match, which a server
         # requiring one on update would refuse. Advisory -- see the check.
         _check_fhir_update_if_match(config_dir),
+        # ADR 0139: every REST outbound whose ECH sidecar hop is cleartext http on this host. No hop
+        # gate refuses it, because it is loopback. Advisory -- see the check.
+        _check_ech_cleartext_sidecar(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -2887,6 +2890,46 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
             "opt-in'). Set conditional='if-match', which needs meta.versionId on the resource, or "
             "a static If-Match in headers. Advisory: check cannot tell which server a connection "
             "points at, or see a header a Handler stamps"
+        ),
+    )
+
+
+def _check_ech_cleartext_sidecar(config_dir: str | Path) -> CheckResult:
+    """Name every ``REST`` outbound that sends through an ``http://`` ECH sidecar (ADR 0139).
+
+    The sidecar is always loopback, because the resolver refuses any other, so no cleartext-hop gate
+    refuses the hop to it. That hop still carries the body and every request header, a credential
+    included, unencrypted on this host. The set and its ``env()`` case are in
+    :func:`~messagefoundry.config.wiring.ech_cleartext_sidecar_hops`. Advisory
+    (``required=False``): an https sidecar listener is the fix, and nothing refuses the hop.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, ech_cleartext_sidecar_hops, load_config
+
+    name = "ech-sidecar-cleartext"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    found = ech_cleartext_sidecar_hops(registry)
+    if not found:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no REST connection sends through an http:// ECH sidecar",
+        )
+    listed = "; ".join(f"{conn} ({note})" for conn, note in found)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(found)} REST connection(s) send through an ECH sidecar whose hop on this host "
+            f"is cleartext http — {listed}. That hop carries the body and every request header, "
+            "any credential included; an https sidecar listener encrypts it (ADR 0139)"
         ),
     )
 

@@ -117,6 +117,7 @@ __all__ = [
     "RestDestination",
     "ech_readdressed_request",
     "capture_response_headers",
+    "ech_sidecar_is_cleartext",
     "ech_sidecar_url_from_settings",
     "egress_route_from_settings",
     "proxy_auth_handler_from_settings",
@@ -2567,6 +2568,25 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     return sidecar.rstrip("/")
 
 
+def ech_sidecar_is_cleartext(sidecar: object) -> bool:
+    """Whether an ``ech_sidecar`` value names a cleartext ``http://`` listener.
+
+    The one rule the construction WARNING in :class:`RestDestination`, the
+    ``config.wiring.ech_cleartext_sidecar_hops`` reader and the unread-CA check in
+    ``auth.trust_anchors`` share, so none of them can disagree. On such a sidecar the
+    engine-to-sidecar hop carries the request body and every request header, a credential included,
+    unencrypted on this host.
+
+    Why this one loopback cleartext hop is named when a plain ``http://127.0.0.1`` ``url`` is not
+    (ADR 0092 keeps loopback quiet): the connection's ``url`` reads ``https://``, so its config
+    shows TLS while the first leg under it is cleartext. A plain ``http`` url shows what it is.
+
+    Loopback is not decided here: :func:`ech_sidecar_url_from_settings` refuses any other sidecar,
+    http or https, and no declaration lifts that. ``None`` and an unresolved ``env()`` value are not
+    strings, so they read as ``False``; the reader handles the ``env()`` case itself."""
+    return isinstance(sidecar, str) and sidecar.strip().lower().startswith("http://")
+
+
 def ech_readdressed_request(
     sidecar: str,
     url: str,
@@ -2860,6 +2880,19 @@ class RestDestination(DestinationConnector):
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
                 connection=config.name,
+            )
+        if ech_sidecar_is_cleartext(self._ech_sidecar):
+            # After every refusal above, so only a connection that builds is recorded. The hop is
+            # loopback (the resolver refuses any other), so no hop gate refuses it, and before this
+            # nothing said it was cleartext. Logged at every construction, naming the connection and
+            # never a header value; `security_loosenings()` lists the same set.
+            logger.warning(
+                "cleartext ECH sidecar hop — connection %s; the engine-to-sidecar hop is http on "
+                "this host, so the request body and every request header, any credential included, "
+                "cross it unencrypted, and on a SMART or OAuth2 connection so does the token-endpoint "
+                "request with its client credential; the sidecar does the partner TLS (ADR 0139). "
+                "An https sidecar listener encrypts this hop",
+                audit_connection_name(config.name),
             )
 
     def _ech_request(

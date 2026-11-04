@@ -163,6 +163,7 @@ def _loosening_names(store: StoreSettings) -> set[str]:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
