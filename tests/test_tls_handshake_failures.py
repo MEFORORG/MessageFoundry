@@ -3,10 +3,11 @@
 """A failed inbound TLS handshake the EVENT LOOP ran leaves a record (vault BACKLOG #3302).
 
 Before #3302 the HTTP intake listener and the API recorded none on any loop, and the MLLP listener
-none on uvloop, where the loop runs its handshakes. Each surface below fails a real handshake and
-reads the record, and each has a control that completes one and reads none. The MLLP case runs on
-uvloop where it is installed (CI's Linux legs) and, everywhere, on the stdlib loop forced onto the
-same loop-run path uvloop takes.
+none on uvloop, where the loop then ran its handshakes; since BACKLOG #1606 the MLLP listener runs
+its own there. Each surface below fails a real handshake and reads the record, and each has a
+control that completes one and reads none. The MLLP case runs on uvloop where it is installed
+(CI's Linux legs) and, everywhere, on the stdlib loop forced onto the same accept-loop path uvloop
+takes.
 """
 
 from __future__ import annotations
@@ -618,16 +619,20 @@ async def test_the_http_listener_window_shortens_through_the_shared_seam(
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-# --- the MLLP listener where the loop runs the handshake --------------------------------------
+# --- the MLLP listener on a loop it does not upgrade TLS on itself ----------------------------
+#
+# There the listener runs its own accept loop and hands each admitted socket to
+# ``connect_accepted_socket`` (BACKLOG #1606), so it counts a failure itself, with the peer, rather
+# than through the context's hook.
 
 
-async def _mllp_loop_run_scenario(tmp_path: Path) -> None:
+async def _mllp_accept_loop_scenario(tmp_path: Path) -> None:
     source, cert = _tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
     await source.start(_ack)
     try:
-        assert source._upgrade_tls is False  # the loop runs the handshake here
+        assert source._upgrade_tls is False  # `_AcceptingServer` runs the handshake here
         # The control: a real TLS sender gets a message through and no failure is recorded.
         dest = MLLPDestination(
             Destination(
@@ -654,19 +659,21 @@ async def _mllp_loop_run_scenario(tmp_path: Path) -> None:
         await _until(lambda: "tls_handshake_failed" in events.kinds(), "no failure event")
         assert source.tls_handshake_failures == 1
         (_kind, peer, reason) = next(e for e in events.seen if e[0] == "tls_handshake_failed")
-        assert peer is None  # the loop's hook does not read the peer
+        assert peer == "127.0.0.1"  # counted by the listener, which knows the peer
         assert reason is not None and reason.startswith("1 failed handshake(s)")
         assert "MSH" not in reason and "GET" not in reason
+        assert source._ssl is not None
+        assert source._ssl.sslobject_class is ssl.SSLObject  # the context is not hooked as well
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_mllp_records_a_failed_loop_run_handshake_on_the_stdlib_loop(
+async def test_mllp_records_a_failed_accept_loop_handshake_on_the_stdlib_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The path uvloop takes, forced on the stdlib loop so it runs on every platform."""
     monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
-    await _mllp_loop_run_scenario(tmp_path)
+    await _mllp_accept_loop_scenario(tmp_path)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not run on Windows")
@@ -674,7 +681,7 @@ def test_mllp_records_a_failed_handshake_on_uvloop(tmp_path: Path) -> None:
     """Vault BACKLOG #2613 item 3: the real loop, not a stand-in. It skips where uvloop is not
     installed."""
     uvloop = pytest.importorskip("uvloop")
-    asyncio.run(_mllp_loop_run_scenario(tmp_path), loop_factory=uvloop.new_event_loop)
+    asyncio.run(_mllp_accept_loop_scenario(tmp_path), loop_factory=uvloop.new_event_loop)
 
 
 async def test_mllp_running_its_own_handshake_counts_a_close_notify(
