@@ -2720,9 +2720,15 @@ Valid entries are `MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_
 `env()` credential, since their names are yours and unknown at load. Any other name is refused at config
 load, and so is `MEFOR_STORE_ENCRYPTION_KEY`, which has its own knob.
 
-The store DEK is tracked **live-by-default** (ASVS 13.3.4): at first keyed start the engine records a
-non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK off
-it, so `store_key_last_rotated` is an **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC
+The store DEK is tracked **live-by-default** (ASVS 13.3.4): a keyed start records a non-secret
+tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK off it, so
+`store_key_last_rotated` is an **override**, not a prerequisite. Not every keyed start stamps. A start
+writes no stamp for a key an unfinished `rotate-key` run is recorded against, nor, on a store with a
+keyed audit chain, for a changed key that chain has not been rolled to; it opens the rotation record
+for that key instead, and the key's age runs from the prior stamp, or from the record where there is
+none, until a run completes (BACKLOG #3737, #4942; [PHI.md](PHI.md) says when each applies). Under
+`enforcement = enforce` that date can refuse a start. Where no run can roll the chain, setting
+`store_key_last_rotated` is one way out; [PHI.md](PHI.md) names the other. The connector/AD/SMTP/Vault/OIDC
 credentials the engine holds are tracked too — each fingerprinted with a keyed MAC sealed as a
 store-cipher cell, its clock reset when the secret no longer matches it (rotation auto-detected). A store
 key rotation re-seals the cells and resets no clock, and a cell the engine cannot read keeps its dates
