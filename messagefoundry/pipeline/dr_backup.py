@@ -3824,18 +3824,23 @@ def _compare_row_counts(
     manifest never tracked is not compared at all.
 
     Because the compare walks the manifest's tables, it reads nothing when the manifest records none
-    (``row_counts`` empty, missing or not a mapping), and nothing of the snapshot when the two share
-    no table, the case of a snapshot whose schema holds no table at all: every manifest count then
-    reads as 0. A PASS there would certify counts nobody compared, the shape BACKLOG #2186 produced
+    (``row_counts`` empty or missing), and nothing of the snapshot when the two share no table, the
+    case of a snapshot whose schema holds no table at all: every manifest count then reads as 0. A PASS there would certify counts nobody compared, the shape BACKLOG #2186 produced
     when the backup and the verify both counted an empty stand-in, so at least those refuse (BACKLOG
     #5056). A full archive never legitimately has either: its manifest lists every table of its
     store, and even the oldest, four-table manifest names ``messages``. A config-only archive carries
-    no snapshot and returns before this compare. A count that is not a non-negative integer refuses
-    too, rather than being coerced (``3.9`` read as ``3``) or raising out of the verify."""
+    no snapshot and returns before this compare. A ``row_counts`` that is not a mapping, or a count
+    that is not a non-negative integer, refuses too, rather than being coerced (``3.9`` read as
+    ``3``) or raising out of the verify."""
     raw_counts = manifest.get("row_counts")
     manifest_counts: dict[str, int] = {}
+    if raw_counts is not None and not isinstance(raw_counts, dict):
+        return manifest_counts, (
+            f"the manifest's row counts are a {type(raw_counts).__name__}, not a mapping of table "
+            "to count, so they cannot be compared"
+        )
     malformed: list[str] = []
-    for table, count in raw_counts.items() if isinstance(raw_counts, dict) else ():
+    for table, count in (raw_counts or {}).items():
         # bool is an int subclass, and a float, a string or a null is not a row count.
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             manifest_counts[str(table)] = count
@@ -3851,18 +3856,20 @@ def _compare_row_counts(
             "the manifest records no row counts, so the row-count compare would read nothing; a "
             "full archive's manifest lists every table of its store"
         )
-    if not manifest_counts.keys() & row_counts.keys():
-        return manifest_counts, (
-            f"the manifest's {len(manifest_counts)} table(s) share none with the archive's store.db "
-            f"({len(row_counts)} table(s)), so the row-count compare would read nothing"
-        )
     mismatches = sorted(
         table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
     )
     if mismatches:
         return manifest_counts, (
-            f"row-count mismatch on {mismatches} (a torn or truncated snapshot, or a manifest that "
-            f"does not describe it): snapshot={row_counts} manifest={manifest_counts}"
+            f"row-count mismatch on {mismatches} (a torn snapshot or a wrong manifest): "
+            f"snapshot={row_counts} manifest={manifest_counts}"
+        )
+    # After the mismatch check, so a truncated snapshot against nonzero counts still reads as the
+    # data loss it is; what reaches here is an all-zero manifest agreeing with tables it never saw.
+    if not manifest_counts.keys() & row_counts.keys():
+        return manifest_counts, (
+            f"the manifest's {len(manifest_counts)} table(s) share none with the archive's store.db "
+            f"({len(row_counts)} table(s)), so the row-count compare would read nothing"
         )
     return manifest_counts, None
 

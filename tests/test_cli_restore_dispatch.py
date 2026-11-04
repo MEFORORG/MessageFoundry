@@ -1149,7 +1149,7 @@ _MALFORMED = "are not non-negative integers"
         # the snapshot's counts as if compared. Both now refuse, because nothing was compared.
         ("manifest carrying no row_counts at all", None, _NO_MANIFEST_COUNTS),
         ("manifest carrying an empty row_counts", {}, _NO_MANIFEST_COUNTS),
-        ("manifest whose row_counts is not a mapping", [["messages", 3]], _NO_MANIFEST_COUNTS),
+        ("manifest whose row_counts is not a mapping", [["messages", 3]], "not a mapping"),
         # Every manifest key reads as 0 against a schema it shares no table with, so an all-zero
         # manifest agreed with a snapshot it never compared.
         ("manifest sharing no table with the snapshot", {"zzz": 0}, "share none with"),
@@ -1182,3 +1182,6 @@ def test_restore_refuses_a_snapshot_with_no_table(tmp_path: Path) -> None:
     assert dr_backup._count_tables(snap) == {}
     with pytest.raises(dr_backup.BackupError, match="share none with"):
         dr_backup._verify_extracted_store(snap, {"row_counts": {"messages": 0, "queue": 0}})
+    # Against nonzero counts the same file is data loss, and the reason must still say so.
+    with pytest.raises(dr_backup.BackupError, match=_MISMATCH):
+        dr_backup._verify_extracted_store(snap, {"row_counts": {"messages": 5, "queue": 0}})
