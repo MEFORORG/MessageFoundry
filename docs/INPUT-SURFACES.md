@@ -106,14 +106,15 @@ the scrub.
 
 **One case can leave no message row.** If the handler itself faults, for example when the store
 is down, no check refused the body. Usually no row is written. A fault after the commit leaves the
-committed row, so check the message log before you resend by hand. On MLLP,
-`MLLPSource._answer_handler_failure` records a `handler_error` connection event. A sender that
-expects replies gets a negative acknowledgment, and the connection closes. The raw-TCP and X12
-listeners record `handler_error` too, though for a sender that waits for no reply only once the
-fault outlasts several retries or a stop ends them; the `SourceConnector` docstring in
-[`transports/base.py`](../messagefoundry/transports/base.py) states what each listener does with
-the frame. Those two retry the handler for a sender that waits for no reply, so a fault after the
-commit can leave more than one committed row for the frame (BACKLOG #5022).
+committed row, so check the message log before you resend by hand. On MLLP, a sender that
+expects replies gets a negative acknowledgment, `MLLPSource._answer_handler_failure` records a
+`handler_error` connection event, and the connection closes. A raw-TCP inbound that replies in
+HL7 records `handler_error` and closes with no reply, so its sender resends. For a sender that
+waits for no reply, the MLLP, raw-TCP and X12 listeners hold the frame and retry the handler, and
+record `handler_error` only once the fault outlasts several retries or a stop ends them, so a fault
+after the commit can leave more than one committed row for the frame (BACKLOG #5022). The
+`SourceConnector` docstring in [`transports/base.py`](../messagefoundry/transports/base.py) states
+what each listener does with the frame, and names the one MLLP case that is not retried.
 
 What the sender is told depends on the connector and the content type:
 

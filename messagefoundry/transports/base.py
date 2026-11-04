@@ -1545,16 +1545,18 @@ class SourceConnector(abc.ABC):
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
     answer; the raw-TCP and X12 listeners close with no reply for such a sender. A sender that
-    waits for none cannot be told to resend, so the frame in hand is its only copy. At least the
-    socket listeners differ there:
+    waits for none cannot be told to resend, so the frame in hand is its only copy. The MLLP,
+    raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or the
+    listener stops (:func:`hold_and_retry`, BACKLOG #5022). At least two things lose it, together
+    with every frame behind it on that connection: a stop during the hold whose last attempt also
+    fails or is cancelled, which logs the loss at ERROR, and the process dying during the hold,
+    which logs nothing, since the held frames are only in memory.
 
-    * the raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or
-      the listener stops (:func:`hold_and_retry`, BACKLOG #5022). At least two things lose it,
-      together with every frame behind it on that connection: a stop during the hold whose last
-      attempt also fails or is cancelled, which logs the loss at ERROR, and the process dying
-      during the hold, which logs nothing, since the held frames are only in memory;
-    * the MLLP listener records ``handler_error``, drops the frame with no retry and reads on. That
-      is a gap in the shipped code, not a pattern to copy. Other sources may have one too."""
+    One MLLP case is not held: a sender the ``tls_client_subjects`` allowlist refuses (BACKLOG
+    #4907). Its connection closes after the read either way, and a hold would keep a refused peer's
+    socket open for a whole store outage, so its frame gets one attempt, ``handler_error`` and an
+    ERROR line, and the refusal's ``ERROR`` row is not written. Other sources may have gaps of
+    their own."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
