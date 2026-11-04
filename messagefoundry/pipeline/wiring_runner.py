@@ -6850,7 +6850,10 @@ class RegistryRunner:
         claims nothing until the rows are pending again, so no later row overtakes them. Only a
         stop returns first; any other end of the hold goes on to the worker, as the except arm
         does. ``reschedule_claimed`` is guarded ``status='inflight'``, so a row the dead worker had
-        already handed off is left alone.
+        already handed off is left alone. The re-pend is a retry rather than the first write, so
+        it waits on the fence first, as a hold's retry does (:func:`wait_to_retry`): not the leader,
+        the lane stays held. A landed re-pend dates the rows one backoff ahead, which the
+        replacement sleeps out before its first claim, as the except arm does.
 
         Like the except arm's re-pend, this one undoes the claim's ``attempts`` increment, so
         ``max_attempts`` never dead-letters a row that kills every worker: the lane stays held on
@@ -6873,15 +6876,39 @@ class RegistryRunner:
         if claims.ids and fence is not None and not fence.may_write():
             # Not the fault-time write but a retry of it, so it is fenced as the hold's retries
             # are: a successor may have claimed these rows, and reschedule_claimed is guarded only
-            # by status='inflight'. They stay in flight for that successor's recovery.
-            log.warning(
-                "%s worker %r: not re-pending %d row(s) its predecessor died holding: this node no "
-                "longer leads under the lease they were claimed under",
-                kind,
-                name,
-                len(claims.ids),
+            # by status='inflight'. Not the leader, the replacement holds the lane and polls, as
+            # the hold does, so a flap under the same lease resumes the re-pend rather than let
+            # the worker claim past the rows; another lease or the lane's pause or halt ends the
+            # hold with them in flight for that successor's recovery or the next start.
+            held = await wait_to_retry(
+                0.0,
+                poll=_WORKER_ERROR_BACKOFF_SECONDS,
+                sleep=self._stop_or_sleep,
+                fence=fence,
+                abandon=abandon,
+                not_leader=functools.partial(
+                    log.warning,
+                    "%s worker %r: this node is not the leader, so the %d row(s) its predecessor "
+                    "died holding are not re-pended; the lane stays held with them in flight, and "
+                    "the re-pend resumes only if this node leads again before it stops",
+                    kind,
+                    name,
+                    len(claims.ids),
+                ),
             )
-            claims.ids.clear()
+            if held is HoldResult.STOPPED:
+                self._log_left_in_flight(kind, name, claims.ids)
+                return
+            if held is not None:
+                log.warning(
+                    "%s worker %r: not re-pending %d row(s) its predecessor died holding (%s); "
+                    "they stay in flight until a store recovery path re-pends them",
+                    kind,
+                    name,
+                    len(claims.ids),
+                    held.name.lower(),
+                )
+                claims.ids.clear()
         if claims.ids:
             # On the death log's own schedule, so a row that kills every worker does not flood it.
             log.log(
@@ -6899,6 +6926,13 @@ class RegistryRunner:
                 self._log_left_in_flight(kind, name, claims.ids)
                 return
             claims.ids.clear()
+            # The re-pend dated the rows one backoff ahead, and no wake is armed for that date, so
+            # a worker that claimed now would find nothing and wait on its lane's idle backstop.
+            # Sleep it out first, as the except arm does after its re-pend.
+            if ended is HoldResult.LANDED and await self._stop_or_sleep(
+                _WORKER_ERROR_BACKOFF_SECONDS
+            ):
+                return
         await run(name, claims=claims)
 
     @staticmethod

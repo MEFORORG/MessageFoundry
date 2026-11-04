@@ -15,22 +15,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import BatchConfig
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.stage_dispatcher import (
     HoldResult,
     LaneResultKind,
     RependFence,
     _LaneOutcome,
+    _LanePhase,
+    _LaneState,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _LaneClaims
 from messagefoundry.store import MessageStore, Stage
+from tests.test_backlog1611_inflight_watch import (
+    RAW,
+    _bare_dispatcher,
+    _claimed_ingress_row,
+    _ingress_inflight,
+    _registry,
+)
 from tests.test_task_resilience import (
     _control_ids,
     _hl7,
@@ -261,19 +272,28 @@ async def test_rows_a_dying_serializer_noted_beyond_its_prefix_are_re_pended_wit
 ) -> None:
     """A batching outbound claims its coalesced members itself, outside the serializer's prefix.
     When a ``BaseException`` kills it, the body records them (``note_held``) and the replacement
-    dates them with the prefix; a fresh claim starts with none."""
+    dates them with the prefix; a fresh claim starts with none. The supervisor is handed the
+    claimed rows' ids only, never the items, so a replacement waiting out its backoff holds no
+    payload."""
     store, runner, _ = await _start_runner(tmp_path, "pooled")
     try:
         dispatcher = runner._dispatchers[Stage.OUTBOUND]
         st = dispatcher._states["OB"]
         dispatcher.note_held("OB", ["extra-1", "extra-2"])
-        item: Any = SimpleNamespace(id="head-1")
-        _, dated, released = dispatcher._dead_serializer_outcome("OB", [item])
+        _, dated, released = dispatcher._dead_serializer_outcome("OB", ["head-1"])
         assert dated == ["head-1", "extra-1", "extra-2"]
         assert released == []
-        monkeypatch.setattr(dispatcher, "_start_serializer", lambda *a, **k: None)
+        started: list[tuple[str, list[str]]] = []
+
+        def capture(lane: str, body: Any, ids: list[str], fence: RependFence) -> None:
+            body.close()
+            started.append((lane, ids))
+
+        monkeypatch.setattr(dispatcher, "_start_serializer", capture)
+        item: Any = SimpleNamespace(id="head-1")
         dispatcher._spawn_serializer("OB", [item])
         assert st.held_extra_ids == []
+        assert started == [("OB", ["head-1"])]
     finally:
         await runner.stop()
         await store.close()
@@ -288,16 +308,16 @@ async def test_a_replacement_takes_over_where_its_dead_serializer_stopped(tmp_pa
     try:
         dispatcher = runner._dispatchers[Stage.INGRESS]
         st = dispatcher._states["IB"]
-        items: Any = [SimpleNamespace(id=f"r{n}") for n in range(3)]
+        ids = [f"r{n}" for n in range(3)]
         st.drained = (_LaneOutcome(LaneResultKind.STOP, made_progress=True), ["r1", "r2"], None)
-        outcome, dated, released = dispatcher._dead_serializer_outcome("IB", items)
+        outcome, dated, released = dispatcher._dead_serializer_outcome("IB", ids)
         assert outcome.kind is LaneResultKind.STOP
         assert (dated, released) == ([], ["r1", "r2"])
 
         st.drained = None
         st.drain_index = 1
         st.infra_error_streak = 5
-        outcome, dated, released = dispatcher._dead_serializer_outcome("IB", items)
+        outcome, dated, released = dispatcher._dead_serializer_outcome("IB", ids)
         assert outcome.kind is LaneResultKind.RETRY and outcome.is_infra_fault
         assert outcome.made_progress
         assert (dated, released) == (["r1", "r2"], [])
@@ -306,33 +326,287 @@ async def test_a_replacement_takes_over_where_its_dead_serializer_stopped(tmp_pa
         await store.close()
 
 
-async def test_a_replacement_sends_no_re_pend_once_its_node_no_longer_leads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+# --- the round-3 review repairs -------------------------------------------------------------------
+
+
+class _Flap:
+    """A lease this node holds under one epoch throughout, whose ``is_leader`` reads False for the
+    first ``lost`` reads and True after (a flap), or False forever with ``lost=None``."""
+
+    def __init__(self, lost: int | None, epoch: int = 1) -> None:
+        self.lost = lost
+        self.reads = 0
+        self.epoch = epoch
+
+    def is_leader(self) -> bool:
+        self.reads += 1
+        return self.lost is not None and self.reads > self.lost
+
+    def fence(self) -> RependFence:
+        return RependFence(self.is_leader, lambda: self.epoch, True, 1)
+
+
+async def _recover_per_lane(
+    runner: RegistryRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    fence: RependFence,
+    *,
+    stop_after_sleeps: int | None = None,
+) -> tuple[list[list[str]], list[list[str]], list[float]]:
+    """Run a per-lane replacement over one inherited row, recording its re-pends, the ids the
+    worker it then runs starts with, and its sleeps."""
+    sent: list[list[str]] = []
+    ran: list[list[str]] = []
+    sleeps: list[float] = []
+
+    async def repend(kind: str, name: str, ids: list[str], **_: Any) -> HoldResult:
+        sent.append(list(ids))
+        return HoldResult.LANDED
+
+    async def run(name: str, *, claims: _LaneClaims) -> None:
+        ran.append(list(claims.ids))
+
+    async def sleep(delay: float) -> bool:
+        sleeps.append(delay)
+        if stop_after_sleeps is not None and len(sleeps) >= stop_after_sleeps:
+            runner._stop.set()
+        await asyncio.sleep(0)
+        return runner._stop.is_set()
+
+    monkeypatch.setattr(runner, "_repend_claimed_on_fault", repend)
+    monkeypatch.setattr(runner, "_stop_or_sleep", sleep)
+    await asyncio.wait_for(
+        runner._recover_then_run("router", "IB", _LaneClaims(["r1"], fence), run), timeout=5.0
+    )
+    return sent, ran, sleeps
+
+
+@pytest.mark.parametrize("case", ["flap", "superseded", "stopped-while-not-leading"])
+async def test_a_per_lane_replacement_holds_its_lane_while_not_the_leader(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The replacement's re-pend is a retry of the dead worker's, not its first write, so it is
-    fenced as a hold's retries are: a node that no longer leads under the lease the rows were
-    claimed under sends none, since a successor may hold them. The control fence sends one."""
+    """R3-1. The replacement's re-pend is a retry of the dead worker's, not its first write, so it
+    is fenced as a hold's retries are, and it waits on the fence as they do. A False leadership
+    read under an unchanged lease (a flap) is waited out and the re-pend is sent: before the
+    repair one False read dropped the rows and the worker claimed past them. A node that leads
+    under another lease sends none, since a successor may hold them, and the worker runs. A stop
+    while it waits leaves them in flight and runs no worker, so nothing overtakes them."""
+    _shorten_backoffs(monkeypatch)
     store, runner, _ = await _start_runner(tmp_path, "per_lane")
     try:
-        sent: list[list[str]] = []
-
-        async def repend(kind: str, name: str, ids: list[str], **_: Any) -> HoldResult:
-            sent.append(list(ids))
-            return HoldResult.LANDED
-
-        ran: list[list[str]] = []
-
-        async def run(name: str, *, claims: _LaneClaims) -> None:
-            ran.append(list(claims.ids))
-
-        monkeypatch.setattr(runner, "_repend_claimed_on_fault", repend)
-        demoted = RependFence(lambda: False, lambda: 1, True, 1)
-        await runner._recover_then_run("router", "IB", _LaneClaims(["r1"], demoted), run)
-        assert (sent, ran) == ([], [[]])
-
-        leading = RependFence(lambda: True, lambda: 1, True, 1)
-        await runner._recover_then_run("router", "IB", _LaneClaims(["r1"], leading), run)
-        assert (sent, ran) == ([["r1"]], [[], []])
+        if case == "flap":
+            sent, ran, _ = await _recover_per_lane(runner, monkeypatch, _Flap(lost=2).fence())
+            assert (sent, ran) == ([["r1"]], [[]])
+        elif case == "superseded":
+            sent, ran, _ = await _recover_per_lane(runner, monkeypatch, _Flap(0, epoch=2).fence())
+            assert (sent, ran) == ([], [[]])
+        else:
+            sent, ran, _ = await _recover_per_lane(
+                runner, monkeypatch, _Flap(lost=None).fence(), stop_after_sleeps=3
+            )
+            assert (sent, ran) == ([], [])
     finally:
         await runner.stop()
         await store.close()
+
+
+async def test_a_per_lane_replacement_sleeps_out_its_re_pend_before_its_first_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-3. The re-pend dates the rows one backoff ahead and arms no wake, so a worker that
+    claimed at once would find nothing and wait on its lane's idle backstop, up to 30 s with
+    per-lane wake on. The replacement sleeps the backoff out first, as the except arm does."""
+    _shorten_backoffs(monkeypatch)
+    store, runner, _ = await _start_runner(tmp_path, "per_lane")
+    try:
+        leading = RependFence(lambda: True, lambda: 1, True, 1)
+        sent, ran, sleeps = await _recover_per_lane(runner, monkeypatch, leading)
+        assert (sent, ran) == ([["r1"]], [[]])
+        assert sleeps == [wiring_runner._WORKER_ERROR_BACKOFF_SECONDS]
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+@pytest.fixture
+async def db(tmp_path: Path) -> AsyncIterator[MessageStore]:
+    s = await MessageStore.open(tmp_path / "r3.db")
+    yield s
+    await s.close()
+
+
+def _processing_dispatcher(
+    store: MessageStore, **kwargs: Any
+) -> tuple[stage_dispatcher.StageDispatcher, _LaneState]:
+    """A bare INGRESS dispatcher whose lane IB is PROCESSING with its slot consumed, as a dead
+    serializer leaves it."""
+    dispatcher = _bare_dispatcher(store, **kwargs)
+    st = _LaneState(phase=_LanePhase.PROCESSING, slot_held=True)
+    dispatcher._states["IB"] = st
+    dispatcher._slots_free -= 1
+    return dispatcher, st
+
+
+@pytest.mark.parametrize("case", ["flap", "stopped-while-not-leading"])
+async def test_a_pooled_replacement_holds_its_lane_while_not_the_leader(
+    case: str, db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-2, R3-5 and R3-6. A flap under an unchanged lease is waited out and the dead
+    serializer's row is re-pended: before the repair the row was left INFLIGHT under the same
+    epoch and the lane parked, so a later row could overtake it. A stop while it waits leaves the
+    row in flight, and quiesce no longer reports zero rows INFLIGHT. The replacement returns its
+    slot on entry, since it holds no payload."""
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
+    flap = _Flap(lost=2 if case == "flap" else None)
+    dispatcher, _ = _processing_dispatcher(db)
+    monkeypatch.setattr(dispatcher, "_park", lambda lane, st, until: None)
+    row = await _claimed_ingress_row(db)
+    task = asyncio.ensure_future(
+        dispatcher._run_lane("IB", [], fence=flap.fence(), recover_ids=[row])
+    )
+    await _until(lambda: flap.reads >= 1)
+    assert dispatcher.slots_free == dispatcher._max_processing_lanes  # returned on entry
+    if case == "flap":
+        await asyncio.wait_for(task, timeout=5.0)
+        assert await _ingress_inflight(db) == 0  # re-pended, so nothing can overtake it
+        assert dispatcher._stranded_on_stop == set()
+        return
+    await _until(lambda: flap.reads >= 3)
+    dispatcher._stop.set()
+    await asyncio.wait_for(task, timeout=5.0)
+    assert await _ingress_inflight(db) == 1  # no write sent while not the leader
+    assert dispatcher._stranded_on_stop == {"IB"}
+    dispatcher._running = True
+    assert await dispatcher.quiesce(0.1) is False
+
+
+async def test_a_stop_during_a_pooled_respawn_backoff_is_counted_against_quiesce(
+    db: MessageStore,
+) -> None:
+    """R3-5. A recovery still in its respawn backoff when a demotion's stop lands sends no write,
+    so its row stays INFLIGHT; quiesce must not then report zero rows INFLIGHT."""
+    dispatcher, _ = _processing_dispatcher(db)
+    row = await _claimed_ingress_row(db)
+    fence = RependFence(lambda: True, lambda: 1, True, 1)
+    task = asyncio.ensure_future(
+        dispatcher._run_lane("IB", [], fence=fence, recover_ids=[row], delay=30.0)
+    )
+    await asyncio.sleep(0.05)
+    dispatcher._stop.set()
+    await asyncio.wait_for(task, timeout=5.0)
+    assert await _ingress_inflight(db) == 1
+    dispatcher._running = True
+    assert await dispatcher.quiesce(0.1) is False
+
+
+@pytest.mark.parametrize("streak", [0, 2], ids=["deaths-only", "streak-at-bound"])
+async def test_the_death_page_does_not_duplicate_the_recoverys_own_bound(
+    streak: int, db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-4. A run of ``infra_fault_stop_after`` deaths pages ``lane_stuck`` once, from the
+    supervisor, when the deaths alone reach the bound. When the recovery about to run is the
+    zero-progress fault that brings the streak to that bound, its own STOP or page is the alert,
+    and the supervisor sends none: before the repair both fired in the same cycle."""
+    pages: list[str] = []
+    sink = SimpleNamespace(lane_stuck=lambda lane, *, detail: pages.append(lane))
+    dispatcher, st = _processing_dispatcher(db, alert_sink=sink, infra_fault_stop_after=3)
+    st.infra_error_streak = streak
+    monkeypatch.setattr(
+        dispatcher, "_start_serializer", lambda lane, body, ids, fence: body.close()
+    )
+    fence = RependFence(lambda: True, lambda: 1, True, 1)
+
+    async def die() -> None:
+        raise _Kill("injected kill")
+
+    for _ in range(3):
+        dead = asyncio.ensure_future(die())
+        with pytest.raises(_Kill):
+            await dead
+        dispatcher._on_lane_task_done("IB", ["r1"], fence, dead)
+    assert st.serializer_deaths.count == 3
+    if streak == 0:
+        assert pages == ["IB"] and st.lane_stuck_alerted
+    else:
+        assert pages == [] and not st.lane_stuck_alerted
+
+
+async def test_a_replacement_for_a_serializer_that_died_in_its_transition_counts_the_streak_once(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-7. A serializer that dies inside its terminal transition, after ``_apply_retry`` counted
+    its fault, is replayed by its replacement. The replay puts the streak back to what that
+    transition found, so the fault is counted once, not twice."""
+    _shorten_backoffs(monkeypatch)
+    dispatcher, st = _processing_dispatcher(db)
+    row = await _claimed_ingress_row(db)
+    head = _LaneOutcome(LaneResultKind.RETRY, 1.0, is_infra_fault=True, made_progress=False)
+    st.drained = (head, [], (row, 1.0))
+    parks: list[float | None] = []
+
+    def park(lane: str, st: Any, until: float | None) -> None:
+        parks.append(until)
+        if len(parks) == 1:
+            raise _Kill("injected kill inside the terminal transition")
+
+    monkeypatch.setattr(dispatcher, "_park", park)
+    fence = RependFence(lambda: True, lambda: 1, True, 1)
+    with pytest.raises(_Kill):
+        await dispatcher._run_lane("IB", [], fence=fence, recover_ids=[row])
+    assert st.infra_error_streak == 1
+    assert st.phase is _LanePhase.PROCESSING  # the transition died before the park
+    await dispatcher._run_lane("IB", [], fence=fence, recover_ids=[row])
+    assert st.infra_error_streak == 1
+    assert len(parks) == 2
+
+
+async def test_resume_lane_starts_a_fresh_run_of_serializer_deaths(db: MessageStore) -> None:
+    """R3-12. An operator resume re-arms a paused lane with a fresh run of serializer deaths, as
+    it starts a fresh claimer-death budget, so the next death is not paced or paged as a repeat."""
+    dispatcher = _bare_dispatcher(db)
+    st = _LaneState(phase=_LanePhase.PAUSED)
+    st.serializer_deaths = st.serializer_deaths.record(
+        logging.getLogger("test"), _Kill("x"), "death", level=logging.DEBUG
+    )
+    assert st.serializer_deaths.count == 1
+    dispatcher._states["IB"] = st
+    dispatcher.resume_lane("IB")
+    assert st.serializer_deaths.count == 0
+
+
+@pytest.mark.parametrize("mode", ["per_lane", "pooled"])
+async def test_a_batch_killed_by_a_base_exception_hands_its_extras_on(
+    mode: str, db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-15. A ``BaseException`` that kills a batching outbound after it coalesced its extras
+    sends no write, and hands the extras to whoever re-pends the dead task's rows: the per-lane
+    worker's claimed list, or the pooled serializer's ``note_held``."""
+    runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
+    for _ in range(3):
+        await db.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=1.0)
+    head = await db.claim_next_fifo("OB", now=2.0)
+    assert head is not None
+    coalesced: list[str] = []
+
+    async def coalesce_then_die(name: str, cfg: Any, items: list[Any]) -> Any:
+        for _ in range(2):
+            more = await db.claim_next_fifo(name, now=2.0)
+            assert more is not None
+            items.append(more)
+            coalesced.append(more.id)
+        raise _Kill("injected kill after coalescing")
+
+    monkeypatch.setattr(runner, "_deliver_coalesced_batch", coalesce_then_die)
+    noted: list[tuple[str, list[str]]] = []
+    if mode == "pooled":
+        out: Any = SimpleNamespace(note_held=lambda lane, ids: noted.append((lane, list(ids))))
+        monkeypatch.setitem(runner._dispatchers, Stage.OUTBOUND, out)
+    extras_out: list[str] | None = [head.id] if mode == "per_lane" else None
+    cfg = BatchConfig(max_count=3, max_wait_ms=1)
+    with pytest.raises(_Kill):
+        await runner._process_delivery_batch("OB", head, cfg, extras_out=extras_out)
+    if mode == "per_lane":
+        assert extras_out == [head.id, *coalesced] and noted == []
+    else:
+        assert noted == [("OB", coalesced)]
+    assert await db.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB": (3, 2.0)}

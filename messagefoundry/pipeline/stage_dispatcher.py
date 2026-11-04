@@ -37,7 +37,9 @@ synchronous except a claimer's single ``await claim_fifo_heads`` (plus, only on 
 its opening backoff sleep and ``await release_claimed`` in ``_adopt_abandoned``) and a serializer's
 ``await process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
 ``await`` — the conservation law (``slots_free + processing_lanes + reserved == max_processing_lanes``)
-and the ``busy_violations`` counter assert this holds.
+and the ``busy_violations`` counter assert this holds. One serializer holds no slot: a dead
+serializer's replacement, which returns it on entry because it holds no payload (BACKLOG #4607), so
+the law counts ``processing_lanes`` less those.
 """
 
 from __future__ import annotations
@@ -47,10 +49,10 @@ import functools
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Protocol
+from typing import Any, Protocol
 
 from messagefoundry.log_backoff import CONSECUTIVE, IN_THIS_RUN, FailureRun
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -305,6 +307,9 @@ class _LaneState:
     # the prefix item its body is on; drained is _drain_lane's return once the body has finished.
     drain_index: int = 0
     drained: tuple[_LaneOutcome, list[str], tuple[str, float] | None] | None = None
+    # BACKLOG #4607: infra_error_streak as the live serializer's terminal transition found it, so a
+    # replacement for one that died inside that transition does not count the streak twice.
+    transition_streak: int | None = None
 
 
 @dataclass
@@ -581,6 +586,9 @@ class StageDispatcher:
         self._head_skip_window = _WindowedCount()
         # Debug tripwire: the one-consumer-per-lane invariant. Must stay 0 (the 200-lane soak asserts).
         self._busy_violations = 0
+        # BACKLOG #4607: lanes whose dead serializer's rows a stop left INFLIGHT with no write sent,
+        # so quiesce does not report zero rows INFLIGHT. Cleared by start().
+        self._stranded_on_stop: set[str] = set()
         # BACKLOG #1609 claimer/sweep supervision, keyed by task name (see _Supervised).
         self._supervised: dict[str, _Supervised] = {}
         self._respawns = 0
@@ -722,6 +730,7 @@ class StageDispatcher:
             return
         st.pause_pending = False
         st.claimer_deaths = 0  # an operator re-arm starts a fresh #2074 budget, as notify_work does
+        st.serializer_deaths = FailureRun()  # #4607: and a fresh run of serializer deaths
         st.phase = _LanePhase.IDLE
         self.mark_ready(key, woken=True)  # IDLE -> READY + enqueue (T2)
         self._sweep_now.set()
@@ -736,6 +745,7 @@ class StageDispatcher:
             return
         self._running = True
         self._stop.clear()
+        self._stranded_on_stop.clear()
         # Clear the latched teardown signals so a start()-after-stop() (a PR4 restart-in-place) begins
         # clean — stop() SETs these to break the tasks out of their waits; a stale set would otherwise
         # spuriously wake a fresh claimer / trigger one extra immediate sweep.
@@ -815,7 +825,10 @@ class StageDispatcher:
                 # A dead claimer's rows that its replacement had not yet released are INFLIGHT too, so
                 # the contract is not met. They are NOT released here: this path runs because the
                 # lease may be lost, and an unfenced release could re-pend a row a successor holds.
-                return not any(claimer.orphan_ids for claimer in self._claimers)
+                # So are those of a dead serializer whose recovery the stop ended first (#4607).
+                return not self._stranded_on_stop and not any(
+                    claimer.orphan_ids for claimer in self._claimers
+                )
             remaining = deadline - loop.time()
             if remaining <= 0:
                 self._reap(watched)
@@ -1386,7 +1399,10 @@ class StageDispatcher:
             st.held_extra_ids.clear()
             st.drain_index = 0
             st.drained = None
-        self._start_serializer(lane, items, fence)
+            st.transition_streak = None
+        self._start_serializer(
+            lane, self._run_lane(lane, items, fence=fence), [it.id for it in items], fence
+        )
 
     def note_held(self, lane: str, ids: list[str]) -> None:
         """Record rows the serializer of ``lane`` claimed beyond its prefix and is dying holding,
@@ -1401,23 +1417,21 @@ class StageDispatcher:
     def _start_serializer(
         self,
         lane: str,
-        items: list[OutboxItem],
+        body: Coroutine[Any, Any, None],
+        ids: list[str],
         fence: RependFence,
-        *,
-        recover: bool = False,
-        delay: float = 0.0,
     ) -> None:
+        """Run ``body``, the serializer of ``lane`` over the claimed rows ``ids``, supervised by
+        :meth:`_on_lane_task_done`. The callback is handed the ids only, never the claimed items:
+        a replacement waiting out its respawn backoff holds no decrypted payload (BACKLOG #4607)."""
         if lane in self._lane_tasks:
             self._busy_violations += 1  # a live serializer already owns this lane — invariant break
-        task = asyncio.create_task(
-            self._run_lane(lane, items, fence=fence, recover=recover, delay=delay),
-            name=f"lane:{lane}",
-        )
-        task.add_done_callback(functools.partial(self._on_lane_task_done, lane, items, fence))
+        task = asyncio.create_task(body, name=f"lane:{lane}")
+        task.add_done_callback(functools.partial(self._on_lane_task_done, lane, ids, fence))
         self._lane_tasks[lane] = task
 
     def _on_lane_task_done(
-        self, lane: str, items: list[OutboxItem], fence: RependFence, task: asyncio.Task[None]
+        self, lane: str, ids: list[str], fence: RependFence, task: asyncio.Task[None]
     ) -> None:
         """Supervise the serializer. ``_run_lane`` pops ``_lane_tasks`` itself on the normal path;
         this is an idempotent safety net, and it RESPAWNS a serializer that died before its
@@ -1441,8 +1455,10 @@ class StageDispatcher:
         lane's ``infra_error_streak`` grows, its park backs off, and ``infra_fault_policy`` STOPs it
         or pages ``lane_stuck``. A replacement that itself dies, before its terminal transition,
         moves no streak, so a run of ``infra_fault_stop_after`` deaths pages ``lane_stuck`` once
-        here. A stop, a cancel and the teardown are not respawned; their rows
-        wait for the next start, as a cancelled serializer's do."""
+        here, unless the recovery about to run is the zero-progress fault that brings the streak to
+        that bound, whose STOP or page is then the one alert (:meth:`_recovery_meets_bound`). A
+        stop, a cancel and the teardown are not respawned; their rows wait for the next start, as a
+        cancelled serializer's do, and a stop's are counted against :meth:`quiesce`."""
         if self._lane_tasks.get(lane) is task:
             self._lane_tasks.pop(lane, None)
         if task.cancelled():
@@ -1451,12 +1467,13 @@ class StageDispatcher:
         if exc is None:
             return
         if self._stop.is_set():
+            self._stranded_on_stop.add(lane)
             log.warning(
                 "StageDispatcher %s lane %s serializer died during a stop holding %d claimed row(s); "
                 "they stay in flight until the next start",
                 self._stage.value,
                 lane,
-                len(items),
+                len(ids),
             )
             return
         st = self._states.get(lane)
@@ -1477,17 +1494,22 @@ class StageDispatcher:
             "to re-pend them before the lane claims again",
             self._stage.value,
             lane,
-            len(items),
+            len(ids),
             count_label=IN_THIS_RUN,
         )
         deaths = st.serializer_deaths.count
-        if deaths == self._infra_fault_stop_after:
+        if (
+            deaths == self._infra_fault_stop_after
+            and not st.lane_stuck_alerted
+            and not self._recovery_meets_bound(st)
+        ):
+            st.lane_stuck_alerted = True
             try:
                 self._alert_sink.lane_stuck(
                     lane,
                     detail=(
                         f"{self._stage.value} serializer died {deaths} times with no serializer "
-                        f"surviving its body between, the last holding {len(items)} claimed row(s)"
+                        f"surviving its body between, the last holding {len(ids)} claimed row(s)"
                     ),
                 )
             except Exception:  # noqa: BLE001 — an alert failure must not stop the respawn
@@ -1504,7 +1526,23 @@ class StageDispatcher:
                 _RESPAWN_BACKOFF_BASE_SECONDS, deaths - 2, _RESPAWN_BACKOFF_CAP_SECONDS
             )
         )
-        self._start_serializer(lane, items, fence, recover=True, delay=delay)
+        self._start_serializer(
+            lane, self._run_lane(lane, [], fence=fence, recover_ids=ids, delay=delay), ids, fence
+        )
+
+    def _recovery_meets_bound(self, st: _LaneState) -> bool:
+        """Whether the recovery a dead serializer's replacement is about to apply
+        (:meth:`_dead_serializer_outcome`) is a zero-progress infra fault that brings the lane's
+        ``infra_error_streak`` to ``infra_fault_stop_after``, so :meth:`_apply_retry` STOPs or pages
+        the lane itself (BACKLOG #4607)."""
+        if st.drained is not None:
+            outcome, _, head = st.drained
+            if head is None or outcome.made_progress or not outcome.is_infra_fault:
+                return False
+        elif st.drain_index > 0:
+            return False
+        streak = st.infra_error_streak if st.transition_streak is None else st.transition_streak
+        return streak + 1 >= self._infra_fault_stop_after
 
     def _close_serializer_deaths(self, lane: str, st: _LaneState) -> None:
         """End the lane's run of serializer deaths (BACKLOG #4607), with one line if it was open."""
@@ -1519,7 +1557,7 @@ class StageDispatcher:
             )
 
     def _dead_serializer_outcome(
-        self, lane: str, items: list[OutboxItem]
+        self, lane: str, ids: list[str]
     ) -> tuple[_LaneOutcome, list[str], list[str]]:
         """What a replacement for a dead serializer applies (:meth:`_on_lane_task_done`). Returns
         ``(outcome, rows to date to its park_until, rows to release)``.
@@ -1536,8 +1574,15 @@ class StageDispatcher:
         the prefix (:meth:`note_held`) with them. A row it had not reached keeps its ``seq`` and
         waits behind the head anyway; releasing it past-due instead would let the sweep re-ready the
         lane at its cadence whenever the row that killed it was not the first, the spin fix A
-        collapses."""
+        collapses.
+
+        A serializer that died INSIDE its terminal transition may already have counted its fault
+        on the streak, so the streak is first put back to what that transition found
+        (``_LaneState.transition_streak``); the replayed transition then counts it once."""
         st = self._states[lane]  # the caller respawns only a lane whose state it read
+        if st.transition_streak is not None:
+            st.infra_error_streak = st.transition_streak
+            st.transition_streak = None
         if st.drained is not None:
             outcome, tail, head = st.drained
             if head is None:
@@ -1545,13 +1590,13 @@ class StageDispatcher:
             streak = 0 if outcome.made_progress else st.infra_error_streak
             park_until = self._clock() + self._infra_backoff(streak)
             return replace(outcome, park_until=park_until), [head[0]], list(tail)
-        i = min(st.drain_index, max(len(items) - 1, 0))
+        i = min(st.drain_index, max(len(ids) - 1, 0))
         streak = st.infra_error_streak if i == 0 else 0
         park_until = self._clock() + self._infra_backoff(streak)
         outcome = _LaneOutcome(
             LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)
         )
-        return outcome, [it.id for it in items[i:]] + st.held_extra_ids, []
+        return outcome, ids[i:] + st.held_extra_ids, []
 
     async def _run_lane(
         self,
@@ -1559,7 +1604,7 @@ class StageDispatcher:
         items: list[OutboxItem],
         *,
         fence: RependFence | None = None,
-        recover: bool = False,
+        recover_ids: list[str] | None = None,
         delay: float = 0.0,
     ) -> None:
         """Drain the claimed prefix strictly oldest-first (K fully resolved before K+1 — ADR 0058's
@@ -1568,9 +1613,14 @@ class StageDispatcher:
         state mutation runs synchronously after the (async) tail release so it is atomic on the loop
         (no double-dispatch window).
 
-        ``recover`` is the replacement for a serializer that DIED holding ``items``
-        (:meth:`_on_lane_task_done`): it runs no body, waits ``delay`` first, and treats the whole
-        prefix as a T17 head (:meth:`_dead_serializer_outcome`)."""
+        ``recover_ids`` makes this the replacement for a serializer that DIED holding those rows
+        (:meth:`_on_lane_task_done`): it runs no body and holds no item. It returns the lane's slot
+        at once, since it holds no decrypted payload and its wait can last up to the respawn cap,
+        waits ``delay``, then holds the lane while this node is not the leader, as a hold's retries
+        do (:func:`wait_to_retry`), and treats the whole prefix as a T17 head
+        (:meth:`_dead_serializer_outcome`)."""
+        recover = recover_ids is not None
+        claimed = len(items) if recover_ids is None else len(recover_ids)
         # BACKLOG #1611: the lease these rows were claimed under, read before the body runs, so a
         # lease change during the body or the first re-pend still fences the retries. Every
         # dispatched serializer is handed the one read at its spawn (which its replacement reuses);
@@ -1580,27 +1630,44 @@ class StageDispatcher:
         head_ids: list[str] = []
         when = 0.0
         head = tail = HoldResult.LANDED
-        if recover:
+        if recover_ids is not None:
+            if (st_r := self._states.get(lane)) is not None:
+                self._release_lane_slot(st_r)
             # Sliced, so a pause that lands during the wait ends it, as it ends a hold.
+            held: HoldResult | None = None
             while delay > 0.0 and not self._hold_abandoned(lane):
                 step = min(delay, _RESPAWN_BACKOFF_BASE_SECONDS)
                 if await self._slept_into_stop(step):
-                    log.warning(
-                        "StageDispatcher %s lane %s: stopped before re-pending %d claimed row(s) a "
-                        "dead serializer held; they stay in flight for the next start",
-                        self._stage.value,
-                        lane,
-                        len(items),
-                    )
-                    return
+                    held = HoldResult.STOPPED
+                    break
                 delay -= step
-            outcome, head_ids, tail_ids = self._dead_serializer_outcome(lane, items)
-            when = outcome.park_until or 0.0
-            if not fence.may_write():
+            if held is None and not fence.may_write():
                 # Retries of the dead serializer's writes, not its first, so fenced as a hold's
                 # retries are: a successor may own these rows, and every write is guarded only by
-                # status='inflight'. They stay in flight for that successor's recovery.
-                head = tail = HoldResult.SUPERSEDED
+                # status='inflight'. Not the leader, the lane stays held, so a flap under the same
+                # lease resumes the re-pend rather than let a later row overtake these; another
+                # lease, a pause or a stop ends the hold with them in flight.
+                held = await wait_to_retry(
+                    0.0,
+                    poll=_LANE_ERROR_BACKOFF_SECONDS,
+                    sleep=self._slept_into_stop,
+                    fence=fence,
+                    abandon=functools.partial(self._hold_abandoned, lane),
+                    not_leader=functools.partial(
+                        log.warning,
+                        "StageDispatcher %s lane %s: this node is not the leader, so the %d "
+                        "row(s) a dead serializer held are not re-pended; the lane stays held "
+                        "with them in flight, and the re-pend resumes only if this node leads "
+                        "again before it stops",
+                        self._stage.value,
+                        lane,
+                        claimed,
+                    ),
+                )
+            outcome, head_ids, tail_ids = self._dead_serializer_outcome(lane, recover_ids)
+            when = outcome.park_until or 0.0
+            if held is not None:
+                head = tail = held
         else:
             st0 = self._states.get(lane)
             outcome, tail_ids, head_reschedule = await self._drain_lane(lane, items)
@@ -1664,7 +1731,11 @@ class StageDispatcher:
         )
         if HoldResult.STOPPED in (head, tail):
             # No terminal transition, so the dispatcher's quiesce reads this lane as drained; say
-            # here that its rows did not come back. Counts only, never content.
+            # here that its rows did not come back. Counts only, never content. A dead serializer's
+            # replacement may have sent no write at all, so its lane is counted against quiesce
+            # (#4607); a body's own first writes were sent, as before step 2.
+            if recover:
+                self._stranded_on_stop.add(lane)
             log.warning(
                 "StageDispatcher %s lane %s: stopped while holding %d claimed row(s) whose re-pend "
                 "had not landed; they stay in flight for the next start or a successor's recovery",
@@ -1700,6 +1771,7 @@ class StageDispatcher:
         st = self._states.get(lane)
         if st is None:  # torn down under us: stop() already returned every slot, nothing to book
             return
+        st.transition_streak = st.infra_error_streak  # #4607: see _dead_serializer_outcome
         self._release_lane_slot(st)
         st.held_extra_ids.clear()
         if not recover:  # #4607: this serializer survived its body, so a run of deaths ends
@@ -1726,16 +1798,12 @@ class StageDispatcher:
             # THE ONLY BOOKABLE SERVICE: the lane was reserved, claimed a prefix, drained EVERY item and
             # quiesced. `rows=len(items)` is the λ numerator — it must read 1 on the hard-1 OUTBOUND /
             # RESPONSE stages and may exceed 1 on the batching INGRESS / ROUTED prefixes.
-            self._book_lane_episode(
-                _episode_start_ns, _episode_end_ns, rows=len(items), service=True
-            )
+            self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=claimed, service=True)
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
             # A full batch (claim hit per_lane_limit) ⇒ more due rows likely remain — feeds T13b's greedy
             # sweep/seed backlog drain (a wake-less residue must not throttle to one row per sweep).
-            self._lane_done(
-                lane, st, claimed_full=len(items) >= self._per_lane_limit
-            )  # T13/T13b/T14
+            self._lane_done(lane, st, claimed_full=claimed >= self._per_lane_limit)  # T13/T13b/T14
         elif outcome.kind is LaneResultKind.RETRY:  # T15
             # S_lane DROP: a RETRY head was re-pended, not delivered — no completed service. Occupancy.
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
