@@ -79,17 +79,11 @@
   carve-out for anon/..."*, the owner answered *"Sign it (Recommended)"*. The question is quoted as
   that Manager relayed it, elision included; the decision record holds the answer, not the
   question. ADR 0201 was accepted on 2026-09-29 and designs this amendment. Its section 5 says that
-  changing this ADR's ratified home needs the owner's sign-off on its own, and this bullet records
-  it. The four items below are ratified. The sign-off builds nothing: the package is still at
-  `messagefoundry/anon/`, and every path in this ADR describes the tree until ADR 0201 slice 6
-  moves it. That slice re-points the guards and tests that pin the path, in the same change.
-  > **Superseded text, kept as a record.** Until 2026-11-04 this bullet opened *"AMENDMENT
-  > PROPOSED 2026-10-27, AWAITING THE OWNER'S SIGN-OFF"*, and its second to fourth sentences read
-  > *"Its section 5 also says that changing this ADR's ratified home needs the owner's sign-off on
-  > its own, in its own pull request. So the four items below are proposed, not ratified, until
-  > that sign-off is recorded in this bullet. This builds nothing either way: the package is still
-  > at `messagefoundry/anon/`, and every path in this ADR describes the tree until ADR 0201 slice 6
-  > moves it."*
+  changing this ADR's ratified home needs the owner's sign-off on its own, in its own pull request;
+  this bullet records the sign-off. The four items below are ratified. The sign-off builds nothing:
+  the package is still at `messagefoundry/anon/`, and every path in this ADR describes the tree
+  until ADR 0201 slice 6 moves it. That slice re-points the guards and tests that pin the path, in
+  the same change.
   1. **The home becomes `messagefoundry_toolkit/anon/`**, in the `messagefoundry-toolkit`
      distribution rather than the engine wheel. This replaces the §1 *"engine-owned"* home *"sitting
      beside `parsing/`"*, one of the forks ratified before the build.
@@ -101,16 +95,24 @@
      CLAUDE.md §4 pure-library carve-out from `parsing/` to `anon/`, and §8 and *To resolve on
      acceptance* list that as a doc flip. That flip never landed: CLAUDE.md §4 names `parsing/`
      alone. Once `anon/` is not an engine package there is nothing for the carve-out to cover, so
-     the flip is withdrawn rather than left pending. Each of those four places carries a marker.
+     the flip is withdrawn rather than left pending. Each of those four places carries a marker,
+     and so does the *On acceptance* footer.
 
   What the package does, its rules, its fail-closed behaviour and its limits are unchanged.
   **One correction here needs no sign-off**, because it records what the tree and an owner ruling
   already say: §1 claimed the harness imports the package, and none does. The correction stands
   where that sentence stood, with markers on the two other places that read as permission.
+  > **Superseded text, kept as a record.** Until 2026-11-04 this bullet opened *"AMENDMENT
+  > PROPOSED 2026-10-27, AWAITING THE OWNER'S SIGN-OFF"*. After its sentence on ADR 0201's
+  > acceptance it read *"Its section 5 also says that changing this ADR's ratified home needs the
+  > owner's sign-off on its own, in its own pull request. So the four items below are proposed, not
+  > ratified, until that sign-off is recorded in this bullet. This builds nothing either way: the
+  > package is still at `messagefoundry/anon/`, and every path in this ADR describes the tree until
+  > ADR 0201 slice 6 moves it."*
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
-  with **deterministic keyed surrogates**; the engine **owns** it beside `parsing/` *(amended: the home moves to `messagefoundry_toolkit/anon/`; see the status banner)* and the tee **vendors a
+  with **deterministic keyed surrogates**; the engine **owns** it beside `parsing/` *(amended: the home is to move to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner)* and the tee **vendors a
   byte-identical copy** (mirroring [`tee/hl7_fields.py`](../../tee/hl7_fields.py)), every output proven clean
   by `scan_forbidden` before it can be committed. *(On landing this would be the first built slice of the
   de-id capability PHI.md §9 / CLAUDE.md §9 still call planned-not-built — see §8; the docs only flip on
@@ -164,7 +166,7 @@ that **vendoring it costs nothing and the rule *table* is the single authority**
 
 ### 1. A pure, dependency-free `anon` package — engine-owned, tee-vendored (additive only)
 
-*(Amended: the home moves to `messagefoundry_toolkit/anon/`; see the status banner.)*
+*(Amended: the home is to move to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner.)*
 
 The anonymizer ships as **`messagefoundry/anon/`**: a small, **pure-stdlib** package — no `hl7apy`, no
 `python-hl7`, no engine state, I/O, or DB — sitting beside [`parsing/`](../../messagefoundry/parsing/). Like
@@ -222,7 +224,7 @@ an anonymizer function, and no harness file imports the package. The shipped
 `python -m harness.reconcile capture` passes none, so it writes the bodies it receives as they
 arrive. The tee runs the rules by a parity-pinned vendor copy.
 
-**CORRECTED 2026-10-27 (BACKLOG #1192; see the 2026-10-27 status-banner bullet):** the paragraph
+**CORRECTED 2026-10-27 (BACKLOG #1192; see that item's status-banner bullet):** the paragraph
 read, after its first sentence, *"The **harness imports `messagefoundry.anon` directly** (it already
 imports `parsing`/`generators`). This is the **asymmetric resolution**: both sides run the *same
 rules*, the harness by import, the tee by a parity-pinned vendor copy."* No harness file imports the
@@ -495,7 +497,7 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
 ## To resolve on acceptance
 
 - [ ] Confirm `messagefoundry/anon/` (engine-owned) + `tee/anon/` (vendored byte-identical, CI-parity-checked)
-      as the home *(amended: the home moves to `messagefoundry_toolkit/anon/`; see the status banner)* — vs a single installable package — and that the rule *table* is the named engine-side
+      as the home *(amended: the home is to move to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner)* — vs a single installable package — and that the rule *table* is the named engine-side
       authority with a parity-pinned tee copy.
 - [ ] Ratify the **two-layer rule model** — declarative field-*selection* map (data, overlay-able by
       `anon.toml`) over a code `SURROGATES` registry — as the §12-safe line, and confirm `load_rules`
