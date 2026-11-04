@@ -2712,8 +2712,8 @@ def _win_create_owner_probe(directory: Path) -> tuple[int, Path]:
     entry inherited from the staging root gives another account ``WRITE_OWNER`` on it, and none can
     re-own it before its owner is read and choose the owner the sweep goes by (BACKLOG #4988). The
     list is read back from the handle before the probe is used, and a probe whose list is not
-    protected, or names an entry the create did not ask for, as on a server that does not apply the
-    list a create asks for, is closed and refused. ``CREATE_NEW`` with
+    protected, or is not exactly the list the create asked for, as on a server that does not
+    apply the list a create asks for, is closed and refused. ``CREATE_NEW`` with
     ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name already taken, by a file or by a link, and
     ``FILE_FLAG_DELETE_ON_CLOSE`` deletes the probe when the handle closes, wherever a rename has
     put it by then."""
@@ -2777,7 +2777,7 @@ def _win_create_owner_probe(directory: Path) -> tuple[int, Path]:
     try:
         sddl = _win_handle_sddl(handle, dacl_info)
         got = _parse_sddl_dacl(sddl) if sddl is not None else None
-        if got is None or not got.protected or not set(got.aces) <= set(asked.aces):
+        if got is None or not got.protected or set(got.aces) != set(asked.aces):
             raise OSError(
                 f"owner probe in {directory} does not carry the protected access list it was "
                 "created with, so its owner is not read"
@@ -2948,7 +2948,9 @@ def _sweep_abandoned_staging(root: Path, *, owner: object | None, own: Path) -> 
     Another account could plant a directory in either holding a lock file and a marker, and the
     teardown must never run on a tree it controls."""
     if owner is None:
-        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", own, root)
+        log.warning(
+            "DR staging: this run's owner for %s could not be read, so %s is not swept", own, root
+        )
         return 0
     return _sweep_owned(root, owner, own=own)
 
