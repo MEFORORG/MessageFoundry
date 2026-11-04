@@ -605,6 +605,47 @@ def test_a_certificate_nested_in_another_block_is_not_indexed(
 
 
 @pytest.mark.parametrize(
+    ("width", "newline"),
+    [
+        pytest.param(254, "\n", id="254"),
+        pytest.param(508, "\n", id="508"),
+        pytest.param(253, "\r\n", id="253-crlf"),
+    ],
+)
+def test_a_base64_line_wrapped_at_a_piece_boundary_is_read(width: int, newline: str) -> None:
+    """OpenSSL reads a long line in 254-byte pieces, and a LF left alone by a full piece ends that
+    line rather than being a blank line. The index must not hand ``cryptography`` a blank line in
+    the body there, or a CA OpenSSL loads would be counted unreadable and every partner under it
+    refused (BACKLOG #4948)."""
+    plain = _ca(_dn((NameOID.COMMON_NAME, "Plain CA")))
+    wide = _ca(_dn((NameOID.COMMON_NAME, "Wide CA")))
+    b64 = "".join(_pem(wide[0]).decode("ascii").splitlines()[1:-1])
+    assert len(b64) > width  # the premise: the body really spans a piece boundary
+    rows = [b64[i : i + width] for i in range(0, len(b64), width)]
+    block = newline.join(["-----BEGIN CERTIFICATE-----", *rows, "-----END CERTIFICATE-----", ""])
+    cadata = _pem(plain[0]).decode("ascii") + block
+    assert _loaded_subjects(cadata) == {"CN=Plain CA", "CN=Wide CA"}  # the premise
+    index = IssuerIndex(cadata)
+    assert index.unreadable == 0
+    assert index.unmatched_keys(["CN=Plain CA", "CN=Wide CA"]) == {}
+
+
+def test_a_label_is_compared_up_to_a_nul_as_openssl_compares_it() -> None:
+    """OpenSSL compares a PEM label with ``strcmp``, so ``CERTIFICATE`` then a NUL and more text
+    loads as a certificate, with its END line naming ``CERTIFICATE``. The index must read it too,
+    and must not take that END line as another label's and stop reading (BACKLOG #4948)."""
+    odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
+    good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
+    marker = b"-----BEGIN CERTIFICATE-----"
+    block = _pem(odd[0]).replace(marker, b"-----BEGIN CERTIFICATE\x00Z-----")
+    cadata = (block + _pem(good[0])).decode("ascii")
+    assert _loaded_subjects(cadata) == {"CN=Odd CA", "CN=Good CA"}  # the premise
+    index = IssuerIndex(cadata)
+    assert index.unreadable == 0
+    assert index.unmatched_keys(["CN=Odd CA", "CN=Good CA"]) == {}
+
+
+@pytest.mark.parametrize(
     ("nested", "label"),
     [
         pytest.param(False, "CERTIFICATE", id="certificate"),

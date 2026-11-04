@@ -1749,12 +1749,19 @@ _OPENSSL_STRIPPED = bytes(range(0x21))
 
 def _pem_reader_lines(pem: bytes) -> Iterator[bytes]:
     """Each line of ``pem`` as OpenSSL's PEM reader reads one: up to and including a LF, at most
-    :data:`_OPENSSL_LINE_PIECE` bytes, with its trailing bytes at or below a space stripped."""
-    at = 0
+    :data:`_OPENSSL_LINE_PIECE` bytes, with its trailing bytes at or below a space stripped.
+
+    A piece that strips to nothing right after a full piece with no LF is not yielded: OpenSSL
+    reads it as the end of that long line, not as a blank line (``prev_partial_line_read``), so a
+    base64 line wrapped at a piece boundary does not gain a blank line inside its block."""
+    at, partial = 0, False
     while at < len(pem):
         stop = pem.find(b"\n", at, at + _OPENSSL_LINE_PIECE)
         stop = at + _OPENSSL_LINE_PIECE if stop < 0 else stop + 1
-        yield pem[at:stop].rstrip(_OPENSSL_STRIPPED)
+        line = pem[at:stop].rstrip(_OPENSSL_STRIPPED)
+        if line or not partial:
+            yield line
+        partial = stop - at == _OPENSSL_LINE_PIECE and pem[stop - 1 : stop] != b"\n"
         at = stop
 
 
@@ -1772,23 +1779,29 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
     than read as nothing.
 
     A certificate block is handed on rebuilt from the lines OpenSSL read, so ``cryptography`` sees
-    the bytes OpenSSL kept, not the bytes it stripped. At least one loadable shape still differs: a
-    block missing its END line before the next block, which OpenSSL loads and the index counts as
-    unreadable, so it names no issuer and warns."""
+    the bytes OpenSSL kept, not the bytes it stripped. At least two loadable shapes still differ.
+    One fails closed: a block missing its END line before the next block, which OpenSSL loads and
+    the index counts as unreadable, so it names no issuer and warns. The other fails OPEN, and this
+    scan does not close it: OpenSSL silently stops loading the file at a block of any label whose
+    body decodes to no data, such as an empty block, or that has a data line over 64 characters
+    after a header, while this scan reads on and names the CAs after it."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
             continue
-        label = line.removeprefix(b"-----BEGIN ").removesuffix(b"-----")
+        # OpenSSL compares the label with strcmp, which stops at a NUL.
+        label = line.removeprefix(b"-----BEGIN ").removesuffix(b"-----").partition(b"\0")[0]
+        keep = label in _PEM_CERTIFICATE_LABELS
         body: list[bytes] = []
         for end in lines:
             if end.startswith(b"-----END "):
                 break
-            body.append(end)
+            if keep:
+                body.append(end)
         else:
             end = b""  # no END line at all
         if end != b"-----END " + label + b"-----":
             yield None  # no END, or one of another label: OpenSSL refuses the file
             return
-        if label in _PEM_CERTIFICATE_LABELS:
-            yield b"\n".join([line, *body, end, b""])
+        if keep:
+            yield b"\n".join([b"-----BEGIN " + label + b"-----", *body, end, b""])
