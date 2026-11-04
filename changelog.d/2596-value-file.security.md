@@ -1,8 +1,10 @@
 - **The config digest covers the environment value file wherever `[environments].base_dir` puts
   it.** In the default layout the value file sits outside the config directory, so an edit to it
   left the digest unchanged, and a released reload read it from disk after the check. Each reload
-  now reads it into the snapshot it loads, after vetting the file and its folder, folds it into the
-  digest, and `serve` parses the values from those bytes. A dual-control release so checks and
+  now reads it into the snapshot it loads, after vetting the file, its folder and the folder of
+  each link it leads through, folds it into the digest, and `serve` parses the values from those
+  bytes. A value file the reload cannot read refuses it rather than being read again from disk, and
+  a start refuses one it cannot stat rather than reading no values. A dual-control release so checks and
   applies the same value bytes, and refuses a value file edited, created or removed since its
   approval. The start's provenance digest folds it too, read after the start resolved its values,
   so it can name later bytes. The fingerprint scheme is now

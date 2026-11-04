@@ -2529,7 +2529,9 @@ modules, helpers and tables checked are the ones the loader runs, and an edit to
 during the load is neither run nor recorded. The limits below name at least one import that runs
 from disk instead. The digest covers `serve`'s environment value file wherever
 `[environments].base_dir` puts it: in the config directory's `environments/` folder, or elsewhere,
-where the release reads it into the snapshot after vetting the file and its folder. `serve` parses
+where the release reads it into the snapshot after vetting the file, its folder, and the folder of
+each link along a chain of file links from it. A value file it cannot read refuses the reload,
+released or not, rather than being read again from disk. `serve` parses
 it from the same snapshot, so an edit to it during the load does not apply, and a value file
 created or removed since the snapshot is refused. Every engine shard and cluster node shares one
 config directory by contract, and is expected to read the same value file too. Nothing checks
@@ -2610,10 +2612,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
-- a value file read from disk on a network share the engine cannot reach would read as absent, not
-  as a fault, so an `env()` reference with a default would take that default, with no refusal. A
-  config directory on a drive letter this process does not have reads as absent too, even where the
-  letter is mapped in another session;
+- a value file, or a config directory, on a drive letter this process does not have reads as
+  absent, not as a fault, even where the letter is mapped in another session. For a value file an
+  `env()` reference with a default then takes that default, with no refusal. A share Windows
+  reports it cannot reach (errors 53 and 67) is a fault, and a start or a reload that reads the
+  value file there is refused;
 - a DR backup bundle's config digest is a separate, ordinary read, not the digest above, and it
   can be partial. `include_config` under
   [`[backup]`](CONFIGURATION.md#backup--scheduled-dr-backup--restore-verify) gives at least part

@@ -122,11 +122,13 @@ what was decided on its date.
 *Amended 2026-11-03 (vault BACKLOG #2596, the rest of step 1): the scheme is now `mefor-cfg-fp:v4`.*
 The value file the engine's value provider reads, `<base_dir>/<dir>/<env>.toml` resolved wherever
 `[environments].base_dir` puts it, is read by the path an open resolves and folded into at least
-the approval, reload, provenance and start digests, as `@value-file/<env>.toml` when it is outside
+the approval, reload, provenance and start digests, as `@value-file/<name>` (`<env>.toml` for
+`serve`; a provider may name any file) when it is outside
 the config directory's `environments/` folder: the file name and not the path, so the digest stays
 independent of where the bundle sits. A reload reads it into the snapshot it loads, after vetting
-the file and its folder, and the provider parses those bytes, so a dual-control release checks and
-applies the same value bytes. A start still reads its values when the engine is built, so the start
+the file, its folder and the folder of each link along a chain of file links from it, and the
+provider parses those bytes, so a dual-control release checks and applies the same value bytes. A
+value file the reload cannot read refuses it; one that is not there is folded as absent. A start still reads its values when the engine is built, so the start
 digest reads the file again afterwards and can name later bytes. Every engine shard and cluster
 node is assumed to read the same value file, though nothing checks it and sharing the config
 directory does not share a value file outside it; outside that
