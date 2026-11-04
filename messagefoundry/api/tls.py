@@ -57,6 +57,7 @@ __all__ = [
     "generated_state_dir",
     "plan_api_tls_material",
     "plaintext_upstream_hop_off_loopback",
+    "plaintext_upstream_hop_off_loopback_remedy",
     "plaintext_upstream_hop_unacknowledged",
     "record_generated_pair_replacements",
 ]

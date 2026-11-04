@@ -1808,8 +1808,8 @@ class ApiSettings(_Section):
 
     @property
     def exposure_protected(self) -> bool:
-        """Whether an off-loopback bind is safe: in-process TLS (WP-13a) OR a declared upstream TLS
-        terminator behind trusted proxies (WP-15)."""
+        """Whether in-process TLS (WP-13a) OR a declared upstream TLS terminator behind trusted
+        proxies (WP-15) is configured."""
         return self.tls_enabled or (self.tls_terminated_upstream and bool(self.trusted_proxies))
 
     @property
