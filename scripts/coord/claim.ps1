@@ -39,11 +39,12 @@
     signed text and not part of the signature, has the seat taking the batch read the holder's seat
     record and recent commits first, then release each claim through the path for another
     worktree's claim, `-Release` with `-Force`, which records the release as the next paragraph says.
-    That record has no field for a reason, so it does not show that R8 was the ground. This script
-    still expires nothing by itself: it does not measure the 72 hours or tell a batch's claim from
-    any other. Its refusals name R8 only in the directory-only state; where a session is, or may be,
-    in the claim's worktree, they still say to ask it first. CLAUDE.md section 5 cites the signed
-    text, under R5.
+    That record has no field for a reason, so it does not show that R8 was the ground. Before
+    releasing, read the holder's PR activity too: it is R8's third signal, though that reading names
+    only the seat record and commits. This script still expires nothing by itself: it does not
+    measure the 72 hours or tell a batch's claim from any other. Its refusals name R8 only in the
+    directory-only state; where a session is, or may be, in the claim's worktree, they still say to
+    ask it first. CLAUDE.md section 5 cites the signed text, under R5.
 
     EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
     <git-common-dir>/mefor-coord/claims/.history: at least the key, the releasing worktree and branch,
@@ -198,11 +199,13 @@ function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
 # placed no session in the claim's worktree: 'occupied' has one and says to ask it, 'present' and
 # the undated state could not look, and 'elsewhere' cannot see the holder's unpushed commits. The
 # polarity rule below applies: a missing answer must not earn the pointer. Printed, never acted on:
-# nothing here can tell a batch's claim from another or read R8's three signals.
+# nothing here can tell a batch's claim from another or read R8's three signals. Only what R8 signs
+# sits under the OWNER RULING label; who releases, and how, is the Manager's reading and says so.
 function Write-R8Note {
-    Write-Host "  OWNER RULING R8 (ledger, 2026-11-04) covers one case: a claim held for a batch whose"
-    Write-Host "  holder has shown no seat goal, commit or PR activity for 72 hours returns to FREE, released"
-    Write-Host "  by the seat taking the batch. One worktree's last commit is not R8's test. The header of"
+    Write-Host "  OWNER RULING R8 (ledger, 2026-11-04): a batch whose holder has shown no seat goal, commit"
+    Write-Host "  or PR activity for 72 hours is released to FREE, and its claims with it."
+    Write-Host "  Not part of the ruling: one worktree's last commit is not R8's test, and the Manager's"
+    Write-Host "  reading has the seat taking the batch release the claims. The header of"
     Write-Host "  scripts\coord\claim.ps1 says how."
 }
 

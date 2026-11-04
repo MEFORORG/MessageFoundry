@@ -1081,8 +1081,8 @@ fleet, so never take them*.
   filing mechanics only: a merged PR now files at most one row. `CLAUDE.md` section 5 states the new
   mechanics once, at the end of its merge bullet, so read them there. The 2026-10-31 rulings are
   not recorded in this repository; the vault ledger's banners quote at least the owner's answers
-  *"Merge, file rows"* on engine PRs 2675 and 2676, and *"Merge both, file rows"* on engine PRs
-  2691 and 2671. `CLAUDE.md` section 5 cites the signed text, under R5.
+  *"Merge, file rows (Recommended)"* on engine PRs 2675 and 2676, and *"Merge both, file rows"* on
+  engine PRs 2691 and 2671. `CLAUDE.md` section 5 cites the signed text, under R5.
 
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
