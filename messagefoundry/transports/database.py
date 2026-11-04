@@ -120,10 +120,13 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
     generic_hop_endpoint,
+    is_remote_spelling,
     odbc_keyword_name,
     odbc_param,
+    sqlserver_preset_refusal,
 )
 from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -211,6 +214,10 @@ def _build_dsn(
 ) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
+    It refuses settings under which the driver might not read ``SERVER={server},{port}`` as one
+    host and its port (:func:`~messagefoundry.transports.db_endpoint.sqlserver_preset_refusal`,
+    BACKLOG #4873).
+
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
     ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
     authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
@@ -229,13 +236,17 @@ def _build_dsn(
     reads it, it changes nothing. A statement guard is a shape test on text. The control that
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
+    where = hop_name_prefix(connection)
+    refusal = sqlserver_preset_refusal(s)
+    if refusal is not None:
+        raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
         attested=attested, posture=current_hop_posture()
     ):
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE connection TLS is weakened "
+            f"{where}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
             "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
             f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
@@ -244,24 +255,27 @@ def _build_dsn(
             "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
             "the default, or with no posture)."
         )
-    if (trust or not encrypt) and attested:
-        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
-        raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
+        raise ValueError(f"{where}DATABASE auth must be sql|integrated|entra, got {auth!r}")
     # SERVER must be emitted UNBRACED so the driver parses the ",port" suffix and resolves the host for
     # the TLS handshake — a brace-quoted "SERVER={host},port" is malformed ODBC (content after the
     # closing brace) and breaks certificate handling against a real SQL Server. So the host is
     # *validated* for connection-string metacharacters instead of brace-quoted (the guard used for every
     # other free-text value), exactly like the store backend's connection_string.
     server = str(s["server"])
-    if any(ch in server for ch in ";{}=\r\n"):
+    # Not printable covers a newline, a tab and a NUL, which a driver manager may read as the end
+    # of the string, dropping the port and the TLS tail after it.
+    if any(ch in server for ch in ";{}=") or not server.isprintable():
         raise ValueError(
-            "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', or a control "
+            "character (ODBC injection risk)"
         )
-    port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
+    port = port_setting(
+        s.get("port", SQLSERVER_DEFAULT_PORT), transport=f"{where}DATABASE connection"
+    )
     parts = [
-        f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
+        f"DRIVER={odbc_brace(str(s.get('odbc_driver', SQLSERVER_DEFAULT_DRIVER)))}",
         f"SERVER={server},{port}",
         f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
@@ -278,7 +292,12 @@ def _build_dsn(
         # Advertise read-only intent; the docstring says who asks for it. Not a TLS keyword, so it
         # goes in the head, before the TLS tail (messagefoundry.odbc_dsn).
         parts.append("ApplicationIntent=ReadOnly")
-    return odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
+    dsn = odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
+    # Last, once every refusal above has passed, so a connection this builder refuses leaves no
+    # audit line saying its weakened hop was permitted.
+    if (trust or not encrypt) and attested:
+        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
+    return dsn
 
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
@@ -699,13 +718,6 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     )
 
 
-def _is_remote_spelling(value: object) -> bool:
-    """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
-    can name another host. The spelling only; :func:`names_another_host` adds the Windows check."""
-    text = str(value).strip()
-    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
-
-
 #: ``GetDriveTypeW`` answers: a mapped network drive, no volume at that letter, and an unknown type.
 _DRIVE_REMOTE = 4
 _DRIVE_NO_ROOT_DIR = 1
@@ -799,7 +811,7 @@ def _windows_path_verdict(
             raise _PathEnds from None
         if target is not None:
             text = target.strip()
-            if _is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
+            if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
                 raise _LeavesHost
             if text[:1] in "\\/" and text.lstrip("\\/").split("\\")[0].lower() in _NT_OBJECT_ROOTS:
                 raise OSError("the link names an NT object path")  # the walk reports it: unclear
@@ -822,9 +834,9 @@ def _windows_path_verdict(
     return False
 
 
-#: A link target :func:`_is_remote_spelling` matches that :func:`_windows_path_verdict` does not
+#: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
 #: count as leading off the host: two separators, ``?`` or ``.``, a separator, then a drive letter
-#: or ``Volume{``. Any other link target :func:`_is_remote_spelling` matches is counted as leading
+#: or ``Volume{``. Any other link target :func:`is_remote_spelling` matches is counted as leading
 #: off the host.
 _LOCAL_DEVICE_TARGET = re.compile(r"[\\/]{2}[?.][\\/](?:[A-Za-z]:|[Vv]olume\{)")
 
@@ -861,7 +873,7 @@ def file_keyword_verdicts(value: object) -> FileVerdicts:
         return {}
     raw = str(value)
     return {
-        p: True if _is_remote_spelling(p) else _path_verdict(p)
+        p: True if is_remote_spelling(p) else _path_verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
         if p
     }
@@ -3892,7 +3904,13 @@ class DatabaseLookupExecutor:
             attested = hop_attestation_from_settings(s)
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
-            self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
+            self._dsn[cname] = _build_dsn(
+                dict(s),
+                read_only=True,
+                attested=attested,
+                # Named as the loosening reports name a lookup, so a refusal matches its row.
+                connection=f"db_lookup:{cname}",
+            )
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )

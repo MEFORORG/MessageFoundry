@@ -8,8 +8,9 @@ The two dialects send the port by different routes. The SQL Server preset writes
 setting into ``SERVER={server},{port}``. The generic dialect writes ``SERVER={server}`` and never
 reads ``port``, so the only port it sends as a port is the ``PORT`` keyword in ``odbc_params``. An
 allowlist entry that pins a port means something only while the check reads the port the connection
-string sends, so :func:`database_dial_endpoint` reads it per dialect. What a driver does with that
-string is outside this module: docs/CONNECTIONS.md says so once.
+string sends, so :func:`database_dial_endpoint` reads it per dialect, and the preset refuses some
+driver names and ``server`` values (:func:`sqlserver_preset_refusal`). What a driver does with
+that string is outside this module: docs/CONNECTIONS.md says so once.
 
 A leaf module on purpose. :mod:`messagefoundry.transports.egress` and
 :mod:`messagefoundry.transports.database` both read it, and it imports neither, so neither has to
@@ -18,6 +19,7 @@ import the other to share it. It imports nothing outside the standard library.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
@@ -132,8 +134,8 @@ class DialEndpoint(NamedTuple):
     #: matches an entry that names no port, and never one that pins a port.
     port: int | None
     #: Why the reading itself refuses the hop, or ``None``. Set when a generic ``server`` holds a
-    #: comma or a port, or ``odbc_params`` gives the ``PORT`` keyword more than once or with a
-    #: leading zero.
+    #: comma or a port, when ``odbc_params`` gives the ``PORT`` keyword more than once or with a
+    #: leading zero, or when the SQL Server preset refuses the driver or the ``server``.
     conflict: str | None = None
     #: What the author should do when ``port`` is ``None`` and an entry pins a port, written to
     #: lead the refusal: the setting this dialect and driver read a port from.
@@ -145,16 +147,113 @@ class DialEndpoint(NamedTuple):
 #: name with none of these words reads no port, whatever driver it names.
 _PORT_KEYWORD_DRIVERS = ("postgres", "psqlodbc", "mysql", "mariadb")
 
-#: Words that mark a Microsoft SQL Server driver, which ignores ``PORT``. They win over the words
-#: above, so a name holding both reads no port.
+#: Words that mark a Microsoft SQL Server driver, which ignores ``PORT``. On the generic dialect
+#: they win over the words above, so a name holding both reads no port. The SQL Server preset
+#: reads whole names instead (:data:`_PRESET_DRIVER_NAMES`).
 _SQLSERVER_DRIVER_WORDS = ("msodbcsql", "sql server")
 
+#: The driver the SQL Server preset names when ``odbc_driver`` is not set.
+SQLSERVER_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
 
-def _sqlserver_driver_name(name: object) -> bool:
-    """Whether ``odbc_driver``, as written, names a SQL Server driver
-    (:data:`_SQLSERVER_DRIVER_WORDS`)."""
-    folded = odbc_keyword_name(str(name or ""))
-    return any(word in folded for word in _SQLSERVER_DRIVER_WORDS)
+#: The ``odbc_driver`` names the SQL Server preset accepts, whole, in lower case and spelled with
+#: single spaces: Microsoft's registered names for its ODBC Driver (``13.1`` included) and its SQL
+#: Server Native Client. Whole names on purpose. The password escape list in
+#: :mod:`messagefoundry.transports.database` is a separate list, and holds neither ``13.1`` nor
+#: the Native Client. Why another name is refused is in
+#: docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds* (BACKLOG #4873).
+_PRESET_DRIVER_NAMES = re.compile(
+    r"odbc driver [0-9]+(?:\.[0-9]+)? for sql server|sql server native client [0-9]+(?:\.[0-9]+)?"
+)
+
+#: The file name, in lower case, of the Microsoft ODBC Driver library, for an ``odbc_driver`` given
+#: as a path: ``libmsodbcsql-18.3.so.3.1`` on Linux, ``libmsodbcsql.18.dylib`` on macOS and
+#: ``msodbcsql18.dll`` on Windows. Only the file name is read, in any case; the directories are
+#: not. docs/CONNECTIONS.md says what a name cannot tell about the library that loads.
+#: The digits inside a repeated group are possessive (``++``), so a failed match never retries
+#: them along another split, and the ReDoS gate in tests/test_security_static.py passes it.
+_PRESET_DRIVER_LIBRARIES = re.compile(
+    r"libmsodbcsql[-.][0-9]+(?:\.[0-9]++)*\.(?:so|dylib)(?:\.[0-9]++)*|msodbcsql[0-9]+\.dll"
+)
+
+
+def is_remote_spelling(value: object) -> bool:
+    """Whether the trimmed ``value`` starts with two separators, or with a device prefix such as
+    ``\\\\?\\`` or ``\\??\\``, and so can name another host. The spelling only;
+    :func:`messagefoundry.transports.database.names_another_host` adds the Windows check."""
+    text = str(value).strip()
+    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
+
+
+#: The characters the SQL Server preset refuses anywhere in ``odbc_driver`` (BACKLOG #4873): the
+#: ``;{}`` the generic dialect refuses in its driver, and ``=``, which it refuses in the values it
+#: sends unbraced. The driver is sent braced with the ``}}`` escape, and no probe has measured a
+#: driver manager reading that escape, or ``=``, inside a braced ``DRIVER`` value, so a library
+#: path's directories may not hold them either.
+_PRESET_DRIVER_REFUSED = ";{}="
+
+
+def _holds_preset_delimiter(name: object) -> bool:
+    """Whether ``odbc_driver`` holds any of :data:`_PRESET_DRIVER_REFUSED`."""
+    text = str(name or "")
+    return any(ch in text for ch in _PRESET_DRIVER_REFUSED)
+
+
+def _preset_driver(name: object) -> bool:
+    """Whether the SQL Server preset accepts ``odbc_driver``, as written: a whole name in
+    :data:`_PRESET_DRIVER_NAMES`, or a path whose file name is in
+    :data:`_PRESET_DRIVER_LIBRARIES`, in any case.
+
+    Blanks are NOT folded, unlike :func:`odbc_keyword_name` (docs/CONNECTIONS.md says why). The
+    text must be ASCII, which refuses a no-break space, and printable, which refuses a tab and the
+    ``\\x1c`` to ``\\x1f`` separators ``str.split`` reads as blanks, and must hold none of
+    :data:`_PRESET_DRIVER_REFUSED`. The strip test is for a path: the file-name pattern does not
+    see a blank that leads its directory. A path :func:`is_remote_spelling` matches, a UNC or
+    device path, or one holding ``://`` is refused: it can name a library on another host. A
+    mapped drive or a mount is not visible here."""
+    text = str(name or "")
+    if not (text.isascii() and text.isprintable()) or text != text.strip():
+        return False
+    if _holds_preset_delimiter(text) or is_remote_spelling(text) or "://" in text:
+        return False
+    lowered = text.lower()
+    return bool(
+        _PRESET_DRIVER_NAMES.fullmatch(lowered)
+        or _PRESET_DRIVER_LIBRARIES.fullmatch(re.split(r"[\\/]", lowered)[-1])
+    )
+
+
+def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
+    """Why the SQL Server preset refuses to send ``SERVER={server},{port}`` for ``settings``, or
+    ``None`` (BACKLOG #4873). The connection-string build and the ``[egress].allowed_db`` check
+    both call it, so the egress check refuses the driver and ``server`` the build refuses here. It
+    does not make the build's other refusals, at least of ``auth`` and of the delimiters in
+    ``server``: those the build alone refuses.
+
+    It refuses an ``odbc_driver`` that fails :func:`_preset_driver`, and a ``server`` holding a
+    comma or a ``\\``. Why each is refused, and what a name cannot tell, is stated once in
+    docs/CONNECTIONS.md, *The port an ``allowed_db`` entry binds*. Short, remedy first: a stored
+    failure keeps about its first 200 characters."""
+    driver = settings.get("odbc_driver", SQLSERVER_DEFAULT_DRIVER)
+    # Its own text, ahead of the check below that also refuses it.
+    if _holds_preset_delimiter(driver):
+        return "odbc_driver must not hold ';', '{', '}' or '=' (ODBC injection risk)"
+    if not _preset_driver(driver):
+        return (
+            'name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect="generic": '
+            "another driver can misread the server,port the preset sends"
+        )
+    server = str(settings.get("server", ""))
+    if "," in server:
+        return (
+            "name one host in server and put the port in the port setting: server holds a "
+            "comma, and the SQL Server preset adds its own ,port"
+        )
+    if "\\" in server:
+        return (
+            "name the host alone in server and set port to the instance's port: the preset "
+            "sends the port, so the instance name in server is not what is dialled"
+        )
+    return None
 
 
 def _reads_port_keyword(name: object) -> bool:
@@ -166,7 +265,7 @@ def _reads_port_keyword(name: object) -> bool:
     its driver, such as a path holding ``mysql`` to a library that ignores ``PORT``, is outside what
     this check can catch."""
     folded = odbc_keyword_name(str(name or ""))
-    return not _sqlserver_driver_name(name) and any(
+    return not any(word in folded for word in _SQLSERVER_DRIVER_WORDS) and any(
         word in folded for word in _PORT_KEYWORD_DRIVERS
     )
 
@@ -180,7 +279,8 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     Server preset, whatever ``settings`` say.
 
     **The SQL Server preset** sends ``SERVER={server},{port}``, so the ``port`` setting is the port
-    sent, defaulting to 1433 as the connection string does, read as :func:`_preset_port` says.
+    sent, defaulting to 1433 as the connection string does, read as :func:`_preset_port` says. A
+    driver or a ``server`` the preset refuses (:func:`sqlserver_preset_refusal`) is a conflict.
 
     **The generic dialect** sends ``SERVER={server}`` and never reads the ``port`` setting, so it is
     ignored here. The port is the ``PORT`` keyword's, the one value the connection string sends as a
@@ -194,13 +294,17 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     engine knows reads ``PORT`` (:func:`_reads_port_keyword`, which says what a name cannot tell).
     The factory default, ``ODBC Driver 18 for SQL Server``, is one: the SQL Server drivers ignore
     ``PORT`` and dial their own default, and the generic dialect gives them no way to send a port,
-    so for a SQL Server name the remedy names the SQL Server preset.
+    so for a name the preset accepts the remedy names the SQL Server preset.
 
     The host is the whole ``server`` text on both dialects, as the check read it before this
     change, so an entry is matched on its host as written."""
     host = str(settings.get("server", ""))
     if dialect.lower() != "generic":
-        return DialEndpoint(host, _preset_port(settings.get("port", SQLSERVER_DEFAULT_PORT)))
+        return DialEndpoint(
+            host,
+            _preset_port(settings.get("port", SQLSERVER_DEFAULT_PORT)),
+            conflict=sqlserver_preset_refusal(settings),
+        )
     params = settings.get("odbc_params")
     # A table that is not a mapping is the build's own refusal; read it as giving no keyword.
     keywords = [
@@ -240,7 +344,9 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
         )
     driver = settings.get("odbc_driver")
     if not _reads_port_keyword(driver):
-        sqlserver = _sqlserver_driver_name(driver)
+        # Point at the preset only for a name the preset accepts, so neither dialect's remedy
+        # names the other for a mixed name that both refuse.
+        sqlserver = _preset_driver(driver)
         return DialEndpoint(
             host,
             None,

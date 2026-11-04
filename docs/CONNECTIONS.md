@@ -1729,6 +1729,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
+| `odbc_driver` | `ODBC Driver 18 for SQL Server` | the ODBC driver name. On the SQL Server preset it must name a Microsoft SQL Server driver, or the connection is refused (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
@@ -1808,8 +1809,59 @@ dialects send it differently (vault BACKLOG #2704):
 | `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. |
 
 **The check compares the port the connection string sends, not the port the driver opens.** A
-driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `SERVER`, connects
-to its own default port, and the check cannot see that. Check that your driver reads the keyword.
+driver that ignores `PORT` connects to its own default port, and the check cannot see that. Check
+that your driver reads the keyword. The preset refuses a driver name that is not Microsoft's, as
+below.
+
+**On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
+string is built and by the egress check (BACKLOG #4873). This holds for every factory that builds
+the preset, at least `Database`, `DatabasePoll`, `DatabaseLookup` and `DatabaseRef`. The egress
+check reads the refusal only for a host an `[egress].allowed_db` entry names. It refuses any other
+host as unlisted. Under the audited opt-out with an empty list, the build alone refuses. When
+each runs:
+
+- For `Database`, `DatabasePoll` and `DatabaseLookup`, both run when the engine starts or
+  reloads. They also run in `messagefoundry check` where its build leg runs, with a
+  `messagefoundry.toml` or `MEFOR_AI_ENVIRONMENT`.
+- For a `DatabaseRef`, both run at each sync, and the first sync runs at start. The build also
+  runs at a reload, a dry run included, and in that `messagefoundry check` leg, once its `env()`
+  values resolve. So each case below still fails there. The egress check runs only at sync.
+
+The preset sends `SERVER=<server>,<port>`, and the port pin and the host match assume the driver
+reads `,<port>` as the port and the text before it as one host. psqlODBC does not: it passes
+`SERVER` to libpq, which reads a comma as a list of hosts. There the port would be read as a
+second host name, which can resolve as a numeric address, and a comma in `server` could name any
+host.
+
+- The `odbc_driver` must be one of Microsoft's ODBC Driver or SQL Server Native Client names,
+  whole, in any case: `ODBC Driver <n> for SQL Server` or `SQL Server Native Client <n>`. Here
+  `<n>` is a version such as `18`, `13.1` or `11.0`.
+- Blanks are read as written: one space between words, none at either end, and no tab or other
+  control character. The driver manager looks a name up as written, and another spelling can be
+  a separate alias. The whole text must be ASCII, a path's directories included, so a library
+  under a folder with a non-ASCII name is refused.
+- A path is accepted when its file name, in any case, is the Microsoft ODBC Driver library:
+  `libmsodbcsql-18.so`, `libmsodbcsql.18.dylib` or `msodbcsql18.dll`, with a version suffix
+  allowed, and either separator before the version on Linux and macOS. A bare file name with no
+  directory is accepted too, and the loader then finds it on its own search path. A path that opens with two separators or a device prefix, such as a UNC path or
+  `\??\UNC\`, or holds `://` is refused, since it can name a library on another host.
+- The preset's `odbc_driver` may hold no `;`, `{`, `}` or `=`, anywhere in a path included. The
+  driver is sent braced, but whether every driver manager reads the brace escape there is
+  unmeasured, and an unread one would let the rest of the path add keywords to the connection
+  string.
+- Any other name is refused. That is at least a mixed name such as `PostgreSQL via SQL Server
+  gateway`, a vendor driver that names SQL Server, FreeTDS, and the bare legacy `SQL Server`. On
+  Linux that last name is commonly a FreeTDS alias. FreeTDS reads `,<port>` as the port. But
+  nothing shows it reads the preset's TLS keywords, `Encrypt` and `TrustServerCertificate`. A hop
+  the engine reports as verifying TLS could then not verify.
+- For another driver, use `dialect="generic"` on `Database` or `DatabasePoll`. `DatabaseLookup`
+  and `DatabaseRef` take only a Microsoft driver.
+- `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
+- `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
+  the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
+  dial a port the check never compared. Set `port` to the instance's port.
+
+As on the generic dialect, the engine reads the driver name, not the library it loads.
 
 An entry with no port admits its host at any port. On the generic dialect the egress check
 **refuses** at least these cases for a listed host, at load like every other miss:
@@ -1824,8 +1876,9 @@ An entry with no port admits its host at any port. On the generic dialect the eg
 - The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
   The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
   unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
-  `PORT`, so use `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A
-  host-only entry still admits any driver.
+  `PORT`. For a name the preset accepts, use
+  `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A host-only entry
+  still admits any driver.
 
 The check reads the driver **name** as written, an odbcinst alias or a library path included, and
 cannot see which library that name loads. A name that misdescribes its driver, such as a path
@@ -1835,7 +1888,7 @@ A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at
 so no entry can name it, and it is refused as unlisted.
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
-port compared.
+port compared, and the preset's driver rule above applies to them.
 
 ##### Accepted `odbc_params` keywords
 
