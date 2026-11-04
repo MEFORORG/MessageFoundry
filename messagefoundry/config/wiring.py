@@ -179,6 +179,7 @@ __all__ = [
     "Registry",
     "WiringError",
     "PortConflictError",
+    "StateKeyError",
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
     "resolved_encoding_problems",
@@ -232,6 +233,14 @@ class PortConflictError(WiringError):
     to 422, ``messagefoundry check`` still reports it, and the runner's ADR 0031 per-connection
     isolation still records the offending inbound as failed (the engine comes up DEGRADED rather than
     aborting). Callers that care can still catch the conflict specifically."""
+
+
+class StateKeyError(WiringError):
+    """A :class:`SetState` ``namespace`` or ``key`` that some store backend could not hold exactly.
+
+    A subclass of :class:`WiringError`, so a Handler fault still reaches every existing handler of
+    that error unchanged. The message names the field and the rule, never the text: a state key is
+    often an MRN."""
 
 
 @dataclass(frozen=True)
@@ -4940,6 +4949,14 @@ class Send:
 #: :func:`messagefoundry.config.state.state_get` returns on a hit.
 StateValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 
+#: The longest :class:`SetState` ``namespace`` or ``key``, in UTF-16 code units: SQL Server's
+#: ``state`` columns are ``NVARCHAR(256)``, and a longer bind would fail the handoff there.
+STATE_KEY_MAX_UNITS: Final = 256
+#: The longest ``namespace`` plus ``key``, in UTF-16 code units. ``pk_state`` is SQL Server's
+#: clustered primary key, whose key is capped at 900 bytes, two per code unit. Two full-width
+#: ``NVARCHAR(256)`` columns would be 1024 bytes, so this pair cap, not the column width, binds.
+STATE_KEY_MAX_PAIR_UNITS: Final = 450
+
 
 @dataclass(frozen=True)
 class SetState:
@@ -4960,20 +4977,63 @@ class SetState:
         # Validate at construction so a non-serializable value fails in the author's handler (with a
         # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
         # are the composite PK and must be non-empty strings.
-        # Every message names the field only: namespace, key and value may be PHI.
+        # Every message names the field and the rule, plus the length in UTF-16 code units for a
+        # length refusal and json's reason for a value refusal, never the text: namespace, key and
+        # value may be PHI.
+        # Each key rule below is refused on EVERY backend, though only one backend needs it, so a
+        # feed behaves the same wherever it runs (BACKLOG #1588, #4917).
+        units = 0
         for name, text in (("namespace", self.namespace), ("key", self.key)):
             if not isinstance(text, str) or not text:
-                raise WiringError(f"SetState {name} must be a non-empty string")
-            # BACKLOG #1588: SQL Server pads trailing U+0020 in `=` and the primary key under every
-            # collation, BIN2 included, so 'k' and 'k ' would be one stored row there and two cache
-            # entries. Refused on every backend so a feed behaves the same wherever it runs.
+                raise StateKeyError(f"SetState {name} must be a non-empty string")
+            # SQL Server pads trailing U+0020 (the `state` DDL comment in store/sqlserver.py), so
+            # 'k' and 'k ' would be one stored row there and two cache entries.
             if text.endswith(" "):
-                raise WiringError(f"SetState {name} must not end with a space")
+                raise StateKeyError(f"SetState {name} must not end with a space")
+            # Postgres TEXT cannot hold U+0000, so the handoff INSERT would fail there.
+            if "\x00" in text:
+                raise StateKeyError(f"SetState {name} must not contain U+0000 (NUL)")
+            # NVARCHAR counts UTF-16 code units. ASCII is one unit per char, so the usual MRN-style
+            # key skips the encode. A strict encode refuses a lone surrogate (U+D800..U+DFFF): no
+            # backend stores one, and cell_aad's UTF-8 encode would raise it inside the handoff, a
+            # store error the runner retries rather than a content fault it dead-letters. A key
+            # already over the limit in code points is refused unencoded: each is at least a unit,
+            # so a huge content-derived key costs no copy.
+            at_least = ""
+            if text.isascii():
+                field_units = len(text)
+            elif len(text) > STATE_KEY_MAX_UNITS:
+                field_units, at_least = len(text), "at least "
+            else:
+                lone_surrogate = False
+                try:
+                    field_units = len(text.encode("utf-16-le")) // 2
+                except UnicodeEncodeError:
+                    # Raised outside the handler: the encode error's `.object` is the whole key, so
+                    # it must not ride the chain as __context__ (nor would `from None` stop that).
+                    lone_surrogate = True
+                if lone_surrogate:
+                    raise StateKeyError(
+                        f"SetState {name} must not contain a lone surrogate (U+D800..U+DFFF)"
+                    )
+            if field_units > STATE_KEY_MAX_UNITS:
+                raise StateKeyError(
+                    f"SetState {name} is {at_least}{field_units} UTF-16 code units; the limit is "
+                    f"{STATE_KEY_MAX_UNITS}"
+                )
+            units += field_units
+        if units > STATE_KEY_MAX_PAIR_UNITS:
+            raise StateKeyError(
+                f"SetState namespace and key together are {units} UTF-16 code units; the limit is "
+                f"{STATE_KEY_MAX_PAIR_UNITS}"
+            )
         import json
 
         try:
             json.dumps(self.value)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
+            # RecursionError: a value nested past the interpreter's depth. Converted like the others
+            # so the Handler sees the documented WiringError, not a bare interpreter fault.
             reason = str(exc)
         else:
             return
