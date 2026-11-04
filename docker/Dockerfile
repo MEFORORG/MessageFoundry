@@ -34,22 +34,27 @@
 # rebuild. The pin also freezes the base's Debian packages: a fix reaches the image only when that
 # digest moves, and a build from an older checkout keeps that checkout's digest.
 #
-# CA STORES, INSPECTED 2026-10-26 FOR linux/amd64 ONLY (BACKLOG #3905, GHSA-6q48-6c7w-9gw2). The
-# base holds at least three CA bundles no lock controls: Debian's ca-certificates in /etc/ssl/certs,
-# the certifi the system pip vendors, and the same inside the ensurepip pip wheel, which is where
-# the pip that `python -m venv` puts in /opt/venv comes from. The digest inspected was
-# sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1, not the one pinned
-# below. The digest before it carried "emSign ECC Root CA - G3" in all three; 9974e245 carried it
-# in none (ca-certificates 20250419~deb12u2, pip 26.2.2). The certifi installed into /opt/venv is
-# the locked one in docker/locks/.
+# CA STORES (BACKLOG #3905, GHSA-6q48-6c7w-9gw2). The base holds at least three CA bundles no
+# lock controls: Debian's ca-certificates in /etc/ssl/certs, the certifi the system pip vendors,
+# and the same inside the ensurepip pip wheel, which is where the pip that `python -m venv` puts in
+# /opt/venv comes from. The certifi installed into /opt/venv is the locked one in docker/locks/.
 #
-# The pinned digest, sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527, was
-# NOT inspected for CA bundles. The Lander's review of engine PR 2778 on 2026-11-04 compared it
-# against 9974e245 instead: the tag python:3.14-slim-bookworm is unchanged, 516b51cb is the
-# official image for that tag, built from the same docker-library revision, with Python 3.14.10
-# and the same 69 Debian packages at the same versions on linux/amd64, ca-certificates
-# 20250419~deb12u2 among them. That comparison opened no CA bundle. Nothing re-inspects a later
-# digest or another platform: tests/test_container_build_pins.py refuses only the known-bad digests.
+# INSPECTED 2026-10-26, linux/amd64 ONLY: the index
+# sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1 (its amd64 manifest is
+# 0a8fba2d..., per engine PR 2558). It carried "emSign ECC Root CA - G3" in none of the three
+# (ca-certificates 20250419~deb12u2, pip 26.2.2). The digest it replaced, index
+# sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 (amd64 manifest
+# sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf), carried it in all three.
+#
+# NOT INSPECTED: the digest Dependabot moved the pin to on 2026-11-04, index
+# sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 (engine PR 2778). The
+# Lander's review of that PR on 2026-11-04 compared it against 9974e245 instead and recorded: the
+# tag python:3.14-slim-bookworm unchanged, 516b51cb the official image for that tag on that day,
+# built from the same docker-library revision, with Python 3.14.10 and the same 69 Debian packages
+# at the same versions on linux/amd64, ca-certificates 20250419~deb12u2 among them. That comparison
+# opened no CA bundle, and a Debian package list cannot show the two pip-vendored certifi bundles
+# at all. A later digest the pin moves to is inspected by nothing: tests/test_container_build_pins.py
+# refuses only the known-bad digests, so check this block against the FROM line when it moves.
 FROM python:3.14-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
