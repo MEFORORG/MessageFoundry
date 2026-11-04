@@ -1381,6 +1381,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:hmac.compare_digest",
             "compare:via messagefoundry.store.backup_codec",  # BACKLOG #1167: the key_id match
             "csprng:via messagefoundry.store.backup_codec",
+            # BACKLOG #4988: the Windows owner probe's name, unguessable so another account cannot
+            # pre-create every candidate and keep the probe from being made. No key material.
+            "csprng:os.urandom",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.store.backup_codec",

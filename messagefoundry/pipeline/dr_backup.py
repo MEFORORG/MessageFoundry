@@ -1621,7 +1621,7 @@ def _verify_archive_blocking(
             # After the key precheck, so a verify that was never going to stage pays for no scan, and
             # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
             # Inside this block, so even a fault in the sweep still releases this run's directory.
-            _sweep_abandoned_staging(staging_root, owned_like=work.path)
+            _sweep_abandoned_staging(staging_root, owner=work.owner(), own=work.path)
         # A standalone verify holds the decrypted tar and the extracted store at once, each about the
         # archive's size (BACKLOG #1174, PR 1771 defect 3). The backup's own verify is covered by the
         # backup's check, which counts this peak on its staging root.
@@ -2084,24 +2084,49 @@ def _win_security_api() -> Any:
         ctypes.POINTER(wintypes.LPWSTR),
         ctypes.c_void_p,
     ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        pvoid_p,
+        ctypes.c_void_p,
+    ]
     return advapi32
 
 
-def _win_owner_of_handle(handle: int) -> object | None:
-    """The owner SID of the object open as ``handle``, read with ``GetSecurityInfo`` on the handle,
-    never by path, in the form :func:`_owner_of` reports (SDDL, aliases resolved), so the two compare.
-    ``None`` when it cannot be read. The handle needs ``READ_CONTROL``."""
+def _win_sd_as_sddl(descriptor: Any, info: int) -> str | None:
+    """The ``info`` parts of the security descriptor ``descriptor`` as SDDL, or ``None`` (logged)
+    when it cannot be rendered."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the Windows security API runs only on Windows")
     from ctypes import wintypes
 
-    advapi32, kernel32 = _win_security_api(), _win_api()
-    owner_info = 0x00000001  # OWNER_SECURITY_INFORMATION
+    text = wintypes.LPWSTR()
+    if not _win_security_api().ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor, 1, info, ctypes.byref(text), None
+    ):
+        log.warning(
+            "DR staging: a security descriptor could not be rendered as SDDL: Win32 status %d",
+            ctypes.get_last_error(),
+        )
+        return None
+    try:
+        return text.value
+    finally:
+        _win_api().LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _win_handle_sddl(handle: int, info: int) -> str | None:
+    """The ``info`` parts of the security descriptor of the object open as ``handle``, read with
+    ``GetSecurityInfo`` on the handle, never by path, as SDDL. ``None`` (logged) when it cannot be
+    read. The handle needs ``READ_CONTROL``."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
     descriptor = ctypes.c_void_p()
-    status = advapi32.GetSecurityInfo(
+    status = _win_security_api().GetSecurityInfo(
         handle,
         1,  # SE_FILE_OBJECT
-        owner_info,
+        info,
         None,
         None,
         None,
@@ -2109,25 +2134,19 @@ def _win_owner_of_handle(handle: int) -> object | None:
         ctypes.byref(descriptor),
     )
     if status != 0:
-        log.warning("DR staging: GetSecurityInfo could not read an owner: Win32 status %d", status)
+        log.warning("DR staging: GetSecurityInfo could not read a handle: Win32 status %d", status)
         return None
     try:
-        text = wintypes.LPWSTR()
-        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor, 1, owner_info, ctypes.byref(text), None
-        ):
-            log.warning(
-                "DR staging: an owner could not be rendered as SDDL: Win32 status %d",
-                ctypes.get_last_error(),
-            )
-            return None
-        try:
-            sddl = text.value
-        finally:
-            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        return _win_sd_as_sddl(descriptor, info)
     finally:
-        kernel32.LocalFree(descriptor)
-    return _owner_from_sddl(sddl)
+        _win_api().LocalFree(descriptor)
+
+
+def _win_owner_of_handle(handle: int) -> object | None:
+    """The owner SID of the object open as ``handle``, read with ``GetSecurityInfo`` on the handle,
+    never by path, in the form :func:`_owner_of` reports (SDDL, aliases resolved), so the two compare.
+    ``None`` when it cannot be read. The handle needs ``READ_CONTROL``."""
+    return _owner_from_sddl(_win_handle_sddl(handle, 0x00000001))  # OWNER_SECURITY_INFORMATION
 
 
 def _owner_from_sddl(sddl: str | None) -> object | None:
@@ -2658,11 +2677,15 @@ def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
     names the object it created: after a rename swap the name holds someone else's object, which is
     theirs to remove. A swap between that check and the unlink can still remove the swapped-in
     object. A removal that fails is logged and left for the next sweep. Windows:
-    ``NamedTemporaryFile``, opened with ``O_TEMPORARY``, so the file is deleted when its handle
-    closes, wherever a rename has put it by then, and nothing is ever removed by its name."""
+    :func:`_win_create_owner_probe`, created with a protected access list and opened
+    delete-on-close, so the file is deleted when its handle closes, wherever a rename has put it by
+    then, and nothing is ever removed by its name."""
     if sys.platform == "win32":
-        with tempfile.NamedTemporaryFile(prefix=_OWNER_PROBE_PREFIX, dir=root) as probe:
-            yield probe.fileno(), Path(probe.name)
+        fd, probe = _win_create_owner_probe(Path(tempfile.gettempdir()) if root is None else root)
+        try:
+            yield fd, probe
+        finally:
+            os.close(fd)
         return
     fd, name = tempfile.mkstemp(prefix=_OWNER_PROBE_PREFIX, dir=root)
     try:
@@ -2677,6 +2700,92 @@ def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
         except OSError as exc:
             log.warning("DR staging: could not remove owner probe %s: %s", name, safe_exc(exc))
         os.close(fd)
+
+
+def _win_create_owner_probe(directory: Path) -> tuple[int, Path]:
+    """Create the Windows owner probe under ``directory`` and return a descriptor owning its handle,
+    and its path. Raises ``OSError`` when it cannot be created as asked.
+
+    The probe carries, from the ``CreateFileW`` call that creates it, the protected access list
+    :mod:`messagefoundry.restricted_file` writes on a key file: full control for SYSTEM,
+    Administrators and the creating account, and nothing inherited from ``directory``. So no access
+    entry inherited from the staging root gives another account ``WRITE_OWNER`` on it, and none can
+    re-own it before its owner is read and choose the owner the sweep goes by (BACKLOG #4988). The
+    list is read back from the handle before the probe is used, and a probe whose list is not
+    protected, or names an entry the create did not ask for, as on a server that does not apply the
+    list a create asks for, is closed and refused. ``CREATE_NEW`` with
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name already taken, by a file or by a link, and
+    ``FILE_FLAG_DELETE_ON_CLOSE`` deletes the probe when the handle closes, wherever a rename has
+    put it by then."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows owner probe runs only on Windows")
+    import msvcrt
+    from ctypes import wintypes
+
+    from messagefoundry.config.wiring import _win32_config_source_probes
+    from messagefoundry.restricted_file import _expected_access, _protected_sddl
+    from messagefoundry.store.store import _parse_sddl_dacl
+
+    self_sid = _win32_config_source_probes().self_sid
+    if self_sid is None:
+        raise OSError("this process's own account could not be read, so no probe was made")
+    advapi32, kernel32 = _win_security_api(), _win_api()
+    dacl_info = 0x00000004  # DACL_SECURITY_INFORMATION
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = (
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        )
+
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        _protected_sddl(_expected_access(self_sid, ())), 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # The list as Windows renders it, so the read-back below compares like with like.
+        rendered = _win_sd_as_sddl(descriptor, dacl_info)
+        asked = _parse_sddl_dacl(rendered) if rendered is not None else None
+        if asked is None:
+            raise OSError("the probe's access list could not be built")
+        attributes = _SecurityAttributes(
+            ctypes.sizeof(_SecurityAttributes), descriptor.value, False
+        )
+        for _attempt in range(100):
+            probe = directory / f"{_OWNER_PROBE_PREFIX}{os.urandom(8).hex()}"
+            handle = kernel32.CreateFileW(
+                str(probe),
+                0x00020000 | 0x00010000,  # READ_CONTROL, for the owner read; DELETE, for the close
+                0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                ctypes.byref(attributes),
+                1,  # CREATE_NEW
+                # FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE
+                0x00000100 | _WIN_OPEN_REPARSE_POINT | 0x04000000,
+                None,
+            )
+            if handle is not None and handle != ctypes.c_void_p(-1).value:
+                break
+            error = ctypes.get_last_error()
+            if error not in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS: another name
+                raise ctypes.WinError(error)
+        else:
+            raise FileExistsError(f"no free owner probe name under {directory}")
+    finally:
+        kernel32.LocalFree(descriptor)
+    try:
+        sddl = _win_handle_sddl(handle, dacl_info)
+        got = _parse_sddl_dacl(sddl) if sddl is not None else None
+        if got is None or not got.protected or not set(got.aces) <= set(asked.aces):
+            raise OSError(
+                f"owner probe in {directory} does not carry the protected access list it was "
+                "created with, so its owner is not read"
+            )
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY), probe
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
 
 
 def _probe_owner(root: Path | None) -> object | None:
@@ -2817,7 +2926,7 @@ def _owner_of(path: Path) -> object | None:
     return _owner_from_sddl(_read_dacl_sddl(path, owner=True))
 
 
-def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
+def _sweep_abandoned_staging(root: Path, *, owner: object | None, own: Path) -> int:
     """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
 
     A directory is removed only when its lock file exists, its lock can be taken, and it holds the
@@ -2826,20 +2935,22 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
     never consulted. Returns how many directories were removed.
 
-    ``owned_like`` names a directory this run just created, and only a directory with its owner is a
-    candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
-    standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
+    ``own`` names a directory this run just created, left alone, and only a directory with ``owner``
+    is a candidate; nothing is swept when ``owner`` is ``None``, an owner that could not be read. It
+    is required (BACKLOG #2420). A standalone verify passes, for the OS temp dir, which can be
+    shared, :meth:`_Staging.owner` of its own directory: the owner of the lock file it created
+    there, read from its descriptor, never by path, so a rename in ``root`` cannot choose it
+    (BACKLOG #4988). A backup sweeps both the OS
     temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
     with :func:`_sweep_owned` by the same rule: the staging root keyed on the owner a probe there
     gets (:func:`_probe_owner`), or on the process's owner only as :func:`_fallback_root_owner`
     allows, and the OS temp dir on :func:`_process_owner`.
     Another account could plant a directory in either holding a lock file and a marker, and the
     teardown must never run on a tree it controls."""
-    owner = _owner_of(owned_like)
     if owner is None:
-        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
+        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", own, root)
         return 0
-    return _sweep_owned(root, owner, own=owned_like)
+    return _sweep_owned(root, owner, own=own)
 
 
 def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
