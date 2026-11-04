@@ -3,8 +3,7 @@
 """A failed inbound TLS handshake the EVENT LOOP ran leaves a record (vault BACKLOG #3302).
 
 Before #3302 the HTTP intake listener and the API recorded none on any loop, and the MLLP listener
-none on uvloop, where the loop then ran its handshakes; since BACKLOG #1606 the MLLP listener runs
-its own there. Each surface below fails a real handshake and reads the record, and each has a
+none on uvloop. Each surface below fails a real handshake and reads the record, and each has a
 control that completes one and reads none. The MLLP case runs on uvloop where it is installed
 (CI's Linux legs) and, everywhere, on the stdlib loop forced onto the same accept-loop path uvloop
 takes.
@@ -632,7 +631,7 @@ async def _mllp_accept_loop_scenario(tmp_path: Path) -> None:
     source.on_connection_event = events
     await source.start(_ack)
     try:
-        assert source._upgrade_tls is False  # `_AcceptingServer` runs the handshake here
+        assert source._upgrade_tls is False
         # The control: a real TLS sender gets a message through and no failure is recorded.
         dest = MLLPDestination(
             Destination(
