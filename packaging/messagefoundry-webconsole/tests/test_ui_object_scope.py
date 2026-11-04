@@ -80,6 +80,39 @@ async def test_ui_flag_refuses_a_connection_outside_the_scope(engine: Engine) ->
         assert len(await engine.store.list_audit(actor="dep", action="auth.channel_denied")) == 1
 
 
+async def test_ui_flag_bad_direction_from_a_scoped_caller_is_the_audited_403(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3378: a direction other than inbound or outbound used to answer 404 before the JSON
+    handler's scope check, so a scoped caller's probe wrote no denial row. It now gets the audited
+    403 every other target outside its scope gets, naming the probed connection, even one its scope
+    lists. An all-channels caller still gets the 404, with no denial row."""
+    service = await auth_service(engine)
+    await _scoped(service, "dep", Role.DEPLOYMENT, ["IB_A"])
+    await provision(service, "wide", [Role.DEPLOYMENT.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "dep")
+        for name in ("IB_A", "IB_B"):
+            r = await c.post(
+                f"/ui/connections/{name}/flag",
+                data={"direction": "sideways", "flagged": "true"},
+                headers=SAME_ORIGIN,
+            )
+            assert r.status_code == 403, (name, r.status_code, r.text[:300])
+        rows = await engine.store.list_audit(actor="dep", action="auth.channel_denied")
+        assert sorted(row["channel_id"] for row in rows) == ["IB_A", "IB_B"]
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "wide")
+        r = await c.post(
+            "/ui/connections/IB_A/flag",
+            data={"direction": "sideways", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 404, r.text[:300]
+        assert await engine.store.list_audit(actor="wide", action="auth.channel_denied") == []
+    assert await engine.store.list_connection_flags() == set()
+
+
 async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) -> None:
     # The page shows each rule's connection, not its id, so the connection names are the markers.
     rules = AlertsSettings(

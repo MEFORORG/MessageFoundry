@@ -96,8 +96,12 @@ from messagefoundry.api.header_floor import (
     hsts_notable,
     refuse_websocket,
 )
+from messagefoundry.api.message_scope import (
+    CONNECTION_DENIED_DETAIL,
+    get_scoped_message,
+    read_scoped_message,
+)
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
-from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -5549,7 +5553,7 @@ def create_app(
         # A name that fails the connection-name rule is recorded with no channel by the audit
         # helper itself (BACKLOG #3031).
         await _audit_channel_denied(engine, identity, name, client)
-        raise HTTPException(403, "not authorized for this connection")
+        raise HTTPException(403, CONNECTION_DENIED_DETAIL)
 
     async def _resolve_connection(
         engine: Engine,
@@ -5787,7 +5791,15 @@ def create_app(
 
         A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
         other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
-        engine looks the name up, so a 200 against a 409 cannot tell it which names exist."""
+        engine looks the name up, so a 200 against a 409 cannot tell it which names exist.
+
+        The test is written here rather than through :func:`_resolve_connection`, which the other
+        per-name routes share, because the two ask whether a name exists in different sets
+        (BACKLOG #3378). Those routes act on this process's runner, so they read its own inbounds.
+        The flag lives in the store, so this one reads ``inbound_names()``, every inbound in the
+        deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
+        give the same refusal for an outbound and for a name outside the scope; a change to one of
+        those rules has to be made in both places."""
         rr = engine.registry_runner
         if identity.allowed_channels is not None and (
             req.direction != "inbound"
@@ -9603,8 +9615,14 @@ def create_app(
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
+        Such a caller also gets every rule's ``id`` as null (BACKLOG #3378). The id is the
+        operator's free-text label, so whoever writes ``[alerts]`` can put any connection name in
+        it, and nothing here can tell a label that names one from a label that does not. Shown, on
+        a first deployment it would hand a scoped caller a name outside its scope that the two
+        fields above were filtered to hide. An all-channels caller still reads every id.
+
         A read that withholds at least one rule writes an audit row; see
-        :func:`_audit_alert_rules_withheld`."""
+        :func:`_audit_alert_rules_withheld`. A withheld id writes none: the rule itself is shown."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
@@ -9615,6 +9633,7 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
+        show_ids = _user.allowed_channels is None
 
         config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
@@ -9641,7 +9660,8 @@ def create_app(
                     cooldown_seconds=r.cooldown_seconds,
                     # #146: report the COUNT of per-rule recipients, never the addresses (secret-guard parity).
                     recipient_count=len(r.recipients) if r.recipients else 0,
-                    id=r.id,  # #138 — the operator rule label ({rule_id})
+                    # #138 — the operator rule label ({rule_id}); null to a scoped caller (#3378)
+                    id=r.id if show_ids else None,
                     control_action=r.control_action,  # #144 — auto-remediation action
                     control_target=r.control_target,
                     mute=r.mute,  # #143 — static per-rule notification mute

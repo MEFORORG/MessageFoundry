@@ -2113,10 +2113,13 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name the running graph does not have.
+> reaches the engine, which answers 409 for a name the running graph does not have. The web
+> console's twin gives a scoped caller the same 403 and denial row for a direction other than
+> `inbound` or `outbound`; an all-channels caller gets 404 for it (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
+> scope, and `control_target` is unset or in it. Each rule it shows has a null `id`, because the
+> id is free text that can hold any connection name (BACKLOG #3378). When it withholds at least one rule, it writes an
 > `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
 > contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
 > or a defect in `AUDIT_WRITE_DEFECTS` loses, is logged at ERROR and the read still answers. A row

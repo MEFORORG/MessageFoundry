@@ -22,7 +22,7 @@ Why 404 and not 403: a 403 would tell a scoped caller that a message exists in a
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import HTTPException, Request
 
@@ -33,6 +33,12 @@ from messagefoundry.store.cell_tag import CellTagError
 if TYPE_CHECKING:
     from messagefoundry.auth import Identity
     from messagefoundry.pipeline import Engine
+
+
+#: The detail of the one 403 a channel-scoped caller gets for a connection it may not reach
+#: (BACKLOG #2551). Held here, beside the audit it follows, so the API's per-name routes and the web
+#: console's flag route answer with one text (BACKLOG #3378).
+CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
 
 
 async def audit_channel_denied(

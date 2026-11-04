@@ -69,6 +69,12 @@ this line.**
 
 ### Security
 
+- **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
+  /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
+  before the engine handler's scope check, so on a first deployment such a caller's probe there
+  would have left no `auth.channel_denied` row. It now writes that row and answers the 403 the
+  handler gives every other target outside the scope. An all-channels caller still gets the 404.
+  (BACKLOG #3378)
 - **An IPv4 entry that is not one host's address covers nothing.** Engine settings refuse such an
   entry at load: at least all of `0.0.0.0/8`, a multicast address and the reserved class E range.
   The console matched one that reached it another way, so a URL to that address skipped the

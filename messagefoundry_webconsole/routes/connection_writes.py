@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
+from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.api.models import (
     ConnectionFlagRequest,
     PendingApprovalResponse,
@@ -185,6 +186,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         direction = form.get("direction", "")
         if direction not in ("inbound", "outbound"):
+            # BACKLOG #3378: a channel-scoped caller gets the audited refusal the API handler gives
+            # every target outside its scope, never this 404. The 404 returned before that handler's
+            # scope check, so on a first deployment such a caller's probe here would leave no
+            # denial row. A bad direction names no inbound, and a scoped caller may flag only an
+            # inbound, so the refusal is the one it would get for any other non-inbound target.
+            if identity.allowed_channels is not None:
+                await core.audit_channel_denied(engine, identity, name, client_ip(request))
+                raise HTTPException(403, CONNECTION_DENIED_DETAIL)
             raise HTTPException(404, "unknown connection direction")
         req = ConnectionFlagRequest(
             flagged=form.get("flagged") == "true",

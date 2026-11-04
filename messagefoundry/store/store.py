@@ -7779,7 +7779,13 @@ def _security_events_where(username: str, until: float | None) -> tuple[str, lis
     inclusive because a directory account's birth row is written with ``created_at`` as its own
     ``ts``. It is a read filter, so the hash-chained ``audit_log`` is untouched. It does not cover a row that keeps its ``created_at``
     while its name or holder changes: a directory rename onto the name, or a ``provision-admin``
-    repair of an existing row. Rows under the name from before either change still show."""
+    repair of an existing row. Rows under the name from before either change still show.
+
+    Two more residuals, each open rather than accepted (BACKLOG #3378). SQL Server compares
+    ``actor = ?`` under the column's collation, so under a case-insensitive one the feed also shows
+    rows recorded under a case variant of the name. ``ts`` and ``created_at`` are each stamped by
+    the host that wrote them, so on a server store that several hosts share, clock skew between
+    them can move a row across the bound."""
     params: list[Any] = [username, username]
     clause = (
         " WHERE actor = ? AND action LIKE 'auth.%'"
