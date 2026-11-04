@@ -21,7 +21,8 @@ driver module is a stand-in, so what is proved is whether the guard let the comm
   ``warn`` with ``serve``'s WARNING, so the refusal above is the instance's posture and not a
   constant;
 * :func:`test_a_weakened_hop_is_refused` is the weakened-TLS check, which a SQL Server store has
-  too, beside the pin's anchor checks, which these tests do not drive;
+  too, beside the pin's anchor checks, which these tests do not drive
+  (``tests/test_b5000_store_tls_refusal_exit.py`` drives both on ``audit-verify``);
 * :func:`test_warn_keeps_refusing_a_weakened_hop_with_the_escape` and
   :func:`test_warn_keeps_refusing_an_unattested_off_box_vault` hold the no-loosening rule (Manager
   decision d20261031T021248404-699a64): at ``warn`` each command still refuses what it refused with
@@ -183,14 +184,17 @@ def test_a_weakened_hop_is_refused(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The escape is inert at ``enforce``, with a posture as it was with none. The exit is not
-    pinned: this refusal is a bare ``ValueError``, so it reaches the dispatch floor's 1. The reason
-    is pinned, so a refusal for any other cause before the dial does not pass for this one."""
+    """The escape is inert at ``enforce``, with a posture as it was with none. Exit 2, could not
+    start: the refusal is a ``StoreTlsRefused`` since BACKLOG #5000, where it was a bare
+    ``ValueError`` that reached the dispatch floor's 1. The reason is pinned too, so a refusal for
+    any other cause before the dial does not pass for this one.
+
+    Mutation: raise ``ValueError`` again in ``postgres._build_ssl``; every command exits 1."""
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     code = main(_argv(command, shell, server=_REMOTE, enforcement="enforce", weakened=True))
     captured = capsys.readouterr()
     assert not asyncpg.pool_kwargs, "the command crossed a hop serve refuses"
-    assert code != 0
+    assert code == 2, (captured.out, captured.err)
     assert "weakened" in (captured.out + captured.err + caplog.text).lower(), (
         captured.out,
         captured.err,
@@ -215,7 +219,7 @@ def test_warn_keeps_refusing_a_weakened_hop_with_the_escape(
     code = main(_argv(command, shell, server=_REMOTE, enforcement="warn", weakened=True))
     captured = capsys.readouterr()
     assert not asyncpg.pool_kwargs, "the command crossed a weakened hop it refused before"
-    assert code != 0
+    assert code == 2, (captured.out, captured.err)  # could not start (BACKLOG #5000)
     assert "weakened" in (captured.out + captured.err + caplog.text).lower(), (
         captured.out,
         captured.err,

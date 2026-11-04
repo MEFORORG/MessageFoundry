@@ -10205,7 +10205,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     try:
         verdict = run_guarded(run())
     # #1916; #1780: a server database with no store; #2725: no key; #2532: a store hop the posture
-    # refuses. Could not start.
+    # refuses; #5000: a weakened hop or a SQL Server pin the store refuses. Could not start, never
+    # the broken chain's 1.
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -12405,8 +12406,9 @@ def _emit_key_unresolved(exc: Exception, *, as_json: bool) -> int:
 
 class _StoreOpenRefused(RuntimeError):
     """The store open refused, so the command could not start: the key the settings name could not
-    be resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532), or a
-    server store's live schema falls short of this build's DDL batch (BACKLOG #1720). Its text is
+    be resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532) or the
+    hop's own TLS settings refused it (BACKLOG #5000), or a server store's live schema falls short
+    of this build's DDL batch (BACKLOG #1720). Its text is
     the refusal's, which names settings, variables, files, the hop's host, or the tables, columns
     and indexes that differ."""
 
@@ -12492,8 +12494,10 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     one can raise a class caught here was not traced, so read "before a row" as the intent for at
     least the key and the store hop. A malformed key is
     caught as ``StoreCipherConfigError`` and an unrevoked hop as ``InsecureHopRefused``, never as
-    the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal is one of
-    those bare ones, so it still reaches the dispatch floor.
+    the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal, on
+    either server backend, and a SQL Server pin refusal are ``StoreTlsRefused``, an
+    ``InsecureHopRefused``, so they are caught here too (BACKLOG #5000). They were bare, and
+    reached the dispatch floor's 1.
 
     The text goes through ``codec_safe_str``, never ``str(exc)``: a key source's codec error quotes
     a byte of what it decoded, and every caller prints this text.

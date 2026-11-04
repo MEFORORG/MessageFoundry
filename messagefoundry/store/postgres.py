@@ -87,6 +87,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HopPosture,
     RevocationHopGuard,
+    StoreTlsRefused,
     current_hop_posture,
     harden_cipher_suites,
     harden_crl_check,
@@ -1536,7 +1537,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     if (
         settings.trust_server_certificate or not settings.encrypt
     ) and not weakened_tls_escape_permitted(posture):
-        raise ValueError(
+        raise StoreTlsRefused(
             "Postgres TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
             "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "

@@ -92,6 +92,7 @@ __all__ = [
     "HopDisposition",
     "HopPosture",
     "InsecureHopRefused",
+    "StoreTlsRefused",
     "is_vault_hop_refusal",
     "vault_hop_refusal_text",
     "RevocationHopGuard",
@@ -2101,6 +2102,20 @@ class InsecureHopRefused(ValueError):
     A ``ValueError`` subclass so it flows through the existing connector-construction error handling
     (the loader / ``build_check`` surfaces a ``ValueError`` as a ``WiringError``/422 at ``messagefoundry
     check`` / dry-run / reload) with no new except-arms needed."""
+
+
+class StoreTlsRefused(InsecureHopRefused):
+    """The store open refused the engine-to-store hop's own TLS settings (BACKLOG #5000): a
+    weakened hop (``trust_server_certificate`` on or ``encrypt`` off) the escape does not cover,
+    on either server backend, or a SQL Server ``[store].ssl_root_cert`` pin the engine must not
+    send. Raised before the store dials.
+
+    Typed so a command can tell "could not start" from its other errors. It was a bare
+    ``ValueError``, which reached the CLI's dispatch floor and exited 1, the code ``audit-verify``
+    reserves for a broken chain. An :class:`InsecureHopRefused`, so every handler that already
+    reports a refused store hop reports this too, and still a ``ValueError`` for every caller
+    that caught it as one. Its text is the engine's own: the setting, the pin's path and the fix,
+    never a value read from the server."""
 
 
 #: The module that defines the Vault hop's marked refusal; see :func:`is_vault_hop_refusal`.
