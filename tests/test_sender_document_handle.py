@@ -1687,6 +1687,118 @@ async def test_a_stored_document_the_splice_would_alter_is_refused_at_egress(
     assert stored not in str(rows[0]["last_error"])
 
 
+#: Separator sets in ``Message._encoding_chars`` order, ``(field, component, repetition, escape,
+#: subcomponent)``: the ordinary five, and unusual ones, with letters, digits, base64 characters,
+#: a control character and a non-ASCII character among them.
+_SEPARATOR_SETS: list[tuple[str, str, str, str, str]] = [
+    ("|", "^", "~", "\\", "&"),
+    ("#", "F", "~", "\\", "&"),
+    ("|", "A", "1", "/", "="),
+    ("|", "^", "~", "\x01", "&"),
+    ("\x1f", "^", "~", "\\", "&"),
+    ("§", "^", "¶", "\\", "&"),
+    ("|", "+", "~", "!", "一"),
+]
+
+#: Non-ASCII characters the equivalence is also checked on: Latin-1 controls and letters, CJK,
+#: and a character outside the Basic Multilingual Plane.
+_NON_ASCII_SAMPLE = [chr(cp) for cp in (0x80, 0x85, 0x9F, 0xA0, 0xA7, 0xB6, 0xE9, 0xFF)] + [
+    "Δ",
+    "一",
+    "﻿",
+    "\U0001f600",
+]
+
+
+@pytest.mark.parametrize("separators", _SEPARATOR_SETS)
+def test_the_splice_check_agrees_with_the_escape_on_every_character(
+    separators: tuple[str, str, str, str, str],
+) -> None:
+    """The linear check answers exactly what comparing ``Message._escape_leaf``'s output with its
+    input answers, character by character and on whole strings, under ordinary and unusual
+    delimiters (BACKLOG #5099)."""
+    from messagefoundry.parsing.binary import _splice_alters
+
+    singles = [chr(cp) for cp in range(0x80)] + _NON_ASCII_SAMPLE
+    strings = [
+        "",
+        _EVERY_BASE64_CHARACTER,
+        "Q" * 50 + separators[4] + "R" * 50,
+        "plain text 一\U0001f600",
+        "".join(separators),
+        "\t" * 3 + "x",
+        "AB" + separators[3] + "E" + separators[3],
+    ]
+    for value in singles + strings:
+        assert _splice_alters(value, separators) is (
+            Message._escape_leaf(value, *separators) != value
+        ), (separators, value)
+
+
+def test_the_splice_check_is_linear_on_a_hostile_value() -> None:
+    """The detach runs the check on a sender's value before the ACK. The escape it replaces took
+    about 10 s on 4 MiB of ``\\x01``; the check must answer 16 MiB of a control or a delimiter,
+    and clear 16 MiB of base64, well inside a bound no linear scan comes near (BACKLOG #5099)."""
+    import time
+
+    from messagefoundry.parsing.binary import _splice_alters
+
+    separators = ("|", "^", "~", "\\", "&")
+    size = 16 * 1024 * 1024
+    clean = (_EVERY_BASE64_CHARACTER * (size // len(_EVERY_BASE64_CHARACTER) + 1))[:size]
+    for value, alters in (("\x01" * size, True), ("&" * size, True), (clean, False)):
+        started = time.perf_counter()
+        assert _splice_alters(value, separators) is alters
+        assert time.perf_counter() - started < 2.0
+
+
+#: A streaming body with a document under a three-character MSH-2, ``^~\\``. ``Message`` reads
+#: no delimiters from it, so every ``OBX-5.5`` read raises.
+_SHORT_MSH2_DOCUMENT = _hl7(_b64(2000), msh2="^~\\")
+
+
+def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> None:
+    from messagefoundry.parsing.binary import UnreadableDelimitersError
+
+    message = Message.parse(_SHORT_MSH2_DOCUMENT)
+    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+        message._encoding_chars()
+    scan = iter_obx_documents(message, received=_SHORT_MSH2_DOCUMENT)
+    with pytest.raises(UnreadableDelimitersError) as caught:
+        next(scan)
+    assert "^~" not in str(caught.value)
+
+
+async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_before_the_ack(
+    store: MessageStore,
+) -> None:
+    """A streaming body over the threshold whose MSH-2 is shorter than four characters, with no
+    marker for the listener's check to find: the detach's OBX reads raised a plain ValueError
+    that neither listener records. It is refused by name instead, with an ERROR row, an AR on
+    MLLP, a permanent refusal on HTTP and nothing stored (BACKLOG #5099)."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    body = _SHORT_MSH2_DOCUMENT
+    assert DOC_REF_MARKER not in body
+    ic = _streaming_ic()
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "MSH-1 and MSH-2 name no delimiters" in ack
+    assert receipt.refusal is RefusalKind.PERMANENT
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all(
+        "streaming detach failed: UnreadableDelimitersError" in str(r["error"]) for r in rows
+    )
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
 async def test_an_ordinary_base64_document_is_detached_and_spliced_back_byte_identical(
     store: MessageStore,
 ) -> None:

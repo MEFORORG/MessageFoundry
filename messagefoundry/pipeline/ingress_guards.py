@@ -30,7 +30,9 @@ document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a re
 handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
 under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
 document the splice would not set back verbatim
-(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`), each an
+(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX whose
+MSH-1 and MSH-2 name no delimiters
+(:class:`~messagefoundry.parsing.binary.UnreadableDelimitersError`), each an
 ``ERROR`` row on a streaming inbound, which the dry-run never raises because it never detaches. A ``str`` body, which
 only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
 name, and a name that would refuse every received byte body passes. Bytes go through the one name

@@ -62,6 +62,7 @@ from messagefoundry.framing import FrameDecoder
 from messagefoundry.mllpcodec import frame as mllp_frame
 from messagefoundry.parsing import HL7PeekError, Peek, compression
 from messagefoundry.parsing.binary import (
+    UnreadableDelimitersError,
     extract_obx_document,
     iter_obx_documents,
     strip_documents,
@@ -642,7 +643,9 @@ def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> No
     assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         strip_documents(text, pruned_at=0.0)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+    # The detach scan's half is fixed: it refuses the body by name, which both listeners record
+    # (BACKLOG #5099).
+    with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(Message.parse(text), received=text))
     assert _is_short_msh2_shape(text)
     assert not _is_batch_header_shape(text)
@@ -658,7 +661,7 @@ def test_the_batch_header_finding_still_reproduces_through_the_raw_helpers() -> 
     with pytest.raises(HL7PeekError):
         Peek.parse(text)
     message = Message.parse(text)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+    with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         extract_obx_document(message)

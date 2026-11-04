@@ -138,6 +138,7 @@ from messagefoundry.parsing.binary import (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
+    UnreadableDelimitersError,
     UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
@@ -932,8 +933,8 @@ class _StreamBudgetExceeded(Exception):
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. Not every raise: a body the separator read refuses (a registered fuzz known finding,
-#: ``fuzz/targets.py``) still escapes as a bare ``ValueError``.
+#: by one alone. A body with an OBX whose MSH-1 and MSH-2 name no delimiters is one of them,
+#: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
@@ -941,6 +942,7 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
+    UnreadableDelimitersError,
 )
 
 
@@ -8234,7 +8236,9 @@ class RegistryRunner:
         holds an HL7 escape (vault BACKLOG #2809),
         :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
-        delivery's splice would not set back verbatim (BACKLOG #5099) — each, as one of
+        delivery's splice would not set back verbatim, and
+        :class:`~messagefoundry.parsing.binary.UnreadableDelimitersError` for a body with an OBX
+        whose MSH-1 and MSH-2 name no delimiters (BACKLOG #5099) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
@@ -8603,6 +8607,9 @@ class RegistryRunner:
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
                     nak_code, nak_text = "AR", "OBX-5.5 document holds a delimiter or control"
+                elif isinstance(exc, UnreadableDelimitersError):
+                    # The header, not a document: no OBX-5.5 of this body can be read.
+                    nak_code, nak_text = "AR", "MSH-1 and MSH-2 name no delimiters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_code, nak_text = "AR", "document under base64 delimiters"

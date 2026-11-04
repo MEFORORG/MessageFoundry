@@ -268,14 +268,18 @@ from an MSH it cannot always find. They are registered separately because their 
 consequences differ:
 
 * **An MSH-led body whose MSH-2 carries fewer than four encoding characters.** `Peek.parse` and
-  `Message.parse` accept it and `build_ack` answers it `AA`; then `strip_documents`,
-  `iter_obx_documents` and `extract_obx_document` all let the `ValueError` out. The retention
-  document-strip pass calls `strip_documents` with no `try`, so on first deployment one such stored
-  body would abort that pass on every run.
+  `Message.parse` accept it and `build_ack` answers it `AA`; then `strip_documents` and
+  `extract_obx_document` let the `ValueError` out. The retention document-strip pass calls
+  `strip_documents` with no `try`, so on first deployment one such stored body would abort that
+  pass on every run.
 * **An FHS- or BHS-led body with no MSH.** `Peek.parse` refuses it but `Message.parse` accepts it,
-  and `iter_obx_documents` and `extract_obx_document` then raise. A Handler that parsed such a body
+  and `extract_obx_document` then raises. A Handler that parsed such a body
   with `Message.parse` would get a bare `ValueError` from `extract_obx_document` on first deployment,
   not the `BinaryCarriageError` that function documents. `strip_documents` is not affected.
+
+On either shape `iter_obx_documents` no longer lets the `ValueError` out: a body with an OBX whose
+MSH-1 and MSH-2 name no delimiters is its named refusal, `UnreadableDelimitersError`, which the
+over-threshold ingress detach records as `ERROR` (BACKLOG #5099).
 
 Each carve-out swallows an error only when it is a bare `ValueError` with that message AND the input
 has that entry's shape; tests plant a different `ValueError` on each reproducer, and the engine's

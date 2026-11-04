@@ -39,6 +39,7 @@ from messagefoundry.parsing._builtin_hl7 import (
     _SEPARATOR_HEAD,
     _extract_separators,
     _whitespace_end,
+    escape_leaf_alters,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +100,7 @@ __all__ = [
     "InboundDocRefError",
     "NonVerbatimDocumentError",
     "Base64DelimiterError",
+    "UnreadableDelimitersError",
     "UnreattachableDocumentError",
     "encode",
     "decode",
@@ -168,6 +170,14 @@ class NonVerbatimDocumentError(ValueError):
     sender's. Refused at the detach, before anything is stored and before the ACK, as
     :class:`EscapedDocumentError` is. The text names the OBX occurrence only, never a byte of the
     value."""
+
+
+class UnreadableDelimitersError(ValueError):
+    """A received body has an OBX, and its MSH-1 and MSH-2 do not name its delimiters: an MSH-2
+    shorter than four characters, or no MSH at all (BACKLOG #5099). Every ``OBX-5.5`` read raises
+    on such a body, so the ingress detach refuses it by this name, before anything is stored and
+    before the ACK, rather than letting a plain ``ValueError`` out that no listener records. The
+    text names no byte of the body."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -579,12 +589,25 @@ def iter_obx_documents(
     refuse the handle after the ACK. It raises :class:`NonVerbatimDocumentError` when a
     document's own value holds a character the splice would escape under the body's own
     delimiters: a document is detached only if splicing it back under them reproduces it exactly.
-    A Handler that moves ``MSH-2`` afterwards is caught by the re-attach instead.
+    A Handler that moves ``MSH-1`` or ``MSH-2`` afterwards is caught by the re-attach instead.
+
+    It raises :class:`UnreadableDelimitersError` when the body has an OBX and its MSH-1 and MSH-2
+    do not name its delimiters, since no ``OBX-5.5`` can then be read; nothing else in the body is
+    read first.
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
-    value is read again when it is yielded and dropped after. Holding every value until the scan
-    ends would make the peak the sum of the documents."""
+    value is read again when it is yielded and dropped after. No check makes a copy of a value:
+    the marker and splice checks scan it in place. What each read holds beside the value is the
+    copy of its field that the read splits, dropped when the read returns. Holding every value
+    until the scan ends would make the peak the sum of the documents."""
+    if message.count_segments("OBX") and not _delimiters_readable(message):
+        # Every OBX-5.5 read below would raise a plain ValueError, which no listener records;
+        # named here, it is a refusal both of them answer (BACKLOG #5099).
+        raise UnreadableDelimitersError(
+            "the body's MSH-1 and MSH-2 do not name its delimiters, so no OBX-5.5 can be read; "
+            "refusing the detach"
+        )
     occurrences: list[int] = []
     documents: list[int] = []
     value_holds_marker = False
@@ -632,13 +655,23 @@ def iter_obx_documents(
         del data_b64
 
 
+def _delimiters_readable(message: Message) -> bool:
+    """Whether ``Message._encoding_chars`` names ``message``'s delimiters. Its refusal quotes
+    ``MSH-1`` and ``MSH-2``, so the caller raises outside this handler, with nothing chained."""
+    try:
+        message._encoding_chars()
+    except ValueError:
+        return False
+    return True
+
+
 def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool, bool, bool]:
     """Read one OBX's ``OBX-5.5`` for :func:`iter_obx_documents` and return whether the OBX is ED
     Base64, whether its value is a document the detach lifts out, whether that value holds the
     handle marker, and whether delivery's splice, escaping under the message's own delimiters,
     would alter it. The value lives only in this frame, and is read after the OBX-2 and OBX-5.4
     reads, whose splits copy the field and are dropped first, so the scan holds one value at a
-    time; the escape check's copy of a document is freed before the value is. Raises
+    time; the marker and splice checks scan the value in place and copy none of it. Raises
     :class:`InboundDocRefError` when the value is a live handle (BACKLOG #5099): every OBX is
     read, as the delivery re-attach resolves a handle in any ``OBX-5.5`` first repetition."""
     is_ed = _is_base64_ed(message, occ)
@@ -663,12 +696,13 @@ def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool,
 def _splice_alters(value: str, separators: tuple[str, str, str, str, str]) -> bool:
     """Whether delivery's splice would not set ``value`` back verbatim under ``separators``, the
     ``(field, component, repetition, escape, subcomponent)`` tuple ``Message._encoding_chars``
-    returns: ``Message.set`` applies this same escape to a component value (BACKLOG #5099). The
-    escape builds a copy of the value, freed on return."""
-    # Local import, as the re-attach does: message.py imports this module.
-    from messagefoundry.parsing.message import Message
-
-    return Message._escape_leaf(value, *separators) != value
+    returns: ``Message.set`` applies ``Message._escape_leaf`` to a component value (BACKLOG
+    #5099). Answered by :func:`escape_leaf_alters`, which builds no escaped copy and is linear in
+    the value: the detach runs this on a sender's value before the ACK, and the escape itself was
+    measured slower than linear on a hostile one."""
+    field_sep, comp_sep, rep_sep, esc, sub_sep = separators
+    # escape_leaf_alters takes the order escape_leaf does, as Message._escape_leaf passes it.
+    return escape_leaf_alters(value, (field_sep, comp_sep, rep_sep, sub_sep, esc))
 
 
 def _received_holds_marker(message: Message, received: str) -> bool:
@@ -955,7 +989,7 @@ async def reattach_documents_in_hl7(
         separators = message._encoding_chars()
         # Under a base64 delimiter the splice below would escape it inside the stored document,
         # so a handle to splice is refused before any read (_delimits_with_base64). A Handler
-        # that changed MSH-2 after the detach reaches this too.
+        # that changed MSH-1 or MSH-2 after the detach reaches this too.
         base64_delimited = _delimits_with_base64(separators)
         if found and base64_delimited:
             raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)
@@ -983,7 +1017,7 @@ async def reattach_documents_in_hl7(
 
     def _splice(occ: int, verbatim: str) -> None:
         # The detach checks a value under the delimiters it arrived with; a Handler that moved
-        # MSH-2 since reaches this instead. Message.set would escape a character the value holds,
+        # MSH-1 or MSH-2 since reaches this instead. Message.set would escape a character the value holds,
         # so the partner would not get the sender's document.
         if _splice_alters(verbatim, separators):
             # Scanned only on this refusal path. The detach refuses a control character under any

@@ -79,6 +79,7 @@ from messagefoundry.parsing.binary import (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
+    UnreadableDelimitersError,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -268,14 +269,14 @@ KNOWN_FINDINGS: tuple[KnownFinding, ...] = (
     KnownFinding(
         target="binary_carriage",
         summary=(
-            "strip_documents, iter_obx_documents and extract_obx_document raise a bare ValueError "
-            "('cannot determine HL7 separators') on an MSH-led HL7 body whose MSH-2 carries fewer "
-            "than four encoding characters. Peek.parse and Message.parse both accept such a body, "
-            "and build_ack answers it AA; Message.field then raises on the first read. The store "
-            "backends' retention document-strip pass calls strip_documents with no try, so on first "
-            "deployment one such stored body would abort that pass on every run, and the "
-            "over-threshold ingress detach in pipeline/wiring_runner.py does not list ValueError "
-            "among the errors it records."
+            "strip_documents and extract_obx_document raise a bare ValueError ('cannot determine "
+            "HL7 separators') on an MSH-led HL7 body whose MSH-2 carries fewer than four encoding "
+            "characters. Peek.parse and Message.parse both accept such a body, and build_ack "
+            "answers it AA; Message.field then raises on the first read. The store backends' "
+            "retention document-strip pass calls strip_documents with no try, so on first "
+            "deployment one such stored body would abort that pass on every run. "
+            "iter_obx_documents refuses such a body as UnreadableDelimitersError instead, which the "
+            "over-threshold ingress detach records (BACKLOG #5099)."
         ),
         discriminator=(
             "the exception is a bare ValueError whose message starts 'cannot determine HL7 "
@@ -287,9 +288,10 @@ KNOWN_FINDINGS: tuple[KnownFinding, ...] = (
     KnownFinding(
         target="binary_carriage",
         summary=(
-            "iter_obx_documents and extract_obx_document raise a bare ValueError ('cannot "
-            "determine HL7 separators', with MSH-1 and MSH-2 both empty) on a body that leads with "
-            "an FHS or BHS batch header and carries no MSH. Peek.parse refuses such a body but "
+            "extract_obx_document raises a bare ValueError ('cannot determine HL7 separators', "
+            "with MSH-1 and MSH-2 both empty) on a body that leads with an FHS or BHS batch header "
+            "and carries no MSH; iter_obx_documents refuses it as UnreadableDelimitersError "
+            "(BACKLOG #5099). Peek.parse refuses such a body but "
             "Message.parse accepts it, so the two HL7 parsers disagree about it. On first "
             "deployment a Handler that parsed such a body with Message.parse and called "
             "extract_obx_document would get a bare ValueError, not the BinaryCarriageError that "
@@ -662,8 +664,9 @@ def _binary_carriage(data: bytes) -> None:
       does not strip comes back unchanged;
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
       document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
-      wrote into ``OBX-5.5`` ``InboundDocRefError``, and for a value the splice would not set back
-      verbatim ``NonVerbatimDocumentError`` (BACKLOG #5099) -- and ``extract_obx_document``
+      wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
+      verbatim ``NonVerbatimDocumentError``, and for a body with an OBX whose MSH-1 and MSH-2 name
+      no delimiters ``UnreadableDelimitersError`` (BACKLOG #5099) -- and ``extract_obx_document``
       on every OBX, whose refusal is ``BinaryCarriageError``.
 
     The HL7 half carries the only carve-outs in this file, one per registered known finding: see
@@ -691,7 +694,12 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    with contextlib.suppress(EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
+    with contextlib.suppress(
+        EscapedDocumentError,
+        InboundDocRefError,
+        NonVerbatimDocumentError,
+        UnreadableDelimitersError,
+    ):
         list(iter_obx_documents(message, received=text))
     for occurrence in range(1, message.count_segments("OBX") + 1):
         with contextlib.suppress(BinaryCarriageError):
