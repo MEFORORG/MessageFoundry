@@ -1590,7 +1590,8 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
         except OSError as exc:
             # A missing file raises a bare FileNotFoundError with no path. Name the setting, since the
             # pool re-reads this file on every new connection and it can vanish after the load check.
-            raise ValueError(
+            # Typed as the store's TLS refusal, so a command reports it as could not start (#5000).
+            raise StoreTlsRefused(
                 f"[store].ssl_root_cert ({settings.ssl_root_cert!r}) could not be read: {exc}"
             ) from exc
         connector = "Postgres store (pinned CA)"

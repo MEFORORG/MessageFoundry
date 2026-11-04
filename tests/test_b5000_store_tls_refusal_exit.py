@@ -17,11 +17,9 @@ on a SQLite store whose audit row was edited, and still exits 1.
 from __future__ import annotations
 
 import asyncio
-import os
 import sqlite3
 import sys
 import types
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -29,34 +27,15 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
 from messagefoundry.config.tls_policy import InsecureHopRefused, StoreTlsRefused
-from messagefoundry.store.crypto import generate_key
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
+
+# The shell and driver stand-in that file drives each command with, shared rather than copied.
 from tests.test_cli_store_hop_posture import _RefusingAsyncpg
+from tests.test_cli_store_hop_posture import asyncpg as asyncpg  # noqa: F401
+from tests.test_cli_store_hop_posture import shell as shell  # noqa: F401
 from tests.test_store_ssl import _ca_cert_file, _pg, _ss
 
 _REMOTE = "db.example.invalid"
-
-
-@pytest.fixture
-def shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """A shell holding a store key and nothing else that decides these tests, with no ambient hop
-    posture, as a real shell has none (``tests/test_cli_store_hop_posture.py`` says why)."""
-    from messagefoundry.config.tls_policy import active_hop_posture
-
-    monkeypatch.chdir(tmp_path)
-    for name in list(os.environ):
-        if name.startswith(("MEFOR_STORE_", "MEFOR_SECURITY_", "MEFOR_TLS_", "MEFOR_ALLOW_")):
-            monkeypatch.delenv(name)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    with active_hop_posture(None):
-        yield tmp_path
-
-
-@pytest.fixture
-def asyncpg(monkeypatch: pytest.MonkeyPatch) -> _RefusingAsyncpg:
-    fake = _RefusingAsyncpg()
-    monkeypatch.setitem(sys.modules, "asyncpg", fake)
-    return fake
 
 
 @pytest.fixture
@@ -184,21 +163,23 @@ def test_a_broken_chain_still_exits_1(
 
 
 def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
-    """Each of the three raises ``StoreTlsRefused``, which every handler of a refused hop catches,
-    and which a caller that caught the bare ``ValueError`` still catches."""
+    """Each refusal raises ``StoreTlsRefused``, which every handler of a refused hop catches, and
+    which a caller that caught the bare ``ValueError`` still catches. The fourth is a PostgreSQL
+    pin file gone since the settings load, the same kind of refusal."""
     from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.store.postgres import _build_ssl
+    from messagefoundry.store.postgres import _build_ssl, _verifying_context
     from messagefoundry.store.sqlserver import check_pinned_certificate, connection_string
 
+    assert issubclass(StoreTlsRefused, InsecureHopRefused)
+    assert issubclass(StoreTlsRefused, ValueError)
     enforcing = HopPosture(enforcing=True)
     pin = _ca_cert_file(tmp_path, signs=False, not_after_days=-1)
-    refusals = []
+    gone = _pg(ssl_root_cert=pin).model_copy(update={"ssl_root_cert": str(tmp_path / "gone.pem")})
     for refuse in (
         lambda: _build_ssl(_pg(trust_server_certificate=True), posture=enforcing),
         lambda: connection_string(_ss(trust_server_certificate=True), posture=enforcing),
         lambda: check_pinned_certificate(_ss(ssl_root_cert=pin), posture=enforcing),
+        lambda: _verifying_context(gone),
     ):
-        with pytest.raises(StoreTlsRefused) as caught:
+        with pytest.raises(StoreTlsRefused):
             refuse()
-        refusals.append(caught.value)
-    assert all(isinstance(r, InsecureHopRefused) and isinstance(r, ValueError) for r in refusals)

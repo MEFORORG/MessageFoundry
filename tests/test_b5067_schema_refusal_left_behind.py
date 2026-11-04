@@ -17,20 +17,19 @@ Not server-gated: the store open is replaced, so no driver or server runs.
 
 from __future__ import annotations
 
-import os
 import sys
 import types
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
-_DIFFERENCE = "table 'messages' lacks column 'lease_owner'"
-_PASSWORD = "a-long-enough-operator-passphrase"
+# The shell, the difference and the password the #1720 tests use, shared rather than copied.
+from tests.test_b1720_cli_schema_refusal_exit import _DIFFERENCE, _PASSWORD
+from tests.test_b1720_cli_schema_refusal_exit import shell as shell  # noqa: F401
+
 _RCSI = "READ_COMMITTED_SNAPSHOT"
 _ROLLED_BACK = "rolled its schema batch back and wrote no schema marker"
 _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app, delete it"
@@ -41,21 +40,6 @@ _STORES = {
     ("sqlserver", "external"): False,
     ("postgres", "auto"): False,
 }
-
-
-@pytest.fixture
-def shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """A shell holding a store key and nothing else that decides these tests (as
-    ``tests/test_b1720_cli_schema_refusal_exit.py`` sets one up)."""
-    from messagefoundry.config.tls_policy import active_hop_posture
-
-    monkeypatch.chdir(tmp_path)
-    for name in list(os.environ):
-        if name.startswith(("MEFOR_STORE_", "MEFOR_SECURITY_", "MEFOR_TLS_", "MEFOR_ALLOW_")):
-            monkeypatch.delenv(name)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    with active_hop_posture(None):
-        yield tmp_path
 
 
 def _settings(tmp: Path, backend: str, management: str, *, require_mfa: bool = True) -> Path:
@@ -84,6 +68,48 @@ def _refusal(backend: str) -> ServerSchemaMismatchError:
     return ServerSchemaMismatchError(backend, "mefor", [_DIFFERENCE])
 
 
+def _every_open_refuses(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    """Every store open refuses as a server store with a short schema does."""
+    from messagefoundry.store import base
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise _refusal(backend)
+
+    monkeypatch.setattr(base, "open_store", refusing)
+
+
+def _refused_at_the_write(
+    monkeypatch: pytest.MonkeyPatch, backend: str, refusal: Exception
+) -> None:
+    """The pre-check finds no store, so ``provision-admin`` prompts, shows the key and reaches the
+    write's ``create=True`` open, which raises ``refusal``. A console types the password and proves
+    the enrolment."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store import base
+
+    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
+        if not create:
+            raise base.StoreNotFoundError.server_schema(StoreBackend(backend), "mefor")
+        raise refusal
+
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+
+
+def _run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> str:
+    """Run the command; its output, once it exited 2, could not start."""
+    code = main(argv)
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 2, out
+    return out
+
+
 def _provision(settings: Path, *extra: str) -> list[str]:
     return [
         "provision-admin",
@@ -95,18 +121,6 @@ def _provision(settings: Path, *extra: str) -> list[str]:
         "--service-config",
         str(settings),
     ]
-
-
-def _at_a_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A console that types the password and proves an enrolment, so the command reaches the
-    write."""
-    from messagefoundry import __main__ as cli
-
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
-    monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
-    )
 
 
 def _assert_left_behind(out: str, *, names_the_setting: bool) -> None:
@@ -128,16 +142,8 @@ def test_provision_admin_pre_check_says_what_the_open_left(
     """The pre-check open, before the prompt. Exit 2 as before (#1720).
 
     Mutation: print ``_NOTHING_PROVISIONED`` again in the pre-check's arm."""
-    from messagefoundry.store import base
-
-    async def refusing(*_args: object, **_kwargs: object) -> object:
-        raise _refusal(backend)
-
-    monkeypatch.setattr(base, "open_store", refusing)
-    code = main(_provision(_settings(shell, backend, management)))
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 2, out
+    _every_open_refuses(monkeypatch, backend)
+    out = _run(_provision(_settings(shell, backend, management)), capsys)
     assert "Refusing to provision" in out, out
     _assert_left_behind(out, names_the_setting=_STORES[backend, management])
     assert _UNUSED_ENTRY not in out, "no key was shown before the pre-check"
@@ -155,20 +161,8 @@ def test_provision_admin_write_says_what_the_open_left_and_names_the_entry(
     authenticator entry.
 
     Mutation: drop ``before_the_write`` from the write's open-refusal arm."""
-    from messagefoundry.config.settings import StoreBackend
-    from messagefoundry.store import base
-
-    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
-        if not create:
-            raise base.StoreNotFoundError.server_schema(StoreBackend(backend), "mefor")
-        raise _refusal(backend)
-
-    monkeypatch.setattr(base, "open_store", opening)
-    _at_a_terminal(monkeypatch)
-    code = main(_provision(_settings(shell, backend, management)))
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 2, out
+    _refused_at_the_write(monkeypatch, backend, _refusal(backend))
+    out = _run(_provision(_settings(shell, backend, management)), capsys)
     _assert_left_behind(out, names_the_setting=_STORES[backend, management])
     assert _UNUSED_ENTRY in out, out
 
@@ -178,21 +172,9 @@ def test_provision_admin_write_names_no_entry_under_no_totp(
 ) -> None:
     """The control on the entry: with ``--no-totp`` no key was shown, so no entry is named, and
     the hint above is not printed on every refusal."""
-    from messagefoundry.config.settings import StoreBackend
-    from messagefoundry.store import base
-
-    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
-        if not create:
-            raise base.StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, "mefor")
-        raise _refusal("sqlserver")
-
-    monkeypatch.setattr(base, "open_store", opening)
-    _at_a_terminal(monkeypatch)
+    _refused_at_the_write(monkeypatch, "sqlserver", _refusal("sqlserver"))
     settings = _settings(shell, "sqlserver", "auto", require_mfa=False)
-    code = main(_provision(settings, "--no-totp"))
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 2, out
+    out = _run(_provision(settings, "--no-totp"), capsys)
     _assert_left_behind(out, names_the_setting=True)
     assert _UNUSED_ENTRY not in out, out
 
@@ -203,20 +185,11 @@ def test_provision_admin_keyless_refusal_at_the_write_names_the_entry(
     """A keyless refusal at the write comes after the key was shown too, and before any write.
 
     Mutation: drop ``before_the_write`` from the keyless arm."""
-    from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store import base
 
-    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
-        if not create:
-            raise base.StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, "mefor")
-        raise base.KeylessAuditChainRefused("mefor", "[store].synthetic_setting")
-
-    monkeypatch.setattr(base, "open_store", opening)
-    _at_a_terminal(monkeypatch)
-    code = main(_provision(_settings(shell, "sqlserver", "auto")))
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 2, out
+    refusal = base.KeylessAuditChainRefused("mefor", "[store].synthetic_setting")
+    _refused_at_the_write(monkeypatch, "sqlserver", refusal)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "[store].synthetic_setting" in out, out
     assert _UNUSED_ENTRY in out, out
 
@@ -233,22 +206,14 @@ def test_admin_reset_totp_says_what_the_open_left(
     refusal arrives as the cause of a ``_StoreOpenRefused``.
 
     Mutation: print "Nothing was written." again in ``open_refused``'s could-not-start arm."""
-    from messagefoundry.store import base
-
-    async def refusing(*_args: object, **_kwargs: object) -> object:
-        raise _refusal(backend)
-
-    monkeypatch.setattr(base, "open_store", refusing)
+    _every_open_refuses(monkeypatch, backend)
     settings = _settings(shell, backend, management)
-    code = main(["admin-reset-totp", "--username", "ops", "--service-config", str(settings)])
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 2, out
+    out = _run(["admin-reset-totp", "--username", "ops", "--service-config", str(settings)], capsys)
     _assert_left_behind(out, names_the_setting=_STORES[backend, management])
 
 
-def test_any_other_open_refusal_still_says_nothing_was_written() -> None:
-    """The control on the helper: only the schema refusal changes its text."""
+def test_any_other_open_refusal_keeps_its_text() -> None:
+    """The control on the helper: only the schema refusal, raised or as a cause, has more to say."""
     from messagefoundry.__main__ import _open_refusal_left_behind, _StoreOpenRefused
     from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 
@@ -259,9 +224,7 @@ def test_any_other_open_refusal_still_says_nothing_was_written() -> None:
         username="mefor",
         schema_management=SchemaManagement.AUTO,
     )
-    assert _open_refusal_left_behind(RuntimeError("a hop refusal"), store) == (
-        "nothing was written"
-    )
+    assert _open_refusal_left_behind(RuntimeError("a hop refusal"), store) is None
     wrapped = _StoreOpenRefused("short")
     wrapped.__cause__ = _refusal("sqlserver")
-    assert _RCSI in _open_refusal_left_behind(wrapped, store)
+    assert _RCSI in (_open_refusal_left_behind(wrapped, store) or "")

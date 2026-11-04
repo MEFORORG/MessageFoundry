@@ -8671,27 +8671,26 @@ _PROVISION_AUTH_REFUSALS = {
 _NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
 
 
-def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str:
-    """What a refused store open left behind, as far as the command knows it (BACKLOG #5067).
+def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str | None:
+    """What a refused store open left behind, when that is more than "nothing was written"
+    (BACKLOG #5067), or ``None`` when nothing was.
 
-    ``"nothing was written"`` for every refusal but one. A server store whose live schema falls
-    short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself
-    or as the cause of a :class:`_StoreOpenRefused`, is refused after the open has touched the
-    database. The open rolls its batch back and writes no schema marker. But on SQL Server under
+    ``None`` for every refusal but one. A server store whose live schema falls short of this
+    build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
+    of a :class:`_StoreOpenRefused`, is refused after the open has touched the database. The open
+    rolls its batch back and writes no schema marker. But on SQL Server under
     ``[store].schema_management = auto`` a writable open first switches the database's
     READ_COMMITTED_SNAPSHOT option on (``SqlServerStore._ensure_database_options``), outside that
-    batch, and the refusal does not switch it back. So that refusal says the batch was rolled
-    back and, there, that the setting may already have changed. A sentence with no full stop,
-    so a caller can end it."""
+    batch, and the refusal does not switch it back. So for that refusal it says the batch was
+    rolled back and, there, that the setting may already have changed: sentences, the last with
+    no full stop, so a caller can end it."""
     from messagefoundry.config.settings import SchemaManagement, StoreBackend
     from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
-    if not isinstance(exc, ServerSchemaMismatchError) and not isinstance(
-        exc.__cause__, ServerSchemaMismatchError
-    ):
-        return "nothing was written"
+    if not any(isinstance(e, ServerSchemaMismatchError) for e in (exc, exc.__cause__)):
+        return None
     left = (
-        "the open rolled its schema batch back and wrote no schema marker, and this command wrote "
+        "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
         "no row"
     )
     if (
@@ -8709,7 +8708,9 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str:
 def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
     behind (:func:`_open_refusal_left_behind`, BACKLOG #5067)."""
-    return f"{_sentence(exc)} Refusing to provision; {_open_refusal_left_behind(exc, store)}"
+    left = _open_refusal_left_behind(exc, store)
+    tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
+    return f"{_sentence(exc)} {tail}"
 
 
 def _sentence(message: object) -> str:
@@ -8993,13 +8994,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except key_unresolved as exc:
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
-        return 2
-    except (InsecureHopRefused, ServerSchemaMismatchError) as exc:
-        # The store hop, refused at the open as `serve` refuses it now that the posture is passed:
-        # a server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`.
-        # Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
+    except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
+        # A store key that could not be resolved (the comment above `key_unresolved`). Or the
+        # store hop, refused at the open as `serve` refuses it now that the posture is passed: a
+        # server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`
+        # (#5000). Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
         # store's live schema falls short of this build's DDL batch: the open rolled the batch back
         # and wrote no marker, and the text lists the differences and the remedy, then says what
         # the open may have changed before it (#5067). Exit 2: could not start, never the
@@ -9669,11 +9668,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         decoded (BACKLOG #2532). A short server schema says what the open may have changed before
         it (BACKLOG #5067)."""
         if isinstance(exc, could_not_start):
-            left = _open_refusal_left_behind(exc, settings.store)
-            _emit_error(
-                f"{_sentence(codec_safe_str(exc))} {left[:1].upper()}{left[1:]}.{hint}",
-                as_json=args.json,
-            )
+            left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+            _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
             return _emit_error(

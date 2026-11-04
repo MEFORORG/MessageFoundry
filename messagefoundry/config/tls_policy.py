@@ -2107,8 +2107,9 @@ class InsecureHopRefused(ValueError):
 class StoreTlsRefused(InsecureHopRefused):
     """The store open refused the engine-to-store hop's own TLS settings (BACKLOG #5000): a
     weakened hop (``trust_server_certificate`` on or ``encrypt`` off) the escape does not cover,
-    on either server backend, or a SQL Server ``[store].ssl_root_cert`` pin the engine must not
-    send. Raised before the store dials.
+    on either server backend, a SQL Server ``[store].ssl_root_cert`` pin the engine must not send,
+    or a PostgreSQL ``[store].ssl_root_cert`` file that can no longer be read. Raised before the
+    store dials; the PostgreSQL pool also re-reads that file for each new connection.
 
     Typed so a command can tell "could not start" from its other errors. It was a bare
     ``ValueError``, which reached the CLI's dispatch floor and exited 1, the code ``audit-verify``
