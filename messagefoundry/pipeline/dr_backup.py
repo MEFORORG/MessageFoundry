@@ -220,6 +220,8 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 #: produce: ``config_unreadable_files`` holds one relative path per file or folder the config
 #: digest left out, uncapped (vault BACKLOG #3765). A list long enough to pass this cap writes an
 #: archive this read refuses, so a verify reports FAIL and a restore refuses it.
+#: ``config_skipped_files`` is capped at :data:`_MAX_SKIPPED_RECORDED` for that reason (vault
+#: BACKLOG #5233).
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -296,12 +298,36 @@ class BackupResult:
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
     #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
+    #: What the archive walk passed over (vault BACKLOG #5233), at most
+    #: :data:`_MAX_SKIPPED_RECORDED` of them, and how many there were in all. What they mean for
+    #: the archive is in the ``include_config`` row of ``docs/CONFIGURATION.md``.
+    config_skipped_files: tuple[str, ...] = ()
+    config_skipped_count: int = 0
 
 
 #: The ``config_bundle_error`` a pass records when its config walk added no regular file, as for an
 #: empty dir or one holding only links (vault BACKLOG #5220). Every other value there is an exception
 #: class name, so this one is spelled so it cannot be read as one.
 CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
+
+#: How many of the paths the archive walk passed over a pass records by name, and how many bytes
+#: of the manifest's JSON they may take (vault BACKLOG #5233); the record also carries the total.
+#: A config dir can hold any number of links, such as a linked package tree, and a list long
+#: enough to pass :data:`_MAX_MANIFEST_BYTES` would make the whole archive, store snapshot
+#: included, one that verify and restore refuse.
+_MAX_SKIPPED_RECORDED = 1000
+_MAX_SKIPPED_BYTES = 256 * 1024
+
+
+def _capped_skips(skipped: tuple[str, ...]) -> tuple[str, ...]:
+    """The leading ``skipped`` paths that fit both caps above, each measured as the manifest
+    encodes it (``json.dumps`` escapes every non-ASCII character to six bytes)."""
+    size = 0
+    for i, rel in enumerate(skipped[:_MAX_SKIPPED_RECORDED]):
+        size += len(json.dumps(rel)) + 2  # the separator ", "
+        if size > _MAX_SKIPPED_BYTES:
+            return skipped[:i]
+    return skipped[:_MAX_SKIPPED_RECORDED]
 
 
 @dataclass(frozen=True)
@@ -315,18 +341,25 @@ class _ConfigBundle:
     #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
     #: of the whole bundle (vault BACKLOG #3765).
     left_out: tuple[str, ...] = ()
+    #: What the archive walk passed over, the first :data:`_MAX_SKIPPED_RECORDED` of them, and how
+    #: many in all; set by :meth:`after_walk` (vault BACKLOG #5233).
+    skipped: tuple[str, ...] = ()
+    skipped_count: int = 0
 
-    def after_walk(self, added: int) -> _ConfigBundle:
-        """This bundle as the record states it once the walk has run: a bundled pass whose walk
-        added no regular file carries no config, so it is recorded as not bundled, with
-        :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG #5220)."""
+    def after_walk(self, added: int, skipped: tuple[str, ...]) -> _ConfigBundle:
+        """This bundle as the record states it once the walk has run, with what the walk passed
+        over: a bundled pass whose walk added no regular file carries no config, so it is recorded
+        as not bundled, with :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG
+        #5220)."""
+        walked = replace(self, skipped=_capped_skips(skipped), skipped_count=len(skipped))
         if self.bundled and added == 0:
-            return replace(self, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
-        return self
+            return replace(walked, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
+        return walked
 
     def manifest_fields(self) -> dict[str, object]:
-        """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
-        directory path, a digest, an exception class name and relative config file names."""
+        """The fields the manifest and the ``dr_backup`` audit row both carry: a directory path, a
+        digest, an exception class name, and relative paths from the operator's config dir. No
+        message content, but a path carries whatever name the operator gave the file."""
         return {
             "config_fingerprint": self.fingerprint,
             "config_bundled": self.bundled,
@@ -334,6 +367,8 @@ class _ConfigBundle:
             "config_dir": str(self.path) if self.path is not None else None,
             "config_bundle_error": self.error,
             "config_unreadable_files": list(self.left_out),
+            "config_skipped_files": list(self.skipped),
+            "config_skipped_count": self.skipped_count,
         }
 
 
@@ -759,7 +794,9 @@ class BackupRunner:
                     snapshot_sha256,
                     row_counts,
                     archive_bytes,
-                    config_files_added,
+                    # What the archive carries, as its manifest records it (vault BACKLOG #5220,
+                    # #5233).
+                    bundle,
                     staging_leftover,
                 ) = await asyncio.to_thread(
                     self._build_in_staging,
@@ -818,8 +855,6 @@ class BackupRunner:
         # every earlier archive that also passed — and nothing that failed (AC-6).
         pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
 
-        # What the archive carries, as its manifest records it (vault BACKLOG #5220).
-        bundle = bundle.after_walk(config_files_added)
         return BackupResult(
             archive_path=str(archive_path),
             archive_bytes=archive_bytes,
@@ -837,6 +872,8 @@ class BackupRunner:
             config_dir=str(bundle.path) if bundle.path is not None else None,
             config_bundle_error=bundle.error,
             config_unreadable_files=bundle.left_out,
+            config_skipped_files=bundle.skipped,
+            config_skipped_count=bundle.skipped_count,
         )
 
     async def _verify_and_publish(
@@ -1016,7 +1053,7 @@ class BackupRunner:
         now: float,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int, int, str | None]:
+    ) -> tuple[str, dict[str, int], int, _ConfigBundle, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
         thread. Returns the build's four values, then the release's leftover sentence (``None`` when
         no file in the directory still holds plaintext). Releasing here, not on the loop, is what
@@ -1067,11 +1104,11 @@ class BackupRunner:
         secure: bool,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int, int]:
+    ) -> tuple[str, dict[str, int], int, _ConfigBundle]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
-        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes, config_files_added)``, the
-        last the regular config files the walk added. The tar goes to a file in
+        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes, walked)``, the last
+        ``bundle`` as the manifest records it once the walk has run. The tar goes to a file in
         ``work_dir`` (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the
         archive. That tar is plaintext, so with ``secure`` it is locked to its owner before its first
         byte, the way the restore path locks its own staged tar.
@@ -1094,8 +1131,10 @@ class BackupRunner:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
                 added = 0
+                skipped: tuple[str, ...] = ()
                 if bundle.bundled and bundle.path is not None:
-                    added = self._add_config_dir(tar, bundle.path)
+                    added, skipped = self._add_config_dir(tar, bundle.path)
+                walked = bundle.after_walk(added, skipped)
                 if config_only and added == 0:
                     # Before the archive is written, so nothing is published or pruned: an archive of
                     # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
@@ -1107,7 +1146,8 @@ class BackupRunner:
                         f"nothing to archive (config dir {bundle.path})",
                     )
                 # Built after the walk, so `config_bundled` says whether a config file was added,
-                # not whether the walk was asked to run (vault BACKLOG #5220).
+                # not whether the walk was asked to run (vault BACKLOG #5220), and
+                # `config_skipped_files` names what the walk passed over (vault BACKLOG #5233).
                 manifest = {
                     "format": "mfbak",
                     # The .mfbak archive format version — parity with the AAD-bound codec header
@@ -1121,7 +1161,7 @@ class BackupRunner:
                     "config_only": config_only,
                     "backend": self._backend_value(),
                     "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-                    **bundle.after_walk(added).manifest_fields(),
+                    **walked.manifest_fields(),
                     "snapshot_sha256": snapshot_sha256,
                     "row_counts": row_counts,
                 }
@@ -1158,9 +1198,9 @@ class BackupRunner:
             dst.flush()
             os.fsync(dst.fileno())
         archive_bytes = out_path.stat().st_size
-        return snapshot_sha256, row_counts, archive_bytes, added
+        return snapshot_sha256, row_counts, archive_bytes, walked
 
-    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> int:
+    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> tuple[int, tuple[str, ...]]:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
         arbitrary host file into the archive, so the walk aims to add only regular files and does
@@ -1187,10 +1227,15 @@ class BackupRunner:
         written must not ride in the bundle.
 
         Returns how many regular files it added, which a config-only pass needs (vault BACKLOG
-        #5220)."""
+        #5220), and what it passed over, so the archive records what it does not carry (vault
+        BACKLOG #5233): sorted paths relative to ``base``, ``.`` for ``base`` itself, as
+        :func:`~messagefoundry.config.fingerprint.describe_left_out` reads them. What that names,
+        and what it does not, is stated once, in the ``include_config`` row of
+        ``docs/CONFIGURATION.md``."""
         pruned: list[str] = []
+        unlisted: list[str] = []
         found: list[Path] = []
-        for dirpath, dirs, files in _walk_unfollowed(base, pruned):
+        for dirpath, dirs, files in _walk_unfollowed(base, pruned, unlisted):
             # Pruned here, before the walk descends them, so a link inside one is not reported.
             dirs[:] = [
                 d
@@ -1198,22 +1243,32 @@ class BackupRunner:
                 if not (atomic_edit.is_candidate_dir_name(d) or _is_staging_dir(Path(dirpath, d)))
             ]
             found.extend(Path(dirpath, name) for name in files)
-        if pruned:
+        links = sorted(Path(p).relative_to(base).as_posix() for p in pruned)
+        if links:
             log.warning(
                 "DR backup: the config bundle of %s does not follow a directory link, so it leaves "
                 "out: %s",
                 base,
-                scrub_log_argument(
-                    ", ".join(sorted(Path(p).relative_to(base).as_posix() for p in pruned))
-                ),
+                scrub_log_argument(", ".join(links)),
             )
+        # What is passed over as neither a link nor config: unlisted folders, then files below.
+        passed_over = {Path(p).relative_to(base).as_posix() for p in unlisted}
         added = 0
         # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
         for path in sorted(found):
-            if path.is_symlink() or not path.is_file():
-                continue
             rel = path.relative_to(base)
             if _is_config_edit_artifact(rel):
+                continue
+            try:
+                st = path.lstat()
+                regular = stat.S_ISREG(st.st_mode) and not _stat_names_another_path(st)
+            except FileNotFoundError:
+                # Gone since the listing, such as an editor's save probe: no longer config.
+                continue
+            except OSError:
+                regular = False
+            if not regular:
+                passed_over.add(rel.as_posix())
                 continue
             before = len(tar.getmembers())
             tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
@@ -1222,7 +1277,20 @@ class BackupRunner:
             members = tar.getmembers()
             if len(members) > before and members[-1].isreg():
                 added += 1
-        return added
+            else:
+                passed_over.add(rel.as_posix())
+        if passed_over:
+            from messagefoundry.config.fingerprint import describe_left_out
+
+            log.warning(
+                "DR backup: the config bundle of %s leaves out %d path(s) it could not list or add "
+                "as a regular file, first %d by name: %s",
+                base,
+                len(passed_over),
+                min(len(passed_over), _MAX_SKIPPED_RECORDED),
+                scrub_log_argument(describe_left_out(sorted(passed_over)[:_MAX_SKIPPED_RECORDED])),
+            )
+        return added, tuple(sorted(passed_over | set(links)))
 
     # --- keep-N retention ----------------------------------------------------
 
@@ -1339,6 +1407,8 @@ class BackupRunner:
             "config_dir": result.config_dir,
             "config_bundle_error": result.config_bundle_error,
             "config_unreadable_files": list(result.config_unreadable_files),
+            "config_skipped_files": list(result.config_skipped_files),
+            "config_skipped_count": result.config_skipped_count,
             "snapshot_sha256": result.snapshot_sha256,
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
@@ -1416,7 +1486,9 @@ class BackupRunner:
         unreadable is recorded beside it, so the record does not read as the digest of the whole
         bundle (vault BACKLOG #3765), and logged at WARNING when the bundle is being archived. On a
         bundled pass that list reaches a record only for what the walk passes over, at least a
-        folder it cannot list, and for a lock gone by the walk. Each warning names the directory
+        folder it cannot list, and for a lock gone by the walk. What the walk itself passes over is
+        recorded apart, by :meth:`_add_config_dir` (vault BACKLOG #5233), since this digest is
+        taken before the walk runs and can read through a link. Each warning names the directory
         and an error class, a scrubbed reason or a relative file name, never config content. With
         ``include_config`` off nothing is bundled, so a listing fault is not one the operator needs
         to hear about, and none is recorded; the digest is still taken, so its left-out list is."""
@@ -2406,16 +2478,29 @@ def _is_config_edit_artifact(rel: Path) -> bool:
 
 
 def _walk_unfollowed(
-    root: Path, pruned: list[str] | None = None
+    root: Path, pruned: list[str] | None = None, unlisted: list[str] | None = None
 ) -> Iterator[tuple[str, list[str], list[str]]]:
     """``os.walk(root)``, top-down, that does not descend a directory link below ``root``, as
     :func:`_is_dir_link` reads one: at least a symlinked directory and, on Windows, a junction or
     volume mount point, which ``os.walk`` descends even with ``followlinks=False`` (vault BACKLOG
     #5221). A directory whose ``lstat`` fails is not descended either. Each pruned directory's path
-    is appended to ``pruned`` when one is given. A caller may prune the yielded directory list
+    is appended to ``pruned`` when one is given, and each folder ``os.walk`` could not list, ``root``
+    included, to ``unlisted`` (vault BACKLOG #5233). A caller may prune the yielded directory list
     further, as with ``os.walk``. The read and the descent are by name, so a directory swapped for a
     link between them is descended."""
-    for dirpath, dirs, files in os.walk(root, followlinks=False):
+
+    def record_unlisted(exc: OSError) -> None:
+        # os.walk names the folder it failed to list. With no name the folder is unknown, so root
+        # is recorded: that overstates the loss rather than let it pass unrecorded.
+        if unlisted is None:
+            return
+        name = os.fsdecode(exc.filename) if exc.filename is not None else str(root)
+        # A subfolder gone since its parent was listed is no longer config; root gone is a loss.
+        if isinstance(exc, FileNotFoundError) and name != str(root):
+            return
+        unlisted.append(name)
+
+    for dirpath, dirs, files in os.walk(root, onerror=record_unlisted, followlinks=False):
         kept = []
         for d in dirs:
             full = os.path.join(dirpath, d)
@@ -2438,6 +2523,13 @@ def _is_dir_link(path: str, *, unreadable: bool = False) -> bool:
         st = os.lstat(path)
     except OSError:
         return unreadable
+    return _stat_names_another_path(st)
+
+
+def _stat_names_another_path(st: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a link as :func:`_is_dir_link` reads one, for a file or a
+    folder. On Windows a name-surrogate reparse point other than a symlink, such as a WSL link,
+    reads as ``S_IFREG``, so the mode alone does not say."""
     reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     return stat.S_ISLNK(st.st_mode) or bool(
         reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
