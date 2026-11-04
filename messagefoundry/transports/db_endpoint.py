@@ -184,9 +184,9 @@ def is_remote_spelling(value: object) -> bool:
 
 #: The characters the SQL Server preset refuses anywhere in ``odbc_driver`` (BACKLOG #4873): the
 #: ``;{}`` the generic dialect refuses in its driver, and ``=``, which it refuses in the values it
-#: sends unbraced. The driver is sent braced with the ``}}`` escape, but whether every driver
-#: manager reads that escape in a ``DRIVER`` value is unmeasured, so a library path's directories
-#: may not hold them either.
+#: sends unbraced. The driver is sent braced with the ``}}`` escape, and no probe has measured a
+#: driver manager reading that escape, or ``=``, inside a braced ``DRIVER`` value, so a library
+#: path's directories may not hold them either.
 _PRESET_DRIVER_REFUSED = ";{}="
 
 

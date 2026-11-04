@@ -233,6 +233,20 @@ def test_the_build_refusal_holds_with_no_allowlist() -> None:
         )
 
 
+def test_the_build_refusal_holds_for_a_poll_and_a_reference_with_no_allowlist() -> None:
+    # The other two factories that build the preset: the inbound poll when it is constructed, and
+    # a DatabaseRef's DSN, built at sync and at check.
+    from messagefoundry.pipeline.reference_sync import database_source_dsn
+    from messagefoundry.transports.base import build_source
+
+    refused = _preset(odbc_driver="PostgreSQL Unicode")
+    settings = DatabasePoll(poll_statement=POLL, **refused).settings
+    with pytest.raises(ValueError, match=DRIVER_REFUSAL):
+        build_source(Source(type=ConnectorType.DATABASE, settings=settings), egress=OPEN)
+    with pytest.raises(ValueError, match=DRIVER_REFUSAL):
+        database_source_dsn(refused, connection="REF")
+
+
 def test_the_generic_dialect_still_takes_a_psqlodbc_driver() -> None:
     # The remedy the refusal names: this tightens the preset only.
     kw = {
@@ -309,9 +323,19 @@ def test_a_refused_connection_writes_no_weakened_tls_audit_line(
     assert _audit_lines(caplog) == 0
 
 
-def test_a_lookup_refusal_names_the_lookup() -> None:
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"odbc_driver": "PostgreSQL Unicode"},
+        {"auth": "kerberos"},
+        {"server": f"{HOST};X=1"},
+        {"port": 70000},
+    ],
+    ids=["driver", "auth", "server-delimiter", "port"],
+)
+def test_a_lookup_refusal_names_the_lookup(update: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="'db_lookup:LK_ACME'"):
-        DatabaseLookupExecutor({"LK_ACME": _preset(odbc_driver="PostgreSQL Unicode")}, egress=OPEN)
+        DatabaseLookupExecutor({"LK_ACME": _preset(**update)}, egress=OPEN)
 
 
 def _logged_refusal(name: str) -> str:

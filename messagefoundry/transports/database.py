@@ -236,16 +236,17 @@ def _build_dsn(
     reads it, it changes nothing. A statement guard is a shape test on text. The control that
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
+    where = hop_name_prefix(connection)
     refusal = sqlserver_preset_refusal(s)
     if refusal is not None:
-        raise ValueError(f"{hop_name_prefix(connection)}DATABASE {refusal}")
+        raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
         attested=attested, posture=current_hop_posture()
     ):
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE connection TLS is weakened "
+            f"{where}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
             "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
             f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
@@ -256,7 +257,7 @@ def _build_dsn(
         )
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
-        raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
+        raise ValueError(f"{where}DATABASE auth must be sql|integrated|entra, got {auth!r}")
     # SERVER must be emitted UNBRACED so the driver parses the ",port" suffix and resolves the host for
     # the TLS handshake — a brace-quoted "SERVER={host},port" is malformed ODBC (content after the
     # closing brace) and breaks certificate handling against a real SQL Server. So the host is
@@ -265,9 +266,12 @@ def _build_dsn(
     server = str(s["server"])
     if any(ch in server for ch in ";{}=\r\n"):
         raise ValueError(
-            "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', or newlines "
+            "(ODBC injection risk)"
         )
-    port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
+    port = port_setting(
+        s.get("port", SQLSERVER_DEFAULT_PORT), transport=f"{where}DATABASE connection"
+    )
     parts = [
         f"DRIVER={odbc_brace(str(s.get('odbc_driver', SQLSERVER_DEFAULT_DRIVER)))}",
         f"SERVER={server},{port}",
@@ -3713,10 +3717,10 @@ class DatabaseLookupExecutor:
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
             self._dsn[cname] = _build_dsn(
-                # Named as the loosening reports name a lookup, so a refusal matches its row.
                 dict(s),
                 read_only=True,
                 attested=attested,
+                # Named as the loosening reports name a lookup, so a refusal matches its row.
                 connection=f"db_lookup:{cname}",
             )
             self._pool_max[cname] = count_setting(
