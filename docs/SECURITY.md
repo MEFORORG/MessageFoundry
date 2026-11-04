@@ -1501,7 +1501,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when an earlier revoke's sweep missed it, when it is left unstamped and refused when next presented (BACKLOG #4975). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when the revoke declines to re-stamp it, because an earlier revoke's sweep missed it or its account's record fails its seal, when the revoke ends it in the same transaction (BACKLOG #4975 and its follow-up). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614); the count includes the caller's own session wherever the call ended it. What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -4734,42 +4734,42 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the row is missing, at least these refuse with an error naming it: a read of an existing
   account's user record that a sign-in or a session check makes, and every every-account revoke.
   A request that returns before that read is refused as it would be anyway.
-  **A revoke that keeps a missed session does not make it usable again** (BACKLOG #4975). At
-  least two cases reach this: a request from that session to end the user's other sessions,
-  accepted just before the sweep commits, which waits for it and then runs, and an every-account
-  revoke that keeps a session an earlier sweep missed. A revoke that keeps a session, the per-account one or the every-account one, stamps
-  the new epochs onto it only when it carried the epochs that revoke's own raises replaced: its
-  account's epoch, taken from the record the raise read under the account's lock, and for the
-  every-account revoke the global epoch too. A kept session that does not carry an epoch that
-  revoke checks is left as it is, unrevoked; one behind on it, as a missed session is, is refused
-  when next presented. Where the account's record fails its seal,
-  its epoch cannot be raised and nothing is stamped. The per-account revoke checks and raises the
-  account's epoch alone, and leaves the kept session's global stamp as it is. So a session behind
-  on the global epoch only, for example one an every-account revoke missed on an account its read
-  did not return, gets the new account epoch there and is still refused on the global one. The
-  revoke still ends the user's other sessions, current ones included. All three stores make this
-  check. **Each revoke reports whether it stamped the kept session, from the transaction that
-  stamped it** (`RevokeResult` in `messagefoundry/store/store.py`), and the service takes "kept"
-  from that answer and from nothing read afterwards. So a kept session left unstamped is not
-  called kept: `DELETE /sessions` answers that it was not kept and audits scope `all`, and ending
-  the user's other sessions audits scope `self_all`, even with nothing else ended. "Kept" says
-  what the revoke wrote, not what the gate will answer: the gate's expiry checks still apply, a
-  later revoke can still end the session, and the per-account revoke reports as kept a session
-  behind on the global epoch only, which it stamps as above and the gate still refuses. The count
-  in either audit row is the sessions that call's sweep revoked. Where the caller's own session
-  failed its seal, `DELETE /sessions` ends it in its fallback sweep, so it is in that count, and
-  ending the user's other sessions ends it apart from its sweep, so it is not. Where the revoke
-  left it unstamped, it was not revoked and is in neither count. The reply to `DELETE
-  /me/sessions` says only how many other sessions ended. The session left unstamped stays unrevoked
-  until it is presented, and its refusal then is reported as a seal failure, as below.
-  `tests/_session_seal_contract.py` tests the per-account revoke, a seal failure included;
-  `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on both epochs and
-  on one behind on its account's epoch alone; and `tests/test_b5091_global_session_epoch.py` one
-  behind on the global epoch alone. Each runs on SQLite and on the server legs
-  `.github/workflows/ci.yml` runs from `tests/test_postgres_store.py` and
-  `tests/test_sqlserver_store.py`. Each of those three also checks the store's kept answer.
-  `tests/test_session_seal.py` tests that the service's reply and audit scope follow that answer,
-  and that a read failing after the revoke cannot change them; it runs on SQLite only.
+  **A revoke that keeps a missed session does not make it usable again: it ends it** (BACKLOG
+  #4975 and its follow-up). At least two cases reach this: a request from that session to end the
+  user's other sessions, accepted just before the sweep commits, which waits for it and then runs,
+  and an every-account revoke that keeps a session an earlier sweep missed. A revoke that keeps a
+  session, the per-account one or the every-account one, stamps the new epochs onto it only when
+  it carried both epochs that revoke checks. One is its account's epoch, taken from the record the
+  raise read under the account's lock. The other is the global epoch: for the every-account revoke
+  the value its raise replaced, and for the per-account revoke, which raises no global epoch, the
+  value read in its own transaction, which it leaves on the session as it is. Where the account's
+  record fails its seal, its epoch cannot be raised and nothing is stamped. **A kept session the
+  revoke does not stamp is ended in the same transaction**, as the sweep ends the rest, and counted
+  with them: one behind on either epoch, as a missed session is, and one whose account's record
+  failed its seal. The revoke still ends the user's other sessions, current ones included. All
+  three stores do this. Because it is ended there, a declined session no longer holds a place
+  under the session cap, and presenting it again is refused as an ended session, not reported as a
+  seal failure. **Each revoke reports whether it stamped the kept session, and whether it ended
+  it, from the transaction that did so** (`RevokeResult` in `messagefoundry/store/store.py`), and
+  the service takes "kept" from that answer and from nothing read afterwards. So a declined session
+  is not called kept, and it was in fact ended: `DELETE /sessions` answers "this session was ended
+  too" and audits scope `all`, and ending the user's other sessions audits scope `self_all`, even
+  with nothing else ended. "Kept" says what the revoke wrote, not what the gate will answer: the
+  gate's expiry checks still apply, and a later revoke can still end the session. The count in
+  the reply and the audit row of `DELETE /sessions` includes the caller's own session wherever the
+  call ended it: in the revoke, as above, or in its fallback sweep where that session failed its
+  own seal. The reply and the audit row of `DELETE /me/sessions` count only the user's other
+  sessions, wherever the caller's own ended. `tests/_session_seal_contract.py` tests the
+  per-account revoke, on a session behind on its account's epoch and on one whose account's record
+  fails its seal; `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on
+  both epochs, on one behind on its account's epoch alone and on one whose account's record fails
+  its seal; and `tests/test_b5091_global_session_epoch.py` both revokes on one behind on the global
+  epoch alone. Each declined case sits beside a control where the kept session is current and
+  stays live. Each runs on SQLite and on the server legs `.github/workflows/ci.yml` runs from
+  `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`. Each of those three also
+  checks the store's kept answer. `tests/test_session_seal.py` tests that the service's counts and
+  audit scope follow that answer, and that a read failing after the revoke cannot change them, and
+  `tests/test_b2614_revoke_all_route_cli.py` that both routes' replies do; both run on SQLite only.
   **A request that straddles a revoke's commit can still end the session the revoke kept, and
   reports a seal failure either way.** The gate and the session list read a session before its
   account, so such a request can see a session's old stamps beside the account's new epochs. On

@@ -282,10 +282,11 @@ async def test_signing_out_elsewhere_ends_every_session_when_the_callers_own_fai
 async def test_a_kept_session_a_sweep_missed_is_not_reported_kept(
     keyed: tuple[MessageStore, Path],
 ) -> None:
-    """BACKLOG #4975: a revoke leaves a kept session an earlier sweep missed unstamped, so the gate
-    refuses it at its next request. The service must not report it kept: the every-account
-    revoke answers not kept and audits scope ``all``, and signing out elsewhere audits
-    ``self_all``, even with nothing else to end. Each has a control, a current kept session."""
+    """BACKLOG #4975 and its follow-up: a revoke does not stamp a kept session an earlier sweep
+    missed, and ends it in the same transaction. The service must not report it kept, and its
+    counts must say what ended: the every-account revoke answers not kept, counts the caller's
+    row and audits scope ``all``; signing out elsewhere audits ``self_all`` and counts only the
+    other sessions, even with none to end. Each has a control, a current kept session."""
     store, path = keyed
     raw = _raw_for(path)
     service = AuthService(store, AuthSettings())
@@ -324,17 +325,28 @@ async def test_a_kept_session_a_sweep_missed_is_not_reported_kept(
     )  # control: a current session is kept, and said to be
     assert await scopes() == ["all_but_caller"]
 
+    async def ended(token: str) -> bool:
+        row = await store.get_session(hash_token(token))
+        return row is not None and row.revoked_at is not None
+
+    async def last_count() -> int:
+        rows = await store.list_audit(action="auth.session_revoked", limit=1)
+        return int(json.loads(rows[0]["detail"])["count"])
+
     stale = await missed()
     assert await service.revoke_every_session(actor="u", keep_token_hash=hash_token(stale)) == (
-        0,
+        1,
         False,
-    )
-    assert (await scopes())[0] == "all"
+    )  # the caller's own row, ended by the revoke and counted
+    assert (await scopes())[0] == "all" and await last_count() == 1
+    assert await ended(stale)
 
     stale = await missed()
     assert await service.revoke_other_sessions(identity, hash_token(stale), actor="u") == 0
-    assert (await scopes())[0] == "self_all"
-    # Control: a current caller ending the stale row is audited as keeping its own session.
+    assert (await scopes())[0] == "self_all" and await last_count() == 0  # the others only
+    assert await ended(stale)
+    # Control: a current caller ending a stale row is audited as keeping its own session.
+    stale = await missed()
     fresh = mint_token()
     await store.create_session(
         token_hash=hash_token(fresh), user_id="u", expires_at=time.time() + 3600

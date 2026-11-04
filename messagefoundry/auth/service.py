@@ -11687,11 +11687,13 @@ class AuthService:
 
         Whether it kept that session is the store's answer from the revoke's own transaction
         (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
-        after it. The store keeps the session only when it re-stamped it with the new epoch, so a
-        session an earlier sweep missed, left unstamped and refused at its next request, is not
-        reported kept. The count is the caller's other sessions this call revoked, never the
-        caller's own: on the seal-failure path the handler ends that one before the counted sweep.
-        :meth:`revoke_every_session` counts it there instead."""
+        after it. The store keeps the session only when it re-stamped it with the new epoch, and
+        otherwise ends it in that transaction (follow-up to BACKLOG #4975), so a session an earlier
+        sweep missed, or one behind on the global epoch, is ended and not reported kept. The count
+        is the caller's other sessions this call revoked, never the caller's own: the store counts
+        the caller's own when it ends it, and that one is taken off (``ended_kept``), and on the
+        seal-failure path the handler ends it before the counted sweep.
+        :meth:`revoke_every_session` counts it in both cases instead."""
         try:
             result = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
@@ -11704,14 +11706,15 @@ class AuthService:
             # the other sessions only.
             await self._session_seal_failed(current_token_hash)
             result = await self._store.revoke_user_sessions(identity.user_id)
+        others = result.count - result.ended_kept
         scope = "self_others" if result.kept else "self_all"
-        if result.count or not result.kept:
+        if others or not result.kept:
             await self._audit(
                 "auth.session_revoked",
                 actor=actor,
-                detail=_json({"scope": scope, "count": result.count}),
+                detail=_json({"scope": scope, "count": others}),
             )
-        return result.count
+        return others
 
     async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int | None:
         """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
@@ -11770,9 +11773,10 @@ class AuthService:
         (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
         after it: kept only when the store re-stamped it with the new epochs. Not kept covers at
         least a session another request ended first, one an earlier sweep missed, which the store
-        leaves unstamped and the gate refuses at its next request, and the seal-failure path. The
-        count is the rows this call's sweep revoked: on the seal-failure path that includes the
-        caller's own, which :meth:`revoke_other_sessions` leaves out of its count."""
+        ends in the revoke's own transaction (follow-up to BACKLOG #4975), and the seal-failure
+        path. The count is the rows this call revoked: where the store or the seal-failure path
+        ended the caller's own, that one is in it, which :meth:`revoke_other_sessions` leaves out
+        of its count."""
         try:
             result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:

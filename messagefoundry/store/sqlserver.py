@@ -314,6 +314,7 @@ from messagefoundry.store.store import (
     full_authentication_clear,
     global_epoch_or_refuse,
     global_epoch_raise,
+    global_epoch_unmoved,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -722,6 +723,12 @@ _MSSQL_EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
 #: session.
 _MSSQL_REVOKE_ALL_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash WHERE revoked_at IS NULL"
+)
+#: store.py's ``_END_DECLINED_KEPT_SESSION_SQL``, counted from ``OUTPUT`` as the sweeps are
+#: (follow-up to BACKLOG #4975).
+_MSSQL_END_DECLINED_KEPT_SESSION_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
+    " WHERE token_hash=? AND user_id=? AND revoked_at IS NULL"
 )
 #: Whether the account holds at least one passkey.
 _MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
@@ -15469,10 +15476,11 @@ class SqlServerStore:
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row, the order
-        ``create_session`` takes them in. The borrow is :meth:`_acquire_after_commit`'s, for the
-        reason it gives (BACKLOG #3023)."""
+        ``create_session`` takes them in. The kept session is checked against the global epoch
+        too, read while the account row is held, as ``create_session`` reads it, and ended where
+        it is declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
-        kept = False
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
                 raised = await self._bump_session_epoch(cur, user_id)
@@ -15483,15 +15491,34 @@ class SqlServerStore:
                         _MSSQL_REVOKE_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, user_id, except_token_hash),
                     )
-                revoked = len(await cur.fetchall())
+                result = RevokeResult(len(await cur.fetchall()), kept=False, ended_kept=False)
                 if except_token_hash is not None:
-                    restamp = KeptSessionRestamp(user_id, raised)
-                    kept = restamp.kept(await self._write_session(cur, except_token_hash, restamp))
+                    unmoved = global_epoch_unmoved(await self._global_session_epoch(cur))
+                    result = await self._keep_or_end_session(
+                        cur,
+                        result.count,
+                        except_token_hash,
+                        KeptSessionRestamp(user_id, raised, unmoved),
+                        now,
+                    )
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return RevokeResult(revoked, kept)
+        return result
+
+    async def _keep_or_end_session(
+        self, cur: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+    ) -> RevokeResult:
+        """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, on ``cur``
+        inside an open transaction (follow-up to BACKLOG #4975); store.py's
+        ``MessageStore._keep_or_end_session`` states the contract. The end is counted from its
+        ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
+        if restamp.kept(await self._write_session(cur, token_hash, restamp)):
+            return RevokeResult(revoked, kept=True, ended_kept=False)
+        await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, token_hash, restamp.user_id))
+        ended = len(await cur.fetchall()) == 1
+        return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -15517,8 +15544,9 @@ class SqlServerStore:
         it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
         session minted before it whatever account it belongs to, and re-seals the kept session
         under both new epochs, when it carried both epochs those raises replaced
-        (:class:`KeptSessionRestamp`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session
-        sweep*, says what that leaves.
+        (:class:`KeptSessionRestamp`, BACKLOG #4975), and otherwise ends and counts it
+        (:meth:`_keep_or_end_session`); docs/SECURITY.md, *Limits of the session sweep*, says what
+        that leaves.
 
         LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
         while holding that row. Taken first, as on Postgres, it would close a cycle wherever the
@@ -15535,7 +15563,6 @@ class SqlServerStore:
         old value, so it ends when this commits. Read from the code and not run against a server
         that has READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
-        kept = False
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
@@ -15550,7 +15577,7 @@ class SqlServerStore:
                         _MSSQL_REVOKE_ALL_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, except_token_hash),
                     )
-                revoked = len(await cur.fetchall())
+                result = RevokeResult(len(await cur.fetchall()), kept=False, ended_kept=False)
                 await cur.execute(
                     "UPDATE global_session_epoch SET epoch = epoch + 1"
                     " OUTPUT inserted.epoch WHERE id = 1"
@@ -15566,15 +15593,18 @@ class SqlServerStore:
                     owners = await cur.fetchall()
                     if owners:
                         owner = str(owners[0][0])
-                        restamp = KeptSessionRestamp(owner, raised.get(owner), global_raised)
-                        kept = restamp.kept(
-                            await self._write_session(cur, except_token_hash, restamp)
+                        result = await self._keep_or_end_session(
+                            cur,
+                            result.count,
+                            except_token_hash,
+                            KeptSessionRestamp(owner, raised.get(owner), global_raised),
+                            now,
                         )
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return RevokeResult(revoked, kept)
+        return result
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a SQL Server database's
