@@ -313,6 +313,9 @@ class _LaneState:
     # the prefix item its body is on; drained is _drain_lane's return once the body has finished.
     drain_index: int = 0
     drained: tuple[_LaneOutcome, list[str], tuple[str, float] | None] | None = None
+    # BACKLOG #4607: a replacement has sent a write of these rows, so a later replacement's
+    # in-flight reading cannot tell the dead body's writes from that one (_dead_rows_in_flight).
+    recovery_wrote: bool = False
     # BACKLOG #4607: infra_error_streak as the live serializer's terminal transition found it, so a
     # replacement for one that died inside that transition does not count the streak twice.
     transition_streak: int | None = None
@@ -1406,6 +1409,7 @@ class StageDispatcher:
             st.held_extra_ids.clear()
             st.drain_index = 0
             st.drained = None
+            st.recovery_wrote = False
             st.transition_streak = None
         self._start_serializer(
             lane, self._run_lane(lane, items, fence=fence), [it.id for it in items], fence
@@ -1568,40 +1572,41 @@ class StageDispatcher:
                 count_label=IN_THIS_RUN,
             )
 
-    async def _dead_head_resolved(self, lane: str, ids: list[str]) -> bool:
-        """Whether a dead serializer's body wrote the row it died on, ``ids[drain_index]``
-        (BACKLOG #4607). ``drain_index`` moves past a row only when the body returns, so a death
+    async def _dead_rows_in_flight(self, lane: str, ids: list[str]) -> int | None:
+        """Read whether a dead serializer's body wrote one of the rows it died holding, from
+        ``ids[drain_index]`` on (BACKLOG #4607). ``drain_index`` moves past a row only when the body returns, so a death
         after the row's terminal write, still inside the body or in the runner's per-stage adapter
         after it, reads as zero progress, and under ``stop`` a lane that delivers at every death
         would be STOPped.
 
-        Measured, not inferred: the dead serializer's rows from ``drain_index`` on, the noted extras
-        with them, are counted against the lane's in-flight rows at this stage. Fewer in flight
-        means one of them was written, and since they are worked oldest-first, the first was. A
-        read that fails, a body that had finished, or another holder of the lane's rows reads as
-        not written, which is the zero-progress reading this had before. A body that re-pended the
-        row itself before dying (``mark_failed``) reads as written too: a retry that spends one of
-        the row's attempts, not a machinery fault on the row."""
+        Measured, not inferred: returns how many of the lane's rows are in flight at this stage, to
+        compare with the dead serializer's rows from ``drain_index`` on, the noted extras with them
+        (:meth:`_dead_serializer_outcome`). Fewer in flight means one of them was written. That is
+        evidence of progress only, never of WHICH row: a batch's coalesced rows can be written
+        before its head, so every row is still re-pended, each write guarded ``status='inflight'``.
+        None, read as zero progress as before, when the body had finished, when a recovery of
+        these rows has already sent a write (``_LaneState.recovery_wrote``), whose landed re-pend
+        would read as progress, or when the read fails. Another holder of the lane's rows reads as
+        not written too. A body that re-pended the row itself before dying (``mark_failed``) reads
+        as written: a retry that spends one of the row's attempts, not a machinery fault."""
         st = self._states.get(lane)
-        if st is None or st.drained is not None or not ids:
-            return False
-        i = min(st.drain_index, len(ids) - 1)
-        held = len(ids) - i + len(st.held_extra_ids)
+        if st is None or st.drained is not None or st.recovery_wrote or not ids:
+            return None
         try:
             inflight = await self._store.inflight_by_lane(stage=self._stage.value)
         except Exception:  # noqa: BLE001 — the reading only; the recovery proceeds as zero progress
-            log.debug(
+            log.warning(
                 "StageDispatcher %s lane %s: could not read the in-flight rows a dead serializer "
                 "held; recovering it as zero progress",
                 self._stage.value,
                 lane,
                 exc_info=True,
             )
-            return False
-        return inflight.get(lane, (0, 0.0))[0] < held
+            return None
+        return inflight.get(lane, (0, 0.0))[0]
 
     def _dead_serializer_outcome(
-        self, lane: str, ids: list[str], *, head_resolved: bool = False
+        self, lane: str, ids: list[str], *, in_flight: int | None = None
     ) -> tuple[_LaneOutcome, list[str], list[str]]:
         """What a replacement for a dead serializer applies (:meth:`_on_lane_task_done`). Returns
         ``(outcome, rows to date to its park_until, rows to release)``.
@@ -1620,9 +1625,10 @@ class StageDispatcher:
         lane at its cadence whenever the row that killed it was not the first, the spin fix A
         collapses.
 
-        With ``head_resolved`` (:meth:`_dead_head_resolved`) row ``i`` was written before the death,
-        so the body counts as past it: the recovery made progress, and only the rows after it are
-        dated.
+        ``in_flight`` is :meth:`_dead_rows_in_flight`'s reading. Below the rows held, one was written
+        before the death, so the recovery made progress and the streak is not escalated; the rows
+        are dated as before. At zero none is in flight, so nothing is dated and the lane parks
+        until now rather than for a backoff, since nothing failed.
 
         Pure: a serializer that died INSIDE its terminal transition may already have counted its
         fault on the streak, so the streak read is the one that transition found
@@ -1636,14 +1642,19 @@ class StageDispatcher:
             park_until = self._clock() + self._infra_backoff(streak)
             return replace(outcome, park_until=park_until), [head[0]], list(tail)
         i = min(st.drain_index, max(len(ids) - 1, 0))
-        if head_resolved:
-            i += 1
-        streak = _found_streak(st) if i == 0 else 0
+        held = ids[i:] + st.held_extra_ids
+        progressed = i > 0 or (in_flight is not None and in_flight < len(held))
+        streak = 0 if progressed else _found_streak(st)
+        if in_flight == 0:
+            outcome = _LaneOutcome(
+                LaneResultKind.RETRY, self._clock(), is_infra_fault=True, made_progress=True
+            )
+            return outcome, [], []
         park_until = self._clock() + self._infra_backoff(streak)
         outcome = _LaneOutcome(
-            LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)
+            LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=progressed
         )
-        return outcome, ids[i:] + st.held_extra_ids, []
+        return outcome, held, []
 
     async def _run_lane(
         self,
@@ -1688,6 +1699,13 @@ class StageDispatcher:
                     held = HoldResult.STOPPED
                     break
                 delay -= step
+            # Read before the fence is checked, so the write that follows is never a round trip
+            # behind it; a stop during the read sends nothing, as a stop during the wait does.
+            in_flight = (
+                None if held is not None else await self._dead_rows_in_flight(lane, recover_ids)
+            )
+            if held is None and self._stop.is_set():
+                held = HoldResult.STOPPED
             if held is None and not fence.may_write():
                 # Retries of the dead serializer's writes, not its first, so fenced as a hold's
                 # retries are: a successor may own these rows, and every write is guarded only by
@@ -1713,11 +1731,11 @@ class StageDispatcher:
                         claimed + (len(st_r.held_extra_ids) if st_r is not None else 0),
                     ),
                 )
-            # Read only once the lane may be written: a stop or a superseded lease sends nothing.
-            resolved = held is None and await self._dead_head_resolved(lane, recover_ids)
             outcome, head_ids, tail_ids = self._dead_serializer_outcome(
-                lane, recover_ids, head_resolved=resolved
+                lane, recover_ids, in_flight=in_flight
             )
+            if st_r is not None and held is None and (head_ids or tail_ids):
+                st_r.recovery_wrote = True  # from here a write of these rows may land
             if st_r is not None and st_r.transition_streak is not None:
                 # A death inside the terminal transition: the replay below counts the fault once.
                 st_r.infra_error_streak, st_r.transition_streak = st_r.transition_streak, None

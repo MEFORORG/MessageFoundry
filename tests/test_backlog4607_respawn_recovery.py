@@ -817,3 +817,97 @@ async def test_a_per_lane_worker_that_died_after_writing_a_row_closes_its_run_of
     assert claims.deaths.count == (0 if written else 3)
     backoff = wiring_runner._WORKER_ERROR_BACKOFF_SECONDS
     assert sleeps == ([backoff] if written else [backoff, backoff, backoff])
+
+
+# --- the round-5 review repairs (this branch's own round-4 changes) -------------------------------
+
+
+def _capture_retries(
+    dispatcher: stage_dispatcher.StageDispatcher, monkeypatch: pytest.MonkeyPatch
+) -> list[_LaneOutcome]:
+    outcomes: list[_LaneOutcome] = []
+    monkeypatch.setattr(
+        dispatcher, "_apply_retry", lambda lane, st, outcome: outcomes.append(outcome)
+    )
+    return outcomes
+
+
+async def test_a_written_extra_does_not_drop_a_head_still_in_flight_from_the_re_pend(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5-2a. The in-flight count says a row was written, never which: a batching outbound writes
+    its kept members before it dead-letters a refused head. A replacement that read the head as
+    written left it out of the re-pend, INFLIGHT, and the lane claimed past it. Every row is
+    re-pended now; the reading moves only the progress accounting."""
+    dispatcher, _ = _processing_dispatcher(db)
+    head = await _claimed_ingress_row(db)
+    dispatcher.note_held("IB", ["written-extra"])
+    outcomes = _capture_retries(dispatcher, monkeypatch)
+    await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=[head])
+    assert await _ingress_inflight(db) == 0  # the head was re-pended
+    (outcome,) = outcomes
+    assert outcome.made_progress
+
+
+async def test_a_reading_after_a_recovery_wrote_is_not_taken_as_progress(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5-2b. A replacement whose re-pend landed, and which then died before its terminal
+    transition, left the rows pending; the next replacement read that as the dead body's
+    progress, reset the streak and closed the run, so the stop bound and the page were never
+    reached. A recovery marks that it sent a write, and the next one reads zero progress."""
+    dispatcher, st = _processing_dispatcher(db, infra_fault_stop_after=3)
+    st.serializer_deaths = _dead_run(2)
+    st.recovery_wrote = True
+    outcomes = _capture_retries(dispatcher, monkeypatch)
+    await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=["re-pended-row"])
+    (outcome,) = outcomes
+    assert not outcome.made_progress
+    assert st.serializer_deaths.count == 2
+
+
+async def test_a_stop_during_the_in_flight_read_sends_no_write(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5-1. The read came after the fence check, so a re-pend went out a whole store round trip
+    behind it, during a teardown or after a lease change. It now comes first, and a stop during
+    it ends the recovery with the row in flight and the lane counted against quiesce."""
+    dispatcher, _ = _processing_dispatcher(db)
+    row = await _claimed_ingress_row(db)
+
+    async def read_then_stop(lane: str, ids: list[str]) -> int:
+        dispatcher._stop.set()
+        return 1
+
+    monkeypatch.setattr(dispatcher, "_dead_rows_in_flight", read_then_stop)
+    await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=[row])
+    assert await _ingress_inflight(db) == 1
+    assert dispatcher._stranded_on_stop == {"IB"}
+
+
+async def test_a_recovery_with_nothing_in_flight_does_not_back_off(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5-6. A serializer that died after writing every row it held left nothing to re-pend, yet
+    its replacement parked the lane for an infra backoff, dropping a wake that came meanwhile. It
+    now parks it until now."""
+    dispatcher, _ = _processing_dispatcher(db)
+    outcomes = _capture_retries(dispatcher, monkeypatch)
+    before = dispatcher._clock()
+    await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=["written-row"])
+    (outcome,) = outcomes
+    assert outcome.made_progress
+    assert outcome.park_until is not None
+    assert before <= outcome.park_until <= dispatcher._clock()
+
+
+async def test_a_per_lane_reading_after_a_replacement_sent_its_re_pend_is_not_progress(
+    db: MessageStore, tmp_path: Path
+) -> None:
+    """R5-2b, per-lane half: a replacement that died after its re-pend was sent hands the next one
+    rows that read as written; they are not taken as the dead worker's progress."""
+    runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
+    claims = _LaneClaims(["re-pended-row"], _leading(), deaths=_dead_run(3), repend_sent=True)
+    assert not await runner._dead_worker_wrote("router", "IB", claims)
+    claims.repend_sent = False
+    assert await runner._dead_worker_wrote("router", "IB", claims)

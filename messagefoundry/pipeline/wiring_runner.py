@@ -541,6 +541,9 @@ class _LaneClaims:
     fence: RependFence | None = None
     deaths: FailureRun = field(default_factory=FailureRun)
     last_death: float = 0.0  # time.monotonic() of the run's last death
+    # A replacement has sent a re-pend of ``ids``, so a later replacement cannot tell the dead
+    # worker's writes from that one by the in-flight count (_dead_worker_wrote).
+    repend_sent: bool = False
 
     def settle(self, worker: str, name: str) -> None:
         """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends."""
@@ -6843,7 +6846,11 @@ class RegistryRunner:
         old = self._lane_claims.get(key)
         if _died(prev) and old is not None:
             claims = _LaneClaims(
-                ids=list(old.ids), fence=old.fence, deaths=old.deaths, last_death=old.last_death
+                ids=list(old.ids),
+                fence=old.fence,
+                deaths=old.deaths,
+                last_death=old.last_death,
+                repend_sent=old.repend_sent,
             )
         else:
             claims = _LaneClaims()
@@ -6885,7 +6892,7 @@ class RegistryRunner:
             self._log_left_in_flight(kind, name, claims.ids)
             return
         abandon = self._hold_abandon(kind, name)
-        if claims.deaths.count and await self._dead_worker_wrote(kind, name, claims.ids):
+        if claims.deaths.count and await self._dead_worker_wrote(kind, name, claims):
             claims.close_deaths(kind, name)  # it moved the lane on: the next death is another row's
         if claims.deaths.count >= 2:
             delay = _capped_backoff(
@@ -6946,6 +6953,7 @@ class RegistryRunner:
                 name,
                 len(claims.ids),
             )
+            claims.repend_sent = True  # from here a re-pend of these rows may land
             ended = await self._repend_claimed_on_fault(
                 kind, name, claims.ids, fence=fence, abandon=abandon
             )
@@ -6962,6 +6970,7 @@ class RegistryRunner:
                     ended.name.lower(),
                 )
             claims.ids.clear()
+            claims.repend_sent = False  # the worker's next claim is its own
             # The re-pend dated the rows one backoff ahead, and no wake is armed for that date, so
             # a worker that claimed now would find nothing and wait on its lane's idle backstop.
             # Sleep it out first, as the except arm does after its re-pend.
@@ -6971,15 +6980,20 @@ class RegistryRunner:
                 return
         await run(name, claims=claims)
 
-    async def _dead_worker_wrote(self, kind: str, name: str, ids: Sequence[str]) -> bool:
+    async def _dead_worker_wrote(self, kind: str, name: str, claims: _LaneClaims) -> bool:
         """Whether a dead per-lane worker wrote any of the rows it died holding, ``ids`` (BACKLOG
         #4607). A run of deaths otherwise closes only on a settled pass, so a worker that dies after
         delivering a row, every time, would read as stuck on it.
 
-        Measured as the pooled twin measures it (``StageDispatcher._dead_head_resolved``): fewer of
+        Measured as the pooled twin measures it (``StageDispatcher._dead_rows_in_flight``): fewer of
         the lane's rows in flight at this stage than it held means one was written. A read that
-        fails, or another holder of the lane's rows, reads as not written."""
-        if not ids:
+        fails, another holder of the lane's rows, or a replacement's re-pend of them already sent
+        (``_LaneClaims.repend_sent``), whose landing would read as a write, reads as not written.
+        The except arm's own re-pend is not marked: a worker that dies after that write lands and
+        before it clears ``ids`` reads as having written. That only closes a run of deaths early;
+        every row is still re-pended."""
+        ids = claims.ids
+        if not ids or claims.repend_sent:
             return False
         stage = {
             "delivery": Stage.OUTBOUND,
@@ -6990,8 +7004,9 @@ class RegistryRunner:
         try:
             inflight = await self.store.inflight_by_lane(stage=stage.value)
         except Exception:  # noqa: BLE001 — the reading only; the run of deaths stays open
-            log.debug(
-                "%s worker %r: could not read the in-flight rows a dead worker held",
+            log.warning(
+                "%s worker %r: could not read the in-flight rows a dead worker held; its run of "
+                "deaths stays open",
                 kind,
                 name,
                 exc_info=True,
