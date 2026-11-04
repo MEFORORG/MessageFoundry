@@ -188,7 +188,9 @@ async def test_the_strict_validation_timeout_stays_a_permanent_422(
         release.wait(10.0)  # held until the answer is read, so the orphaned thread ends at once
 
     monkeypatch.setattr(wiring_runner, "validate", _stuck_validate)
-    monkeypatch.setattr(wiring_runner, "_strict_validate_timeout", lambda ic: 0.01)
+    # 1 s, not a few ms: a timeout that fires before a worker thread begins the validate is now
+    # TEMPORARY (BACKLOG #5078), and under GIL contention a thread can take tens of ms to begin.
+    monkeypatch.setattr(wiring_runner, "_strict_validate_timeout", lambda ic: 1.0)
     ic = _ic(validation=Validation(strict=True))
     try:
         resp = await _post_through_runner(store, ic, HL7.encode("ascii"))

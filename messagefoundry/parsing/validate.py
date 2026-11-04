@@ -360,4 +360,7 @@ def validate(
                 errors.append(str(exc))
                 fault = True
 
+    # A fault beside a verdict the body earns every time (the version mismatch above) is not what
+    # decides: that verdict already fails the body, so the result is no fault.
+    fault = fault and len(errors) == 1
     return ValidationResult(ok=not errors, version=version, errors=errors, fault=fault)

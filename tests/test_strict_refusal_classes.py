@@ -23,6 +23,7 @@ synthetic HL7. Deliberately ASCII-only.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import threading
 from collections.abc import Callable, Iterator
@@ -136,8 +137,10 @@ class _QueuedAsyncio:
         return getattr(asyncio, name)
 
     async def to_thread(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        # As asyncio.to_thread does: the worker runs in a copy of the caller's context.
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._pool, functools.partial(func, *args, **kwargs))
+        call = functools.partial(contextvars.copy_context().run, func, *args, **kwargs)
+        return await loop.run_in_executor(self._pool, call)
 
 
 class _OneWorker:
@@ -192,7 +195,7 @@ async def test_a_timeout_that_never_began_is_temporary_on_the_receipt_path(
     assert receipt.refusal is RefusalKind.TEMPORARY
     rows = await _error_rows(store)
     assert len(rows) == 1 and rows[0]["status"] == MessageStatus.ERROR.value
-    assert "strict-validation timed out after 0.1s waiting for a worker thread" in rows[0]["error"]
+    assert "strict-validation timed out after 0.1s before the validate began" in rows[0]["error"]
     # Nothing was left running: once the worker frees, the abandoned validate does not start. This
     # is the outcome, not a control for the lock: cancelling the executor future already skips a
     # queued job. The lock is pinned by the direct test of _StrictValidateRun below.
@@ -204,13 +207,47 @@ async def test_control_a_timeout_that_began_stays_permanent_on_the_receipt_path(
     store: MessageStore, one_worker: _OneWorker
 ) -> None:
     """Control: the same pool with its worker free. The validate begins, hangs past the timeout,
-    and stays PERMANENT, with the text the dry-run mirrors."""
-    ic = _strict_ic(ConnectorType.HTTP, timeout=0.1)
+    and stays PERMANENT, with the text the dry-run mirrors. A 1 s timeout, so a thread slow to be
+    scheduled under GIL contention still begins inside it."""
+    ic = _strict_ic(ConnectorType.HTTP, timeout=1.0)
     receipt = await _runner(store, ic)._handle_inbound_http(ic, _ADT.encode("ascii"))
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _error_rows(store)
-    assert rows[0]["error"].endswith("strict-validation timed out after 0.1s")
+    assert rows[0]["error"].endswith("strict-validation timed out after 1.0s")
     assert one_worker.calls == [1]
+
+
+async def test_a_validator_fault_is_temporary_on_the_receipt_path(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The receipt half of the fault arm below: a fault that may be the engine's is not final there
+    either. Mutation: drop the fault branch. Red: PERMANENT."""
+    import hl7apy.parser
+
+    def _engine_fault(*_: Any, **__: Any) -> Any:
+        raise MemoryError
+
+    monkeypatch.setattr(hl7apy.parser, "parse_message", _engine_fault)
+    ic = _strict_ic(ConnectorType.HTTP)
+    receipt = await _runner(store, ic)._handle_inbound_http(ic, _ADT.encode("ascii"))
+    assert receipt.refusal is RefusalKind.TEMPORARY
+
+
+def test_a_fault_beside_a_version_mismatch_is_no_fault(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body that declares the wrong MSH-12 fails the same way every time, whatever else faulted, so
+    the result is final; the same fault alone is a fault. Uses validate() directly."""
+    import hl7apy.validation
+
+    from messagefoundry.parsing.validate import validate
+
+    def _validator_fault(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("validator fault")
+
+    monkeypatch.setattr(hl7apy.validation.Validator, "validate", _validator_fault)
+    mismatched = validate(_ADT, expected_version="2.3")
+    assert not mismatched.ok and mismatched.fault is False
+    alone = validate(_ADT, expected_version="2.5.1")
+    assert not alone.ok and alone.fault is True
 
 
 async def test_a_timeout_that_never_began_is_still_ae_on_mllp(
@@ -225,10 +262,10 @@ async def test_a_timeout_that_never_began_is_still_ae_on_mllp(
         held.set()
     assert ack is not None and "MSA|AE|" in ack
     # The wire carries the same text for both causes, so a sender cannot read pool state off MSA-3.
-    assert "worker thread" not in ack
+    assert "before the validate began" not in ack
     assert "strict-validation timed out after 0.1s" in ack
     rows = await _error_rows(store)
-    assert "waiting for a worker thread" in rows[0]["error"]
+    assert "before the validate began" in rows[0]["error"]
 
 
 async def test_a_validator_fault_stays_ae_on_mllp(

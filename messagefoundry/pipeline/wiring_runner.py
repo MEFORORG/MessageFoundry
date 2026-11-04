@@ -913,14 +913,17 @@ class _StrictValidateTimedOut(Exception):
     as the validate, so under load a body can time out before it is ever looked at. That body says
     nothing about itself, and it left no thread behind, so a receipt source answers it as temporary.
     One that had started stays final: it may be the slow body the timeout exists for, and its
-    thread is still running. ``reason`` is value-free, only the numeric timeout, and goes to the
-    stored ``ERROR`` row. ``ack_text`` is what goes on the wire in MSA-3: the same for both causes,
-    so an unauthenticated sender cannot read the engine's thread-pool state off the NAK."""
+    thread is still running. "Began" means the worker ran the run's first line; a free thread that
+    the GIL or the OS did not schedule in time reads as not begun too, so the reason says only that.
+
+    ``reason`` is value-free, only the numeric timeout, and goes to the stored ``ERROR`` row.
+    ``ack_text`` goes in an MLLP NAK's MSA-3 and is the same for both causes, so the NAK text does
+    not report engine load. The receipt path's status (``503`` versus ``422``) does, by design."""
 
     def __init__(self, timeout: float, *, started: bool) -> None:
         self.started = started
         self.ack_text = f"strict-validation timed out after {timeout}s"
-        self.reason = self.ack_text if started else f"{self.ack_text} waiting for a worker thread"
+        self.reason = self.ack_text if started else f"{self.ack_text} before the validate began"
         super().__init__(self.reason)
 
 
@@ -8169,7 +8172,14 @@ class RegistryRunner:
                 # validate() keeps its own size cap, the engine default, even where the inbound's
                 # max_message_bytes admitted the body to the peek. It says itself when that cap
                 # refused the body, measured on the text it normalized, so nothing here re-derives it.
-                kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
+                # A validator fault may be the engine's (a MemoryError under load), so it is
+                # TEMPORARY, as MLLP answers it AE (BACKLOG #5078).
+                if result.oversize:
+                    kind = RefusalKind.OVERSIZE
+                elif result.fault:
+                    kind = RefusalKind.TEMPORARY
+                else:
+                    kind = RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns a refusal — never accepted-and-dropped.

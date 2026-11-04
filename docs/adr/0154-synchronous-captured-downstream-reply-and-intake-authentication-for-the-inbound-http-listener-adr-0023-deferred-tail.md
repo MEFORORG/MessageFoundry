@@ -24,7 +24,8 @@
   [Amendment 2026-10-30, refusal kinds](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
 - **Amended 2026-11-03 (BACKLOG #5078, the batch 604 Manager's direction after an adversarial
   review):** a strict-validation timeout whose validate never began, because no worker thread came
-  free inside the timeout, is **temporary** (`503` with `Retry-After`); one that began stays `422`.
+  free or ran it inside the timeout, is **temporary** (`503` with `Retry-After`); one that began
+  stays `422`.
   The 2026-10-30 amendment keeps its text, with a dated note in place. See
   [Amendment 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
@@ -1542,11 +1543,13 @@ time validating. When every worker is busy for the whole timeout, the validate n
 `pipeline/wiring_runner.py`. The worker marks the run started as its first act, and the listener,
 when the timeout fires, marks it abandoned. Both take one lock, so they cannot cross: either the
 worker began first and the listener reads that it began, or the listener gave up first and the worker
-returns without calling `hl7apy` at all. Nothing is inferred from timings.
+returns without calling `hl7apy` at all. Nothing is inferred from timings. "Began" means the worker
+ran the run's first line, so a free thread that the GIL or the OS did not schedule in time also reads
+as not begun. The stored reason therefore says only "before the validate began", not why.
 
 | Timeout | What is known | Receipt path | MLLP / TCP | Stored reason |
 | --- | --- | --- | --- | --- |
-| the validate never began | nothing about the body; no thread was left running | temporary: `503` with `Retry-After` | `AE` | `strict-validation timed out after <N>s waiting for a worker thread` |
+| the validate never began | nothing about the body; no thread was left running | temporary: `503` with `Retry-After` | `AE` | `strict-validation timed out after <N>s before the validate began` |
 | the validate began and ran past the timeout | it may be the slow body the timeout exists for; its thread is still running | permanent: `422` | `AE` | `strict-validation timed out after <N>s`, unchanged |
 
 The 2026-10-30 reason for keeping the timeout permanent was that each retry orphans another `hl7apy`
@@ -1576,11 +1579,14 @@ cannot see it, because cancelling the executor future already skips a queued job
   measured, and the discriminator does not see it.
 
 **MLLP is unchanged.** Both timeouts still answer `AE` with the same MSA-3 text; only the stored
-reason tells them apart, so an unauthenticated sender cannot read the engine's thread-pool state off
-the NAK. The same change made a strict-validation failure answer `AR` on MLLP, the final code,
+reason tells them apart, so the NAK text does not report engine load. The receipt path's status
+does (`503` versus `422`), by design: a sender cannot be told to re-send without being told the
+engine was busy. The same change made a strict-validation failure answer `AR` on MLLP, the final code,
 matching the receipt path's `422` and `413` for it (BACKLOG #5078). A validator fault, an unexpected
 exception inside `validate()` that may be the engine's own, such as a `MemoryError` under load,
-stays `AE` (`ValidationResult.fault`); the receipt path still answers it `422`. The engine's own
+stays `AE` (`ValidationResult.fault`), and the receipt path answers it temporary, `503`. A fault
+beside a verdict the body earns every time, such as an MSH-12 version mismatch, is not a fault. The
+engine's own
 MLLP outbound dead-letters `AR` at once and retries `AE`.
 
 **What else is unchanged.** Strict validation's own size cap stays the engine default, 16 MiB,
