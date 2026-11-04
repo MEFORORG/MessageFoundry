@@ -49,7 +49,7 @@ from __future__ import annotations
 import re
 
 from messagefoundry.redaction import redact as _redact_phi
-from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.secretscrub import _CONNECTION_STRING_MEMBER, scrub_credentials
 
 __all__ = [
     "redact_log_line",
@@ -375,28 +375,8 @@ _MEFOR_SECRET = re.compile(
 # copy's case fold, and that change is what the comment above ``redact_log_line`` records as
 # printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses
 # them.
-# THE FIRST BRANCH IS A CONNECTION-STRING MEMBER (BACKLOG #5030): a key right after a ";" that ends
-# in a credential word, glued on or not (``;PWD=``, ``;sslpassword=``), its value taken to the next
-# ";". The plain class stops at a space, "," or "&", which a credential the generic ODBC dialect sends
-# unbraced may hold, and ``sslpassword`` has no ``\b`` before its word at all. The rule, its guards
-# and its cost are stated once, on ``_CONNECTION_STRING_MEMBER`` in ``messagefoundry/secretscrub.py``;
-# this copy spells its keywords literally, so the regex scanner in ``tests/test_security_static.py``
-# still reads it. The label branch keeps group 2, which ``_keep_label`` reads.
-_CONNECTION_STRING_MEMBER = (
-    r"(?<=;)([A-Za-z0-9_]++(?:(?<=(?i:password))|(?<=(?i:passwd))|(?<=(?i:passphrase))"
-    r"|(?<=(?i:pass))|(?<=(?i:pwd))|(?<=(?i:secret))|(?<=(?i:credential))|(?<=(?i:token))))=(?:"
-    + _ODBC_BRACED
-    + r"|"
-    + _ODBC_BRACED_OVERRUN
-    + r"|(?:[^;'\"{:\r\n]|:(?!//))++(?:(?=[;\r\n])|\Z|(?<![:=\s])(?=['\"])))"
-)
 _CREDENTIAL_KV = re.compile(
-    _LABEL_START
-    + r"(?:"
-    + _CONNECTION_STRING_MEMBER
-    + r"|("
-    + _LABEL_PREFIX
-    + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
+    _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _ODBC_BRACED
@@ -406,7 +386,7 @@ _CREDENTIAL_KV = re.compile(
     + _ODBC_BRACED_OVERRUN
     + r"|"
     + _PLAIN_KV_VALUE
-    + r"))"
+    + r")"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -587,7 +567,8 @@ def redact_log_line(line: str) -> str:
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
     JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the
-    stored-error PHI coverage (DELTA-07). Then the write-time credential vocabulary
+    stored-error PHI coverage (DELTA-07). Then a credential member of a connection string, its value
+    taken to the next ``;`` (BACKLOG #5030). Then the write-time credential vocabulary
     (:func:`messagefoundry.secretscrub.scrub_credentials`) runs over the text between the placeholders
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694). A final long-base64 sweep catches any residual key/token run.
@@ -607,6 +588,14 @@ def redact_log_line(line: str) -> str:
     body = _redact_phi(
         body
     )  # shared engine PHI pass: generic HL7 segments/field runs + DOB + names
+    # A connection-string member, its value taken to the next ";" (BACKLOG #5030). secretscrub's own
+    # object, not a copy, and run here rather than among this module's passes: after the PHI pass,
+    # which judges a token by its separators and would see fewer of them once this pass took a "&",
+    # and over the whole body before the split below, since this module's placeholder can sit
+    # inside the value (``;PWD=[REDACTED] kx,Pw&mv;``). It only ever hides more; the reason is on
+    # the pattern.
+    if ";" in body:
+        body = _CONNECTION_STRING_MEMBER.sub(_keep_label, body)
     # The second credential layer; see the comment above this function.
     pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
     body = REDACTION_PLACEHOLDER.join(
@@ -656,10 +645,8 @@ def redact_log_text(text: str) -> str:
 
 def _keep_label(m: re.Match[str]) -> str:
     """Replace a ``<label>=<value>`` match, keeping the label so a reviewer sees WHICH credential
-    leaked, and never the value. Group 1 is the label in every pattern that uses this, except where
-    ``_CREDENTIAL_KV``'s label branch matched: its connection-string branch holds group 1, so the
-    label is group 2 there."""
-    return f"{m.group(1) or m.group(2)}={REDACTION_PLACEHOLDER}"
+    leaked, and never the value. Group 1 is the label in every pattern that uses this."""
+    return f"{m.group(1)}={REDACTION_PLACEHOLDER}"
 
 
 def _keep_scheme(m: re.Match[str]) -> str:

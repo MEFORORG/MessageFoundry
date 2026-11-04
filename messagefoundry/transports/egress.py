@@ -375,7 +375,8 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     least check, start, operator start and test), from :func:`check_fhir_lookup_allowed`, its
     FhirLookup twin, and from :func:`warn_url_query_credentials_before_build`, the runner's one
     pre-build step for both kinds, which logs it at a start and an operator start before anything
-    can fail the build; those builds then skip it in :func:`check_egress_allowed`. All run on
+    in that connection's own build can fail; those builds then skip it in
+    :func:`check_egress_allowed`. All run on
     env-resolved settings, so this sees a URL that ``env()`` supplied. A reload skips it on the
     builds that follow its build check, which has already warned; :func:`check_egress_allowed` says
     how.

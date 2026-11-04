@@ -735,74 +735,6 @@ _MEFOR_SECRET = re.compile(
     + r"['\"]?)"
 )
 
-#: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
-#: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
-#: :data:`_MEMBER_EXTRA_HINT`, admits ``_CREDENTIAL_KV`` beside :data:`_CREDENTIAL_HINT`.
-_MEMBER_EXTRA_WORDS = ("token",)
-
-# A connection-string member whose KEY ends in a credential word, its value taken to the next ";"
-# (BACKLOG #5030). ``_CREDENTIAL_KV``'s first branch, so it is tried before the label branch at the
-# same position, and only right after a ";".
-#
-# THE ";" IN FRONT IS THE DISCRIMINATOR. Every member after the first follows one, and the generic
-# dialect's string never opens with a credential (``transports/database.py`` writes ``DRIVER`` and
-# ``SERVER`` first). With no space allowed after it, prose such as "failed; password=x was wrong"
-# keeps the label branch and its old value class.
-#
-# THE KEY MAY CARRY ANY RUN OF LETTERS, DIGITS AND "_" IN FRONT OF THE WORD. ``sslpassword``,
-# ``SSLPassword`` and ``KeyStorePwd`` glue a word on with no separator, and only the lookbehinds
-# below, built from the word tuples named at the end of this comment, read that. So the admission
-# gates still hold: the key ends in a word of a tuple whose hint admits this pattern. ``;Bypass=1`` is a member too, and its value is hidden;
-# over-redaction is the direction this module may fail in. No "." or "-": a word-only run cannot be
-# re-entered from a later ``\b``, which is what the scan-prefix guard in
-# ``tests/test_log_redaction_secret_domain.py`` reads, and an ODBC keyword holding either is a key
-# this branch leaves to the label branch. The "=" must follow the key directly, as the builder writes
-# it; ``;PWD =x`` is left to the label branch too.
-#
-# THE VALUE IS TAKEN WHOLE OR NOT AT ALL. It runs over spaces, ",", "&" and "=" to a ";", a line
-# break or the end of the text, and stops at a quote only where the quote does not follow ":", "="
-# or whitespace. Nothing a plain value from the builder can hold is refused, since a plain password
-# and every ``odbc_params`` value refuse ";", braces and quotes. The guards make the branch refuse,
-# and the label branch then reads the text as it always did, in at least these cases:
-#
-# * a value that opens with a quote, which the label branch's quoted forms take;
-# * a quote right after ":", "=" or whitespace, which opens a LATER label's value. Running up to it
-#   would leave that label's head inside this span, and its quoted value would print:
-#   ``;PWD=a,password='b c'`` would print "b c'";
-# * a "{" inside, because a later label's braced value may hold the ";" this walk stops at;
-# * a "://" inside, because a DSN password may hold a ";" too, and ``_DSN_PASSWORD`` would then no
-#   longer match.
-#
-# A braced value is taken by the same ``_ODBC_BRACED`` and ``_ODBC_BRACED_OVERRUN`` the label branch
-# uses, so ``;sslpassword={a;b}`` is hidden whole, and a key the label branch also reads gets the same
-# span from either branch.
-#
-# WHERE THE LABEL BRANCH ALSO MATCHES AT THAT ";", THIS SPAN ENDS NO EARLIER. Each character that ends
-# this value ends the plain class too, and every guarded case falls back to the label branch. The key
-# is kept as the label, so the output only hides more of a line than before.
-#
-# LINEAR. It starts only right after a ";", and its value walk stops at or before the next one, so
-# walks from two starts never overlap. The key run and the value walk are possessive, and the
-# lookbehinds are a fixed set of fixed widths.
-#
-# WHAT IT COSTS, at least: text after a glued ``;password=`` in prose or in a URL's matrix
-# parameters is hidden to the next ";" or the end of the line, and a later label inside that span
-# loses its label to the placeholder, though never its value.
-#
-# The key's words are :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`, which together are
-# the builder's own secret keywords, ``transports/database.py`` ``_ODBC_SECRET_KEY_RE``. That set
-# matches a word anywhere in a key and this branch only at its end, so a key such as
-# ``ClientSecretValue`` is left to the label branch: a residual.
-_CONNECTION_STRING_MEMBER = (
-    r"(?<=;)([A-Za-z0-9_]++(?:"
-    + "|".join(f"(?<={re.escape(word)})" for word in _CREDENTIAL_WORDS + _MEMBER_EXTRA_WORDS)
-    + r"))=(?:"
-    + _ODBC_BRACED
-    + r"|"
-    + _ODBC_BRACED_OVERRUN
-    + r"|(?:[^;'\"{:\r\n]|:(?!//))++(?:(?=[;\r\n])|\Z|(?<![:=\s])(?=['\"])))"
-)
-
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
 # provider "secret=". The value class stops at the separators these actually appear inside (";" in an
 # ODBC string, "," and "&" in a query), so a redaction cannot swallow the rest of the line.
@@ -839,20 +771,10 @@ _CONNECTION_STRING_MEMBER = (
 #   braced value, for the reason given at :data:`_NOT_BEFORE_QUOTED_LABEL`.
 # Each of the four residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.
-#
-# THE FIRST BRANCH IS A CONNECTION-STRING MEMBER (BACKLOG #5030); the second is the label pattern
-# described above. A credential an ODBC connection string sends WITHOUT braces may hold a space, ",",
-# "&" or "=" -- the generic dialect sends a password plain for a driver it has not measured, and every
-# ``odbc_params`` value plain, ``sslpassword`` among them -- and the plain value class stops at the
-# first three. So an echoed ``;PWD=Zq7 kx,Pw&mv=Ty9;`` printed " kx,Pw&mv=Ty9", and
-# ``;sslpassword=...`` printed whole: "ssl" glued to "password" leaves no ``\b`` for the label.
-# :data:`_CONNECTION_STRING_MEMBER` holds the rule and its guards.
 _CREDENTIAL_KV = re.compile(
     r"(?i)"
     + _LABEL_START
-    + r"(?:"
-    + _CONNECTION_STRING_MEMBER
-    + r"|("
+    + r"("
     + _LABEL_PREFIX
     + r"(?:"
     + _alternation(_CREDENTIAL_WORDS)
@@ -866,7 +788,7 @@ _CREDENTIAL_KV = re.compile(
     + _ODBC_BRACED_OVERRUN
     + r"|"
     + _PLAIN_KV_VALUE
-    + r"))"
+    + r")"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -972,13 +894,80 @@ _KEY_MATERIAL = re.compile(
 # one does not.
 _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
 
+#: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
+#: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
+#: :data:`_MEMBER_EXTRA_HINT`, admits the member pass beside :data:`_CREDENTIAL_HINT`.
+_MEMBER_EXTRA_WORDS = ("token",)
+
+# A connection-string member whose KEY ends in a credential word, its value taken to the next ";"
+# (BACKLOG #5030). A credential an ODBC connection string sends WITHOUT braces may hold a space, ",",
+# "&" or "=": the generic dialect sends a password plain for a driver it has not measured, and every
+# ``odbc_params`` value plain, ``sslpassword`` among them. ``_CREDENTIAL_KV``'s plain value class
+# stops at the first three, so an echoed ``;PWD=Zq7 kx,Pw&mv=Ty9;`` printed " kx,Pw&mv=Ty9", and
+# ``;sslpassword=...`` printed whole: "ssl" glued to "password" leaves no ``\b`` for a label.
+#
+# IT IS ITS OWN PASS, AND IT RUNS LAST in :func:`_run`, over the text every other pass left. It only
+# replaces a span with ``<key>=<placeholder>``, and the key is text those passes kept, so every
+# character it leaves was already in their output: it hides the same or more of a line, never less.
+# Its first draft was a branch of ``_CREDENTIAL_KV``, tried at the same position as the label, and a
+# review of that draft found at least four shapes where it printed a value the label pattern hid: a
+# later label written with a quoted key, a "}" or "@" that ``_KEY_MATERIAL`` or ``_DSN_PASSWORD``
+# needed later, and a value of only spaces before a line break. Run last, a value an earlier pass
+# hid is already the placeholder when this pass reads it.
+#
+# THE ";" IN FRONT IS THE DISCRIMINATOR. Every member after the first follows one, and the generic
+# dialect's string never opens with a credential (``transports/database.py`` writes ``DRIVER`` and
+# ``SERVER`` first). The "=" must follow the key directly, as the builder writes it.
+#
+# THE KEY IS A RUN OF LETTERS, DIGITS AND "_" THAT ENDS IN ONE OF THE WORDS. ``sslpassword``,
+# ``SSLPassword`` and ``KeyStorePwd`` glue a word on with no separator, and only the fixed-width
+# lookbehinds below read that. ``;Bypass=1`` is a member too, and its value is hidden.
+#
+# THE VALUE RUNS TO THE NEXT ";", QUOTE OR LINE BREAK, OR THE END OF THE TEXT, over spaces, ",",
+# "&", "=" and "://" alike. One quote may open it. Stopping at a later quote costs nothing the builder
+# sends, since a plain password and every ``odbc_params`` value refuse quotes, and it keeps the rest
+# of a quoted echo (``'...;PWD=a b' refused``) readable; stopping early is safe here because an earlier
+# pass has already hidden whatever it hides. A braced value is taken by ``_ODBC_BRACED`` and then on
+# to the same stops, so ``;sslpassword={a;b} c`` is hidden whole, and an unclosed "{" takes the rest
+# of the line, as ``_ODBC_BRACED_OVERRUN`` does for the label pattern. An empty value is no match.
+#
+# LINEAR. A match starts only right after a ";", the key run and every value walk are possessive,
+# and the lookbehinds are a fixed set of fixed widths. A plain walk stops at the next ";", so walks
+# from two starts never overlap; a braced walk that crosses a ";" ends the match beyond it, and the
+# scan resumes there. ``tests/test_connection_string_member_scrub.py`` pins the time on a long line.
+#
+# WHAT IT COSTS, at least: text after a glued ``;password=`` in prose or in a URL's matrix parameters
+# is hidden to the next ";" or the end of the line, and a later label inside that span loses its
+# label to the placeholder. Its value was already hidden by an earlier pass, or is hidden here.
+#
+# WHAT IT LEAVES, at least these:
+#
+# * a credential that is the FIRST member, with no ";" before it (``Password=a b;Server=h``).
+#   ``_CREDENTIAL_KV`` reads it as before, so its tail after a space still prints;
+# * a key that holds a credential word but does not END in one, such as ``ClientSecretValue``. The
+#   builder's own ``_ODBC_SECRET_KEY_RE`` matches a word anywhere in a key, this pass only at its end;
+# * a key holding "." or "-", or a space before its "=" (``;PWD =x``), left to ``_CREDENTIAL_KV``;
+# * on the write-time chain, a member glued to a percent-encoded HL7 run in one token
+#   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
+#   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030.
+#
+# The words are :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`, which together are the
+# builder's own secret keywords, ``transports/database.py`` ``_ODBC_SECRET_KEY_RE``. They and the two
+# brace fragments are spelled literally, so the regex scanner in ``tests/test_security_static.py``
+# reads the pattern; ``tests/test_connection_string_member_scrub.py`` holds the words to the tuples
+# and the fragments to ``_ODBC_BRACED`` and ``_ODBC_BRACED_OVERRUN``. ``support/redact.py`` imports
+# this one object and runs it after its own PHI pass, so the bundle has no copy to drift.
+_CONNECTION_STRING_MEMBER = re.compile(
+    r"(?i)(?<=;)([A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
+    r"|(?<=secret)|(?<=credential)|(?<=token)))="
+    r"(?:\{(?:[^}]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|['\"]?[^;'\"\r\n]++)"
+)
+
 
 def _keep_label(m: re.Match[str], placeholder: str) -> str:
     """Replace a ``<label>=<value>`` match, keeping the label so a reader sees WHICH credential was
-    there, and never the value. Group 1 is the label in every pattern that uses this, except where
-    ``_CREDENTIAL_KV``'s label branch matched: its first branch, a connection-string member, holds
-    group 1, so the label is group 2 there."""
-    return f"{m.group(1) or m.group(2)}={placeholder}"
+    there, and never the value. Group 1 is the label in every pattern that uses this."""
+    return f"{m.group(1)}={placeholder}"
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------
@@ -1334,10 +1323,13 @@ def _run(text: str, placeholder: str, folded: str | None) -> str:
         text = _BEARER.sub(lambda m: _keep_label(m, placeholder), text)
     if _admits(folded, _SCHEME_HINT):
         text = _AUTH_SCHEME.sub(lambda m: f"{m.group(1)} {placeholder}", text)
-    if _admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT):
+    if _admits(folded, _CREDENTIAL_HINT):
         text = _CREDENTIAL_KV.sub(lambda m: _keep_label(m, placeholder), text)
     if _admits(folded, _KEY_MATERIAL_HINT):
         text = _KEY_MATERIAL.sub(lambda m: _keep_label(m, placeholder), text)
     if _admits(folded, _DSN_HINT):
         text = _DSN_PASSWORD.sub(lambda m: f"{m.group(1)}:{placeholder}@", text)
+    # LAST, over what every pass above left, so it can only hide more (BACKLOG #5030).
+    if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
+        text = _CONNECTION_STRING_MEMBER.sub(lambda m: _keep_label(m, placeholder), text)
     return text

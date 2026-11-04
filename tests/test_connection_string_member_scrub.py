@@ -13,12 +13,17 @@ builder's own output, so the shape tested is the shape the engine would send."""
 from __future__ import annotations
 
 import logging
+import random
+import re
+import time
 from collections.abc import Callable
 
 import pytest
 
+from messagefoundry import secretscrub
 from messagefoundry.logging_setup import CredentialScrubFilter
 from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.support import redact as bundle_redact
 from messagefoundry.support.redact import redact_log_line
 from messagefoundry.transports.database import _build_odbc_dsn
 from tests._phi_log_capture import filtered_sink
@@ -112,26 +117,134 @@ def test_a_password_last_in_a_quoted_echo_stops_at_the_closing_quote(
     assert "retry in 5s" in out, out
 
 
-@pytest.mark.parametrize(
-    ("line", "later"),
-    [
-        # A later label's quoted value: running up to its quote would print it.
-        (";PWD=Qv7m,password='kX4r Pw9z' tail", ("kX4r", "Pw9z")),
-        # A later label's braced value holding the ";" the walk stops at.
-        (";PWD=Qv7m,password={Pw9z;mT3y} tail", ("Pw9z", "mT3y")),
-        # A DSN password holding a ";".
-        (";PWD=Qv7m postgres://u:kX4r;Pw9z@h tail", ("kX4r", "Pw9z")),
-    ],
+#: Shapes a review of the first draft measured printing a value ``origin/main`` hid, when the member
+#: rule was a branch of ``_CREDENTIAL_KV`` tried at the label's own position. Each planted fragment
+#: is ``<letter><digit>q``. As its own pass, run last, the rule only adds redaction to what the
+#: other passes left, so none of these may print anywhere.
+_SHAPES_THE_FIRST_DRAFT_PRINTED = (
+    # A later label written with a quoted key.
+    ";PWD=a1q,password'=b2q c3q tail",
+    ';PWD=a1q,password":"b2q c3q;d4q" tail',
+    ";sslpassword=a1q,private_key'='b2q c3q' tail",
+    ";pwd=a1q password' :'b2q c3q'",
+    # A "}" that _KEY_MATERIAL needs, and an "@" that _DSN_PASSWORD needs, after the ";".
+    "encryption_key={a1q b2q;xpass=c3q} done",
+    "dial postgres://svc:a1q;sslpwd=b2q@db.example/mf failed",
+    # A value of only spaces before a line break, which the label pattern's \s* crosses.
+    "SERVER=h;PWD= \nb2q rest",
+    "SERVER=h;Password=\t\r\nc3q",
+    ";pwd=a1q password=\nb2q",
+    # A "://" inside a value the builder sends plain.
+    "DRIVER={X};SERVER=h;PWD=a1q b2q://c3q;sslmode=require;sslpassword=d4q e5q://f6q;",
+    # A brace the walk would stop inside.
+    ";sslpassword={a1q;b2q} c3q;PORT=1",
 )
-def test_the_guards_fall_back_to_the_label_branch_and_print_no_later_value(
-    line: str, later: tuple[str, ...]
-) -> None:
-    """Where a guard refuses, the label branch reads the line as before; this pins that the later
-    label's value stays hidden, not that the first value's own tail does."""
+
+
+def _planted(line: str) -> list[str]:
+    return re.findall(r"[a-f][0-9]q", line)
+
+
+@pytest.mark.parametrize("line", _SHAPES_THE_FIRST_DRAFT_PRINTED)
+def test_no_planted_value_reaches_a_log_surface(line: str) -> None:
     for surface, apply in _SURFACES:
         out = apply(line)
-        printed = [f for f in later if f in out]
+        printed = [f for f in _planted(line) if f in out]
         assert not printed, f"{surface}: {printed} printed -- {out!r}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The bundle's own credential copy runs before its PHI pass. Had this rule run there, it
+        # would take the "&" and leave the token one separator short of a field run.
+        "connect failed: DOE^JOHN;pwd=a1q&b2q",
+        # An encoded HL7 run is switched off by a credential shape; ";Bypass=" must not be one.
+        "lookup DOE%5EJOHN%5EQ%5EMRN12345 failed;Bypass=1",
+    ],
+)
+def test_the_phi_passes_see_the_text_they_saw_before(line: str) -> None:
+    for surface, apply in (
+        ("configured handler", _through_a_configured_handler),
+        ("redact_log_line", redact_log_line),
+    ):
+        out = apply(line)
+        assert "DOE" not in out and "JOHN" not in out, f"{surface}: {out!r}"
+
+
+def test_the_member_pass_only_adds_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A differential: every planted value the scrubbers print WITH the member pass, they print
+    without it too. Run against the first draft's branch form, a fuzz of this kind found values it
+    printed that the scrubbers hid without it (1144 lines of 80,000, recorded in the commit)."""
+    pieces = (
+        ";PWD=",
+        ";sslpassword=",
+        "password'=",
+        'password":',
+        "private_key'=",
+        "encryption_key={",
+        ";xpass=",
+        "postgres://svc:",
+        "@db",
+        " \n",
+        "DOE^JOHN",
+        " :",
+        "'",
+        '"',
+        "{",
+        "}",
+        ";",
+        ",",
+        "&",
+        "=",
+        " ",
+        "%7C",
+        "Token=",
+        "a1q",
+        "b2q",
+        "c3q",
+        "d4q",
+        "[REDACTED]",
+        "secret=",
+    )
+    rng = random.Random(5030)
+    lines = list(_SHAPES_THE_FIRST_DRAFT_PRINTED) + [
+        "".join(rng.choice(pieces) for _ in range(rng.randint(3, 14))) for _ in range(3000)
+    ]
+    with_member = [(scrub_credentials(line), redact_log_line(line)) for line in lines]
+    never = re.compile(r"(?!)")  # matches nowhere
+    monkeypatch.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", never)
+    monkeypatch.setattr(bundle_redact, "_CONNECTION_STRING_MEMBER", never)
+    for line, (scrubbed, bundled) in zip(lines, with_member, strict=True):
+        base_scrubbed, base_bundled = scrub_credentials(line), redact_log_line(line)
+        for fragment in _planted(line):
+            assert fragment not in scrubbed or fragment in base_scrubbed, (line, scrubbed)
+            assert fragment not in bundled or fragment in base_bundled, (line, bundled)
+
+
+def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None:
+    """The pattern is a literal so the static regex scanner reads it; this holds the literal to its
+    sources, and the bundle to the same object, so neither can drift."""
+    pattern = secretscrub._CONNECTION_STRING_MEMBER.pattern
+    words = re.findall(r"\(\?<=([a-z]+)\)", pattern)
+    assert sorted(words) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
+    assert secretscrub._ODBC_BRACED in pattern
+    assert secretscrub._ODBC_BRACED_OVERRUN in pattern
+    assert bundle_redact._CONNECTION_STRING_MEMBER is secretscrub._CONNECTION_STRING_MEMBER
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [";", ";pwd=", ";pwd=a b", ";pwd={", ";pwd={a}}", ";sslpassword=x", ";Xpass", ";a=b c,d&e"],
+)
+def test_a_long_semicolon_dense_line_scrubs_in_linear_time(unit: str) -> None:
+    """About 400 KB of one unit. Linear work is milliseconds; a quadratic walk over this many ";"
+    would take minutes, so the generous bound still tells them apart under load."""
+    line = "DRIVER={X}" + unit * (400_000 // len(unit))
+    started = time.perf_counter()
+    scrub_credentials(line)
+    redact_log_line(line)
+    assert time.perf_counter() - started < 10.0
 
 
 @pytest.mark.parametrize(

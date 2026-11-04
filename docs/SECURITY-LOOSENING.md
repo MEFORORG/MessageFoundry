@@ -1944,10 +1944,13 @@ count is above `0` (vault BACKLOG #2613).
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
-  again. At a start that logs it, each outbound and each `FhirLookup` whose `url` resolved logs it
-  once, in one step before any build, and an operator start does the same for its outbound. So the
-  URL is named while the connection is down, whether its build or another setting failed, at least
-  on an unresolved `env()` value; its failure is recorded and alerted (BACKLOG #4997). The exception is a
+  again. At a start that logs it, each outbound lane the start builds logs it in a step just before
+  its own build, and an operator start does the same for its outbound. After the outbound lanes and
+  the `DatabaseLookup` executor, each `FhirLookup` logs it in the same step, before any lookup is
+  built. So the URL is named while the connection is down, whether its build or another setting
+  failed, at least on an unresolved `env()` value; its failure is recorded and alerted (BACKLOG
+  #4997). A graph-wide failure before the lookups' step, at least a `DatabaseLookup` executor that
+  fails to build, ends the start before any `FhirLookup` logs it. The exception is a
   connection whose warning step itself raises: a lookup is degraded and an outbound lane fails,
   with an ERROR line or a failure record and no WARNING. A connection whose `url` did not resolve
   has no URL to read and logs an INFO line saying so instead. Everywhere else the egress check
