@@ -406,13 +406,10 @@ The one row that *does* vary:
 > tls_cert_file = "C:/mefor/tls/server.pem"
 > tls_key_file  = "C:/mefor/tls/server.key"
 > ```
-> Posture **B** additionally needs `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service environment — see
-> the next paragraph.
+> Posture **B** additionally needs `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service environment, on
+> the rule [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate) states.
 >
-> **The keys above are not the whole of either start.** Posture B, like any off-loopback bind on a
-> certificate, also needs the environment variable **`MEFOR_TLS_REVOCATION_ATTESTED=1`**, on the
-> rule [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate) states. A terminator
-> bound off loopback also needs **`[api].proxy_intra_service_auth`** *and*
+> A terminator bound off loopback also needs **`[api].proxy_intra_service_auth`** *and*
 > **`[api].proxy_tls_min_version`** on a PHI instance under `enforcement = enforce` (the rows
 > above), which block A declares. Both are `exit 2`, both land before the console gates, and
 > `--allow-insecure-bind` covers neither. The worked recipes are

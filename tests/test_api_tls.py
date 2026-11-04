@@ -1788,6 +1788,22 @@ def test_serve_starts_an_acknowledged_plaintext_hop_on_every_loopback_spelling(
     assert "AUDIT: [api].plaintext_upstream_hop_acknowledged=true" in captured.out
 
 
+def test_the_off_loopback_refusal_names_serve_host_alone_when_the_flag_set_the_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The file binds loopback and `serve --host` moves it off. The flag overrides the file, so the
+    # refusal must not send the operator to [security].listen_address (BACKLOG #1361).
+    _posture_b_toml(
+        tmp_path, intra="network", floor="1.2", auto_cert=False, listen_address="127.0.0.1"
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod", extra_args=("--host", "0.0.0.0"))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert _OFF_LOOPBACK_REFUSAL in err
+    levers = "serve --host, which overrides [security].listen_address"
+    assert plaintext_upstream_hop_off_loopback_remedy(levers) in err
+
+
 #: The loopback levers serve's off-loopback plaintext-hop refusal names. The remedy sentence itself
 #: comes from plaintext_upstream_hop_off_loopback_remedy, the one source serve and the check share.
 _SERVE_LOOPBACK_LEVERS = "[security].listen_address or serve --host"
@@ -1816,7 +1832,8 @@ def test_serve_starts_once_the_off_loopback_plaintext_hop_remedy_is_applied(
     # The refusal is only as good as the remedy it names: each one, applied to the config the refusal
     # test above refuses and nothing else, must start. The certificate arm attests revocation (the
     # _run_posture_b default for a TOML carrying a certificate), which the remedy names because off
-    # loopback the certificate alone meets the ADR 0078 revocation gate; the next test shows that.
+    # loopback the certificate alone is refused by the ADR 0078 revocation gate; the next test
+    # shows that.
     _posture_b_toml(
         tmp_path,
         intra="network",
@@ -1885,17 +1902,25 @@ _OFF_LOOPBACK_SYNTHETIC_TOML = _SYNTHETIC_LOOPBACK_TOML.replace(
 def test_each_phi_read_remedy_starts_with_a_secure_serve_hop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     listen: str,
     cert: bool,
     extra: tuple[str, ...],
 ) -> None:
     # Each remedy the PHI-read 403 names, applied to an off-loopback config serve refuses, must start
     # AND hand create_managed_app a serve hop it counts as secure, which is what keeps the 403 away.
+    from messagefoundry.store.crypto import generate_key
+
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    # Stubbed for the control too, so a regression that let it start cannot bind a real port.
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     refused = f'{_OFF_LOOPBACK_SYNTHETIC_TOML}security.listen_address = "0.0.0.0"\n'
     (tmp_path / "messagefoundry.toml").write_text(refused, encoding="utf-8")
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
+    # Refused by the exposed-bind gate, not by some unrelated exit-2 refusal.
+    assert "refusing to serve the API on non-loopback host '0.0.0.0'" in capsys.readouterr().err
     toml = f'{_OFF_LOOPBACK_SYNTHETIC_TOML}security.listen_address = "{listen}"\n'
     if cert:
         cert_file, key_file = _self_signed(tmp_path)

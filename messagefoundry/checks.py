@@ -3580,8 +3580,9 @@ def _check_upstream_hop_ack(
             detail=(
                 "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
                 f"proxy-to-engine hop in plaintext on the non-loopback API bind host {api.host!r}, "
-                "which serve accepts only on a loopback bind, acknowledged or not -- serve would "
-                "refuse to start (exit 2, in every enforcement mode). "
+                "which serve accepts only on a loopback bind; off loopback the acknowledgement "
+                "does not clear it -- serve would refuse to start (exit 2, in every enforcement "
+                "mode). "
                 f"{plaintext_upstream_hop_off_loopback_remedy('[security].listen_address')} (see "
                 "docs/SECURITY.md, Plaintext proxy hop)"
             ),

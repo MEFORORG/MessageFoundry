@@ -3412,6 +3412,14 @@ def _serve(args: argparse.Namespace) -> int:
         plaintext_upstream_hop_unacknowledged,
     )
 
+    # The loopback levers a refusal names. `serve --host` overrides the file, so when it is set,
+    # editing [security].listen_address changes nothing and the refusal names the flag alone
+    # (the BACKLOG #1361 trap the /ui refusal below records).
+    loopback_levers = (
+        "serve --host, which overrides [security].listen_address"
+        if args.host is not None
+        else "[security].listen_address or serve --host"
+    )
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3437,14 +3445,13 @@ def _serve(args: argparse.Namespace) -> int:
             # accepts that hop from a same-machine proxy only. So off loopback it is refused,
             # acknowledged or not, in every mode, ahead of the acknowledgement arm below. The
             # predicate is shared with `messagefoundry check`.
-            remedy = plaintext_upstream_hop_off_loopback_remedy(
-                "[security].listen_address or serve --host"
-            )
+            remedy = plaintext_upstream_hop_off_loopback_remedy(loopback_levers)
             print(
                 "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
                 f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
                 "[api].tls_cert_file the engine serves that hop in plaintext, which serve accepts "
-                "only on a loopback bind (127.0.0.1, ::1 or localhost), acknowledged or not. "
+                "only on a loopback bind (127.0.0.1, ::1 or localhost); off loopback the "
+                "acknowledgement does not clear it. "
                 f"{remedy}, trusting that certificate. See docs/SECURITY.md, Plaintext proxy hop "
                 "(BACKLOG #4636).",
                 file=sys.stderr,
@@ -3511,9 +3518,9 @@ def _serve(args: argparse.Namespace) -> int:
     # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
     # prem, offline-by-default; CLAUDE.md §2). So refuse fail-closed unless the operator attests
     # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation; a declared terminator does
-    # not exempt the bind (BACKLOG #4636, the predicate's docstring says why). Layered AFTER the §0
-    # exposed-bind ladder above (extend-never-weaken), like the keyless-store / open-egress /
-    # MFA-at-exposure gates.
+    # not exempt the bind (BACKLOG #4636; docs/SECURITY.md, API revocation gate, says why). Layered
+    # AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
+    # open-egress / MFA-at-exposure gates.
     if in_process_tls_revocation_refused(
         tls_enabled=settings.api.tls_enabled,
         is_loopback=settings.api.is_loopback,
@@ -3533,8 +3540,8 @@ def _serve(args: argparse.Namespace) -> int:
             f"{terminator_note}Set "
             "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
             "certificates this engine serves and accepts, or bind the engine to loopback "
-            "([security].listen_address or serve --host) behind a revocation-checking reverse "
-            "proxy on the same machine. See docs/SECURITY.md, API revocation gate (ADR 0078).",
+            f"({loopback_levers}) behind a revocation-checking reverse proxy on the same machine. "
+            "See docs/SECURITY.md, API revocation gate (ADR 0078).",
             file=sys.stderr,
         )
         return 2

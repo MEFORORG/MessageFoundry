@@ -1110,7 +1110,8 @@ one, so routing your egress through it is good practice and does not change the 
    `[tls].crl_file` where it reaches the hop. The guard reads the CRL check off that hop's own TLS
    context and lets the hop through (BACKLOG #299). This is not a declaration: the engine checks the
    CRL on the wire. A hop that sets `tls_allow_expired` gets no credit from it (ADR 0173 §13). An mTLS listener takes its own `tls_crl_file`, and each non-connection hop names
-   its own CRL setting (above). The Vault hops have no CRL lever.
+   its own CRL setting (above). The Vault hops have no CRL lever, and no CRL clears the `[api]`
+   listener's gate ([SECURITY.md](SECURITY.md#api-revocation-gate)).
 4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
    the widest crossing on this list, the easiest to reach for by accident, and this page claimed it was

@@ -59,8 +59,8 @@ and for a PHI instance at the default enforcement; on an instance dialled to `en
 the escape genuinely starts the engine. The engine's own refusal message names the flag, so an operator will find it — treat it as a
 lab tool and keep it out of any exposed deployment.
 
-**Neither TLS row starts a stock instance on its own.** Each refusal above is an `exit 2` before any
-listener binds, and `--allow-insecure-bind` covers none of them. The revocation refusal's scope is
+**Neither TLS row starts a stock instance on its own.** Each TLS row's refusal is an `exit 2` before
+any listener binds, and `--allow-insecure-bind` covers neither. The revocation refusal's scope is
 stated once, in [SECURITY.md](SECURITY.md#api-revocation-gate). The **terminator's** attestation
 refusal *is* posture-keyed — PHI **and** `enforcement = enforce` **and** an off-loopback bind. The
 recommended loopback-behind-a-proxy topology only warns.
@@ -130,8 +130,8 @@ audit/rate-limit source IP is the real client. The block below keeps the engine 
 the proxy on the same machine, so it needs **no** `MEFOR_TLS_REVOCATION_ATTESTED`; that is why it is
 the better option when you cannot attest a revocation-checking PKI. For a proxy on another machine,
 set `local_access_only = false` and a `listen_address`, add `[api].tls_cert_file`, drop the
-acknowledgement, point the proxy at https, and set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service
-environment. [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and
+acknowledgement, set `trusted_proxies` to the address the engine sees that proxy connect from, point
+the proxy at https, and set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service environment. [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and
 [API revocation gate](SECURITY.md#api-revocation-gate) say why.
 
 ```toml
