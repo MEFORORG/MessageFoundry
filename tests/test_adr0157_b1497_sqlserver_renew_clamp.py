@@ -112,6 +112,8 @@ class _Conn:
         self.fail: Exception | None = None
         self.hang: asyncio.Event | None = None
         self.rolled_back = 0
+        self.rollback_fail: Exception | None = None
+        self.rollback_hangs = False
 
     @property
     def closed(self) -> bool:
@@ -125,6 +127,10 @@ class _Conn:
 
     async def rollback(self) -> None:
         self.rolled_back += 1
+        if self.rollback_fail is not None:
+            raise self.rollback_fail
+        if self.rollback_hangs:
+            await asyncio.Event().wait()
 
 
 class _Pool:
@@ -272,18 +278,6 @@ async def test_the_unclamped_read_is_unchanged() -> None:
 # --- the rollback after a failed claim (BACKLOG #5066) -------------------------
 
 
-class _RollbackFails(_Conn):
-    async def rollback(self) -> None:
-        self.rolled_back += 1
-        raise RuntimeError("08S01 communication link failure during rollback")
-
-
-class _RollbackHangs(_Conn):
-    async def rollback(self) -> None:
-        self.rolled_back += 1
-        await asyncio.Event().wait()
-
-
 @pytest.mark.parametrize("clamped", [True, False], ids=["clamped", "unclamped"])
 async def test_a_failed_rollback_discards_the_connection_and_raises_the_original(
     clamped: bool,
@@ -292,7 +286,8 @@ async def test_a_failed_rollback_discards_the_connection_and_raises_the_original
     must never go back to the pool able to be lent. The caller sees the claim's own error, not the
     rollback's. Before #5066 the connection was recycled open and the rollback's error replaced the
     original, on both paths."""
-    conn = _RollbackFails()
+    conn = _Conn()
+    conn.rollback_fail = RuntimeError("08S01 communication link failure during rollback")
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
     with pytest.raises(RuntimeError, match="HYT00"):
@@ -310,7 +305,8 @@ async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -
     """The bound (step 1 of #5066): the rollback gets the clamp floored at 1 s. Past it the
     connection is discarded and the claim's error is raised, so the rollback cannot hold the
     leadership lock unbounded."""
-    conn = _RollbackHangs()
+    conn = _Conn()
+    conn.rollback_hangs = True
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
     started = time.monotonic()
@@ -325,7 +321,8 @@ async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -
 async def test_a_hung_rollback_on_a_failed_claim_releases_the_leadership_lock() -> None:
     """End to end over the coordinator: the tick that failed its claim returns inside the bound,
     and a stepdown waiting on _leadership_lock can then take it."""
-    conn = _RollbackHangs()
+    conn = _Conn()
+    conn.rollback_hangs = True
     conn.fail = RuntimeError("HYT00 query timeout expired")
     coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=1.0)
     started = time.monotonic()

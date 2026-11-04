@@ -5426,11 +5426,8 @@ class SqlServerStore:
 
         A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
         try:
-            if within is None:
+            async with asyncio.timeout(within):  # None never expires
                 await conn.rollback()
-            else:
-                async with asyncio.timeout(within):
-                    await conn.rollback()
         except Exception:  # noqa: BLE001 - every driver fault, and the bound; the caller raises the original
             log.warning(
                 "sqlserver: rollback after a failed transaction failed or ran past its bound;"
@@ -5596,11 +5593,8 @@ class SqlServerStore:
                 # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
                 # under RCSI an open snapshot pins the version store / bloats tempdb). Roll back before
                 # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
-                # closed and the statement timeout is restored, so a discard cannot race either on
-                # another thread. A rollback that fails, or on the clamped path runs past its bound,
-                # discards the connection rather than lend an open transaction (BACKLOG #5066): the
-                # clamped caller holds the coordinator's _leadership_lock, and the claim's MERGE holds
-                # HOLDLOCK range locks on leader_lease.
+                # closed and the timeout is restored, so a discard races neither; _rollback_or_discard
+                # says why it is bounded and discards (BACKLOG #5066).
                 await self._rollback_or_discard(conn, within=rollback_bound)
                 raise
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
