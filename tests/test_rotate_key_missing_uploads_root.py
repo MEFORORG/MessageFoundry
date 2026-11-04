@@ -168,12 +168,16 @@ def test_rotate_key_refuses_a_nul_in_uploads_dir_with_exit_2(
     assert load_settings(config_path=cfg).store.uploads_dir == "up\0loads"
     assert main(["rotate-key", "--service-config", str(cfg), "--db", str(db)]) == 2
     captured = capsys.readouterr()
-    assert "OK" not in captured.out
+    assert captured.out == ""
     assert "contains a NUL character" in captured.err
     rows = asyncio.run(_rows(db, key_a))  # key A alone: nothing was re-encrypted
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
     assert rows[_DEK].last_rotated == _OLD_DATE
     assert ROTATION_RECORD_ID not in rows
+    # The chain did not roll: key A alone still verifies it.
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_a)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED")
+    assert main(["audit-verify", "--db", str(db)]) == 0, capsys.readouterr()
 
 
 @pytest.mark.parametrize(
