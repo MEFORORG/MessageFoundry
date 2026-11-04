@@ -87,13 +87,20 @@ async def marked(fetch: RawFetch) -> bool:
     )
 
 
+async def unmark(raw: RawSql) -> None:
+    """Drop ``queue.payload``'s ``keyed_surface`` marker, leaving its ciphertext the only signal."""
+    await raw(
+        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
+    )
+
+
 async def outbound(store: Any, lane: str, body: str) -> str:
     return str(await store.enqueue_message(channel_id="IB_KB", raw=RAW, deliveries=[(lane, body)]))
 
 
-async def terminal(store: Any, lane: str, *, dead: bool) -> str:
-    """A delivery with an empty body, driven to a terminal status on the keyless store."""
-    mid = await outbound(store, lane, "")
+async def terminal(store: Any, lane: str, *, dead: bool, body: str = "") -> str:
+    """A delivery, empty unless ``body`` says otherwise, driven to a terminal status."""
+    mid = await outbound(store, lane, body)
     [item] = await store.claim_ready(destination_name=lane)
     if dead:
         await store.dead_letter_now(item.id, "permanent reject")
@@ -202,9 +209,7 @@ async def assert_a_blank_on_a_keyed_surface_stays_refused(
         assert (await row_of(fetch, unmarked))["payload"] == ""
     finally:
         await keyed.close()
-    await raw(
-        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
-    )
+    await unmark(raw)
 
     alarms, hook = alarm_log()
     keyed = await open_keyed(on_tag_failure=hook)
@@ -272,9 +277,7 @@ async def assert_the_dead_letter_purge_counts_only_the_bodies_it_blanks(
     body is purged, so the count the retention audit records leaves it out; the dead row beside it
     that held a body is counted."""
     blank = await terminal(keyless, "OB_KB_DLQ_BLANK", dead=True)
-    full = await outbound(keyless, "OB_KB_DLQ_BODY", BODY)
-    [item] = await keyless.claim_ready(destination_name="OB_KB_DLQ_BODY")
-    await keyless.dead_letter_now(item.id, "permanent reject")
+    full = await terminal(keyless, "OB_KB_DLQ_BODY", dead=True, body=BODY)
     errors = "SELECT payload, last_error FROM queue WHERE message_id=?"
     assert (await fetch(errors, (blank,)))[0]["last_error"] is not None  # the premise
     assert (await fetch(errors, (full,)))[0]["payload"] == BODY

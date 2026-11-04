@@ -133,7 +133,7 @@ async def test_the_opt_out_seals_a_live_blank_on_a_sealed_surface_too(
 
     async def reopen(*, allow_unmarked: bool) -> str:
         store = await MessageStore.open(
-            db, cipher=make_cipher(key, write_v2=True, allow_unmarked=allow_unmarked)
+            db, cipher=contract.keyed_cipher(make_cipher, key, allow_unmarked=allow_unmarked)
         )
         await store.close()
         return str((await contract.row_of(fetch, mid))["payload"])
@@ -150,13 +150,9 @@ async def test_the_opt_out_seals_a_live_blank_on_a_sealed_surface_too(
     finally:
         await store.close()
     await raw("UPDATE queue SET payload='' WHERE message_id=?", (mid,))
-    await raw(
-        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
-    )
+    await contract.unmark(raw)
     assert await reopen(allow_unmarked=False) == ""  # the control
-    await raw(
-        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
-    )
+    await contract.unmark(raw)
     assert (await reopen(allow_unmarked=True)).startswith(MARKER_PREFIX)
 
 

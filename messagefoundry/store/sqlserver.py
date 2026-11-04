@@ -4131,10 +4131,8 @@ class SqlServerStore:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant. A blank here
-                # stays refused, unless the opt-out is on.
-                if strict:
-                    blanks = 0
+                # so count again rather than report its legitimate seal as a plant. Without the
+                # opt-out the return below leaves a blank here refused.
                 pending = await self._count_unmarked(count_sql, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -9586,19 +9584,18 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so a
-                # whitespace-only body would otherwise read as blank and survive uncounted.
+                # As on SQLite: only the body blank is counted (BACKLOG #4996). DATALENGTH, not
+                # `<> ''`: T-SQL pads trailing spaces before comparing, so a whitespace-only body
+                # would otherwise read as blank and survive.
                 await cur.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
+                    "UPDATE queue SET payload=''"
                     f" WHERE status=? AND DATALENGTH(payload) > 0 AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
-                # As on SQLite: a row already blank only loses its `last_error`, and is not counted
-                # (BACKLOG #4996).
                 await cur.execute(
-                    "UPDATE queue SET last_error=NULL WHERE status=? AND DATALENGTH(payload) = 0"
-                    f" AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET last_error=NULL"
+                    f" WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so

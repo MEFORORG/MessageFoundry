@@ -3294,10 +3294,8 @@ class PostgresStore:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant. A blank here
-                # stays refused, unless the opt-out is on.
-                if strict:
-                    blanks = 0
+                # so count again rather than report its legitimate seal as a plant. Without the
+                # opt-out the return below leaves a blank here refused.
                 pending = int(await self._fetchval(count_sql, like) or 0)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -11090,18 +11088,17 @@ class PostgresStore:
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # As on SQLite: only the body blank is counted (BACKLOG #4996).
                 result = await conn.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
+                    "UPDATE queue SET payload=''"
                     f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
                 purged = _rowcount(result)
-                # As on SQLite: a row already blank only loses its `last_error`, and is not counted
-                # (BACKLOG #4996).
                 await conn.execute(
-                    "UPDATE queue SET last_error=NULL WHERE status=$1 AND payload = ''"
-                    f" AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET last_error=NULL"
+                    f" WHERE status=$1 AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )

@@ -9593,10 +9593,8 @@ class MessageStore:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
-                # its legitimate seal is not reported as a plant. A blank here stays refused,
-                # unless the opt-out is on.
-                if strict:
-                    blanks = 0
+                # its legitimate seal is not reported as a plant. Without the opt-out the
+                # return below leaves a blank here refused.
                 pending = await self._count_unmarked(table, pending_where, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -18607,17 +18605,17 @@ class MessageStore:
                 f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                 (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
             )
+            # Only the body blank is counted. A row already blank only loses its `last_error`,
+            # which purges no body, so the retention audit's count leaves it out (BACKLOG #4996).
             cur = await self._db.execute(
-                "UPDATE queue SET payload='', last_error=NULL "
+                "UPDATE queue SET payload='' "
                 f"WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
                 (OutboxStatus.DEAD.value, *cutoff_params),
             )
             purged = int(cur.rowcount)
-            # A row already blank only loses its `last_error`: no body is purged, so it is left out
-            # of the count the retention audit records (BACKLOG #4996).
             await self._db.execute(
-                "UPDATE queue SET last_error=NULL WHERE status=? AND payload = '' "
-                f"AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                "UPDATE queue SET last_error=NULL "
+                f"WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
                 (OutboxStatus.DEAD.value, *cutoff_params),
             )
             # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
