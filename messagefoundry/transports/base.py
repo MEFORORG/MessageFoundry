@@ -108,6 +108,8 @@ __all__ = [
     "peer_ip_allowed",
     "probe_tcp_reachable",
     "DEFAULT_MAX_ITEMS_PER_POLL",
+    "POLL_STOP_GRACE_S",
+    "PollStopGuard",
     "cap_setting",
     "count_setting",
     "float_setting",

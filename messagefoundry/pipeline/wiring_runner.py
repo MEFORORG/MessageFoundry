@@ -6251,8 +6251,10 @@ class RegistryRunner:
 
         Abandonment is safe for those four. It is NOT safe for DICOM, which releases its port inside
         ``await to_thread(server.shutdown)`` — an abandoned DICOM stop can still hold the port at
-        re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and
-        parks on that Event, so an abandoned one finishes at most its single in-flight scan.
+        re-promotion. File/RemoteFile/Database/Timer set an Event, and each is leader-gated and
+        parks on that Event, so an abandoned one finishes at most its single in-flight scan. File,
+        RemoteFile and Database then cancel a poll task still outside a store call after their own
+        grace (BACKLOG #1620, #4685), so that scan's blocked external call is cut, not waited on.
 
         The bound is applied HERE, at the call site — never by editing a transport constant, which would
         make ``transports/`` know about clustering (the one-way dependency rule).

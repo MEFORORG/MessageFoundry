@@ -286,6 +286,10 @@ async def test_remotefile_stop_never_cuts_a_ledger_call(
     assert not poll.cancelled(), f"stop() cut the poll task inside the ledger's {slow}"
     if slow == "mark_processed":
         assert len(ledger.keys) == 1, "the file was not recorded as ingested"
+    else:
+        # A stop met during the ledger read ends the poll there. Mutation: drop the stop check after
+        # the read in _poll_once. Red: the file is retrieved for a hand-off the stop then refuses.
+        assert ("retrieve", "/in/a.hl7") not in client.ops, "the poll retrieved after its stop"
 
 
 async def test_a_cancelled_remotefile_stop_still_cuts_the_poll_task(
