@@ -2345,7 +2345,7 @@ both are described below:
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it by segment id and line position, as in `PV2 at line 3 (line with no fields)` | Every line but a header of three or more split fields. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`); with no readable version in MSH-12, only a rule that rewrites a field counts. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it by segment id and line position, as in `PV2 at line 3 (line with no fields)` | Every line but a header of three or more split fields. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 The rows describe both anonymizers, the engine's `messagefoundry/anon/` and the tee's
@@ -2393,9 +2393,11 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
 - With no readable version in MSH-12, any id that some HL7 version defines is printed.
 - `LEE|` with only empty fields passes and is not reported at all.
 - A bare fragment that is a real segment id for the message's version, such as `ROL` or `CON`,
-  passes as an empty segment. With no readable version in MSH-12, any id that some HL7 version
-  defines does. MSH-12 has no readable version when it is empty, when it is not digits and dots,
-  or when it is older than 2.1. Each message's coverage report records each such line by its
+  passes as an empty segment. With no readable version in MSH-12, only an id named by a rule
+  that rewrites a field passes, and any other bare line is refused, as described below. MSH-12
+  has no readable version at least when it is empty, when it is not digits joined by single dots
+  (such as `x`, `2.`, `2..5` or a superscript digit), or when it is older than 2.1, whatever the
+  header's field count. Each message's coverage report records each such line by its
   segment id and its position, as in `ROL at line 4 (line with no fields)`. The position counts
   only lines that hold something, so a blank or whitespace-only line, which the anonymizer drops,
   does not move it. The run summary counts such lines by segment id alone, once per message, as
@@ -2414,6 +2416,14 @@ A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came 
 bare `SFT` in a 2.3 message is not an empty segment. That holds for a line ahead of the header
 too. Every line is judged against the version in the header's own MSH-12.
 
+With no readable version in MSH-12, no version says which ids are empty segments, so every bare
+line is refused unless a rule that rewrites a field names its segment. That holds at any field
+count of the header, so a three-field `MSH|^~\&|` header with a real 2.3 header behind it does
+not let a bare `SFT` through. A `keep` does not count. To get such a line through, give the
+header its version, or map a field of the segment with a rule that rewrites. A rule on `MSH-12`
+does not help, because the version of the input is the one judged (vault BACKLOG #3001, #3004).
+The report still prints any id that some HL7 version defines in a field's address.
+
 `anonymize_checked` judges a bare line by the HL7 version of its input, so a rule on `MSH-12`
 does not change which bare line passes. A caller that runs `anonymize` and then `leak_check` or
 `leak_report` itself must pass `version=message_version(raw)` to get the same answer. Without
@@ -2425,10 +2435,9 @@ A line holding only whitespace or control characters is dropped before anything 
 **An `MSH`, `FHS` or `BHS` line with fewer than three split fields is refused,** wherever it sits,
 the header included. Such a line has no separator after its encoding characters. That includes a
 bare `FHS` and a minimal `BHS|^~\&` line; add a trailing separator to pass the second. A header
-that is only `MSH|^~\&` holds no MSH-12, so every other line would be judged against the segment
-ids of every HL7 version; it is refused instead. A header of three or more split fields is not
-walked, and when its MSH-12 has no readable version the any-version reading in the list above
-applies. Any other
+that is only `MSH|^~\&` is refused in the same way. A header of three or more split fields is not
+walked; when its MSH-12 has no readable version, a bare line behind it is refused unless a rule
+that rewrites names its segment, as the paragraph on a missing version above says. Any other
 `MSH` line ahead of the header is refused, whatever it holds. That includes a leading bare `MSH`
 or `msh` (vault BACKLOG #3001).
 
