@@ -152,8 +152,11 @@ def test_the_notify_mailbox_check_is_the_send_rule_and_a_dot(value: str) -> None
     as an empty label. So over the shared table its verdict is the send rule's, plus a dot inside
     the domain, which the shared rule does not ask for and the mailbox check keeps.
 
+    The expectation restates the function's own two conjuncts, so this pins agreement with the send
+    rule rather than the dot rule; the test below holds the dot-edge cases with stated verdicts.
+
     Mutation: drop ``envelope_address_problem(address) is None`` from ``_is_single_mailbox``. Red:
-    ``.example.org`` and every other refused value with a dot in it."""
+    at least ``.example.org`` and ``example.org.``."""
     address = "a@" + value
     expected = envelope_address_problem(address) is None and "." in value.strip(".")
     assert _is_single_mailbox(address) is expected
@@ -161,7 +164,9 @@ def test_the_notify_mailbox_check_is_the_send_rule_and_a_dot(value: str) -> None
 
 @pytest.mark.parametrize("domain", [".example.org", "example.org.", ".example.org.", ".", ".."])
 def test_the_send_rule_refuses_a_dot_at_either_end_of_a_mailbox_domain(domain: str) -> None:
-    # The cases the two dropped checks in _is_single_mailbox held, now held by the shared rule alone.
+    # The cases the two dropped checks in _is_single_mailbox held. The send rule refuses each as an
+    # empty label; the first three reach _is_single_mailbox past its own dot conjunct, so for them
+    # the send rule alone refuses. "." and ".." fail that conjunct too, since stripping leaves "".
     address = "a@" + domain
     assert "empty label" in (envelope_address_problem(address) or "")
     assert not _is_single_mailbox(address)
@@ -187,22 +192,50 @@ def test_the_proxy_bypass_list_loads_every_shared_table_value_as_written(value: 
 #: The refused values that bypass the proxy for ``example.org`` and its subdomains. Each is a form
 #: the proxy rule names: a dot-led suffix and a wildcard suffix (the field's comment), a port, which
 #: the rule ignores (the same comment), and a trailing dot, which it strips (its docstring). Each
-#: covers the same hosts ``example.org`` does, so none widens the bypass past the domain it names.
+#: covers the same hosts ``example.org`` does and no host outside it, so none in this table widens
+#: the bypass past the domain it names. The written reason names a malformed entry that does, such
+#: as ``*:443``; see :data:`_PROXY_COVERS_EVERY_HOST`.
 _PROXY_COVERS_EXAMPLE_ORG = {".example.org", "example.org.", "example.org:25", "*.example.org"}
 
 
 @pytest.mark.parametrize("value", list(_REFUSED))
 def test_a_refused_value_bypasses_the_proxy_only_in_a_form_the_proxy_rule_names(value: str) -> None:
     """The rest of the refused values name no host under ``example.org``, so each sends that host
-    through the proxy, the direction the written reason says a malformed entry fails in. A host the
-    malformed entry itself spells, such as ``mx_1.example.org``, it still bypasses; the written
-    reason names the underscore host and the IP literal as accepted.
+    through the proxy, one of the two directions the written reason says a malformed entry fails
+    in; :data:`_PROXY_COVERS_EVERY_HOST` pins the other. No value here bypasses a host outside
+    ``example.org``.
+
+    Two of these load and act on a host the shared rule would not take, and the written reason does
+    not name either: ``https://example.org`` is cut at its first ``:`` to the pattern ``https``, and
+    ``a@example.org`` matches only a host spelled with an ``@``. Pinned as they are, not endorsed.
 
     Mutation: strip a leading ``-`` from each entry in ``_proxy_bypasses``. Red: ``-mx.example.org``
-    covers ``mx.example.org``."""
-    covers = value in _PROXY_COVERS_EXAMPLE_ORG
+    covers ``mx.example.org``. Mutation: let an entry starting with ``*`` bypass every host. Red:
+    ``*.example.org`` covers ``example.net``."""
+    covers, loaded = value in _PROXY_COVERS_EXAMPLE_ORG, _no_proxy(value)
     for host in ("example.org", "mx.example.org"):
-        assert proxy_bypasses_host(host, _no_proxy(value)) is covers, host
+        assert proxy_bypasses_host(host, loaded) is covers, host
+    assert not proxy_bypasses_host("example.net", loaded)
+
+
+#: Malformed entries the written reason says bypass the proxy for every host: the rule ignores a
+#: port, so each reads as ``*``.
+_PROXY_COVERS_EVERY_HOST = ["*:443", "*.", "[*]"]
+
+
+@pytest.mark.parametrize("value", _PROXY_COVERS_EVERY_HOST)
+def test_a_wildcard_with_a_port_bypasses_the_proxy_for_every_host(value: str) -> None:
+    # The widening direction the written reason beside proxy_no_proxy names, pinned so a change to
+    # it is a decision. Mutation: stop stripping the port in _strip_proxy_host_port. Red: "*:443".
+    assert _no_proxy(value) == [value]
+    assert proxy_bypasses_host("example.net", _no_proxy(value))
+
+
+@pytest.mark.parametrize("value", ["mx_1.example.org", "0x7f000001"])
+def test_an_entry_the_shared_rule_refuses_still_bypasses_the_host_it_spells(value: str) -> None:
+    # The written reason: the list takes an underscore host and an IP literal. Mutation: refuse a
+    # host holding "_" in _proxy_bypasses. Red: the first case.
+    assert proxy_bypasses_host(value, _no_proxy(value))
 
 
 @pytest.mark.parametrize("value", [*_ACCEPTED, _IPV4])
@@ -239,6 +272,10 @@ def test_the_oidc_suffix_list_loads_every_shared_table_value_and_matches_it_exac
     the list applies no shape check and every value the shared rule refuses loads too. What keeps
     that safe is the exact compare: an entry admits the one suffix it spells, in
     ``upn_suffix_key`` form, and no subdomain of it.
+
+    One case the written reason does not name: ``a@example.org`` loads, and admits a claim
+    ``jdoe@a@example.org``, whose suffix after the first ``@`` is that entry. The claim check's own
+    comment treats a second ``@`` as the attack form. Pinned as it is, not endorsed.
 
     Mutation: apply ``domain_shape_problem`` to ``oidc_allowed_username_domains`` at load. Red:
     every refused value. Mutation: let ``_resolve_username`` match a subdomain. Red: the last
