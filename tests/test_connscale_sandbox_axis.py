@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import dataclasses
 import inspect
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -174,6 +175,9 @@ def test_the_stamp_is_what_the_engine_parser_reads() -> None:
 #: The stand-in driver never reads the corpus.
 _NO_CORPUS: Any = object()
 
+#: The port the stand-in driver's first connection sends on; connection i sends on this plus i.
+_BASE_PORT = 6100
+
 
 class _Driver:
     """Queues one send per connection, and after a short delay the correlator takes one arrival for
@@ -185,11 +189,11 @@ class _Driver:
         self._arrivals = arrivals
         self.task: asyncio.Task[None] | None = None
 
-    def send_one_each(self, *, corpus: object, mix: object) -> list[int]:
+    def send_one_each(self, *, corpus: object, mix: object) -> dict[int, int]:
         for seq in range(self._count):
             self._correlator.on_send(seq, 0)
         self.task = asyncio.create_task(self._arrive())
-        return list(range(self._count))
+        return {seq: _BASE_PORT + seq for seq in range(self._count)}
 
     async def _arrive(self) -> None:
         await asyncio.sleep(0.01)
@@ -254,10 +258,31 @@ async def test_a_redelivery_does_not_stand_in_for_a_connection_that_never_delive
     monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: None)
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
 
-    reading = await _warm(metrics, arrivals=[0, 0, 1, 2, 3, 4, 5, 6, 7, 8], pid=None, timeout=0.3)
+    # A handler on the runner's own logger, not caplog, which reads at the root and so depends on
+    # every logger between staying as this test found it under xdist.
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(logging.WARNING)
+    handler.emit = lambda record: records.append(record)  # type: ignore[method-assign]
+    level = runner_mod.log.level
+    runner_mod.log.setLevel(logging.WARNING)
+    runner_mod.log.addHandler(handler)
+    try:
+        reading = await _warm(
+            metrics, arrivals=[0, 1, 2, 3, 4, 5, 6, 7, 8, 0], pid=None, timeout=0.3
+        )
+    finally:
+        runner_mod.log.removeHandler(handler)
+        runner_mod.log.setLevel(level)
 
     assert metrics.counters.sink_received == 10
     assert (reading.warmup_sent, reading.warmup_delivered) == (10, 9)
+    # The redelivery arrived last, at 10 ms, and is not a first delivery, so it is out of the
+    # first-delivery figures: their max is connection 8's first arrival, at 9 ms (BACKLOG #5089).
+    assert reading.warmup_first_delivery_max_ms == pytest.approx(9.0, rel=0.02)
+    # The warning names the silent inbound by its port, and no other.
+    silent = [r.getMessage() for r in records if "first deliveries" in r.getMessage()]
+    assert len(silent) == 1, silent
+    assert silent[0].endswith(f"port(s) {_BASE_PORT + 9}"), silent
 
 
 def _compare_stderr(
