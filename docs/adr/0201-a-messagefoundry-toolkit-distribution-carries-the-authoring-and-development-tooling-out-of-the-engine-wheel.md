@@ -661,7 +661,9 @@ first lists missed, so each slice's builder runs the whole suite rather than tru
 
    **Wait for open PR 1797**, which edits `docs/DANGEROUS-FUNCTIONALITY.md` section 8.
 5. **Amend ADR 0030.** Files: `docs/adr/0030-anonymization-test-harness-tee.md`,
-   `docs/adr/README.md`. Documentation only, and on its own.
+   `docs/adr/README.md`. Documentation only, and on its own. Done: the owner signed the amendment
+   off, and [ADR 0030](0030-anonymization-test-harness-tee.md)'s status banner records it. Slice 6
+   no longer waits on it.
 6. **Move `anon/`.** Files:
    - moved: `messagefoundry/anon/` to `messagefoundry_toolkit/anon/`. `_pools.py` keeps importing
      `messagefoundry.generators._hl7data` for now;
