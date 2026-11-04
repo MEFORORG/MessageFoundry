@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -504,9 +505,10 @@ def test_restore_refuses_a_config_member_aimed_at_the_restored_store(
     assert "where this restore publishes the store" in err
     assert str(dest) in err  # the colliding path is named
     # Refused BEFORE the store was extracted, so nothing was published and nothing was clobbered: no
-    # store at the --to path, and no half-written config bundle beside it.
+    # store at the --to path, and no half-written config bundle beside it. The directory the restore
+    # made to stage in goes too, since it was absent before (vault BACKLOG #5233).
     assert not dest.exists()
-    assert list(newdir.iterdir()) == []
+    assert not newdir.exists()
 
 
 def test_restore_refuses_a_colliding_config_member_whatever_the_case(
@@ -702,11 +704,12 @@ def test_restore_rollback_removes_the_partial_config_bundle_too(tmp_path, key_b6
         assert main(argv) == 1
     assert "member-count cap" in _refusal(capsys)
     assert not dest.exists(), "the published store survived a mid-bundle failure"
-    # The directory is kept (a retry re-creates or reuses it); what it held must be gone.
-    assert config_dest.is_dir()
-    assert not any(config_dest.iterdir()), (
+    # What the bundle wrote must be gone, and the directory with it: it was absent before, and the
+    # directories a failed restore made go too (vault BACKLOG #5233). The parent of --to as well.
+    assert not config_dest.exists(), (
         "a partially written config bundle survived, which blocks the retry's empty-dir check"
     )
+    assert not dest.parent.exists()
     # The control: with the shipped cap the SAME command restores, so the rollback left a destination
     # the retry can use. Without this arm a rollback that deleted too much would pass the asserts above.
     assert main(argv) == 0
@@ -752,8 +755,9 @@ def test_restore_rollback_in_the_one_directory_form_never_reaches_the_staging_di
     assert not any(p.name.startswith("mefor-restore-") for p in ledger), ledger
     assert dest.resolve() not in ledger
 
-    # End state: the directory is back to empty, with no staging leftover and no store.
-    assert d.is_dir() and not any(d.iterdir()), sorted(p.name for p in d.iterdir())
+    # End state: the directory is back as the restore found it, absent, so no staging leftover and
+    # no store either (vault BACKLOG #5233: the directories a failed restore made go too).
+    assert not d.exists(), sorted(p.name for p in d.rglob("*"))
     # And the control: the same command, with the shipped cap, restores into that directory.
     assert main(argv) == 0
     assert dest.is_file() and (d / "feed.py").is_file()
@@ -1055,7 +1059,8 @@ def test_restore_config_only_route_rolls_back_a_partial_bundle(tmp_path, key_b64
         mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
         assert main(argv) == 1
     assert "member-count cap" in _refusal(capsys)
-    assert cfg.is_dir() and not any(cfg.iterdir()), sorted(p.name for p in cfg.rglob("*"))
+    # Absent before, so absent again: the directory a failed restore made goes too.
+    assert not cfg.exists(), sorted(p.name for p in cfg.rglob("*"))
     _no_staging_left(tmp_path)
     # The control: with the shipped cap the same command restores.
     assert main(argv) == 0
@@ -1275,6 +1280,10 @@ def test_restore_refuses_a_dangling_link_member_before_the_store_is_extracted(tm
     with pytest.raises(dr_backup.BackupError) as excinfo:
         dr_backup._refuse_colliding_config_members(tar, d / "msg.db", tmp_path / "cfg")
     assert excinfo.value.kind == "restore" and "config/b.toml" in str(excinfo.value)
+    # The whole restore is refused, and the refusal names the way to the store alone.
+    assert "The store alone restores: run the same command without --config-to" in str(
+        excinfo.value
+    ), str(excinfo.value)
     # The control: a link to the member before it passes the scan.
     ok = _plain_tar(
         tmp_path / "ok.tar",
@@ -1302,6 +1311,169 @@ def test_no_config_refusal_names_a_walk_that_added_nothing(tmp_path) -> None:
     assert "added no regular file" in err and "holds only symbolic links" in err, err
     # The control: the two causes it named before are still named.
     assert "[backup].include_config=false" in err and "no config dir loaded" in err, err
+
+
+# --- (5b-quater) vault BACKLOG #5233, the round-3 review's repairs ---------------------------------
+
+
+@pytest.mark.parametrize("name", ["writelines", "tell", "flush", "seek"])
+def test_store_member_guard_offers_nothing_but_write(name) -> None:
+    # The raw file would answer any of these without the held bytes: `writelines` would land bytes
+    # past the check, and `tell` would report a position short of what was written. So the guard
+    # does not forward them.
+    out = io.BytesIO()
+    # `Any`: the methods the guard does not declare are the subject.
+    guard: Any = dr_backup._StoreMemberGuard(out)
+    guard.write(b"x" * 512)
+    with pytest.raises(AttributeError):
+        getattr(guard, name)
+    assert out.getvalue() == b"", "a held byte reached the file"
+    # The control: `finish` releases the head, which then lands whole.
+    guard.finish()
+    assert out.getvalue() == b"x" * 512
+
+
+def test_first_member_name_logs_a_head_that_does_not_parse(caplog) -> None:
+    # A head that does not parse is left to the checks after the decrypt, and says so in the log,
+    # by exception type only: the head is decrypted archive content.
+    head = b"\xff" * 1024
+    with caplog.at_level("DEBUG", logger=dr_backup.__name__):
+        assert dr_backup._first_member_name(head) is None
+    records = [r for r in caplog.records if "first member" in r.getMessage()]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    assert "\\xff" not in records[0].getMessage() and "\xff" not in records[0].getMessage()
+
+
+@pytest.mark.parametrize("case", ["carries a store", "undated"])
+def test_config_only_refusal_leaves_no_new_ancestor_of_config_to(tmp_path, capsys, case) -> None:
+    # The staging directory is made beside --config-to, so a missing ancestor of it is created
+    # first. A refusal after that ("Nothing was written", for the age refusal) must not leave
+    # that ancestor behind.
+    if case == "undated":
+        tar = _undated_config_only_tar(tmp_path)
+        expect = "restore failed (age_undated)"
+    else:
+        tar = _plain_tar(
+            tmp_path / "store.tar",
+            [("store.db", b"SQLite format 3\x00"), ("manifest.json", b"{}")],
+        )
+        expect = "carries a store"
+    toml = _service_toml(tmp_path, key_b64=None)
+    new = tmp_path / "new"
+    cfg = new / "deeper" / "cfg"
+    assert main(_config_only_argv(str(tar), toml, cfg)) == 1
+    err = _refusal(capsys)
+    assert expect in err, err
+    assert not new.exists(), sorted(str(p.relative_to(tmp_path)) for p in new.rglob("*"))
+    # The control: the same command restores once it may, and keeps the directories it made.
+    if case == "undated":
+        assert main([*_config_only_argv(str(tar), toml, cfg), "--allow-old-archive"]) == 0
+        assert (cfg / "feed.py").is_file()
+
+
+def test_store_route_refusal_leaves_no_new_ancestor_of_to(tmp_path, capsys) -> None:
+    # The same rule on the store route, where the staging directory goes beside --to: a config-only
+    # archive is refused there after its decrypt, and the new ancestor of --to goes with it.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    new = tmp_path / "new"
+    dest = new / "deeper" / "restored.db"
+    argv = ["restore", str(tar), "--to", str(dest), "--service-config", toml, "--allow-old-archive"]
+    assert main(argv) == 1
+    assert "CONFIG-ONLY" in _refusal(capsys)
+    assert not new.exists()
+
+
+def test_config_only_age_refusal_speaks_of_the_config_bundle(tmp_path, capsys) -> None:
+    # The config-only route places no store, so its age refusal names no audit row and no account
+    # change to undo; what an old bundle brings back is old config.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    err = _refusal(capsys)
+    assert "restore failed (age_undated)" in err, err
+    assert "Nothing was written" in err and "config bundle brings back" in err, err
+    assert "audit row" not in err and "A restore undoes" not in err, err
+
+
+def _failing_extract():
+    """An extractor that writes one file into the ledger, then fails the way a revoked ACL would."""
+
+    def boom(tar_path: Path, config_dest: Path, *, written: list[Path] | None = None) -> int:
+        config_dest.mkdir(parents=True, exist_ok=True)
+        partial = config_dest / "partial.py"
+        partial.write_bytes(b"# half a bundle\n")
+        if written is not None:
+            written.append(partial)
+        raise PermissionError(13, "Access is denied", str(config_dest / "sub"))
+
+    return boom
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_config_only_route_refuses_a_failure_the_extractor_does_not_word(
+    tmp_path, key_b64, capsys, prepared
+) -> None:
+    # A PermissionError from inside the bundle's extraction escaped as a traceback. It is now a
+    # refusal line, and the partial bundle is rolled back.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys, config_only=True)
+    cfg = tmp_path / "bundle"
+    if prepared:
+        cfg.mkdir()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_extract_config_members", _failing_extract())
+        assert main(_config_only_argv(archive, toml, cfg)) == 1
+    err = _refusal(capsys)
+    assert "restore failed (restore)" in err and "could not restore the config bundle" in err, err
+    assert "Traceback" not in err, err
+    assert not (cfg / "partial.py").exists(), "the partial bundle was not rolled back"
+    # A --config-to the operator prepared stays, empty; one the restore made goes.
+    assert cfg.exists() is prepared
+    _no_staging_left(tmp_path)
+
+
+def test_store_route_refuses_a_failure_the_extractor_does_not_word(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The store route had the same gap, and the same wrapper closes it: a refusal line, with the
+    # placed store and the partial bundle rolled back.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored.db"
+    cfg = tmp_path / "bundle"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_extract_config_members", _failing_extract())
+        assert main(_restore_argv(archive, toml, dest, cfg)) == 1
+    err = _refusal(capsys)
+    assert "restore failed (restore)" in err and "could not restore the config bundle" in err, err
+    assert not dest.exists(), "the placed store was not rolled back"
+    assert not (cfg / "partial.py").exists()
+
+
+def test_restore_config_members_refuses_a_member_that_ends_early(tmp_path) -> None:
+    # A tarfile.TarError from a truncated member is a refusal, not a traceback.
+    tar = _plain_tar(tmp_path / "whole.tar", [("config/a.toml", b"[a]\n" * 4096)])
+    data = tar.read_bytes()
+    cut = tmp_path / "cut.tar"
+    cut.write_bytes(data[: 512 + 1024])  # the header and the first two blocks of the body
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_config_members(cut, tmp_path / "cfg")
+    assert excinfo.value.kind == "restore", excinfo.value
+    assert "could not restore the config bundle" in str(excinfo.value)
+    # The control: the whole tar restores.
+    assert dr_backup._restore_config_members(tar, tmp_path / "cfg-whole") == 1
+
+
+def test_config_only_dangling_link_refusal_does_not_offer_dropping_config_to(tmp_path) -> None:
+    # The pre-check's advice is for the store route. The extractor, which the config-only route
+    # runs, refuses the same link without it: dropping --config-to there restores nothing.
+    tar = _plain_tar(
+        tmp_path / "dangling.tar",
+        [("config/a.toml", b"[a]\n"), _hard_link("config/b.toml", "config/absent.toml")],
+    )
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._restore_config_members(tar, tmp_path / "cfg")
+    assert "hard link" in str(excinfo.value)
+    assert "without --config-to" not in str(excinfo.value)
 
 
 # --- (5b) a corrupt or forged archive refuses, it does not traceback ----------
