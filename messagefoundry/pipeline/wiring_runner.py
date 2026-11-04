@@ -28,7 +28,6 @@ import functools
 import json
 import logging
 import math
-import sqlite3
 import threading
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
@@ -228,17 +227,12 @@ from messagefoundry.store import (
     Stage,
     StreamingAttachmentsUnsupported,
 )
-from messagefoundry.store.base import (
-    AuditStore,
-    pool_over_provisioned_warning,
-    store_call_errors,
-)
+from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.cell_tag import CellTagError, CellTagSink, dead_letter_on_cell_tag
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
-from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -1084,17 +1078,6 @@ class _StreamBudgetExceeded(Exception):
         self.alone = alone
 
 
-class _AttachmentWriteFailed(Exception):
-    """The store's ``put_attachment`` refused a document for a fault in the document itself, one
-    :func:`_attachment_body_fault` names, so every resend of the same body meets it again: a
-    PERMANENT refusal, which :func:`_detach_refusal_kind` answers as it does an escaped document, as
-    the Manager's decisions d20261104T042552411-c23337 and d20261104T081642325-1a4f74 set (BACKLOG
-    #1619). Propagating it left a retrying source re-reading that body forever, and a TEMPORARY
-    answer would invite a conforming sender to resend it forever. Any other ``put_attachment`` fault
-    that is not already one of :data:`_DETACH_REFUSALS` (at least ``StreamingAttachmentsUnsupported``
-    is) still propagates, as a store fault always has."""
-
-
 #: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
 #: SQL Server's ``NVARCHAR(256)`` (SQLite and PostgreSQL use unbounded ``TEXT``). OBX-5.2 is
 #: sender-controlled, so a longer label would fail the write with error 2628 on every resend.
@@ -1103,59 +1086,26 @@ _ATTACHMENT_CONTENT_TYPE_MAX = 256
 
 def _label_fits_every_backend(label: str) -> bool:
     """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
-    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), encodable as
-    UTF-8, and no wider than :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing any of these
-    would fail the write on every resend. The length test comes first, so a long sender-controlled
-    label is never copied to be measured."""
+    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), no lone surrogate,
+    which no backend's driver can encode, and no wider than :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A
+    label failing any of these would fail the write on every resend. The length test comes first,
+    so a long sender-controlled label is never copied to be measured."""
     if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
         return False
     try:
-        label.encode("utf-8")
+        # Strict UTF-16 refuses exactly the strings UTF-8 refuses, the lone surrogates, and its
+        # length counts the code units NVARCHAR counts.
+        units = len(label.encode("utf-16-le")) // 2
     except UnicodeEncodeError:
         return False
-    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
+    return units <= _ATTACHMENT_CONTENT_TYPE_MAX
 
 
-def _attachment_body_fault(exc: BaseException) -> str | None:
-    """A content-free name for a ``put_attachment`` fault that lies in the document it was handed,
-    or ``None`` for any other fault, which the detach then lets propagate (BACKLOG #1619).
-
-    A fault is the body's only when it is positively known to recur for that body: a document or
-    label that cannot be encoded (``UnicodeEncodeError``; a decode failure may be a driver's or a
-    service's, not the document's), or SQLite's "string or blob too big" (``sqlite3.DataError``).
-    Anything unclassified counts as transient, because propagating never consumes the input: the
-    transport NAKs and closes, a TCP inbound with no reply holds the frame (BACKLOG #5022), and a
-    poll source leaves the file or row for its next scan. Recording it instead would finish a body
-    over a fault that may clear, and past the refused-body allowance a listener's row keeps only the
-    head. So at least these propagate: a lost connection, a lock or deadlock
-    (``transports.database._is_transient``'s 08 and 40 classes and HYT00), a locked SQLite file, and
-    class 23, since the only constraint ``put_attachment`` can break is the content address's key,
-    which a concurrent put of the same document breaks and a resend then dedups against.
-
-    A server driver's SQLSTATE class 22, a data exception such as SQL Server's 2628 truncation,
-    propagates too (Manager decision d20261104T081642325-1a4f74). The label, the one
-    sender-controlled value a column could refuse, is bounded before the write
-    (:func:`_label_fits_every_backend`), so class 22 more likely comes from a drifted schema than
-    from the document, and recording it would consume a body the fixed schema then accepts.
-
-    The read side classifies differently on purpose. :data:`_STORE_READ_CONTENT_FAULTS` names what a
-    read raises for a STORED cell, so a ``CipherError`` there is the cell failing authentication. A
-    write seals fresh plaintext, so a ``CipherError`` here is the key or the Vault Transit service,
-    never the document, and propagates. And a read's row stays in the store whichever arm it takes,
-    while here a recorded fault ends the body and a propagated one keeps the input, so only the
-    write needs a transient-or-deterministic split."""
-    if isinstance(exc, (UnicodeEncodeError, sqlite3.DataError)):
-        return f"{type(exc).__module__}.{type(exc).__qualname__}"
-    return None
-
-
-#: The refusals ``_detach_documents`` raises for a body it does not detach, an attachment write that
-#: failed for a fault in the document among them (BACKLOG #1619). Both listeners catch exactly these
-#: and record ``ERROR`` before the ACK, so a type added here is refused by both, never by one alone.
-#: Not every raise: a body the separator read refuses (a registered fuzz known finding,
+#: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
+#: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
+#: by one alone. Not every raise: a body the separator read refuses (a registered fuzz known finding,
 #: ``fuzz/targets.py``) still escapes as a bare ``ValueError``.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
-    _AttachmentWriteFailed,
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
     DocRefError,
@@ -1196,9 +1146,8 @@ def _detach_refusal_kind(exc: Exception) -> RefusalKind:
 
     Only the in-flight budget is the engine's own and clears as concurrent detaches finish, so only
     it invites a re-send, and only when the body would fit the budget once they have: one larger
-    than the whole budget is over-size. An unsupported backend, a malformed handle, an escaped
-    document and a fault in a document (:class:`_AttachmentWriteFailed`, BACKLOG #1619) refuse the
-    same body every time. The receipt path answers the class as is; MLLP answers
+    than the whole budget is over-size. An unsupported backend, a malformed handle and an escaped
+    document refuse the same body every time. The receipt path answers the class as is; MLLP answers
     ``AE`` for TEMPORARY and ``AR`` for every final class (owner ruling of 2026-11-03, decision log
     d20261104T032854299-7235a9, stamped in UTC)."""
     if isinstance(exc, _StreamBudgetExceeded):
@@ -1741,8 +1690,6 @@ class RegistryRunner:
         # The inbounds whose source polls a shared resource (a directory, a table): the engine consumes
         # the only copy of what it reads, so a refusal there is always stored whole. Set at bind.
         self._refusals_kept_whole: set[str] = set()
-        # Built now, so the detach's catch does not first import a driver on the event loop.
-        store_call_errors()
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -8443,8 +8390,7 @@ class RegistryRunner:
                 kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # refusal records ERROR + returns a refusal — never accepted-and-dropped. A put_attachment
-        # fault that is not the document's propagates with no row (_attachment_body_fault, #1619).
+        # failure records ERROR + returns a refusal — never accepted-and-dropped.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8541,12 +8487,9 @@ class RegistryRunner:
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
         support (SQL Server / Postgres in Phase 1a), and
         :class:`~messagefoundry.parsing.binary.EscapedDocumentError` when a document's ``OBX-5.5``
-        holds an HL7 escape (vault BACKLOG #2809), and :class:`_AttachmentWriteFailed` when
-        ``put_attachment`` fails for a fault in the document (BACKLOG #1619) — each, as one of
-        :data:`_DETACH_REFUSALS`, is turned into an ``ERROR``/NAK by the caller. Any other
-        ``put_attachment`` fault propagates (:func:`_attachment_body_fault`). The whole body is
-        buffered once (accepted-by-design until the streaming decoder, ADR 0105 Phase-C); the budget
-        bounds how many such buffers can be concurrent."""
+        holds an HL7 escape (vault BACKLOG #2809) — each, as one of :data:`_DETACH_REFUSALS`, is turned
+        into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
+        Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
         budget = self._stream_inflight_budget
         if budget and self._stream_inflight_bytes + size > budget:
@@ -8592,27 +8535,7 @@ class RegistryRunner:
                     content_type, b64_head(verbatim_b64)
                 ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
-                fault: str | None = None
-                try:
-                    ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
-                except store_call_errors() as exc:
-                    # Only a fault in the document is the body's; a store fault, a refusal and a bug
-                    # propagate exactly as before. Only the name is kept, because a driver's text
-                    # can quote the value it refused (BACKLOG #1661).
-                    fault = _attachment_body_fault(exc)
-                    if fault is None:
-                        raise
-                if fault is not None:
-                    # Raised outside the except block, so the driver's exception, its text and its
-                    # frames are neither chained nor kept alive. A document stored before this one
-                    # stays at refcount 0 for the startup orphan sweep.
-                    log.warning(
-                        "inbound %r: attachment write failed in the streaming detach (%s); the "
-                        "message is not accepted",
-                        ic.name,
-                        fault,
-                    )
-                    raise _AttachmentWriteFailed(f"attachment write failed ({fault})")
+                ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
                 )
@@ -8880,9 +8803,7 @@ class RegistryRunner:
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
         # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
-        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. A
-        # put_attachment fault that is not the document's (_attachment_body_fault, #1619) and a
-        # failed ERROR write (BACKLOG #1608) propagate to the transport instead, with no row.
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8894,15 +8815,13 @@ class RegistryRunner:
                 # The receipt path's class decides MSA-1 (BACKLOG #5078): AE only for a budget held by
                 # concurrent detaches, which a re-send may clear, and AR for every refusal the
                 # receipt path answers as final, a body alone over the whole budget, an unsupported
-                # backend, a malformed handle, an escaped document (vault BACKLOG #2809) and a fault
-                # in a document (#1619) alike.
+                # backend, a malformed handle and an escaped document (vault BACKLOG #2809) alike.
                 nak_code = "AE" if _detach_refusal_kind(exc) is RefusalKind.TEMPORARY else "AR"
-                if isinstance(exc, EscapedDocumentError):
-                    nak_text = "escaped document in OBX-5.5"
-                elif isinstance(exc, _AttachmentWriteFailed):
-                    nak_text = "attachment write failed"
-                else:
-                    nak_text = "streaming detach failed"
+                nak_text = (
+                    "escaped document in OBX-5.5"
+                    if isinstance(exc, EscapedDocumentError)
+                    else "streaming detach failed"
+                )
                 ack = (
                     build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply
@@ -12048,8 +11967,7 @@ class _StoreReadFault(_RedactedFault):
 # a backend without streaming become a DeliveryError in _hydrate_payload; a cell that fails decryption
 # (CipherError) reaches the internal-error policy. At least one infrastructure fault also arrives as a
 # CipherError -- a Vault Transit cipher wraps an unreachable Vault in one -- and so still takes that
-# arm; telling the two apart needs the cipher to raise a distinct type. The write side's split is
-# _attachment_body_fault, which says why the two differ (BACKLOG #1619).
+# arm; telling the two apart needs the cipher to raise a distinct type.
 _STORE_READ_CONTENT_FAULTS: tuple[type[Exception], ...] = (
     KeyError,
     StreamingAttachmentsUnsupported,
