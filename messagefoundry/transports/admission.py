@@ -189,12 +189,12 @@ class ListenerAdmission:
     capacity; switch it off there.
 
     ``max_handshakes_per_host`` counts only sockets from one peer address that hold a slot while
-    still in their TLS handshake. A socket leaves that count when its handshake ends, however it
-    ends (:meth:`handshake`), so it bounds the slots a peer that never finishes a handshake can
-    hold, at least an mTLS peer with no client certificate, without capping an address's
-    established connections (vault BACKLOG #4888). It does not bound a peer that completes its
-    handshake and then sends nothing; ``docs/DEPLOYMENT.md`` says what does. Only a listener that admits a socket before upgrading it passes ``handshake`` to
-    :meth:`check`, then runs the handshake inside :meth:`handshake`.
+    still in their TLS handshake, and a socket leaves that count when its handshake ends, however
+    it ends (:meth:`handshake`). So it bounds a peer that stalls its handshakes without capping an
+    address's established connections (vault BACKLOG #4888; ``docs/DEPLOYMENT.md``, *Per-address
+    listener caps behind the VIP*, holds what it does and does not bound). Only a listener that
+    admits a socket before upgrading it passes ``handshake`` to :meth:`check`, then runs the
+    handshake inside :meth:`handshake`.
     """
 
     def __init__(
@@ -267,7 +267,7 @@ class ListenerAdmission:
             self._log_capacity_once(
                 peer_host,
                 self.host_capacity_warned,
-                "max_connections_per_host",
+                _AT_HOST_CAPACITY,
                 self.max_connections_per_host,
                 "it has no connections left",
             )
@@ -277,7 +277,7 @@ class ListenerAdmission:
             self._log_capacity_once(
                 peer_host,
                 self.handshake_capacity_warned,
-                "max_handshakes_per_host",
+                _AT_HANDSHAKE_CAPACITY,
                 self.max_handshakes_per_host,
                 "none of its sockets is in a TLS handshake",
             )
@@ -358,10 +358,11 @@ class ListenerAdmission:
         )
 
     def _log_capacity_once(
-        self, peer_host: str, warned: set[str], knob: str, cap: int | None, until: str
+        self, peer_host: str, warned: set[str], refusal: Refusal, cap: int | None, until: str
     ) -> None:
         """Warn the FIRST time a host hits a per-host cap, then stay quiet until its count for that
-        cap drops to zero, which is ``until`` in words.
+        cap drops to zero, which is ``until`` in words. The line names the knob by the refusal's
+        reason, so the log and the `at_capacity` event cannot spell it differently.
 
         Clearing at zero rather than when the host drops back under the cap is deliberate: a peer
         oscillating on the boundary would otherwise earn a line per cycle. A per-refusal line would
@@ -377,7 +378,7 @@ class ListenerAdmission:
             "not logged until %s.",
             self.transport,
             peer_host,
-            knob,
+            refusal.reason,
             cap,
             until,
         )

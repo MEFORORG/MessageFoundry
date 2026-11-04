@@ -483,8 +483,8 @@ counts a socket in its handshake, this one included. The loop's 10 s handshake b
 bound there.
 
 Without it, one address that opens sockets and never finishes a handshake could hold every
-`max_connections` slot (256) for up to the 10 s handshake bound each. An mTLS peer with no client
-certificate is one such peer. The budget is per address, as `max_connections_per_host` is, so a
+`max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
+port can stall its handshake; on an mTLS listener it needs no client certificate to do so. The budget is per address, as `max_connections_per_host` is, so a
 peer with many source addresses gets 32 for each of them.
 
 **What it does not bound.** A peer that completes its handshake leaves the count, and on a listener
@@ -498,14 +498,15 @@ handshakes together. A client behind the balancer that stalls 32 handshakes woul
 other client's new connection for as long as it keeps them stalled. The budget does not make that
 lockout meaningfully cheaper, though: without it, the same client would refuse everyone by stalling
 256 sockets instead, which costs it no more. A real client finishes its handshake in one or two
-round trips, so 32 in flight at once from the balancer's address takes a high connection rate or a
-busy event loop. A refused socket is closed with no answer, and each refusal counts as a peer
+round trips, but it reaches 32 with no attacker at all on a busy enough listener: at 200 requests
+a second and a 150 ms handshake, about 30 are in flight at once, since `Http()` answers one request
+per connection and so runs a handshake per request. A refused socket is closed with no answer, and each refusal counts as a peer
 refusal for the security-signal burst detector. If `at_capacity` events with the reason
 `max_handshakes_per_host` name the balancer's address under ordinary load, raise the cap, or set
 it to `None` or `0` to turn it off.
 
-**`source_ip_allowlist` is a further mitigation, not a replacement.** It refuses an unlisted peer
-before any TLS byte. A listed peer with no client certificate passes it and is bounded only by this
+**`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
+an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer with no client certificate passes it and is bounded only by this
 budget. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
 it cannot tell clients apart either.
 
