@@ -1550,7 +1550,9 @@ when the timeout fires, marks it abandoned. Both take one lock, so they cannot c
 worker began first and the listener reads that it began, or the listener gave up first and the worker
 returns without calling `hl7apy` at all. Nothing is inferred from timings. "Began" means the worker
 ran the run's first line, so a free thread that the GIL or the OS did not schedule in time also reads
-as not begun. The stored reason therefore says only "before the validate began", not why.
+as not begun. The stored reason therefore says only "before the validate began", not why. The run
+keeps its result under the same lock, so a validate that finished inside the timeout, but whose
+result reached a stalled event loop after the timeout fired, is not a timeout: its result is used.
 
 | Timeout | What is known | Receipt path | MLLP / TCP | Stored reason |
 | --- | --- | --- | --- | --- |

@@ -33,6 +33,7 @@ import asyncio
 import contextvars
 import functools
 import threading
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,6 +44,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.parsing import ValidationResult
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.store.store import MessageStatus, MessageStore
@@ -59,6 +61,7 @@ _WRONG_VERSION = _ADT.replace("|P|2.5.1\r", "|P|2.3\r")
 #: not an ``HL7apyException``, so it reaches ``validate()``'s defensive catch-all from the body alone.
 _GLUED_MSH2 = "MSH|^~\\&A|B|C|D|20260101||ADT^A01|G5078|P|2.5.1\rEVN|A01|20260101\rPID|1||100\r"
 _STRICT_CAP = DEFAULT_MAX_MESSAGE_BYTES  # validate()'s own default cap
+_OK = ValidationResult(True, "2.5.1", [])
 
 
 @pytest.fixture
@@ -299,19 +302,49 @@ def test_an_abandoned_run_never_validates_and_a_begun_one_reports_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The lock protocol on its own: abandon first and the run returns without validating; begin
-    first and abandon reports that it began."""
+    first and abandon reports that it began, with its result once it finished."""
     calls: list[int] = []
-    monkeypatch.setattr(wiring_runner, "validate", lambda *a, **k: calls.append(1))
+
+    def _validate(*_: Any, **__: Any) -> ValidationResult:
+        calls.append(1)
+        return _OK
+
+    monkeypatch.setattr(wiring_runner, "validate", _validate)
 
     first = wiring_runner._StrictValidateRun()
-    assert first.abandon() is False
+    assert first.abandon() == (False, None)
     assert first(_ADT, "2.5.1") is None
     assert calls == []
 
     second = wiring_runner._StrictValidateRun()
-    second(_ADT, "2.5.1")
+    assert second(_ADT, "2.5.1") is _OK
     assert calls == [1]
-    assert second.abandon() is True
+    assert second.abandon() == (True, _OK)
+
+
+async def test_a_validate_that_finished_in_time_is_not_a_timeout_when_the_loop_takes_it_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validate finishes inside the timeout, but a callback stalls the event loop past the
+    timeout, so the loop reaches the timeout before it takes the result. The run had finished, so its
+    result is used: a valid body is not refused as a begun timeout, which is final (AR / 422).
+    Mutation: drop the finished result from ``_validate_strictly``'s timeout arm. Red:
+    ``_StrictValidateTimedOut``. Measured on CPython 3.14: the mutation times out 6 of 6 runs."""
+    finished = threading.Event()
+
+    def _fast(*_: Any, **__: Any) -> ValidationResult:
+        time.sleep(0.1)  # finishes at about 0.1 s, inside the stall and the 0.3 s timeout
+        finished.set()
+        return _OK
+
+    monkeypatch.setattr(wiring_runner, "validate", _fast)
+    ic = _strict_ic(ConnectorType.MLLP, timeout=0.3)
+    loop = asyncio.get_running_loop()
+    # Synchronous work on the loop from 0.05 s to 0.55 s, scheduled before the worker finishes.
+    loop.call_later(0.05, time.sleep, 0.5)
+    result = await wiring_runner._validate_strictly(ic, _ADT)
+    assert finished.is_set()
+    assert result is _OK
 
 
 # --- the 16 MiB cap -------------------------------------------------------------------------------

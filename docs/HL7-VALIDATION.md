@@ -8,7 +8,7 @@ compose.
 | Tier | Engine | When | Checks | On failure |
 |---|---|---|---|---|
 | 1. Tolerant peek | The built-in parser ([parsing/peek.py](../messagefoundry/parsing/peek.py), ADR 0054) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
-| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK (AR/AE) at the listener |
+| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK at the listener, `AR` (Tier 2 below has the codes) |
 | 3. Business consistency | `parsing/consistency.py` (this WP) | In a Router/Handler | **Cross-field** coherence the schema can't express | Handler decides: `FILTERED` or `ERROR`/dead-letter |
 
 ## Tier 1 — tolerant peek (always on)
@@ -47,7 +47,10 @@ What the sender hears (BACKLOG #5078, owner ruling 2026-11-04):
 | the validate began and ran past `validation.strict_timeout_s` | `AR` | `422` |
 | the timeout fired before any worker thread began the validate | `AE` | `503` with `Retry-After` |
 
-The engine's own MLLP outbound dead-letters an `AR` at once and retries an `AE`. Why a timeout splits
+The engine's own MLLP outbound dead-letters an `AR` at once and retries an `AE`. A third-party sender
+that reads MSA-1 by the HL7 v2 letter, where `AE` marks a content error, would read these two codes
+the other way round, so set such a sender up to give up on `AR` and re-send on `AE`
+([`messagefoundry/CLAUDE.md`](../messagefoundry/CLAUDE.md), *ACK/NAK*, states the convention). Why a timeout splits
 on whether the validate began is in the
 [ADR 0154 amendment of 2026-11-03](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
 

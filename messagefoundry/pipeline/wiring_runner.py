@@ -924,6 +924,10 @@ class _StrictValidateTimedOut(Exception):
 
     def __init__(self, timeout: float, *, started: bool) -> None:
         self.started = started
+        #: The receipt path's class and the MLLP NAK's MSA-1, kept together so the two listeners
+        #: cannot split the timeout differently.
+        self.refusal_kind = RefusalKind.PERMANENT if started else RefusalKind.TEMPORARY
+        self.nak_code = "AR" if started else "AE"
         self.ack_text = f"strict-validation timed out after {timeout}s"
         self.reason = self.ack_text if started else f"{self.ack_text} before the validate began"
         super().__init__(self.reason)
@@ -934,25 +938,33 @@ class _StrictValidateRun:
 
     The start and the listener's abandonment take one lock, so they cannot cross: either the worker
     began first and :meth:`abandon` reports it started, or the listener gave up first and the worker
-    returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind."""
+    returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind.
+
+    The result is kept under the same lock, because a validate can finish inside the timeout and its
+    result still reach the event loop after the timeout fired (a loop stalled by other work). Such a
+    run is not a timeout at all, and :meth:`abandon` hands its result back."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._abandoned = False
         self._started = False
+        self._result: ValidationResult | None = None
 
     def __call__(self, text: str, expected_version: str | None) -> ValidationResult | None:
         with self._lock:
             if self._abandoned:
                 return None
             self._started = True
-        return validate(text, expected_version=expected_version)
+        result = validate(text, expected_version=expected_version)
+        with self._lock:
+            self._result = result
+        return result
 
-    def abandon(self) -> bool:
-        """Stop a run that has not begun, and report whether it had."""
+    def abandon(self) -> tuple[bool, ValidationResult | None]:
+        """Stop a run that has not begun. Report whether it had, and its result if it finished."""
         with self._lock:
             self._abandoned = True
-            return self._started
+            return self._started, self._result
 
 
 async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResult:
@@ -970,7 +982,9 @@ async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResu
             asyncio.to_thread(run, text, ic.validation.hl7_version), timeout
         )
     except TimeoutError:
-        started = run.abandon()
+        started, finished = run.abandon()
+        if finished is not None:
+            return finished  # it finished in time; only its delivery to the loop was late
     except BaseException:
         # Cancelled (engine stop, connection teardown): nobody will await the result, so a run not
         # yet begun must not begin.
@@ -8165,11 +8179,11 @@ class RegistryRunner:
                 # A validate that had begun is PERMANENT (BACKLOG #2105; owner ruling 2026-11-04): a
                 # body that times out for its own content times out on every re-send, and each
                 # attempt orphans another hl7apy thread this path cannot kill. One that never began
-                # timed out waiting for a worker thread: nothing is known of the body and no thread
-                # was left, so it is TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
-                # _handle_inbound answers the same split AR / AE.
-                kind = RefusalKind.PERMANENT if exc.started else RefusalKind.TEMPORARY
-                return await self._refuse(ic, raw, text, kind, error=exc.reason, peek=peek)
+                # (no worker thread ran it inside the timeout) tells nothing of the body and left no
+                # thread, so it is TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
+                return await self._refuse(
+                    ic, raw, text, exc.refusal_kind, error=exc.reason, peek=peek
+                )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
                 # validate() keeps its own size cap, the engine default, even where the inbound's
@@ -8543,9 +8557,8 @@ class RegistryRunner:
                 # 2026-11-04, BACKLOG #5078): a validate that had begun is final, AR, and one that
                 # never began is temporary, AE.
                 mid = await self._record_refused(ic, raw, text, error=exc.reason, peek=peek)
-                timeout_code = "AR" if exc.started else "AE"
                 ack = (
-                    build_ack(peek, code=timeout_code, text=exc.ack_text, ack_mode=ack_mode)
+                    build_ack(peek, code=exc.nak_code, text=exc.ack_text, ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8553,7 +8566,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code=timeout_code,
+                        ack_code=exc.nak_code,
                         ack_phase="strict",
                         ack_body=None,
                         detail=exc.reason,
