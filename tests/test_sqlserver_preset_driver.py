@@ -14,7 +14,6 @@ refuses what the build refuses. Nothing here opens a connection.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -76,6 +75,28 @@ REFUSED_DRIVERS = [
     # A library file name needs its dot before the extension.
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18so",
     "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18..so",
+    # A version is digits joined by single dots, on either side of the extension.
+    *(
+        f"/opt/microsoft/msodbcsql18/lib64/{name}"
+        for name in (
+            "libmsodbcsql-.18.so",
+            "libmsodbcsql-.so",
+            "libmsodbcsql-18.x.so",
+            "libmsodbcsql-18.so.",
+            "libmsodbcsql-18.so..3",
+            "libmsodbcsql-18.so.3.",
+            "libmsodbcsql-18.so3",
+            "libmsodbcsql-18.so.x",
+            "libmsodbcsql.18.dylib.",
+        )
+    ),
+    # The separator, the extension and the Windows version are fixed.
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql18.so",
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql_18.so",
+    "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.dll",
+    "/opt/microsoft/msodbcsql18/lib64/msodbcsql18.so",
+    r"C:\Windows\System32\msodbcsql.dll",
+    r"C:\Windows\System32\msodbcsql18.1.dll",
     # A path that can name a library on another host.
     r"\\files.test.invalid\share\msodbcsql18.dll",
     r"\\?\C:\Windows\System32\msodbcsql18.dll",
@@ -106,6 +127,10 @@ ACCEPTED_DRIVERS = [
     # Only the file name is read: a directory cannot change the library that loads.
     "/opt/mysql-compat/libmsodbcsql-18.so",
     "/opt/homebrew/lib/libmsodbcsql.18.dylib",
+    # Several version parts before and after the extension, on both library spellings.
+    "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1",
+    "/opt/x/libmsodbcsql-1.2.3.4.5.so.6.7.8.9",
+    "/opt/homebrew/lib/libmsodbcsql.18.3.dylib.1.2",
     r"C:\Windows\System32\msodbcsql18.dll",
     # Case is folded on a path too: Windows and macOS look a library file up in any case.
     r"C:\WINDOWS\SYSTEM32\MSODBCSQL18.DLL",
@@ -381,51 +406,3 @@ def test_the_refusal_leads_with_its_remedy_and_fits_a_stored_failure() -> None:
     message = str(raised.value)
     assert message.index("name a Microsoft SQL Server driver") < 80
     assert len(message) < 200, len(message)
-
-
-# --- the library-name pattern -------------------------------------------------------------------
-
-#: The pattern as first written, with a repeated group holding a repetition, which the ReDoS gate
-#: in tests/test_security_static.py refuses in shipped code. Kept here only to prove the rewrite
-#: accepts the same file names.
-_NESTED_LIBRARY_PATTERN = (
-    r"libmsodbcsql[-.][0-9]+(?:\.[0-9]+)*\.(?:so|dylib)(?:\.[0-9]+)*|msodbcsql[0-9]+\.dll"
-)
-
-#: File names on both sides of each version rule: a lone dot, a doubled dot, a leading or trailing
-#: dot, an empty version and several version parts, before and after the extension.
-_LIBRARY_NAMES = [
-    "libmsodbcsql-18.so",
-    "libmsodbcsql-18.3.so.3.1",
-    "libmsodbcsql-17.10.so.6.1",
-    "libmsodbcsql.18.dylib",
-    "libmsodbcsql-1.2.3.4.5.so.6.7.8.9",
-    "msodbcsql18.dll",
-    "libmsodbcsql-18so",
-    "libmsodbcsql-18..so",
-    "libmsodbcsql-.18.so",
-    "libmsodbcsql-18.so.",
-    "libmsodbcsql-18.so..3",
-    "libmsodbcsql-18.so.3.",
-    "libmsodbcsql-.so",
-    "libmsodbcsql18.so",
-    "libmsodbcsql-18.dll",
-    "msodbcsql.dll",
-    "msodbcsql18.so",
-    "libmsodbcsql-18.so3",
-]
-
-
-@pytest.mark.parametrize("name", _LIBRARY_NAMES)
-def test_the_library_pattern_accepts_what_the_nested_pattern_accepted(name: str) -> None:
-    from messagefoundry.transports.db_endpoint import _PRESET_DRIVER_LIBRARIES
-
-    expected = re.fullmatch(_NESTED_LIBRARY_PATTERN, name) is not None
-    assert (_PRESET_DRIVER_LIBRARIES.fullmatch(name) is not None) is expected
-
-
-def test_the_library_names_hold_both_verdicts() -> None:
-    # The control for the test above: a list every name of which one verdict covers would pass it
-    # with any pattern of that verdict.
-    verdicts = {re.fullmatch(_NESTED_LIBRARY_PATTERN, name) is not None for name in _LIBRARY_NAMES}
-    assert verdicts == {True, False}

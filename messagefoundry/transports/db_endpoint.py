@@ -169,14 +169,10 @@ _PRESET_DRIVER_NAMES = re.compile(
 #: as a path: ``libmsodbcsql-18.3.so.3.1`` on Linux, ``libmsodbcsql.18.dylib`` on macOS and
 #: ``msodbcsql18.dll`` on Windows. Only the file name is read, in any case; the directories are
 #: not. docs/CONNECTIONS.md says what a name cannot tell about the library that loads.
-#:
-#: A version is digits joined by single dots, spelled ``[0-9](?:[0-9]|\.(?=[0-9]))*`` rather than
-#: ``[0-9]+(?:\.[0-9]+)*``: the same strings, with no repeated group that holds a repetition, which
-#: is the shape the ReDoS gate in tests/test_security_static.py refuses. The two branches never
-#: match the same character, so a failed match is not retried along another split.
+#: The digits inside a repeated group are possessive (``++``), so a failed match never retries
+#: them along another split, and the ReDoS gate in tests/test_security_static.py passes it.
 _PRESET_DRIVER_LIBRARIES = re.compile(
-    r"libmsodbcsql[-.][0-9](?:[0-9]|\.(?=[0-9]))*\.(?:so|dylib)"
-    r"(?:\.[0-9](?:[0-9]|\.(?=[0-9]))*)?|msodbcsql[0-9]+\.dll"
+    r"libmsodbcsql[-.][0-9]+(?:\.[0-9]++)*\.(?:so|dylib)(?:\.[0-9]++)*|msodbcsql[0-9]+\.dll"
 )
 
 
