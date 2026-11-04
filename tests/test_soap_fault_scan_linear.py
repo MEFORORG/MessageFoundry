@@ -51,36 +51,41 @@ def _old_fault_code(body: str, fault: object = None) -> str:
 
 
 # The reference reading: the old patterns, run on the text between the first Fault start tag and
-# its close tag, with an element that cannot hold a code read as empty. It reuses the production
-# close-tag and nested-tag patterns, so it re-checks the str.find bounds and captures, not those
-# patterns; the named shapes pin what they read.
+# its close tag, the earlier of the two names taken, with an element that cannot hold a code read
+# as empty. It reuses the production close-tag and nested-tag patterns, so it re-checks the
+# str.find bounds and captures, not those patterns; the named shapes pin what they read.
 _REF_FAULT_RE = re.compile(
     r"<\s*(?:[\w.\-]+:)?Fault[\s/>](.*?)(?:</\s*(?:[\w.\-]+:)?Fault\s*>|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
-
-
-def _ref_code(old: re.Pattern[str], own_close: re.Pattern[str], inner: str) -> str | None:
-    m = old.search(inner)
-    if m is None:
-        return None
-    code = m.group(1)
-    self_closing = inner[m.start(1) - 2] == "/"
-    holds_an_element = soap._TAG_OPEN_RE.search(code) is not None
-    if self_closing or holds_an_element or not own_close.match(inner, m.end() - 2):
-        return ""
-    return code
+_REF_START_TAG_RE = re.compile(r"[^>]*>")
 
 
 def _ref_fault_code(body: str) -> str:
     fault = _REF_FAULT_RE.search(body)
     if fault is None:
         return ""
+    fault_tag = _REF_START_TAG_RE.match(body, fault.start(1) - 1)
+    if fault_tag is None or fault_tag.group().endswith("/>"):
+        return ""
     inner = fault.group(1)
-    code = _ref_code(_OLD_FAULTCODE_RE, soap._FAULTCODE_END_RE, inner)
-    if code is None:
-        code = _ref_code(_OLD_CODEVALUE_RE, soap._CODEVALUE_END_RE, inner)
-    return code or ""
+    found = [
+        (m, close)
+        for m, close in (
+            (_OLD_FAULTCODE_RE.search(inner), soap._FAULTCODE_END_RE),
+            (_OLD_CODEVALUE_RE.search(inner), soap._CODEVALUE_END_RE),
+        )
+        if m is not None
+    ]
+    if not found:
+        return ""
+    m, own_close = min(found, key=lambda pair: pair[0].start())
+    code = m.group(1)
+    self_closing = inner[m.start(1) - 2] == "/"
+    holds_an_element = soap._TAG_OPEN_RE.search(code) is not None
+    if self_closing or holds_an_element or not own_close.match(inner, m.end() - 2):
+        return ""
+    return code
 
 
 # --- what the extraction reads ------------------------------------------------------------------
@@ -119,7 +124,7 @@ _NAMED_SHAPES = {
     "multiline": ("<Fault><faultcode>\n  soap:Client\n</faultcode></Fault>", "\n  soap:Client\n"),
     "faultcode-unclosed-then-value": ("<Fault><Value>x:Sender</Value><faultcode>y", "x:Sender"),
     "name-only-prefix-match": ("<Fault><faultcodeX>a</faultcodeX><Value>v</Value></Fault>", "v"),
-    # An empty faultcode stops the read: the Value after it is not consulted.
+    # The first code element decides: an empty one is not passed over for the Value after it.
     "empty": ("<Fault><faultcode></faultcode><Value>x:Sender</Value></Fault>", ""),
     "nested": ("<Fault><faultcode><b>soap:Client</b></faultcode></Fault>", ""),
     "self-closing": ("<Fault><faultcode/>x</y>", ""),
@@ -138,8 +143,9 @@ def test_each_named_shape_yields_its_code(body: str, code: str) -> None:
     assert _ref_fault_code(body) == code
 
 
-# Defect 1: the code was the first one anywhere in the reply, so a Header element decided the Fault.
-_HEADER_DECIDES = {
+# Defect 1: the code was the first faultcode, else the first Value, anywhere in the reply, so a
+# Header element, or a faultcode in a SOAP 1.2 Detail, decided the Fault.
+_OUTSIDE_THE_CODE = {
     "soap12-header-value": (
         "<env:Envelope><env:Header><x:Value>Receiver</x:Value></env:Header><env:Body>"
         "<env:Fault><env:Code><env:Value>env:Sender</env:Value></env:Code></env:Fault>"
@@ -152,14 +158,20 @@ _HEADER_DECIDES = {
         "</soap:Envelope>",
         "soap:Client",
     ),
+    "soap12-detail-faultcode": (
+        "<env:Fault><env:Code><env:Value>env:Sender</env:Value></env:Code><env:Detail>"
+        "<app:faultcode>SERVER_ERROR</app:faultcode></env:Detail></env:Fault>",
+        "env:Sender",
+    ),
 }
 
 
 @pytest.mark.parametrize(
-    ("body", "code"), list(_HEADER_DECIDES.values()), ids=list(_HEADER_DECIDES)
+    ("body", "code"), list(_OUTSIDE_THE_CODE.values()), ids=list(_OUTSIDE_THE_CODE)
 )
 def test_a_code_in_the_header_does_not_decide_a_sender_fault(body: str, code: str) -> None:
-    """Red on the old reading, which took the Header's Receiver and retried a Sender fault."""
+    """Red on the old reading, which took the Header's, or the Detail's, Receiver code and retried
+    a Sender fault."""
     assert soap._RECEIVER_RE.search(_old_fault_code(body)), "the shape must exercise the defect"
     assert _fault_code(body) == code
     failure = _classify_soap(200, body)
@@ -167,10 +179,18 @@ def test_a_code_in_the_header_does_not_decide_a_sender_fault(body: str, code: st
     assert failure.code == "soap-sender"
 
 
-def test_a_code_after_the_fault_does_not_decide_it() -> None:
-    """The read stops at the Fault's close tag."""
-    body = "<Fault><faultstring>bad</faultstring></Fault><Value>env:Receiver</Value>"
-    assert _old_fault_code(body) == "env:Receiver", "the shape must exercise the bound"
+_AFTER_THE_FAULT = {
+    "after-the-close-tag": (
+        "<Fault><faultstring>bad</faultstring></Fault><Value>env:Receiver</Value>"
+    ),
+    "after-a-self-closing-fault": "<env:Body><x:Fault/><r><Value>Receiver</Value></r></env:Body>",
+}
+
+
+@pytest.mark.parametrize("body", list(_AFTER_THE_FAULT.values()), ids=list(_AFTER_THE_FAULT))
+def test_a_code_after_the_fault_does_not_decide_it(body: str) -> None:
+    """The read stops at the Fault's close tag, and a self-closing Fault holds no code."""
+    assert soap._RECEIVER_RE.search(_old_fault_code(body)), "the shape must exercise the bound"
     assert _fault_code(body) == ""
     failure = _classify_soap(200, body)
     assert isinstance(failure, NegativeAckError) and failure.code == "soap-fault"
@@ -248,8 +268,9 @@ def test_random_replies_yield_the_reference_reading() -> None:
 #: line and attempt rule as tests/test_ad_group_dn_only.py.
 _MAX_LINEAR_RATIO = 8.0
 
-#: Replies shaped to make the old tails rescan: many start tags, none of them closed. The last three
-#: name neither element, so they never reached the old tails. ``long-prefixes`` is here for the
+#: Replies shaped to make the old tails rescan: many start tags, none of them closed. ``long-prefixes``,
+#: ``lt-run`` and ``long-close-prefixes`` name neither element, so they never reached the old tails;
+#: the last two reach the checks on a code element that has a close. ``long-prefixes`` is here for the
 #: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon, and
 #: ``long-close-prefixes`` for the same class in the Fault close-tag scan, ``_FAULT_END_RE``.
 #: ``lt-run`` is the shape measured in ``SoapDestination._post_and_classify``'s docstring.
@@ -262,6 +283,10 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     "lt-run": lambda k: "<Fault>" + "<" * k,
     # The Fault close-tag scan's prefix class, over close tags with no colon.
     "long-close-prefixes": lambda k: "<Fault>" + ("</" + "a." * 50) * (k // 102),
+    # A code element's own close-tag check, over one long prefix run with no colon, and its scan
+    # for a nested start tag, over a long run of comment openers.
+    "long-code-close-prefix": lambda k: "<Fault><faultcode>x</" + "a." * (k // 2),
+    "long-code-text": lambda k: "<Fault><faultcode>" + "<!x" * (k // 3) + "</faultcode>",
 }
 
 

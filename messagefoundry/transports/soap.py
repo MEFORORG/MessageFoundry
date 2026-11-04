@@ -146,7 +146,7 @@ _WSSE_FAULT_RE = re.compile(
 # NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
 # its length. _code_text finds the `>` and `</` with str.find, once, from the leftmost name, and only
-# inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE).
+# inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's end.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
 # The close tags, with the start tags' optional prefix. Literal, so tests/test_security_static.py
@@ -178,30 +178,20 @@ _ENV_OPEN = (
 )
 
 
-def _code_text(
-    name_re: re.Pattern[str], end_re: re.Pattern[str], body: str, start: int, end: int
-) -> str | None:
-    """The text from the first ``name_re`` start tag in ``body[start:end]`` to the next ``</``,
-    ``""`` when that element cannot hold a code, or ``None`` when it has no ``>`` or no ``</``.
+def _code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -> str:
+    """The text from the ``>`` of the start tag ``m`` begins to the next ``</``, before ``end``, or
+    ``""`` when there is none or the element cannot hold a code.
 
-    The capture is the one the former ``name[^>]*>(.*?)</`` DOTALL search took within those bounds.
-    Only the leftmost name match can be its answer: a later start tag's ``>`` is no earlier than this
-    one's, so if this one has no ``>`` or no ``</`` after it, no later one has either. BACKLOG #2827:
-    the element cannot hold a code when it is self-closing, when the capture holds another element's
+    The capture is the one the former ``name[^>]*>(.*?)</`` DOTALL search took. BACKLOG #2827: the
+    element cannot hold a code when it is self-closing, when the capture holds another element's
     start tag, or when the ``</`` is not ``end_re``, its own close tag. The capture would then be
     another element's text, such as ``<faultstring>Server busy`` after ``<faultcode/>``."""
-    m = name_re.search(body, start, end)
-    if m is None:
-        return None
     gt = body.find(">", m.end(), end)
-    if gt < 0:
-        return None
-    close = body.find("</", gt + 1, end)
-    if close < 0:
-        return None
+    close = -1 if gt < 0 else body.find("</", gt + 1, end)
     # Cheapest first: the scan for a nested start tag is the only check that reads the whole text.
     if (
-        body[gt - 1] == "/"
+        close < 0
+        or body[gt - 1] == "/"
         or not end_re.match(body, close, end)
         or _TAG_OPEN_RE.search(body, gt + 1, close)
     ):
@@ -212,20 +202,30 @@ def _code_text(
 def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     """The fault code text (e.g. ``soap:Client`` / ``soap:Receiver``), SOAP 1.1 or 1.2, or ``""``.
 
-    Read only inside ``fault``, the ``_FAULT_RE`` match (searched for when not given), from its start
-    tag to its close tag or the reply's end. BACKLOG #2827: a ``faultcode`` or ``Value`` in the Header,
-    or anywhere else outside the Fault, must not decide the fault's class."""
+    BACKLOG #2827: read only inside ``fault``, the ``_FAULT_RE`` match (searched for when not
+    given), from its start tag to its close tag or, with none, the reply's end, so a ``faultcode``
+    or ``Value`` outside it, in the Header say, does not decide the fault's class. A self-closing
+    Fault holds no code. The first ``faultcode`` or ``Value`` start tag in that range is the code
+    element: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may carry an
+    element of the other name. Only that first tag can be the answer: a later start tag's ``>`` is
+    no earlier than its, so if it has no ``>`` or no ``</`` after it, no later one has either."""
     if fault is None:
         fault = _FAULT_RE.search(body)
         if fault is None:
             return ""
     start = fault.end()
+    gt = body.find(">", start - 1)
+    if gt < 0 or body[gt - 1] == "/":
+        return ""
     fault_end = _FAULT_END_RE.search(body, start)
     end = len(body) if fault_end is None else fault_end.start()
-    code = _code_text(_FAULTCODE_RE, _FAULTCODE_END_RE, body, start, end)
-    if code is None:
-        code = _code_text(_CODEVALUE_RE, _CODEVALUE_END_RE, body, start, end)
-    return code or ""
+    faultcode = _FAULTCODE_RE.search(body, start, end)
+    value = _CODEVALUE_RE.search(body, start, end if faultcode is None else faultcode.start())
+    if value is not None:
+        return _code_text(value, _CODEVALUE_END_RE, body, end)
+    if faultcode is not None:
+        return _code_text(faultcode, _FAULTCODE_END_RE, body, end)
+    return ""
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:
