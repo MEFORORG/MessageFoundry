@@ -442,16 +442,120 @@ def test_the_inheritance_plan_takes_every_childs_documents_in_one_sorted_pass() 
     the opposite of the order the ingress increfs and the retention decrefs take."""
     from messagefoundry.store.store import inheritance_plan
 
+    low, high, children = _three_children()
+
+    assert inheritance_plan([high, low], children) == [(low, ["c2", "c3"]), (high, ["c1", "c2"])]
+
+
+def _three_children() -> tuple[str, str, list[tuple[str, str]]]:
+    """Two content addresses, and three children: one names the higher, one both, one the lower,
+    plus a fourth whose body carries no handle."""
     low, high = sorted(hashlib.sha256(s).hexdigest() for s in (b"one", b"two"))
     names_high = _hl7(make_doc_ref(high, "Application"))
     names_both = names_high + f"OBX|2|ED|PDF||^Application^PDF^Base64^{make_doc_ref(low, 'x')}\r"
     names_low = _hl7(make_doc_ref(low, "Application"))
+    children = [("c1", names_high), ("c2", names_both), ("c3", names_low), ("c4", _hl7("plain"))]
+    return low, high, children
 
-    plan = inheritance_plan(
-        [high, low], [("c1", names_high), ("c2", names_both), ("c3", names_low), ("c4", "x")]
-    )
 
-    assert plan == [(low, ["c2", "c3"]), (high, ["c1", "c2"])]
+async def test_postgres_links_every_child_in_one_sorted_pass() -> None:
+    """The Postgres inheritance, offline: one incref per document, by the number of children that
+    name it, in content-address order, then that document's links. A handle-free body reads
+    nothing."""
+    from messagefoundry.store.postgres import PostgresStore
+
+    low, high, children = _three_children()
+    calls: list[tuple[str, tuple]] = []
+
+    class _Conn:
+        async def fetch(self, sql: str, *args: object) -> list[dict[str, str]]:
+            calls.append(("fetch", args))
+            return [{"attachment_id": high}, {"attachment_id": low}]
+
+        async def execute(self, sql: str, *args: object) -> str:
+            assert sql.startswith("UPDATE attachment SET refcount = refcount + $1")
+            calls.append(("incref", args))
+            return "UPDATE 1"
+
+        async def executemany(self, sql: str, rows: list[tuple[str, str]]) -> None:
+            assert "inherited" in sql
+            calls.append(("link", tuple(rows)))
+
+    store = object.__new__(PostgresStore)
+    await store._inherit_attachments(_Conn(), "parent", [("c4", _hl7("plain"))])
+    assert calls == []
+
+    await store._inherit_attachments(_Conn(), "parent", children)
+
+    assert calls == [
+        ("fetch", ("parent",)),
+        ("incref", (2, low)),
+        ("link", (("c2", low), ("c3", low))),
+        ("incref", (2, high)),
+        ("link", (("c1", high), ("c2", high))),
+    ]
+
+
+@pytest.mark.parametrize("sync", [False, True], ids=["async", "sync"])
+async def test_sql_server_links_every_child_in_one_sorted_pass(sync: bool) -> None:
+    """The SQL Server inheritance and its synchronous twin, offline, in the same order as the
+    Postgres one."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    low, high, children = _three_children()
+    calls: list[tuple[str, tuple]] = []
+
+    class _Cursor:
+        def __init__(self) -> None:
+            self.last: tuple = ()
+
+        def _execute(self, sql: str, params: tuple = ()) -> None:
+            kind = "fetch" if sql.startswith("SELECT") else "incref"
+            kind = "link" if sql.startswith("INSERT") else kind
+            calls.append((kind, tuple(params)))
+            self.last = tuple(params)
+
+        def _fetchall(self) -> list[tuple[str]]:
+            return [(high,), (low,)]
+
+        def _fetchone(self) -> tuple[str]:
+            return (self.last[1],)  # the incref found the header
+
+    class _AsyncCursor(_Cursor):
+        async def execute(self, sql: str, params: tuple = ()) -> None:
+            self._execute(sql, params)
+
+        async def fetchall(self) -> list[tuple[str]]:
+            return self._fetchall()
+
+        async def fetchone(self) -> tuple[str]:
+            return self._fetchone()
+
+    class _SyncCursor(_Cursor):
+        def execute(self, sql: str, params: tuple = ()) -> None:
+            self._execute(sql, params)
+
+        def fetchall(self) -> list[tuple[str]]:
+            return self._fetchall()
+
+        def fetchone(self) -> tuple[str]:
+            return self._fetchone()
+
+    store = object.__new__(SqlServerStore)
+    if sync:
+        store._inherit_attachments_sync(_SyncCursor(), "parent", children)
+    else:
+        await store._inherit_attachments(_AsyncCursor(), "parent", children)
+
+    assert calls == [
+        ("fetch", ("parent",)),
+        ("incref", (2, low)),
+        ("link", ("c2", low)),
+        ("link", ("c3", low)),
+        ("incref", (2, high)),
+        ("link", ("c1", high)),
+        ("link", ("c2", high)),
+    ]
 
 
 async def test_several_passthrough_children_of_one_transform_each_hold_their_documents(
@@ -893,20 +997,27 @@ def test_the_detach_refuses_a_marker_its_delimiters_escape_in_the_received_text(
 
 def test_the_detach_scan_holds_one_document_value_at_a_time() -> None:
     """The caller's in-flight budget assumes the scan holds one document at a time. Each
-    ``OBX-5.5`` value the scan reads is wrapped so a weak reference sees when it is freed; at every
-    yield, with the consumer's own reference dropped, at most the yielded value is alive. A scan
-    that kept every value until it finished holds all of them at the first yield."""
+    ``OBX-5.5`` value the scan reads is wrapped so a weak reference sees when it is freed. When
+    the scan starts each read, no earlier value is alive; at every yield, with the consumer's own
+    reference dropped as the ingress loop drops it, only the yielded value is. A scan that kept
+    every value until it finished holds all of them at the first yield."""
     import weakref
 
     class _Tracked(str):
         pass
 
     live: list[weakref.ref[_Tracked]] = []
+    held_at_each_read: list[int] = []
+
+    def _alive() -> int:
+        return sum(1 for ref in live if ref() is not None)
 
     class _TrackingMessage(Message):
         def field(
             self, path: str, *, occurrence: int = 1, repetition: int | None = None
         ) -> str | None:
+            if path == "OBX-5.5":
+                held_at_each_read.append(_alive())
             value = super().field(path, occurrence=occurrence, repetition=repetition)
             if path != "OBX-5.5" or not value:
                 return value
@@ -925,9 +1036,11 @@ def test_the_detach_scan_holds_one_document_value_at_a_time() -> None:
     for document in scan:
         occurrences.append(document[0])
         del document
-        held_at_each_yield.append(sum(1 for ref in live if ref() is not None))
+        held_at_each_yield.append(_alive())
     assert occurrences == list(range(1, count + 1))
     assert max(held_at_each_yield) == 1, held_at_each_yield
+    assert len(held_at_each_read) >= 2 * count
+    assert max(held_at_each_read) == 0, held_at_each_read
 
 
 def test_the_detach_scan_cannot_be_called_without_the_received_text() -> None:

@@ -8270,6 +8270,9 @@ class RegistryRunner:
                 if ref not in refs:
                     refs.append(ref)
                 detached += 1
+                # Dropped before the scan reads the next document, so the loop holds one value at
+                # a time, as the budget assumes (BACKLOG #5099).
+                del document, verbatim_b64
             if detached == 0:
                 # An over-threshold body with no detachable document (e.g. a large non-ED message): keep
                 # it byte-identical — no attachment, no skeleton re-encode divergence, no ref to incref.

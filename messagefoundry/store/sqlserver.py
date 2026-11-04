@@ -309,6 +309,7 @@ from messagefoundry.store.store import (
     held_approval_tombstone,
     if_applied,
     inheritance_plan,
+    inheriting_children,
     judge_totp,
     load_audit_chain,
     lockout_clear,
@@ -6261,9 +6262,8 @@ class SqlServerStore:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
         SQL Server twin of :meth:`MessageStore._insert_passthrough_child`, which says what
-        ``inherits`` collects. Returns ``True`` if a child
-        was produced, ``False`` if the depth cap was breached (no child; the caller records the parent
-        ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
+        ``inherits`` collects. Returns ``True`` if a child was produced, ``False`` if the depth cap
+        was breached (no child; the caller records the parent ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
         'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
         to the parent. Idempotent re-run: the content-addressed id is pre-checked so a partial-then-
         recovered run does not double-inject. Depth is computed purely from the parent's immutable
@@ -11423,6 +11423,7 @@ class SqlServerStore:
         """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
         that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). SQL Server
         twin of :meth:`MessageStore._inherit_attachments`, which says why."""
+        children = inheriting_children(children)
         if not children:
             return
         await cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
@@ -11440,6 +11441,7 @@ class SqlServerStore:
         self, cur: Any, parent_id: str, children: Sequence[tuple[str, str]]
     ) -> None:
         """Synchronous twin of :meth:`_inherit_attachments` (ADR 0071 B5)."""
+        children = inheriting_children(children)
         if not children:
             return
         cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))

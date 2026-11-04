@@ -307,7 +307,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   row lock until commit, and the ingress increfs and the retention decrefs now take those locks in
   the same order, so an inheritance, an ingress and a purge take the documents' header locks in one
   order. SQLite needs no such order, since a write transaction there holds the database-wide write
-  lock; it shares the one-pass shape so the three backends stay twins.
+  lock; it shares the one-pass shape so the three backends stay twins, and its group commit can put
+  several handoffs, so several passes, in one transaction, which that lock makes harmless. A
+  child whose body delivery's gate would not open on is skipped before the parent's documents are
+  read, so a pass-through of a body with no handle costs no extra round trip.
   **An inherited link grants no download.** It is written with `inherited` set, and
   `attachments_for` leaves it out unless the caller asks for it, which only delivery does. So the
   download route and the message detail's attachment list read through the child exactly as

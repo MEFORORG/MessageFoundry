@@ -1037,9 +1037,10 @@ def inheritance_plan(
 ) -> list[tuple[str, list[str]]]:
     """For every content address in ``held`` that some child's body names (:func:`attachments_named`),
     the ids of the children that name it, in content-address order (BACKLOG #5099). ``children`` is
-    ``(child_id, body)`` for each child one transaction makes: a transform with several pass-through
-    Sends makes several. The caller increfs each address once, by the number of children naming
-    it, in this order, so the transaction takes each document's header lock once and in the order
+    ``(child_id, body)`` for each child one ``transform_handoff`` makes: one with several
+    pass-through Sends makes several. The caller increfs each address once, by the number of
+    children naming it, in this order. So on Postgres and SQL Server, where one transaction runs
+    one ``transform_handoff``, the transaction takes each document's header lock once, in the order
     the ingress increfs and the retention decrefs take them, however many children it makes."""
     held = list(held)
     naming: dict[str, list[str]] = {}
@@ -1047,6 +1048,15 @@ def inheritance_plan(
         for ref in attachments_named(held, body):
             naming.setdefault(ref, []).append(child_id)
     return sorted(naming.items())
+
+
+def inheriting_children(children: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The ``(child_id, body)`` pairs whose body delivery's gate
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`) would open on: only these can name a
+    document a child inherits (:func:`attachments_named`). A caller that finds none skips the read
+    of the parent's documents, so a pass-through of a body with no handle costs no extra round
+    trip in the write transaction (BACKLOG #5099)."""
+    return [(child_id, body) for child_id, body in children if _may_hold_doc_ref(body)]
 
 
 @dataclass(frozen=True)
@@ -10987,9 +10997,11 @@ class MessageStore:
         either releases only its own and ``refcount`` still equals the live linkage rows.
         :func:`attachments_named` says why only a named document is inherited. The link is written
         ``inherited``, so it serves delivery and retention but grants no download
-        (:meth:`attachments_for`). Every child one transaction makes comes in one call, the shape
-        the server backends need (:func:`inheritance_plan`); SQLite's database-wide write lock makes
-        the order moot here."""
+        (:meth:`attachments_for`). Every child one ``transform_handoff`` makes comes in one call,
+        the shape the server backends need (:func:`inheritance_plan`). Here group commit can put
+        several handoffs, so several calls, in one transaction; SQLite's database-wide write lock
+        makes the order moot, so that is harmless."""
+        children = inheriting_children(children)
         if not children:
             return
         # ORDER BY as the server backends read it; inheritance_plan sorts what it returns anyway.
@@ -12677,9 +12689,9 @@ class MessageStore:
         Returns ``True`` if a child was produced, ``False`` if the depth cap was breached (no child; the
         caller records the parent ``ERROR`` instead). A child it makes is appended to ``inherits`` as
         ``(child_id, body)``, for the caller to link to the parent's documents once every child of
-        the transaction is made (:meth:`_inherit_attachments`, BACKLOG #5099). The child is a **new, independent** message
-        (``source_type='passthrough'``, its own content-addressed id, status ``RECEIVED`` per
-        count-and-log), correlated to the parent (``correlation_id``/``correlation_root_id``/
+        the handoff is made (:meth:`_inherit_attachments`, BACKLOG #5099). The child is a **new,
+        independent** message (``source_type='passthrough'``, its own content-addressed id, status
+        ``RECEIVED`` per count-and-log), correlated to the parent (``correlation_id``/``correlation_root_id``/
         ``correlation_depth``). The PT inbound's own router worker drains the INGRESS row and re-routes
         it. Idempotent re-run: the content-addressed id is pre-checked, so a partial-then-recovered run
         does not double-inject the message. Bounds internal loops by ``correlation_depth`` (mirrors
