@@ -191,6 +191,8 @@ def test_the_reader_walks_both_tables_and_skips_the_preset() -> None:
     # The peer label names the host the egress check reads, so an operator can find the entry.
     assert "ob_oracle.example.invalid" in hops["OB_ORACLE"]
     assert "Oracle in" not in hops["OB_ORACLE"]
+    # Never the `port` setting's 1433 default: the generic string does not send it.
+    assert "1433" not in hops["OB_ORACLE"]
 
 
 def test_the_reader_reads_an_env_dialect_and_an_env_driver_as_possibly() -> None:

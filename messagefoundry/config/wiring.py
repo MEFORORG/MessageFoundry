@@ -4356,8 +4356,9 @@ def Database(
     18. ``dialect='generic'`` (#66) targets an OS-installed ODBC driver that reads ``SERVER`` as its
     target (PostgreSQL / MySQL; docs/CONNECTIONS.md, *Accepted odbc_params keywords*, says what is
     reported for a driver the engine cannot place): name it in ``odbc_driver`` and pass
-    driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``; credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
-    default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
+    driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``; credentials stay in
+    ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` — default
+    ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
     ``odbc_driver="PostgreSQL Unicode", odbc_params={"SSLmode": "verify-full"}``; ``odbc_driver``
     defaults to Microsoft's driver, which refuses ``SSLmode``) — the SQL-Server weakened-TLS refusal
     does not apply there.
@@ -4463,8 +4464,8 @@ def DatabasePoll(
     this connector already requires. Pass None/0 for the unbounded fetch.
 
     ``dialect='generic'`` (#66) polls through an OS-installed ODBC driver that reads ``SERVER`` as its
-    target (PostgreSQL / MySQL; as for ``Database``) — name it in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
-    keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
+    target (PostgreSQL / MySQL; as for ``Database``) — name it in ``odbc_driver``, pass driver
+    keywords via ``odbc_params``, and configure TLS through the driver's own keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
     A ``poll_statement`` that could write is refused: a literal one here, when declared (as
@@ -6998,7 +6999,7 @@ def server_unread_generic_db_hops(
         if driver is _UNRESOLVED and isinstance(raw_driver, EnvRef):
             reason = (
                 f"{UNRESOLVED_SERVER_DRIVER_REASON} (env({raw_driver.key})); if it names no "
-                "driver family documented to read SERVER, [egress].allowed_db may not bind this hop"
+                "driver family documented to read SERVER, the host checks on server may not bind"
             )
         elif odbc_driver_reads_server(driver):
             return None
@@ -7019,9 +7020,10 @@ def server_unread_generic_db_hops(
                 continue
             reason = unread(conn.spec.settings, deployed=conn.deployed)
             if reason is not None:
-                out.append(
-                    (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
-                )
+                # The server alone: the generic string never sends the ``port`` setting, so the
+                # label must not print its 1433 default as the endpoint.
+                peer = _peer_label({"server": conn.spec.settings.get("server")})
+                out.append((record_name(conn.name), f"{reason} ({peer})"))
     return sorted(out)
 
 

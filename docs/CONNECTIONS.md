@@ -1931,20 +1931,22 @@ these kinds:
 Two limits follow from this:
 
 - **A driver may take its target under another keyword.** The engine sends the target as `SERVER`
-  and nothing else, and `[egress].allowed_db` checks the host in `server`. A driver that takes
-  its target from another keyword dials a host that check never saw, so the check binds nothing
-  for that hop. Oracle's ODBC driver documents `DBQ` for its target, and `DBQ` is refused.
-  Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
+  and nothing else, and at least `[egress].allowed_db` and the cleartext-hop guard's on-box test
+  read the host in `server`. A driver that takes its target from another keyword dials a host
+  neither judged, so neither binds that hop: a `server` of `127.0.0.1` passes the on-box test
+  while such a driver dials elsewhere. Oracle's ODBC driver documents `DBQ` for its target, and
+  `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
   a driver reads. It places three families documented to read `SERVER`, by the registered names
   [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
-  Microsoft's `ODBC Driver <n> for SQL Server`. No driver was run to confirm it (vault BACKLOG
-  #2705), and a placed family is the documentation's claim, not proof that the check binds the
+  Microsoft's `ODBC Driver <n> for SQL Server`. No driver was run to confirm it (BACKLOG #2705),
+  and a placed family is the documentation's claim, not proof that either check binds the
   address the driver dials. For any other `odbc_driver` name, building the connection logs a
   WARNING naming the connection, not the driver, and `messagefoundry check`'s advisory
   `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
-  the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, use
-  `dialect="sqlserver"` for SQL Server, whose driver ignores `PORT` on this dialect, or reach that
-  database another way than the generic dialect.
+  the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, or
+  reach that database another way than the generic dialect. For SQL Server that is
+  `dialect="sqlserver"` with Microsoft's driver, since on the generic dialect Microsoft's driver
+  ignores `PORT`.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment

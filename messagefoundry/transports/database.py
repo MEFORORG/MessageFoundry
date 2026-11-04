@@ -11,7 +11,7 @@ parameters. The transport rides **``aioodbc``** (ADR 0003) — the ``[sqlserver]
 Driver 18, T-SQL-flavoured DSN with the ``Encrypt``/``TrustServerCertificate`` TLS posture and its
 weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised by the CI SQL Server
 job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
-any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
+an OS-installed ODBC driver that reads ``SERVER`` (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
 list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`): the list is hand-chosen, no keyword is on it in order to
 name a host, and a file keyword's value is screened separately: by its spelling, and on Windows
@@ -785,15 +785,17 @@ def _driver_family(driver: object) -> str | None:
 #: Why a generic hop's ``odbc_driver`` is reported as possibly not reading ``SERVER`` (BACKLOG
 #: #5163). The one wording the construction warning and ``messagefoundry check`` share.
 SERVER_UNREAD_REASON = (
-    "odbc_driver names no driver family documented to read SERVER as its target, so "
-    "[egress].allowed_db does not bind this hop if the driver takes its target from another keyword"
+    "odbc_driver names no driver family documented to read SERVER as its target, so the host "
+    "checks on server, at least [egress].allowed_db and the on-box test of the cleartext-hop guard, "
+    "do not bind this hop if the driver takes its target from another keyword"
 )
 #: What to do about :data:`SERVER_UNREAD_REASON`, shared by the warning and the check line.
 #: Microsoft's driver is not offered: on this dialect it ignores ``PORT``, and its own remedy is
 #: ``dialect="sqlserver"`` (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`).
 SERVER_UNREAD_REMEDY = (
-    "name psqlODBC or MySQL Connector/ODBC by its registered name, use dialect sqlserver for SQL "
-    "Server, or reach this database another way (see Generic ODBC in docs/CONNECTIONS.md)"
+    "name psqlODBC or MySQL Connector/ODBC by its registered name, use dialect sqlserver with "
+    "Microsoft's driver for SQL Server, or reach this database another way (see Generic ODBC in "
+    "docs/CONNECTIONS.md)"
 )
 
 
