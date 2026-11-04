@@ -151,6 +151,36 @@ def test_a_refused_edit_keeps_the_owner_only_mode_and_the_bytes(
     assert _leftovers(path.parent) == []
 
 
+def _connections_remove(tmp_path: Path) -> tuple[Path, Edit]:
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    return path, lambda v: connections_edit.remove_connection(tmp_path, "OB_TOML", validate=v)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [_security, _alerts, _codeset, _connections, _connections_remove],
+    ids=["security", "alert", "codeset", "conn", "conn-remove"],
+)
+def test_a_refused_edit_leaves_a_crlf_file_byte_for_byte(
+    tmp_path: Path, make: Callable[[Path], tuple[Path, Edit]]
+) -> None:
+    """Vault BACKLOG #2944 item 3: after a REFUSED toggle, the old rollback rewrote a CRLF
+    connections.toml as LF. The toggle no longer writes the file (the flag lives in the store), so
+    this pins the same guarantee on at least these file-writing entry points (not alerts
+    ``remove_rule``). No platform skip, so it runs on the Windows test legs, where CRLF is usual."""
+    path, edit = make(tmp_path)
+    # Make every line CRLF: write_text gives LF on POSIX and CRLF on Windows; the CSV writer, CRLF.
+    path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    before = path.read_bytes()
+    assert before.count(b"\r\n") == before.count(b"\n") > 0
+    # The match pins the refusal to validate time, not an earlier read or parse of the CRLF file.
+    with pytest.raises(ValueError, match="simulated load failure"):
+        edit(_refuse)
+    assert path.read_bytes() == before
+    assert _leftovers(path.parent) == []
+
+
 @posix_only
 @EDITORS
 def test_a_successful_edit_leaves_the_file_owner_only(
