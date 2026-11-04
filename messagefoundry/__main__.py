@@ -7813,6 +7813,12 @@ class _KeylessProvisionRefused(RuntimeError):
     """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
 
 
+class _ProvisionWriteOpenRefused(RuntimeError):
+    """``provision-admin``'s write open refused for its key or cipher (``StoreKeylessError`` or
+    ``CipherError``, the cause), before the write wrote anything (BACKLOG #5067). Raised for the
+    open only: the same classes from the write itself may follow a row it wrote."""
+
+
 class _UnauditableWrite(RuntimeError):
     """A command's audit row would be refused, found before its first write (BACKLOG #1916)."""
 
@@ -9057,6 +9063,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if violations:
         return _emit_error("; ".join(violations), as_json=args.json)
 
+    try:
+        # Before the key is shown, as `admin-reset-totp` names it: a shell whose OS user cannot be
+        # named fails here, not after the operator has added an entry for a seed never stored.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({exc}); refusing to provision, and "
+            "nothing was written",
+            as_json=args.json,
+        )
+
     # ADR 0197 Amendment A (N-A): the first Administrator is born with an authenticator app, so
     # option E's combined sign-in is its way past a lock anyone who knows the username can set.
     totp_secret: str | None = None
@@ -9077,8 +9094,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except _PasswordEntryRefused as exc:
             return _emit_error(str(exc), as_json=args.json)
 
-    actor = f"cli:{getpass.getuser()}"
-
     def after_the_key(text: str) -> str:
         """``text`` for a refusal of the write's open or of its keyless checks, raised before the
         write wrote anything but after the key was shown (BACKLOG #5067). It then names the entry
@@ -9093,12 +9108,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        store = await open_store(
-            settings.store,
-            create=True,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
+        try:
+            store = await open_store(
+                settings.store,
+                create=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        except (StoreKeylessError, CipherError) as exc:
+            raise _ProvisionWriteOpenRefused(type(exc).__name__) from exc
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
@@ -9190,6 +9208,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
         _emit_error(after_the_key(_provision_open_refusal(exc, settings.store)), as_json=args.json)
+        return 2
+    except _ProvisionWriteOpenRefused as exc:
+        # The pre-check's key or cipher arm, at the write's open after the key was shown: exit 2,
+        # and the shown key's entry has no seed (#5067). Printed from the cause, codec-safe.
+        cause = exc.__cause__ or exc
+        _emit_error(
+            after_the_key(_provision_open_refusal(cause, settings.store)), as_json=args.json
+        )
         return 2
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
@@ -12547,8 +12573,8 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). The schema refusal rolls the
     open's DDL batch back and writes no schema marker, and the command has written no store row,
     so it could not start, exit 2. Not "changed
-    nothing": a SQL Server open under ``auto`` may already have switched the database's RCSI
-    option on, before the batch. Its text lists the tables, columns and indexes that differ and
+    nothing": a SQL Server open under ``auto`` may already have switched database options on,
+    before the batch; :func:`_open_refusal_left_behind` names them. Its text lists the tables, columns and indexes that differ and
     the remedy, and names no row's content. ``audit-verify`` and ``audit-anchor`` open read-only,
     which runs no DDL batch and so never raises it. Only the
     OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop

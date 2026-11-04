@@ -1573,9 +1573,12 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # open only, so such a refusal is could not start rather than the CLI floor's exit 1. Not
         # an OSError that is also a ValueError, such as a CRL staging copy that failed: that is a
         # fault of the host, not a verdict on the settings, and keeps its own type. Nor an OSError
-        # alone, such as a CRL file the engine may not read, which this does not catch. The pool's
-        # per-connection rebuild calls the builder directly, so a refusal there is not typed.
-        if isinstance(exc, (InsecureHopRefused, OSError)):
+        # alone, such as a CRL file the engine may not read, which this does not catch (a pin file
+        # it may not read arrives as a ValueError naming the setting, and is typed). Nor a UnicodeError: `str()` of one names the byte it
+        # met, and wrapped in a plain message `codec_safe_str` could no longer tell it from any
+        # other text (BACKLOG #2532), so it propagates as it did before. The pool's per-connection
+        # rebuild calls the builder directly, so a refusal there is not typed.
+        if isinstance(exc, (InsecureHopRefused, OSError, UnicodeError)):
             raise
         raise StoreTlsRefused(str(exc)) from exc
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an

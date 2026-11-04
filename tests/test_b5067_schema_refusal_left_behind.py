@@ -6,8 +6,8 @@ left behind.
 Both said "nothing was written" for a server store whose live schema falls short of this build's
 DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720). The open rolls that batch back and writes
 no schema marker. But on SQL Server under ``[store].schema_management = auto`` a writable open first
-switches the database's READ_COMMITTED_SNAPSHOT option on, outside the batch, so the database may
-already have changed. Each refusal now says the batch was rolled back, and there, that the setting
+switches database options on, outside the batch (``_open_refusal_left_behind`` names them), so the
+database may already have changed. Each refusal now says the batch was rolled back, and there, that the setting
 may have changed. ``provision-admin``'s refusal at the write, after the key was shown, also says the
 entry the operator may have added has no seed, as ``admin-reset-totp`` already did. Severity is
 conditional (CLAUDE.md section 0): this is what a first deployment would have read.
@@ -191,6 +191,61 @@ def test_provision_admin_keyless_refusal_at_the_write_names_the_entry(
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "[store].synthetic_setting" in out, out
     assert _UNUSED_ENTRY in out, out
+
+
+@pytest.mark.parametrize("kind", ["keyless", "cipher"])
+def test_provision_admin_key_refusal_at_the_write_open_names_the_entry(
+    kind: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key or cipher refusal at the write's ``create=True`` open comes after the key was shown
+    and before any write: could not start, exit 2, with the pre-check's text and the entry named.
+    It escaped to the CLI floor's exit 1 with no hint.
+
+    Mutation: drop the ``_ProvisionWriteOpenRefused`` arm; the exit is then 1."""
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+
+    refusal: Exception = (
+        StoreKeylessError("table synthetic_table holds an encrypted value")
+        if kind == "keyless"
+        else CipherError("table synthetic_table holds a value no key opens")
+    )
+    _refused_at_the_write(monkeypatch, "sqlserver", refusal)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "synthetic_table" in out, out
+    assert "nothing was written" in out, out
+    assert _UNUSED_ENTRY in out, out
+    assert "Traceback" not in out, out
+
+
+def test_provision_admin_names_the_os_user_before_the_key_is_shown(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A shell whose OS user cannot be named is refused before the key is shown, so no entry is
+    left for a seed never stored. It was named after the key was shown, and an ``OSError`` there
+    escaped with no hint.
+
+    Mutation: name the OS user after ``_enrol_totp_at_terminal`` again; the enrolment then runs."""
+    from messagefoundry import __main__ as cli
+
+    _refused_at_the_write(monkeypatch, "sqlserver", _refusal("sqlserver"))
+    shown: list[object] = []
+
+    def enrol(**_k: object) -> tuple[str, str, float]:
+        shown.append(_k)
+        return ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+
+    def no_user() -> str:
+        raise OSError("no user name for this shell")
+
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    monkeypatch.setattr("getpass.getuser", no_user)
+    code = main(_provision(_settings(shell, "sqlserver", "auto")))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code != 0, out
+    assert not shown, "the key was shown before the OS user was named"
+    assert "cannot name the OS user" in out and "nothing was written" in out, out
+    assert "Traceback" not in out, out
 
 
 @pytest.mark.parametrize(("backend", "management"), _STORES)

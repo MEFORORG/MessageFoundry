@@ -2116,8 +2116,15 @@ class StoreTlsRefused(InsecureHopRefused):
     ``ValueError``, which reached the CLI's dispatch floor and exited 1, the code ``audit-verify``
     reserves for a broken chain. An :class:`InsecureHopRefused`, so every handler that already
     reports a refused store hop reports this too, and still a ``ValueError`` for every caller
-    that caught it as one. Its text is the engine's own: the setting, the pin's path and the fix,
-    never a value read from the server."""
+    that caught it as one.
+
+    Its text names the setting, the file's path and the fix, and reads no value from the server.
+    The SQL Server and weakened-hop texts are the engine's own. The PostgreSQL wrap carries the
+    context builder's ``ValueError`` text whole, which can quote the ``ssl`` or ``cryptography``
+    library's message and what was read from the operator's pin or CRL file, such as its dates. A
+    ``UnicodeError`` is never wrapped (``_build_ssl`` lets it propagate), so ``codec_safe_str``
+    still recognizes one. Print it through ``codec_safe_str``, as ``_open_store_or_refuse`` in the
+    CLI does."""
 
 
 #: The module that defines the Vault hop's marked refusal; see :func:`is_vault_hop_refusal`.
