@@ -5571,6 +5571,37 @@ step-up. So an id shown on a sessions page can go stale. The console's revoke sa
 revoked" when the id no longer matches, rather than reporting a revoke that did not happen, and
 `DELETE /me/sessions/{id}` answers 404.
 
+### A restored store brings its sessions back, and only `messagefoundry restore` records it
+
+A store restored from a backup brings back the accounts as they were when the backup was taken:
+users, password hashes, roles, second factors and sessions. **The engine records a restore only
+when `messagefoundry restore` placed a SQLite store** (BACKLOG #2614). That command ends every
+session in the store it places and writes a marker into it, and the first `serve` on that store
+ends every session again, writes one `store_restored` audit row and raises a `store_restored`
+alert. The [early-adopter guide](EARLY-ADOPTER-GUIDE.md#10-backup-restore--disaster-recovery)
+says what an operator sees.
+
+**Every other restore writes no marker, and the engine cannot tell it happened** (BACKLOG #5092).
+At least these: a PostgreSQL or SQL Server store restored with the database's own tools, such as
+`pg_restore`, point-in-time recovery or `RESTORE DATABASE`, and a SQLite store put back by copying
+its files. Neither server backend holds a marker (`consume_restore_record` returns nothing there),
+and nothing at start compares the store with an earlier state of itself. So the first `serve`
+ends no session, writes no `store_restored` row and raises no alert, and the backup's sessions
+are accepted until they expire or are revoked.
+
+**After such a restore, before the first `serve`, an operator must by hand:**
+
+- run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
+  finds, of every account, and writes one `auth.session_revoked` audit row; *Limits of the session
+  sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
+  may miss;
+- re-apply every disable, delete, role change and password or factor reset made after the backup
+  was taken, which the restore undid. The source's audit log, or its off-host copy, lists them.
+
+An audit anchor recorded after the backup was taken (`messagefoundry audit-anchor`) no longer
+matches the restored store's audit log: `audit-verify --expected-anchor` reports the difference.
+That is a check an operator runs, not one the engine runs at start.
+
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
 Users are notified of security-relevant changes to their account through **two** channels:
