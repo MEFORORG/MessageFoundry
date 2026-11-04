@@ -1482,6 +1482,12 @@ No DICOM refusal is temporary today. A DICOM object takes the binary branch, whi
 size or a declared-type mismatch; the streaming detach is HL7 only. The SCP maps the kind in step so
 that a temporary refusal, should a binary path ever produce one, is answered as one.
 
+*(Note 2026-11-04, BACKLOG #5101: "A DICOM object takes the binary branch" holds only for an SCP
+whose inbound keeps a binary `content_type` such as `dicom`. An SCP whose inbound declares a text
+type decodes the object, as the 2026-11-04 note on the 2026-11-01 note below says, so a
+configuration refusal can reach it and is answered `0xA700`. For such an SCP, "no DICOM refusal is
+temporary today" was not checked.)*
+
 `Retry-After` is 5 seconds, from the module constant `TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS` in
 [`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py). Every answer to a
 refused body is `{"error": "message was not accepted", "refused_message_id": "<id>"}`, where the id is
@@ -1667,7 +1673,9 @@ temporary and filed a separate kind as follow-up.
 
 **Why.** A temporary refusal tells a sender that the same body may be taken on a re-send soon, and
 `Http()` says so with `Retry-After`. An inbound codec name that sets up no decode is not that: it
-refuses every body, and nothing clears it but an operator editing the connection. Told to come back
+refuses every non-empty body, and nothing clears it but an operator editing the connection. (An
+empty body decodes under any name, since Python does not look the codec up for it, and is refused
+later as the body's own fault.) Told to come back
 in 5 seconds, a sender re-sends every 5 seconds and leaves one `ERROR` row each time. A final
 answer is wrong too, since the body is not at fault, and a sender that drops it loses a body the
 engine would take once the name is fixed.

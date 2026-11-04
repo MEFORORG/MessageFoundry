@@ -905,7 +905,7 @@ ingress**, after reading it, is never answered `202`. The message is still recor
   validate, so nothing is known of the body (BACKLOG #5078). Re-send the same body later. A body
   larger than the whole in-flight budget is over-size instead.
 - **`503`** with **no** `Retry-After` for a configuration refusal: the inbound's own configuration
-  refuses every body until an operator changes it, so the body is not at fault but nothing clears
+  refuses every non-empty body until an operator changes it, so the body is not at fault but nothing clears
   it soon. At least an inbound `encoding` naming no text codec is classed so (BACKLOG #2431, #5102);
   the [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) says when one can arrive. A
   sender re-sending meanwhile leaves one `ERROR` row per attempt.

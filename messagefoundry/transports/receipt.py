@@ -34,9 +34,11 @@ class RefusalKind(StrEnum):
     #: thread began the validate (BACKLOG #5078). A strict-validation timeout whose validate began
     #: is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
     TEMPORARY = "temporary"
-    #: The inbound's own configuration refuses every body alike, whatever it holds, until an
-    #: operator changes it, so the body is not at fault, yet no re-send clears it on its own
-    #: (BACKLOG #5102). At least an inbound codec name that sets up no decode (BACKLOG #2431). A
+    #: The inbound's own configuration refuses every non-empty body alike, whatever it holds, until
+    #: an operator changes it, so the body is not at fault, yet no re-send clears it on its own
+    #: (BACKLOG #5102). At least an inbound codec name that sets up no decode (BACKLOG #2431). An
+    #: empty body is not this kind: Python decodes empty bytes without looking the codec up, so it
+    #: reaches the later guards and is refused as the body's own fault. A
     #: refusal that depends on the body, such as a backend that cannot stream refusing only a body
     #: over the streaming threshold, is not this kind. Told apart from TEMPORARY so that a source
     #: whose protocol can say so, at least ``Http()``, does not invite a re-send soon for an
