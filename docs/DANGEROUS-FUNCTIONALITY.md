@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 20 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 21 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -459,12 +459,18 @@ reach one:
 
 ## 5. Native library calls
 
-20 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+21 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
+  a staging root's owner from with `kernel32`'s `CreateFileW`, with a protected access list built by
+  `advapi32` attached and `CREATE_NEW`, and reads that probe's owner, a staging root's, and its own
+  lock file's from the open handle with `advapi32`'s `GetSecurityInfo`, never by path, so a rename
+  in the staging root cannot choose the owner a sweep goes by (BACKLOG #4988). POSIX needs no
+  `ctypes` for this; it reads `fstat` of each one's open descriptor
 - Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
   the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
