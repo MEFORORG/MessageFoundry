@@ -13,8 +13,8 @@ as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress 
 no ingress row) is never answered ``202``: a temporary refusal is answered ``503`` with
 ``Retry-After``, an over-size one ``413``, and any other ``422``, each naming the ``ERROR`` row as
 ``refused_message_id`` (ADR 0154 amendments 2026-09-26 and 2026-10-30). A refusal the inbound's own
-configuration caused, an unusable codec name, is temporary: it clears once the operator fixes the
-name (BACKLOG #2431).
+configuration caused, at least an unusable codec name, is ``503`` with no ``Retry-After``: it clears
+only once an operator fixes the configuration (BACKLOG #2431, #5102; the 2026-11-04 amendment).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;

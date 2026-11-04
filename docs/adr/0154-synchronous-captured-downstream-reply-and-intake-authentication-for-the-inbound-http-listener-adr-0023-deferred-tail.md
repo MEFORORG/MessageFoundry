@@ -29,6 +29,12 @@
   answers `AR` on MLLP, and so does every streaming-detach refusal the receipt path answers as final.
   The 2026-10-30 amendment keeps its text, with a dated note in place. See
   [Amendment 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
+- **Amended 2026-11-04 (BACKLOG #5102, #5101; Manager decision d20261104T003342588-cbb49e):** an
+  operator-only fault at intake, at least an inbound codec name that sets up no decode, is a
+  **configuration** refusal: **`503` with no `Retry-After`** on `Http()`, Out of Resources
+  (`0xA700`) on the DICOM SCP, and `AE` on MLLP and TCP. The 2026-10-30 table and the 2026-11-01 note
+  keep their text, with a dated note in place. See
+  [Amendment 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
   start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
   ratified. **Both halves have since been authorised and built** — the split below is retained as the
@@ -1459,6 +1465,15 @@ sources answer it in step.
 | over the engine's ingress ceiling (a `size`-phase guard, text or binary), an HL7 body over `Peek.parse`'s `max_bytes` or over strict validation's own engine-default cap as `validate()` itself measures and reports it, and a body larger than the whole in-flight budget by itself | over-size | `413` | Cannot Understand (`0xC000`) |
 | every other refusal: at least a decode failure, a NUL or frame byte, more than one message, a declared-type mismatch, an HL7 parse failure, a strict-validation failure or timeout, a backend that cannot stream, and a malformed document handle | permanent | `422` | Cannot Understand (`0xC000`) |
 
+*(Note 2026-11-04, BACKLOG #5101: the last row does not say what the code answers for two of its
+causes. A decode failure is permanent only when the inbound's codec name is usable; an inbound
+`encoding` that sets up no decode is a configuration refusal, `503` with no `Retry-After` and Out of
+Resources (`0xA700`), per the
+[amendment of 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
+A strict-validation timeout whose validate never began is temporary, per the
+[amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
+(BACKLOG #5078). The row is kept as decided on 2026-10-30.)*
+
 A body larger than the whole in-flight budget is over-size, not temporary: it could never fit, so a
 re-send would meet the same refusal. The budget is engine-wide and `max_message_bytes` is set per
 inbound, and nothing requires the first to be at least the second.
@@ -1526,6 +1541,15 @@ with `Retry-After`, and its `ERROR` row's reason names the decode, not the in-fl
 object is never decoded, so the SCP never sees it. A decode failure in a usable charset stays
 permanent. A sender that honours `Retry-After` re-sends every 5 seconds until the name is fixed,
 leaving one `ERROR` row per attempt.)*
+
+*(Note 2026-11-04, BACKLOG #5101, #5102: two sentences of the note above no longer hold. The codec
+name is no longer temporary and no longer carries `Retry-After`: it is a configuration refusal,
+`503` with no `Retry-After`, per the
+[amendment of 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
+And "a DICOM object is never decoded" holds only for an SCP whose inbound keeps a binary
+`content_type` such as `dicom`. The receipt handler decodes any body whose inbound declares a text
+type, and nothing found in the wiring refuses one on a DICOM inbound, so such an SCP would decode
+the object and answer this refusal Out of Resources (`0xA700`).)*
 
 ## Amendment 2026-11-03: a strict-validation timeout that never began is temporary
 
@@ -1632,3 +1656,57 @@ whatever the inbound's `max_message_bytes`. `docs/HL7-VALIDATION.md` says so for
 run validates inline and never waits for a worker, so it never produces the new reason. The operator
 resend (`ingress_guards.admit_resubmission`) times its validate as before and does not yet tell the
 two causes apart.
+
+## Amendment 2026-11-04: an operator-only intake fault is a configuration refusal
+
+**Who decided.** A batch 605 Manager seat, on 2026-11-04, after an adversarial review (decision
+d20261104T003342588-cbb49e, class B), on BACKLOG #5102, which engine PR 2690 asked for. It replaces
+the batch 469 decision d20261101T081013734-e9b348, which classed the unusable codec name as
+temporary and filed a separate kind as follow-up.
+
+**Why.** A temporary refusal tells a sender that the same body may be taken on a re-send soon, and
+`Http()` says so with `Retry-After`. An inbound codec name that sets up no decode is not that: it
+refuses every body, and nothing clears it but an operator editing the connection. Told to come back
+in 5 seconds, a sender re-sends every 5 seconds and leaves one `ERROR` row each time. A final
+answer is wrong too, since the body is not at fault, and a sender that drops it loses a body the
+engine would take once the name is fixed.
+
+**The decision.** `RefusalKind.CONFIGURATION`
+([`transports/receipt.py`](../../messagefoundry/transports/receipt.py)) is a fourth kind, for a
+body the inbound's own configuration refuses. At least an `IngressCodecUnusable` decode refusal is
+classed so. One function, `_guard_refusal_kind` in
+[`pipeline/wiring_runner.py`](../../messagefoundry/pipeline/wiring_runner.py), classes an ingress
+guard for both listeners, and one mapping, `_nak_code`, turns a kind into MSA-1, the detach arm's
+included.
+
+| Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers | MLLP / TCP |
+| --- | --- | --- | --- | --- |
+| an inbound `encoding` that sets up no decode | configuration | `503` with no `Retry-After` | Out of Resources (`0xA700`) | `AE` |
+
+* **No `Retry-After`.** A `503` alone says "not now"; leaving the header out keeps any sender from
+  reading an operator fault as retry-soon. The engine's own `Rest()` outbound never read the header,
+  so on an engine-to-engine hop it retries this `503` under its `RetryPolicy` and dead-letters the
+  row after `max_attempts`, as for a temporary one.
+* **DICOM and MLLP keep the re-send class.** Neither protocol has a status that says "after an
+  operator acts", and their final classes tell a sender to drop the object or message.
+* **The row says which.** The receipt path's `ERROR` row opens `[refusal kind: configuration]`.
+* **A backend that cannot stream stays permanent.** `StreamingAttachmentsUnsupported` is also the
+  operator's choice of store, but it refuses only a body at or over the streaming threshold, and
+  that same body every time, so it stays a final `422` and `AR`, as the 2026-10-30 table classes it.
+* **A poll source still consumes its input.** The file and remote-file sources reach this refusal
+  through the generic handler, whose answer cannot say "refused", so each records the `ERROR` row
+  and moves on as for every refusal; the timer and database sources fail to build on such a name.
+  A poll source's refused input is stored whole, since it is exempt from the refused-body
+  allowance. Holding the input instead would need a receipt contract on every poll source, and
+  config load already refuses the name, so only a graph that skipped that check reaches it.
+
+**MLLP's split for a streaming-detach budget is settled.** A body alone over the whole in-flight
+budget is over-size, answered `413` on the receipt path and `AR` on MLLP, and only a budget held by
+concurrent detaches answers `503` and `AE`. The batch 604 change under the
+[amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
+built that (BACKLOG #5078); `_nak_code` now maps every final class to `AR` in one place.
+
+The tests: `tests/test_ingress_refusal_kinds.py` pins the `503` with no `Retry-After` behind a real
+listener, the classifier, the kind-to-MSA-1 mapping, and the `Rest()` outbound retrying the `503`;
+`tests/test_dicom_scp.py` pins `0xA700`; `tests/test_inbound_http_source.py` and
+`tests/test_ingress_guard_parity.py` pin the stored tag.
