@@ -967,12 +967,12 @@ DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a credential
 
 #: The outcome :meth:`AuthService._directory_roles_lost` gives an account that lost a role in the
-#: directory since sign-in (BACKLOG #2240); that method's docstring states the rule. The TOTP,
-#: passkey and enrolment legs reach it through :meth:`AuthService._directory_step_up_refusal`, for
-#: a present, enabled account, and audit it beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's
-#: own outcomes. The federated step-up leg refuses with it as its own closed-set reason (BACKLOG
-#: #2154), and so does the password re-bind, as the ``auth.reauth`` row's ``reason`` (BACKLOG
-#: #3081).
+#: directory since sign-in (BACKLOG #2240); that method's docstring states the rule, and its
+#: callers are the legs that refuse with it. Among them, at least: the legs that reach it through
+#: :meth:`AuthService._directory_step_up_refusal`, for a present, enabled account, audit it beside
+#: :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes; the federated step-up leg refuses
+#: with it as its own closed-set reason (BACKLOG #2154); and the password re-bind gives it as the
+#: ``auth.reauth`` row's ``reason`` (BACKLOG #3081).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 
 #: The outcome :meth:`AuthService._directory_roles_lost` gives, on every leg that calls it, an
@@ -984,8 +984,11 @@ DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
 
 class DirectoryRefusal(Enum):
-    """Why a step-up leg refused a directory account it never checked the proof of, carried on
-    ``Elevation.directory_refusal`` so a caller can name the fix that clears it (BACKLOG #3082).
+    """Why a step-up or enrolment leg refused a directory account on the directory's answer rather
+    than on its proof, carried on ``Elevation.directory_refusal`` so a caller can name the fix that
+    clears it (BACKLOG #3082). The legs that ask the directory before the proof never checked it;
+    the password re-bind proved the password with its bind, then refused the account for what the
+    bind returned (BACKLOG #3081).
 
     ``UNCONFIRMED``: the directory did not confirm the account is present and enabled, or could not
     be asked. A later try, or an administrator, clears it; a new sign-in would fail the same way.

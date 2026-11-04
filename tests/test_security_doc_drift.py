@@ -4331,16 +4331,20 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
         "charged to neither the lockout nor the session's re-proof budget",
         # BACKLOG #3822: the paragraph cites the role rule by the opening words of the paragraph
         # that states it, so those words must still open a paragraph.
-        "Both legs also refuse a present account that lost a role in the directory",
+        _ROLE_RULE_OPENER,
     ):
         assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
-    rule = "**Both legs also refuse a present account that lost a role in the directory"
-    assert rule in doc, "the role-rule paragraph the re-bind paragraph cites lost its opening"
+    assert f"**{_ROLE_RULE_OPENER}" in doc, (
+        "the role-rule paragraph the re-bind paragraph cites lost its opening"
+    )
 
 
 #: The opening words of the SECURITY.md paragraph that states the directory role rule. The re-bind
 #: and IdP step-up paragraphs cite the rule by these words rather than restating it (#3822).
-_ROLE_RULE_OPENER = "Both legs also refuse a present account that lost a role in the directory"
+_ROLE_RULE_OPENER = (
+    "A directory step-up or enrolment leg refuses a present account that lost a role in the "
+    "directory"
+)
 
 
 def test_the_idp_step_up_role_test_cites_the_rule_paragraph() -> None:
