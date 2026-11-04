@@ -943,12 +943,12 @@ def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monke
     staging.mkdir()
     (staging / "extracted_store.db").write_bytes(b"synthetic")
 
-    def walk_refusing(top, onerror=None, **kwargs):
-        assert onerror is not None
-        onerror(PermissionError(13, "synthetic listing refusal", str(top)))
-        return iter(())
+    def scandir_refusing(path):
+        raise PermissionError(13, "synthetic listing refusal", str(path))
 
-    monkeypatch.setattr(dr_backup, "_walk", walk_refusing)
+    # The listing both walks make: by descriptor on POSIX, and by held handle on Windows (BACKLOG
+    # #4992), which no longer goes through `_walk`.
+    monkeypatch.setattr(os, "scandir", scandir_refusing)
     unproven = dr_backup._empty_files_in_place(staging)
     assert unproven == ["mefor-verify-x/ (not listed)"]
 

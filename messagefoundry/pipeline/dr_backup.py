@@ -104,6 +104,7 @@ from messagefoundry.transports.file import (
     _Replaced,
     _Unconfined,
     _win_hold_dirs,
+    _win_lstat,
     _win_open_file,
     _win_release,
 )
@@ -1772,14 +1773,9 @@ def _fd_walk(
             os.close(fd)
 
 
-#: The walk the truncate fail-safe uses, named here so a test can refuse a listing without patching
-#: every caller's walk. POSIX walks by descriptor (:func:`_fd_walk`). Windows has no such walk, so there
-#: it goes by path and each directory's and file's final path is checked instead (see
-#: :func:`_empty_files_in_place`).
-if sys.platform == "win32":
-    _walk = os.walk
-else:
-    _walk = _fd_walk
+#: The POSIX walk the truncate fail-safe uses, named here so a test can refuse a listing without
+#: patching every caller's walk. Windows walks by held handle instead (:func:`_win_held_walk`).
+_walk = _fd_walk
 
 
 def _empty_files_in_place(staging: Path) -> list[str]:
@@ -1797,13 +1793,9 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     - POSIX: :func:`_fd_walk` hands over a descriptor per directory and opens each child directory with
       ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
-    - Windows: :func:`_win_held_walk` opens ``staging`` and each directory under it without following a
-      reparse point that names another path, and HOLDS each, so that none can be renamed, from before
-      its check until its files have been emptied (BACKLOG #4992). A directory must lie under
-      ``staging``'s final path, or it is left unwalked and reported without its name. Each file is
-      opened the same way, and must be a regular file with one link, before a reparse point that names
-      no path (a cloud, deduplicated or tiered file) is opened again so its filter serves it; that
-      second open must reach the same file, and its final path must lie under ``staging``'s too.
+    - Windows: :func:`_win_held_walk` holds each directory, and the ones above it, while it is checked,
+      listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
+      its final path must lie under ``staging``'s.
 
     What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
     unproven: list[str] = []
@@ -1859,11 +1851,13 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     hard link without opening it; the check that decides is the one on the open handle."""
     name = entry.name
     try:
-        st = (
-            os.lstat(entry)
-            if dir_fd is None
-            else os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        )
+        if dir_fd is not None:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        elif sys.platform == "win32":
+            # Not `os.lstat`, which opens a cloud, deduplicated or tiered file through its filter.
+            st = _win_lstat(entry)
+        else:
+            st = os.lstat(entry)
     except FileNotFoundError:
         return None
     except OSError:
@@ -1876,27 +1870,35 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     # the engine stages has a second link, so one here was put there by someone else.
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
-    fd = -1
     try:
         fd = _open_unfollowed(entry, dir_fd)
-        if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
-            return _OUTSIDE_REASON
-        _vet_for_truncate(fd)  # Windows ran it before any filter acted; POSIX runs it here
-        os.ftruncate(fd, 0)
     except FileNotFoundError:
         return None
-    except _HardLinked:
+    except OSError as exc:
+        return _not_truncated(name, exc)
+    try:
+        if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
+            return _OUTSIDE_REASON
+        # Checked on the handle that truncates: POSIX's only check, and on Windows the reopened
+        # handle of a file a filter serves (the handle opened as itself was checked before that).
+        _vet_for_truncate(fd)
+        os.ftruncate(fd, 0)
+    except OSError as exc:
+        return _not_truncated(name, exc)
+    finally:
+        os.close(fd)
+    return None
+
+
+def _not_truncated(name: str, exc: OSError) -> str:
+    """What the fail-safe reports for the file ``name`` it did not truncate, by why."""
+    if isinstance(exc, _HardLinked):
         return f"{name} (hard-linked, not truncated)"
-    except (_Unconfined, _Replaced):
+    if isinstance(exc, (_Unconfined, _Replaced)):
         # The name became a link or not a regular file, or the Windows reopen that lets a filter
         # serve the file reached another one. A swap, not something reached through a link.
         return f"{name} (changed while being emptied, not truncated)"
-    except OSError:
-        return name
-    finally:
-        if fd >= 0:
-            os.close(fd)
-    return None
+    return name
 
 
 def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
@@ -1909,11 +1911,9 @@ def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
     also makes an open that breaks a file lease fail rather than wait, and that file is reported.
 
     Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
-    connector's own open: as itself, refusing a link or junction there (``_Unconfined``). The file
-    must then be a regular file with one link (:func:`_vet_for_truncate`) BEFORE a reparse point
-    that names no path is opened again so its filter serves its data, so no filter recalls or
-    hydrates a file that check refuses (BACKLOG #4992). That reopen must reach the same file, or this
-    raises ``_Replaced``."""
+    connector's own open: as itself, refusing a link or junction there (``_Unconfined``), checked by
+    :func:`_vet_for_truncate` before a filter is let serve it, and refusing a reopen that reaches
+    another file (``_Replaced``)."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
@@ -1940,9 +1940,13 @@ _WIN_NAME_SURROGATE = _NAME_SURROGATE
 
 def _vet_for_truncate(fd: int) -> None:
     """Refuse, on the open file, what the fail-safe never truncates: something that is not a regular
-    file, or a file with a second link. On Windows :func:`_win_open_file` calls this on the file
-    opened as itself, before it lets a filter serve a reparse point that names no path, so a file
-    refused here is never recalled or hydrated (BACKLOG #4992)."""
+    file, or a file with a second link.
+
+    On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
+    filter serve a reparse point that names no path, and the screen before that open is
+    :func:`_win_lstat`, not ``os.lstat``. So no filter recalls or hydrates a file refused here
+    (BACKLOG #4992), except one renamed into its name between that check and the reopen, which
+    :func:`_win_open_file` then refuses only after its filter served it."""
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise _Unconfined("not a regular file")
@@ -1983,45 +1987,54 @@ def _win_unlisted(
         "DR staging: the truncate fail-safe could not open or list %s, so no file in it was "
         "emptied: %s",
         where,
-        safe_exc(exc, file_name=where.name),
+        safe_exc(exc),
     )
 
 
 def _win_held_walk(
     staging: Path, unproven: list[str], report: Callable[[str | None], None]
 ) -> Iterator[tuple[str, list[str], list[str], str]]:
-    """Windows: walk ``staging`` with :data:`_walk`, yielding ``(dirpath, dirnames, filenames,
-    inside)`` for each directory, where ``inside`` is ``staging``'s final path with a trailing
-    separator, for a prefix test.
+    """Windows: walk ``staging`` top down, as ``os.walk`` does, yielding ``(dirpath, dirnames,
+    filenames, inside)`` for each directory, where ``inside`` is ``staging``'s final path with a
+    trailing separator, for a prefix test. A caller that prunes ``dirnames`` in place prunes the walk.
 
-    Each directory is yielded only while it, every directory between it and ``staging``, and
-    ``staging`` itself are HELD open by :func:`_win_hold_dirs`: opened as themselves, refused if one
-    names another path, and shared for reading and writing but not for delete, so that none can be
-    renamed, or swapped for a junction, until the caller has opened and emptied that directory's
-    files and resumes the walk (BACKLOG #4992).
+    Each directory is HELD by :func:`_win_hold_dirs`, with every directory between it and
+    ``staging``, and ``staging`` itself: opened as themselves, refused if one names another path, and
+    shared for reading and writing but not for delete, so that none can be renamed or swapped for a
+    junction. It is held before it is checked and listed, and until the caller has emptied its files
+    and resumes the walk (BACKLOG #4992), the order :func:`_fd_walk` keeps with its descriptors.
 
     A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
     ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
     junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
     as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
-    if sys.platform != "win32":  # pragma: no cover - `_walk` is the descriptor walk off Windows
-        return
     held_root = _win_hold_root(staging, unproven)
     if held_root is None:
         return
     root, inside = held_root
-
-    def _not_listed(exc: OSError) -> None:
-        _win_unlisted(unproven, Path(exc.filename or staging), exc)
-
     try:
-        for dirpath, dirnames, filenames in _walk(staging, onerror=_not_listed):
-            held = _win_hold_below(staging, Path(dirpath), inside, unproven, report)
+        stack = [staging]
+        while stack:
+            where = stack.pop()
+            held = _win_hold_below(staging, where, inside, unproven, report)
             if held is None:
-                dirnames[:] = []
                 continue
             try:
-                yield dirpath, dirnames, filenames, inside
+                try:
+                    with os.scandir(where) as listing:
+                        entries = list(listing)
+                except OSError as exc:
+                    _win_unlisted(unproven, where, exc)
+                    continue
+                dirnames: list[str] = []
+                filenames: list[str] = []
+                for entry in entries:
+                    # Not followed: a link to a directory is listed as a file, and its lstat skips it.
+                    (dirnames if entry.is_dir(follow_symlinks=False) else filenames).append(
+                        entry.name
+                    )
+                yield os.fspath(where), dirnames, filenames, inside
+                stack.extend(where / name for name in reversed(dirnames))
             finally:
                 _win_release(held)
     finally:

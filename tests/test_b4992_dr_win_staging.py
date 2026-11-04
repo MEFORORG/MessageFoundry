@@ -22,6 +22,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -53,18 +54,23 @@ def test_a_directory_cannot_be_swapped_while_its_files_are_opened(
     check then caught it, reported as something reached through a link)."""
     staging = tmp_path / "mefor-verify-own"
     (staging / "sub").mkdir(parents=True)
+    (staging / "top.tar").write_bytes(_PLAINTEXT)
     (staging / "sub" / "inner.tar").write_bytes(_PLAINTEXT)
     # The tree a junction in place of the swapped directory would lead to.
     outside = tmp_path / "outside"
     (outside / "sub").mkdir(parents=True)
+    (outside / "top.tar").write_bytes(_OUTSIDE)
     (outside / "sub" / "inner.tar").write_bytes(_OUTSIDE)
     victim = staging / "sub" if swap == "sub" else staging
     lead = outside / "sub" if swap == "sub" else outside
+    # The root is swapped while its OWN file is opened, when no directory below it is held: a held
+    # subdirectory alone already stops a rename of the root.
+    trigger = "inner.tar" if swap == "sub" else "top.tar"
     renamed: list[bool] = []
     real_open = dr_backup._open_unfollowed
 
     def swap_then_open(entry: Path, dir_fd: int | None) -> int:
-        if not renamed:
+        if entry.name == trigger and not renamed:
             try:
                 os.rename(victim, tmp_path / "moved")
             except PermissionError:
@@ -77,9 +83,38 @@ def test_a_directory_cannot_be_swapped_while_its_files_are_opened(
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
     assert renamed == [False], "the directory could be renamed while its file was being opened"
+    assert (outside / "top.tar").read_bytes() == _OUTSIDE
     assert (outside / "sub" / "inner.tar").read_bytes() == _OUTSIDE
+    assert (staging / "top.tar").read_bytes() == b""
     assert (staging / "sub" / "inner.tar").read_bytes() == b""
     assert unproven == []
+
+
+def test_a_staged_file_is_screened_without_opening_it_through_a_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``os.lstat`` opens a cloud, deduplicated or tiered file through its filter, so the screen
+    before the open uses the file connector's as-itself stat instead.
+
+    Red before the fix: every staged file was ``os.lstat``-ed by name."""
+    staging = tmp_path / "mefor-verify-own"
+    (staging / "sub").mkdir(parents=True)
+    names = {"top.tar", "inner.db"}
+    (staging / "top.tar").write_bytes(_PLAINTEXT)
+    (staging / "sub" / "inner.db").write_bytes(_PLAINTEXT)
+    real_lstat = os.lstat
+    screened: list[str] = []
+
+    def recording(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name in names:
+            screened.append(Path(path).name)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", recording)
+    assert dr_backup._empty_files_in_place(staging) == []
+    assert screened == []
+    assert (staging / "top.tar").read_bytes() == b""
+    assert (staging / "sub" / "inner.db").read_bytes() == b""
 
 
 def test_a_cloud_file_is_checked_before_its_filter_is_let_serve_it(

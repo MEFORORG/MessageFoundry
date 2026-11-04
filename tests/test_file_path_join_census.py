@@ -685,6 +685,13 @@ SITES: dict[str, Site] = {
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_win_held_walk": Site(
+        1,
+        INTERNAL,
+        "A subdirectory name listed from a staging directory this module made, while that "
+        "directory is held; the child is then opened as itself and refused if it names another "
+        "path (BACKLOG #4992).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
         REVIEWED,

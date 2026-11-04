@@ -17,9 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -212,8 +210,8 @@ def test_a_file_swapped_for_a_symlink_after_its_check_is_not_truncated(
 def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
     tmp_path, monkeypatch
 ) -> None:
-    """The subdirectory passed the walk's link filter, then was moved away and replaced by a link
-    to a directory outside before the walk entered it."""
+    """The subdirectory was listed in the root, then was moved away and replaced by a link to a
+    directory outside while the root's own file was being emptied, before the walk entered it."""
     staging = tmp_path / "mefor-verify-planted"
     (staging / "sub").mkdir(parents=True)
     (staging / "sub" / "inner.tar").write_bytes(b"synthetic plaintext")
@@ -221,16 +219,15 @@ def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
     (outside_dir / "victim.dat").write_bytes(_OUTSIDE)
-    real_walk = dr_backup._walk
+    real_open = dr_backup._open_unfollowed
 
-    def walk_then_swap(top: Path, **kwargs: Any) -> Iterator[Any]:
-        listing = iter(real_walk(top, **kwargs))
-        yield next(listing)  # the root, whose dirnames the caller filters before resuming
-        os.rename(staging / "sub", tmp_path / "moved")
-        _link_dir(outside_dir, staging / "sub")
-        yield from listing
+    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+        if entry.name == "own.tar":  # the root's file, emptied before the walk enters `sub`
+            os.rename(staging / "sub", tmp_path / "moved")
+            _link_dir(outside_dir, staging / "sub")
+        return real_open(entry, dir_fd)
 
-    monkeypatch.setattr(dr_backup, "_walk", walk_then_swap)
+    monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
     assert (outside_dir / "victim.dat").read_bytes() == _OUTSIDE
     assert (staging / "own.tar").read_bytes() == b""
@@ -540,3 +537,19 @@ def test_a_volume_without_final_paths_empties_nothing_and_says_so(
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("fail-safe cannot run on the volume" in m for m in warnings)
     assert not any("extracted_store.db" in m for m in warnings)
+
+
+def test_a_file_that_vanishes_only_after_its_open_is_still_reported(tmp_path, monkeypatch) -> None:
+    """BACKLOG #4992: only the OPEN's "not found" means there was nothing to empty. The same error
+    from a check on the already-open file leaves that file full, so it is reported by name, and the
+    teardown does not read the directory as holding no plaintext."""
+    staging = tmp_path / "mefor-verify-own"
+    staging.mkdir()
+    (staging / "extracted_store.db").write_bytes(b"synthetic plaintext")
+
+    def gone(fd: int, length: int) -> None:
+        raise FileNotFoundError(2, "synthetic: not found after the open")
+
+    monkeypatch.setattr(os, "ftruncate", gone)
+    assert dr_backup._empty_files_in_place(staging) == ["extracted_store.db"]
+    assert (staging / "extracted_store.db").read_bytes() == b"synthetic plaintext"

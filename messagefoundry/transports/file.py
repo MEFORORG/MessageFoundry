@@ -2941,8 +2941,9 @@ def _win_open_file(
     identity compare then refuses what it reached.
 
     ``vet``, where given, is called with the descriptor of the file opened as itself, after the tag
-    check and before that second open, and raises to refuse the file. So a caller's own check on the
-    file runs before any filter can recall or hydrate it (BACKLOG #4992)."""
+    check and before that second open, and raises to refuse the file, so a file it refuses is never
+    served by its filter (BACKLOG #4992). The second open still goes by name: a file renamed into
+    that name between the two opens is served by ITS filter before the identity compare refuses it."""
     fd = _fd_for(_win_create(path, access, _SHARE_ALL, _FLAG_OPEN_REPARSE_POINT), fd_flags)
     try:
         attributes, tag = _attribute_tag(_os_handle(fd))
@@ -2957,11 +2958,31 @@ def _win_open_file(
             fd = _fd_for(_win_create(path, access, _SHARE_ALL, 0), fd_flags)
             if _file_id(os.fstat(fd)) != first:
                 raise _Replaced("not the file first opened")
-    except OSError:
+    except BaseException:  # a caller's `vet` may raise anything; never leak the handle
         if fd >= 0:
             os.close(fd)
         raise
     return fd
+
+
+def _win_lstat(path: Path) -> os.stat_result:
+    """Windows: ``os.fstat`` of the object at ``path`` opened as itself, for attributes only.
+
+    ``os.lstat`` opens a reparse point that names no path (a cloud, deduplicated or tiered file)
+    through its filter, as ``os.stat`` does. This never does, so a caller can screen such a file
+    before anything lets a filter act on it (BACKLOG #4992)."""
+    fd = _fd_for(
+        _win_create(
+            path,
+            _FILE_READ_ATTRIBUTES,
+            _SHARE_ALL,
+            _FLAG_OPEN_REPARSE_POINT | _FLAG_BACKUP_SEMANTICS,
+        )
+    )
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
 
 
 def _win_error(code: int | None = None) -> OSError:
