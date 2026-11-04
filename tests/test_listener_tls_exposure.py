@@ -154,8 +154,8 @@ def test_serve_loopback_inprocess_tls_starts(
 def test_serve_proxy_terminated_offloopback_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # AC-3: a declared TLS-terminating proxy (tls_terminated_upstream + trusted_proxies) is "revocation
-    # proven in front" — the engine terminates no TLS itself, so the gate passes without attestation.
+    # AC-3: a declared TLS-terminating proxy (tls_terminated_upstream + trusted_proxies) is exempt
+    # from the revocation gate, so it passes without attestation.
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     _mock_start(monkeypatch)

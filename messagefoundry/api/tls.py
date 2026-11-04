@@ -314,10 +314,10 @@ def plaintext_upstream_hop_off_loopback(api: ApiSettings) -> bool:
     acknowledgement that would then be refused. An operator ``tls_cert_file`` makes the hop TLS,
     so it is not refused here.
 
-    Loopback is :attr:`ApiSettings.is_loopback`, the one definition every other bind decision in
-    ``serve`` reads: the exact hosts ``127.0.0.1``, ``::1`` and ``localhost``. Any other spelling,
-    another ``127.0.0.0/8`` address and the empty host included, is refused, which is the
-    fail-closed side of the ruling.
+    Loopback is :attr:`ApiSettings.is_loopback`, the definition the exposed-bind gate reads: the
+    exact hosts ``127.0.0.1``, ``::1`` and ``localhost``. Any other spelling, another
+    ``127.0.0.0/8`` address and the empty host included, is refused. ``localhost`` is taken as a
+    name, unresolved, so a hosts file that maps it off the box is not seen here.
 
     Shared by ``serve``'s exposed-bind gate and the ``upstream-hop-ack`` leg of
     ``messagefoundry check``.

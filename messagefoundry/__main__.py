@@ -3406,7 +3406,10 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
-    from messagefoundry.api.tls import plaintext_upstream_hop_off_loopback
+    from messagefoundry.api.tls import (
+        plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_unacknowledged,
+    )
 
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
@@ -3534,9 +3537,10 @@ def _serve(args: argparse.Namespace) -> int:
 
     # --- #200 Posture-B (upstream TLS termination) fail-closed gate (ASVS 4.2.1/4.4.1, 11.6.2) ------
     # When a reverse proxy terminates TLS in front (settings.api.tls_terminated_upstream), the exposed-
-    # gate above ALLOWS the off-loopback bind unconditionally — but two properties are then UNVERIFIABLE
-    # by the engine: (a) the proxy→engine internal hop is a plaintext segment, so a rogue peer on that
-    # segment could impersonate the proxy unless the hop is authenticated; and (b) the engine terminates
+    # gate above ALLOWS the off-loopback bind once an operator certificate serves the proxy→engine hop
+    # (BACKLOG #4636 refuses a plaintext one there) — but two properties are then UNVERIFIABLE by the
+    # engine: (a) a rogue peer on the proxy→engine segment could impersonate the proxy unless the hop
+    # is authenticated; and (b) the engine terminates
     # no browser TLS, so it cannot observe the proxy's negotiated version/KEX floor (11.6.2). The engine
     # cannot inspect either, so it requires the operator to AFFIRMATIVELY DECLARE them (attestations made
     # fail-closed) before an off-loopback Posture-B bind may start under enforcement. The split is
@@ -3569,8 +3573,6 @@ def _serve(args: argparse.Namespace) -> int:
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
         # enforcing or warn: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
-
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "

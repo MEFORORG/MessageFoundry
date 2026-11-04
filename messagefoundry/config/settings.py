@@ -1754,9 +1754,10 @@ class ApiSettings(_Section):
     # trust nothing (the audit/rate-limit source IP is then the direct TCP peer). Set this ONLY to the
     # reverse proxy's address(es), or XFF spoofing returns.
     trusted_proxies: list[str] = []
-    # Declare that a reverse proxy / load balancer terminates TLS in front of the engine. Lets a
-    # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
-    # is set (so the engine knows a terminator is really in front).
+    # Declare that a reverse proxy / load balancer terminates TLS in front of the engine. Requires
+    # trusted_proxies (so the engine knows a terminator is really in front). Without tls_cert_file the
+    # proxy-to-engine hop is plaintext, and serve accepts that on a loopback bind only (BACKLOG #4636),
+    # so a non-loopback bind behind a terminator also needs tls_cert_file.
     tls_terminated_upstream: bool = False
     # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
     # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
@@ -1771,8 +1772,9 @@ class ApiSettings(_Section):
     plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
-    # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
-    # the internal network. The ENGINE cannot observe the proxy's negotiated TLS/KEX or authenticate the
+    # In Posture-B the proxy terminates browser TLS. Off loopback the proxy→engine hop then runs over
+    # the engine's own TLS (BACKLOG #4636 refuses a plaintext one there), but the engine still cannot
+    # tell its peer is the proxy. The ENGINE cannot observe the proxy's negotiated TLS/KEX or authenticate the
     # internal hop for itself, so an off-loopback Posture-B bind under enforce must not start on trust
     # alone. These are operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
     # REFUSES an off-loopback Posture-B bind under [security].enforcement=enforce unless both are
