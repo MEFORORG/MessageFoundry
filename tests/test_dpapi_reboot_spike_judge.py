@@ -326,9 +326,10 @@ SCENARIOS: dict[str, Scenario] = {
 }
 
 # Refusals that are not the key-state refusal: access denied, the RPC server unavailable, a FAIL
-# with no last error, and the invalid-parameter code the docs say tampering may also give. Each may
-# be the host rather than the key, so none may read NO. The REFUSED scenarios above are the
-# positive control that the key-state refusal still does.
+# with no last error, and invalid parameter. None names a lost key, so none may read NO. 87 is one
+# the docs say tampering may also give, but nothing here measured it as damage, so it is not read
+# as INVALID either: only 13, which the instrument's own tampered control gets, is. The REFUSED
+# scenarios above are the positive control that the key-state refusal still reads NO.
 OTHER_CODES = ("5", "1722", "0", "87")
 for _c in OTHER_CODES:
     _fail = {"user_unprotect": f"FAIL win32={_c}"}
@@ -339,6 +340,10 @@ for _c in OTHER_CODES:
     SCENARIOS[f"a3_fail_{_c}_unloaded"] = Scenario(
         _all(A3=_report("A3", **_fail)), profile="loaded_before_start=False profile=x"
     )
+# A boot-time start refused with a code that names no lost key, beside an A5 that opened.
+SCENARIOS["a4_fail_1722_a5_opened"] = Scenario(
+    _all(A4=_report("A4", user_unprotect="FAIL win32=1722"))
+)
 
 
 def _parse(stdout: str) -> dict[str, dict[str, str]]:
@@ -511,6 +516,13 @@ def test_only_the_key_state_refusal_reads_no(judged: Judged, code: str) -> None:
     # After a seen unload too: only the key refusal is the real A3 NO.
     assert _v(judged, f"a3_fail_{code}_unloaded", "A3") == "INCONCLUSIVE"
     assert "A3 NO" not in judged[f"a3_fail_{code}_unloaded"]["VERDICT"]
+
+
+def test_an_inconclusive_verdict_names_the_reboot_arms(judged: Judged) -> None:
+    # Not SURVIVES, BUT NOT AT THE BOOT-TIME START: A4's refusal names no lost key.
+    verdict = judged["a4_fail_1722_a5_opened"]["VERDICT"]
+    assert _v(judged, "a4_fail_1722_a5_opened", "VERDICT") == "INCONCLUSIVE"
+    assert "(A4 INCONCLUSIVE, A5 YES: no survival verdict reads from these)" in verdict, verdict
 
 
 def test_the_key_state_refusal_still_reads_no(judged: Judged) -> None:
@@ -705,9 +717,11 @@ def test_host_reboot_wait_and_cleanup(tmp_path: Path) -> None:
     assert "it is Saved now" in out["saved"]
 
 
-# Every Host-mode guest call is a job with a timeout. Here Invoke-Command is a stand-in that hands
-# back a real thread job, so Wait-Job, Stop-Job and Receive-Job run as written, and the rig's
-# behaviour on a hang (stop the job, revert, release the lock, name the arm) runs end to end.
+# Every Host-mode guest call is a thread job with a timeout. Here Start-GuestJob is a stand-in that
+# hands back a real thread job running a script in place of Invoke-Command -VMName, so the waiting,
+# streaming and abandoning run as written, and the rig's behaviour on a hang (stop the job without
+# waiting on it, revert, release the lock, name the arm) runs end to end. What the stand-in cannot
+# show is PowerShell Direct itself: that runs only on MEFORHV01.
 _HANG_DRIVER = (
     _lift(
         "Invoke-GuestCall",
@@ -728,13 +742,15 @@ _HANG_DRIVER = (
             "StopWaitSeconds",
             "GuestCallSeconds",
             "PreRebootSteps",
+            "AbandonedJobs",
         ),
     )
     + r"""
 $VMName = 'REVTEST01'; $Checkpoint = 'cp'
 # Loaded before Import-Module is shadowed below.
 $null = Start-ThreadJob { 1 } | Wait-Job | Remove-Job
-foreach ($k in @($GuestCallSeconds.Keys)) { $GuestCallSeconds[$k] = 2 }
+# Short, but long enough that a thread job meant to finish does so on a loaded runner.
+foreach ($k in @($GuestCallSeconds.Keys)) { $GuestCallSeconds[$k] = 5 }
 $script:log = [Collections.Generic.List[string]]::new()
 $script:calls = [Collections.Generic.List[string]]::new()
 $script:behaviour = @{}
@@ -760,41 +776,53 @@ function Start-VM { }
 function Stop-VM { $script:stops++ }
 function Restore-VMSnapshot { $script:restores++ }
 function Invoke-Judge { @{ Lines = @('DPAPI-REBOOT VERDICT: judged') } }
-function Invoke-Command {
-    param($VMName, $Credential, $FilePath, $ScriptBlock, $ArgumentList, [switch]$AsJob)
-    if (-not $AsJob) { throw 'a guest call without -AsJob' }
-    # Bound, not truthy: a lifted function has no $PSCommandPath, so FilePath arrives empty here.
-    if ($PSBoundParameters.ContainsKey('FilePath')) { $label = "step $($ArgumentList[1]) $($ArgumentList[2])".TrimEnd() }
-    elseif ($ArgumentList) { $label = 'copy' } else { $label = 'uptime' }
+function Start-GuestJob($Credential, [hashtable]$Call) {
+    # Keyed, not truthy: a lifted function has no $PSCommandPath, so FilePath arrives empty here.
+    if ($Call.ContainsKey('FilePath')) { $label = "step $($Call.ArgumentList[1]) $($Call.ArgumentList[2])".TrimEnd() }
+    elseif ($Call.ContainsKey('ArgumentList')) { $label = 'copy' } else { $label = 'uptime' }
     $script:calls.Add($label)
     switch ([string]$script:behaviour[$label]) {
-        'hang' { Start-ThreadJob { 'partial line'; Start-Sleep -Seconds 60 } }
+        # Blocked in native code, where a stop request cannot reach it: a call that waited for
+        # the stop would wait the whole 8 s.
+        'hang' { Start-ThreadJob { 'partial line'; [Threading.Thread]::Sleep(8000) } }
         'fail' { Start-ThreadJob { 'before the error'; throw 'guest boom' } }
+        # Ends Stopped with no error, as a dropped transport may.
+        'stopped' { $j = Start-ThreadJob { Start-Sleep -Seconds 30 }; Stop-Job -Job $j; $j }
         default {
             if ($label -eq 'uptime') { Start-ThreadJob { 0 } }
-            # A guest-supplied name with a path in it: only its leaf may be written.
-            elseif ($label -eq 'copy') { Start-ThreadJob { [pscustomobject]@{ Name = '..\report-A1.txt'; Bytes = [byte[]](104, 105) } } }
-            else { $l = $label; Start-ThreadJob { "ok $using:l" } }
+            # A guest-supplied name with a path in it, of which only the leaf may be written, and
+            # a file the guest could not read, which costs only itself.
+            elseif ($label -eq 'copy') {
+                Start-ThreadJob {
+                    [pscustomobject]@{ Name = '..\report-A1.txt'; Bytes = [byte[]](104, 105); Error = '' }
+                    [pscustomobject]@{ Name = 'crash-1.txt'; Bytes = $null; Error = 'in use' }
+                }
+            } else { $l = $label; Start-ThreadJob { "ok $using:l" } }
         }
     }
 }
 function Show-Run([string]$Name) {
     foreach ($line in $script:log) { "$Name log=$line" }
     "$Name calls=$($script:calls -join ',')"
-    "$Name restores=$script:restores stops=$script:stops released=$global:released jobs=$(@(Get-Job).Count)"
+    $kept = @(Get-Job | Where-Object { $script:AbandonedJobs -notcontains $_ }).Count
+    "$Name restores=$script:restores stops=$script:stops released=$global:released jobs=$kept"
     $script:log.Clear(); $script:calls.Clear(); $script:restores = 0; $script:stops = 0; $global:released = $false
 }
 
-# One call: its output, an error after output, and a hang.
+# One call: its output, an error after output, a hang, a job that ended Stopped, and no budget.
 "ok=$((Invoke-GuestCall 'cred' 'x' 10 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Report', '' }) -join ',')"
-$script:behaviour = @{ 'step Fail' = 'fail'; 'step Hang' = 'hang' }
+$script:behaviour = @{ 'step Fail' = 'fail'; 'step Hang' = 'hang'; 'step Stopped' = 'stopped' }
 $got = @()
 try { Invoke-GuestCall 'cred' 'x' 10 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Fail', '' } | ForEach-Object { $got += $_ }; 'fail=RETURNED' }
 catch { "fail=$($_.Exception.Message) got=$($got -join ',')" }
 $got = @()
 $t = [Diagnostics.Stopwatch]::StartNew()
-try { Invoke-GuestCall 'cred' 'the guest step Hang' 2 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Hang', '' } | ForEach-Object { $got += $_ }; 'hang=RETURNED' }
-catch { "hang=$($_.Exception.GetType().Name)|$($_.Exception.Message)|got=$($got -join ',')|fast=$($t.Elapsed.TotalSeconds -lt 20)|jobs=$(@(Get-Job).Count)" }
+try { Invoke-GuestCall 'cred' 'the guest step Hang' 3 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Hang', '' } | ForEach-Object { $got += $_ }; 'hang=RETURNED' }
+catch { "hang=$($_.Exception.GetType().Name)|$($_.Exception.Message)|got=$($got -join ',')|fast=$($t.Elapsed.TotalSeconds -lt 7)|kept=$(@(Get-Job | Where-Object { $script:AbandonedJobs -notcontains $_ }).Count)|abandoned=$(@($script:AbandonedJobs).Count)" }
+try { Invoke-GuestCall 'cred' 'the guest step Stopped' 10 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Stopped', '' }; 'stopped=RETURNED' }
+catch { "stopped=$($_.Exception.Message)" }
+try { Invoke-GuestCall 'cred' 'the guest step Unbudgeted' 0 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Report', '' }; 'budget=RETURNED' }
+catch { "budget=$($_.Exception.Message) calls=$($script:calls.Count)" }
 $script:calls.Clear()
 
 # A hang before the reboot, through Invoke-HostRun, so the lock release is seen.
@@ -846,16 +874,28 @@ def test_a_guest_call_returns_its_output_and_its_error(hang_lines: list[str]) ->
     assert fail == "fail=guest boom got=before the error", fail
 
 
-def test_a_hung_guest_call_is_stopped_and_named(hang_lines: list[str]) -> None:
+def test_a_hung_guest_call_is_abandoned_without_waiting_and_named(hang_lines: list[str]) -> None:
     hang = next(line for line in hang_lines if line.startswith("hang="))
-    kind, message, got, fast, jobs = hang[len("hang=") :].split("|")
+    kind, message, got, fast, kept, abandoned = hang[len("hang=") :].split("|")
     assert kind == "TimeoutException"
     # No STOP at this depth: Wait-Guest retries a hung probe, so only the rig words it as a STOP.
-    assert message == "the guest step Hang did not finish within 2 s", message
-    # The output before the hang is still returned, and the job is gone.
+    assert message == "the guest step Hang did not finish within 3 s", message
+    # The output before the hang is still returned.
     assert got == "got=partial line"
+    # Back well before the job's 8 s native block ends, so nothing waited for the stop.
     assert fast == "fast=True"
-    assert jobs == "jobs=0"
+    # The hung job is left, recorded, and no other job is.
+    assert kept == "kept=0"
+    assert abandoned == "abandoned=1"
+
+
+def test_a_job_that_ends_other_than_completed_is_a_failure(hang_lines: list[str]) -> None:
+    # Receiving from a stopped thread job raises its own error first; either way it is no success.
+    stopped = next(line for line in hang_lines if line.startswith("stopped="))
+    assert stopped != "stopped=RETURNED"
+    budget = next(line for line in hang_lines if line.startswith("budget="))
+    # Refused before any job starts, rather than read as a hang at 0 s.
+    assert budget == "budget=no timeout is set for the guest step Unbudgeted calls=4", budget
 
 
 @pytest.mark.parametrize(("run", "arm"), [("pre", "Start A2"), ("post", "Start A5")])
@@ -863,15 +903,20 @@ def test_a_hang_reverts_names_the_arm_and_skips_the_rest(
     hang_lines: list[str], run: str, arm: str
 ) -> None:
     log = _run_lines(hang_lines, run, "log")
-    stop = f"STOP     the guest step {arm} did not finish within 2 s"
-    # The run fails with the STOP line, and prints it again last.
-    assert _run_lines(hang_lines, run, "run")[0].startswith(stop)
+    stop = f"STOP     the guest step {arm} did not finish within 5 s"
+    # The run fails with the STOP line, and prints it again last. It claims no revert, which its
+    # own line reports.
+    run_error = _run_lines(hang_lines, run, "run")[0]
+    assert run_error.startswith(stop), run_error
+    assert "revert" not in run_error
     assert log[-1].startswith(stop), log[-1]
     assert any(line.startswith("FAILED: System.TimeoutException") for line in log)
     # The finally ran whole: reports copied, uninstall skipped, VM reverted, judge read.
     assert "uninstall skipped: a guest call hung" in log
     assert "REVTEST01 turned off and reverted to cp; output in" in " ".join(log)
     assert "DPAPI-REBOOT VERDICT: judged" in log
+    # The hung job is still in its native block at the revert, and the log says so.
+    assert any(line.startswith("1 hung guest call(s) still running") for line in log), log
     calls = _run_lines(hang_lines, run, "calls")[0].split(",")
     assert calls[-1] == "copy"
     assert f"step {arm}" in calls
@@ -884,8 +929,11 @@ def test_a_hang_reverts_names_the_arm_and_skips_the_rest(
 
 def test_a_hang_still_releases_the_hvtest_lock(hang_lines: list[str]) -> None:
     assert _run_lines(hang_lines, "pre", "restores")[0].split()[2] == "released=True"
-    # Only the leaf of the guest's file name is written.
+    # Only the leaf of the guest's file name is written, and a file the guest could not read is
+    # logged and costs only itself.
     assert "pre leaf=True escaped=False" in hang_lines
+    assert "could not copy crash-1.txt at the end: in use" in _run_lines(hang_lines, "pre", "log")
+    assert "could not copy crash-1.txt after A3: in use" in _run_lines(hang_lines, "post", "log")
 
 
 def test_any_stop_that_ends_the_run_is_printed_last(hang_lines: list[str]) -> None:

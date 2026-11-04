@@ -33,8 +33,8 @@
   of its own blob with one byte flipped (it must be refused, or the unprotect checks nothing). After
   A1 the administrator also tries the service's own user-scope blob (crosscheck.txt), which must be
   refused, or the blob is not bound to the service account at all. A machine-scope blob that opens
-  shows DPAPI and the file read worked in that process, so a user-scope refusal beside it is a real
-  NO and not a broken instrument.
+  shows DPAPI and the file read worked in that process, so a user-scope key-state refusal beside it
+  is a real NO and not a broken instrument.
 
   THE ARMS:
     A1  first start: protect in user scope, unprotect in the same process
@@ -63,9 +63,9 @@
   it; INCONCLUSIVE when A1 to A3 do not all open the blob (A3 counted where the unload was not
   seen; the payload's exit code is the same test); else SURVIVES when A4 and A5 both open the
   user-scope blob with every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START when A5 opens it
-  and A4 is refused; DOES NOT SURVIVE when A5 is refused with the controls held and A4 did not open
-  it; INCONCLUSIVE, A4 OPENED AND A5 DID NOT for that contradiction; and INCONCLUSIVE otherwise, A5
-  opening with A4 missing included.
+  and A4 reads NO; DOES NOT SURVIVE when A5 reads NO and A4 did not open it; INCONCLUSIVE, A4
+  OPENED AND A5 DID NOT for that contradiction; and INCONCLUSIVE otherwise, naming A4's and A5's
+  readings, A5 opening with A4 missing included. A NO here is always the key-state refusal above.
 
   THREE MODES.
     -Mode Host     On MEFORHV01, elevated, by the owner. Refuses unless REVTEST01 is Off, reverts it
@@ -75,9 +75,10 @@
                    end, pass or fail, it turns the VM off and reverts it to -Checkpoint again, and
                    reads back that it is off; where either step fails it prints a STOP line naming
                    the VM's state, which the owner then turns off and reverts by hand. Every guest
-                   call is a job with a timeout, as in hvtest's runner; a call that hangs is
-                   stopped, the run turns the VM off, reverts it, releases the hvtest lock and
-                   prints a STOP line naming the step and the arm that hung.
+                   call, its connect included, is a job with a timeout, as in hvtest's runner; a
+                   call that hangs is asked to stop without waiting on it, the run turns the VM off,
+                   reverts it, releases the hvtest lock and prints a STOP line naming the step and
+                   the arm, or the read or copy, that hung.
     -Mode Payload  Inside the VM, through the hvtest harness (entry.ps1 beside this file). Runs A1 to
                    A3. hvtest cannot reboot a VM inside a run (one PowerShell Direct session per run,
                    and every run starts by reverting the checkpoint), so A4 and A5 read NOT RUN.
@@ -840,7 +841,7 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
         elseif ($a5 -eq 'YES' -and $a4 -eq 'NO') { $overall = 'SURVIVES, BUT NOT AT THE BOOT-TIME START' }
         elseif ($a5 -eq 'NO' -and $a4 -ne 'YES') { $overall = 'DOES NOT SURVIVE' }
         elseif ($a5 -eq 'NO') { $overall = 'INCONCLUSIVE, A4 OPENED AND A5 DID NOT' }
-        else { $overall = 'INCONCLUSIVE' }
+        else { $overall = "INCONCLUSIVE (A4 $a4, A5 ${a5}: no survival verdict reads from these)" }
     }
     @{ Lines = $lines + "DPAPI-REBOOT VERDICT: $overall"; Verdicts = $v; PrePass = $prePass }
 }
@@ -898,30 +899,60 @@ $GuestCallSeconds = @{
     Copy          = 300
 }
 
+# Guest-call jobs that hung and were left running: stopping one waits on the guest, which may never
+# answer. The revert turns the VM off, which ends their connections.
+$AbandonedJobs = @()
+
+function Start-GuestJob($Credential, [hashtable]$Call) {
+    # The whole Invoke-Command runs on a thread job, the PowerShell Direct connect and the credential
+    # exchange included: Invoke-Command -AsJob makes those on the calling thread before it returns
+    # the job, so they would sit outside the timeout. The limit is raised so that abandoned jobs
+    # cannot queue new ones behind them (the default is 5).
+    Start-ThreadJob -ThrottleLimit 64 -ArgumentList $VMName, $Credential, $Call -ScriptBlock {
+        param($Vm, $Cred, $Splat)
+        Invoke-Command -VMName $Vm -Credential $Cred @Splat
+    }
+}
+
 function Invoke-GuestCall($Credential, [string]$What, [int]$Seconds, [hashtable]$Call) {
-    # Every guest call is a job, as in hvtest's runner (HvTestRunner.ps1 Invoke-RunVerb), so a guest
-    # that stops answering cannot hold the run, the VM and the hvtest lock forever. Each call opens
-    # its own PowerShell Direct connection: New-PSSession and Copy-Item -FromSession take no -AsJob,
-    # so a held session would leave the connect and the copy unbounded. Returns the call's output;
-    # throws its first error after that output, or a TimeoutException naming $What once $Seconds
-    # pass. No STOP in it: Wait-Guest takes a hung probe as one failed attempt, and only the rig,
-    # which ends the run on it, words it as a STOP.
-    $job = Invoke-Command -VMName $VMName -Credential $Credential @Call -AsJob
+    # Every guest call is a job waited on with a timeout, as in hvtest's runner (HvTestRunner.ps1
+    # Invoke-RunVerb), so a guest that stops answering cannot hold the run, the VM and the hvtest
+    # lock forever. Each call opens its own PowerShell Direct connection: New-PSSession and
+    # Copy-Item -FromSession cannot be time-bound, so a held session would leave both unbounded.
+    # Streams the call's output as it arrives; throws its first error after that output, or a
+    # TimeoutException naming $What once $Seconds pass. No STOP in it: Wait-Guest takes a hung probe
+    # as one failed attempt, and only the rig, which ends the run on it, words it as a STOP.
+    # A hung job is asked to stop without waiting (StopJobAsync), and left: Stop-Job and Remove-Job
+    # wait for it, which a guest that never answers would make forever.
+    if ($Seconds -le 0) { throw "no timeout is set for $What" }
+    $job = Start-GuestJob $Credential $Call
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $errs = New-Object System.Collections.ArrayList
+    $abandoned = $false
     try {
-        $finished = Wait-Job -Job $job -Timeout $Seconds
-        if (-not $finished) { Stop-Job -Job $job }
-        $errs = $null
-        Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable errs
-        if (-not $finished) { throw [TimeoutException]::new("$What did not finish within $Seconds s") }
-        if ($errs) { throw $errs[0] }
-        if ($job.State -eq 'Failed') { throw "$What failed: $($job.ChildJobs[0].JobStateInfo.Reason.Message)" }
+        while ($true) {
+            $left = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
+            $finished = Wait-Job -Job $job -Timeout ([Math]::Max(1, [Math]::Min(5, $left)))
+            $more = $null
+            Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable more
+            if ($more) { $errs.AddRange(@($more)) }
+            if ($finished) { break }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                $abandoned = $true
+                $script:AbandonedJobs = @($script:AbandonedJobs) + $job
+                try { $job.StopJobAsync() } catch [System.Management.Automation.PSInvalidOperationException] { Write-Log "could not ask the hung job to stop: $($_.Exception.Message)" }
+                throw [TimeoutException]::new("$What did not finish within $Seconds s")
+            }
+        }
+        if ($errs.Count) { throw $errs[0] }
+        if ($job.State -ne 'Completed') { throw "$What ended $($job.State): $($job.JobStateInfo.Reason.Message)" }
     } finally {
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        if (-not $abandoned) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
     }
 }
 
 function Invoke-Guest($Credential, [string]$GuestStep, [string]$ArmName = '') {
-    # The lines a step printed before it threw still reach the log, ahead of the error.
+    # Streamed, so the lines a step printed before it threw or hung still reach the log.
     Write-Log "----- guest step $GuestStep $ArmName -----"
     $what = "the guest step $GuestStep $ArmName".TrimEnd()
     Invoke-GuestCall $Credential $what $GuestCallSeconds[$GuestStep] @{
@@ -929,22 +960,36 @@ function Invoke-Guest($Credential, [string]$GuestStep, [string]$ArmName = '') {
     } | ForEach-Object { Write-Log ([string]$_) }
 }
 
-function Copy-GuestReports($Credential, [string]$Reports) {
-    # The reports come back as the job's output, since Copy-Item -FromSession takes no -AsJob. The
-    # name is the guest's word, so only its leaf is used.
-    $files = Invoke-GuestCall $Credential 'the copy of the reports' $GuestCallSeconds['Copy'] @{
-        ScriptBlock  = { param($Dir) foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter '*.txt' -File)) { [pscustomobject]@{ Name = $f.Name; Bytes = [IO.File]::ReadAllBytes($f.FullName) } } }
+function Copy-GuestReports($Credential, [string]$Reports, [string]$When) {
+    # The reports come back as the job's output, since Copy-Item -FromSession cannot be time-bound.
+    # One file the guest cannot read is reported and costs only itself. The name is the guest's
+    # word, so only its leaf is used, under the provider path of $Reports, since .NET resolves a
+    # relative path against the process directory rather than PowerShell's.
+    $dir = (Resolve-Path -LiteralPath $Reports).ProviderPath
+    $files = Invoke-GuestCall $Credential "the copy of the reports $When" $GuestCallSeconds['Copy'] @{
         ArgumentList = $Work
+        ScriptBlock  = {
+            param($Dir)
+            foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter '*.txt' -File)) {
+                try { [pscustomobject]@{ Name = $f.Name; Bytes = [IO.File]::ReadAllBytes($f.FullName); Error = '' } }
+                catch [System.IO.IOException] { [pscustomobject]@{ Name = $f.Name; Bytes = $null; Error = $_.Exception.Message } }
+                catch [System.UnauthorizedAccessException] { [pscustomobject]@{ Name = $f.Name; Bytes = $null; Error = $_.Exception.Message } }
+            }
+        }
     }
-    foreach ($f in @($files)) { [IO.File]::WriteAllBytes((Join-Path $Reports ([IO.Path]::GetFileName([string]$f.Name))), [byte[]]$f.Bytes) }
+    foreach ($f in @($files)) {
+        $leaf = [IO.Path]::GetFileName([string]$f.Name)
+        if ($f.Error) { Write-Log "could not copy $leaf $($When): $($f.Error)"; continue }
+        [IO.File]::WriteAllBytes((Join-Path $dir $leaf), [byte[]]$f.Bytes)
+    }
 }
 
-function Get-GuestUptimeMs($Credential) {
+function Get-GuestUptimeMs($Credential, [string]$When) {
     # The guest's tick count, which only a boot resets. The guest side is Windows PowerShell 5.1,
     # whose .NET has no Environment.TickCount64; the 32-bit count wraps negative after 24.8 days up,
     # which a guest started from the checkpoint minutes before never reaches, and a negative reading
     # is refused, never taken as a fresh boot.
-    Invoke-GuestCall $Credential 'the read of the guest uptime' $GuestCallSeconds['Uptime'] @{ ScriptBlock = { [Environment]::TickCount } }
+    Invoke-GuestCall $Credential "the read of the guest uptime $When" $GuestCallSeconds['Uptime'] @{ ScriptBlock = { [Environment]::TickCount } }
 }
 
 function Wait-Guest($Credential, $AskedAt, [int]$Seconds) {
@@ -961,7 +1006,7 @@ function Wait-Guest($Credential, $AskedAt, [int]$Seconds) {
         $beat = [string](Get-VM -Name $VMName).Heartbeat
         if ($beat -notlike 'Ok*') { Write-Log "waiting for the guest: heartbeat $beat"; Start-Sleep -Seconds 10; continue }
         try {
-            $up = [double](Get-GuestUptimeMs $Credential)
+            $up = [double](Get-GuestUptimeMs $Credential 'while waiting for the guest')
             if ($null -eq $AskedAt) { return }
             $since = ([DateTime]::UtcNow - $AskedAt).TotalMilliseconds
             if ($up -ge 0 -and $up -lt $since) { Write-Log "guest back: uptime_ms=$up, $([long]$since) ms since the reboot was asked"; return }
@@ -1072,7 +1117,7 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         $guestUp = $true
         foreach ($s in $PreRebootSteps) { Invoke-Guest $Credential $s[0] $s[1] }
         # Out before the reboot, so a guest that never comes back still leaves A1 to A3 to judge.
-        Copy-GuestReports $Credential $Reports
+        Copy-GuestReports $Credential $Reports 'after A3'
         $askedAt = [DateTime]::UtcNow
         Invoke-Guest $Credential 'Reboot' $rebootArm
         $guestUp = $false
@@ -1083,7 +1128,7 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         Invoke-Guest $Credential 'BootReport' $rebootArm
         # A5 is the demand start once boot is over, so it waits for 300 s of uptime: a failure that
         # only boot timing causes then shows at A4 alone.
-        $up = [double](Get-GuestUptimeMs $Credential)
+        $up = [double](Get-GuestUptimeMs $Credential 'before A5')
         if ($up -ge 0 -and $up -lt 300000) {
             Write-Log "waiting $([long]((300000 - $up) / 1000)) s for the guest to be 300 s up before A5"
             Start-Sleep -Milliseconds ([int](300000 - $up))
@@ -1093,7 +1138,8 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         $message = $_.Exception.Message
         if ($_.Exception -is [TimeoutException]) {
             $hung = $true
-            $stopLine = "STOP     $message, so the guest is taken as hung; its job was stopped and the run turns the VM off and reverts it"
+            # Says nothing of the revert, which has not run yet: its own line above this says how it went.
+            $stopLine = "STOP     $message, so the guest is taken as hung; its job was asked to stop and the run ended there"
         } elseif ($message.StartsWith('STOP')) { $stopLine = $message }
         # Logged here: the transcript stops in finally, before a rethrown error reaches the console.
         Write-Log "FAILED: $($_.Exception.GetType().FullName): $message"
@@ -1104,7 +1150,7 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         # guest call is time-bound, so none can keep the revert below from running.
         if ($guestUp) {
             try {
-                Copy-GuestReports $Credential $Reports
+                Copy-GuestReports $Credential $Reports 'at the end'
                 # The revert discards the install anyway; after a hang it is one more wait.
                 if ($hung) { Write-Log 'uninstall skipped: a guest call hung' } else { Invoke-Guest $Credential 'Uninstall' }
             } catch {
@@ -1115,6 +1161,8 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         }
         $endStop = Stop-AndRevert $Snap
         if ($endStop) { Write-Log $endStop } else { Write-Log "$VMName turned off and reverted to $Checkpoint; output in $OutDir" }
+        $left = @($script:AbandonedJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Stopping' })
+        if ($left.Count) { Write-Log "$($left.Count) hung guest call(s) still running; PowerShell exits once they end, which the VM being off should make prompt, else close this window" }
         # After the revert, so a judge that throws on a damaged report cannot leave the VM running.
         try { foreach ($line in (Invoke-Judge $Reports $true).Lines) { Write-Log $line } }
         catch { Write-Log "the judge failed: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
