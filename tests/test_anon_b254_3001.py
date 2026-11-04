@@ -222,7 +222,8 @@ def test_the_refused_bare_lines_are_still_refused(
 def test_a_long_run_keeps_one_entry_per_segment_id(side: Any) -> None:
     """Each report gives a bare line's position, and the tally folds it away: line 3 of one
     message and line 3 of the next are different lines, so the tally keeps one entry per segment
-    id and does not grow with the dataset or the batch."""
+    id and does not grow with the dataset or the batch. Like every other address, it counts once
+    per message, so two bare ``PV2`` lines in one message add one."""
     tally = side.leak.CoverageTally(full_coverage=True)
     reports: list[Any] = []
 
@@ -233,12 +234,13 @@ def test_a_long_run_keeps_one_entry_per_segment_id(side: Any) -> None:
     for message in (_message("PV2"), _message("EVN|A01", "PV2"), _message("PV2", "PV2")):
         side.anon.anonymize_checked(message, salt=_SALT, rules=_rules(side), on_report=add)
     assert _bare("PV2", 4) in reports[1].unmapped_fields
-    assert tally.counts[f"PV2{_NO_FIELDS}"] == 4
-    assert tally.undecided[f"PV2{_NO_FIELDS}"] == 4
+    assert {_bare("PV2", 3), _bare("PV2", 4)} <= set(reports[2].unmapped_fields)
+    assert tally.counts[f"PV2{_NO_FIELDS}"] == 3
+    assert tally.undecided[f"PV2{_NO_FIELDS}"] == 3
     assert [address for address in tally.counts if address.startswith("PV2")] == [
         f"PV2{_NO_FIELDS}"
     ]
-    assert f"PV2{_NO_FIELDS} x4" in tally.summary()
+    assert f"PV2{_NO_FIELDS} x3" in tally.summary()
 
 
 # --- parts 2 and 3: the header is one line, and its version judges every line ---------------------

@@ -169,9 +169,9 @@ UNKNOWN_SEGMENT = "(unknown segment)"
 #: same, so the line gets a coverage record. The address is the segment id, the line's 1-based
 #: position among the lines that hold something, and then this marker, as in
 #: ``PV2 at line 3 (line with no fields)`` (:func:`_bare_line_address`). The position counts no
-#: blank or whitespace-only line, so it is the same in a capture and in the output
-#: ``normalized_message`` makes of it. :class:`CoverageTally` folds the position away, so a
-#: long run keeps one entry per segment id (BACKLOG #3001).
+#: blank or whitespace-only line, so ``normalized_message`` dropping one does not move it.
+#: :class:`CoverageTally` folds the position away and counts each segment id once per
+#: message, so a long run keeps one entry per segment id (BACKLOG #3001).
 BARE_LINE = " (line with no fields)"
 
 
@@ -428,7 +428,8 @@ def unmapped_field_values(
     A bare line that passes gets one record: its segment id, its 1-based position among the lines
     of ``text`` that hold something, and :data:`BARE_LINE`, as in
     ``PV2 at line 3 (line with no fields)``, with an empty value. No rule can rewrite it, so the
-    record is there whatever ``mapped_paths`` holds, and :func:`leak_report` decides whether it counts as decided (BACKLOG #3001).
+    record is there whatever ``mapped_paths`` holds, and :func:`leak_report` decides whether it
+    counts as decided (BACKLOG #3001).
 
     A well-formed id that the header's MSH-12 version does not define, is not a Z-segment and no
     rule names is addressed as :data:`UNKNOWN_SEGMENT`: its fields are still checked, but the id
@@ -881,8 +882,9 @@ class CoverageTally:
         self.messages += 1
         # A bare line's position is folded away: line 3 of one message and line 3 of the next
         # are different lines, and the per-message report keeps the position (BACKLOG #3001).
-        self.counts.update(map(_tally_key, report.unmapped_fields))
-        self.undecided.update(map(_tally_key, report.undecided_fields))
+        # Once per message, as every other address is counted.
+        self.counts.update({_tally_key(address) for address in report.unmapped_fields})
+        self.undecided.update({_tally_key(address) for address in report.undecided_fields})
         self.blanked.update(report.blanked_fields)
         self.denylist_live = self.denylist_live and denylist_is_live(report)
 
@@ -911,8 +913,8 @@ class CoverageTally:
             # carries never reaches an operator whose caller prints its own text (BACKLOG #3004).
             text += (
                 f" An entry that ends in '{BARE_LINE.strip()}' is a line holding only that "
-                "segment id. Each report names the line by its position. It is not an overlay "
-                "key. A rule or a keep on any field of that segment decides it."
+                "segment id. It is not an overlay key. A rule or a keep on any field of that "
+                "segment decides it."
             )
         if self.refused:
             text += (

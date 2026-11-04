@@ -318,9 +318,8 @@ _OF_THEM = "{n} of them were refused before the leak-check, as the coverage line
 _WRAPPED = "QQX"
 _SHORT_HEADER = "a header line with no separator after its encoding characters"
 _BARE_NOTE = (
-    "An entry that ends in '(line with no fields)' is a line holding only that segment id. Each "
-    "report names the line by its position. It is not an overlay key. A rule or a keep on any "
-    "field of that segment decides it."
+    "An entry that ends in '(line with no fields)' is a line holding only that segment id. "
+    "It is not an overlay key. A rule or a keep on any field of that segment decides it."
 )
 
 
