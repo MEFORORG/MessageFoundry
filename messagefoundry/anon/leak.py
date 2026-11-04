@@ -139,9 +139,23 @@ UNKNOWN_SEGMENT = "(unknown segment)"
 #: What follows the segment id in the address of a bare line that passed: a line with no field
 #: separator whose whole text is an id the message's HL7 version defines or a rule names. That is
 #: a legal empty segment, but a wrapped line of free text that is exactly such an id looks the
-#: same, so the line gets a coverage record. The address holds no line position, so a long run
-#: still keeps one entry per segment id (BACKLOG #3001).
+#: same, so the line gets a coverage record. The address is the segment id, the line's 1-based
+#: position and then this marker, as in ``PV2 at line 3 (line with no fields)``
+#: (:func:`_bare_line_address`). A long run keeps one entry per segment id and line position, so
+#: the tally is bounded by the longest message, never by the size of the dataset (BACKLOG #3001).
 BARE_LINE = " (line with no fields)"
+
+
+def _bare_line_address(seg_id: str, line: int) -> str:
+    """The coverage address of a bare ``seg_id`` line that passed, at 1-based ``line``."""
+    return f"{seg_id} at line {line}{BARE_LINE}"
+
+
+def _is_bare_line(address: str) -> bool:
+    """True for a :func:`_bare_line_address`. No other address ends in :data:`BARE_LINE`: a
+    field address ends in its field number."""
+    return address.endswith(BARE_LINE)
+
 
 #: The segment ids each HL7 v2 version defines, as (version, ids added, ids removed) from the version
 #: before. Derived from hl7apy's tables and checked against them by ``tests/test_anon_core.py``; held
@@ -357,9 +371,11 @@ def unmapped_field_values(
 
     The MSH control header is skipped whole: it carries routing/site data the field-anchored
     site-code pass already covers, not patient PHI. The header is the ONE line
-    ``read_message_seps`` takes the separators from, and no other. An ``MSH`` line ahead of it is
-    not the header: it is walked, and refused whatever it holds, where one after the header is
-    refused only when it is bare or short. Every line,
+    ``read_message_seps`` takes the separators from, and no other. A header with fewer than
+    :data:`_HEADER_MIN_FIELDS` split fields, such as a lone ``MSH|^~\\&``, is not skipped: it holds
+    no version to judge the other lines by, so it is refused (BACKLOG #3001). An ``MSH`` line
+    ahead of it is not the header: it is walked, and refused whatever it holds, where one after
+    the header is refused only when it is bare or short. Every line,
     whichever side of the header it sits on, is judged against the header's own MSH-12 version
     (BACKLOG #3001). A later MSH line is checked. It, and every ``BHS`` and ``FHS`` line, is
     numbered the header way: field N sits at split index N-1, because field 1 is the separator
@@ -375,8 +391,9 @@ def unmapped_field_values(
     :func:`structural_phi_hits` refuses such a line outright. A line holding only whitespace or
     control characters (NUL padding, a trailing SUB) carries nothing and is skipped.
 
-    A bare line that passes gets one record: its segment id followed by :data:`BARE_LINE`, with
-    an empty value. No rule can rewrite it, so the record is there whatever ``mapped_paths``
+    A bare line that passes gets one record: its segment id, its 1-based line number in ``text``
+    and :data:`BARE_LINE`, as in ``PV2 at line 3 (line with no fields)``, with an empty value. No
+    rule can rewrite it, so the record is there whatever ``mapped_paths``
     holds, and :func:`leak_report` decides whether it counts as decided (BACKLOG #3001).
 
     A well-formed id that the header's MSH-12 version does not define, is not a Z-segment and no
@@ -421,8 +438,10 @@ def _walk(
         is_msh = seg_id.upper() == "MSH"
         # A header whose separator is a letter of its own id does not split to an MSH id. It is
         # not skipped, and the check below refuses it, as it did before the header was found
-        # by line.
-        if n == header_at and is_msh:
+        # by line. Nor is a header below _HEADER_MIN_FIELDS (a lone ``MSH|^~\&``): it holds no
+        # MSH-12 to read a version from, so every line would be judged against EVERY version's
+        # ids. The check below refuses it (BACKLOG #3001).
+        if n == header_at and is_msh and len(fields) >= _HEADER_MIN_FIELDS:
             continue
         # One address per split index; None for a field the check does not judge.
         addresses: list[str | None]
@@ -435,7 +454,7 @@ def _walk(
         elif len(fields) == 1:
             # A bare id that passed is in ``nameable``, so it is safe to print. The value is
             # empty: the id is all the line holds, and an empty value trips no detector.
-            out.append((f"{seg_id}{BARE_LINE}", ""))
+            out.append((_bare_line_address(seg_id, n + 1), ""))
             continue
         else:
             named = seg_id if seg_id in nameable or seg_id.startswith("Z") else UNKNOWN_SEGMENT
@@ -687,7 +706,7 @@ def leak_report(
         decided = {r.path for r in rules}
         # A bare line has no field a rule could name, so a rule or a keep on ANY field of its
         # segment decides it (BACKLOG #3001).
-        decided_bare = {f"{path.split('-', 1)[0]}{BARE_LINE}" for path in decided}
+        decided_segments = {path.split("-", 1)[0] for path in decided}
         parsed = read_message_seps(text)
         seps = parsed[0] if parsed is not None else Seps()
         undecided = tuple(
@@ -695,7 +714,8 @@ def leak_report(
                 {
                     address
                     for address, value in unmapped_field_values(text, decided, version=version)
-                    if address not in decided_bare and not _decided_by_shape(address, value, seps)
+                    if not (_is_bare_line(address) and address.split(" ", 1)[0] in decided_segments)
+                    and not _decided_by_shape(address, value, seps)
                 }
             )
         )
@@ -767,7 +787,7 @@ def refusal_advice(
         steps.append(RETARGET_ADVICE)
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
-        if any(address.endswith(BARE_LINE) for address in report.undecided_fields):
+        if any(_is_bare_line(address) for address in report.undecided_fields):
             steps.append(
                 "For a line with no fields, add a rule or a keep for any field of that segment."
             )
@@ -833,13 +853,13 @@ class CoverageTally:
             text += (
                 f" Date fields emptied because the value was not a timestamp it could keep: {gone}."
             )
-        if any(address.endswith(BARE_LINE) for address in self.counts):
+        if any(_is_bare_line(address) for address in self.counts):
             # The entry reads like a field address and is not one, and the advice a LeakError
             # carries never reaches an operator whose caller prints its own text (BACKLOG #3004).
             text += (
                 f" An entry that ends in '{BARE_LINE.strip()}' is a line holding only that "
-                "segment id. It is not an overlay key. A rule or a keep on any field of that "
-                "segment decides it."
+                "segment id, at the line number it gives. It is not an overlay key. A rule or a "
+                "keep on any field of that segment decides it."
             )
         if self.refused:
             text += (

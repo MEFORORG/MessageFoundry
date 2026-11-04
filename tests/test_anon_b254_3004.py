@@ -262,7 +262,7 @@ def test_a_direct_leak_report_takes_the_version(side: Any) -> None:
     ]
     report = side.leak.leak_report(older, rules=rules, version="2.7")
     assert report.structural_hits == []
-    assert "PRT (line with no fields)" in report.unmapped_fields
+    assert "PRT at line 3 (line with no fields)" in report.unmapped_fields
 
 
 @pytest.mark.parametrize("index", _REFUSING_SALTS)
@@ -318,8 +318,9 @@ _OF_THEM = "{n} of them were refused before the leak-check, as the coverage line
 _WRAPPED = "QQX"
 _SHORT_HEADER = "a header line with no separator after its encoding characters"
 _BARE_NOTE = (
-    "An entry that ends in '(line with no fields)' is a line holding only that segment id. "
-    "It is not an overlay key. A rule or a keep on any field of that segment decides it."
+    "An entry that ends in '(line with no fields)' is a line holding only that segment id, at "
+    "the line number it gives. It is not an overlay key. A rule or a keep on any field of that "
+    "segment decides it."
 )
 
 
@@ -419,7 +420,7 @@ def test_the_tee_says_what_a_bare_line_entry_is(
     prints its own text. The summary lists the entry, so the summary explains it."""
     code, text, _ = run_tee(_message("PV2"))
     assert code == 0
-    assert "PV2 (line with no fields) x1" in text
+    assert "PV2 at line 3 (line with no fields) x1" in text
     assert _BARE_NOTE in text
 
 
@@ -438,7 +439,7 @@ def test_the_tally_explains_a_bare_line_entry_only_when_it_lists_one(side: Any) 
     plain.add(report("ZPD-1"))
     assert _BARE_NOTE not in plain.summary()
     bare = side.leak.CoverageTally()
-    bare.add(report("ZPD-1", "PV2 (line with no fields)"))
+    bare.add(report("ZPD-1", "PV2 at line 3 (line with no fields)"))
     assert _BARE_NOTE in bare.summary()
 
 

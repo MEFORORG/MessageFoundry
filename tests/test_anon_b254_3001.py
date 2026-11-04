@@ -47,6 +47,11 @@ _TEE = SimpleNamespace(anon=tee_anon, rules=tee_rules, leak=tee_leak)
 _SIDES = pytest.mark.parametrize("side", (_ENGINE, _TEE), ids=("engine", "tee"))
 
 
+def _bare(seg: str, line: int) -> str:
+    """The coverage address of a bare ``seg`` line that passed, at 1-based ``line``."""
+    return f"{seg} at line {line}{_NO_FIELDS}"
+
+
 def _msh(version: str, seg: str = "MSH") -> str:
     return rf"{seg}|^~\&|APP|FAC|RCV|RFAC|20260101120000||ADT^A01|M1|P|{version}"
 
@@ -93,25 +98,38 @@ def test_a_passed_bare_line_gets_a_coverage_record(side: Any) -> None:
     report names it. Before the fix both lists came back without it."""
     out, report = _checked(side, _message("PV2"), _rules(side))
     assert out.split("\r")[-1] == "PV2"
-    assert f"PV2{_NO_FIELDS}" in report.unmapped_fields
-    assert f"PV2{_NO_FIELDS}" in report.undecided_fields
+    assert _bare("PV2", 3) in report.unmapped_fields
+    assert _bare("PV2", 3) in report.undecided_fields
     assert report.structural_hits == []
 
 
+@pytest.mark.parametrize(
+    ("lines", "positions"),
+    (
+        (("PV2",), (3,)),
+        (("PV2", "EVN|A01"), (3,)),
+        (("EVN|A01", "PV2", "PV2"), (4, 5)),
+    ),
+    ids=("last", "before-a-segment", "two-lines"),
+)
 @_SIDES
-def test_the_record_holds_no_value_and_no_position(side: Any) -> None:
-    """The record is the id and the marker, with an empty value, wherever the line sits. It is
-    not the malformed-line address, so the message is not refused as unreachable."""
-    for message in (_message("PV2"), _message("PV2", "EVN|A01"), _message("EVN|A01", "PV2", "PV2")):
-        records = [
-            pair
-            for pair in side.leak.unmapped_field_values(message, set())
-            if pair[0].startswith("PV2")
-        ]
-        assert set(records) == {(f"PV2{_NO_FIELDS}", "")}
-        assert side.leak.has_unreachable_line(message) is False
-        mapped = {rule.path for rule in side.rules.DEFAULT_RULES}
-        assert side.leak.structural_phi_hits(message, mapped) == []
+def test_the_record_holds_the_line_position_and_no_value(
+    side: Any, lines: tuple[str, ...], positions: tuple[int, ...]
+) -> None:
+    """The record is the id, the line's 1-based position and the marker, with an empty value.
+    Before step 2 of the row it held the id alone, so two bare ``PV2`` lines left one record and
+    neither said where it sat. It is not the malformed-line address, so the message is not
+    refused as unreachable."""
+    message = _message(*lines)
+    records = [
+        pair
+        for pair in side.leak.unmapped_field_values(message, set())
+        if pair[0].startswith("PV2")
+    ]
+    assert records == [(_bare("PV2", n), "") for n in positions]
+    assert side.leak.has_unreachable_line(message) is False
+    mapped = {rule.path for rule in side.rules.DEFAULT_RULES}
+    assert side.leak.structural_phi_hits(message, mapped) == []
 
 
 @_NO_SCANNER
@@ -124,7 +142,7 @@ def test_full_coverage_refuses_an_undecided_bare_line(side: Any) -> None:
     with pytest.raises(side.anon.LeakError) as exc:
         _checked(side, message, _rules(side), require_full_coverage=True)
     text = str(exc.value)
-    assert f"1 field(s) with no rule and no keep: PV2{_NO_FIELDS}" in text
+    assert f"1 field(s) with no rule and no keep: {_bare('PV2', 3)}" in text
     assert _ADVICE in text
 
 
@@ -147,7 +165,7 @@ def test_a_rule_or_keep_on_any_field_of_the_segment_decides_it(side: Any, kind: 
     _, report = _checked(
         side, _message("PV2"), _rules(side, ("PV2-3", kind)), require_full_coverage=True
     )
-    assert f"PV2{_NO_FIELDS}" in report.unmapped_fields
+    assert _bare("PV2", 3) in report.unmapped_fields
     assert report.undecided_fields == ()
 
 
@@ -155,7 +173,7 @@ def test_a_rule_or_keep_on_any_field_of_the_segment_decides_it(side: Any, kind: 
 @_SIDES
 def test_a_rule_on_another_segment_does_not_decide_it(side: Any) -> None:
     """The control for the case above: the deciding rule must name the bare line's own segment."""
-    with pytest.raises(side.anon.LeakError, match="PV2 .line with no fields."):
+    with pytest.raises(side.anon.LeakError, match="PV2 at line 3 .line with no fields."):
         _checked(side, _message("PV2"), _rules(side, ("EVN-3", "keep")), require_full_coverage=True)
 
 
@@ -168,7 +186,7 @@ def test_a_bare_z_id_a_rule_names_gets_a_record_and_is_decided(side: Any) -> Non
         side, _message("ZPD"), _rules(side, ("ZPD-3", "drop")), require_full_coverage=True
     )
     assert out.split("\r")[-1] == "ZPD"
-    assert f"ZPD{_NO_FIELDS}" in report.unmapped_fields
+    assert _bare("ZPD", 3) in report.unmapped_fields
     assert report.undecided_fields == ()
 
 
@@ -201,17 +219,20 @@ def test_the_refused_bare_lines_are_still_refused(
 
 @_NO_SCANNER
 @_SIDES
-def test_a_long_run_keeps_one_entry_per_segment_id(side: Any) -> None:
-    """The address holds no line position, so the tally does not grow with the dataset."""
+def test_a_long_run_keeps_one_entry_per_segment_id_and_line(side: Any) -> None:
+    """The address holds the segment id and the line position and nothing else, so the tally is
+    bounded by the longest message, not by the number of messages."""
     tally = side.leak.CoverageTally(full_coverage=True)
     for message in (_message("PV2"), _message("EVN|A01", "PV2"), _message("PV2", "PV2")):
         side.anon.anonymize_checked(message, salt=_SALT, rules=_rules(side), on_report=tally.add)
-    assert tally.counts[f"PV2{_NO_FIELDS}"] == 3
-    assert tally.undecided[f"PV2{_NO_FIELDS}"] == 3
-    assert [address for address in tally.counts if address.startswith("PV2")] == [
-        f"PV2{_NO_FIELDS}"
+    assert tally.counts[_bare("PV2", 3)] == 2
+    assert tally.counts[_bare("PV2", 4)] == 2
+    assert tally.undecided[_bare("PV2", 3)] == 2
+    assert sorted(address for address in tally.counts if address.startswith("PV2")) == [
+        _bare("PV2", 3),
+        _bare("PV2", 4),
     ]
-    assert f"PV2{_NO_FIELDS} x3" in tally.summary()
+    assert f"{_bare('PV2', 3)} x2" in tally.summary()
 
 
 # --- parts 2 and 3: the header is one line, and its version judges every line ---------------------
@@ -246,7 +267,7 @@ def test_the_tee_passes_a_leading_bare_id_of_its_own_version_with_a_record() -> 
     legal empty segment of that version. It passes, and it gets its record."""
     out, report = _checked(_TEE, _leading("SFT", version="2.5"), _rules(_TEE))
     assert out.split("\r")[0] == "SFT"
-    assert f"SFT{_NO_FIELDS}" in report.unmapped_fields
+    assert _bare("SFT", 1) in report.unmapped_fields
 
 
 @pytest.mark.parametrize("leading", ("MSH", "msh", "SFT", "MSH|x"))
@@ -267,7 +288,7 @@ def test_the_walk_passes_a_leading_bare_id_of_the_messages_own_version(side: Any
     it is not a line the walk refuses."""
     message = _leading("PV2", version="2.3")
     assert side.leak.has_unreachable_line(message) is False
-    assert side.leak.unmapped_field_values(message, set())[0] == (f"PV2{_NO_FIELDS}", "")
+    assert side.leak.unmapped_field_values(message, set())[0] == (_bare("PV2", 1), "")
 
 
 @pytest.mark.parametrize("leading", ("MSH|a|b", "MSH|^~|x", "msh|a|b"))
@@ -307,7 +328,49 @@ def test_a_header_not_in_capitals_is_still_the_header(side: Any) -> None:
     encoding characters, so that line is the header, and its version still judges a bare id."""
     lower = "\r".join((_msh("2.3", seg="msh"), _PID, "PV2"))
     addresses = [address for address, _ in side.leak.unmapped_field_values(lower, set())]
-    assert f"PV2{_NO_FIELDS}" in addresses
+    assert _bare("PV2", 3) in addresses
     assert not any(address.startswith(("MSH-", "(")) for address in addresses)
     later = "\r".join((_msh("2.3", seg="msh"), _PID, "SFT"))
     assert side.leak.has_unreachable_line(later) is True
+
+
+# --- step 3 of the row: a header too short to hold a version is refused ----------------------------
+
+#: A header line with its encoding characters and nothing after them. It holds no MSH-12.
+_SHORT_MSH = r"MSH|^~\&"
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "\r".join((_SHORT_MSH, _PID, "SFT")),  # a bare id only 2.5 on defines
+        "\r".join((_SHORT_MSH, _PID, "PV2")),  # a bare id every version since 2.2 defines
+        "\r".join((_SHORT_MSH, _PID)),
+        _SHORT_MSH,
+        "\r".join((_SHORT_MSH.lower(), _PID)),
+        "\r".join((_SHORT_MSH, _msh("2.3"), _PID, "SFT")),  # a real header behind it
+    ),
+    ids=("later-id", "defined-id", "no-bare-line", "alone", "lowercase", "real-header-behind"),
+)
+@_SIDES
+def test_a_header_too_short_to_hold_a_version_is_refused(side: Any, message: str) -> None:
+    """The reproduction for step 3. ``MSH|^~\\&`` is the line the separators come from, so it was
+    the header, and the walk skipped it without the three-field floor every other header line
+    gets. Its version read as empty, so a bare ``SFT`` behind it was judged against the ids of
+    EVERY HL7 version and emitted, on both anonymizers. No version can be read from it, so it
+    is refused instead."""
+    with pytest.raises(side.anon.AnonError, match="no rule can reach"):
+        side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
+    assert side.leak.has_unreachable_line(message) is True
+    addresses = [address for address, _ in side.leak.unmapped_field_values(message, set())]
+    assert addresses[0] == "(malformed segment)-0"
+
+
+@_SIDES
+def test_a_three_field_header_is_still_the_header(side: Any) -> None:
+    """The control for the case above: one more separator puts the header at the floor, so it
+    is skipped as a header, and a bare ``PV2`` behind it passes with its record."""
+    message = "\r".join((f"{_SHORT_MSH}|", _PID, "PV2"))
+    assert side.leak.has_unreachable_line(message) is False
+    assert side.leak.unmapped_field_values(message, set())[-1] == (_bare("PV2", 3), "")
+    side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
