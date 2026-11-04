@@ -144,10 +144,14 @@ The SCP will not start, and refuses each connection, while pynetdicom's process-
 temporary file in plaintext, outside the store.
 
 The abort changes what a sender of a large object sees. `0xC010` is a final refusal, which a sender
-does not retry. A failed association reads as transient, and this engine's own C-STORE client
-retries one at the head of its lane, so a sender whose own cap is above twice this SCP's would
-retry such an object for as long as it is sent. The engine's client defaults to 128 MiB. Clamping
-the client to a peer's limit is separate work, not built here.
+does not retry. A failed association reads as transient, and a sender whose own cap is above twice
+this SCP's would retry such an object for as long as it is sent. This engine's own C-STORE client
+defaults to 32 MiB, twice the 16 MiB ingress ceiling, so at its default no engine SCP left at its
+own default aborts an object it sends for the object's size (vault BACKLOG #4908). With that cap raised or removed, an
+object over 32 MiB that ends with no response three times in a row is dead-lettered as final,
+whatever the retry policy. An engine SCP whose `max_object_bytes` was set lower aborts smaller
+objects, and the client still re-sends those; set the client's `max_object_bytes` to that SCP's
+limit. [CONNECTIONS.md](CONNECTIONS.md), the outbound `DICOM(...)` section, states the client's rule.
 
 **A peer that stalls before its request is complete does not use up `max_associations`.** It never
 gets an association, so with `max_associations=2` and three stalled peers held, a real sender is
@@ -222,6 +226,8 @@ association runs **off the loop**; the C-STORE status is classified onto the eng
 
 - **Success** (`0x0000`) / **Warning** (`0xB0xx`, stored with a caveat) → delivered.
 - **Out of Resources** (`0xA7xx`) or an association/transport failure → **transient** `DeliveryError` (retried).
+  One bound: an object over 32 MiB whose store ends with no response three times in a row is **permanent**
+  (vault BACKLOG #4908; the inbound SCP subsection above says why).
 - A **rejected presentation context**, an **unencodable dataset**, or any **hard refusal** (Cannot Understand,
   dataset-mismatch, Not Authorized, SOP-class-unsupported) → **permanent** `NegativeAckError` → dead-letter
   (a deterministic failure never head-blocks the FIFO lane).

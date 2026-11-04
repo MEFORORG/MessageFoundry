@@ -680,6 +680,55 @@ def test_generic_verifying_keyword_is_not_gated() -> None:
         assert DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "verify-full"}))
 
 
+@pytest.mark.parametrize(
+    ("driver", "params"),
+    [
+        # BACKLOG #5053: psqlODBC has no Encrypt keyword, so this set no TLS at all.
+        ("PostgreSQL Unicode", {"Encrypt": "yes"}),
+        ("MySQL ODBC 8.0 Unicode Driver", {"Encrypt": "yes"}),
+        # BACKLOG #5053, #5029: a name the engine cannot place, so no keyword counts.
+        ("/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so", {"SSLmode": "verify-full"}),
+        ("MySQL", {"SSLmode": "verify-full"}),
+    ],
+)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_mode_the_driver_family_does_not_read_is_refused(
+    driver: str,
+    params: dict[str, str],
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+) -> None:
+    """Red on the previous head, which cleared each of these on any driver name. The engine counts
+    a mode only on the keyword and spelling the named family reads. The attestation is the control:
+    it still allows the hop, so the refusal is the classifier's and nothing else."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(odbc_driver=driver, odbc_params=params))
+    attested = config(
+        odbc_driver=driver,
+        odbc_params=params,
+        tls_hop_attested=True,
+        tls_hop_attested_reason="mesh sidecar mTLS",
+    )
+    with active_hop_posture(PROD_PHI):
+        assert connector(attested)
+
+
+@pytest.mark.parametrize(
+    ("driver", "params"),
+    [
+        ("MySQL ODBC 8.0 Unicode Driver", {"SSLMODE": "VERIFY_IDENTITY"}),
+        ("ODBC Driver 18 for SQL Server", {"Encrypt": "yes"}),
+        ("PostgreSQL", {"SSLmode": "verify-full"}),
+    ],
+)
+def test_generic_mode_the_driver_family_reads_is_not_gated(
+    driver: str, params: dict[str, str]
+) -> None:
+    # The control for the test above: each family's own keyword and spelling stays delegated.
+    with active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(_generic_dest(odbc_driver=driver, odbc_params=params))
+
+
 def test_sqlserver_preset_is_untouched_by_the_generic_gate() -> None:
     # Scope: the preset keeps its own weakened-TLS refusal and gains none of this gradient's arms.
     with active_hop_posture(PROD_PHI):
@@ -692,15 +741,74 @@ def test_sqlserver_preset_is_untouched_by_the_generic_gate() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "server", ["localhost", "127.0.0.1", "127.0.0.1,5432", "127.0.0.1:5432", "[::1]:5432"]
-)
+@pytest.mark.parametrize("server", ["localhost", "127.0.0.1", "127.0.0.1:5432", "[::1]:5432"])
 def test_generic_loopback_hop_allowed(server: str) -> None:
     # An on-box hop puts no byte on a network. Every port-suffix spelling is here because
     # is_loopback_hop_host never resolves DNS: a suffix left on the host reads as a name, is treated
     # as remote, and would refuse a genuinely on-box dev hop.
     with active_hop_posture(PROD_PHI):
         assert DatabaseDestination(_generic_dest(server=server))
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "127.0.0.1,remote.example",
+        "localhost,remote.example",
+        "[::1],remote.example",
+        "[::1]:5432,remote.example",
+        "127.0.0.1,5432,remote.example",
+        "127.0.0.1,5432",
+        "::1,remote.example",
+    ],
+)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_server_with_a_comma_is_not_on_box(
+    server: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    """BACKLOG #4874. libpq reads a comma in a host as a list of hosts, so a ``server`` that starts
+    with a loopback address can still name a remote host after the comma. The guard read loopback
+    from the first comma element, so each of these crossed with no TLS keyword on an enforcing
+    instance. Red on the previous head. The control is the first element alone, which is on-box."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(server=server))
+    first = server.split(",")[0]
+    with active_hop_posture(PROD_PHI):
+        assert connector(config(server=first))
+
+
+_MS_DRIVER = "ODBC Driver 18 for SQL Server"
+
+
+@pytest.mark.parametrize("server", ["127.0.0.1,1433", "localhost,1433", "[::1],1433"])
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_sql_server_comma_port_is_on_box(
+    server: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    """BACKLOG #4874. ``host,port`` is Microsoft's own spelling of a SQL Server ``server``, and
+    its driver ignores ``PORT``, so a loopback host with a comma port is on-box on that driver.
+    Red on the previous head, which read every comma ``server`` whole. The control is the same
+    text on psqlODBC, which reads the comma as a host list and is refused."""
+    with active_hop_posture(PROD_PHI):
+        assert connector(config(server=server, odbc_driver=_MS_DRIVER))
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(server=server))
+
+
+@pytest.mark.parametrize(
+    "server",
+    ["127.0.0.1,remote.example", "127.0.0.1,1433,x", "127.0.0.1,1433,remote.example", ",1433"],
+)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_sql_server_other_comma_is_not_on_box(
+    server: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    # BACKLOG #4874: on Microsoft's driver only `host,<port>` is split; anything else holding a
+    # comma is read whole, as a remote host. The control is a plain loopback host on that driver.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(server=server, odbc_driver=_MS_DRIVER))
+    with active_hop_posture(PROD_PHI):
+        assert connector(config(server="127.0.0.1", odbc_driver=_MS_DRIVER))
 
 
 def test_generic_attestation_allows_and_is_audited(caplog: pytest.LogCaptureFixture) -> None:
@@ -780,7 +888,10 @@ def test_generic_guard_is_none_off_the_arm() -> None:
     [
         ("db.example", {}, ("db.example", 0)),
         ("db.example", {"PORT": "5432"}, ("db.example", 5432)),
-        ("db.example,1521", {"PORT": "5432"}, ("db.example", 1521)),  # the server suffix wins
+        # BACKLOG #4874: a comma can name a second host, so the whole text is the host.
+        ("db.example,1521", {"PORT": "5432"}, ("db.example,1521", 5432)),
+        ("127.0.0.1,remote.example", {}, ("127.0.0.1,remote.example", 0)),
+        ("[::1]:5432,remote.example", {}, ("[::1]:5432,remote.example", 0)),
         ("127.0.0.1:5432", {}, ("127.0.0.1", 5432)),
         ("[::1]:5432", {}, ("::1", 5432)),
         ("[fe80::1]", {}, ("fe80::1", 0)),
@@ -789,14 +900,60 @@ def test_generic_guard_is_none_off_the_arm() -> None:
         ("db.example", {"PORT": "9" * 4400}, ("db.example", 0)),  # no int() digit-limit crash
         # ONE definition of "is this a port": an unusable suffix falls through to the keyword rather
         # than swallowing the question, so both lookups agree on what counts.
-        ("db.example,notaport", {"PORT": "5432"}, ("db.example", 5432)),
-        ("db.example,999999", {"PORT": "5432"}, ("db.example", 5432)),
+        # An unusable suffix is not a port, so the text is read whole and the keyword gives the port.
+        ("db.example:notaport", {"PORT": "5432"}, ("db.example:notaport", 5432)),
+        ("db.example:999999", {"PORT": "5432"}, ("db.example:999999", 5432)),
+        # BACKLOG #4874: text the split would drop is never left behind a loopback host.
+        ("[::1]remote.example", {}, ("[::1]remote.example", 0)),
+        ("[::1]:5432x", {}, ("[::1]:5432x", 0)),
+        ("127.0.0.1 : 5432", {}, ("127.0.0.1 : 5432", 0)),
+        # An empty bracketed host is read whole: the loopback check reads an empty host as on-box.
+        ("[]", {}, ("[]", 0)),
+        ("[]:5432", {}, ("[]:5432", 0)),
     ],
 )
 def test_generic_hop_endpoint_splits(
     server: str, params: dict[str, str], expected: tuple[str, int]
 ) -> None:
-    assert generic_hop_endpoint(server, params) == expected
+    assert generic_hop_endpoint(server, params, reads_comma_port=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("server", "params", "comma_port", "expected"),
+    [
+        # BACKLOG #4874: Microsoft's driver reads `host,port` as one host and its port.
+        ("127.0.0.1,1433", {}, True, ("127.0.0.1", 1433)),
+        ("[::1],1433", {}, True, ("::1", 1433)),
+        ("db.example,1433", {"PORT": "5432"}, True, ("db.example", 1433)),
+        # Microsoft's driver ignores PORT, so it is never read as that driver's port.
+        ("127.0.0.1", {"PORT": "5432"}, True, ("127.0.0.1", 0)),
+        ("127.0.0.1,remote.example", {"PORT": "5432"}, True, ("127.0.0.1,remote.example", 0)),
+        # Anything else holding a comma is read whole on that driver too.
+        ("127.0.0.1,remote.example", {}, True, ("127.0.0.1,remote.example", 0)),
+        ("127.0.0.1,1433,x", {}, True, ("127.0.0.1,1433,x", 0)),
+        ("127.0.0.1,1433,1433", {}, True, ("127.0.0.1,1433,1433", 0)),
+        ("127.0.0.1,99999", {}, True, ("127.0.0.1,99999", 0)),
+        ("127.0.0.1,0", {}, True, ("127.0.0.1,0", 0)),
+        # A leading zero is refused, as the egress reading refuses it in PORT.
+        ("127.0.0.1,01433", {}, True, ("127.0.0.1,01433", 0)),
+        ("[],1433", {}, True, ("[],1433", 0)),
+        ("127.0.0.1, 1433", {}, True, ("127.0.0.1, 1433", 0)),
+        ("127.0.0.1 ,1433", {}, True, ("127.0.0.1 ,1433", 0)),
+        ("127.0.0.1,\u00b9433", {}, True, ("127.0.0.1,\u00b9433", 0)),
+        ("127.0.0.1,", {}, True, ("127.0.0.1,", 0)),
+        (",1433", {}, True, (",1433", 0)),
+        ("127.0.0.1:5432,1433", {}, True, ("127.0.0.1:5432,1433", 0)),
+        ("tcp:127.0.0.1,1433", {}, True, ("tcp:127.0.0.1,1433", 0)),
+        ("[::1]x,1433", {}, True, ("[::1]x,1433", 0)),
+        # The same spelling on every other driver stays whole.
+        ("127.0.0.1,1433", {}, False, ("127.0.0.1,1433", 0)),
+        ("127.0.0.1,1433", {"PORT": "5432"}, False, ("127.0.0.1,1433", 5432)),
+    ],
+)
+def test_generic_hop_endpoint_comma_port(
+    server: str, params: dict[str, str], comma_port: bool, expected: tuple[str, int]
+) -> None:
+    assert generic_hop_endpoint(server, params, reads_comma_port=comma_port) == expected
 
 
 # --- INBOUND: the --allow-insecure-bind clamp predicate -----------------------------------------

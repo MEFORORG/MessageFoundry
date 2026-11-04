@@ -251,12 +251,15 @@ async def test_an_over_cap_interchange_is_recorded_as_frame_oversize() -> None:
     assert events[1][2], "the over-cap event must carry a redacted reason, not an empty one"
 
 
-async def test_an_unexpected_handler_failure_is_recorded_as_framing_error() -> None:
+async def test_an_unexpected_handler_failure_is_recorded_as_handler_error() -> None:
+    # BACKLOG #5022: was `framing_error`, though the reader had framed the interchange cleanly.
+    # tests/test_tcp_x12_handler_failure.py covers the retry, the close and the keep.
+
     async def explode(raw: bytes) -> None:
         raise ValueError("synthetic handler failure")
 
     events = await _drive(_x12(), _OnceThenSilent(EDI), _Peer(), handler=explode)
-    assert _kinds(events) == ["established", "framing_error"]
+    assert _kinds(events) == ["established", "handler_error"]
 
 
 async def test_a_peer_reset_is_recorded_and_not_also_reported_as_a_clean_close() -> None:

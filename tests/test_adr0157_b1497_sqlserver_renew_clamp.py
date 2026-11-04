@@ -19,9 +19,11 @@ the driver really ends a statement at the clamp, which no fake can.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +71,7 @@ class _Raw:
     def __init__(self) -> None:
         self._timeout = 0
         self.assigned: list[int] = []
+        self.log: list[str] = []  # timeout assignments and rollbacks, in the order they ran
 
     @property
     def timeout(self) -> int:
@@ -79,6 +82,7 @@ class _Raw:
         assert isinstance(value, int), "pyodbc's Connection.timeout takes an int"
         self._timeout = value
         self.assigned.append(value)
+        self.log.append(f"timeout={value}")
 
     def close(self) -> None:
         pass
@@ -112,6 +116,8 @@ class _Conn:
         self.fail: Exception | None = None
         self.hang: asyncio.Event | None = None
         self.rolled_back = 0
+        self.rollback_fail: Exception | None = None
+        self.rollback_hangs = False
 
     @property
     def closed(self) -> bool:
@@ -125,6 +131,11 @@ class _Conn:
 
     async def rollback(self) -> None:
         self.rolled_back += 1
+        self.raw.log.append("rollback")
+        if self.rollback_fail is not None:
+            raise self.rollback_fail
+        if self.rollback_hangs:
+            await asyncio.Event().wait()
 
 
 class _Pool:
@@ -267,6 +278,262 @@ async def test_the_unclamped_read_is_unchanged() -> None:
     await store._fetchone("SELECT owner, leader_epoch FROM leader_lease", ("k",))
     assert conn.statement_timeouts == [30]
     assert conn.raw.assigned == [30]
+
+
+# --- the rollback after a failed claim (BACKLOG #5066) -------------------------
+
+
+@pytest.mark.parametrize("clamped", [True, False], ids=["clamped", "unclamped"])
+async def test_a_failed_rollback_discards_the_connection_and_raises_the_original(
+    clamped: bool,
+) -> None:
+    """A rollback that fails may leave the claim's HOLDLOCK transaction open, so the connection
+    must never go back to the pool able to be lent. The caller sees the claim's own error, not the
+    rollback's. Before #5066 the connection was recycled open and the rollback's error replaced the
+    original, on both paths."""
+    conn = _Conn()
+    conn.rollback_fail = RuntimeError("08S01 communication link failure during rollback")
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        if clamped:
+            await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+        else:
+            await store._fetchone("SELECT 1", ())
+    assert conn.rolled_back == 1
+    assert conn.closed is True  # detached: aioodbc's pool will not re-lend a closed connection
+    assert conn.raw.assigned == ([30, 4, 30] if clamped else [30])
+    # The restore ran before the rollback and its discard, never beside them: nothing touched the
+    # handle's timeout after the rollback began. A rollback moved back inside the statement-timeout
+    # block would log the restore after it.
+    assert conn.raw.log[-1] == "rollback", conn.raw.log
+
+
+async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -> None:
+    """The bound (step 1 of #5066): the rollback gets the clamp floored at 1 s. Past it the
+    connection is discarded and the claim's error is raised, so the rollback cannot hold the
+    leadership lock unbounded."""
+    conn = _Conn()
+    conn.rollback_hangs = True
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+    elapsed = time.monotonic() - started
+    assert 0.9 <= elapsed < 3.0, elapsed
+    assert conn.rolled_back == 1
+    assert conn.closed is True
+
+
+async def test_a_hung_rollback_on_a_failed_claim_frees_the_leadership_lock_in_the_bound() -> None:
+    """End to end over the coordinator: a second acquirer, standing in for a stepdown, waits on
+    _leadership_lock while the tick that failed its claim sits in a hung rollback, and gets the lock
+    inside the bound. With the rollback unbounded the tick never lets go, and the wait times out.
+    Asserting the lock is free after the tick returns would prove nothing: ``async with`` always
+    releases on the way out."""
+    conn = _Conn()
+    conn.rollback_hangs = True
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=1.0)
+    tick = asyncio.create_task(coord._maintain_leadership())
+    async with asyncio.timeout(2.0):  # the tick holds the lock and has entered the rollback
+        while conn.rolled_back == 0:
+            await asyncio.sleep(0)
+    assert coord._leadership_lock.locked() is True
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(coord._leadership_lock.acquire(), timeout=3.0)
+    finally:
+        if not tick.done():  # the red case: do not leave the hung tick behind the test
+            tick.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await tick
+    waited = time.monotonic() - started
+    coord._leadership_lock.release()
+    # The bound is the 1 s clamp; under 2 s keeps out a lock held for about three times it.
+    assert waited < 2.0, waited
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await tick
+    assert conn.closed is True
+
+
+def test_an_unbounded_rollback_outside_a_task_still_runs() -> None:
+    """``within=None``, which every caller but a clamped read passes, enters no timeout at all.
+    ``asyncio.timeout(None)`` still needs a current task, so wrapping the rollback in it raised
+    RuntimeError outside one, and the broad except then discarded the connection without trying the
+    rollback. Driven by hand, so no task is current."""
+    conn = _Conn()
+    coro = _store(conn)._rollback_or_discard(conn)
+    with pytest.raises(StopIteration):
+        coro.send(None)
+    assert conn.rolled_back == 1
+    assert conn.closed is False  # rolled back cleanly, so not discarded
+
+
+@pytest.mark.parametrize("method", ["_execute", "_execute_output"])
+async def test_a_failed_rollback_after_a_failed_write_discards_the_connection(method: str) -> None:
+    """The heartbeat and stepdown-release writes: a rollback that fails may leave the write's X
+    locks held, so the connection is discarded rather than recycled, and the caller sees the write's
+    own error. Before, a bare rollback raised its own error over the write's, and the connection
+    went back to the pool."""
+    conn = _Conn()
+    conn.rollback_fail = RuntimeError("08S01 communication link failure during rollback")
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",))
+    assert conn.rolled_back == 1
+    assert conn.closed is True
+
+
+@pytest.mark.parametrize("method", ["_execute", "_execute_output"])
+async def test_a_rollback_after_a_failed_write_that_succeeds_recycles(method: str) -> None:
+    """Control for the test above: a clean rollback keeps the connection."""
+    conn = _Conn()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",))
+    assert conn.rolled_back == 1
+    assert conn.closed is False
+
+
+class _DriverError(Exception):
+    """Shaped like a pyodbc error: ``args`` is ``(sqlstate, message)``."""
+
+
+# Synthetic driver texts in the shape SQL Server writes for 2627 and 2628, each quoting a made-up
+# stored value. Neither value may reach a WARNING record. Factories, so each case raises fresh
+# instances and no traceback or context carries over from an earlier case.
+_DUPLICATED_ID = "SYNTHETIC-ROW-1111"
+_TRUNCATED_VALUE = "SYNTHETIC-ROW-2222"
+
+
+def _duplicate_key() -> _DriverError:
+    return _DriverError(
+        "23000",
+        "[23000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Violation of PRIMARY KEY"
+        " constraint 'PK_t'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key"
+        f" value is ({_DUPLICATED_ID}). (2627) (SQLExecDirectW)",
+    )
+
+
+def _truncation() -> _DriverError:
+    return _DriverError(
+        "22001",
+        "[22001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]String or binary data would"
+        f" be truncated in table 'dbo.t', column 'c'. Truncated value: '{_TRUNCATED_VALUE}'."
+        " (2628) (SQLEndTran)",
+    )
+
+
+def _other_error() -> Exception:
+    return RuntimeError(f"rollback refused near ({_DUPLICATED_ID})")
+
+
+@pytest.fixture
+def _fake_is_a_driver_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pyodbc is an optional extra; stand the fake in for its error class."""
+    import messagefoundry.store.base as store_base
+
+    monkeypatch.setattr(
+        store_base, "_is_server_driver_error", lambda exc: isinstance(exc, _DriverError)
+    )
+
+
+@pytest.mark.usefixtures("_fake_is_a_driver_error")
+@pytest.mark.parametrize(
+    ("rollback_fail", "named"),
+    [
+        (_truncation, "(_DriverError, SQLSTATE 22001)"),
+        # Not a driver error, so its first argument is never read as a SQLSTATE.
+        (_other_error, "(RuntimeError, SQLSTATE None)"),
+    ],
+    ids=["driver-error", "other-error"],
+)
+@pytest.mark.parametrize("method", ["_execute", "_execute_output", "_fetchone"])
+async def test_a_failed_rollback_logs_no_stored_value_or_traceback_at_warning(
+    method: str,
+    rollback_fail: Callable[[], Exception],
+    named: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The discard's WARNING names the rollback's class and SQLSTATE only. A traceback there would
+    print the rollback's own text and, as its context, the write's: both can quote stored values,
+    and section 9 of CLAUDE.md keeps message content out of the general log at INFO and above.
+    Before this repair the WARNING carried ``exc_info``, so both values reached it."""
+    conn = _Conn()
+    conn.fail = _duplicate_key()
+    conn.rollback_fail = rollback_fail()
+    store = _store(conn)
+    with (
+        caplog.at_level(logging.DEBUG, logger="messagefoundry.store.sqlserver"),
+        pytest.raises(_DriverError),
+    ):
+        await getattr(store, method)("INSERT INTO t VALUES (?)", ("x",))
+    assert conn.closed is True  # the discard still ran
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    for record in warnings:
+        assert record.exc_info is None and record.exc_text is None, record.getMessage()
+        text = record.getMessage()
+        assert _DUPLICATED_ID not in text and _TRUNCATED_VALUE not in text, text
+    (discard,) = [r for r in warnings if "discarding the connection" in r.getMessage()]
+    assert named in discard.getMessage()
+    # The traceback is still there for diagnosis, at DEBUG only.
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
+
+
+async def test_a_faulting_sqlstate_read_neither_skips_the_discard_nor_replaces_the_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing the WARNING computes can skip the discard or stand in for the caller's error: with
+    the SQLSTATE read raising, the connection whose rollback failed is still out of the pool, and
+    the write's own error is the one raised."""
+    import messagefoundry.store.sqlserver as sqlserver
+
+    def _refuse(_exc: BaseException) -> str | None:
+        raise LookupError("synthetic: the SQLSTATE read failed")
+
+    monkeypatch.setattr(sqlserver, "driver_sqlstate", _refuse)
+    conn = _Conn()
+    conn.fail = _duplicate_key()
+    conn.rollback_fail = _truncation()
+    with pytest.raises(_DriverError, match="2627"):
+        await _store(conn)._execute("INSERT INTO t VALUES (?)", ("x",))
+    assert conn.closed is True
+
+
+async def test_a_rollback_past_its_bound_logs_no_stored_value_or_traceback_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The bound's own branch, on the clamped claim: the WARNING names the timeout and carries no
+    traceback, whose chain would hold the claim's driver text."""
+    conn = _Conn()
+    conn.rollback_hangs = True
+    conn.fail = _duplicate_key()
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.sqlserver"),
+        pytest.raises(_DriverError),
+    ):
+        await _store(conn)._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+    assert conn.closed is True
+    for record in caplog.records:
+        assert record.exc_info is None and record.exc_text is None, record.getMessage()
+        assert _DUPLICATED_ID not in record.getMessage(), record.getMessage()
+    (discard,) = [r for r in caplog.records if "discarding the connection" in r.getMessage()]
+    assert "(TimeoutError, SQLSTATE None)" in discard.getMessage()
+
+
+async def test_a_rollback_that_succeeds_still_recycles_the_connection() -> None:
+    """Control: the bound changes nothing when the rollback returns in time."""
+    conn = _Conn()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+    assert conn.rolled_back == 1
+    assert conn.closed is False
 
 
 # --- the coordinator ---------------------------------------------------------

@@ -470,6 +470,7 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
         auth_provider="ad",
         directory_object_id="guid-jdoe",
         password_generated=False,
+        audits=(),
     )
     await service.bind_federated_subject(
         "f" * 32, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"

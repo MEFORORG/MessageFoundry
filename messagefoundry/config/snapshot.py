@@ -107,14 +107,19 @@ def config_py_files(directory: Path) -> list[Path]:
     is config, so the loader, both config-source trust checks and the fingerprint skip a dot-named
     module the same way (vault BACKLOG #2781). The ``_``-helper skip is the loader's own rule on top of
     this, not part of it: a helper is still run when a sibling imports it, so the trust check and the
-    fingerprint keep it."""
-    return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
+    fingerprint keep it.
+
+    Raises the ``OSError`` of a directory it cannot list, a missing one included. It globbed, and
+    ``Path.glob`` drops a listing error, so a share lost at that moment answered ``[]`` and ADR 0036's
+    trust check vetted no module of a bundle the load then listed and ran (vault BACKLOG #5117)."""
+    with os.scandir(directory) as entries:
+        return sorted(directory / e.name for e in entries if _covered_name(".", e.name))
 
 
 def _covered_name(folder: str, name: str) -> bool:
     """Whether a snapshot reads ``name`` from ``folder``. For the directory itself (``.``) that is
-    :func:`config_py_files`'s rule for one name: the suffix in the case the platform's glob matches
-    it, and not dot-named."""
+    :func:`config_py_files`'s rule for one name: the suffix in the case the platform matches it
+    (without case on Windows), and not dot-named."""
     if folder == ".":
         return os.path.normcase(name).endswith(".py") and not name.startswith(".")
     if folder == CODESETS_DIR_NAME:
@@ -301,8 +306,8 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
     for folder in (".", *_FOLDERS):
         if folder not in listable:
             continue
-        # Listed here and not by config_py_files, whose glob swallows a listing error, so a share
-        # lost at this moment would leave every module out with nothing raised or recorded.
+        # Listed here and not by config_py_files, so that a lax read records the folder it cannot
+        # list as unreadable rather than raise.
         try:
             names = sorted(entry.name for entry in os.scandir(base / folder))
         except OSError as exc:

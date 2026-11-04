@@ -209,12 +209,15 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
+    USER_READ_SQL,
     VIEWED_EVENT,
     AdMap,
     AdMapChange,
@@ -237,6 +240,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
     FailOutcome,
@@ -306,6 +310,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    global_epoch_or_refuse,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -334,7 +339,9 @@ from messagefoundry.store.store import (
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
+    require_ingress_audit,
     require_notify_email,
+    require_operator_audit,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -825,6 +832,16 @@ _SCHEMA: list[str] = [
         salt        TEXT NOT NULL,
         created_at  DOUBLE PRECISION NOT NULL
     )""",
+    # The store's global session epoch (BACKLOG #5091) -- see the SQLite `_SCHEMA`, and
+    # GLOBAL_SESSION_EPOCH_SQL in store.py for what it decides. One row, seeded at 0 whenever this
+    # batch runs, which an ordinary open skips while the schema_meta marker matches (ADR 0064).
+    # docs/SECURITY.md, *Limits of the session sweep*, says what runs it and what a deleted row
+    # costs until then. Non-secret: a counter.
+    """CREATE TABLE IF NOT EXISTS global_session_epoch (
+        id    INTEGER PRIMARY KEY CHECK (id = 1),
+        epoch INTEGER NOT NULL DEFAULT 0
+    )""",
+    "INSERT INTO global_session_epoch (id, epoch) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
     # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
     # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
     # cipher-covered (table, column); never deleted by the engine. Non-secret.
@@ -992,6 +1009,7 @@ _SCHEMA: list[str] = [
         auth_mechanism TEXT,
         idp_auth_time DOUBLE PRECISION,
         user_epoch   INTEGER NOT NULL DEFAULT 0,
+        global_epoch INTEGER NOT NULL DEFAULT 0,
         seal         TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
@@ -1196,6 +1214,9 @@ _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"
 _SCHEMA.append(_gated_add_column("sessions", "user_epoch", "INTEGER NOT NULL DEFAULT 0"))
 _SCHEMA.append(_gated_add_column("sessions", "seal", "TEXT NOT NULL DEFAULT ''"))
 _SCHEMA.append(_gated_add_column("users", "session_epoch", "INTEGER NOT NULL DEFAULT 0"))
+# BACKLOG #5091: the global epoch a session was minted under, for a table created before the
+# column. An existing session gets 0, which its seal never covered, so a keyed store refuses it.
+_SCHEMA.append(_gated_add_column("sessions", "global_epoch", "INTEGER NOT NULL DEFAULT 0"))
 # BACKLOG #2592: the passkey digest and the account's integrity seal. An existing account gets an
 # empty seal, which a keyed store refuses like a wrong one; store.py's report_unsealed_users says why
 # nothing seals it here.
@@ -1377,13 +1398,13 @@ def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
 _PG_SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
-    " user_epoch, seal)"
-    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11)"
+    " user_epoch, global_epoch, seal)"
+    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11,$12)"
 )
 _PG_SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=$1, user_id=$2, created_at=$3, expires_at=$4, revoked_at=$5,"
     " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
-    " user_epoch=$11, seal=$12 WHERE token_hash=$13 AND seal=$14"
+    " user_epoch=$11, global_epoch=$12, seal=$13 WHERE token_hash=$14 AND seal=$15"
 )
 # Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`. store.py says
 # which method runs each, and that no other statement names the table.
@@ -4213,6 +4234,7 @@ class PostgresStore:
         skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
         inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
         we couldn't reference. Empty/None → the byte-identical no-detach path."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -5618,17 +5640,17 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # A missing row is a corrupt reference. A NULL body means retention erased the
-                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
-                    # snapshot made the purge's token blank skip it, while the same statement still
-                    # erased the reply. This branch is the only control for that, and the reply
-                    # must never become a child message. A missing row is damage, not an erasure,
-                    # so that token is not blanked: its sealed reference is the evidence.
+                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that
+                    # re-pended this token after the purge's snapshot made the purge's token blank
+                    # skip it, while the same statement still erased the reply. This branch is the
+                    # only control for that, and the reply must never become a child message. A
+                    # missing row is damage, not an erasure, so that token is not blanked: its
+                    # sealed reference is the evidence.
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            "re-ingress ref corrupt",
+                            REINGRESS_ARTIFACT_MISSING,
+                            "re-ingress reply missing",
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -6408,15 +6430,19 @@ class PostgresStore:
 
         The flag statement holds the audit lock while it waits for its row, so its lock waits are
         bounded by ``lock_timeout``, at
-        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`. Nothing else bounds
-        them: the pool sets no server ``statement_timeout``, and asyncpg's client-side
-        ``command_timeout`` is 30 s by default and absent at 0, so a foreign lock on
-        ``connection_flag`` would hold every audit append that long. It is set after the advisory
-        lock, whose wait keeps its own bound, and only tightens, as the schema batch's does. It is
-        local to the transaction, so it ends with it, and it covers the append too, which waits on
-        no lock the audit lock does not already serialise. SQLSTATE 55P03 raises
+        :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` each: Postgres times
+        each lock acquisition separately, so a statement that meets two locks can pass it. The pool
+        sets no server ``statement_timeout``, so without it the wait would run to asyncpg's client-side
+        ``command_timeout``, or without end at 0, unless the role or database set a bound of its
+        own; a foreign lock on ``connection_flag`` would hold every audit append that long. It is
+        set after the advisory lock, whose wait keeps its own bound, and only tightens, as the
+        schema batch's does. It is local to the transaction, so it ends with it. It also bounds the
+        append's lock waits, so a lock on ``audit_log`` held past it, such as a schema change's,
+        fails the toggle with the driver's own 55P03 rather than the typed refusal. SQLSTATE 55P03
+        from the flag statement raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
-        back."""
+        back. Where a non-zero ``command_timeout`` is at or under the bound, that ends the wait
+        first, as asyncpg's own timeout, not retried."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (
@@ -7365,6 +7391,7 @@ class PostgresStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -7456,6 +7483,7 @@ class PostgresStore:
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
         the outbound row is created only when it returned a row (ADR 0090 §4). ``audit``'s row
         commits with the resend, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -7667,6 +7695,7 @@ class PostgresStore:
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
         re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies.
         ``audit``'s row commits with the resubmit, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -7827,6 +7856,7 @@ class PostgresStore:
         pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
         same reason, and the same file pins it. ``audit``'s row commits with the replay, zero
         included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
@@ -7884,6 +7914,7 @@ class PostgresStore:
         even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
         oldest row from that producer, the lane head only when no other inbound feeds the
         destination. Returns the number cancelled."""
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
         # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
@@ -8485,7 +8516,7 @@ class PostgresStore:
         ]
 
     async def _append_operator_audit[R](
-        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row inside its transaction (BACKLOG #2624), so an
         append that fails rolls the mutation back. ``written`` tees the row once the commit lands.
@@ -8807,7 +8838,7 @@ class PostgresStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638); the Store protocol states the contract. The row is read ``FOR UPDATE``, as
@@ -9246,7 +9277,7 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -9272,7 +9303,7 @@ class PostgresStore:
         )
 
     async def get_user(self, user_id: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE id=$1", user_id)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
@@ -9416,13 +9447,13 @@ class PostgresStore:
         return int(row["n"]) if row else 0
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE username=$1", username)
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE username=$1", username)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
         # rather than the recyclable sAMAccountName. A lookup, not a scan: it is on the sign-in path.
-        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=$1", object_id)
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE directory_object_id=$1", object_id)
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def set_user_username(
@@ -9432,7 +9463,7 @@ class PostgresStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=$4` on the old name makes it a compare-and-set; AuthStore says
@@ -9530,12 +9561,12 @@ class PostgresStore:
         # issuer, so a subject-only match would refuse two unrelated people sharing an opaque
         # identifier at different IdPs.
         d = await self._fetchone(
-            "SELECT * FROM users WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
+            f"{USER_READ_SQL} WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
         )
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def list_users(self) -> list[UserRecord]:
-        rows = await self._fetchall("SELECT * FROM users ORDER BY username")
+        rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
         return [UserRecord.from_mapping(dict(r)) for r in rows]
 
     async def count_users(self) -> int:
@@ -9723,7 +9754,7 @@ class PostgresStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -9783,6 +9814,7 @@ class PostgresStore:
                     None if session is None else SessionRecord.from_mapping(dict(session)),
                     record,
                     await self._account_passkeys(conn, cred.user_id),
+                    global_epoch=await self._global_session_epoch(conn),
                 ):
                     return False
             await self._write_passkeys(
@@ -10520,6 +10552,11 @@ class PostgresStore:
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
                 user_epoch=0 if row is None else int(row["session_epoch"]),
+                # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
+                # behind a revoke reads that revoke's global epoch beside its account epoch. A
+                # subquery in the locked read would keep its pre-wait snapshot, and the session
+                # would be minted dead. revoke_all_sessions says why this read never waits.
+                global_epoch=await self._global_session_epoch(conn),
             )
             record = seal_session(self._row_sealer, record)
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
@@ -10547,6 +10584,10 @@ class PostgresStore:
         updated = seal_session(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
         return updated if _rowcount(status) > 0 else None
+
+    async def _global_session_epoch(self, conn: Any) -> int:
+        """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
+        return global_epoch_or_refuse(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
 
     async def _session_epoch(self, conn: Any, user_id: str) -> int:
         """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
@@ -10708,11 +10749,22 @@ class PostgresStore:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss."""
+        Raises the store's global session epoch first (BACKLOG #5091), which ends every session
+        minted before it whatever account it belongs to, then the epoch of each account its read of
+        the account list returns, then ends the sessions it finds and re-seals the kept one under
+        both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that leaves.
+
+        The raise is first so a second revoke of every account waits on that one row, holding
+        nothing, until this one commits. Nothing else locks the row: every reader of the global
+        epoch reads it without a lock clause, and under MVCC such a read never waits on a writer,
+        so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
+            current = global_epoch_or_refuse(
+                await conn.fetchval(
+                    "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+                )
+            )
             for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
                 await self._bump_session_epoch(conn, str(row["id"]))
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
@@ -10723,13 +10775,19 @@ class PostgresStore:
                 if owner is not None:
                     epoch = await self._session_epoch(conn, str(owner))
                     await self._write_session(
-                        conn, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                        conn,
+                        except_token_hash,
+                        lambda s: replace(s, user_epoch=epoch, global_epoch=current),
                     )
         return _rowcount(status)
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a Postgres database's
-        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`.
+
+        So a DBA restore of this store is not recorded at start: no session is ended, and no
+        ``store_restored`` row or alert is written. docs/SECURITY.md, *A restored store brings its
+        sessions back*, names the steps an operator takes by hand (BACKLOG #5092)."""
         return None
 
     async def enforce_session_cap(
@@ -11062,10 +11120,10 @@ class PostgresStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
         retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns the number of dead rows purged.
+        Ported, not stubbed. Returns a :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -11087,14 +11145,22 @@ class PostgresStore:
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
                 purged = _rowcount(result)
+                cleared = _rowcount(
+                    await conn.execute(
+                        "UPDATE queue SET last_error=NULL"
+                        f" WHERE status=$1 AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                        OutboxStatus.DEAD.value,
+                        *cutoff_params,
+                    )
+                )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row, release its
                 # streaming attachment here — the deferred half of the per-MESSAGE dead-row split with
@@ -11105,7 +11171,7 @@ class PostgresStore:
                     older_than, connection_cutoffs
                 )
                 await self._release_message_attachments(conn, rel_where, rel_params)
-        return purged
+        return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention) and

@@ -31,12 +31,15 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.odbc_call_gate import install_call_gate
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from tests._claim_lock_helpers import (
     assert_skip_named,
     claim_heads_no_block,
+    claim_past_empty_yield,
     ss_hold_row_lock,
     ss_lane_pending,
+    ss_release_row_lock,
 )
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
@@ -163,14 +166,24 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
     # (message_id, stage) so the U-lock lands on the actual head row (locking by `id`=message_id matches
     # no row, holds no lock, and the claim never contends — the bug this assertion now guards against).
     lock_conn = await ss_store._pool.acquire()
-    lock_cur = await lock_conn.cursor()
-    await lock_cur.execute("BEGIN TRAN")
-    await lock_cur.execute(
-        "SELECT id FROM queue WITH (UPDLOCK, ROWLOCK) WHERE message_id=? AND stage=?",
-        (head_id, Stage.INGRESS.value),
-    )
-    assert len(await lock_cur.fetchall()) == 1  # the U-lock MUST land on the head row
+    lock_cur: Any = None
+    locked = False
     try:
+        # Everything after the acquire sits inside the try, so a failure while taking the lock still
+        # reaches the release rather than leaking the open transaction against the next test's
+        # cleanup DELETE (BACKLOG #4915). The call gate goes on before the first statement, so a
+        # discard in the release never frees a handle under one a cancellation left running. Until
+        # the lock is proven taken the release discards rather than sends a ROLLBACK, which could
+        # fail on no open transaction and replace the setup's own failure.
+        install_call_gate(lock_conn)
+        lock_cur = await lock_conn.cursor()
+        await lock_cur.execute("BEGIN TRAN")
+        await lock_cur.execute(
+            "SELECT id FROM queue WITH (UPDLOCK, ROWLOCK) WHERE message_id=? AND stage=?",
+            (head_id, Stage.INGRESS.value),
+        )
+        assert len(await lock_cur.fetchall()) == 1  # the U-lock MUST land on the head row
+        locked = True
         claim = asyncio.ensure_future(
             ss_store.claim_next_fifo_batch(channel, now=200.0, stage=Stage.INGRESS.value, limit=8)
         )
@@ -178,9 +191,7 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
             await asyncio.wait_for(asyncio.shield(claim), timeout=1.0)
         assert not claim.done()  # BLOCKED on the locked head — did NOT skip to a later seq
     finally:
-        await lock_cur.execute("ROLLBACK TRAN")  # release the head lock
-        await lock_cur.close()
-        await ss_store._pool.release(lock_conn)
+        await ss_release_row_lock(ss_store, lock_conn, lock_cur, held=locked)
 
     items = await asyncio.wait_for(claim, timeout=10.0)
     assert items and items[0].message_id == head_id
@@ -252,31 +263,13 @@ async def _pg_lane_pending(pg_store: Any, channel: str) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-# claim_fifo_heads' SQL Server path opens with SET LOCK_TIMEOUT 0 (ADR 0066 §9 never-block), so a
-# transient lock can fail-close the WHOLE batch to EMPTY-all — by_lane AND rearm both empty, the claim
-# rolled back, nothing consumed. That yield is contract-legal (the pooled caller self-heals on retry)
-# but flakes a single-shot assertion. _claim_heads_until re-issues past a transient EMPTY-all while
-# keeping claim_heads_no_block's segfault-safe shield, for the sites here that assert a NON-empty
-# outcome — an after-release head, or a sibling/committed-successor lane claimed while ANOTHER row is
-# locked. Masks nothing: EMPTY-all is a full roll-back (a retry cannot double-claim; a successful claim
-# never retries), and a GENUINELY unclaimable head stays EMPTY-all every pass and still fails after the
-# cap. A real BLOCK still raises TimeoutError through the shield (not a return), so it is never retried.
-# Sites that assert EMPTY-all itself (a locked head with no free sibling) keep calling
-# claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield.
-_CLAIM_YIELD_RETRIES = 16
-_CLAIM_YIELD_BACKOFF = 0.01
-
-
 async def _claim_heads_until(store: Any, *args: Any, **kwargs: Any) -> Any:
-    """claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield; see
-    the note above. Returns as soon as the claim did ANYTHING (a non-empty by_lane or rearm)."""
-    res = await claim_heads_no_block(store, *args, **kwargs)
-    for _ in range(_CLAIM_YIELD_RETRIES):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
-        res = await claim_heads_no_block(store, *args, **kwargs)
-    return res
+    """claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield, for the
+    sites here that assert a NON-empty outcome: an after-release head, or a sibling/committed-successor
+    lane claimed while ANOTHER row is locked. :func:`claim_past_empty_yield` says why that masks
+    nothing. Sites that assert EMPTY-all itself (a locked head with no free sibling) keep calling
+    claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield."""
+    return await claim_past_empty_yield(lambda: claim_heads_no_block(store, *args, **kwargs))
 
 
 # --- 1a: true T6 — locked head => lane EMPTY, no lock-wait, N claimed first after
@@ -296,7 +289,7 @@ async def test_pooled_1a_pg_locked_head_lane_empty_never_blocks(pg_store: Any) -
             pg_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
-        assert_skip_named(res, channel, abort_ok=False)
+        assert_skip_named(res, channel, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await _pg_lane_pending(pg_store, channel)
         assert all(
             r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows
@@ -325,13 +318,11 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
-        assert_skip_named(res, channel, abort_ok=True)
+        assert_skip_named(res, channel, abort_ok=True, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(ss_store, channel)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
     after = await _claim_heads_until(
         ss_store, Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
     )
@@ -529,9 +520,7 @@ async def test_pooled_1c_ss_multilane_isolation(ss_store: Any) -> None:
         rows = await ss_lane_pending(ss_store, channel_a)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
 
 
 # --- 1e: mid-prefix gap — only the contiguous head prefix; gap-tail never UPDATEd
@@ -581,9 +570,7 @@ async def test_pooled_1e_ss_midprefix_gap_truncates_tail_untouched(ss_store: Any
         )
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
 
 
 # --- 1f: attempts-neutrality under a wedged head across repeated claim attempts
@@ -602,7 +589,8 @@ async def test_pooled_1f_pg_wedged_head_attempts_neutral(pg_store: Any) -> None:
                 pg_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
-            assert_skip_named(res, channel, abort_ok=False)  # #1270: every pass, not just one
+            # #1270: every pass, not just one
+            assert_skip_named(res, channel, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await _pg_lane_pending(pg_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [
             (OutboxStatus.PENDING.value, 0)
@@ -627,13 +615,12 @@ async def test_pooled_1f_ss_wedged_head_attempts_neutral(ss_store: Any) -> None:
                 ss_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
-            assert_skip_named(res, channel, abort_ok=True)  # #1270: every pass, not just one
+            # #1270: every pass, not just one
+            assert_skip_named(res, channel, abort_ok=True, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(ss_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [(OutboxStatus.PENDING.value, 0)] * 3
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
     after = await _claim_heads_until(
         ss_store, Stage.INGRESS.value, [channel], now=300.0, per_lane_limit=8
     )

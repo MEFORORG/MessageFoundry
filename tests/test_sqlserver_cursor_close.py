@@ -110,17 +110,21 @@ async def test_execute_closes_cursor_before_release_on_success() -> None:
     assert events == ["execute", "commit", "cursor.close", "release"]
 
 
-async def test_execute_closes_cursor_before_release_on_error() -> None:
+@pytest.mark.parametrize("method", ["_execute", "_execute_output", "_fetchall"])
+async def test_closes_cursor_before_rollback_and_release_on_error(method: str) -> None:
     events: list[str] = []
     conn = _FakeConn(events, fail_execute=True)
     store = _make_store(conn, events)
 
     with pytest.raises(RuntimeError, match="execute boom"):
-        await store._execute("UPDATE t SET x=1")
+        await getattr(store, method)("UPDATE t SET x=1", ("x",))
 
     assert conn.cursor_obj.closed == 1
-    # Even on the rollback path the cursor is closed before release.
-    assert events == ["execute", "rollback", "cursor.close", "release"]
+    # Even on the rollback path the cursor is closed before release. It is closed before the
+    # rollback too, on every helper that rolls back through _rollback_or_discard, so a discard
+    # after a failed rollback cannot race the cursor's own close (BACKLOG #5066; the order was
+    # execute, rollback, cursor.close before that).
+    assert events == ["execute", "cursor.close", "rollback", "release"]
 
 
 async def test_cursor_helper_closes_when_body_raises() -> None:

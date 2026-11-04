@@ -128,6 +128,15 @@ def test_the_restore_puts_back_handler_level_formatter_and_the_disable_level(
     assert _LINE in stream.getvalue().splitlines()
 
 
+def test_the_restore_puts_back_the_last_resort() -> None:
+    # BACKLOG #3768: main() replaces the process-wide lastResort on a handler-less root, so a test
+    # that runs main() that way would otherwise hand the filtered one to every later test.
+    before = logging.lastResort
+    with root_logging_restored():
+        logging.lastResort = logging.StreamHandler(io.StringIO())
+    assert logging.lastResort is before
+
+
 def test_no_module_shadows_the_conftest_restore() -> None:
     # A test module fixture with the conftest fixture's name REPLACES it for that module. That is how
     # tests/test_log_write_guard.py silently lost the filter restore until BACKLOG #2093.

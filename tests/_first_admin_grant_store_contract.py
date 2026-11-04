@@ -50,6 +50,7 @@ async def provisioned_row(store: Any, user_id: str, *, totp: bool) -> str | None
         now=1.0,
         password_hash=None,
         password_generated=False,
+        audits=(),
     )
     await store.set_password(
         user_id,
@@ -146,6 +147,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         now=1.0,
         password_hash=None,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_roles("dir", [ADMIN], assigned_by="test")
     # A directory account holding a hash still needs the directory: the provider is what decides.
@@ -156,6 +158,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         now=1.0,
         password_hash="synthetic-hash-dir-hashed",
         password_generated=False,
+        audits=(),
     )
     await store.set_user_roles("dir-hashed", [ADMIN], assigned_by="test")
     await store.create_user(
@@ -165,6 +168,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         now=1.0,
         password_hash=None,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_roles("hashless", [ADMIN], assigned_by="test")
     # Vault BACKLOG #3849 C1: an admin-issued temporary credential past its deadline signs nobody
@@ -200,6 +204,7 @@ async def _temporary_credential_admin(store: Any, user_id: str, *, issued_at: fl
         password_hash=f"synthetic-hash-{user_id}",
         must_change_password=True,
         password_generated=True,
+        audits=(),
     )
     await store.set_user_roles(user_id, [ADMIN], assigned_by="test")
 

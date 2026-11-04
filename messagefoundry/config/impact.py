@@ -46,6 +46,7 @@ from messagefoundry.config.reachability import (
 from messagefoundry.config.wiring import Registry, WiringError, config_py_files
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "LiteralEdit",
@@ -400,10 +401,17 @@ def _scan_declaration_span(
     statement is found by parsing each config-dir ``.py`` module and matching a call to one of
     ``factories`` whose first positional arg is the string literal ``old``. Best-effort: an unparseable
     module is skipped; the first match wins (a loaded graph holds the name once). Returns ``(None, None)``
-    when nothing matches — the definition simply isn't rewritten, exactly as before this branch existed."""
+    when nothing matches — the definition simply isn't rewritten, exactly as before this branch existed.
+    Raises :class:`WiringError` when ``config_dir`` cannot be listed, which is not "nothing matches"."""
     # The loader's own file rule: a dot-named backup of a module (vault BACKLOG #2781) or a file in a
     # subdirectory is never run, so a declaration in one must not take the definition edit.
-    for path in config_py_files(config_dir):
+    try:
+        modules = config_py_files(config_dir)
+    except OSError as exc:
+        # Read as an empty directory, this left the definition out of the plan unremarked, and an
+        # apply renamed only the referents (vault BACKLOG #5117).
+        raise WiringError(f"could not list the config dir {config_dir}: {safe_exc(exc)}") from exc
+    for path in modules:
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, ValueError, MemoryError, RecursionError):

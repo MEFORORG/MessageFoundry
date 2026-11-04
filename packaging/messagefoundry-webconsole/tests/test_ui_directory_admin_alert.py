@@ -96,6 +96,7 @@ async def _service(engine: Engine, *, held: Role | None, bind: bool) -> AuthServ
         auth_provider="ad",
         directory_object_id=_OBJECT_ID,
         password_generated=False,
+        audits=(),
     )
     if held is not None:
         await engine.store.set_user_roles(user_id, [held.value], assigned_by="ad-sync")

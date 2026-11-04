@@ -158,6 +158,7 @@ async def _local_account(store: MessageStore, password: str) -> None:
         auth_provider="local",
         password_hash=hash_password(password),
         password_generated=False,
+        audits=(),
     )
 
 
