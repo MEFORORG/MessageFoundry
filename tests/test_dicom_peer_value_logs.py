@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -121,10 +122,26 @@ def _filter_removed() -> Iterator[None]:
             "      =[redacted]",
         ),
         (
+            "pynetdicom.presentation",
+            "The Transfer Syntax Name 'SMITH^JOHN MRN123' is non-conformant",
+            "The Transfer Syntax Name '[redacted]' is non-conformant",
+        ),
+        (
+            "pynetdicom.pdu_primitives",
+            f"The Related General SOP Class UID '{_PLANTED}' is non-conformant",
+            "The Related General SOP Class UID '[redacted]' is non-conformant",
+        ),
+        (
+            # A title with more than one value is logged as its repr, which passes as a title.
+            "pynetdicom._handlers",
+            "Move Originator               : ['MRN1234', 'X']",
+            "Move Originator               : [redacted]",
+        ),
+        (
             # A line of a known kind whose end the filter does not know loses all after the head.
             "pynetdicom.utils",
             f"Non-conformant 'Affected SOP Instance UID' value '{_PLANTED}' (a wording not seen)",
-            "Non-conformant 'Affected SOP Instance UID' value [redacted]",
+            "Non-conformant 'Affected SOP Instance UID' value '[redacted]",
         ),
         (
             "pynetdicom._handlers",
@@ -146,6 +163,9 @@ def _filter_removed() -> Iterator[None]:
         "pydicom-joined",
         "association-dump",
         "transfer-syntax",
+        "presentation",
+        "pdu-primitives",
+        "multi-valued-title",
         "unknown-end",
         "handler-uid",
         "handler-ae",
@@ -174,6 +194,8 @@ def test_a_flagged_value_is_redacted_and_the_line_kept(
         ),
         ("pynetdicom._handlers", "    Abstract Syntax: =Verification SOP Class"),
         ("pynetdicom._handlers", "      =Implicit VR Little Endian"),
+        # pynetdicom's own placeholder where a peer sent nothing.
+        ("pynetdicom._handlers", "Their Implementation Class UID:    unknown"),
     ],
 )
 def test_a_conformant_value_and_a_line_with_no_value_pass_unchanged(
@@ -311,6 +333,12 @@ def test_the_line_shapes_the_filter_reads_are_still_pynetdicoms_and_pydicoms() -
     store_rq = inspect.getsource(_handlers._recv_c_store_rq)
     assert 'f"Affected SOP Instance UID     : {cs.AffectedSOPInstanceUID}"' in store_rq
     assert 'f"Move Originator               : {move_aet}"' in store_rq
+    from pynetdicom import pdu_primitives, presentation
+
+    assert "f\"The Transfer Syntax Name '{syntax}' is non-conformant\"" in inspect.getsource(
+        presentation
+    )
+    assert "f\"The Related General SOP Class UID '{uid}' is \"" in inspect.getsource(pdu_primitives)
 
 
 def test_the_phi_record_states_the_ruling() -> None:
@@ -403,3 +431,24 @@ async def test_the_association_request_check_writes_no_second_copy_and_no_value(
     assert _implementation_lines(unfiltered), "CONTROL: the planted UID was flagged"
     # The check decodes the request as the DUL does, so it wrote as many copies as the DUL writes.
     assert 2 * len(_implementation_lines(filtered)) == len(_implementation_lines(unfiltered))
+
+
+def test_a_long_line_costs_one_pass() -> None:
+    # A line that opens like pydicom's and never ends like it: a pattern that backtracked over the
+    # value took seconds here at 40 KB, on whatever thread logged it.
+    value = "'" + ("a. Please see <x" * 20000) + "'."
+    started = time.monotonic()
+    redacted = _filtered("pydicom", f"Invalid value for VR UR: {value}")
+    assert time.monotonic() - started < 1.0
+    assert redacted == "Invalid value for VR UR: [redacted]"
+
+
+def test_a_hold_inside_another_hands_back_to_it() -> None:
+    log = logging.getLogger("pynetdicom.utils")
+    with dicom_module._logs_held() as outer:
+        with dicom_module._logs_held() as inner:
+            log.warning("inner")
+        log.warning("outer")
+    assert [r.getMessage() for r in inner] == ["inner"]
+    assert [r.getMessage() for r in outer] == ["outer"]
+    assert getattr(dicom_module._PRE_READ, "held", None) is None

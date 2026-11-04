@@ -74,7 +74,7 @@ import warnings
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, NamedTuple, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
@@ -404,50 +404,87 @@ def _drain_readable(sock: socket.socket) -> None:
 #: association.
 _SERVED_COMMANDS = frozenset({0x0001, 0x0030})
 
-#: The line shapes, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or
-#: flags (owner ruling 2026-11-03, vault BACKLOG #5081). A match keeps ``head`` and ``tail`` and
-#: puts :data:`_REDACTED` where ``value`` was; the first that matches wins. ``pynetdicom.utils``
-#: writes ``set_uid`` and ``set_ae``: ``Non-conformant '<name>' value '<value>'`` at WARNING, and
-#: ``Invalid '<name>' value '<value>' - <reason>`` at ERROR, whose reasons are fixed strings in
-#: ``pynetdicom._validators``. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>:
-#: <repr>.`` from ``valuerep.validate_regex``, with a pointer to PS3.5 after it when a data element
-#: is read. A peer's value can hold a quote or that fixed text, so each value is greedy and runs up
-#: to the last fixed text that can follow it, and the last pattern for each logger takes all of a
-#: line of that kind whose end it does not know. pydicom can write its line after another one in
-#: the same message, so its head starts anywhere. ``pynetdicom._handlers`` writes ``<label> :
-#: <value>`` at DEBUG for each association request and DIMSE message it receives or sends; a
-#: pattern with a ``label`` group keeps a value that passes :func:`_kept`, since a real UID or AE
-#: title may be logged. At least these shapes; a line of another shape passes whole.
-_PEER_VALUE_LINES: dict[str, tuple[re.Pattern[str], ...]] = {
+
+class _Shape(NamedTuple):
+    """One kind of log line that names a peer's value. ``head`` is matched at the start of the line,
+    or found anywhere in it where ``anywhere`` is set; the value runs from there to ``tail``, the
+    fixed text the line ends with, found from its last ``anchor``. A line whose end is not ``tail``
+    loses everything after its head. No pattern here can backtrack over the peer's text, so a long
+    value costs one pass, on whatever thread logged it."""
+
+    head: re.Pattern[str]
+    anchor: str | None = None
+    tail: re.Pattern[str] | None = None
+    anywhere: bool = False
+
+
+#: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
+#: (owner ruling 2026-11-03, vault BACKLOG #5081). Each keeps its head and tail and puts
+#: :data:`_REDACTED` where the value was. ``pynetdicom.utils`` writes ``set_uid`` and ``set_ae``:
+#: ``Non-conformant '<name>' value '<value>'`` at WARNING, and ``Invalid '<name>' value '<value>' -
+#: <reason>`` at ERROR, whose reasons are fixed strings in ``pynetdicom._validators``.
+#: ``pynetdicom.presentation`` and ``pynetdicom.pdu_primitives`` write ``The <name> '<value>' is
+#: non-conformant``. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>: <repr>.``,
+#: with a pointer to PS3.5 after it when a data element is read, and sometimes after its own length
+#: message in the same line. ``pynetdicom._handlers`` writes ``<label> : <value>`` at DEBUG for each
+#: association request and DIMSE message it receives or sends; a head with a ``label`` group keeps a
+#: value that passes :func:`_kept`, since a real UID or AE title may be logged. At least these
+#: shapes; a line of another shape, or on another logger, passes whole.
+_NON_CONFORMANT_NAME = _Shape(
+    re.compile(r"The [A-Za-z ]{1,64} '"), "' is non-conformant", re.compile("' is non-conformant")
+)
+_PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
     "pynetdicom.utils": (
-        re.compile(r"^(?P<head>Non-conformant '[^']*' value ')(?P<value>.*)(?P<tail>')$", re.S),
-        re.compile(r"^(?P<head>Invalid '[^']*' value ')(?P<value>.*)(?P<tail>' - [^']*)$", re.S),
-        re.compile(
-            r"^(?P<head>(?:Non-conformant|Invalid) '[^']*' value )(?P<value>'.*)(?P<tail>)$", re.S
-        ),
+        _Shape(re.compile(r"Non-conformant '[^']*' value '"), "'", re.compile("'")),
+        _Shape(re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^']*")),
     ),
+    "pynetdicom.presentation": (_NON_CONFORMANT_NAME,),
+    "pynetdicom.pdu_primitives": (_NON_CONFORMANT_NAME,),
     "pydicom": (
-        re.compile(
-            r"^(?P<head>.*?Invalid value for VR [A-Z]{2}: )(?P<value>.*)"
-            r"(?P<tail>\. Please see <[^>]*> for allowed values for each VR\.)$",
-            re.S,
+        _Shape(
+            re.compile(r"Invalid value for VR [A-Z]{2}: "),
+            ". Please see <",
+            re.compile(r"\. Please see <[^<>]*> for allowed values for each VR\."),
+            anywhere=True,
         ),
-        re.compile(r"^(?P<head>.*?Invalid value for VR [A-Z]{2}: )(?P<value>.+)(?P<tail>)$", re.S),
     ),
     "pynetdicom._handlers": (
-        re.compile(
-            r"^(?P<head> *(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator"
-            r"|Requested SOP Class UID|Their Implementation Class UID|Application Context Name"
-            r"|Abstract Syntax|SOP Class|Service Class) *: *=?)(?P<value>.*)(?P<tail>)$",
-            re.S,
+        _Shape(
+            re.compile(
+                r" *(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator"
+                r"|Requested SOP Class UID|Their Implementation Class UID|Application Context Name"
+                r"|Abstract Syntax|SOP Class|Service Class) *: *=?"
+            )
         ),
-        # A transfer syntax, alone on its line under its context.
-        re.compile(r"^(?P<head>(?P<label>) +=)(?P<value>.*)(?P<tail>)$", re.S),
+        _Shape(re.compile(r"(?P<label>) +=")),  # a transfer syntax, alone under its context
     ),
 }
 
+#: What pynetdicom's dumps print where a peer sent no value; not a peer's value.
+_DUMP_PLACEHOLDERS = frozenset({"unknown", "none", "None"})
+
+
+def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
+    """``text`` with the peer's value in it redacted, or ``None`` where it keeps its value."""
+    for shape in shapes:
+        head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
+        if head is None:
+            continue
+        rest = text[head.end() :]
+        label = head.groupdict().get("label")
+        if label is not None and _kept(label, rest):
+            return None
+        tail = ""
+        if shape.anchor is not None and shape.tail is not None:
+            cut = rest.rfind(shape.anchor)
+            if cut >= 0 and shape.tail.fullmatch(rest, cut):
+                tail = rest[cut:]
+        return f"{text[: head.end()]}{_REDACTED}{tail}"
+    return None
+
+
 #: Every logger the filter is on: those above, and three more a pre-read of a command set writes to
-#: with no peer value in the line, ``message_to_primitive``'s WARNING for an element with more than
+#: with no peer value in the line, so that the hold covers them: ``message_to_primitive``'s WARNING for an element with more than
 #: one value, the Move Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
 _FILTERED_LOGGERS = (
     *_PEER_VALUE_LINES,
@@ -471,10 +508,14 @@ def _kept(label: str, value: str) -> bool:
     check that raises redacts the value, since a filter that raised would raise on the pynetdicom
     thread that logged the line."""
     try:
+        if value in _DUMP_PLACEHOLDERS:
+            return True
         if label == "Move Originator":
             from pynetdicom import _config as netdicom_config
 
-            return bool(netdicom_config.VALIDATORS["AE"](value)[0])
+            # A quote is not in a real title; it is in the repr of one with more than one value,
+            # which message_to_primitive flags before it takes the first.
+            return "'" not in value and bool(netdicom_config.VALIDATORS["AE"](value)[0])
         # A class or syntax is logged by its name; an instance UID never is.
         named = not label.endswith("Instance UID") and value in _uid_names()
         return named or _loggable_uid(value) == value
@@ -515,20 +556,16 @@ class _PeerValueFilter(logging.Filter):
         if held is not None:
             held.append(record)
             return False
-        patterns = _PEER_VALUE_LINES.get(record.name, ())
-        if not patterns:
+        shapes = _PEER_VALUE_LINES.get(record.name, ())
+        if not shapes:
             return True
         try:
             text = record.getMessage()
         except (TypeError, ValueError):  # bad %-args: the handler reports it, as it would anyway
             return True
-        for pattern in patterns:
-            matched = pattern.match(text)
-            if matched is None:
-                continue
-            if "label" not in pattern.groupindex or not _kept(matched["label"], matched["value"]):
-                record.msg, record.args = f"{matched['head']}{_REDACTED}{matched['tail']}", ()
-            break
+        redacted = _redacted_line(shapes, text)
+        if redacted is not None:
+            record.msg, record.args = redacted, ()
         return True
 
 
@@ -559,14 +596,22 @@ def _write_held(held: list[logging.LogRecord]) -> None:
 
 
 @contextlib.contextmanager
-def _logs_held() -> Iterator[list[logging.LogRecord]]:
-    """Hold what the filtered loggers write on this thread, and only this one, for the block."""
+def _logs_held(*, write_on_error: bool = False) -> Iterator[list[logging.LogRecord]]:
+    """Hold what the filtered loggers write on this thread, and only this one, for the block. With
+    ``write_on_error``, a block that raises has what it held written, redacted, before the raise
+    goes on. A hold inside another hands back to it on exit."""
     held: list[logging.LogRecord] = []
+    outer = getattr(_PRE_READ, "held", None)
     _PRE_READ.held = held
     try:
         yield held
+    except BaseException:
+        if write_on_error:
+            _PRE_READ.held = outer
+            _write_held(held)
+        raise
     finally:
-        _PRE_READ.held = None
+        _PRE_READ.held = outer
 
 
 def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
@@ -596,8 +641,8 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
     association: when it returns ``None``, a command the SCP does not serve, or a request that is
     not valid. Otherwise pynetdicom writes its own as it reads the message, so one the association
     ends on later for another reason, such as a data set past its bound or the message deadline,
-    has none of them; the end's own line says why it ended. :class:`_PeerValueFilter` redacts the peer's value from each line (vault
-    BACKLOG #5081)."""
+    has none of them; the end's own line says why it ended. :class:`_PeerValueFilter` redacts the
+    peer's value from each line (vault BACKLOG #5081)."""
     from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
     from pynetdicom.dsutils import decode
 
@@ -1031,13 +1076,8 @@ def _admitting_server_class() -> type[Any]:
                 first_pdu = self._read_first_pdu(sock)
                 # The checks decode the request as the DUL will, so their pynetdicom lines are held,
                 # and written only where the request is refused and the DUL never decodes it.
-                held: list[logging.LogRecord] = []
-                try:
-                    with _logs_held() as held:
-                        self._check_association_request(sock, first_pdu)
-                except BaseException:
-                    _write_held(held)
-                    raise
+                with _logs_held(write_on_error=True):
+                    self._check_association_request(sock, first_pdu)
                 # A request that sets bit 0 and other version bits as well is a version-1 request,
                 # but pynetdicom's AE-6 compares the whole field to 1 and would reject it. So the
                 # copy pynetdicom reads names version 1 alone. Nothing else in it changes.

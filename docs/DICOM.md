@@ -302,11 +302,12 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   The rule holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A
   UID or AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe
   identifier. The SCP redacts it from at least these lines, which stay with the element's name and the reason
-  while the value reads `[redacted]`: pynetdicom's non-conformant and refused value lines, pydicom's invalid value
-  line, and the UID and AE title fields of pynetdicom's DEBUG dumps of an association request and a DIMSE
-  message. A line of another shape passes whole, so a pynetdicom or pydicom upgrade must re-read them. The SCP
-  reads each association request and command set once before pynetdicom does, and the lines that read writes are
-  written only where pynetdicom will not read the same bytes again.
+  while the value reads `[redacted]`: pynetdicom's non-conformant and refused value lines, its non-conformant
+  transfer syntax and related SOP class lines, pydicom's invalid value line, and the UID and AE title fields of
+  pynetdicom's DEBUG dumps of an association request and a DIMSE message. A line of another shape, or on another
+  logger, passes whole, so a pynetdicom or pydicom upgrade must re-read them. The SCP reads each association
+  request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
+  written only where pynetdicom will not read the same bytes again; a line on any other logger is written twice.
   pydicom also raises each of its lines as a `UserWarning`, which would carry the value to stderr. A warnings
   filter, installed at import and again at each SCP start, ignores that copy; a host that resets the process's
   warnings filters after that brings the copy back. The engine's
