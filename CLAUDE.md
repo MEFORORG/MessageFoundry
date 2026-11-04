@@ -519,9 +519,9 @@ hook, required context, seat or method rule, except a fix for a red `main` or a 
 Existing machinery is still repaired, and review effort is not touched. The freeze lapses on
 2026-12-02. The drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they
 require is carrying them out, not new machinery; that reading is recorded beside the signed text
-and is not part of the signature. The signed text is vault commit `22579b250`,
-`docs/LEDGER-INFLOW-RULINGS-DRAFT.md`, now `docs/LEDGER-INFLOW-RULINGS.md` in vault PR 2818 (open on
-2026-11-04).
+and is not part of the signature. The rulings are the vault's `docs/LEDGER-INFLOW-RULINGS.md`,
+merged in vault PR 2818 as `a03b25550`. The signature covers R1-R9 as they stood at `22579b250` on
+that PR's branch.
 
 The brief is disposable. The BACKLOG item is the record.
 
@@ -720,13 +720,12 @@ Manager's watch reached the cloud session 29 seconds after its question.
   for that ruling. A finding the Lander cannot classify goes to the owner (decision
   d20261029T165623191-578690).
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
-  are filed, and nothing else in this bullet.** A merged PR files at most one row, holding all its
-  open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
-  briefed to that row's next Builder, and goes into a new row only when the PR cites none, which is
-  still the PR's one row. A finding about code the PR did not touch goes into the one open row for
+  are filed, and nothing else in this bullet.** A merged PR files at most one row, holding its open
+  findings as numbered items. Its deferred scope becomes steps on the row it cites, or is briefed to
+  that row's next Builder, and goes into a new row only when the PR cites none, which is still the
+  PR's one row. A finding about code the PR did not touch goes instead into the one open row for
   that module, as an item. The merge permission, and what goes to the owner, are unchanged. The
-  signed text is vault commit `22579b250`, `docs/LEDGER-INFLOW-RULINGS-DRAFT.md`, now
-  `docs/LEDGER-INFLOW-RULINGS.md` in vault PR 2818 (open on 2026-11-04).
+  signed text is cited under R5 above.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus

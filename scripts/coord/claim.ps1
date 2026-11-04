@@ -31,18 +31,19 @@
     original signal and it was actively misleading: a 21h claim whose holder had committed two minutes
     earlier was labelled STALE and recommended for release.
 
-    A QUIET HOLDER IS STILL NOT A REASON TO -Force, WITH ONE EXCEPTION: A BATCH'S CLAIMS (ledger ruling
-    R8, owner-signed 2026-11-04, in session: "Sign R1-R9"). R8 releases a batch whose holder has shown
-    no seat goal, commit or PR activity for 72 hours to FREE, and its claims with it. The holder is the
-    seat that took the batch, which is not always the worktree a claim names. The seat taking the
-    batch first reads those three signals for that holder: its seat record, its recent commits and
-    its pull requests. It then releases each claim through the path for another worktree's claim,
-    `-Release` with `-Force`, which records the release as the next paragraph says. That record has
-    no field for a reason, so it does not show that R8 was the ground. R8 is not an expiry: nothing
-    here releases on a clock, this script does not measure the 72 hours or tell a batch's claim from
-    any other, and a seat still reads before it releases. The signed text is vault commit
-    22579b250, docs/LEDGER-INFLOW-RULINGS-DRAFT.md, now docs/LEDGER-INFLOW-RULINGS.md in vault PR
-    2818 (open on 2026-11-04).
+    A QUIET HOLDER IS STILL NOT A REASON TO -Force, EXCEPT WHERE THE OWNER HAS RULED: A BATCH'S CLAIMS
+    (ledger ruling R8, owner-signed 2026-11-04, in session: "Sign R1-R9"). R8 returns a batch whose
+    holder has shown no seat goal, commit or PR activity for 72 hours to FREE, and its claims with
+    it. The holder is the seat that took the batch, which is not always the worktree a claim names.
+    No tool applies R8 yet. Until one does, the drafting Manager's reading, recorded beside the
+    signed text and not part of the signature, has the seat taking the batch read the holder's seat
+    record and recent commits first, then release each claim through the path for another
+    worktree's claim, `-Release` with `-Force`, which records the release as the next paragraph says.
+    That record has no field for a reason, so it does not show that R8 was the ground. This script
+    still expires nothing by itself: it does not measure the 72 hours or tell a batch's claim from
+    any other. Its refusals name R8 only in the directory-only state; where a session is, or may be,
+    in the claim's worktree, they still say to ask it first. CLAUDE.md section 5 cites the signed
+    text, under R5.
 
     EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
     <git-common-dir>/mefor-coord/claims/.history: at least the key, the releasing worktree and branch,
@@ -191,13 +192,18 @@ function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
     Write-Host "        so the $Subject" -ForegroundColor Yellow
 }
 
-# LEDGER RULING R8, stated once in the header and pointed at from every refusal that says a quiet
-# holder is no reason to -Force. Printed, never acted on: nothing here can tell a batch's claim from
-# another or read R8's three signals, so the decision stays with the seat that reads them.
+# LEDGER RULING R8, stated once in the header and pointed at from the two directory-only refusals.
+# It is framed as an OWNER RULING so that it reads as the owner having said so, which those refusals
+# already count, and not as a third reason. Only there, because only there has this host positively
+# placed no session in the claim's worktree: 'occupied' has one and says to ask it, 'present' and
+# the undated state could not look, and 'elsewhere' cannot see the holder's unpushed commits. The
+# polarity rule below applies: a missing answer must not earn the pointer. Printed, never acted on:
+# nothing here can tell a batch's claim from another or read R8's three signals.
 function Write-R8Note {
-    Write-Host "  EXCEPT a claim held for a batch whose holder has shown no seat goal, commit or PR activity"
-    Write-Host "  for 72 hours: ledger ruling R8 releases it once you have read those three signals. The"
-    Write-Host "  header of scripts\coord\claim.ps1 says how. One worktree's last commit is not R8's test."
+    Write-Host "  OWNER RULING R8 (ledger, 2026-11-04) covers one case: a claim held for a batch whose"
+    Write-Host "  holder has shown no seat goal, commit or PR activity for 72 hours returns to FREE, released"
+    Write-Host "  by the seat taking the batch. One worktree's last commit is not R8's test. The header of"
+    Write-Host "  scripts\coord\claim.ps1 says how."
 }
 
 # WHERE THE REGISTRY LIVES, resolved from the repository the claim is FOR (BACKLOG #1346).
@@ -887,7 +893,6 @@ if ($Release) {
                 Write-Host "  HOLDER IS ON $($live.Host) -- not checkable here." -ForegroundColor Yellow
                 Write-Host "  This machine cannot see that PC's worktrees, so a missing path here proves nothing."
                 Write-Host "  Do NOT -Force it from here. Check the holder on $($live.Host), or ask the owner."
-                Write-R8Note
             }
             'present' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
@@ -896,14 +901,12 @@ if ($Release) {
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
                 Write-Host "  sessions end up building the same thing."
-                Write-R8Note
             }
             'occupied' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists, a live session is IN it, and it last committed $($live.QuietHours)h ago." -ForegroundColor Red
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
                 Write-Host "  sessions end up building the same thing."
-                Write-R8Note
             }
             'unoccupied' {
                 Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
@@ -934,7 +937,6 @@ if ($Release) {
             default {
                 Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
                 Write-Host "  Confirm with that session before using -Force."
-                Write-R8Note
             }
         }
         # BACKLOG #1358, and this is the placement that earns the most. The refusal above says the claim
@@ -1152,7 +1154,6 @@ try {
             Write-Host "  HOLDER IS ON $($live.Host) -- not checkable here." -ForegroundColor Yellow
             Write-Host "  This machine cannot see that PC's worktrees. Do NOT build it in parallel and do NOT"
             Write-Host "  -Force it from here: coordinate with that session, or pick different work."
-            Write-R8Note
         }
         'gone' {
             Write-Host "  HOLDER GONE -- that worktree no longer exists on disk, so nobody is building this." -ForegroundColor Green
@@ -1167,14 +1168,12 @@ try {
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
             Write-Host "  different work. Its note above says what it is doing."
-            Write-R8Note
         }
         'occupied' {
             Write-Host "  HOLDER IS STILL THERE -- that worktree exists, a live session is IN it, and it last committed $($live.QuietHours)h ago." -ForegroundColor Red
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
             Write-Host "  different work. Its note above says what it is doing."
-            Write-R8Note
         }
         'unoccupied' {
             Write-Host "  HOLDER IS A DIRECTORY, NOT A SESSION -- that worktree exists and last committed $($live.QuietHours)h ago," -ForegroundColor Yellow
@@ -1193,7 +1192,6 @@ try {
         default {
             Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
             Write-Host "  Treat it as live: coordinate with that session before -Force."
-            Write-R8Note
         }
     }
     exit 1

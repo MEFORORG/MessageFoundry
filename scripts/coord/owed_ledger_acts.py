@@ -27,7 +27,7 @@ THE ASK. Two shapes, in a comment on a MERGED pull request by an OWNER, MEMBER o
 (every seat posts under one login, so this keeps out outside accounts, not other seats), not
 minimized:
 
-* PRIMARY, machine-readable: ``<!-- lander-ledger-ask rows=#3844,#3025 file=2 -->``. ``rows`` names
+* PRIMARY, machine-readable: ``<!-- lander-ledger-ask rows=#3844,#3025 file=1 -->``. ``rows`` names
   existing rows whose banner the Lander owes; ``file`` counts new rows to file. Either may be left
   out. It may also sit in the PR body; on a fork PR's body it prints as READ, since an outside
   account wrote it. A marker inside a code span, a fenced block or a quoted line is an example, not
