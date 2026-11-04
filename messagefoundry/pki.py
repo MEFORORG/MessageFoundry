@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import ipaddress
 import os
+import re
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -1610,8 +1611,10 @@ class IssuerIndex:
                 key = cert.public_key().public_bytes(
                     serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
                 )
-            except (ValueError, UnsupportedAlgorithm):
-                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
+            except (*_UNREADABLE_CA, UnsupportedAlgorithm):
+                # OpenSSL may load what cryptography will not; never nameable. _UNREADABLE_CA holds
+                # InvalidVersion, which is not a ValueError: a v4 CA raised it out of the build.
+                self.unreadable += 1
                 continue
             if der in seen:
                 continue  # the same certificate twice is one anchor
@@ -1632,7 +1635,7 @@ class IssuerIndex:
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
                 if _directly_issued(leaf, anchor.cert)
             ]
-        except ValueError:
+        except _UNREADABLE_CA:  # InvalidVersion, for one, is not a ValueError (BACKLOG #4948)
             return ""
         subjects = {anchor.subject for anchor in issuers}
         if len(subjects) != 1:
@@ -1663,13 +1666,23 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
+#: The two PEM labels OpenSSL's ``load_verify_locations(cadata=)`` loads a certificate from, and
+#: ``cryptography`` parses: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE`` (BACKLOG #4948).
+#: Missing the legacy one left a CA the handshake trusts out of the index, so every partner under it
+#: would have been refused, with a start warning naming the wrong cause.
+_PEM_CERTIFICATE_BEGIN = re.compile(rb"-----BEGIN (X509 )?CERTIFICATE-----")
+
+
 def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
-    """Each ``CERTIFICATE`` PEM block in ``pem``, in order."""
-    begin, end = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
+    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, each ending at
+    the next END marker of its own label. A BEGIN marker with no END of its label after it is
+    passed over, so a stray marker of one label does not hide the blocks of the other."""
     at = 0
-    while (start := pem.find(begin, at)) >= 0:
-        stop = pem.find(end, start)
+    while (begin := _PEM_CERTIFICATE_BEGIN.search(pem, at)) is not None:
+        end = b"-----END " + (begin[1] or b"") + b"CERTIFICATE-----"
+        stop = pem.find(end, begin.start())
         if stop < 0:
-            return
+            at = begin.end()
+            continue
         at = stop + len(end)
-        yield pem[start:at]
+        yield pem[begin.start() : at]
