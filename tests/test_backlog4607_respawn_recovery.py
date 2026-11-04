@@ -17,6 +17,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from tests.test_task_resilience import (
     _control_ids,
     _hl7,
     _inflight_rows,
+    _pending_at,
     _start_runner,
     _until,
     _until_async,
@@ -37,15 +39,6 @@ from tests.test_task_resilience import (
 
 class _Kill(BaseException):
     """Not an ``Exception``, so no worker's ``except Exception`` arm catches it."""
-
-
-async def _pending_at(store: MessageStore, stage: Stage) -> int:
-    cur = await store._db.execute(
-        "SELECT COUNT(*) AS c FROM queue WHERE stage=? AND status='pending'", (stage.value,)
-    )
-    row = await cur.fetchone()
-    assert row is not None
-    return int(row["c"])
 
 
 class _Killer:
@@ -217,7 +210,7 @@ async def test_a_pooled_serializer_killed_mid_handoff_is_respawned_and_its_lane_
         assert await _inflight_rows(store) == 0
         assert dispatcher.busy_violations == 0
         assert dispatcher.slots_free == dispatcher._max_processing_lanes
-        assert dispatcher._states[lane].serializer_deaths == 0
+        assert dispatcher._states[lane].serializer_deaths.count == 0
     finally:
         await runner.stop()
         await store.close()
@@ -244,6 +237,28 @@ async def test_a_row_that_kills_every_pooled_serializer_stops_its_lane_under_the
         assert await _inflight_rows(store) == 0
         assert await _pending_at(store, Stage.INGRESS) == 2
         assert dispatcher.slots_free == dispatcher._max_processing_lanes
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_rows_a_dying_serializer_noted_beyond_its_prefix_are_re_pended_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batching outbound claims its coalesced members itself, outside the serializer's prefix.
+    When a ``BaseException`` kills it, the body records them (``note_held``) and the replacement
+    dates them with the prefix; a fresh claim starts with none."""
+    store, runner, _ = await _start_runner(tmp_path, "pooled")
+    try:
+        dispatcher = runner._dispatchers[Stage.OUTBOUND]
+        st = dispatcher._states["OB"]
+        dispatcher.note_held("OB", ["extra-1", "extra-2"])
+        item: Any = SimpleNamespace(id="head-1")
+        _, dated = dispatcher._dead_serializer_outcome("OB", [item])
+        assert dated == ["head-1", "extra-1", "extra-2"]
+        monkeypatch.setattr(dispatcher, "_start_serializer", lambda *a, **k: None)
+        dispatcher._spawn_serializer("OB", [item])
+        assert st.held_extra_ids == []
     finally:
         await runner.stop()
         await store.close()

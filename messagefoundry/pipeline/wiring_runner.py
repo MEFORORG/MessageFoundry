@@ -117,7 +117,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
-from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
+from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun, is_emission
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.netaddr import (
@@ -6742,7 +6742,7 @@ class RegistryRunner:
         respawn, and one traceback per death would flood the log."""
         exc = task.exception()
         claims = self._lane_claims.get((kind, name))
-        if exc is None or claims is None:  # not spawned through _start_lane_worker
+        if exc is None or claims is None:  # a task installed without _start_lane_worker
             log.error("%s worker %r exited unexpectedly; respawning", kind, name, exc_info=exc)
             return
         claims.deaths = claims.deaths.record(
@@ -6822,7 +6822,9 @@ class RegistryRunner:
         if self._stop.is_set():
             return
         if claims.ids:
-            log.warning(
+            # On the death log's own schedule, so a row that kills every worker does not flood it.
+            log.log(
+                logging.WARNING if is_emission(max(claims.deaths.count, 1)) else logging.DEBUG,
                 "%s worker %r: re-pending %d row(s) its predecessor died holding, before its first "
                 "claim",
                 kind,
@@ -9148,7 +9150,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=lambda: not self._lane_may_deliver(name),
+                    abandon=self._hold_abandon("delivery", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -9669,7 +9671,7 @@ class RegistryRunner:
                     name,
                     extras,
                     fence=fence,
-                    abandon=lambda: not self._lane_may_deliver(name),
+                    abandon=self._hold_abandon("delivery", name),
                     give_up_after=(
                         self._infra_fault_stop_after if self._infra_fault_policy == "stop" else None
                     ),
@@ -9684,9 +9686,10 @@ class RegistryRunner:
                         held.name.lower(),
                     )
             raise
+        except asyncio.CancelledError:
+            raise  # teardown: the rows wait for the next start
         except BaseException:
-            # #4607: a death no except arm catches (a cancel included, whose rows wait for the next
-            # start anyway). No write here: the extras go on to whoever re-pends the dead task's
+            # #4607: a death no except arm catches. No write here: the extras go on to whoever re-pends the dead task's
             # rows, the per_lane worker's replacement or the pooled serializer's.
             extras = [it.id for it in members[1:]]
             if extras_out is not None:
@@ -10097,7 +10100,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=functools.partial(self._inbound_log_halted, name),
+                    abandon=self._hold_abandon("inbound", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -10458,7 +10461,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=functools.partial(self._inbound_log_halted, name),
+                    abandon=self._hold_abandon("inbound", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -10598,7 +10601,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=functools.partial(self._inbound_log_halted, name),
+                    abandon=self._hold_abandon("inbound", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -11542,9 +11545,9 @@ class RegistryRunner:
         the handoff leaves the row ``inflight``. Part A made the per-lane workers re-pend it, and the
         pooled dispatcher already did (T17). Both re-pends are store writes that can fail too, so
         since step 2 each retries its write while holding the lane. A store that stays down keeps
-        the row in flight for as long as it stays down, and a worker killed by a ``BaseException``
-        leaves its row to ``reset_stale_inflight`` at the next start. Such a row is invisible to
-        ``pending_depth``, so the buildup and stall alerts read the lane healthy, and those alerts
+        the row in flight for as long as it stays down, and so does a dead worker's replacement
+        whose re-pend of the rows it inherited keeps failing (BACKLOG #4607). Such a row is
+        invisible to ``pending_depth``, so the buildup and stall alerts read the lane healthy, and those alerts
         only run from the lane's own processing path, which a strand has stopped. This check runs on
         its own clock and reads in-flight rows directly, so it pages whichever recovery is waiting.
 

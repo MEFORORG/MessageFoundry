@@ -19,8 +19,8 @@ the two ``pooled`` rows of P3-03's measured table as failure-injection tests:
 Step 2 part A recovers it with no restart and no clock: a holder whose re-pend fails retries it
 while it holds the lane, leader-gated after the first write. The last tests show it in both claim
 modes, in FIFO order, with a control that restores the one-shot re-pend and goes red; the leader
-gate; and a prompt stop. A worker killed by a ``BaseException`` still strands its row until the next
-start, as before; recovering it at the worker's respawn is part B, not here.
+gate; and a prompt stop. A worker killed by a ``BaseException`` is recovered at its respawn, part B
+(BACKLOG #4607), whose tests are ``tests/test_backlog4607_respawn_recovery.py``.
 """
 
 from __future__ import annotations
