@@ -96,8 +96,13 @@ def test_the_builder_sends_both_credentials_unbraced() -> None:
 def test_no_fragment_of_an_unbraced_credential_reaches_a_log_surface(
     surface: str, apply: Callable[[str], str]
 ) -> None:
-    out = apply(_dsn())
-    survivors = [fragment for fragment in _FRAGMENTS if fragment in out]
+    dsn = _dsn()
+    # The count guard: an absence below means something only if the input carried every fragment.
+    planted = [fragment for fragment in _FRAGMENTS if fragment in dsn]
+    assert planted, f"no fragment to look for in {dsn!r}"
+    assert planted == list(_FRAGMENTS), f"the builder dropped some fragments -- {dsn!r}"
+    out = apply(dsn)
+    survivors = [fragment for fragment in planted if fragment in out]
     assert not survivors, f"{surface}: {survivors} survived -- {out!r}"
     # The labels stay, so a reader still sees which credential it was, and the members around them
     # are not swallowed.
@@ -147,9 +152,11 @@ def _planted(line: str) -> list[str]:
 
 @pytest.mark.parametrize("line", _SHAPES_THE_FIRST_DRAFT_PRINTED)
 def test_no_planted_value_reaches_a_log_surface(line: str) -> None:
+    planted = _planted(line)
+    assert planted, f"{line!r} plants no fragment, so nothing could be seen printing"
     for surface, apply in _SURFACES:
         out = apply(line)
-        printed = [f for f in _planted(line) if f in out]
+        printed = [f for f in planted if f in out]
         assert not printed, f"{surface}: {printed} printed -- {out!r}"
 
 
