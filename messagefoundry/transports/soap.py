@@ -207,8 +207,10 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     or ``Value`` outside it, in the Header say, does not decide the fault's class. A self-closing
     Fault holds no code. The first ``faultcode`` or ``Value`` start tag in that range is the code
     element: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may carry an
-    element of the other name. Only that first tag can be the answer: a later start tag's ``>`` is
-    no earlier than its, so if it has no ``>`` or no ``</`` after it, no later one has either."""
+    element of the other name. Only that first tag is read. Where it has no ``>`` or no ``</``
+    after it, no later one has either, since a later start tag's ``>`` is no earlier than its.
+    Where it cannot hold a code, a later tag is still not tried: that is a choice, so the code
+    stays the Fault's first code element."""
     if fault is None:
         fault = _FAULT_RE.search(body)
         if fault is None:

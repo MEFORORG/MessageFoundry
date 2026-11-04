@@ -150,8 +150,8 @@ at least `.`, `-` or `:`, such as `<faultcode.detail>` or `<Value-x>`, matches t
 the next `>` after a match to the next `</`, with `str.find`. Which match it reads, inside the Fault
 `_FAULT_RE` matched, and when it yields an empty code instead, the `_fault_code` and `_code_text`
 docstrings say. *(Corrected 2026-11-04, for the fault-code sentences: until BACKLOG #2827 made
-the scan linear, the two patterns captured the code text themselves, from the first match anywhere in
-the reply, the Header included, and an empty `<faultcode/>` took the next element's text as its code.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
+the scan linear, the two patterns captured the code text themselves, from the first faultcode anywhere
+in the reply, else the first Value, the Header included, and an empty `<faultcode/>` took the next element's text as its code.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
 `tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports

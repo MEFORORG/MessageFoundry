@@ -10,8 +10,8 @@ Three things are pinned here: what the new extraction reads, its time grows line
 classification runs in the worker thread. The old patterns are kept below, verbatim, as the positive
 control for the second, and inside the reference for the first.
 
-The new extraction is NOT the old one everywhere. The old patterns read the first code anywhere in
-the reply, the Header included, and an empty ``<faultcode/>`` took the next element's text as its
+The new extraction is NOT the old one everywhere. The old patterns read the first faultcode anywhere
+in the reply, else the first Value, the Header included, and an empty ``<faultcode/>`` took the next element's text as its
 code. Both could make a permanent fault read as a Receiver one and retry for ever; the named tests
 below pin each, with a control.
 
@@ -129,6 +129,11 @@ _NAMED_SHAPES = {
     "nested": ("<Fault><faultcode><b>soap:Client</b></faultcode></Fault>", ""),
     "self-closing": ("<Fault><faultcode/>x</y>", ""),
     "foreign-close": ("<Fault><faultcode>soap:Server</faultstring></Fault>", ""),
+    "processing-instruction": (
+        "<Fault><faultcode><?pi?>soap:Server</faultcode></Fault>",
+        "<?pi?>soap:Server",
+    ),
+    "spaced-self-closing-fault": ("<Fault /><faultcode>soap:Server</faultcode>", ""),
     "no-gt": ("<Fault><faultcode", ""),
     "no-close": ("<Fault><faultcode>soap:Client", ""),
     "code-outside-any-fault": ("<faultcode>soap:Server</faultcode>", ""),
@@ -253,7 +258,7 @@ _FRAGMENTS = (
 
 
 def test_random_replies_yield_the_reference_reading() -> None:
-    """The argument is in ``_code_text``'s docstring; this samples it against the regex reference.
+    """The argument is in ``_fault_code``'s docstring; this samples it against the regex reference.
     Seeded, so a failure replays."""
     rng = random.Random(2827)
     for _ in range(5_000):
