@@ -11,8 +11,10 @@ Backend-parametrized exactly like ``tests/test_claim_fifo_heads.py`` (SQLite alw
 Postgres gated on ``MEFOR_TEST_*`` — the merge rider makes row 5 run on the live SS + PG CI legs), so
 the stub ``process_item`` performs the **real** head store write per outcome (RESOLVED leaves the
 claimed row INFLIGHT; RETRY ``mark_failed``s; STOP leaves the head INFLIGHT) — the SS/PG legs then
-exercise a faithful queue, not a fiction. A test whose every claim comes from ``_ClaimShim`` is
-parametrized to SQLite alone, since a server param would claim nothing from it (BACKLOG #4915).
+exercise a faithful queue, not a fiction. Two tests whose every arm BACKLOG #4915 moved onto
+``_ClaimShim``, and which read nothing else from the store, are parametrized to SQLite alone. Other
+shim-driven tests keep the server params where they still read the store, a drain's pending check
+for one.
 
 **Clock model (subtle, load-bearing).** The dispatcher drives ALL its time decisions off the injected
 :class:`ManualClock` — the claim's due-ness (it passes ``now=clock()`` to ``claim_fifo_heads``), the
@@ -344,7 +346,7 @@ class _ClaimShim:
     ``times`` intercepts more than one round-trip — needed to test anything whose unit IS the
     round-trip (BACKLOG #1270's log throttle). It defaults to 1, so every existing mode fires once.
 
-    ``real_claims`` counts the calls it passed to the real store, for any lane. An arm that must run
+    ``real_claims`` counts the calls it passed on to the store it wraps, for any lane. An arm that must run
     NO real claim asserts it is 0, which fails if the intercept missed (BACKLOG #4915). ``_remaining`` could not
     say that: the first claim of a target lane always spends it, whatever ran after."""
 
@@ -1551,10 +1553,13 @@ async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
     stub = RecordingStub(store, mc.time)
     abort_lane, quiet_lane = "IB_WINDOW_ABORT", "IB_WINDOW_QUIET"
     await _seed(store, abort_lane, [100.0])
-    # `times=5` so every round-trip the shim intercepts aborts; `quiet_lane` is NOT a target, so a
-    # round-trip driven on it alone falls through to the real store and is a genuine CLEAN claim.
+    # `times=5` so every round-trip the shim intercepts aborts. `quiet_lane` is NOT its target; an
+    # outer shim answers it with a plain EMPTY, a CLEAN claim with no store round-trip. A real SQL
+    # Server claim of that unseeded lane may legally answer with a 1222 and break the sum below
+    # (BACKLOG #4915).
     shim = _ClaimShim(store, abort_lane, mode="lock_timeout_once", times=5)
-    d = _make(shim, stub, set(), clock=mc)
+    quiet = _ClaimShim(shim, quiet_lane, mode="empty_once", times=_EVERY_CLAIM)
+    d = _make(quiet, stub, set(), clock=mc)
     await d.start()
     try:
         with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
@@ -1603,6 +1608,7 @@ async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
             f"a lane NAME reached the log — a lane is a destination_name (PHI): {lines!r}"
         )
         assert d.busy_violations == 0
+        assert shim.real_claims == 0, "a claim reached the real store"
     finally:
         await d.stop()
 

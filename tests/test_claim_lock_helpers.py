@@ -4,8 +4,11 @@
 
 The helpers run only on the hosted SQL Server legs, where a failure in their cleanup shows up as a
 hang in the NEXT test rather than in the one that failed. These stand-ins drive the failure paths a
-live server never offers on demand: a ROLLBACK that raises, and a cancellation mid-statement. Each
-must still hand the connection back to the pool, and close the cursor before its connection."""
+live server never offers on demand: a ROLLBACK that raises, and a cancellation while the lock is
+being taken. Each must still hand the connection back to the pool, and close the cursor before its
+connection. The stand-in raises before any gated pyodbc call is running, so the gate's deferred close
+behind a running statement is not driven here; ``tests/test_backlog2049_sqlserver_cancel_handle_free.py``
+drives that path."""
 
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.odbc_call_gate import call_gate
 from tests._claim_lock_helpers import ss_hold_row_lock, ss_release_row_lock
 
 
@@ -111,6 +115,7 @@ async def test_a_clean_release_rolls_back_and_recycles_the_connection() -> None:
     held_conn, held_cur = await ss_hold_row_lock(store, "m1", "ingress")
     await ss_release_row_lock(store, held_conn, held_cur)
     assert cur.statements[-1] == "ROLLBACK TRAN"
+    assert call_gate(conn) is not None, "the hold must gate the connection it may have to discard"
     assert store._pool.released == [conn]
     assert conn._conn is not None, "a clean release must not discard the connection"
     assert closed == ["cursor"]

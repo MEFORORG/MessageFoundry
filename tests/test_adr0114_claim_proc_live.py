@@ -34,7 +34,7 @@ import pytest
 from messagefoundry.config.settings import load_settings
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import ClaimAbortPhase, OutboxStatus, Stage
+from messagefoundry.store.store import OutboxStatus, Stage
 from tests._claim_lock_helpers import (
     assert_skip_named,
     claim_heads_no_block,
@@ -265,11 +265,6 @@ async def test_ac11_no_match_parity_oversized_lane_lives(proc_store: SqlServerSt
     assert sum(len(v) for v in control.by_lane.values()) == 1
 
 
-def _head_phase_abort(res: Any) -> bool:
-    """A claim that aborted on 1222 before its fetch, so it read no row and no head-skip marker."""
-    return res.lock_timeout is not None and res.lock_timeout.phase is ClaimAbortPhase.HEAD
-
-
 async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     proc_store: SqlServerStore,
 ) -> None:
@@ -282,12 +277,12 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     The lock is taken on the fifo index key, the shape every real contender holds, so the READPAST
     probe skips it rather than waiting on it.
 
-    A HEAD-phase 1222 abort is the one other legal answer, but it comes before the fetch, names no
-    lane and never reads the marker, so a pass on it proves nothing about the ``_v2`` CALL. Each
-    abort is a full rollback, so the claim is re-issued past it, and the test FAILS if every attempt
-    aborts that way (BACKLOG #4915). It used to pass on that route with only a UserWarning. Any abort
-    seen on the way still rides out as a warning, so a re-issue never hides one. A FINALIZE-phase
-    abort comes after the fetch, so it read the marker and is judged by ``assert_skip_named``."""
+    A 1222 abort is the one other legal answer. One that came before the fetch names no lane and
+    never read the marker, so a pass on it proves nothing about the ``_v2`` CALL. Each abort is a
+    full rollback, so the claim is re-issued until it completes or names the lane, and the test FAILS
+    if no attempt does (BACKLOG #4915). It used to pass on that route with only a UserWarning. An
+    abort that did name the lane read the marker and is judged by ``assert_skip_named``. Every abort
+    seen, the last attempt's included, still rides out as a warning, so a re-issue never hides one."""
     lane = "IB_V2_HEADSKIP"
     mids = [
         await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|SKIP|{t}", now=t)
@@ -308,20 +303,24 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
             attempts.append(attempt)
             return attempt
 
-        res = await claim_past_empty_yield(_claim, done=lambda r: not _head_phase_abort(r))
+        def _read_the_marker(r: Any) -> bool:
+            return r.lock_timeout is None or lane in r.head_skipped
+
+        res = await claim_past_empty_yield(_claim, done=_read_the_marker)
         assert all(a.by_lane == {} and a.rearm == frozenset() for a in attempts)
-        assert not _head_phase_abort(res), (
-            f"all {len(attempts)} claims aborted on 1222 before their fetch ({res.lock_timeout!r}),"
-            " so the _v2 head-skip marker was never read and this test proved nothing about it"
+        assert _read_the_marker(res), (
+            f"all {len(attempts)} claims aborted on 1222 without naming the lane"
+            f" ({res.lock_timeout!r}), so the _v2 head-skip marker was never read and this test"
+            " proved nothing about it"
         )
-        aborts = len(attempts) - 1
+        aborts = sum(a.lock_timeout is not None for a in attempts)
         assert_skip_named(res, lane, abort_ok=False)
         if aborts:
             # Re-issued past, so say so in the warnings summary: a 1222 nobody sees is the defect
             # class BACKLOG #1270 is about, and a re-issue must not become one.
             warnings.warn(
-                f"the _v2 head-skip test re-issued its claim past {aborts} 1222 abort(s) before the"
-                " marker was read",
+                f"the _v2 head-skip test saw {aborts} 1222 abort(s) in {len(attempts)} claim(s)"
+                " before the marker was read",
                 stacklevel=1,
             )
         rows = await ss_lane_pending(proc_store, lane)

@@ -180,9 +180,7 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
             await asyncio.wait_for(asyncio.shield(claim), timeout=1.0)
         assert not claim.done()  # BLOCKED on the locked head — did NOT skip to a later seq
     finally:
-        await lock_cur.execute("ROLLBACK TRAN")  # release the head lock
-        await lock_cur.close()
-        await ss_store._pool.release(lock_conn)
+        await ss_release_row_lock(ss_store, lock_conn, lock_cur)  # release the head lock
 
     items = await asyncio.wait_for(claim, timeout=10.0)
     assert items and items[0].message_id == head_id
