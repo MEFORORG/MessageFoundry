@@ -1255,7 +1255,10 @@ the context they dial with and `expiry_relaxed=True` to `RevocationHopGuard.capt
 CRL credit and names `EXPIRY_RELAXED_WAYS_ACROSS` as the remedy, and at least REST, SOAP and FHIR hand
 the guard no context or opener (ADR 0173 §13 and its §4.3 note of 2026-11-03). A new call site passes
 the flag. A connector that takes the setting and hands the guard its relaxed context without the flag
-lets a stale CRL admit the hop (vault BACKLOG #5086). CORRECTED 2026-10-30:
+earns no CRL credit either, since vault BACKLOG #5086 made `capture` read the time-validity flag off
+the context itself; it gets the same refusal and remedy. CORRECTED 2026-11-04: this said such a
+connector "lets a stale CRL admit the hop (vault BACKLOG #5086)", which stopped being true once
+#5086 landed. CORRECTED 2026-10-30:
 this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
 true once the call sites handed the guard no context or opener for such a hop, so it earns no CRL
 credit (on MLLP and the DICOM C-STORE SCU since vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`

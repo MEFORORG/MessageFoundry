@@ -117,6 +117,7 @@ __all__ = [
     "RestDestination",
     "ech_readdressed_request",
     "capture_response_headers",
+    "ech_sidecar_is_cleartext",
     "ech_sidecar_url_from_settings",
     "egress_route_from_settings",
     "proxy_auth_handler_from_settings",
@@ -1590,7 +1591,9 @@ def refuse_unrevoked_verified_hop(
       the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
       checks that peer's certificate (vault BACKLOG #2188 for the REST destination, #2169 for the
       SMART and OAuth2 token hop).
-    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` is required there too.
+    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` was required there too until
+      vault BACKLOG #5086, since when ``capture`` gives such a context's CRL no credit itself, so
+      passing the opener gives the same disposition; the shipped callers still pass ``None``.
       :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` sets
       ``X509_V_FLAG_NO_CHECK_TIME`` on its context, and OpenSSL applies that flag to a CRL's
       validity window as well as the certificate's: a CRL past ``nextUpdate`` is then accepted at
@@ -2529,10 +2532,11 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     recovers it — ADR 0139.) It is
     NOT a forward proxy: a proxy would tunnel ``https`` via CONNECT and the engine's own non-ECH
     ClientHello would still leak the SNI. Instead the REST destination sends its request to the sidecar
-    over **cleartext loopback** with the real destination in the ``Host`` header (see
+    over **loopback** with the real destination in the ``Host`` header (see
     :meth:`RestDestination._ech_request`), and the sidecar re-originates the ``https`` + ECH connection —
     verifying the upstream cert. So **destination TLS (verification + ECH) is delegated to the sidecar**;
-    the engine→sidecar hop is same-host cleartext (ADR 0092 loopback posture).
+    the engine→sidecar hop is same-host (ADR 0092 loopback posture), and cleartext on an ``http``
+    sidecar, a listed loosening (:func:`ech_sidecar_is_cleartext`).
 
     Config fails closed: ``ech_egress`` set with no ``ech_sidecar`` raises, and a **non-loopback** sidecar
     is refused (a remote "sidecar" would leak the SNI on the hop to it, defeating the purpose).
@@ -2565,6 +2569,18 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
         )
     return sidecar.rstrip("/")
+
+
+def ech_sidecar_is_cleartext(sidecar: str) -> bool:
+    """Whether a sidecar URL :func:`ech_sidecar_url_from_settings` accepted is cleartext ``http``.
+
+    The one rule the construction WARNING in :class:`RestDestination` and the
+    ``config.wiring.ech_cleartext_sidecar_hops`` reader apply. It reads the scheme by the split the
+    resolver used, never a string prefix, so the two cannot read one value differently. What such
+    a hop carries, and why it is listed although it is loopback, is in
+    ``docs/SECURITY-LOOSENING.md``."""
+    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
+    return parsed.scheme == "http"
 
 
 def ech_readdressed_request(
@@ -2832,8 +2848,9 @@ class RestDestination(DestinationConnector):
         self._connection_name = config.name
         self._header_rule = dynamic_header_rule(scheme, self.url, verify_tls=verify)
         if self._ech_sidecar is not None:
-            # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
-            # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
+            # ECH mode (ADR 0139): the engine->sidecar hop is loopback, cleartext on an http sidecar (the
+            # sidecar owns destination TLS + ECH + cert verification), so a plain no-redirect opener
+            # carries it —
             # never the verify/proxy/insecure opener built above for a direct destination hop.
             # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
@@ -2860,6 +2877,18 @@ class RestDestination(DestinationConnector):
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
                 connection=config.name,
+            )
+        if self._ech_sidecar is not None and ech_sidecar_is_cleartext(self._ech_sidecar):
+            # After every refusal above, so only a connection that builds is recorded. Names the
+            # connection and never a header value (docs/SECURITY-LOOSENING.md, `ech_sidecar`).
+            logger.warning(
+                "cleartext ECH sidecar hop — connection %s; the engine-to-sidecar hop is http on "
+                "this host, so the request body and every request header, any credential included, "
+                "cross it unencrypted, and on a SMART or OAuth2 connection so does the token-endpoint "
+                "request with its client credential; the sidecar does the partner TLS (ADR 0139). "
+                "An https sidecar listener encrypts this hop; see docs/SECURITY-LOOSENING.md, "
+                "ech_sidecar",
+                audit_connection_name(config.name),
             )
 
     def _ech_request(

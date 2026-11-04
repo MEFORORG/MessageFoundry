@@ -1312,29 +1312,36 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
-        "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+        "the store (and optionally the config bundle), or with --config-to alone a CONFIG-ONLY "
+        "archive's config bundle. REFUSES to overwrite anything (ADR 0049, #60)",
         epilog=RESTORE_ROLLBACK_NOTICE,
         formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
+    # Vault BACKLOG #5233: --to is not argparse-required, because a CONFIG-ONLY archive (a server-DB
+    # store's backup) carries no store for it to name. `_restore` refuses a run with neither.
     restore.add_argument(
         "--to",
-        required=True,
+        default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused",
+        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
+        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "whose bundle --config-to restores alone",
     )
     restore.add_argument(
         "--config-to",
         default=None,
         help="also restore the archive's config bundle into this directory (must be empty or absent). "
-        "Refused when the archive carries no config bundle, or when one of its members would be "
-        "written over the store this restore places at --to",
+        "Without --to, restore ONLY the config bundle of a CONFIG-ONLY archive (backup --config-only, "
+        "or a server-DB store's backup); an archive that carries a store is then refused. Refused "
+        "when the archive carries no config bundle, or when one of its members would be written over "
+        "the store this restore places at --to",
     )
     restore.add_argument(
         "--service-config",
         default=None,
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
-        "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
+        "There is deliberately no --db here (unlike backup / restore-verify): --to, when given, IS the store path "
         "this writes, and the decrypt key comes from [store] regardless of any path",
     )
     # BACKLOG #2614: a restore undoes every account change made after the archive was taken, so an
@@ -3300,6 +3307,7 @@ def _serve(args: argparse.Namespace) -> int:
         attested_hops=(),
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
+        ech_cleartext_sidecar_hops=(),
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
@@ -3320,7 +3328,9 @@ def _serve(args: argparse.Namespace) -> int:
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, tls_check_hostname, "
             "url_query_credential, "
             "generic-ODBC "
-            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173) and FHIR update_url_form declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
+            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
+            "loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -11198,6 +11208,10 @@ def _backup(args: argparse.Namespace) -> int:
         "snapshot_method": result.snapshot_method,
         "key_id": result.key_id,
         "config_fingerprint": result.config_fingerprint,
+        # With `config_skipped_files` below, what says whether the archive holds every config file
+        # the walk listed (vault BACKLOG #5233).
+        "config_bundled": result.config_bundled,
+        "config_bundle_error": result.config_bundle_error,
         "snapshot_sha256": result.snapshot_sha256,
         "row_counts": result.row_counts,
         "verify": result.verify.status if result.verify is not None else "skipped",
@@ -11207,6 +11221,9 @@ def _backup(args: argparse.Namespace) -> int:
         payload["staging_leftover"] = result.staging_leftover
     if result.config_unreadable_files:  # vault BACKLOG #3765: the digest covers the rest
         payload["config_unreadable_files"] = list(result.config_unreadable_files)
+    if result.config_skipped_files:  # vault BACKLOG #5233: what the archive does not carry
+        payload["config_skipped_files"] = list(result.config_skipped_files)
+        payload["config_skipped_count"] = result.config_skipped_count
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -11215,17 +11232,23 @@ def _backup(args: argparse.Namespace) -> int:
             f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
         )
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+        print(
+            f"  config_bundled={result.config_bundled} "
+            f"config_bundle_error={result.config_bundle_error}"
+        )
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
-        if result.config_unreadable_files:
-            from messagefoundry.config.fingerprint import describe_left_out
-            from messagefoundry.controlchars import scrub_log_argument
+        from messagefoundry.config.fingerprint import describe_left_out
+        from messagefoundry.controlchars import scrub_log_argument
 
-            left_out = describe_left_out(result.config_unreadable_files)
-            print(
-                f"WARNING: the config fingerprint left out {scrub_log_argument(left_out)}",
-                file=sys.stderr,
-            )
+        for what, files, total in (
+            ("fingerprint", result.config_unreadable_files, len(result.config_unreadable_files)),
+            ("bundle", result.config_skipped_files, result.config_skipped_count),
+        ):
+            if files:
+                left_out = scrub_log_argument(describe_left_out(files))
+                more = f" ({total} in all)" if total > len(files) else ""
+                print(f"WARNING: the config {what} left out {left_out}{more}", file=sys.stderr)
     return 0
 
 
@@ -11597,16 +11620,28 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
 
 
 def _restore(args: argparse.Namespace) -> int:
-    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
+    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``),
+    or with ``--config-to`` and no ``--to`` the config bundle of a CONFIG-ONLY archive (vault BACKLOG
+    #5233).
 
     The engine could write an archive and verify one, and had no way to restore one; ADR 0048's cold seed
     is the consumer (restore here, then activate onto the restored store). Verifies the archive first and
-    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
-    overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
-    counts, fingerprints — never a body or key bytes)."""
+    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. A config-only
+    archive carries no store, so ``--to`` refuses one, and ``--config-to`` alone writes its config
+    bundle instead. **Never overwrites:** an existing destination is refused rather than clobbered.
+    PHI-safe output (paths, counts, fingerprints — never a body or key bytes)."""
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.pipeline.dr_backup import BackupError, run_restore
+    from messagefoundry.pipeline.dr_backup import (
+        RESTORE_NEEDS_A_DESTINATION,
+        BackupError,
+        run_restore,
+    )
 
+    # Before the settings load, so a broken service config cannot hide this usage error.
+    if args.to is None and args.config_to is None:
+        return _emit_error(
+            f"restore failed (destination): {RESTORE_NEEDS_A_DESTINATION}", as_json=args.json
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -11651,6 +11686,8 @@ def _restore(args: argparse.Namespace) -> int:
         "sessions_revoked": result.sessions_revoked,
         # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
         # prints it.
+        # Carried on the config-only route too (vault BACKLOG #5233): it places no store, but the
+        # store it sends the operator to restore by other means rolls back the same changes.
         "rollback_notice": RESTORE_ROLLBACK_NOTICE,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
@@ -11662,6 +11699,18 @@ def _restore(args: argparse.Namespace) -> int:
     }
     if args.json:
         _print_json(payload, compact=True)
+    elif result.store_path is None:
+        print(
+            f"OK: restored the config bundle of the CONFIG-ONLY archive {args.archive}: "
+            f"{result.config_files} file(s) into {result.config_dir}"
+        )
+        print(f"  encrypted={result.encrypted} key_id={result.key_id}")
+        print(f"  archive taken {payload['archive_created_at']}")
+        print(
+            "  It carries no store. Restore the store by other means: a whole-store archive with "
+            "--to, or on a server-DB store the DBA's own backup. That restore rolls back the store: "
+            f"{RESTORE_ROLLBACK_NOTICE}"
+        )
     else:
         print(f"OK: restored {result.store_path} ({result.store_bytes} bytes) from {args.archive}")
         print(
@@ -12540,6 +12589,7 @@ def _security(args: argparse.Namespace) -> int:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
+                ech_cleartext_sidecar_hops=(),
                 api=_api,
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
@@ -12581,7 +12631,8 @@ def _security(args: argparse.Namespace) -> int:
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "
             "tls_hop_attested, "
-            "tls_revocation_attested and FHIR update_url_form declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
+            "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+            "NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
             "reading, its start-up reading (launch flags, start-up code, writable site "

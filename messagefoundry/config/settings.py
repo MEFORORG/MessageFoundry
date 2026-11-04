@@ -7045,8 +7045,9 @@ class BackupSettings(_Section):
     # "vacuum_into" (default; defragmented copy) | "online_backup" (page-for-page copy). Neither holds
     # the store write lock for the copy (BACKLOG #1937). See ADR 0049 §"New store surface".
     snapshot_method: str = "vacuum_into"
-    # Bundle the loaded --config dir into the archive (so the cold seed is self-sufficient — store + the
-    # config that interprets it — without assuming the DR box can reach the org git repo, ADR 0048).
+    # Bundle the loaded --config dir into the archive, so the cold seed can carry the store + the config
+    # that interprets it without assuming the DR box can reach the org git repo (ADR 0048). When it
+    # holds every config file is in the include_config row of docs/CONFIGURATION.md (vault #5233).
     include_config: bool = True
     # Run the lightweight restore-verify after every backup (open + integrity_check + row-count). On by
     # default — a backup nobody has opened is a backup that silently doesn't restore.
@@ -10056,6 +10057,7 @@ def security_loosenings(
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
     path_form_fhir_hops: Sequence[str],
+    ech_cleartext_sidecar_hops: Sequence[str],
     api: ApiSettings,
     approvals: ApprovalsSettings,
     cert_monitor: CertMonitorSettings,
@@ -10102,8 +10104,9 @@ def security_loosenings(
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
     ``DATABASE`` hop
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24),
-    ``tls_revocation_attested`` (ADR 0173) and a ``FHIR()`` outbound set to
-    ``update_url_form="path"`` (vault BACKLOG #2571) -- the store principal's OBSERVED privilege posture
+    ``tls_revocation_attested`` (ADR 0173), a ``FHIR()`` outbound set to
+    ``update_url_form="path"`` (vault BACKLOG #2571) and a ``REST`` outbound sending through an
+    ``http://`` ECH sidecar (ADR 0139) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
     the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
     interpreter (vault BACKLOG #2701), the OBSERVED environment of its own Windows service (vault
@@ -10219,7 +10222,8 @@ def security_loosenings(
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
-    ``update_url_form="path"`` (vault BACKLOG #2571). They arrive as
+    ``update_url_form="path"`` (vault BACKLOG #2571), and ``ech_cleartext_sidecar_hops`` is a
+    ``REST`` outbound whose ECH sidecar is an ``http://`` URL (ADR 0139). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
@@ -10228,7 +10232,8 @@ def security_loosenings(
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
-    ``path_form_fhir_updates``, which walks outbound and already returns plain names). A caller that
+    ``path_form_fhir_updates``, which walks outbound and already returns plain names;
+    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -10881,6 +10886,24 @@ def security_loosenings(
                 "so the receiving server's access log, and any proxy log on the path, holds "
                 "it; an id can be a medical record number or another identifier. The shipped "
                 "transaction form keeps the id out of the URL",
+            )
+        )
+    # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,
+    # `ech_sidecar`, says why it is listed although it is loopback.
+    if ech_cleartext_sidecar_hops:
+        named = ", ".join(sorted(ech_cleartext_sidecar_hops))
+        out.append(
+            (
+                "ech_sidecar",
+                f"{len(ech_cleartext_sidecar_hops)} REST connection(s) send through an ECH sidecar "
+                f"at an http:// URL ({named}) — the engine-to-sidecar hop on this host is "
+                "CLEARTEXT, and it carries the request body and every request header, any "
+                "credential included, and on a SMART or OAuth2 connection the token-endpoint "
+                "request with its client credential. A process on this host that can capture "
+                "loopback traffic, or that binds the sidecar's port first, reads them. An https "
+                "sidecar listener encrypts the hop. A name marked possibly has an env() value this "
+                "reading could not resolve, and the above holds of it only if it resolves to an "
+                "http:// sidecar with ech_egress on",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like

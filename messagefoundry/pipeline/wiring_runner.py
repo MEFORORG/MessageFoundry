@@ -258,7 +258,7 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
-from messagefoundry.transports.egress import warn_url_query_credentials
+from messagefoundry.transports.egress import warn_url_query_credentials_before_build
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
@@ -2791,13 +2791,12 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
-        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
-        recorded while its lookup is down, whether its build or another setting failed (ASVS
-        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
-        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
-        and logs none. A caller
-        whose build check has already warned passes False (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` runs
+        :func:`~messagefoundry.transports.egress.warn_url_query_credentials_before_build` once per
+        lookup, before any build, so an ``env()`` URL carrying a query credential is recorded while
+        its lookup is down (ASVS 14.2.1). A lookup whose warning step itself raises is degraded,
+        with an ERROR line and no WARNING. A caller whose build check has already warned passes
+        False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
@@ -2805,28 +2804,6 @@ class RegistryRunner:
         def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
             return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-
-        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
-            # ``resolved`` is None when a setting failed to resolve. The url alone is then
-            # resolved, so an env() URL is still named while the lookup is down.
-            if resolved is None:
-                try:
-                    resolved = resolve_env_settings(
-                        {"url": specs[name].settings.get("url")},
-                        self._env_values,
-                        connection=fhir_lookup_record_name(name),
-                    )
-                except WiringError:  # names the key, never a value
-                    # The lookup's own failure may name another setting, so say this one too.
-                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
-                    # as a secret, and a lookup name may end in a credential word.
-                    log.info(
-                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
-                        "check could not read it",
-                        name,
-                    )
-                    return
-            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
 
         def build(
             resolved: Mapping[str, Mapping[str, Any]],
@@ -2872,7 +2849,14 @@ class RegistryRunner:
             if not warn_query_credentials:
                 continue
             try:
-                warn(name, settled.get(name))
+                # The one pre-build step an outbound's start takes too (BACKLOG #4997). It reads
+                # the url alone, so an env() URL is still named while the lookup is down.
+                warn_url_query_credentials_before_build(
+                    f"FhirLookup {name!r}",
+                    specs[name].settings,
+                    self._env_values,
+                    connection=fhir_lookup_record_name(name),
+                )
             except Exception as exc:
                 log.error(
                     "FhirLookup %r URL query-credential check failed, so it is not started",
@@ -4510,6 +4494,11 @@ class RegistryRunner:
             return None
         connector: DestinationConnector | None = None
         try:
+            if warn_query_credentials:
+                # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371: the operator start of a lane the boot gates left unbuilt checks
             # its CA too, isolated with the build below.
@@ -4518,8 +4507,9 @@ class RegistryRunner:
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
             # (fail-closed/no-op default) posture.
             with active_hop_posture(self._hop_posture):
+                # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                    dest, egress=self._egress, warn_query_credentials=False
                 )
             # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
@@ -5721,6 +5711,14 @@ class RegistryRunner:
         )  # at/above threshold this run — clear any prior parked marker
         connector: DestinationConnector | None = None
         try:
+            if warn_query_credentials:
+                # The one pre-build step a FhirLookup's start takes too (BACKLOG #4997). Before
+                # env() resolves the rest and before any check, so a lane that is down for an
+                # unresolved setting, a refused CA or any other build failure keeps its ASVS 14.2.1
+                # record. Inside this try, so a step that raises fails this lane only.
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.
             await self._check_lane_anchor("outbound", name, dest.settings)
@@ -5733,8 +5731,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
+                # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                    dest, egress=self._egress, warn_query_credentials=False
                 )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,

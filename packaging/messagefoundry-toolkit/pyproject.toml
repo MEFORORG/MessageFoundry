@@ -1,7 +1,7 @@
 [build-system]
 # EXACT `==`, in lockstep with the engine's table. The reason is stated once, above that table in the
 # root pyproject.toml.
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 # Third sibling distribution: the MessageFoundry TOOLKIT (ADR 0201, BACKLOG #1192, ASVS 15.2.3). It

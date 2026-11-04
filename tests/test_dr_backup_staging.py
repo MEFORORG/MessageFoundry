@@ -532,7 +532,9 @@ async def test_a_run_cancelled_during_the_build_is_cleaned_up_by_its_worker(
     release = threading.Event()
     real_build = BackupRunner._build_archive_blocking
 
-    def slow_build(self: BackupRunner, **kw: object) -> tuple[str, dict[str, int], int, int]:
+    def slow_build(
+        self: BackupRunner, **kw: object
+    ) -> tuple[str, dict[str, int], int, dr_backup._ConfigBundle]:
         entered.set()
         assert release.wait(30), "the test never released the build"
         return real_build(self, **kw)  # type: ignore[arg-type]

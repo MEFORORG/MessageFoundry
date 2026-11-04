@@ -999,8 +999,9 @@ class DrCoordinator:
         against a store nothing was ever restored into, which is exactly the silent success ADR 0048's
         amendment, ``docs/CONFIGURATION.md`` and ``docs/EARLY-ADOPTER-GUIDE.md`` state is refused on
         a SQLite store. It cannot be a false refusal: :func:`~messagefoundry.pipeline.dr_backup.
-        run_restore` refuses a config-only archive outright, so an archive carrying no store is one no
-        SQLite box could have been seeded from in the first place. And a FULL archive always declares
+        run_restore` refuses a config-only archive as a store to restore (with ``--config-to`` alone it
+        restores only its config bundle, vault BACKLOG #5233), so an archive carrying no store is one
+        no SQLite box could have been seeded from in the first place. And a FULL archive always declares
         counts, because :func:`~messagefoundry.pipeline.dr_backup._count_tables` reports every table in
         the snapshot's own schema — a real store has dozens — so empty counts on a ``PASS`` mean
         config-only and nothing else."""

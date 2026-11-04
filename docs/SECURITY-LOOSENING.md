@@ -259,6 +259,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode that verifies the server, such as psqlODBC `SSLmode=verify-full` or MySQL `SSLMODE=VERIFY_IDENTITY` (*connection-scoped*; inbound **and** outbound). The engine cannot check that a mode verifies; its gate refuses only a missing or no-TLS mode |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
+| | `ech_sidecar` | no `ech_egress`, or an `https://` sidecar, on every `REST` outbound (*connection-scoped*; an `http://` sidecar is the loosening, named as `ech_sidecar`) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
@@ -1803,7 +1804,18 @@ count is above `0` (vault BACKLOG #2613).
   the credit whatever CRL the context loads (vault BACKLOG #5089); at least REST, SOAP and FHIR
   hand the guard no context or opener (ADR 0173 §4.3 and §13). CORRECTED 2026-11-03: this said
   `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
-  which stopped being true when `capture` gained that flag. The engine will tell you *which* connections have it set,
+  which stopped being true when `capture` gained that flag. *(Note 2026-11-04: since vault BACKLOG
+  #5086, `capture` also gives no CRL credit to a context it is handed that skips time validity when
+  the flag is not passed, and names the `tls_allow_expired` remedy for a hop that passes no remedy
+  of its own. So a hop handed its relaxed context is decided as above with or without the
+  flag. `capture` reads only the context it is handed, so a call site that handed it some other,
+  unrelaxed context with a CRL would still earn credit. `tests/test_revocation_guard_census.py`
+  fails on such a call site among the ones that reach `relax_verify_expiry` by name, in at least
+  the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
+  some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
+  file's relaxed-hop census say what it reads. REST, SOAP
+  and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
+  (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -1915,6 +1927,43 @@ count is above `0` (vault BACKLOG #2613).
   `cleartext_accepted`. `messagefoundry security show` and a graphless `GET /security/posture`
   cannot see it either, and say so in `loosenings_scope`.
 
+### `ech_sidecar` at an `http://` URL — the hop to the ECH sidecar is cleartext
+> **Connection-scoped:** a `REST` outbound that sets `ech_egress` and points `ech_sidecar` at an
+> `http://` listener. The keys are raw settings, written code-first as
+> [`samples/ech-sidecar/README.md`](../samples/ech-sidecar/README.md) shows. ADR 0139.
+- **What you lose:** the engine sends each request to the sidecar over cleartext http on this host,
+  and the sidecar does the TLS to the partner. That hop carries the request body and every request
+  header, any credential included. On a SMART or OAuth2 connection the token-endpoint request takes
+  the same hop, with its client credential. A process on this host that can capture loopback
+  traffic, or that binds the sidecar's port first, reads all of it.
+- **What you keep:** the sidecar must be a loopback address. A sidecar anywhere else is refused at
+  build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
+  `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
+  it.
+- **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
+  normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
+  `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
+  `url`.
+- **The fix:** run the sidecar's listener on `https://`, which encrypts the hop and takes it off
+  this list. The two hops verify the listener's certificate against different stores. The delivery
+  request reads the operating system's trust store alone, not the connection's `tls_ca_file` or
+  the `[tls]` policy. On a SMART or OAuth2 connection the token-endpoint request reads the anchor
+  its token URL resolves to, the connection's `tls_ca_file` included. So the certificate must name
+  the loopback host the URL uses and chain to a CA every hop that takes it reads.
+- **It is never silent:** a WARNING at every construction naming the connection, never a header
+  value; an `ech-sidecar-cleartext` line in `messagefoundry check` naming every such connection;
+  and an `ech_sidecar` entry in `security_loosenings()`, which `GET /security/posture` shows. The
+  last two read one list. It leaves out a sidecar the build refuses, but it reads only
+  `ech_egress` and `ech_sidecar`, so a connection the build refuses for another reason, such as a
+  `proxy_url` beside them, can still be on it. An `env()` value is
+  resolved where the reader has the instance's values: `GET /security/posture` on a running engine
+  does, and `messagefoundry check` does not. One it cannot resolve is listed, marked possibly,
+  unless the other key alone rules the hop out, as a literal `https://` sidecar does. A
+  `deployed = false` connection with an `env()` value is left off, because it is never built.
+- **Where it is NOT reported:** the serve-time loosening warning, which fires before the graph is
+  loaded, exactly as for `cleartext_accepted`. `messagefoundry security show` and a graphless
+  `GET /security/posture` cannot see it either, and say so in `loosenings_scope`.
+
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
 > outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
@@ -1952,15 +2001,21 @@ count is above `0` (vault BACKLOG #2613).
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
-  again. At a start that logs it, each `FhirLookup` whose `url` resolved logs it once, before any
-  build, so the URL is named while the lookup is down, whether its build or another setting failed;
-  its failure is recorded and alerted. The exception is a lookup whose warning step itself raises:
-  it is degraded, with an ERROR line and no WARNING. A lookup whose `url` did not resolve has no
-  URL to read and logs none. The egress check logs it
-  before any of its refusals, so an outbound or a lookup that check refuses, for example over an
-  unlisted forward proxy, has logged it. An outbound that fails before that check, at least on an
-  unresolved `env()` value, logs none. An `env()` URL on a connection that logged none appears
-  nowhere until a later build or check logs it. There is also a
+  again. At a start that logs it, each outbound lane the start builds logs it in a step just before
+  its own build, and every later build of an unbuilt lane through `start_outbound` does the same,
+  at least an operator start and a schedule window's opening. After the outbound lanes and
+  the `DatabaseLookup` executor, each `FhirLookup` logs it in the same step, before any lookup is
+  built. So the URL is named while the connection is down, whether its build or another setting
+  failed, at least on an unresolved `env()` value; its failure is recorded and alerted (BACKLOG
+  #4997). A graph-wide failure before the lookups' step, at least a `DatabaseLookup` executor that
+  fails to build, ends the start before any `FhirLookup` logs it. The exception is a
+  connection whose warning step itself raises: a lookup is degraded and an outbound lane fails,
+  with an ERROR line or a failure record and no WARNING. A connection whose `url` did not resolve
+  has no URL to read and logs an INFO line saying so instead. Everywhere else the egress check
+  logs it, before any of its refusals, so an outbound or a lookup that check refuses, for example
+  over an unlisted forward proxy, has logged it. There, at least in a build check and a connection
+  test, an outbound or a lookup that fails before that check logs none. An `env()` URL on a
+  connection that logged none appears nowhere until a later build or check logs it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
