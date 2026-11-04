@@ -43,6 +43,8 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_API_PORT: "8443"
   MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"
   MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
+  # Off loopback serve also refuses this certificate bind until you attest revocation with
+  # MEFOR_TLS_REVOCATION_ATTESTED: "1" (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
   MEFOR_INBOUND_BIND_HOST: "0.0.0.0"
   MEFOR_SECURITY_REQUIRE_MFA: "true"
   MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
@@ -84,6 +86,8 @@ services:
       MEFOR_API_PORT: "8443"
       MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"   # paths (not secrets) — mounted read-only below
       MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
+      # Off loopback serve also refuses this certificate bind until you attest revocation with
+      # MEFOR_TLS_REVOCATION_ATTESTED: "1" (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
       MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
       # --- production guardrails ---
       MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce

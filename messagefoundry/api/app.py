@@ -23,10 +23,12 @@ refuse that opt-in beside an auth service or auth settings. Only embedders and t
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
 engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
-``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
+``[api].tls_terminated_upstream`` with no ``[api].tls_cert_file`` declares a reverse proxy
+terminating TLS in front and speaking
 plaintext to the engine, and :func:`messagefoundry.api.tls.ensure_api_tls_material` returns
-``None`` there, so nothing is minted. *Always serves TLS* means the engine never leaves a hop
-unprotected, NOT that it terminates TLS in every topology. Remote network exposure (opening the
+``None`` there, so nothing is minted; docs/SECURITY.md, Plaintext proxy hop, says when ``serve``
+accepts that plaintext hop. *Always serves TLS*
+does NOT mean the engine terminates TLS in every topology. Remote network exposure (opening the
 bind beyond loopback) is a separate, later question from whether the hop is encrypted.
 """
 
@@ -4549,8 +4551,8 @@ def create_app(
         else webauthn_rp_from_request
     )
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
-    # is the OPERATOR'S declaration that the browser-facing scheme is https (in-process TLS or a
-    # declared terminator). It forces the session cookie's Secure flag and HSTS regardless of the
+    # is the OPERATOR'S declaration that the browser-facing scheme is https (an operator
+    # certificate or a declared terminator; the minted placeholder does not count). It forces the session cookie's Secure flag and HSTS regardless of the
     # per-request scheme — the scheme is computed ONCE at login and a proxy that omits
     # X-Forwarded-Proto would otherwise poison the cookie for the whole session.
     # tls_terminated_upstream additionally arms the one-shot /ui cleartext-scheme tripwire.

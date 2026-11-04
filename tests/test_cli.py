@@ -1285,7 +1285,7 @@ def _expose_toml(
     relax: str | None = None,
     public_origin: str | None = None,
 ) -> None:
-    """A non-loopback bind (exposed via a declared TLS-terminating proxy) with egress locked down.
+    """An exposed instance (a loopback bind behind a declared TLS-terminating proxy) with egress locked down.
 
     Exposed via Posture-B (``tls_terminated_upstream`` + ``trusted_proxies``) rather than a cleartext
     ``--allow-insecure-bind``: #200 (ADR 0092) clamped that flag so it can no longer wave a
@@ -1309,9 +1309,9 @@ def _expose_toml(
     # Pass every non-MFA exposure gate (Posture-B declarations + egress deny-by-default + the #186/#188
     # secure retention + SMTP-alert channels) so require_mfa is the ONLY posture under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        enforce_line + relax_line + "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
-        f"security.require_mfa = {auth}\n"
+        # A LOOPBACK bind behind the declared terminator. It is still an exposed instance, and
+        # BACKLOG #4636 refuses the plaintext proxy-to-engine hop off loopback.
+        enforce_line + relax_line + f"security.require_mfa = {auth}\n"
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
         # The at-rest gate, acked here with the rest of the non-MFA plumbing. These callers run
@@ -1523,8 +1523,7 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # Loopback behind the declared terminator, as in _expose_toml (BACKLOG #4636).
         "security.require_mfa = false\n"
         "security.allow_single_factor_admin_when_exposed = true\n"
         "security.block_unlisted_outbound = true\n"
@@ -1668,9 +1667,8 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     (tmp_path / "messagefoundry.toml").write_text(
         # Exposed via a declared TLS-terminating proxy (Posture-B) — #200 clamped --allow-insecure-bind
         # so it can no longer wave a prod-PHI cleartext bind past the exposed-gate; the MFA gate is
-        # reached through a real TLS-terminated bind instead.
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # reached through a real TLS-terminated bind instead. Loopback behind it, as in
+        # _expose_toml (BACKLOG #4636).
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
@@ -2113,9 +2111,9 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     "BY CONFIG FILE" IS A REAL NARROWING, NOT THROAT-CLEARING. ``--host`` is merged AFTER
     ``_desugar_security`` (see ``load_settings``), so ``serve --host 0.0.0.0`` reaches this same gate
     from a file that sets neither key -- and there the old prescription did not die at load, it simply
-    did nothing. This test drives the FILE route only. The CLI route is a separate, unfixed gap:
-    the message names no flag, so an operator who bound off-box with ``--host`` is told to edit a file
-    that is already correct.
+    did nothing. This test drives the FILE route only. The CLI route is
+    ``test_serve_ui_offloopback_refusal_names_the_host_flag`` below: since BACKLOG #4636 the message
+    names the lever in effect, ``serve --host`` on that route.
 
     A test that read the message could not have caught it -- the old text named a real, correctly-spelled
     [security] field. Only running the prescribed config finds it.
@@ -2171,6 +2169,75 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     assert rc == 0, fixed_err
     assert _UI_OFFLOOPBACK_REFUSAL not in fixed_err
     assert "is not a loopback address" not in fixed_err
+
+
+def test_serve_ui_offloopback_refusal_names_the_host_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1361 route 2, #4636: off-box by ``serve --host`` from a file that sets no bind key,
+    the /ui refusal names the flag, the lever that is in effect, not a listen_address edit alone."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", "--host", "0.0.0.0"]
+    assert main(argv) == 2
+    refusal = next(
+        (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
+    )
+    assert "serve --host, which overrides [security].listen_address" in refusal, refusal
+    # The remedy the message names, applied: change the flag to loopback, and serve starts.
+    argv[-1] = "127.0.0.1"
+    rc = main(argv)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _UI_OFFLOOPBACK_REFUSAL not in err
+
+
+def test_serve_ui_offloopback_certificate_remedy_starts_with_the_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #4636: the /ui refusal's certificate remedy names the revocation attestation, because
+    off loopback a certificate alone is refused by the API revocation gate. Applied as named, it
+    starts; without the attestation it is refused there, which is the control."""
+    from tests.test_api_tls import _self_signed
+
+    base = (
+        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+    )
+    monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    assert _l5b_serve(tmp_path, monkeypatch, base) == 2
+    refusal = next(
+        (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
+    )
+    from messagefoundry.api.tls import off_loopback_certificate_remedy
+
+    for spelling in (
+        "[security].listen_address or serve --host",
+        off_loopback_certificate_remedy(),
+    ):
+        assert spelling in refusal, refusal
+    assert "MEFOR_TLS_REVOCATION_ATTESTED=1" in off_loopback_certificate_remedy()
+
+    cert, key = _self_signed(tmp_path)
+    fixed = (
+        f'{base}api.tls_cert_file = "{cert.as_posix()}"\napi.tls_key_file = "{key.as_posix()}"\n'
+    )
+    assert _l5b_serve(tmp_path, monkeypatch, fixed) == 2
+    assert "in-process TLS on non-loopback" in capsys.readouterr().err
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    rc = _l5b_serve(tmp_path, monkeypatch, fixed)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _UI_OFFLOOPBACK_REFUSAL not in err
 
 
 def test_serve_ui_warns_on_undeclared_proxy_signal(

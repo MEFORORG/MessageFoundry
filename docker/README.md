@@ -143,16 +143,21 @@ against one case that matters, described under
 ## Exposure topologies (see the evaluation §1)
 
 - **(A) In-process TLS — default shipped posture.** Engine binds `0.0.0.0:8443` with `tls_cert_file`/
-  `tls_key_file`; MLLP runs `tls=True`. Self-contained, fewest moving parts.
-- **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays loopback (or behind a trusted
-  terminator with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
-  `plaintext_upstream_hop_acknowledged=true`, required because with no `tls_cert_file` that hop is
-  plaintext); the sidecar does TLS + mTLS +
-  OCSP-must-staple revocation. The engine bound to `127.0.0.1` never trips the exposure gate.
+  `tls_key_file`; MLLP runs `tls=True`. Self-contained, fewest moving parts. Off loopback it also
+  needs your revocation attestation, `MEFOR_TLS_REVOCATION_ATTESTED=1`, on the rule
+  [SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate) states.
+- **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
+  sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
+  `plaintext_upstream_hop_acknowledged=true`, because with no `tls_cert_file` that hop is
+  plaintext; the sidecar does TLS + mTLS + OCSP-must-staple revocation. The engine bound to
+  `127.0.0.1` never trips the exposed-bind gate. A proxy in front still owes the declarations
+  [SECURITY.md, Plaintext proxy hop](../docs/SECURITY.md#plaintext-proxy-hop) lists, among them
+  `[security].web_console_public_address`, and a terminator in another pod or on another host
+  needs more, as the same section says.
 
 Reaching the engine through a published port requires binding **off-loopback inside the container**
-(Docker NAT forwards to the container interface, not its loopback). The startup bind guard then requires
-TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by design.
+(Docker NAT forwards to the container interface, not its loopback). Startup then requires an operator
+certificate (A) and its revocation attestation, or it **refuses to start** — by design.
 
 ## Volumes & secrets
 

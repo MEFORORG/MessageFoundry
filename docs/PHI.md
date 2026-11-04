@@ -38,7 +38,7 @@ levels:
   (MLLP-over-TLS), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
   not cross the LAN in cleartext — and can't accidentally: the bind-guards **refuse a non-loopback
   *plaintext* listener**, at least MLLP, raw TCP and X12 (ADR 0002 §0). An off-loopback API bind needs
-  an operator certificate or a declared TLS-terminating proxy (§4).
+  an operator certificate (§4).
 - **Inbound web-service listener** (a partner calling *into* MEFOR) — **built**, as the inbound
   [`Http(...)` listener](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023). It is a
   distinct surface with its own controls: TLS or mTLS, `source_ip_allowlist`, and `intake_auth`, which
@@ -66,7 +66,7 @@ table covers it. Which accounts that factor covers is stated in
 | Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
 | Database writer who holds no store key | Yes | Partly built: row seals on a store whose key is held in the engine, and cell tags on a keyed store under the default `[store]` settings. What each refuses, and what stays open, is [below](#a-database-writer-is-refused-only-where-a-seal-or-a-tag-covers-the-row) |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
-| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is always on, except behind a declared proxy with no operator certificate; MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guards refuse a non-loopback plaintext listener, and an off-loopback API bind needs an operator certificate or a declared TLS-terminating proxy; + your network segmentation |
+| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is always on, except on a loopback bind behind a declared proxy on the same machine with no operator certificate; MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guards refuse a non-loopback plaintext listener, and an off-loopback API bind needs an operator certificate ([SECURITY.md](SECURITY.md#enforcement-model)); + your network segmentation |
 | Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (set `[logging].forward_*` — [§7](#7-logging--phi-redaction)) for evidence beyond the host |
 | **Public-internet attacker** | **Out of scope by design** | MEFOR is **not** internet-facing (trust boundary above); off-loopback exposure is internal-only and TLS-required |
 | Misconfigured outbound destination | Yes | Destination allowlist (`[egress].allowed_*`, §4) |
@@ -1350,15 +1350,15 @@ future claim that this project "has crypto agility" must exclude the audit chain
 |---|---|---|
 | MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or a per-connection `tls_hop_attested` with its mandatory reason. Under `[security].enforcement = warn`, `serve --allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) also permits it. Under the default `enforce` both are inert. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
-| Engine API ↔ console | **The engine always serves TLS** ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) `[BUILT]`, loopback included. An operator certificate (`[api].tls_cert_file`, WP-13a) wins; with none set, the engine mints a self-signed placeholder on first run. Off loopback, `serve` refuses that placeholder. Only `[security].enforcement = warn` with `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) accepts it. So an exposed bind needs an operator certificate **or** a trusted reverse proxy that terminates TLS upstream (`tls_terminated_upstream` + `trusted_proxies`, WP-15). That proxy is the one topology where the engine itself serves plaintext: with no `tls_cert_file`, the proxy-to-engine hop is plaintext, the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
+| Engine API ↔ console | **The engine always serves TLS** ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) `[BUILT]`, loopback included. An operator certificate (`[api].tls_cert_file`, WP-13a) wins; with none set, the engine mints a self-signed placeholder on first run. Off loopback, `serve` refuses that placeholder. Only `[security].enforcement = warn` with `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) accepts it. So an exposed bind needs an operator certificate, with or without a trusted reverse proxy that terminates TLS upstream (`tls_terminated_upstream` + `trusted_proxies`, WP-15) in front of it. That proxy is the one topology where the engine itself serves plaintext: with no `tls_cert_file`, the proxy-to-engine hop is plaintext, and [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says when `serve` accepts it. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]`. No LDAP referral is followed, so the bind credentials never leave this hop for a referred host; a referral refuses the sign-in (BACKLOG #2530, 2026-09-30). A multi-domain forest would need a global catalog or a search base in the bound controller's own domain. | — |
 | PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle; on SQL Server it is instead a pin of the server's own certificate, ODBC 18.1+ `ServerCertificate` sent with `Encrypt=strict`, see [`CONFIGURATION.md`](CONFIGURATION.md)) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without an operator
-certificate or a declared TLS-terminating proxy in front of it. On the self-signed placeholder, no
-client can tell the engine from an on-path attacker unless it pins that exact certificate. Behind a
-declared proxy with no operator certificate, the proxy-to-engine hop is plaintext, and securing it
-is the site's job (the Engine API row above).
+certificate, whether or not a declared TLS-terminating proxy is in front of it. On the self-signed
+placeholder, no client can tell the engine from an on-path attacker unless it pins that exact
+certificate. Behind a declared proxy with no operator certificate, the proxy-to-engine hop is
+plaintext, and securing it is the site's job (the Engine API row above).
 
 **DB-TLS CA trust + rotation `[BUILT — runbook]` (NIST SP 800-52r2; HIPAA §164.312(e)(1); CWE-295).**
 Validating the DB server certificate against a private/internal CA needs that CA trusted, and rotation
@@ -1554,8 +1554,8 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
 - **Residual (documented, not a claimed control):** a shared clinical workstation, browser devtools, or a
   malicious browser extension can observe on-screen PHI while a session is open — the same physical/endpoint
-  exposure any operator screen has. Restrict `/ui` to managed hosts; it never binds off-loopback without TLS
-  (refused even under `--allow-insecure-bind`).
+  exposure any operator screen has. Restrict `/ui` to managed hosts; it never binds off-loopback without an
+  operator certificate (refused even under `--allow-insecure-bind`).
 
 > **Scope:** M1 is read-only. Safe operator actions (replay, start/stop) + a CSRF token stack land in M2;
 > the `/ws/stats` browser channel and any parse-tree endpoint are also M2. A full ASVS L3 re-assessment of
@@ -2848,7 +2848,7 @@ traceability:
 
 - **DB + `-wal`/`-shm` owner-only permissions on create** (`_secure_file`, §2) — **SQLite store only**; on SQL Server / Postgres the engine creates no database file and calls `_secure_file` never. Was P0-1.
 - **`dryrun`/`generate` redact bodies by default; `--show-phi` to opt in** (§7) — was P0-2.
-- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`) or a declared TLS-terminating proxy** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. `serve --allow-insecure-bind` relaxes this refusal only under `[security].enforcement = warn`, and is inert under the default `enforce`. §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
+- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the bind rule and its one dev escape, and §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
 - **At-rest body encryption (AES-256-GCM) + required volume encryption** (§3) — was P1-1.
 - **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
   [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`

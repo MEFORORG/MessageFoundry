@@ -108,9 +108,8 @@ tier: a write that warrants pacing but no step-up, such as `delete_search_preset
 Source: [CLAUDE.md](../CLAUDE.md) section 2, and [SECURITY.md](SECURITY.md).
 
 **R19. TLS-always, attested plaintext hops, and `cap_setting` for numeric caps.** Flag `verify=False`,
-unattested non-loopback plaintext, disabling engine TLS without `tls_terminated_upstream`,
-`trusted_proxies` and `plaintext_upstream_hop_acknowledged`, or `int(v) if v else None` truthiness
-on numeric caps (`"0"` becomes zero instead of unlimited; use `cap_setting`/`positive_cap`). Source: [CLAUDE.md](../CLAUDE.md) section 2, [SECURITY.md](SECURITY.md), [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md), and [transports/base.py](../messagefoundry/transports/base.py).
+unattested non-loopback plaintext, disabling engine TLS other than with `tls_terminated_upstream`,
+`trusted_proxies` and `plaintext_upstream_hop_acknowledged` on a loopback bind ([SECURITY.md](SECURITY.md#plaintext-proxy-hop)), or `int(v) if v else None` truthiness on numeric caps (`"0"` becomes zero instead of unlimited; use `cap_setting`/`positive_cap`). Source: [CLAUDE.md](../CLAUDE.md) section 2, [SECURITY.md](SECURITY.md), [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md), and [transports/base.py](../messagefoundry/transports/base.py).
 
 **R20. No new operator UI in PySide6, and no cross-thread widget calls.** Flag new operator surfaces
 under `harness/` (they belong in `/ui`), any PyQt import, operational logic in widgets, or worker

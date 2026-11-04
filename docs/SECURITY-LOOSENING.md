@@ -355,12 +355,14 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **What you lose:** the API + web console become reachable from the network, not just this host.
 - **When acceptable:** a real remote-operations need, on a trusted/segmented network, with TLS.
 - **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
-  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
-  host / mTLS (OFF-LOOPBACK-DEPLOYMENT.md).
-- **Still refused:** an off-box bind with no operator certificate and no declared TLS-terminating proxy.
+  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`) for the
+  browser's hop; it does not clear the [API revocation gate](SECURITY.md#api-revocation-gate). A managed admin host / mTLS
+  (OFF-LOOPBACK-DEPLOYMENT.md).
+- **Still refused:** an off-box bind with no operator certificate.
   The engine's self-signed placeholder does not count. Under the default `enforce`, nothing lifts this.
-  Under `[security].enforcement = warn`, `require_encryption_for_remote = false` (below) or
-  `--allow-insecure-bind` lets the bind serve on the placeholder.
+  With no declared proxy, under `[security].enforcement = warn`, `require_encryption_for_remote = false`
+  (below) or `--allow-insecure-bind` lets the bind serve on the placeholder. With a declared proxy,
+  [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) applies instead.
 - **`serve --host <non-loopback>` counts as this deviation**, even with no `[security]` block in the file.
   The flag is merged after the `[security]` desugar so it wins over the config, and the loader then folds
   the effective bind back into the posture view: `local_access_only` reads `false` and `listen_address`
@@ -398,11 +400,16 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   - **An inbound MLLP, HTTP, DICOM SCP, raw-TCP or X12 listener** without `tls` binds in cleartext, so
     PHI crosses the network unencrypted.
 - **When acceptable:** a lab/loopback-adjacent trusted, firewalled segment; never for real remote PHI.
-- **Compensating controls:** network isolation; prefer in-process TLS (`[api].tls_cert_file`) or a
-  TLS-terminating proxy instead.
+- **Compensating controls:** network isolation; prefer an operator certificate (`[api].tls_cert_file`)
+  or a TLS-terminating proxy in front of a loopback-bound engine instead.
+  [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and
+  [API revocation gate](SECURITY.md#api-revocation-gate) say what each one needs.
 - **Still refused:** either bind under `[security].enforcement = enforce`, the shipped default — the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
-  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
+  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`. In every mode it also leaves at
+  least the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals, the
+  [API revocation gate](SECURITY.md#api-revocation-gate) and the off-loopback `/ui` certificate refusal
+  in place.
 
 ### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)
 > **Not a loosening — the inverse.** The console is **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
@@ -416,16 +423,15 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
-  than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
-  operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
+  than the JSON API: an explicitly-enabled console off-loopback is refused without an operator
+  `[api].tls_cert_file`, and that refusal holds even under
   `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared
   terminator (`[api].tls_terminated_upstream`). Under `enforce` it also refuses one behind a proxy named
   in `[api].trusted_proxies` alone, for the ASVS 12.1.1 probe (vault BACKLOG #3538; the
   `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) has the rule). With an operator
   certificate, no proxy and no address, this check only warns: the `/ui` origin checks then use the
   request Host, and passkeys fail closed until the address is set. Other gates can still refuse that
-  start, at least the in-process TLS revocation gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and
-  MFA-at-exposure.
+  start, at least the [API revocation gate](SECURITY.md#api-revocation-gate) and MFA-at-exposure.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
@@ -706,7 +712,7 @@ is refused, so an opt-out does nothing and is not reported.
   **AUDIT** line is a gate's own, and not every gate writes one at `warn`: [*The switches*](#the-switches)
   says so.
 - **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
-  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
+  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. So are the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals, the [API revocation gate](SECURITY.md#api-revocation-gate) and the off-loopback `/ui` certificate refusal, which read no enforcement level. `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
@@ -1409,12 +1415,14 @@ count is above `0` (vault BACKLOG #2613).
   ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
   decision 3). So the hop from the proxy to the engine is **plaintext**, and the engine does nothing to
   protect it. At least sign-in credentials, session tokens and PHI reads cross that hop unencrypted.
-- **When acceptable:** the site keeps the hop private by means the engine cannot see: a same-host
-  loopback hop, an isolated network segment, or a host firewall. Without the acknowledgement, `serve`
-  refuses this topology in every mode (BACKLOG #1179).
+- **When acceptable:** only on a same-host loopback hop, with the proxy on the engine's machine and
+  the engine bound to loopback. [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)
+  states when `serve` refuses it.
 - **Compensating controls:** set `[api].tls_cert_file` so the engine serves that hop over TLS, and point
-  the proxy at https with that certificate trusted. Short of that, keep the proxy on the same host.
-  Isolation limits who can read the hop; it does not encrypt it.
+  the proxy at https with that certificate trusted; off loopback the
+  [API revocation gate](SECURITY.md#api-revocation-gate) then applies. Short of that, the
+  same-host proxy that `serve` already requires is the only isolation. Isolation limits who can read the hop; it does not
+  encrypt it.
 - **Visibility:** each start with the acknowledgement honoured writes a WARNING-level startup **AUDIT**
   line, and `GET /security/posture` names it. That makes the loosening visible; it protects nothing.
 - **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing

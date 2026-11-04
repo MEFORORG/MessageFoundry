@@ -16,7 +16,8 @@ import subprocess  # nosec B404 -- runs our own interpreter only
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable
+import tomllib
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -45,6 +46,7 @@ from messagefoundry.api.tls import (
     _generated_pair,
     build_api_ssl_context,
     ensure_api_tls_material,
+    plaintext_upstream_hop_off_loopback_remedy,
 )
 from messagefoundry.api.tls_client_cert import (
     ISSUER_INDEX_ATTR,
@@ -600,13 +602,13 @@ def test_an_upstream_terminated_api_has_no_certificate_to_watch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Control: behind a declared upstream terminator the engine serves no certificate, so there is
-    # nothing of its own to watch. The proxy's certificate is the proxy's to monitor.
+    # nothing of its own to watch. The proxy's certificate is the proxy's to monitor. A loopback
+    # bind, because BACKLOG #4636 refuses that plaintext hop off loopback.
     monitored, captured = _serve_capturing_monitored_api_cert(
         tmp_path,
         monkeypatch,
         "security.block_unlisted_outbound = true\n"
         "alerts.security_notifications_required = false\n"
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         'security.enforcement = "warn"\n'
         "[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\n"
         'trusted_proxies = ["10.0.0.7"]\n'
@@ -1231,8 +1233,10 @@ def test_the_app_factories_derive_the_rp_flag_from_their_own_settings(
 def test_serve_allows_non_loopback_with_upstream_tls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A declared TLS-terminating proxy satisfies the exposed-gate WITHOUT in-process TLS: allowed
-    # without --allow-insecure-bind, and uvicorn trusts XFF only from the proxy (no ssl context).
+    # A declared TLS-terminating proxy in front of a NIC bind: allowed without --allow-insecure-bind,
+    # and uvicorn trusts XFF only from the proxy. Since BACKLOG #4636 that bind needs an operator
+    # certificate, because the plaintext proxy-to-engine hop is refused off loopback, so the proxy
+    # re-encrypts to the engine's own TLS listener.
     from messagefoundry.store.crypto import generate_key
     from tests.test_ambient_proxy_disclosure import _kept
 
@@ -1244,13 +1248,18 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     # The upstream-TLS exposed gate is the subject here, so everything around it is pre-satisfied
     # per-gate. Since BACKLOG #1279 a dev box cannot declare its way past the Posture-B attestations
-    # either, and an undeclared one would refuse before this gate is reached.
+    # either, and an undeclared one would refuse before this gate is reached. Since BACKLOG #4636 the
+    # declared terminator no longer exempts the operator certificate from the ADR 0078 revocation
+    # gate, so revocation is attested too.
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    cert, key = _self_signed(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
         "security.block_unlisted_outbound = true\n"
         "alerts.security_notifications_required = false\n"
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         'security.enforcement = "warn"\n'
-        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        f'tls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
@@ -1260,7 +1269,7 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     assert "refusing to serve" not in capsys.readouterr().err
     # XFF trusted only from the proxy, in both its spellings (BACKLOG #3042).
     assert captured["forwarded_allow_ips"] == ["10.0.0.7", "::ffff:10.0.0.7"]
-    assert "ssl_context_factory" not in captured  # TLS is at the proxy, not in-process
+    assert "ssl_context_factory" in captured  # the proxy re-encrypts to in-process TLS
     # The startup line names the CONFIGURED list, not uvicorn's doubled one. That form is not free
     # of CodeQL's clear-text-logging query: alert 209 is open on this configured-list argument, as
     # an alert was raised on the doubled list on PR 2380. Each message is read here, at the end, as
@@ -1420,13 +1429,22 @@ def _posture_b_toml(
     ack: bool = True,
     cert: tuple[Path, Path] | None = None,
     terminator: bool = True,
+    auto_cert: bool = True,
+    listen_address: str = "0.0.0.0",
 ) -> None:
     """A non-loopback Posture-B bind (declared proxy) with every NON-Posture-B exposure gate satisfied
     (egress deny-by-default + secure retention + SMTP alerts), so only the intra-service-auth + KEX-floor
     attestations are under test. ``intra``/``floor`` toggle the two Posture-B knobs. ``terminator=False``
     leaves out the terminator, the intra-service attestation and the hop acknowledgement (the loader
     refuses that without a terminator): the trusted_proxies-only shape (vault BACKLOG #3538), which
-    loads only with ``cert`` set."""
+    loads only with ``cert`` set.
+
+    Off loopback with no ``cert``, ``auto_cert`` mints an operator certificate, because BACKLOG #4636
+    refuses a plaintext proxy-to-engine hop off loopback before any gate these cases name.
+    ``auto_cert=False`` leaves it out, to put that refusal itself under test. ``listen_address`` is
+    the bind host written when ``loopback`` is False."""
+    if auto_cert and terminator and not loopback and cert is None:
+        cert = _self_signed(tmp_path)
     lines = ["[api]", 'trusted_proxies = ["10.0.0.9"]']
     if terminator:
         lines += ["tls_terminated_upstream = true", f'proxy_intra_service_auth = "{intra}"']
@@ -1470,7 +1488,7 @@ def _posture_b_toml(
         + (
             ""
             if loopback
-            else 'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+            else f'security.local_access_only = false\nsecurity.listen_address = "{listen_address}"\n'
         )
         + "security.block_unlisted_outbound = true\n"
         # PRE-SATISFIED, exactly like intra/floor and for the same reason. Since BACKLOG #1026 a PHI
@@ -1515,7 +1533,11 @@ def _run_posture_b(
     env: str,
     key: bool = True,
     probe: Callable[[str], Any] = lambda origin: _PassingProbe(),
+    attest: bool | None = None,
+    extra_args: Sequence[str] = (),
 ) -> int:
+    """``attest`` None attests revocation exactly when the TOML carries a certificate (below);
+    True or False sets or clears the attestation by hand. ``extra_args`` follow ``serve``'s own."""
     monkeypatch.chdir(tmp_path)
     if key:
         monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
@@ -1531,7 +1553,20 @@ def _run_posture_b(
     # tests/test_tls_floor_probe.py. A test that stubbed it to FAIL would be asserting the probe,
     # not the ladder.
     monkeypatch.setattr("messagefoundry.config.tls_probe.probe_tls_floor", probe)
-    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
+    # Revocation is not the subject of any case here either. Since BACKLOG #4636 a declared terminator
+    # no longer exempts an off-loopback operator certificate from the ADR 0078 revocation gate, so a
+    # case whose TOML carries one (`_posture_b_toml`'s cert branch) attests revocation, as a
+    # deployment of that shape must. The gate reads the attestation only for in-process TLS.
+    if attest is None:
+        api_table = tomllib.loads(
+            (tmp_path / "messagefoundry.toml").read_text(encoding="utf-8")
+        ).get("api", {})
+        attest = bool(api_table.get("tls_cert_file"))
+    if attest:
+        monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    else:
+        monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env, *extra_args])
 
 
 def test_serve_refuses_posture_b_prod_without_intra_service_auth(
@@ -1628,23 +1663,24 @@ def test_serve_posture_b_offloopback_refuses_on_dev_too(
 # --- BACKLOG #1179: the plaintext proxy-to-engine hop must be acknowledged ------------------------
 # ADR 0172 decision 3: behind a declared terminator the engine mints nothing, so the proxy-to-engine
 # hop is plaintext by design and securing it is the deploying site's job. Unlike the attestations
-# above, the acknowledgement is required in EVERY mode -- enforce or warn, loopback or not -- so the
-# matrix below crosses both axes. The attestations are declared in every cell, so the acknowledgement
-# is the only thing that varies between the refusing and the starting arm.
+# above, the acknowledgement is required in EVERY mode -- enforce or warn -- so the matrix below
+# crosses that axis. The attestations are declared in every cell, so the acknowledgement is the only
+# thing that varies between the refusing and the starting arm. Off loopback the acknowledgement
+# covers nothing (BACKLOG #4636), so that axis has its own cases after these.
 
 _ACK_MODES = pytest.mark.parametrize(
     ("loopback", "enforcement"),
     [(True, "enforce"), (True, "warn"), (False, "enforce"), (False, "warn")],
     ids=["loopback-enforce", "loopback-warn", "offloopback-enforce", "offloopback-warn"],
 )
+_LOOPBACK_ACK_MODES = pytest.mark.parametrize("enforcement", ["enforce", "warn"])
 
 
-@_ACK_MODES
+@_LOOPBACK_ACK_MODES
 def test_serve_refuses_a_declared_terminator_without_the_hop_acknowledgement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    loopback: bool,
     enforcement: str,
 ) -> None:
     _posture_b_toml(
@@ -1652,7 +1688,7 @@ def test_serve_refuses_a_declared_terminator_without_the_hop_acknowledgement(
         intra="network",
         floor="1.2",
         enforcement=enforcement,
-        loopback=loopback,
+        loopback=True,
         ack=False,
     )
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
@@ -1665,18 +1701,17 @@ def test_serve_refuses_a_declared_terminator_without_the_hop_acknowledgement(
     assert "point the proxy at https" in err
 
 
-@_ACK_MODES
+@_LOOPBACK_ACK_MODES
 def test_serve_starts_a_declared_terminator_once_the_hop_is_acknowledged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    loopback: bool,
     enforcement: str,
 ) -> None:
-    # The control arm: the same four cells, acknowledgement set, and every one starts. Without it the
+    # The control arm: the same cells, acknowledgement set, and every one starts. Without it the
     # refusing arm above could be passing on some other gate's refusal in a cell it does not name.
     _posture_b_toml(
-        tmp_path, intra="network", floor="1.2", enforcement=enforcement, loopback=loopback, ack=True
+        tmp_path, intra="network", floor="1.2", enforcement=enforcement, loopback=True, ack=True
     )
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
     captured = capsys.readouterr()
@@ -1700,6 +1735,280 @@ def test_serve_starts_a_declared_terminator_once_the_hop_is_acknowledged(
     assert "plaintext_upstream_hop_acknowledged (the proxy-to-engine hop" in captured.out
 
 
+# --- BACKLOG #4636: the acknowledgement covers a loopback bind only ------------------------------
+# Owner ruling R1 of 2026-10-27 on BACKLOG #1179: the plaintext hop is accepted from a proxy on the
+# same machine only. Off loopback serve refuses it whether or not it is acknowledged, in every mode,
+# and names the loopback bind and the operator certificate as the two ways out.
+
+_OFF_LOOPBACK_REFUSAL = "refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API"
+
+
+@pytest.mark.parametrize("ack", [True, False], ids=["acknowledged", "unacknowledged"])
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+# 127.0.0.2 is in 127.0.0.0/8 but is not one of ApiSettings.is_loopback's three hosts.
+@pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.2"])
+def test_serve_refuses_a_plaintext_hop_off_loopback_acknowledged_or_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    ack: bool,
+    enforcement: str,
+    host: str,
+) -> None:
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        enforcement=enforcement,
+        ack=ack,
+        auto_cert=False,
+        listen_address=host,
+    )
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
+    err = capsys.readouterr().err
+    assert _OFF_LOOPBACK_REFUSAL in err
+    assert f"{host!r}" in err
+    assert "accepts only on a loopback bind" in err
+    # The remedy sentence the next test drives to a start, word for word.
+    assert plaintext_upstream_hop_off_loopback_remedy(_SERVE_LOOPBACK_LEVERS) in err
+    # Checked first, so an unacknowledged hop is not told to set an acknowledgement that would
+    # then be refused.
+    assert "without [api].plaintext_upstream_hop_acknowledged" not in err
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_serve_starts_an_acknowledged_plaintext_hop_on_every_loopback_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], host: str
+) -> None:
+    # The control for the refusal above: the same off-box-declared shape, with the bind host moved
+    # onto each spelling ApiSettings.is_loopback accepts, starts.
+    _posture_b_toml(tmp_path, intra="network", floor="1.2", auto_cert=False, listen_address=host)
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    captured = capsys.readouterr()
+    assert _OFF_LOOPBACK_REFUSAL not in captured.err
+    assert "AUDIT: [api].plaintext_upstream_hop_acknowledged=true" in captured.out
+
+
+def test_the_off_loopback_refusal_names_serve_host_alone_when_the_flag_set_the_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The file binds loopback and `serve --host` moves it off. The flag overrides the file, so the
+    # refusal must not send the operator to [security].listen_address (BACKLOG #1361).
+    _posture_b_toml(
+        tmp_path, intra="network", floor="1.2", auto_cert=False, listen_address="127.0.0.1"
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod", extra_args=("--host", "0.0.0.0"))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert _OFF_LOOPBACK_REFUSAL in err
+    levers = "serve --host, which overrides [security].listen_address"
+    assert plaintext_upstream_hop_off_loopback_remedy(levers) in err
+
+
+@pytest.mark.parametrize(
+    ("extra", "levers"),
+    [
+        ((), "[security].listen_address or serve --host"),
+        (("--host", "0.0.0.0"), "serve --host, which overrides [security].listen_address"),
+    ],
+    ids=["file", "serve --host"],
+)
+def test_the_revocation_refusal_names_the_loopback_lever_in_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: tuple[str, ...],
+    levers: str,
+) -> None:
+    # The same lever choice as the plaintext-hop refusal, on the ADR 0078 revocation refusal.
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        ack=False,
+        auto_cert=False,
+        listen_address="0.0.0.0" if not extra else "127.0.0.1",
+        cert=_self_signed(tmp_path),
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod", attest=False, extra_args=extra)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "in-process TLS on non-loopback" in err
+    assert f"bind the engine to loopback ({levers})" in err
+
+
+#: The loopback levers serve's off-loopback plaintext-hop refusal names. The remedy sentence itself
+#: comes from plaintext_upstream_hop_off_loopback_remedy, the one source serve and the check share.
+_SERVE_LOOPBACK_LEVERS = "[security].listen_address or serve --host"
+
+
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+@pytest.mark.parametrize(
+    ("ack", "host", "extra", "cert"),
+    [
+        (True, "127.0.0.1", (), False),
+        (True, "0.0.0.0", ("--host", "127.0.0.1"), False),
+        (False, "0.0.0.0", (), True),
+    ],
+    ids=["listen_address", "serve --host", "certificate"],
+)
+def test_serve_starts_once_the_off_loopback_plaintext_hop_remedy_is_applied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    enforcement: str,
+    ack: bool,
+    host: str,
+    extra: tuple[str, ...],
+    cert: bool,
+) -> None:
+    # The refusal is only as good as the remedy it names: each one, applied to the config the refusal
+    # test above refuses and nothing else, must start. The certificate arm attests revocation (the
+    # _run_posture_b default for a TOML carrying a certificate), which the remedy names because off
+    # loopback the certificate alone is refused by the ADR 0078 revocation gate; the next test
+    # shows that.
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        enforcement=enforcement,
+        ack=ack,
+        auto_cert=False,
+        listen_address=host,
+        cert=_self_signed(tmp_path) if cert else None,
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod", extra_args=extra)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _OFF_LOOPBACK_REFUSAL not in err
+
+
+def test_the_certificate_remedy_needs_the_revocation_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control for the certificate arm above: without the attestation the revocation gate refuses.
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        ack=False,
+        auto_cert=False,
+        cert=_self_signed(tmp_path),
+    )
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod", attest=False) == 2
+    assert "in-process TLS on non-loopback" in capsys.readouterr().err
+
+
+def test_the_phi_read_refusal_names_the_loopback_and_certificate_remedies() -> None:
+    from fastapi import FastAPI
+
+    from messagefoundry.api.security import enforce_phi_read_hop
+    from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV, HopDisposition
+
+    app = FastAPI()
+    app.state.phi_read_hop_disposition = HopDisposition.REFUSE
+    with pytest.raises(HTTPException) as refused:
+        enforce_phi_read_hop(Request({"type": "http", "app": app}))
+    detail = str(refused.value.detail)
+    for spelling in (
+        _SERVE_LOOPBACK_LEVERS,
+        "[api].tls_cert_file",
+        f"{TLS_REVOCATION_ATTESTED_ENV}=1",
+    ):
+        assert spelling in detail, detail
+
+
+_OFF_LOOPBACK_SYNTHETIC_TOML = _SYNTHETIC_LOOPBACK_TOML.replace(
+    "security.local_access_only = true\n", "security.local_access_only = false\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("listen", "cert", "extra"),
+    [
+        ("127.0.0.1", False, ()),
+        ("0.0.0.0", False, ("--host", "127.0.0.1")),
+        ("0.0.0.0", True, ()),
+    ],
+    ids=["listen_address", "serve --host", "certificate + attestation"],
+)
+def test_each_phi_read_remedy_starts_with_a_secure_serve_hop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    listen: str,
+    cert: bool,
+    extra: tuple[str, ...],
+) -> None:
+    # Each remedy the PHI-read 403 names, applied to an off-loopback config serve refuses, must start
+    # AND hand create_managed_app a serve hop it counts as secure, which is what keeps the 403 away.
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    # Stubbed for the control too, so a regression that let it start cannot bind a real port.
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    refused = f'{_OFF_LOOPBACK_SYNTHETIC_TOML}security.listen_address = "0.0.0.0"\n'
+    (tmp_path / "messagefoundry.toml").write_text(refused, encoding="utf-8")
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
+    # Refused by the exposed-bind gate, not by some unrelated exit-2 refusal.
+    assert "refusing to serve the API on non-loopback host '0.0.0.0'" in capsys.readouterr().err
+    toml = f'{_OFF_LOOPBACK_SYNTHETIC_TOML}security.listen_address = "{listen}"\n'
+    if cert:
+        cert_file, key_file = _self_signed(tmp_path)
+        toml += (
+            f'[api]\ntls_cert_file = "{cert_file.as_posix()}"\n'
+            f'tls_key_file = "{key_file.as_posix()}"\n'
+        )
+        monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    handed, _ = _serve_capturing(tmp_path, monkeypatch, toml, extra)
+    assert handed["phi_read_hop_secure"] is True
+
+
+@pytest.mark.parametrize(
+    ("host", "refused"),
+    [
+        ("127.0.0.1", False),
+        ("::1", False),
+        ("localhost", False),
+        ("0.0.0.0", True),
+        ("::", True),
+        ("10.0.0.12", True),
+        ("mefor.example.org", True),
+        # ApiSettings.is_loopback is the exact three hosts above, the one definition every other
+        # bind decision reads, so any other spelling is refused: the fail-closed side.
+        ("127.0.0.2", True),
+        ("LOCALHOST", True),
+        ("::ffff:127.0.0.1", True),
+        # An empty bind host listens on every interface.
+        ("", True),
+    ],
+)
+def test_the_off_loopback_predicate_reads_the_bind_host(host: str, refused: bool) -> None:
+    from messagefoundry.api.tls import plaintext_upstream_hop_off_loopback
+
+    plaintext = ApiSettings(
+        host=host,
+        tls_terminated_upstream=True,
+        trusted_proxies=["10.0.0.9"],
+        plaintext_upstream_hop_acknowledged=True,
+    )
+    assert plaintext_upstream_hop_off_loopback(plaintext) is refused
+    # Unacknowledged reads the same: the bind host decides, not the acknowledgement.
+    assert (
+        plaintext_upstream_hop_off_loopback(
+            plaintext.model_copy(update={"plaintext_upstream_hop_acknowledged": False})
+        )
+        is refused
+    )
+    # No plaintext hop, nothing to refuse: an operator certificate, or no terminator at all.
+    assert not plaintext_upstream_hop_off_loopback(
+        plaintext.model_copy(update={"tls_cert_file": "/etc/mefor/api.crt"})
+    )
+    assert not plaintext_upstream_hop_off_loopback(ApiSettings(host=host))
+
+
 @_ACK_MODES
 def test_serve_needs_no_hop_acknowledgement_when_an_operator_cert_serves_the_hop_over_tls(
     tmp_path: Path,
@@ -1712,7 +2021,9 @@ def test_serve_needs_no_hop_acknowledgement_when_an_operator_cert_serves_the_hop
     # branch (api_tls_source), so serve builds a real TLS context for this listener and the hop is
     # encrypted. Nothing to acknowledge, so it starts without one, in every mode. The SSL context is
     # built for real here -- only uvicorn.run is stubbed -- so a cert the listener could not serve
-    # would fail this test rather than pass it.
+    # would fail this test rather than pass it. Off loopback this is also the control for BACKLOG
+    # #4636: with the hop on TLS, a non-loopback bind is not refused (the refusal names the
+    # acknowledgement, which the assertion below rules out).
     cert, key = _self_signed(tmp_path)
     _posture_b_toml(
         tmp_path,
@@ -3693,9 +4004,7 @@ def _reencrypting_proxy_toml(
 def _run_reencrypting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: _RecordingProbe
 ) -> int:
-    # An off-loopback bind serving an operator certificate with no terminator in front meets the ADR
-    # 0078 revocation gate first. Attested here so that gate is not the one under test.
-    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    # The fixture serves an operator certificate, so _run_posture_b attests revocation (ADR 0078).
     return _run_posture_b(tmp_path, monkeypatch, env="prod", probe=probe)
 
 

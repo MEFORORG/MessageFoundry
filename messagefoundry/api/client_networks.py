@@ -274,8 +274,8 @@ def _record_observation(state: Any, host: str | None) -> None:
         "resolved to %s and no [api].trusted_proxies is declared — the allow-list is INERT. A reverse "
         "proxy is almost certainly in front of the engine without being declared, so the engine never "
         "sees a real client address. Declare the proxy in [api].trusted_proxies, with "
-        "[api].tls_terminated_upstream or an operator [api].tls_cert_file. See "
-        "docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
+        "[api].tls_terminated_upstream or an operator [api].tls_cert_file; docs/SECURITY.md, "
+        "Plaintext proxy hop, says what else each one needs before serve starts.",
         count,
         host,
     )

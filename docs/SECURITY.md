@@ -156,10 +156,13 @@ bind with no declared terminator to run with sign-in off. That mode was removed:
 ran as one shared system identity, so the audit trail named no person, and it could not repair an
 account, because with no auth service the account and audit routes answer 503. A config that still
 sets `[security].require_sign_in` is refused at load. Even with auth enabled, a
-non-loopback bind requires an **operator certificate**: in-process (`[api].tls_cert_file`, WP-13a) or
-TLS terminated at a trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15). With
-neither, `serve` refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
-store vouches for. `serve --allow-insecure-bind`, or its config twin `[security].require_encryption_for_remote = false`, accepts it only under `[security].enforcement = warn` (ADR 0092). So there is no way to be accidentally served with silent,
+non-loopback bind needs an **operator certificate**, `[api].tls_cert_file` (WP-13a), whether or
+not a proxy terminates TLS in front of it (WP-15). The one dev escape below covers only a bind with
+no declared proxy. With no certificate and no declared proxy, `serve`
+refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
+store vouches for. `serve --allow-insecure-bind`, or its config twin `[security].require_encryption_for_remote = false`, accepts it only under `[security].enforcement = warn` (ADR 0092). With a declared proxy and no certificate,
+[Plaintext proxy hop](#plaintext-proxy-hop) applies. With a certificate,
+[API revocation gate](#api-revocation-gate) applies. So there is no way to be accidentally served with silent,
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
@@ -248,21 +251,48 @@ that the gate is correct.
 The route walk in `scripts/security/route_gates.py` reads the same mark. `tests/test_route_deny_default.py`
 checks that every shipped route declares itself and still answers an anonymous caller as before.
 
-**The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
-`tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
+**A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
+pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
+refused at load, unless you set `[api].tls_cert_file`. uvicorn takes the request scheme from a
+trusted peer's `X-Forwarded-Proto`. On the generated placeholder, a proxy that forwarded `http`
+would have made the web console issue its session cookie without `Secure` (ASVS 3.3.1 and 3.3.3).
+Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
+that re-encrypts to the engine keeps working with your own `tls_cert_file`.
+
+### Plaintext proxy hop
+
+With `[api].tls_terminated_upstream = true` and no `[api].tls_cert_file`, the engine mints no certificate
 ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
-decision 3). Unless you also supply `[api].tls_cert_file`, the hop from the proxy to the engine is
-**plaintext by design**, and the engine does nothing to protect it. Keeping it private is the
-deploying site's job: a same-host loopback hop, an isolated network segment, or a host firewall. So
-`serve` refuses to start that topology (exit 2) until `[api].plaintext_upstream_hop_acknowledged =
-true` is set. It refuses in **every** mode, under `enforce` or `warn`, on a loopback bind or not. The
-setting records that the operator took the hop on; it secures nothing by itself. It is a listed
-loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each start reports it. With an operator
-`tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
-not required. The proxy must then speak https to the engine and trust that certificate, or every
-request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
-load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
-`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. With
+decision 3) and serves the hop from the proxy to the engine in **plaintext**. It does nothing to
+protect that hop. `serve` accepts it only on a loopback bind, which is for a proxy on the same
+machine (owner ruling R1 of 2026-10-27 on BACKLOG #1179; BACKLOG #4636). Loopback is exactly `127.0.0.1`, `::1` or
+`localhost`, the hosts `ApiSettings.is_loopback` reads, so another `127.0.0.0/8` address and an
+empty host are not loopback.
+
+- **On a loopback bind**, `serve` refuses to start (exit 2), in every enforcement mode, until
+  `[api].plaintext_upstream_hop_acknowledged = true` records that the site has taken the hop on.
+  The setting secures nothing. It is a listed loosening, and
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how a start reports it. Setting it without
+  `tls_terminated_upstream` is refused at load.
+- **On any other bind host**, `serve` refuses to start (exit 2), in every enforcement mode,
+  acknowledged or not, and names the host.
+
+Two ways out keep the proxy in front. Bind the engine to loopback, with `[security].listen_address` or
+`serve --host`, and set the acknowledgement. Or set `[api].tls_cert_file`: the engine then serves the
+hop over TLS and needs no acknowledgement, and the proxy must speak https to it and trust that
+certificate, or every request through it fails. Off loopback that bind is in-process TLS, so the
+[API revocation gate](#api-revocation-gate) applies to it.
+
+The refusal reads the engine's bind host only. It cannot see a forwarder on the same machine (a port
+proxy, `socat`, an SSH tunnel) that relays a remote proxy's plaintext to the loopback listener, so
+ruling that out stays the site's job. With the proxy on that machine, `trusted_proxies` names the
+address the engine sees it connect from, usually `127.0.0.1`.
+
+`messagefoundry check` runs both refusals as a required check, `upstream-hop-ack`, against the
+`messagefoundry.toml` it finds, so the commit/CI gate catches them before `serve` does, for the bind
+host that file names. A bind host given only as `serve --host` is not in that file, so the
+check judges the file's host. The shipped service installer always passes `--host`, so on that path
+the check and `serve` can disagree on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs
 `MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
 skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.
@@ -272,13 +302,45 @@ names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminat
 `MEFOR_API_*` variables alone, for example on a site that names its environment only with
 `serve --env`, still reaches `serve` and not the check.
 
-**A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
-pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
-refused at load, unless you set `[api].tls_cert_file`. uvicorn takes the request scheme from a
-trusted peer's `X-Forwarded-Proto`. On the generated placeholder, a proxy that forwarded `http`
-would have made the web console issue its session cookie without `Secure` (ASVS 3.3.1 and 3.3.3).
-Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
-that re-encrypts to the engine keeps working with your own `tls_cert_file`.
+**What else a proxy in front owes.** `serve` checks these after the refusals above, whether the hop
+is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
+
+- **A declared terminator** owes `[api].proxy_intra_service_auth` and `[api].proxy_tls_min_version`,
+  with or without `[api].tls_cert_file`. If either is missing, `serve` refuses to start (exit 2) under
+  `[security].enforcement = enforce` on a bind host that is not loopback, and warns otherwise.
+- **A proxy in `[api].trusted_proxies` with no declared terminator** re-encrypts to your
+  `[api].tls_cert_file`. It owes `[api].proxy_tls_min_version` on the same terms, and not
+  `proxy_intra_service_auth`.
+- **Any proxy in `[api].trusted_proxies`**, in either shape, owes `[security].web_console_public_address`
+  under `enforce`, on a loopback bind too: without it, `serve` refuses to start. The ASVS 12.1.1 probe
+  dials that address at start under `enforce`, and `serve` refuses at least when it cannot reach it, when it
+  accepts TLS 1.0 or 1.1, or when it does not negotiate TLS 1.3.
+- **The web console behind a declared terminator** needs `[security].web_console_public_address` in
+  every enforcement mode: `serve` refuses to start without it. Behind a declared
+  terminator the console is served only when `[security].serve_web_console = true` is set.
+
+### API revocation gate
+
+This section covers the `[api]` listener. Nothing in the engine checks whether the certificate it serves is revoked: stdlib `ssl` fetches no OCSP or CRL,
+and the engine, offline by default, attempts no fetch
+([ADR 0078](adr/0078-certificate-revocation-posture.md), ASVS 12.1.4). It checks a client
+certificate against a CRL only when `[api].tls_client_crl_file` is set. So `serve` refuses to start
+(exit 2), in every enforcement mode, when `[api].tls_cert_file` is set and the bind host is not
+loopback (the same three hosts as above), unless `MEFOR_TLS_REVOCATION_ATTESTED` is `1`, `true`,
+`yes` or `on` in `serve`'s own environment. Setting it is your attestation that your PKI enforces
+revocation for the certificates the engine serves and accepts. The engine checks nothing behind it.
+
+- **What clears it:** the attestation, or a loopback bind. It does not refuse a bind with no
+  `[api].tls_cert_file`; the exposed-bind rule in [Enforcement model](#enforcement-model) and
+  [Plaintext proxy hop](#plaintext-proxy-hop) decide that bind.
+- **What does not:** a declared upstream terminator (BACKLOG #4636). The declaration says a proxy
+  terminates the browser's TLS. It does not say the proxy checks the revocation of the engine's
+  certificate on the hop behind it, and the engine cannot observe whether it does. Nor does
+  `[api].tls_client_crl_file`, which the gate does not read.
+- `messagefoundry check` has no leg for this gate, so a green check does not mean `serve` passes it.
+
+The same variable is read by outbound hops too, with a different effect;
+[DEPLOYMENT.md](DEPLOYMENT.md#revocation-guard-behavior) says what it does there.
 
 ### Provisioning the first administrator (ASVS 6.3.2)
 
@@ -3747,8 +3809,10 @@ warning rather than tripping the exposure ladder, so a previously-working expose
 turned into a start failure. An **explicit** `serve_web_console = true` off-box is left on and still runs
 the full ladder (unchanged).
 
-Exposing `/ui` off-box is a supported, **gated** posture. Beyond the existing TLS-or-refuse exposure
-gate (refused even under `--allow-insecure-bind`), `serve` runs the **L5b exposure ladder** for an
+Exposing `/ui` off-box is a supported, **gated** posture. Beyond the existing exposure gate, which
+refuses an off-loopback console without an operator certificate in every enforcement mode, even
+under `--allow-insecure-bind` (the engine's self-signed placeholder does not count, and a
+terminator alone is refused first, as [Plaintext proxy hop](#plaintext-proxy-hop) says), `serve` runs the **L5b exposure ladder** for an
 explicitly-enabled console: with a **declared reverse proxy** (`tls_terminated_upstream`), `serve`
 **refuses to start without `[security].web_console_public_address`** (behind a proxy the Host header
 is client-forwardable — the exact origin anchors the same-origin CSRF check and the WebAuthn rp_id);
@@ -4288,8 +4352,8 @@ slack.
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + a `Retry-After` naming the actor's wait, the same on the JSON API and on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, which says nothing about timing, though a caller that knows its proof is good, or resubmits it, can tell the floor fired (the answers per leg, and the tells, are under *Two second steps have a time floor too*); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
 | Time from a federated start to its callback | at least the flow cache's monotonic clock when the flow was staged vs at the callback, and the verified ID token's `auth_time` (sign-in) and `amr` | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step; on either leg the floor does not apply when a verified `amr` value is in `oidc_callback_floor_exempt_amr` (empty by default; what an exempted pass records is under *What these floors do not do*) | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set (BACKLOG #2388): a callback whose verified `amr` names a listed value is then exempt, and the refusal waits for the code exchange | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
-| Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
-| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179). `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
+| Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor on an operator `[api].tls_cert_file`, nor behind a declared TLS-terminating proxy (`exposure_protected`; the minted placeholder does not count). CORRECTED 2026-11-04 (BACKLOG #4636): this read "nor in-process TLS", which the minted placeholder also is. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
+| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with no `[api].tls_cert_file` and no declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file`, as [Plaintext proxy hop](#plaintext-proxy-hop) states; a non-loopback `[api].tls_cert_file` bind without the attestation, as [API revocation gate](#api-revocation-gate) states. CORRECTED 2026-11-04 (BACKLOG #4636): this cell read "neither in-process TLS nor a declared terminator", which counted the minted placeholder as in-process TLS and read as if a terminator could stand in for a certificate off loopback. `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure, plaintext-hop and API revocation arms refuse **unconditionally** (BACKLOG #4636: this read "plaintext-hop-acknowledgement arms" and named no revocation arm), and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, the `MEFOR_TLS_REVOCATION_ATTESTED` environment variable (API revocation arm) |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind, a declared TLS terminator, **or** a set `trusted_proxies` (vault BACKLOG #2251) — never the console flag, BACKLOG #326) × `[approvals].enabled` and `[approvals].operations` | `admin_exposed` **and** either `[approvals].enabled` off, or on with an `[approvals].operations` list that leaves out a default operation or holds none, which `_approvals_loosenings` reads (vault BACKLOG #3474) — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled`, `[approvals].operations` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited` on the sign-in start, or a **429** that re-renders the step-up page on `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages into the same cache; WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed by this check. On `POST /ui/oidc/start` the `Sec-Fetch-Site` row below runs first and refuses a POST with neither `Sec-Fetch-Site` nor `Origin`, with a 403 and no audit row, BACKLOG #1116, #1124. The skipped-interstitial GET runs that row too, but as a GET: a request with neither header is **not** refused there, under owner rulings R4 and R4b of 2026-09-28). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** each leg's limiter, so the audit write is itself rate-bounded: the login limiter, or on a step-up return to the callback the per-user ceremony key (BACKLOG #3374) and, for the row alone, the step-up return audit budget, kept per user with a backstop across all sources that pages when it stops a row (control 11 of the 6.1.1 protection set, BACKLOG #3965) | on | (no knob) |

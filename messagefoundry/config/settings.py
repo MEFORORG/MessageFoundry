@@ -1660,7 +1660,7 @@ class ApiSettings(_Section):
     # 0143 — the console is the operator UI, effectively core); disable with [security].serve_web_console=
     # false (a surface-reducing opt-out). When on, the engine mounts /ui + /ui/static and accepts an
     # HttpOnly session cookie CONFINED to /ui (the JSON API stays Authorization-header-only). Off a
-    # loopback host it requires exposure_protected (see serve gate) — the UI is a stricter surface.
+    # loopback host it requires tls_cert_file (see serve gate) — the UI is a stricter surface.
     serve_ui: bool = True
     # The browser-facing external origin of the /ui dashboard when it is reached OFF-loopback through a
     # reverse proxy that does NOT preserve the Host header (ADR 0065). The same-origin CSRF + CSWSH checks
@@ -1754,15 +1754,19 @@ class ApiSettings(_Section):
     # trust nothing (the audit/rate-limit source IP is then the direct TCP peer). Set this ONLY to the
     # reverse proxy's address(es), or XFF spoofing returns.
     trusted_proxies: list[str] = []
-    # Declare that a reverse proxy / load balancer terminates TLS in front of the engine. Lets a
-    # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
-    # is set (so the engine knows a terminator is really in front).
+    # Declare that a reverse proxy / load balancer terminates TLS in front of the engine. Requires
+    # trusted_proxies (so the engine knows a terminator is really in front). Without tls_cert_file the
+    # proxy-to-engine hop is plaintext, and serve accepts that on a loopback bind only (BACKLOG #4636),
+    # so a non-loopback bind behind a terminator also needs tls_cert_file. That bind is in-process
+    # TLS, so the ADR 0078 revocation gate applies to it: the terminator does not exempt it, and it
+    # needs MEFOR_TLS_REVOCATION_ATTESTED.
     tls_terminated_upstream: bool = False
     # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
     # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
     # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
-    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
-    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # refuses to start that topology without it, in every mode -- enforcing or warn -- because only
+    # the operator can take on a hop the engine does not protect. It covers a loopback bind only:
+    # off loopback serve refuses the plaintext hop even with it (BACKLOG #4636). With an
     # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
     # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
     # tls_terminated_upstream, so setting it without that is refused at load (a stray
@@ -1770,10 +1774,12 @@ class ApiSettings(_Section):
     plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
-    # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
-    # the internal network. The ENGINE cannot observe the proxy's negotiated TLS/KEX or authenticate the
-    # internal hop for itself, so an off-loopback Posture-B bind under enforce must not start on trust
-    # alone. These are operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
+    # In Posture-B the proxy terminates browser TLS. Off loopback the proxy→engine hop then runs over
+    # the engine's own TLS (BACKLOG #4636 refuses a plaintext one there, and the revocation gate then
+    # applies to that bind), but the engine still cannot tell its peer is the proxy. The ENGINE
+    # cannot observe the proxy's negotiated TLS/KEX or authenticate the internal hop for itself, so
+    # an off-loopback Posture-B bind under enforce must not start on trust alone. These are operator
+    # ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
     # REFUSES an off-loopback Posture-B bind under [security].enforcement=enforce unless both are
     # affirmatively declared, and WARNS on a loopback bind or under enforcement = warn. No instance
     # stays quiet: every instance carries patient data since BACKLOG #1279 (ADR 0186), so the gate
@@ -1802,8 +1808,11 @@ class ApiSettings(_Section):
 
     @property
     def exposure_protected(self) -> bool:
-        """Whether an off-loopback bind is safe: in-process TLS (WP-13a) OR a declared upstream TLS
-        terminator behind trusted proxies (WP-15)."""
+        """Whether an operator certificate (``tls_cert_file``, WP-13a) OR a declared upstream TLS
+        terminator behind trusted proxies (WP-15) is configured. It reads no bind host, and the
+        minted placeholder does not count. True here does not mean ``serve`` starts: off loopback
+        it refuses a terminator with no certificate before any serve-time gate reads this
+        (BACKLOG #4636; docs/SECURITY.md, Plaintext proxy hop)."""
         return self.tls_enabled or (self.tls_terminated_upstream and bool(self.trusted_proxies))
 
     @property
@@ -2017,8 +2026,10 @@ class ApiSettings(_Section):
                 "[api].tls_client_cert_identities requires [api].tls_client_ca_file (in-process mTLS "
                 "verifies the client cert before its subject is resolved to a principal)"
             )
-        # An upstream TLS terminator only satisfies the exposed-gate when the engine knows (and trusts)
-        # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
+        # A declared upstream terminator means nothing unless the engine knows (and trusts) the proxy
+        # in front -- otherwise it's an unverifiable claim that XFF could spoof. It never satisfies
+        # the off-loopback exposed-bind gate on its own (BACKLOG #4636; docs/SECURITY.md, Plaintext
+        # proxy hop).
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
         # The reverse direction (BACKLOG #2055, ASVS 3.3.1 and 3.3.3). uvicorn rewrites the request
@@ -10263,7 +10274,10 @@ def security_loosenings(
                 "[security].enforcement = warn — posture weakenings (cleartext/verify-off "
                 "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
-                "--allow-insecure-bind escapes are honored",
+                "--allow-insecure-bind escapes are honored, where the gate reads this dial; "
+                "at least the plaintext proxy hop, API revocation and /ui refusals read none "
+                "and still refuse (docs/SECURITY.md: Plaintext proxy hop, API revocation gate, "
+                "Off-loopback browser console)",
             )
         )
     # Vault BACKLOG #2599: the config-source escape, named whenever it is LIVE. It is an environment

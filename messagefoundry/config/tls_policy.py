@@ -34,10 +34,11 @@ validator) without crossing the engine's one-way dependency boundaries. The cont
 * :func:`in_process_tls_revocation_refused` / :func:`tls_revocation_attested` — the **ENFORCED** (not
   merely documented) half of that revocation delegation (ASVS 12.1.4, ADR 0078). Because the engine
   performs no revocation, ``serve`` must **refuse to start** an in-process, off-loopback ``[api]`` TLS
-  bind unless revocation is *proven in front* — a declared TLS-terminating reverse proxy (WP-15) or an
-  explicit operator attestation (``MEFOR_TLS_REVOCATION_ATTESTED``). Secure default = refuse; loopback
-  and proxy-terminated binds never trip it (byte-identical start). This module owns the pure predicate
-  + the env read; the ``_serve`` gate wires them.
+  bind unless the operator attests (``MEFOR_TLS_REVOCATION_ATTESTED``) that a revocation-checking PKI
+  backs its certificates. A declared upstream terminator does not exempt such a bind (BACKLOG #4636).
+  Secure default = refuse; a loopback bind and a bind with no operator certificate never trip it
+  (byte-identical start). This
+  module owns the pure predicate + the env read; the ``_serve`` gate wires them.
 """
 
 from __future__ import annotations
@@ -1027,34 +1028,17 @@ def tls_revocation_attested() -> bool:
 
 
 def in_process_tls_revocation_refused(
-    *, tls_enabled: bool, is_loopback: bool, proxy_terminated: bool, attested: bool
+    *, tls_enabled: bool, is_loopback: bool, attested: bool
 ) -> bool:
     """Whether ``serve`` must REFUSE an in-process off-loopback ``[api]`` TLS bind on revocation grounds.
 
-    The **ENFORCED** (not merely documented) delegation of certificate revocation (ASVS 12.1.4, ADR
-    0078). When the engine terminates TLS itself (uvicorn, ``tls_enabled``) on a network-reachable host
-    (``not is_loopback``), a **revoked-but-unexpired** certificate would still be accepted — stdlib
-    ``ssl`` performs no OCSP/CRL check and the engine deliberately attempts none (on-prem, offline-by-
-    default; CLAUDE.md §2 / ADR 0002). So refuse to start UNLESS revocation is *proven in front*:
-
-    * ``proxy_terminated`` — a declared TLS-terminating reverse proxy (WP-15:
-      ``[api].tls_terminated_upstream`` **+** ``[api].trusted_proxies``) that does its own revocation
-      (the engine then runs plaintext behind it and terminates no TLS itself); **or**
-    * ``attested`` — the operator's explicit :data:`TLS_REVOCATION_ATTESTED_ENV` claim that their
-      in-process terminator's certs are backed by a revocation-checking PKI (the opt-out).
-
-    Pure predicate so the ``_serve`` gate stays a one-liner and is unit-testable in isolation. Returns
-    ``False`` (start unchanged, **byte-identical**) for the loopback default, a plaintext bind
-    (``not tls_enabled``), a proxy-terminated bind, or an attested bind — ``True`` only for an otherwise
-    unproven in-process off-loopback TLS bind."""
-    if not (tls_enabled and not is_loopback):
-        # loopback default OR no in-process TLS — path unchanged (byte-identical start)
-        return False
-    if proxy_terminated:
-        return False  # revocation delegated to the declared upstream terminator (proven in front)
-    if attested:  # noqa: SIM103
-        return False  # operator attested their terminator/PKI enforces revocation (the opt-out)
-    return True
+    The enforced half of ADR 0078 (ASVS 12.1.4): True for an ``[api].tls_cert_file`` bind
+    (``tls_enabled``) on a host that is not loopback, unless ``attested`` (the operator's
+    :data:`TLS_REVOCATION_ATTESTED_ENV`). It reads nothing else, so a declared upstream terminator
+    does not exempt the bind (BACKLOG #4636, Manager decision d20261104T080839080-981796). The rule
+    and its reasons are stated once, in docs/SECURITY.md, *API revocation gate*. Pure predicate so the
+    ``_serve`` gate stays a one-liner and is unit-testable in isolation."""
+    return tls_enabled and not is_loopback and not attested
 
 
 def proxy_mtls_declared_but_unverified(*, declared: str, client_ca_configured: bool) -> bool:
@@ -1104,8 +1088,8 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
       :func:`validate_tls_ciphers`, so a *declared* floor can't itself name a non-forward-secret key
       exchange.
 
-    Presence of the declaration (the serve-time PHI-prod fail-closed refusal) is enforced separately in
-    the ``serve`` gate; this is only the shape/coherence check. Raises ``ValueError`` (surfaced as a
+    Presence of the declaration (the serve-time Posture-B refusal, keyed on enforcement and the
+    bind) is enforced separately in the ``serve`` gate; this is only the shape/coherence check. Raises ``ValueError`` (surfaced as a
     config-load error) on an invalid declaration; returns ``None`` when the (possibly empty) declaration
     is coherent."""
     if min_version is not None and min_version not in _APPROVED_TLS_MIN_VERSIONS:
@@ -2505,8 +2489,8 @@ def phi_read_hop_disposition(
 
     The data-path analogue of :func:`insecure_hop_disposition` for the API's PHI-read RESPONSE path
     (raw view / attachment download / summary). A production-PHI instance whose API serve hop is NOT
-    proven secure — not loopback, not in-process TLS, not a declared TLS-terminating proxy — REFUSES to
-    put PHI on that hop rather than emitting it in the clear. Reuses the ONE authority so the API decides
+    proven secure — not loopback, no operator certificate, not a declared TLS-terminating proxy — REFUSES to
+    put PHI on that hop rather than emitting it over a hop not proven secure. Reuses the ONE authority so the API decides
     identically to the transport cells, and the production-PHI clamp (``audited_opt_out``, supplied
     already clamped by the caller) stays the single authority for the global escape.
 
