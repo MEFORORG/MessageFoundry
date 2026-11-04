@@ -98,6 +98,7 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreNotFoundError,
     acquire_pooled,
+    driver_sqlstate,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -430,9 +431,11 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
     """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
 
     A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open
-    transaction and its locks on the server -- after a failed audit rollback, an open audit INSERT
-    and the audit applock -- and an operator whose writes are timing out needs a line that points
-    at it (BACKLOG #1940)."""
+    transaction and its locks on the server, and an operator whose writes are timing out needs a
+    line that points at it (BACKLOG #1940). That is the failed work's transaction after a rollback
+    that failed or ran past its bound (:meth:`SqlServerStore._rollback_or_discard`: an audit
+    append, a lease claim or another write), or the abandoned statement's after a quarantined
+    cancellation (:meth:`SqlServerStore._release_dirty`)."""
     if not fut.cancelled() and fut.exception() is not None:
         log.warning(
             "sqlserver: detached close of a discarded connection failed; the server may hold its"
@@ -5407,7 +5410,10 @@ class SqlServerStore:
         503, which says the row is absent, so a recycled open INSERT would contradict it. The same
         holds for a lease claim's ``HOLDLOCK`` (BACKLOG #5066) and the single-statement writes of
         :meth:`_execute` and :meth:`_execute_output`. The rollback's own error is logged, not
-        raised: the caller re-raises its original error.
+        raised: the caller re-raises its original error. The WARNING names only its class and
+        SQLSTATE. Its traceback goes to DEBUG: that chains the caller's error too, and SQL Server
+        writes stored values into the text of the errors a write meets most, 2627 and 2601 the
+        duplicate key and 2628 the truncated value.
 
         ``within`` bounds the rollback, in seconds; ``None``, which every caller but
         :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
@@ -5440,12 +5446,14 @@ class SqlServerStore:
             # outside one it raises, which would discard without trying the rollback.
             async with nullcontext() if within is None else asyncio.timeout(within):
                 await conn.rollback()
-        except Exception:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
+        except Exception as exc:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
             log.warning(
-                "sqlserver: rollback after a failed transaction failed or ran past its bound;"
-                " discarding the connection",
-                exc_info=True,
+                "sqlserver: rollback after a failed transaction failed or ran past its bound"
+                " (%s, SQLSTATE %s); discarding the connection",
+                type(exc).__name__,
+                driver_sqlstate(exc),
             )
+            log.debug("sqlserver: the failed rollback's traceback", exc_info=True)
             # Its future is deliberately not awaited; see the docstring.
             _detach_connection(conn)
 
