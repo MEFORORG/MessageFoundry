@@ -784,7 +784,9 @@ not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set, where the guard used 
 CRL. No shipped call site's disposition moved,
 because on 2026-11-03 every caller of `relax_verify_expiry` handed the guard no context for the
 relaxed hop: the call sites the next sentence names, MLLP and the DICOM SCU since vault BACKLOG
-#2978. A new caller of `relax_verify_expiry` reopens that claim. The rest of this paragraph is as of
+#2978. A new caller of `relax_verify_expiry` reopens that claim, and
+`test_every_caller_of_relax_verify_expiry_is_a_connection_whose_guard_call_was_read`
+(`tests/test_revocation_guard_remaining_hops.py`) fails on one. The rest of this paragraph is as of
 2026-10-30.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's

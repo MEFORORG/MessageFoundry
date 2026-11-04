@@ -22,6 +22,7 @@ Nothing here dials: construction reads settings only. All certificates and CRLs 
 
 from __future__ import annotations
 
+import ast
 import datetime
 import logging
 import ssl
@@ -566,6 +567,31 @@ def test_an_unattested_crl_on_a_context_that_skips_time_validity_warns_when_not_
     assert relaxed.disposition() is HopDisposition.WARN
     kept = _capture_guard(_crl_context(skip_validity=False), attested=False, posture=NOT_ENFORCING)
     assert kept.disposition() is HopDisposition.ALLOW
+
+
+def test_every_caller_of_relax_verify_expiry_is_a_connection_whose_guard_call_was_read() -> None:
+    """A census, so a dated claim cannot go stale unseen. ADR 0173 §4.3's note of 2026-11-03 says
+    no shipped disposition moved under vault BACKLOG #5086 because every caller of
+    ``relax_verify_expiry`` hands the guard no context for the relaxed hop, and ``capture``'s
+    docstring says none of them is a hop that is not a connection. Both were read off these modules.
+    A new module here means re-reading its guard call and those two notes, then adding it."""
+    package = Path(__file__).resolve().parents[1] / "messagefoundry"
+    callers: set[str] = set()
+    for path in package.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "relax_verify_expiry":
+                callers.add(path.relative_to(package).as_posix())
+    assert callers == {
+        "transports/dicom.py",
+        "transports/mllp.py",
+        "transports/remotefile.py",
+        "transports/rest.py",
+        "transports/soap.py",
+    }
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:

@@ -2672,6 +2672,9 @@ class RevocationHopGuard:
     #: ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence naming both
     #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
     #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
+    #: The field is not always what the caller passed: :meth:`capture` fills a connection's ``None``
+    #: with :data:`EXPIRY_RELAXED_WAYS_ACROSS` when the context it is handed skips time validity
+    #: (vault BACKLOG #5086).
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
@@ -2733,7 +2736,8 @@ class RevocationHopGuard:
         a connection is not given it. Such a hop falls back to the default, which offers
         ``[tls].crl_file`` too and names a connection's flag, so one that hands over such a context
         must pass its own sentence (BACKLOG #1498). On 2026-11-03 no caller of
-        :func:`relax_verify_expiry` was a hop that is not a connection."""
+        :func:`relax_verify_expiry` was a hop that is not a connection; a census test in
+        ``tests/test_revocation_guard_remaining_hops.py`` fails on a new caller."""
         expiry_relaxed = context is not None and skips_validity_period(context)
         return cls(
             host=host,
