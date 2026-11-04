@@ -1507,9 +1507,9 @@ def _is_single_mailbox(address: str) -> bool:
         bool(at)
         and bool(local)
         and "@" not in domain
+        # A dot inside the domain, which the send rule does not ask for. A dot at either end is the
+        # send rule's to refuse, below, as an empty label (BACKLOG #3075 item 8).
         and "." in domain.strip(".")
-        and not domain.startswith(".")
-        and not domain.endswith(".")
         and all(ch.isprintable() and not ch.isspace() for ch in address)
         and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
         # The rule send_plain_email applies to every notice's RCPT TO (vault BACKLOG #2870). Without
