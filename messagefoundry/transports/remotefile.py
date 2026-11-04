@@ -2622,10 +2622,10 @@ class RemoteFileSource(SourceConnector):
         one of its messages is handed off, so an interrupted file is read again whole on the next
         start (at-least-once).
 
-        **A store call is never cancelled**: a pipeline hand-off, or a leave-mode ledger read, write
-        or prune; :class:`PollStopGuard` says how long stop() then waits. A cancel of stop() itself
-        cancels the task at once unless it is inside a store call; ``_stop`` is set, so it then
-        exits at its next stop check."""
+        **This bound never cancels a store call**: a pipeline hand-off, or a leave-mode ledger read
+        or write; :class:`PollStopGuard` says how long stop() then waits. A cancel of stop() itself
+        still cancels the task at once, wherever it is, as the ``gather`` join before this bound
+        did (ADR 0157 Amendment B; BACKLOG #4686 holds that case)."""
         self._stop.set()
         task = self._task
         if task is None:
@@ -2633,16 +2633,16 @@ class RemoteFileSource(SourceConnector):
         try:
             finished = await self._stop_guard.join(task, POLL_STOP_GRACE_S)
         except asyncio.CancelledError:
-            if not self._stop_guard.inside(task):
-                task.cancel()
+            task.cancel()
             raise
         if not finished:
             task.cancel()
             logger.warning(
                 "REMOTEFILE source %s: the poll task did not stop within %.1fs, most likely a "
                 "remote call blocked on an unreachable server; cancelled it. The blocked call "
-                "finishes on its own thread, and any file it was working on is left in place and "
-                "read again on the next start.",
+                "finishes on its own thread. A file it was working on is read again on the next "
+                "start unless that call moves or deletes it, so one whose messages were all "
+                "handed off can re-emit them as duplicates.",
                 self._connection or _where(self._host, self._remote_dir),
                 POLL_STOP_GRACE_S,
             )
@@ -2943,8 +2943,9 @@ class RemoteFileSource(SourceConnector):
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
                 await self._leave_record(file_key)
                 newly_recorded += 1
-        if newly_recorded and self.processed_ledger is not None:
-            # Bound growth (age + count), only when something new.
+        if newly_recorded and self.processed_ledger is not None and not self._stop.is_set():
+            # Bound growth (age + count), only when something new. Skipped once a stop is signalled,
+            # as the File source does, so stop() never waits out housekeeping.
             with self._stop_guard.store_call():
                 await self.processed_ledger.prune()
 

@@ -39,7 +39,7 @@ async def test_the_guard_gives_a_full_grace_after_a_store_call() -> None:
     for that, because the task always gets a full grace after a store call to reach its next stop
     check. Mutation: drop the ``max(deadline, ended + grace)`` restart. Red: the guard gives up at
     2 graces, before the task ends."""
-    grace = 0.4
+    grace = 0.5
     guard = PollStopGuard()
     entered = asyncio.Event()
 
@@ -238,38 +238,79 @@ async def test_remotefile_stop_never_cuts_a_hand_off_in_progress(
     assert not poll.cancelled()
 
 
-async def test_a_cancelled_remotefile_stop_does_not_cut_a_hand_off(
-    monkeypatch: pytest.MonkeyPatch,
+class _SlowLedger(_FakeLedger):
+    """A leave-mode ledger whose read or write, once armed, outlasts the stop grace."""
+
+    def __init__(self, slow: str) -> None:
+        super().__init__()
+        self.slow = slow
+        self.armed = False
+        self.entered = asyncio.Event()
+
+    async def _maybe_wait(self, method: str) -> None:
+        if self.armed and method == self.slow:
+            self.entered.set()
+            await asyncio.sleep(0.5)  # 2.5 graces long
+
+    async def is_processed(self, file_key: str) -> bool:
+        await self._maybe_wait("is_processed")
+        return await super().is_processed(file_key)
+
+    async def mark_processed(self, file_key: str) -> None:
+        await self._maybe_wait("mark_processed")
+        await super().mark_processed(file_key)
+
+
+@pytest.mark.parametrize("slow", ["is_processed", "mark_processed"])
+async def test_remotefile_stop_never_cuts_a_ledger_call(
+    monkeypatch: pytest.MonkeyPatch, slow: str
 ) -> None:
-    """A cancel of stop() itself, as the runner's outer cancel sends, leaves a hand-off running:
-    ``_stop`` is set, so the task exits at its next stop check. Mutation: cancel the task on every
-    cancel of stop(). Red: the hand-off is cut."""
+    """The leave-mode ledger read and write are store calls too. A stop that arrives inside one
+    waits it out, past the grace. Mutation: drop the ``store_call()`` around that ledger call. Red:
+    the poll task is cancelled inside it."""
+    monkeypatch.setattr(remotefile_module, "POLL_STOP_GRACE_S", 0.2)
     client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A"})
-    src = _src(monkeypatch, client)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    committed: list[bytes] = []
-
-    async def held_commit(raw: bytes) -> str | None:
-        entered.set()
-        await release.wait()
-        committed.append(raw)
-        return None
-
-    src._handler = held_commit
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _SlowLedger(slow)
+    src.processed_ledger = ledger
+    src._handler = _noop
     await _settle(src)
+    ledger.armed = True
     src._poll_seconds = 0.0
-    await src.start(held_commit)
+    await src.start(_noop)
     poll = src._task
     assert poll is not None
-    await asyncio.wait_for(entered.wait(), 5)
-    stop = asyncio.create_task(src.stop())
-    await asyncio.sleep(0)  # stop() is now waiting on the poll task
-    stop.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(stop, 5)
-    assert not poll.done()
-    release.set()
-    await asyncio.wait_for(asyncio.gather(poll, return_exceptions=True), 5)
-    assert committed == [b"MSH|^~\\&|A"]
-    assert not poll.cancelled()
+    await asyncio.wait_for(ledger.entered.wait(), 5)
+    await asyncio.wait_for(src.stop(), 10)
+
+    assert not poll.cancelled(), f"stop() cut the poll task inside the ledger's {slow}"
+    if slow == "mark_processed":
+        assert len(ledger.keys) == 1, "the file was not recorded as ingested"
+
+
+async def test_a_cancelled_remotefile_stop_still_cuts_the_poll_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel of stop() itself, as the runner's outer cancel sends, cuts the poll task at once,
+    as the ``gather`` join before the bound did (ADR 0157 Amendment B). Mutation: drop the
+    ``task.cancel()`` in stop()'s cancel arm. Red: the task is left blocked in the listing."""
+    monkeypatch.setattr(remotefile_module, "POLL_STOP_GRACE_S", 60.0)
+    client = _FakeClient()
+    src = _src(monkeypatch, client)
+    entered, release = threading.Event(), threading.Event()
+    _blocked_listing(monkeypatch, client, entered, release)
+    await src.start(_noop)
+    poll = src._task
+    assert poll is not None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5), "the poll never reached the listing"
+        stop = asyncio.create_task(src.stop())
+        await asyncio.sleep(0)  # stop() is now waiting on the poll task
+        stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stop, 5)
+        done, _ = await asyncio.wait({poll}, timeout=5)
+        assert done and poll.cancelled(), "a cancelled stop() left the poll task running"
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(poll, return_exceptions=True), 15)

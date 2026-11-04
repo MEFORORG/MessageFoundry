@@ -1334,17 +1334,19 @@ At least these, read 2026-10-26:
   does, bounded by `_CUT_JOIN_TIMEOUT_S` and `_POOL_CLOSE_TIMEOUT_S`. It never cuts the handler
   call: while the task is inside one it keeps waiting a grace at a time, and the grace restarts
   when the call ends, so that wait is only as bounded as the store. A mark it cuts leaves its
-  committed row unmarked, a duplicate. The cancel path above is unchanged.
+  committed row unmarked, a duplicate. The cancel path above is unchanged. So the fence
+  paragraph's *an uncancelled DEMOTE stop still lets its in-flight row step finish* now holds for
+  the hand-off and for a mark that ends within a grace of it; a longer mark is cut.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
   `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.
 
-  *Amended 2026-11-03 (BACKLOG #4685):* RemoteFile's `stop()` now mirrors `FileSource.stop()`. It
-  waits `POLL_STOP_GRACE_S` for the poll task, then cancels it and logs a WARNING, and it never
-  cancels the task inside a store call: a hand-off, or a leave-mode ledger read, write or prune.
-  When cut, it no longer cancels the poll task inside a store call either; the task exits at its
-  next stop check. Timer is unchanged, and has no bound by design: its only awaits are the stop
-  signal and the hand-off, so a bound could only ever cut a store call.
+  *Amended 2026-11-03 (BACKLOG #4685):* an uncancelled RemoteFile `stop()` now waits
+  `POLL_STOP_GRACE_S` for the poll task, then cancels it and logs a WARNING, and that bound never
+  cancels the task inside a store call: a hand-off, or a leave-mode ledger read or write. A stop
+  also skips the ledger prune, as File's does. When cut, it still cancels the poll task at once,
+  wherever it is, as above. Timer is unchanged, and has no grace bound by design: its only awaits
+  are the stop signal and the hand-off, so such a bound could only ever wait on a store call.
 - **Loopback, PassThrough.** `stop()` returns at once.
 
 ### Tests
