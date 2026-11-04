@@ -109,6 +109,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -150,6 +151,7 @@ __all__ = [
     "ResendSourceEmpty",
     "ResendSourceNotFound",
     "RestoreRecord",
+    "RevokeResult",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -3151,7 +3153,14 @@ class AuthStore(Protocol):
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int: ...
+    ) -> RevokeResult:
+        """Revoke the account's unrevoked sessions, but ``except_token_hash`` when it is given,
+        raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
+        many it revoked and whether it re-stamped the kept session with the new epoch in that
+        transaction (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975): only when
+        that session is the account's and carried the epoch the raise replaced (store.py's
+        ``KeptSessionRestamp``). ``kept`` is False with no ``except_token_hash``."""
+        ...
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -3169,15 +3178,19 @@ class AuthStore(Protocol):
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
-        return how many it revoked (BACKLOG #2614).
+        return how many it revoked and whether it re-stamped the kept session
+        (:class:`~messagefoundry.store.store.RevokeResult`; BACKLOG #2614, #4975).
 
         In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
         every session minted before it whatever account it belongs to, raises the epoch of each
         account its read of the account list returns, ends the sessions it finds, and re-seals the
-        kept session under its account's new epoch and the new global one. The order of the
-        first three is each backend's, and its own docstring states it. store.py's
+        kept session under its account's new epoch and the new global one, only when it carried
+        both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
+        kept session an earlier sweep missed is left unstamped, so it is refused when next
+        presented, and ``kept`` is False. The order of the first three is each backend's, and its
+        own docstring states it. store.py's
         ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
         *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal
         does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError`, a store with

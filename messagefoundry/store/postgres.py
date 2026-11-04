@@ -243,9 +243,12 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EpochBump,
+    EpochRaise,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
+    KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -268,6 +271,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -311,6 +315,7 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     global_epoch_or_refuse,
+    global_epoch_raise,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -9396,14 +9401,17 @@ class PostgresStore:
             await self._write_user(conn, user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
-    async def _bump_session_epoch(self, conn: Any, user_id: str) -> None:
+    async def _bump_session_epoch(self, conn: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
-        transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
-        record that fails its seal does not stop the revoke that called this."""
+        transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
+        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
+        the revoke that called this, and reports no raise."""
+        bump = EpochBump()
         try:
-            await self._write_user(conn, user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(conn, user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -10589,11 +10597,6 @@ class PostgresStore:
         """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
         return global_epoch_or_refuse(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
 
-    async def _session_epoch(self, conn: Any, user_id: str) -> int:
-        """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
-        row = await conn.fetchrow("SELECT session_epoch FROM users WHERE id=$1", user_id)
-        return 0 if row is None else int(row["session_epoch"])
-
     def row_sealer(self) -> RowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
@@ -10708,8 +10711,9 @@ class PostgresStore:
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+    ) -> RevokeResult:
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
+        and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
@@ -10717,8 +10721,9 @@ class PostgresStore:
         ``create_session`` takes them in. The borrow is :meth:`_after_commit_txn`'s, for the reason
         it gives."""
         now = time.time() if now is None else now
+        kept = False
         async with self._after_commit_txn() as conn:
-            await self._bump_session_epoch(conn, user_id)
+            raised = await self._bump_session_epoch(conn, user_id)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
                 now,
@@ -10726,13 +10731,9 @@ class PostgresStore:
                 except_token_hash,
             )
             if except_token_hash is not None:
-                epoch = await self._session_epoch(conn, user_id)
-                await self._write_session(
-                    conn,
-                    except_token_hash,
-                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
-                )
-        return _rowcount(status)
+                restamp = KeptSessionRestamp(user_id, raised)
+                kept = restamp.kept(await self._write_session(conn, except_token_hash, restamp))
+        return RevokeResult(_rowcount(status), kept)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -10745,41 +10746,46 @@ class PostgresStore:
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
         Raises the store's global session epoch first (BACKLOG #5091), which ends every session
         minted before it whatever account it belongs to, then the epoch of each account its read of
         the account list returns, then ends the sessions it finds and re-seals the kept one under
-        both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that leaves.
+        both new epochs, when it carried both epochs those raises replaced
+        (:class:`KeptSessionRestamp`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session
+        sweep*, says what that leaves.
 
         The raise is first so a second revoke of every account waits on that one row, holding
         nothing, until this one commits. Nothing else locks the row: every reader of the global
         epoch reads it without a lock clause, and under MVCC such a read never waits on a writer,
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
+        kept = False
         async with self._timed_acquire() as conn, conn.transaction():
-            current = global_epoch_or_refuse(
-                await conn.fetchval(
-                    "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+            global_raised = global_epoch_raise(
+                global_epoch_or_refuse(
+                    await conn.fetchval(
+                        "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1"
+                        " RETURNING epoch"
+                    )
                 )
             )
-            for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
-                await self._bump_session_epoch(conn, str(row["id"]))
+            raised = {
+                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]))
+                for row in await conn.fetch("SELECT id FROM users ORDER BY id")
+            }
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
             if except_token_hash is not None:
                 owner = await conn.fetchval(
                     "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
                 )
                 if owner is not None:
-                    epoch = await self._session_epoch(conn, str(owner))
-                    await self._write_session(
-                        conn,
-                        except_token_hash,
-                        lambda s: replace(s, user_epoch=epoch, global_epoch=current),
-                    )
-        return _rowcount(status)
+                    owner = str(owner)
+                    restamp = KeptSessionRestamp(owner, raised.get(owner), global_raised)
+                    kept = restamp.kept(await self._write_session(conn, except_token_hash, restamp))
+        return RevokeResult(_rowcount(status), kept)
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a Postgres database's

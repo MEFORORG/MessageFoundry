@@ -96,8 +96,12 @@ from messagefoundry.api.header_floor import (
     hsts_notable,
     refuse_websocket,
 )
+from messagefoundry.api.message_scope import (
+    CONNECTION_DENIED_DETAIL,
+    get_scoped_message,
+    read_scoped_message,
+)
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
-from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -5557,15 +5561,22 @@ def create_app(
             await _deny_connection(engine, identity, name, client)
 
     async def _deny_connection(
-        engine: Engine, identity: Identity, name: str, client: str | None
+        engine: Engine,
+        identity: Identity,
+        name: str,
+        client: str | None,
+        *,
+        flag_direction_not_inbound: bool = False,
     ) -> NoReturn:
         # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
         # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
         # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
         # A name that fails the connection-name rule is recorded with no channel by the audit
         # helper itself (BACKLOG #3031).
-        await _audit_channel_denied(engine, identity, name, client)
-        raise HTTPException(403, "not authorized for this connection")
+        await _audit_channel_denied(
+            engine, identity, name, client, flag_direction_not_inbound=flag_direction_not_inbound
+        )
+        raise HTTPException(403, CONNECTION_DENIED_DETAIL)
 
     async def _resolve_connection(
         engine: Engine,
@@ -5803,16 +5814,33 @@ def create_app(
 
         A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
         other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
-        engine looks the name up, so a 200 against a 409 cannot tell it which names exist."""
+        engine looks the name up, so a 200 against a 409 cannot tell it which names exist.
+
+        The test is written here rather than through :func:`_resolve_connection`, which the other
+        per-name routes share, because the two ask whether a name exists in different sets
+        (BACKLOG #3378). Those routes act on this process's runner, so they read its own inbounds.
+        The flag lives in the store, so this one reads ``inbound_names()``, every inbound in the
+        deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
+        give the same refusal for an outbound and for a name outside the scope, and so does the web
+        console's flag route for a direction that names neither side. A change to that refusal has
+        to be made in at least those three places."""
         rr = engine.registry_runner
+        wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
-            req.direction != "inbound"
+            wrong_direction
             or not identity.can_access_channel(name)
             # inbound_names(), as the engine's own guard reads it: an engine shard's view holds only
             # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
             or (rr is not None and name not in rr.registry.inbound_names())
         ):
-            await _deny_connection(engine, identity, name, client_ip(request))
+            await _deny_connection(
+                engine,
+                identity,
+                name,
+                client_ip(request),
+                # The row's marker, for a row that names an in-scope inbound (BACKLOG #3378).
+                flag_direction_not_inbound=wrong_direction,
+            )
         try:
             await engine.set_connection_flag(
                 name,
@@ -9619,6 +9647,9 @@ def create_app(
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
+        What such a caller reads of each rule's ``id``, and why, is stated once in
+        ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG #3378).
+
         A read that withholds at least one rule writes an audit row; see
         :func:`_audit_alert_rules_withheld`."""
         alerts: AlertsSettings = (
@@ -9631,6 +9662,7 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
+        show_ids = _user.allowed_channels is None
 
         config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
@@ -9657,7 +9689,8 @@ def create_app(
                     cooldown_seconds=r.cooldown_seconds,
                     # #146: report the COUNT of per-rule recipients, never the addresses (secret-guard parity).
                     recipient_count=len(r.recipients) if r.recipients else 0,
-                    id=r.id,  # #138 — the operator rule label ({rule_id})
+                    # #138 — the operator rule label ({rule_id}); withheld per the docstring (#3378)
+                    id=r.id if show_ids else None,
                     control_action=r.control_action,  # #144 — auto-remediation action
                     control_target=r.control_target,
                     mute=r.mute,  # #143 — static per-rule notification mute

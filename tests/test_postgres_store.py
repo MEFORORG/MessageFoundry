@@ -5559,7 +5559,8 @@ async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
     connection, after the revoke read the account list and ran its sweep and before it commits.
     The sweep cannot see that session and the account loop never raised its epoch, so before the
     global epoch it stayed live. It now carries the global epoch the revoke is replacing. The hook
-    is the kept session's epoch read, which runs between the sweep and the commit."""
+    is the kept session's re-seal, which runs between the sweep and the commit (the epoch read it
+    used to hook went with BACKLOG #4975, which takes the epochs from the raises)."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import AuthSettings, load_settings
@@ -5576,15 +5577,15 @@ async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
         await _user(keyed, owner)
         kept = await _mint(keyed, owner)
         minted: list[str] = []
-        original = keyed._session_epoch
+        original = keyed._write_session
 
-        async def between_sweep_and_commit(conn: object, user_id: str) -> int:
+        async def between_sweep_and_commit(conn: Any, token_hash: str, change: Any) -> Any:
             if not minted:
                 await _user(keyed, late)
                 minted.append(await _mint(keyed, late))
-            return await original(conn, user_id)
+            return await original(conn, token_hash, change)
 
-        monkeypatch.setattr(keyed, "_session_epoch", between_sweep_and_commit)
+        monkeypatch.setattr(keyed, "_write_session", between_sweep_and_commit)
         await keyed.revoke_all_sessions(except_token_hash=hash_token(kept))
         monkeypatch.undo()
         assert minted, "the hook did not run inside the revoke"
