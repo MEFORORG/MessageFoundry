@@ -143,14 +143,20 @@ async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subjec
     rather than that a block went unread (BACKLOG #4948)."""
     named = _ca(_dn((NameOID.ORGANIZATION_NAME, "Acme"), (NameOID.COMMON_NAME, "Partner CA")))
     other = _ca(_dn((NameOID.ORGANIZATION_NAME, "Other"), (NameOID.COMMON_NAME, "Other CA")))
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+    listener_log = "messagefoundry.transports.http_listener"
+    control = "capture control: the listener's logger reaches caplog"
+    with caplog.at_level(logging.WARNING, logger=listener_log):
+        # The listener should warn nothing here, so the capture's true floor is this control alone.
+        # It keeps the empty check below from passing on a capture wired to the wrong logger.
+        logging.getLogger(listener_log).warning(control)
         source = _source(
             tmp_path,
             [named[0], other[0]],
             {named[0].subject.rfc4514_string(): [SUBJECT]},
             label=label,
         )
-    at_start = [r.getMessage() for r in caplog.records]
+    assert len(caplog.records) >= 1, "the capture missed its own control warning"
+    at_start = [r.getMessage() for r in caplog.records if r.getMessage() != control]
     await _started(source)
     try:
         # Control: the same subject from the CA it is listed under is admitted.
