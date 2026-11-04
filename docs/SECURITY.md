@@ -301,6 +301,23 @@ names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminat
 `MEFOR_API_*` variables alone, for example on a site that names its environment only with
 `serve --env`, still reaches `serve` and not the check.
 
+**What else a proxy in front owes.** `serve` checks these after the refusals above, whether the hop
+is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
+
+- **A declared terminator** owes `[api].proxy_intra_service_auth` and `[api].proxy_tls_min_version`,
+  with or without `[api].tls_cert_file`. If either is missing, `serve` refuses to start (exit 2) under
+  `[security].enforcement = enforce` on a bind host that is not loopback, and warns otherwise.
+- **A proxy in `[api].trusted_proxies` with no declared terminator** re-encrypts to your
+  `[api].tls_cert_file`. It owes `[api].proxy_tls_min_version` on the same terms, and not
+  `proxy_intra_service_auth`.
+- **Any proxy in `[api].trusted_proxies`**, in either shape, owes `[security].web_console_public_address`
+  under `enforce`, on a loopback bind too: without it, `serve` refuses to start. The ASVS 12.1.1 probe
+  dials that address at start under `enforce`, and `serve` refuses when it cannot reach it, when it
+  accepts TLS 1.0 or 1.1, or when it does not negotiate TLS 1.3.
+- **The web console behind a declared terminator** needs `[security].web_console_public_address` in
+  every enforcement mode: `serve` refuses to serve the console without it. Behind a declared
+  terminator the console is served only when `[security].serve_web_console = true` is set.
+
 ### API revocation gate
 
 This section covers the `[api]` listener. Nothing in the engine checks whether the certificate it serves is revoked: stdlib `ssl` fetches no OCSP or CRL,
