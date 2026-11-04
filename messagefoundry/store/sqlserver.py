@@ -160,6 +160,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PENDING_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -4039,6 +4040,7 @@ class SqlServerStore:
             key_cols=("id",),
             aad_of=queue_row_aad,
             blank_where=f"DATALENGTH([payload]) = 0 AND {LIVE_INLINE_ROW}",
+            sealed_blank_where=f"DATALENGTH([payload]) = 0 AND {PENDING_INLINE_ROW}",
         )
         # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
         # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
@@ -4110,6 +4112,7 @@ class SqlServerStore:
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[dict[str, Any]], bytes] | None = None,
         blank_where: str | None = None,
+        sealed_blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -4119,8 +4122,9 @@ class SqlServerStore:
         reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
-        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
-        are real rows (BACKLOG #3495), sealed as the SQLite twin says (BACKLOG #4994).
+        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` and ``sealed_blank_where``
+        name the blank values that are real rows, sealed as the SQLite twin says (BACKLOG #3495,
+        #4994).
         Every identifier is a code constant and is bracket-quoted (``key`` is a T-SQL reserved word);
         only the marker pattern is a parameter.
 
@@ -4192,13 +4196,22 @@ class SqlServerStore:
                     if left:
                         report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
-                # Without the opt-out, `blanks` is non-zero only on a surface this open claimed.
-                seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
+                # Without the opt-out, `blanks` is non-zero only on a surface this open claimed and
+                # found unsealed. On a sealed one, only the opt-out's narrower set qualifies.
+                live_blank = blank_where if claimed and not is_sealed else sealed_blank_where
+                seal_where = (
+                    f"({pending_where}) OR ({live_blank})"
+                    if blanks and live_blank
+                    else pending_where
+                )
                 # The UPDATE re-checks `seal_where`, as on Postgres (BACKLOG #4994): under the
-                # opt-out a peer engine shard can dead-letter a blank after the SELECT, and sealing
-                # encrypt('') into that dead row would make it replayable as an empty body.
+                # opt-out a peer engine shard can claim a blank after the SELECT, and sealing
+                # encrypt('') into it would leave a dead row replayable as an empty body. The
+                # OUTPUT row counts the seal, since a session-wide SET NOCOUNT ON can hide the
+                # rowcount (BACKLOG #2283).
                 update_sql = (
-                    f"UPDATE {table} SET [{column}]=? WHERE {where_keys} AND ({seal_where})"
+                    f"UPDATE {table} SET [{column}]=? OUTPUT inserted.[{keys[0]}]"
+                    f" WHERE {where_keys} AND ({seal_where})"
                 )
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
@@ -4228,7 +4241,7 @@ class SqlServerStore:
                                 like,
                             ),
                         )
-                        sealed += max(cur.rowcount or 0, 0)
+                        sealed += len(await cur.fetchall())
                 await self._commit(conn)
             except BaseException:
                 # Roll the WHOLE surface back: a half-sealed surface reads as sealed on the next open,

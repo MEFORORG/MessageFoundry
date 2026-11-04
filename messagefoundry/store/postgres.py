@@ -171,6 +171,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PENDING_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -3216,6 +3217,7 @@ class PostgresStore:
             key_cols=("id",),
             aad_of=queue_row_aad,
             blank_where=f"payload = '' AND {LIVE_INLINE_ROW}",
+            sealed_blank_where=f"payload = '' AND {PENDING_INLINE_ROW}",
         )
         total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         total += await self._seal_surface(
@@ -3277,6 +3279,7 @@ class PostgresStore:
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[Any], bytes] | None = None,
         blank_where: str | None = None,
+        sealed_blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -3286,8 +3289,9 @@ class PostgresStore:
         reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
-        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
-        are real rows (BACKLOG #3495), sealed as the SQLite twin says (BACKLOG #4994).
+        (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` and ``sealed_blank_where``
+        name the blank values that are real rows, sealed as the SQLite twin says (BACKLOG #3495,
+        #4994).
         Identifiers are code constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
@@ -3323,7 +3327,7 @@ class PostgresStore:
             return 0
         await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending + blanks)
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
-        where_keys = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(keys))
+        where_keys = " AND ".join(f"{c}=${i + 3}" for i, c in enumerate(keys))
         sealed = 0
         # One transaction for the whole surface, marker included: asyncpg rolls it back on any
         # exception, so a crash or a failure part-way leaves the surface exactly as unsealed as it was.
@@ -3337,15 +3341,20 @@ class PostgresStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
-            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed.
-            seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
+            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed and
+            # found unsealed. On a sealed one, only the opt-out's narrower set qualifies.
+            live_blank = (
+                blank_where if claimed is not None and not is_sealed else sealed_blank_where
+            )
+            seal_where = (
+                f"({pending_where}) OR ({live_blank})" if blanks and live_blank else pending_where
+            )
             # The UPDATE re-checks `seal_where` (BACKLOG #4994). Under the opt-out this seal runs on
             # a surface live peer engine shards already write, so a row can leave it after the
-            # SELECT: a blank a peer claimed and dead-lettered would otherwise take encrypt('') and
+            # SELECT: a blank a peer claimed would otherwise take encrypt('') and, dead-lettered,
             # read as a replayable empty body. A re-check that fails matches no row. The marker
-            # pattern is renumbered past the UPDATE's own parameters.
-            recheck = seal_where.replace("$1", f"${len(keys) + 2}")
-            update_sql = f"UPDATE {table} SET {column}=$1 WHERE {where_keys} AND ({recheck})"
+            # pattern keeps `$1`, so the predicate is the SELECT's own text.
+            update_sql = f"UPDATE {table} SET {column}=$2 WHERE {where_keys} AND ({seal_where})"
             while True:
                 rows = await conn.fetch(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
@@ -3358,6 +3367,7 @@ class PostgresStore:
                     sealed += _rowcount(
                         await conn.execute(
                             update_sql,
+                            like,
                             self._cipher.encrypt(
                                 r["v"],
                                 aad=(
@@ -3367,7 +3377,6 @@ class PostgresStore:
                                 ),
                             ),
                             *(r[c] for c in keys),
-                            like,
                         )
                     )
         # Top the reserve back up for whatever follows; the burst itself was reserved above.

@@ -162,6 +162,7 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PENDING_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     QueueTagError,
@@ -9546,8 +9547,9 @@ class MessageStore:
           the plant. That is why this exception reads the sealed state and not the row. An empty
           body written by a keyless run of a store that was keyed before reads the same way. The
           opt-out is the operator's word that such values are legitimate, so under it this open
-          seals that blank as it seals the run's plaintext, and the row is delivered (BACKLOG #4994).
-          A row the claim already dead-lettered stays blank and is not replayable.
+          seals a ``pending`` blank as it seals the run's plaintext, and the row is delivered
+          (BACKLOG #4994). An ``inflight`` one stays refused, and a row the claim already
+          dead-lettered stays blank and is not replayable: :data:`PENDING_INLINE_ROW` says why.
 
         **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
         otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
@@ -9580,6 +9582,7 @@ class MessageStore:
                 key_cols=("id",),
                 aad_of=queue_row_aad,
                 blank_where=f"payload = '' AND {LIVE_INLINE_ROW}",
+                sealed_blank_where=f"payload = '' AND {PENDING_INLINE_ROW}",
             )
             # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
             total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
@@ -9643,6 +9646,7 @@ class MessageStore:
         key_cols: tuple[str, ...] | None = None,
         aad_of: Callable[[aiosqlite.Row], bytes] | None = None,
         blank_where: str | None = None,
+        sealed_blank_where: str | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
@@ -9651,11 +9655,11 @@ class MessageStore:
         ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
-        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). Without the
-        opt-out they are sealed only by the open that writes the marker on a surface holding no
-        ciphertext; under it, by any keyed open (BACKLOG #4994). On a surface this open finds
-        unsealed they count as something to seal, so it never writes the marker over them unsealed.
-        All identifiers
+        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
+        by the open that writes the marker on a surface holding no ciphertext, and they count as
+        something to seal there, so that open never writes the marker over them unsealed. Under the
+        opt-out, an open that finds the surface sealed seals ``sealed_blank_where`` instead, the
+        narrower set :data:`PENDING_INLINE_ROW` says why (BACKLOG #4994). All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
@@ -9719,8 +9723,12 @@ class MessageStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
-            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed.
-            seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
+            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed and
+            # found unsealed. On a sealed one, only the opt-out's narrower set qualifies.
+            live_blank = blank_where if claimed and not is_sealed else sealed_blank_where
+            seal_where = (
+                f"({pending_where}) OR ({live_blank})" if blanks and live_blank else pending_where
+            )
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
                 # matching NOT LIKE and the loop terminates inside the one transaction.

@@ -592,9 +592,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    with one exception: a `pending` or `inflight` inline row whose payload is `''`, other than a
    `response` re-ingress token, because a keyless store writes an empty body that way and a keyed
    claim refuses a blank (vault BACKLOG #3495). An open that finds `queue.payload` unsealed seals
-   such a row. With the switch `true`, a keyed open seals one on a surface that is already sealed
-   too (vault BACKLOG #4994). The row stays owed work and is delivered as an empty body. Without the
-   switch, a blank live row on a sealed surface is left blank and refused at the claim, and so is
+   such a row. With the switch `true`, a keyed open also seals a `pending` one on a surface that is
+   already sealed (vault BACKLOG #4994). An `inflight` one there may be a peer engine shard's claim
+   about to dead-letter it, so it is left. A sealed row stays owed work and is delivered as an empty
+   body. A blank live row on a sealed surface that no open sealed is refused at the claim, and so is
    one written after the open, switch or not, because the claim itself never seals.
    **At least these limits remain.** The DIRECT S/MIME enveloped body is not covered. A row planted
    before the open that first records its surface, on a surface with no ciphertext, looks exactly

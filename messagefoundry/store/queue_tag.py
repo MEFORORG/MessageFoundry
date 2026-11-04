@@ -45,6 +45,7 @@ __all__ = [
     "BODY_INLINE",
     "BODY_REF",
     "LIVE_INLINE_ROW",
+    "PENDING_INLINE_ROW",
     "QUEUE_TAG_COLUMNS",
     "QUEUE_TAG_SELECT",
     "QUEUE_TAG_FAILED_ACTION",
@@ -68,16 +69,24 @@ BODY_REF: Final = "ref"
 #: #3495): an inline row that is still owed work. Retention blanks only ``done``, ``cancelled`` and
 #: ``dead`` rows, so a blank ``pending`` or ``inflight`` row is a keyless writer's ``encrypt('')`` or a
 #: plant. Nothing tells those apart on a surface with no ciphertext, where a planted plaintext value is
-#: sealed too (docs/PHI.md names that limit). On a surface that is already sealed, the keyed open seals
-#: such a row only under ``[store].allow_unmarked_ciphertext``, the operator's word that it is a keyless
-#: run's empty body (BACKLOG #4994); without it the row is left blank, as a plant would be, and the
-#: claim refuses it. A blank terminal row may be an erasure and cannot be told
-#: from an empty body. A ``ref`` row and a ``response`` re-ingress token are left out, because each
+#: sealed too (docs/PHI.md names that limit). On a surface that is already sealed the keyed open
+#: seals only :data:`PENDING_INLINE_ROW`, and only under the opt-out. A blank terminal row may be an
+#: erasure and cannot be told from an empty body. A ``ref`` row and a ``response`` re-ingress token are left out, because each
 #: writer always stores a reference, so a blank there is damage and stays refused. Literal values, so
 #: each backend can splice this beside its own spelling of "blank".
 LIVE_INLINE_ROW: Final = (
     "body_ref IS NULL AND stage <> 'response' AND status IN ('pending', 'inflight')"
 )
+
+#: The blank rows a keyed open under ``[store].allow_unmarked_ciphertext`` seals on a surface that is
+#: already sealed (BACKLOG #4994): :data:`LIVE_INLINE_ROW`, ``pending`` only. The opt-out is the
+#: operator's word that a keyless run's empty body there is legitimate. Without it the row is left
+#: blank, as a plant would be, and the claim refuses it. Peer engine shards may be running on such a
+#: surface, and one that has claimed a blank (``inflight``) will dead-letter it after this open's
+#: seal. Sealing that row would leave a dead row holding a valid empty body, which a replay would
+#: send. A claim that takes a ``pending`` row after the seal commits reads the sealed empty body
+#: instead. So an ``inflight`` blank stays refused there, under the opt-out too.
+PENDING_INLINE_ROW: Final = "body_ref IS NULL AND stage <> 'response' AND status = 'pending'"
 
 #: The ``seal_bytes`` kind the routing fields are encoded under. Its own kind, so a queue tag can
 #: never equal the encoding of an authority-row seal.

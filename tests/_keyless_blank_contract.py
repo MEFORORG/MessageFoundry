@@ -236,8 +236,10 @@ async def assert_the_opt_out_seals_a_keyless_runs_live_blank(
     on a sealed surface, which reads like a plant. Under ``allow_unmarked_ciphertext`` the operator
     vouches for such values, so the next keyed open seals the blank with the run's plaintext, and
     the row is delivered once with no alarm. A terminal blank still stays blank: it may be an
-    erasure, and sealing it would make it replayable. The refusal without the opt-out is the case
-    above."""
+    erasure, and sealing it would make it replayable. So does one a strict keyed claim already
+    dead-lettered, and an ``inflight`` one, which on a sealed surface may be a peer engine shard's
+    claim about to dead-letter it (``PENDING_INLINE_ROW``). The refusal without the opt-out is the
+    case above."""
     keyed = await open_keyed()
     try:
         witness = await outbound(keyed, "OB_KB_WITNESS", BODY)
@@ -247,6 +249,15 @@ async def assert_the_opt_out_seals_a_keyless_runs_live_blank(
     live = await outbound(keyless, "OB_KB_RUN", "")
     legacy = await outbound(keyless, "OB_KB_RUN_BODY", BODY)
     done = await terminal(keyless, "OB_KB_RUN_DONE", dead=False)
+    claimed = await outbound(keyless, "OB_KB_RUN_CLAIMED", "")
+    assert await keyless.claim_next_fifo("OB_KB_RUN_CLAIMED") is not None
+    refused = await outbound(keyless, "OB_KB_RUN_REFUSED", "")
+    keyed = await open_keyed()  # strict: its claim dead-letters the blank
+    try:
+        assert await keyed.claim_next_fifo("OB_KB_RUN_REFUSED") is None
+    finally:
+        await keyed.close()
+    assert (await row_of(fetch, refused))["status"] == OutboxStatus.DEAD.value
     assert (await row_of(fetch, live))["payload"] == ""  # the premise: blank on a sealed surface
 
     alarms, hook = alarm_log()
@@ -255,6 +266,9 @@ async def assert_the_opt_out_seals_a_keyless_runs_live_blank(
         assert str((await row_of(fetch, live))["payload"]).startswith(MARKER_PREFIX)
         assert str((await row_of(fetch, legacy))["payload"]).startswith(MARKER_PREFIX)
         assert (await row_of(fetch, done))["payload"] == ""
+        assert (await row_of(fetch, claimed))["payload"] == ""
+        assert (await row_of(fetch, refused))["payload"] == ""
+        assert await keyed.replay(refused, audit=no_operator_audit) == 0
         assert str((await row_of(fetch, witness))["payload"]).startswith(MARKER_PREFIX)
 
         item = await keyed.claim_next_fifo("OB_KB_RUN")
