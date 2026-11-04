@@ -560,7 +560,7 @@ class _LaneClaims:
     def settle(self, worker: str, name: str, *, ordered: bool = True) -> None:
         """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends,
         on an unordered lane only once no suspect is left."""
-        if not ordered:
+        if not ordered and self.suspects:  # filled only while a run of deaths is open
             self.suspects.difference_update(self.ids)
         self.ids.clear()
         if self.deaths.count and (ordered or not self.suspects):
