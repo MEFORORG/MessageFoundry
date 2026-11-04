@@ -293,12 +293,38 @@ def test_a_traceback_the_filter_cannot_read_is_withheld_not_raised() -> None:
         def __str__(self) -> str:
             raise RuntimeError("no message")
 
+    # The DUL's own shape: LOGGER.exception(exc), so the record's message is the exception too.
+    unprintable = Unprintable()
     record = logging.LogRecord(
-        "pynetdicom.dul", logging.ERROR, __file__, 1, "x", (), (Unprintable, Unprintable(), None)
+        "pynetdicom.dul",
+        logging.ERROR,
+        __file__,
+        1,
+        unprintable,
+        (),
+        (Unprintable, unprintable, None),
     )
     assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
     assert record.exc_info is None
     assert record.exc_text == "Unprintable (traceback withheld: it did not render)"
+
+
+def test_a_rewritten_traceback_keeps_the_codec_error_protection() -> None:
+    refusal = f"Invalid 'Transfer Syntax Name' value '{_PLANTED}' - must not exceed 64 characters"
+    try:
+        try:
+            b"\xc3".decode("ascii")
+        except UnicodeDecodeError:
+            raise ValueError(refusal)  # noqa: B904 - the implicit context is the case under test
+    except ValueError as exc:
+        info = (ValueError, exc, exc.__traceback__)
+        record = logging.LogRecord("pynetdicom.dul", logging.ERROR, __file__, 1, exc, (), info)
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    assert record.exc_info is None and record.exc_text is not None
+    assert "value '[redacted]' - must not exceed 64 characters" in record.exc_text
+    # Rendered by safe_traceback, which names no byte a codec failed on (vault BACKLOG #3185).
+    assert "UnicodeDecodeError" in record.exc_text
+    assert _PLANTED not in record.exc_text and "0xc3" not in record.exc_text
 
 
 def test_a_traceback_with_no_flagged_value_is_left_to_the_formatter() -> None:
@@ -483,8 +509,11 @@ def test_the_phi_record_states_the_ruling() -> None:
     dicom = (root / "docs" / "DICOM.md").read_text(encoding="utf-8")
     assert "the value reads `[redacted]`" in dicom
     # Both say the filter is a list of known shapes, which a version pin guards; not a guarantee.
-    assert "the pin tests fail when either library's version changes" in " ".join(phi.split())
+    assert "pin tests fail when either library's version changes" in " ".join(phi.split())
     assert "fail when either library's version changes" in " ".join(dicom.split())
+    # The pins guard the tests' environment, never a site's install; both pages must say so.
+    assert "not a site's own install" in " ".join(phi.split())
+    assert "They do not reach a site's own install" in " ".join(dicom.split())
 
 
 @pytest.mark.parametrize(

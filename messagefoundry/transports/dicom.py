@@ -70,7 +70,6 @@ import socketserver
 import ssl
 import threading
 import time
-import traceback
 import warnings
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -111,7 +110,7 @@ from messagefoundry.parsing.dicom._inflate import (
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.redaction import _REDACTED, safe_exc
+from messagefoundry.redaction import _REDACTED, safe_exc, safe_traceback
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
@@ -482,7 +481,9 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
     ),
 }
 
-#: The ``pynetdicom._handlers`` labels whose value ``set_ae`` checks, as :func:`_kept` does.
+#: The ``pynetdicom._handlers`` labels whose value is an AE title, or a version name pynetdicom checks
+#: as one. :func:`_kept` applies ``set_ae``'s check to each, including the A-ASSOCIATE-AC's two
+#: titles, which pynetdicom reads from reserved fields without any check.
 _TITLE_LABELS = frozenset(
     {
         "Move Originator",
@@ -595,17 +596,18 @@ class _PeerValueFilter(logging.Filter):
         if not shapes:
             return True
         try:
-            text = record.getMessage()
-        except (TypeError, ValueError):  # bad %-args: the handler reports it, as it would anyway
-            return True
-        redacted = _redacted_line(shapes, text)
-        if redacted is not None:
-            record.msg, record.args = redacted, ()
+            text: str | None = record.getMessage()
+        except Exception:  # noqa: BLE001 - bad %-args, or a msg whose str() raises: never raise here
+            text = None  # the handler reports it, as it would anyway
+        if text is not None:
+            redacted = _redacted_line(shapes, text)
+            if redacted is not None:
+                record.msg, record.args = redacted, ()
         if record.exc_info and record.exc_info[1] is not None:
             exc = record.exc_info[1]
             try:
                 _redact_traceback(record, shapes, exc)
-            except Exception as failed:  # noqa: BLE001 - rendering a third-party exception; never raise here
+            except Exception as failed:  # noqa: BLE001 - rendering a third-party exception
                 # A filter that raised would raise on the pynetdicom thread that logged the line, and
                 # the traceback could still hold the value, so it is withheld.
                 record.exc_info = None
@@ -619,9 +621,10 @@ def _redact_traceback(
 ) -> None:
     """Redact the message of ``exc``, and of each exception it was raised from or during, where it
     is of a shape in ``shapes``. A formatter writes each one again on the traceback's last lines,
-    which redacting the record's own message does not reach. The traceback is rendered into
-    ``exc_text`` and ``exc_info`` cleared, as ``logging_setup``'s own redaction does, so a
-    formatter writes the rendered copy. A traceback with no such message is left as it was."""
+    which redacting the record's own message does not reach. The traceback is rendered through
+    :func:`~messagefoundry.redaction.safe_traceback` into ``exc_text`` and ``exc_info`` cleared, as
+    ``prepare_log_record`` does, so a formatter writes the rendered copy and its codec-error lines
+    keep that function's protection. A traceback with no such message is left as it was."""
     redactions: list[tuple[str, str]] = []
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -634,7 +637,7 @@ def _redact_traceback(
         current = current.__cause__ or current.__context__
     if not redactions:
         return
-    rendered = "".join(traceback.format_exception(exc)).rstrip("\n")
+    rendered = safe_traceback((type(exc), exc, exc.__traceback__))
     for message, redacted in redactions:
         rendered = rendered.replace(message, redacted)
     record.exc_info, record.exc_text = None, rendered
