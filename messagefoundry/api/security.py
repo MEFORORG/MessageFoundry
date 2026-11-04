@@ -1573,7 +1573,7 @@ def enforce_phi_read_hop(request: Request) -> None:
 
     The serve-start exposed-gate already refuses a prod-PHI cleartext bind, but this is the RESPONSE-path
     defense-in-depth: :func:`create_app` derived the API serve-hop :class:`HopDisposition` once (keyed on
-    the instance posture + whether the serve hop is loopback / in-process TLS / proxy-terminated) and
+    the instance posture + whether the serve hop is loopback / operator certificate / proxy-terminated) and
     stashed it on ``app.state``. When it is :attr:`~HopDisposition.REFUSE` — a production-PHI instance
     whose serve hop is NOT proven secure — a PHI-read is refused with a PHI-free 403 rather than putting a
     body / summary on the clear. ALLOW / WARN (the loopback-dev / non-prod-PHI / synthetic / TLS cases)
@@ -1586,7 +1586,7 @@ def enforce_phi_read_hop(request: Request) -> None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "PHI read refused: this production-PHI instance's API serve hop is not proven secure "
-            "(no loopback bind, in-process TLS, or declared TLS-terminating proxy), so PHI is not "
+            "(no loopback bind, operator certificate, or declared TLS-terminating proxy), so PHI is not "
             "emitted over it (posture-keyed refusal, #200/ADR 0092). Bind the engine to loopback "
             "([security].listen_address or serve --host), or set [api].tls_cert_file, which off "
             "loopback also needs MEFOR_TLS_REVOCATION_ATTESTED=1. See docs/SECURITY.md, Enforcement "

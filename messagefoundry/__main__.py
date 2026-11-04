@@ -335,13 +335,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         action="store_true",
         help="a dev override for a trusted, firewalled network, honoured only under "
         "[security].enforcement=warn. For the API it permits a non-loopback bind with NO operator "
-        "certificate: the engine then serves TLS on its generated self-signed placeholder, which no "
-        "trust store vouches for, so a remote client can authenticate the engine only by pinning "
-        "that exact certificate, handed over out of band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
+        "certificate and no declared upstream terminator: the engine then serves TLS on its "
+        "generated self-signed placeholder, which no trust store vouches for, so a remote client "
+        "can authenticate the engine only by pinning that exact certificate, handed over out of "
+        "band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
         "X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI crosses the network "
-        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which is allowed off-loopback "
-        "without this flag, and per-connection tls where the connector has it (raw-TCP and X12 have "
-        "none). Does not relax the no-auth refuse or the /ui refuse.",
+        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which off loopback also needs "
+        "MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate), and "
+        "per-connection tls where the connector has it (raw-TCP and X12 have none). It relaxes no "
+        "other API refusal, at least the no-auth, /ui, plaintext proxy hop, revocation and proxy "
+        "declaration refusals.",
     )
 
     supervise = sub.add_parser(
@@ -3407,6 +3410,7 @@ def _serve(args: argparse.Namespace) -> int:
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
     from messagefoundry.api.tls import (
+        off_loopback_certificate_remedy,
         plaintext_upstream_hop_off_loopback,
         plaintext_upstream_hop_off_loopback_remedy,
         plaintext_upstream_hop_unacknowledged,
@@ -3818,7 +3822,8 @@ def _serve(args: argparse.Namespace) -> int:
 
     # The browser ops dashboard ([api].serve_ui, ADR 0065) is a STRICTER surface than the JSON API: it
     # puts an HttpOnly session cookie and PHI-rendering HTML on the wire. An off-loopback /ui bind
-    # therefore REQUIRES exposure_protected (in-process TLS) and is
+    # therefore REQUIRES exposure_protected, which off loopback means an operator tls_cert_file: the
+    # plaintext-hop arm above already refused a terminator with no certificate (BACKLOG #4636). It is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
     # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
@@ -3841,9 +3846,13 @@ def _serve(args: argparse.Namespace) -> int:
     #     view -- that is not what the operator wrote. Applying the prescribed edit on this route
     #     (local_access_only=false, listen_address="127.0.0.1", with --host 0.0.0.0 still on the
     #     command line) leaves this refusal firing, rc 2, because the flag still wins. Measured
-    #     2026-09-21. The fix on this route is to drop or change the flag, which the message does not
-    #     yet say. The test above drives the FILE route only and says so; do not read it as covering
-    #     this one.
+    #     2026-09-21. The fix on this route is to drop or change the flag. The message names it
+    #     through loopback_levers, which on this route reads "serve --host, which overrides
+    #     [security].listen_address". The test above drives the FILE route only.
+    # The certificate remedy is off_loopback_certificate_remedy, which names the revocation
+    # attestation: off loopback a certificate bind meets the API revocation gate above. The loopback
+    # remedy is for local access; a same-machine proxy in front of it owes what docs/SECURITY.md,
+    # Plaintext proxy hop, lists, and the message points there rather than restating it.
     if (
         settings.api.serve_ui
         and not settings.api.is_loopback
@@ -3853,13 +3862,13 @@ def _serve(args: argparse.Namespace) -> int:
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
             f"non-loopback host {settings.api.host!r} without an operator certificate. The only "
             "certificate available is the engine's "
-            "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
-            "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
-            "TLS-terminating proxy in front of a loopback engine ([api].tls_terminated_upstream + "
-            "trusted_proxies, BACKLOG #4636); "
-            "--allow-insecure-bind does not cover it, and neither does "
-            "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
-            "address (127.0.0.1) for local-only access, or configure one of those two.",
+            "generated self-signed placeholder, which no trust store vouches for, and off loopback "
+            "the /ui surface requires an operator certificate; --allow-insecure-bind does not cover "
+            "it, and neither does [security].require_encryption_for_remote=false. Either bind the "
+            f"engine to loopback ({loopback_levers}) for local access, or "
+            f"{off_loopback_certificate_remedy()}. A reverse proxy on this machine in front of a "
+            "loopback engine owes what docs/SECURITY.md, Plaintext proxy hop, lists; "
+            "docs/SECURITY.md, API revocation gate, says what the attestation means.",
             file=sys.stderr,
         )
         return 2
@@ -5066,7 +5075,7 @@ def _serve(args: argparse.Namespace) -> int:
         loopback=settings.api.is_loopback,
         tls_terminated_upstream=settings.api.tls_terminated_upstream,
         # #200 residual (ADR 0092): the API PHI-read data-path guard keys on whether the serve hop is
-        # proven secure — a loopback bind (on-box), in-process TLS, or a declared TLS-terminating proxy
+        # proven secure — a loopback bind (on-box), an operator certificate, or a declared TLS-terminating proxy
         # (exposure_protected). A prod-PHI instance whose serve hop is none of these refuses to emit PHI
         # over the response path, mirroring the transport-cell posture-keyed refusal.
         phi_read_hop_secure=settings.api.is_loopback or settings.api.exposure_protected,

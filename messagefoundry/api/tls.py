@@ -55,6 +55,7 @@ __all__ = [
     "build_api_ssl_context",
     "ensure_api_tls_material",
     "generated_state_dir",
+    "off_loopback_certificate_remedy",
     "plan_api_tls_material",
     "plaintext_upstream_hop_off_loopback",
     "plaintext_upstream_hop_off_loopback_remedy",
@@ -336,10 +337,17 @@ def plaintext_upstream_hop_off_loopback_remedy(loopback_lever: str) -> str:
     gate*)."""
     return (
         f"Either bind the engine to loopback ({loopback_lever}) behind a proxy on the same "
-        "machine and set [api].plaintext_upstream_hop_acknowledged = true, or set "
-        f"[api].tls_cert_file, set {TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment, and "
-        "point the proxy at https"
+        "machine and set [api].plaintext_upstream_hop_acknowledged = true, or "
+        f"{off_loopback_certificate_remedy()}, and point the proxy at https"
     )
+
+
+def off_loopback_certificate_remedy() -> str:
+    """The certificate half of an off-loopback API remedy, as a clause: an operator certificate
+    and, because off loopback that bind meets the API revocation gate, the attestation. Shared by
+    :func:`plaintext_upstream_hop_off_loopback_remedy` and ``serve``'s /ui refusal, so the two
+    cannot drift on what a certificate bind needs."""
+    return f"set [api].tls_cert_file, set {TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment"
 
 
 @dataclass(frozen=True)
@@ -679,10 +687,12 @@ def ensure_api_tls_material(
     # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
     # path cannot disagree about which certificate the bind presents. Two of the three branches
     # need no disk at all: an operator's material is passed through UNCHANGED (tls_key_file's None
-    # included -- see the key_path note above), and a DECLARED UPSTREAM TERMINATOR IS NOT AN
-    # UNPROTECTED HOP, so minting there would break the proxy's own plaintext hop rather than
-    # harden anything. "Always serves TLS" means the engine never leaves a hop unprotected, NOT
-    # that it terminates TLS in every topology. Neither branch is ever renewed.
+    # included -- see the key_path note above), and behind a DECLARED UPSTREAM TERMINATOR minting
+    # would break the proxy's own plaintext hop rather than harden anything. That hop is plaintext
+    # and the engine does nothing to protect it, so serve accepts it only on a loopback bind with
+    # an acknowledgement (docs/SECURITY.md, Plaintext proxy hop). "Always serves TLS" means the
+    # engine mints wherever no operator certificate or terminator is configured, NOT that it
+    # terminates TLS in every topology. Neither branch is ever renewed.
     plan = plan_api_tls_material(api, state_dir=state_dir)
     if plan.source != "generated":
         return plan.material()

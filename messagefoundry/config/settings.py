@@ -1808,8 +1808,11 @@ class ApiSettings(_Section):
 
     @property
     def exposure_protected(self) -> bool:
-        """Whether in-process TLS (WP-13a) OR a declared upstream TLS terminator behind trusted
-        proxies (WP-15) is configured."""
+        """Whether an operator certificate (``tls_cert_file``, WP-13a) OR a declared upstream TLS
+        terminator behind trusted proxies (WP-15) is configured. It reads no bind host, and the
+        minted placeholder does not count. True here does not mean ``serve`` starts: off loopback
+        it refuses a terminator with no certificate before any serve-time gate reads this
+        (BACKLOG #4636; docs/SECURITY.md, Plaintext proxy hop)."""
         return self.tls_enabled or (self.tls_terminated_upstream and bool(self.trusted_proxies))
 
     @property
@@ -2023,8 +2026,10 @@ class ApiSettings(_Section):
                 "[api].tls_client_cert_identities requires [api].tls_client_ca_file (in-process mTLS "
                 "verifies the client cert before its subject is resolved to a principal)"
             )
-        # An upstream TLS terminator only satisfies the exposed-gate when the engine knows (and trusts)
-        # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
+        # A declared upstream terminator means nothing unless the engine knows (and trusts) the proxy
+        # in front -- otherwise it's an unverifiable claim that XFF could spoof. It never satisfies
+        # the off-loopback exposed-bind gate on its own (BACKLOG #4636; docs/SECURITY.md, Plaintext
+        # proxy hop).
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
         # The reverse direction (BACKLOG #2055, ASVS 3.3.1 and 3.3.3). uvicorn rewrites the request
@@ -10231,7 +10236,9 @@ def security_loosenings(
                 "[security].enforcement = warn — posture weakenings (cleartext/verify-off "
                 "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
-                "--allow-insecure-bind escapes are honored",
+                "--allow-insecure-bind escapes are honored, where the gate reads this dial; "
+                "at least the plaintext proxy hop, API revocation and /ui refusals read none "
+                "and still refuse (docs/SECURITY.md, Enforcement model)",
             )
         )
     # Vault BACKLOG #2599: the config-source escape, named whenever it is LIVE. It is an environment

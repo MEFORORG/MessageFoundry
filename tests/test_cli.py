@@ -2171,6 +2171,47 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     assert "is not a loopback address" not in fixed_err
 
 
+def test_serve_ui_offloopback_certificate_remedy_starts_with_the_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #4636: the /ui refusal's certificate remedy names the revocation attestation, because
+    off loopback a certificate alone is refused by the API revocation gate. Applied as named, it
+    starts; without the attestation it is refused there, which is the control."""
+    from tests.test_api_tls import _self_signed
+
+    base = (
+        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+    )
+    monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    assert _l5b_serve(tmp_path, monkeypatch, base) == 2
+    refusal = next(
+        (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
+    )
+    from messagefoundry.api.tls import off_loopback_certificate_remedy
+
+    for spelling in (
+        "[security].listen_address or serve --host",
+        off_loopback_certificate_remedy(),
+    ):
+        assert spelling in refusal, refusal
+    assert "MEFOR_TLS_REVOCATION_ATTESTED=1" in off_loopback_certificate_remedy()
+
+    cert, key = _self_signed(tmp_path)
+    fixed = (
+        f'{base}api.tls_cert_file = "{cert.as_posix()}"\napi.tls_key_file = "{key.as_posix()}"\n'
+    )
+    assert _l5b_serve(tmp_path, monkeypatch, fixed) == 2
+    assert "in-process TLS on non-loopback" in capsys.readouterr().err
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    rc = _l5b_serve(tmp_path, monkeypatch, fixed)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _UI_OFFLOOPBACK_REFUSAL not in err
+
+
 def test_serve_ui_warns_on_undeclared_proxy_signal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

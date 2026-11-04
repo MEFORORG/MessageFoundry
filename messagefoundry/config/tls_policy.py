@@ -1066,8 +1066,8 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
       :func:`validate_tls_ciphers`, so a *declared* floor can't itself name a non-forward-secret key
       exchange.
 
-    Presence of the declaration (the serve-time PHI-prod fail-closed refusal) is enforced separately in
-    the ``serve`` gate; this is only the shape/coherence check. Raises ``ValueError`` (surfaced as a
+    Presence of the declaration (the serve-time Posture-B refusal, keyed on enforcement and the
+    bind) is enforced separately in the ``serve`` gate; this is only the shape/coherence check. Raises ``ValueError`` (surfaced as a
     config-load error) on an invalid declaration; returns ``None`` when the (possibly empty) declaration
     is coherent."""
     if min_version is not None and min_version not in _APPROVED_TLS_MIN_VERSIONS:
@@ -2443,7 +2443,7 @@ def phi_read_hop_disposition(
 
     The data-path analogue of :func:`insecure_hop_disposition` for the API's PHI-read RESPONSE path
     (raw view / attachment download / summary). A production-PHI instance whose API serve hop is NOT
-    proven secure — not loopback, not in-process TLS, not a declared TLS-terminating proxy — REFUSES to
+    proven secure — not loopback, no operator certificate, not a declared TLS-terminating proxy — REFUSES to
     put PHI on that hop rather than emitting it in the clear. Reuses the ONE authority so the API decides
     identically to the transport cells, and the production-PHI clamp (``audited_opt_out``, supplied
     already clamped by the caller) stays the single authority for the global escape.
