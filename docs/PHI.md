@@ -2420,7 +2420,7 @@ With no readable version in the header's own MSH-12, no version says which ids a
 segments, so every bare line is refused unless a rule that rewrites a field names its segment.
 That holds at any field count of the header, so a three-field `MSH|^~\&|` header with a real 2.3
 header behind it does not let a bare `SFT` through. A `keep` does not count. To get such a line
-through, give the header a readable version (2.1 or later), or map a field of the segment with a rule that rewrites. A
+through, give the header its real version (the one the sender used), or map a field of the segment with a rule that rewrites. A
 rule on `MSH-12` does not help, because the anonymizer and `anonymize_checked` judge the version
 of the input (vault BACKLOG #3001, #3004). The report still prints any id that some HL7 version
 defines in a field's address. Only the header's MSH-12 is read: the MSH-12 of a later `MSH`
