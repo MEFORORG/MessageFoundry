@@ -1615,9 +1615,7 @@ class IssuerIndex:
                     serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
                 )
             except (*_UNREADABLE_CA, UnsupportedAlgorithm):
-                # OpenSSL may load what cryptography will not; never nameable. _UNREADABLE_CA holds
-                # InvalidVersion, which is not a ValueError: a v4 CA raised it out of the build.
-                self.unreadable += 1
+                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
                 continue
             if der in seen:
                 continue  # the same certificate twice is one anchor
@@ -1638,7 +1636,7 @@ class IssuerIndex:
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
                 if _directly_issued(leaf, anchor.cert)
             ]
-        except _UNREADABLE_CA:  # InvalidVersion, for one, is not a ValueError (BACKLOG #4948)
+        except _UNREADABLE_CA:
             return ""
         subjects = {anchor.subject for anchor in issuers}
         if len(subjects) != 1:
@@ -1673,15 +1671,17 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
 #: ``cryptography`` parses, at least: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE``, measured
 #: on OpenSSL 3.5.7 (BACKLOG #4948). Missing the legacy one left a CA the handshake trusts out of
 #: the index, so every partner under it would have been refused, with a start warning naming the
-#: wrong cause.
-#: The BEGIN marker, then nothing but bytes at or below a space to the end of its line.
+#: wrong cause. The pattern is the BEGIN marker, then nothing but bytes at or below a space to the
+#: end of its line; group 1 is the label.
 _PEM_CERTIFICATE_BEGIN = re.compile(
-    rb"-----BEGIN (X509 )?CERTIFICATE-----[\x00-\x09\x0b-\x20]*(?:\n|\Z)"
+    rb"-----BEGIN ((?:X509 )?CERTIFICATE)-----[\x00-\x09\x0b-\x20]*(?:\n|\Z)"
 )
 
 #: OpenSSL reads a long line in pieces of this many bytes, and a marker opening a piece counts as
 #: opening a line: on OpenSSL 3.5.7 a BEGIN after 254, 508, 762 or 1016 bytes of text loads, and one
-#: after 253, 255, 300 or 509 does not (BACKLOG #4948).
+#: after 253, 255, 300 or 509 does not (BACKLOG #4948). The same rule is applied to an END marker
+#: by analogy; that end was not measured. :func:`_begins_line`, the CRL scan's rule, differs on
+#: purpose: it refuses such a file instead.
 _OPENSSL_LINE_PIECE = 254
 
 
@@ -1697,14 +1697,16 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     A block opens at a BEGIN marker that opens a line (:func:`_opens_line`) and is the whole line
     but for trailing bytes at or below a space, so a marker in a comment opens none. It ends at the
     first END marker of its own label that opens a line, whatever lies between: OpenSSL reads every
-    line up to it as the block's body. A BEGIN with no such END ends the scan, since OpenSSL refuses
-    that file and no context was built from it."""
+    line up to its first END line as the body, and refuses the file when that END names another
+    label. A BEGIN with no such END ends the scan, since OpenSSL refuses that file too. At least one
+    loadable shape still differs: a block missing its END line before the next block, which OpenSSL
+    loads and the index counts as unreadable, so it names no issuer and warns."""
     at = 0
     while (begin := _PEM_CERTIFICATE_BEGIN.search(pem, at)) is not None:
         if not _opens_line(pem, begin.start()):
             at = begin.start() + 1
             continue
-        end = b"-----END " + (begin[1] or b"") + b"CERTIFICATE-----"
+        end = b"-----END " + begin[1] + b"-----"
         stop = pem.find(end, begin.end())
         while stop >= 0 and not _opens_line(pem, stop):
             stop = pem.find(end, stop + 1)

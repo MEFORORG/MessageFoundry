@@ -333,6 +333,13 @@ def _der(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.DER)
 
 
+def _openssl_loads(cadata: str) -> int:
+    """How many certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=cadata)
+    return int(ctx.cert_store_stats()["x509"])
+
+
 def _wrapped(der: bytes, label: str = "CERTIFICATE") -> bytes:
     """``der`` as one PEM block under ``label``, whatever bytes it holds."""
     return _relabelled(ssl.DER_cert_to_PEM_cert(der).encode("ascii"), label)
@@ -350,9 +357,7 @@ def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     cadata = (_pem(good[0]) + _wrapped(_der(odd[0]) + b"\x30\x00", label)).decode("ascii")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations(cadata=cadata)
-    assert len(ctx.get_ca_certs()) == 2  # the premise: OpenSSL loads the odd block
+    assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads the odd block
     subjects = {"CN=Acme CA": [SUBJECT], "CN=Odd CA": [SUBJECT]}
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         index = _client_issuer_index("IB_PARTNER", cadata, subjects)
@@ -387,9 +392,7 @@ def test_a_version_4_ca_names_nothing_and_does_not_end_the_build(
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     cadata = (_pem(good[0]) + _wrapped(_v4(odd[0]))).decode("ascii")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations(cadata=cadata)
-    assert len(ctx.get_ca_certs()) == 2  # the premise: OpenSSL loads it
+    assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads it
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         index = _client_issuer_index("IB_PARTNER", cadata, {})
     assert index is not None and index.unreadable == 1
@@ -482,9 +485,7 @@ def test_the_index_reads_a_block_where_the_context_loads_it(
     marker = f"-----BEGIN {label}-----".encode("ascii")
     block = _labelled(probe, label).replace(marker, marker + after.encode("ascii"), 1)
     cadata = (_pem(plain[0]) + before.encode("ascii") + block).decode("ascii")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations(cadata=cadata)
-    loaded = ctx.cert_store_stats()["x509"]
+    loaded = _openssl_loads(cadata)
     # The measured premise, so the check below cannot pass by OpenSSL loading nothing.
     assert loaded == (2 if loads and label in ("CERTIFICATE", "X509 CERTIFICATE") else 1)
     index = IssuerIndex(cadata)
@@ -517,9 +518,7 @@ def test_a_stray_begin_marker_hides_no_block_after_it(note: str, stray: str) -> 
         + _labelled(mid[0], "X509 CERTIFICATE")
         + _pem(dup2[0])
     ).decode("ascii")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations(cadata=cadata)
-    assert ctx.cert_store_stats()["x509"] == 3  # the premise: every block loads past the note
+    assert _openssl_loads(cadata) == 3  # the premise: every block loads past the note
     index = IssuerIndex(cadata)
     assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Mid CA"]) == {}
@@ -537,9 +536,7 @@ def test_a_block_whose_begin_line_is_commented_out_names_no_issuer(label: str) -
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     partner = _ca(_dn((NameOID.COMMON_NAME, "Partner CA")), by=root)
     cadata = (_pem(root[0]) + b"# " + _labelled(partner[0], label)).decode("ascii")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations(cadata=cadata)
-    assert ctx.cert_store_stats()["x509"] == 1  # the premise: only the root loads
+    assert _openssl_loads(cadata) == 1  # the premise: only the root loads
     index = IssuerIndex(cadata)
     assert index.unmatched_keys(["CN=Root CA"]) == {}  # control
     assert "CN=Partner CA" in index.unmatched_keys(["CN=Partner CA"])
