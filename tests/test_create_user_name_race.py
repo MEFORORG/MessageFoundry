@@ -88,7 +88,11 @@ def _rival_takes_the_name(
     async def racing(**kwargs: Any) -> None:
         monkeypatch.setattr(store, "create_user", original)
         await original(
-            user_id="rival", username=kwargs["username"], password_generated=False, **rival
+            user_id="rival",
+            username=kwargs["username"],
+            password_generated=False,
+            audits=(),
+            **rival,
         )
         if disabled:
             await store.set_user_disabled("rival", disabled=True)
@@ -425,6 +429,7 @@ def test_the_cli_reports_a_lost_race_as_the_refusal_not_as_a_bad_store(
             username=kwargs["username"],
             auth_provider=AuthProvider.LOCAL.value,
             password_generated=False,
+            audits=(),
         )
         await original(self, **kwargs)
 

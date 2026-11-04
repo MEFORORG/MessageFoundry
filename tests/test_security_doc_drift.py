@@ -679,7 +679,8 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 # (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors;
 # +1 BACKLOG #2298: a session whose temporary credential lapsed is ended.
 _CONTEXT_TABLE_A_ROWS = 43
-_CONTEXT_TABLE_B_ROWS = 13
+# +1 BACKLOG #4907 (Table B): the MLLP listener's expected-sender allowlist, tls_client_subjects.
+_CONTEXT_TABLE_B_ROWS = 14
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
 #: exactly one of these — the assertion that turns "no composite risk score" from a phrase the doc
@@ -1718,6 +1719,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "its code claims are pinned by AST and by calling the functions"
     ),
     ("test_docs_security_pathways.py", "_config_row"): "slices a CONFIGURATION.md table row",
+    (
+        "test_docs_security_pathways.py",
+        "test_the_docker_manifests_say_what_require_encryption_does",
+    ): (
+        "reads the comment on each docker manifest line that sets MEFOR_STORE_REQUIRE_ENCRYPTION "
+        "(vault BACKLOG #4178); what the setting does is pinned by calling "
+        "keyless_opt_out_refusal in tests/test_security_config.py"
+    ),
     (
         "test_docs_security_pathways.py",
         "test_the_guide_keeps_the_corrected_crl_signature_sentences",
@@ -4300,6 +4309,22 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
         assert len(found) == 1 and path.name in found[0], f"plant {claim!r} read {found}"
 
 
+#: The opening words of the SECURITY.md paragraph that states the directory role rule. The re-bind
+#: and IdP step-up paragraphs cite the rule by these words rather than restating it (#3822).
+_ROLE_RULE_OPENER = (
+    "A directory step-up or enrolment leg refuses a present account that lost a role in the "
+    "directory"
+)
+
+
+def _assert_role_rule_paragraph_opens(doc: str) -> None:
+    """The cited words must OPEN a paragraph, bold, after a blank line, however they wrap."""
+    words = r"\s+".join(re.escape(w) for w in _ROLE_RULE_OPENER.split())
+    assert re.search(r"\n\s*\n\*\*" + words, doc), (
+        "the role-rule paragraph the citations name no longer opens with its cited words"
+    )
+
+
 def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
     """BACKLOG #3081 item 8: the paragraph saying the password re-bind refuses a demoted directory
     account is pinned to the code that does it. RED when the doc drops the paragraph or brings back
@@ -4331,11 +4356,29 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
         "charged to neither the lockout nor the session's re-proof budget",
         # BACKLOG #3822: the paragraph cites the role rule by the opening words of the paragraph
         # that states it, so those words must still open a paragraph.
-        "Both legs also refuse a present account that lost a role in the directory",
+        _ROLE_RULE_OPENER,
     ):
         assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
-    rule = "**Both legs also refuse a present account that lost a role in the directory"
-    assert rule in doc, "the role-rule paragraph the re-bind paragraph cites lost its opening"
+    _assert_role_rule_paragraph_opens(doc)
+
+
+def test_the_idp_step_up_role_test_cites_the_rule_paragraph() -> None:
+    """BACKLOG #3822: the IdP step-up paragraph and the federated check list state the role test
+    only by citing the rule paragraph, so the citation is the statement. RED when either drops the
+    citation, the paragraph drops its lost-role reason, or the cited words no longer open a
+    paragraph."""
+    doc = _doc_text()
+    _assert_role_rule_paragraph_opens(doc)
+    bullet = "  - the account passes the role test in the paragraph that opens"
+    assert bullet in doc, "the complete_oidc_step_up check list lost its role-test item"
+    item = " ".join(doc.split(bullet, 1)[1].split("\n  - ", 1)[0].split("\n\n", 1)[0].split())
+    for fact in (_ROLE_RULE_OPENER, "reason=directory_role_map_unsealed"):
+        assert fact in item, f"the federated role-test item no longer says: {fact}"
+    idp = "**The IdP step-up leg makes the same role test (BACKLOG #2154).**"
+    assert idp in doc, "docs/SECURITY.md lost the IdP step-up role-test paragraph"
+    paragraph = " ".join(doc.split(idp, 1)[1].split("\n\n", 1)[0].split())
+    for fact in (_ROLE_RULE_OPENER, "reason=directory_roles_demoted"):
+        assert fact in paragraph, f"the IdP step-up paragraph no longer says: {fact}"
 
 
 def test_the_changelog_records_the_re_bind_role_test() -> None:

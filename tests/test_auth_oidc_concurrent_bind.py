@@ -72,6 +72,7 @@ async def _two_accounts(store: MessageStore) -> tuple[str, str]:
         auth_provider="ad",
         directory_object_id="guid-jdoe",
         password_generated=False,
+        audits=(),
     )
     await store.create_user(
         user_id=second,
@@ -79,6 +80,7 @@ async def _two_accounts(store: MessageStore) -> tuple[str, str]:
         auth_provider="ad",
         directory_object_id="guid-bsmith",
         password_generated=False,
+        audits=(),
     )
     return first, second
 

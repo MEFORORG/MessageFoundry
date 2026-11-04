@@ -23,10 +23,12 @@ refuse that opt-in beside an auth service or auth settings. Only embedders and t
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
 engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
-``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
+``[api].tls_terminated_upstream`` with no ``[api].tls_cert_file`` declares a reverse proxy
+terminating TLS in front and speaking
 plaintext to the engine, and :func:`messagefoundry.api.tls.ensure_api_tls_material` returns
-``None`` there, so nothing is minted. *Always serves TLS* means the engine never leaves a hop
-unprotected, NOT that it terminates TLS in every topology. Remote network exposure (opening the
+``None`` there, so nothing is minted; docs/SECURITY.md, Plaintext proxy hop, says when ``serve``
+accepts that plaintext hop. *Always serves TLS*
+does NOT mean the engine terminates TLS in every topology. Remote network exposure (opening the
 bind beyond loopback) is a separate, later question from whether the hop is encrypted.
 """
 
@@ -96,8 +98,12 @@ from messagefoundry.api.header_floor import (
     hsts_notable,
     refuse_websocket,
 )
+from messagefoundry.api.message_scope import (
+    CONNECTION_DENIED_DETAIL,
+    get_scoped_message,
+    read_scoped_message,
+)
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
-from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -398,12 +404,16 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
+    UNRESOLVED_DRIVER_REASON,
+    UNRESOLVED_ECH_SIDECAR,
+    ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
     attested_secure_hops,
+    ech_cleartext_sidecar_hops,
     expiry_relaxed_hops,
     hostname_unchecked_hops,
     load_config,
@@ -486,6 +496,7 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.privilege_probes import probe_vault
+from messagefoundry.redaction import REFUSAL_LOG_LIMIT as _REFUSAL_LOG_LIMIT
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import (
     RemoteDebugPosture,
@@ -2040,10 +2051,18 @@ def _posture_loosenings(
         []
         if registry is None
         else [
-            f"{name} ({POSSIBLY_GENERIC_DB_HOP})"
-            if reason.startswith(POSSIBLY_GENERIC_DB_HOP)
-            else name
+            f"{name} ({marker})" if marker else name
             for name, reason in unverified_generic_db_hops(registry, env_values=db_env_values)
+            for marker in [
+                next(
+                    (
+                        m
+                        for m in (POSSIBLY_GENERIC_DB_HOP, UNRESOLVED_DRIVER_REASON)
+                        if reason.startswith(m)
+                    ),
+                    None,
+                )
+            ]
             # Narrowed on the bare name, before any marker is added.
             if visible is None or visible(name)
         ]
@@ -2052,13 +2071,26 @@ def _posture_loosenings(
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
     path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
+    # Resolved against the same values as the DATABASE hops above. A name the values cannot
+    # resolve keeps the reader's marker, because the entry keeps names only.
+    ech_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note == UNRESOLVED_ECH_SIDECAR else name
+            for name, note in ech_cleartext_sidecar_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
+            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar declarations are "
+            "NOT included "
             "(see `messagefoundry check`)"
         )
     if visible is not None:
@@ -2080,6 +2112,7 @@ def _posture_loosenings(
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
             path_form_fhir_hops=path_form_hops,
+            ech_cleartext_sidecar_hops=ech_hops,
             api=api_settings,
             # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
             # gate that enforces them.
@@ -2536,16 +2569,10 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     WiringError,
 )
 
-#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for at least its 404, 422
-#: and 503 refusal WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer
-#: withholds. ``safe_exc``'s default 200-character cut dropped the directory from a long config
-#: path and the fix from a long WiringError. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
-#: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
-#: bounds how much redaction-missed text one line carries and what each handler's filters re-scan on
-#: the event loop. ``safe_exc`` redacts before the cut. The bound is on the text BEFORE
-#: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
-#: times over. The cut keeps the head, so an error longer than this still loses its tail.
-_REFUSAL_LOG_LIMIT: Final = 8192
+
+#: The answer to a reload whose config directory the engine could not resolve or list: at the
+#: target check, or in the load after it (vault BACKLOG #5248).
+_UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
 
 #: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
 #: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
@@ -2616,9 +2643,11 @@ async def _audit_refused_reload(
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
     and adds ``approved_fingerprint`` and ``approval_digest_check`` ``not_reached``. A directory
-    that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
-    engine logged why at WARNING. Any other ``Exception`` is a fault inside the reload, a plain
-    ``FileNotFoundError`` from a runner start or swap among them (not a missing directory): it
+    that cannot be resolved for another reason, or that the load cannot list once it has been
+    (:class:`~messagefoundry.config.wiring.ConfigDirUnlistable`, vault BACKLOG #5248), writes
+    reason ``unreadable`` and answers 422; why is logged at WARNING. Any other ``Exception`` is a
+    fault inside the reload, a plain ``FileNotFoundError`` from a runner start or swap among them
+    (not a missing directory): it
     writes reason ``reload_fault`` with the error's type name, is logged at ERROR, and answers 500
     with a generic detail (BACKLOG #3157). A ``reload_fault`` row does not claim the old graph is
     still serving: at least a fault raised after the swap committed leaves the new one live, and
@@ -2690,7 +2719,16 @@ async def _audit_refused_reload(
         # The engine logged the cause, scrubbed, where it raised this.
         warn("config reload refused: its config directory could not be resolved or listed")
         action, detail["reason"] = "config_reload_failed", "unreadable"
-        status, answer = 422, "the engine could not read the config directory; see the engine log"
+        status, answer = 422, _UNREADABLE_DETAIL
+    elif isinstance(exc, ConfigDirUnlistable):
+        # The load met a directory lost after the target check (vault BACKLOG #5248). Its refusal
+        # names the directory, so it is logged as any other load refusal is.
+        warn(
+            "config reload refused (unreadable): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
+        action, detail["reason"] = "config_reload_failed", "unreadable"
+        status, answer = 422, _UNREADABLE_DETAIL
     elif isinstance(exc, ConfigDigestUnavailable):
         # Not "the config changed": nothing shows it did. The digest's own WARNING names the cause.
         warn("config reload refused: its config digest could not be taken")
@@ -4513,8 +4551,8 @@ def create_app(
         else webauthn_rp_from_request
     )
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
-    # is the OPERATOR'S declaration that the browser-facing scheme is https (in-process TLS or a
-    # declared terminator). It forces the session cookie's Secure flag and HSTS regardless of the
+    # is the OPERATOR'S declaration that the browser-facing scheme is https (an operator
+    # certificate or a declared terminator; the minted placeholder does not count). It forces the session cookie's Secure flag and HSTS regardless of the
     # per-request scheme — the scheme is computed ONCE at login and a proxy that omits
     # X-Forwarded-Proto would otherwise poison the cookie for the whole session.
     # tls_terminated_upstream additionally arms the one-shot /ui cleartext-scheme tripwire.
@@ -5541,15 +5579,22 @@ def create_app(
             await _deny_connection(engine, identity, name, client)
 
     async def _deny_connection(
-        engine: Engine, identity: Identity, name: str, client: str | None
+        engine: Engine,
+        identity: Identity,
+        name: str,
+        client: str | None,
+        *,
+        flag_direction_not_inbound: bool = False,
     ) -> NoReturn:
         # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
         # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
         # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
         # A name that fails the connection-name rule is recorded with no channel by the audit
         # helper itself (BACKLOG #3031).
-        await _audit_channel_denied(engine, identity, name, client)
-        raise HTTPException(403, "not authorized for this connection")
+        await _audit_channel_denied(
+            engine, identity, name, client, flag_direction_not_inbound=flag_direction_not_inbound
+        )
+        raise HTTPException(403, CONNECTION_DENIED_DETAIL)
 
     async def _resolve_connection(
         engine: Engine,
@@ -5787,16 +5832,33 @@ def create_app(
 
         A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
         other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
-        engine looks the name up, so a 200 against a 409 cannot tell it which names exist."""
+        engine looks the name up, so a 200 against a 409 cannot tell it which names exist.
+
+        The test is written here rather than through :func:`_resolve_connection`, which the other
+        per-name routes share, because the two ask whether a name exists in different sets
+        (BACKLOG #3378). Those routes act on this process's runner, so they read its own inbounds.
+        The flag lives in the store, so this one reads ``inbound_names()``, every inbound in the
+        deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
+        give the same refusal for an outbound and for a name outside the scope, and so does the web
+        console's flag route for a direction that names neither side. A change to that refusal has
+        to be made in at least those three places."""
         rr = engine.registry_runner
+        wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
-            req.direction != "inbound"
+            wrong_direction
             or not identity.can_access_channel(name)
             # inbound_names(), as the engine's own guard reads it: an engine shard's view holds only
             # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
             or (rr is not None and name not in rr.registry.inbound_names())
         ):
-            await _deny_connection(engine, identity, name, client_ip(request))
+            await _deny_connection(
+                engine,
+                identity,
+                name,
+                client_ip(request),
+                # The row's marker, for a row that names an in-scope inbound (BACKLOG #3378).
+                flag_direction_not_inbound=wrong_direction,
+            )
         try:
             await engine.set_connection_flag(
                 name,
@@ -9603,6 +9665,9 @@ def create_app(
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
+        What such a caller reads of each rule's ``id``, and why, is stated once in
+        ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG #3378).
+
         A read that withholds at least one rule writes an audit row; see
         :func:`_audit_alert_rules_withheld`."""
         alerts: AlertsSettings = (
@@ -9615,6 +9680,7 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
+        show_ids = _user.allowed_channels is None
 
         config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
@@ -9641,7 +9707,8 @@ def create_app(
                     cooldown_seconds=r.cooldown_seconds,
                     # #146: report the COUNT of per-rule recipients, never the addresses (secret-guard parity).
                     recipient_count=len(r.recipients) if r.recipients else 0,
-                    id=r.id,  # #138 — the operator rule label ({rule_id})
+                    # #138 — the operator rule label ({rule_id}); withheld per the docstring (#3378)
+                    id=r.id if show_ids else None,
                     control_action=r.control_action,  # #144 — auto-remediation action
                     control_target=r.control_target,
                     mute=r.mute,  # #143 — static per-rule notification mute

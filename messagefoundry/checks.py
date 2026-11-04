@@ -379,6 +379,9 @@ def run_checks(
         # transports.egress.warn_url_query_credentials.
         _check_url_query_credentials(config_dir),
         _check_generic_db_tls(config_dir),
+        # BACKLOG #5163: a generic hop whose driver is not documented to read SERVER, where
+        # [egress].allowed_db may bind nothing. Advisory -- see the check.
+        _check_generic_db_server(config_dir),
         # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
         _check_hop_attested(config_dir),
         # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
@@ -400,6 +403,9 @@ def run_checks(
         # vault BACKLOG #2570: every path-form update that declares no If-Match, which a server
         # requiring one on update would refuse. Advisory -- see the check.
         _check_fhir_update_if_match(config_dir),
+        # ADR 0139: every REST outbound whose ECH sidecar hop is cleartext http on this host. No hop
+        # gate refuses it, because it is loopback. Advisory -- see the check.
+        _check_ech_cleartext_sidecar(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -2679,15 +2685,22 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     # The hostname half is true only where the connection does not ALSO turn the name check off.
     # CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): this said "chain, hostname and key usage are still
     # verified" for every listed hop, which was false on a hop that also set tls_check_hostname=false.
+    # CORRECTED 2026-11-03 (vault BACKLOG #5089): "chain ... still verified" over-stated too. The
+    # relaxation skips at least the other chain certificates' validity periods and a CRL's own window
+    # (relax_verify_expiry), so the line claims only the chain's signatures.
     unchecked = {name for name, _ in hostname_unchecked_hops(registry)}
     both = sorted(name for name, _ in relaxed if name in unchecked)
+    windows = (
+        "at least the validity periods of the intermediates and the trust anchor, and a CRL's own "
+        "validity window, go unchecked too"
+    )
     if not both:
-        still = "chain, hostname and key usage are still verified"
+        still = f"{windows}; the chain's signatures, the hostname and key usage are still verified"
     else:
         # "The others" only when there are some.
         still = (
-            "chain and key usage are still verified; the hostname is NOT on "
-            f"{', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
+            f"{windows}; the chain's signatures and key usage are still verified; the hostname is "
+            f"NOT on {', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
             "counted as false, because it cannot be read before it resolves)"
         )
         if len(both) < len(relaxed):
@@ -2881,6 +2894,46 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
     )
 
 
+def _check_ech_cleartext_sidecar(config_dir: str | Path) -> CheckResult:
+    """Name every ``REST`` outbound that sends through an ``http://`` ECH sidecar (ADR 0139).
+
+    The set and its ``env()`` case are in
+    :func:`~messagefoundry.config.wiring.ech_cleartext_sidecar_hops`; what the hop carries is in
+    ``docs/SECURITY-LOOSENING.md``, ``ech_sidecar``. Advisory (``required=False``): nothing refuses
+    the hop, and an https sidecar listener is the fix.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, ech_cleartext_sidecar_hops, load_config
+
+    name = "ech-sidecar-cleartext"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    found = ech_cleartext_sidecar_hops(registry)
+    if not found:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no REST connection sends through an http:// ECH sidecar",
+        )
+    listed = "; ".join(f"{conn} ({note})" for conn, note in found)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(found)} REST connection(s) send through an ECH sidecar whose hop on this host "
+            f"is cleartext http, or may where marked possibly — {listed}. That hop carries the "
+            "body and every request header, any credential included; an https sidecar listener "
+            "encrypts it (ADR 0139)"
+        ),
+    )
+
+
 def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
     """Surface every connection that declares ``tls_revocation_attested`` (ADR 0173), with its reason.
 
@@ -3013,8 +3066,10 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     So this stays ``required=False`` on purpose, and not because the arm is ungated. It has no posture
     to key on, so a refusal here would have to re-derive the gradient's loopback / attested / accepted
     arms from the graph — a second, silently different definition of a decision that already has one.
-    A hop with a usable mode value outside the no-TLS deny-list is not reported here at all (a blank,
-    padded or non-string mode value is): the engine cannot prove that value verifies
+    A hop with a usable mode value outside the no-TLS deny-list, on the keyword and at a spelling its
+    driver family reads, is not reported here at all (a blank, padded or non-string mode value is,
+    and so is any mode on a driver name the engine cannot place, BACKLOG #5053): the engine cannot
+    prove that value verifies
     anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
     what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
@@ -3047,12 +3102,64 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(hops)} generic-ODBC database connection(s) may cross in plaintext — {listed}; "
-            "set a verifying TLS mode in odbc_params (e.g. SSLmode=verify-full). An enforcing "
+            "set the verifying TLS mode the driver family reads in odbc_params, under the "
+            "driver's registered name (psqlODBC SSLmode=verify-full, MySQL "
+            "SSLMODE=VERIFY_IDENTITY, Microsoft's driver Encrypt=yes). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
             # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
             # does not import a crypto module for a string (the crypto-inventory gate).
             "tls_hop_attested=true with a tls_hop_attested_reason (the hop is secure by other means), "
             "or, on an outbound only, cleartext_accepted with a cleartext_reason"
+        ),
+    )
+
+
+def _check_generic_db_server(config_dir: str | Path) -> CheckResult:
+    """Surface the generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` is not a family
+    documented to read ``SERVER`` as its target (BACKLOG #5163).
+
+    What that costs ``[egress].allowed_db`` is stated once, in docs/CONNECTIONS.md, *Accepted
+    odbc_params keywords*; the construction WARNING is the other report of it. ``required=False``
+    on purpose: the engine cannot tell what a driver it cannot place reads, and refusing such a
+    name is BACKLOG #5041's driver allow-list, a separate decision. SKIPs when the graph will not
+    load, as ``generic-db-tls`` does."""
+    from messagefoundry.config.wiring import (
+        WiringError,
+        load_config,
+        server_unread_generic_db_hops,
+    )
+    from messagefoundry.transports.database import SERVER_UNREAD_REMEDY
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "generic-db-server",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    hops = server_unread_generic_db_hops(registry)
+    if not hops:
+        return CheckResult(
+            "generic-db-server",
+            ok=True,
+            required=False,
+            detail=(
+                "no generic-ODBC database connection names a driver the engine cannot place as "
+                "reading SERVER; the families it places are documented to read it, and no run was "
+                "designed to test that"
+            ),
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    return CheckResult(
+        "generic-db-server",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(hops)} generic-ODBC database connection(s) name a driver the engine cannot place "
+            f"as reading SERVER -- {listed}; {SERVER_UNREAD_REMEDY}"
         ),
     )
 
@@ -3523,11 +3630,13 @@ def _check_upstream_hop_ack(
 ) -> CheckResult:
     """Refuse a declared upstream TLS terminator with no ``[api].tls_cert_file`` and no
     ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
-    brought forward to commit/CI time.
+    brought forward to commit/CI time. Also refuse that plaintext hop on a non-loopback bind host,
+    acknowledged or not, which ``serve`` refuses too (BACKLOG #4636).
 
-    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decision is
-    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicate ``serve``
-    calls, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
+    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decisions are
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_off_loopback` and
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicates ``serve``
+    calls in the same order, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
     enforcement mode, so this check reads no dial either.
 
     Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
@@ -3538,7 +3647,12 @@ def _check_upstream_hop_ack(
     The file lookup differs from ``serve``'s in the ways :func:`_check_posture` documents."""
     from pydantic import ValidationError
 
-    from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+    from messagefoundry.api.tls import (
+        api_tls_source,
+        plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_off_loopback_remedy,
+        plaintext_upstream_hop_unacknowledged,
+    )
     from messagefoundry.config.settings import settings_error_detail
 
     toml, env_only = _settings_source(
@@ -3564,6 +3678,22 @@ def _check_upstream_hop_ack(
             detail=f"settings did not load: {settings_error_detail(exc)}",
         )
     api = settings.api
+    # Checked first, in serve's order: off loopback no acknowledgement covers the plaintext hop.
+    if plaintext_upstream_hop_off_loopback(api):
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=False,
+            required=True,
+            detail=(
+                "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
+                f"proxy-to-engine hop in plaintext on the non-loopback API bind host {api.host!r}, "
+                "which serve accepts only on a loopback bind; off loopback the acknowledgement "
+                "does not clear it -- serve would refuse to start (exit 2, in every enforcement "
+                "mode). "
+                f"{plaintext_upstream_hop_off_loopback_remedy('[security].listen_address')} (see "
+                "docs/SECURITY.md, Plaintext proxy hop)"
+            ),
+        )
     if plaintext_upstream_hop_unacknowledged(api):
         return CheckResult(
             "upstream-hop-ack",
@@ -3574,7 +3704,7 @@ def _check_upstream_hop_ack(
                 "proxy-to-engine hop in plaintext, and [api].plaintext_upstream_hop_acknowledged "
                 "is not set -- serve would refuse to start (exit 2, in every enforcement mode). "
                 "Set the acknowledgement once your site secures that hop, or set "
-                "[api].tls_cert_file (see docs/SECURITY.md)"
+                "[api].tls_cert_file (see docs/SECURITY.md, Plaintext proxy hop)"
             ),
         )
     source = api_tls_source(

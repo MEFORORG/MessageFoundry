@@ -58,6 +58,7 @@ _SEALED_CHANGES: tuple[tuple[str, Any], ...] = (
     ("auth_mechanism", "oidc"),
     ("idp_auth_time", 1.0),
     ("user_epoch", 7),
+    ("global_epoch", 7),  # BACKLOG #5091
 )
 
 
@@ -71,6 +72,7 @@ async def _user(store: Any, user_id: str) -> None:
         password_hash="h",
         now=time.time(),
         password_generated=False,
+        audits=(),
     )
 
 
@@ -116,10 +118,14 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     ended = await store.get_session(hash_token(unsealed))
     assert ended is not None and ended.revoked_at is not None  # refused, then ended
     # A valid seal copied from another row does not carry over: it covers that row's token hash.
+    # The copy carries global_epoch too (BACKLOG #5091), a sealed column: without it, on a store
+    # whose global epoch is above 0, the copy would differ in that column as well, and the seal's
+    # refusal would not show that it binds the token hash.
     copied = mint_token()
     await raw(
         "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-        " client, reauth_at, auth_mechanism, user_epoch, seal) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " client, reauth_at, auth_mechanism, user_epoch, global_epoch, seal)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             hash_token(copied),
             row.user_id,
@@ -130,6 +136,7 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
             row.reauth_at,
             row.auth_mechanism,
             row.user_epoch,
+            row.global_epoch,
             row.seal,
         ),
     )
@@ -213,7 +220,8 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     assert await store.count_user_sessions("seal-u1") == others + 1  # mine is unrevoked too
     absent = hash_token(mint_token())  # a hash that names no row excepts nothing
     assert await store.count_user_sessions("seal-u1", except_token_hash=absent) == others + 1
-    assert await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(mine)) == others
+    result = await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(mine))
+    assert (result.count, result.kept) == (others, True)  # kept: re-stamped (BACKLOG #4975)
     assert await store.count_user_sessions("seal-u1", except_token_hash=hash_token(mine)) == 0
     assert await store.count_user_sessions("seal-u1") == 1
     assert await service.identity_for_token(mine) is not None  # the kept session, re-sealed
@@ -226,3 +234,76 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     assert restored is not None and session_seal_ok(sealer, restored)  # the copy's seal holds...
     assert await service.identity_for_token(other) is None  # ...and its epoch is stale
     assert await service.identity_for_token(mine) is not None
+
+    # --- a kept session a sweep missed is ended, not stamped back to validity (BACKLOG #4975) ----
+    # Restoring a revoked row's sealed copy leaves it where a row the sweep missed stands: live,
+    # sealed, an epoch behind its account. The service is not asked about it before the revoke,
+    # because a refusal would end it. The revoke ends it in its own transaction and counts it
+    # (follow-up to BACKLOG #4975).
+    missed = await _mint(store)
+    snapshot = await store.get_session(hash_token(missed))
+    assert snapshot is not None
+    current = await _mint(store)
+    result = await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(current))
+    assert result.count >= 1 and result.kept  # control: a current one is kept, and said to be
+    assert not result.ended_kept
+    assert await service.identity_for_token(current) is not None
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(missed)),
+    )
+    swept = await store.count_user_sessions("seal-u1", except_token_hash=hash_token(missed))
+    assert swept >= 1  # `current`, at least
+    result = await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(missed))
+    assert (result.count, result.kept, result.ended_kept) == (swept + 1, False, True)
+    left = await store.get_session(hash_token(missed))
+    assert left is not None and left.revoked_at is not None  # ended, in the same transaction
+    assert left.user_epoch == snapshot.user_epoch  # not re-stamped with the new epoch
+    assert await store.count_user_sessions("seal-u1") == 0  # nothing of the account left live
+    assert await service.identity_for_token(missed) is None
+    assert await service.identity_for_token(current) is None  # the revoke still ended the others
+
+    # --- nor when the account's own seal fails and its epoch cannot move ------------------------
+    # With no raise nothing is stamped, a current session included, so the revoke ends the kept
+    # session and counts it. Its own account, so the bent record touches nothing above. The
+    # control is the same current session kept while the record's seal still holds.
+    await _user(store, "seal-u3")
+    behind = await _mint(store, "seal-u3")
+    snapshot = await store.get_session(hash_token(behind))
+    account = await store.get_user("seal-u3")
+    assert snapshot is not None and account is not None
+    await store.revoke_user_sessions("seal-u3")
+    raised = await store.get_user("seal-u3")
+    assert raised is not None and raised.session_epoch == account.session_epoch + 1  # control
+    fresh = await _mint(store, "seal-u3")
+    one_behind = await store.get_session(hash_token(fresh))  # one epoch behind after the control
+    assert one_behind is not None
+    result = await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(fresh))
+    assert (result.count, result.kept, result.ended_kept) == (0, True, False)  # control
+    assert await service.identity_for_token(fresh) is not None
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(behind)),
+    )
+    stamped = await store.get_user("seal-u3")
+    assert stamped is not None
+    await raw("UPDATE users SET authz_seal=? WHERE id=?", ("mfseal:v1:b4975:bogus", "seal-u3"))
+    result = await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(fresh))
+    assert (result.count, result.kept, result.ended_kept) == (2, False, True)  # behind + fresh
+    unmoved = await store.get_user("seal-u3")
+    assert unmoved is not None and unmoved.session_epoch == stamped.session_epoch  # seal failed
+    for token in (fresh, behind):
+        left = await store.get_session(hash_token(token))
+        assert left is not None and left.revoked_at is not None
+    # A session exactly one epoch behind is ended too: the guard compares to the epoch the raise
+    # replaced, not to the new epoch less one, which with no raise it would match.
+    await raw(  # the control re-stamped the row, so its epoch goes back with its seal
+        "UPDATE sessions SET revoked_at=NULL, user_epoch=?, seal=? WHERE token_hash=?",
+        (one_behind.user_epoch, one_behind.seal, hash_token(fresh)),
+    )
+    assert one_behind.user_epoch == stamped.session_epoch - 1  # the account still unmoved
+    result = await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(fresh))
+    assert (result.count, result.kept, result.ended_kept) == (1, False, True)
+    left = await store.get_session(hash_token(fresh))
+    assert left is not None and left.revoked_at is not None
+    assert left.user_epoch == one_behind.user_epoch

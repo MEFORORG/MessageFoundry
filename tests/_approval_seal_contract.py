@@ -368,7 +368,11 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     # --- control: a sound request is rejected the ordinary way, with its operation named ------
     sound = await h.request()
     assert not await store.reject_seal_failed_approval(  # the narrow write leaves it alone
-        sound, approver=_APPROVER, decided_at=time.time(), seal_read=(await h.row(sound)).seal
+        sound,
+        approver=_APPROVER,
+        decided_at=time.time(),
+        seal_read=(await h.row(sound)).seal,
+        audits=(),
     )
     assert (await h.row(sound)).status == "pending" and approval_seal_ok(sealer, await h.row(sound))
     await h.gate.reject(sound, approver=_APPROVER)
@@ -432,7 +436,11 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
         )
     await raw("UPDATE pending_approvals SET params=? WHERE id=?", ('{"x": 1}', cut))
     assert not await store.reject_seal_failed_approval(
-        cut, approver=_APPROVER, decided_at=time.time(), seal_read=(await h.row(cut)).seal
+        cut,
+        approver=_APPROVER,
+        decided_at=time.time(),
+        seal_read=(await h.row(cut)).seal,
+        audits=(),
     )
 
     # --- a seal changed again after the gate's read: the narrow write moves nothing ------------
@@ -441,11 +449,11 @@ async def assert_seal_failed_reject_contract(store: Any, raw: RawSql) -> None:
     seen = (await h.row(moved_on)).seal
     await raw("UPDATE pending_approvals SET seal=? WHERE id=?", ("", moved_on))
     assert not await store.reject_seal_failed_approval(
-        moved_on, approver=_APPROVER, decided_at=time.time(), seal_read=seen
+        moved_on, approver=_APPROVER, decided_at=time.time(), seal_read=seen, audits=()
     )
     assert (await h.row(moved_on)).status == "pending"
     assert await store.reject_seal_failed_approval(  # control: the seal it now carries
-        moved_on, approver=_APPROVER, decided_at=time.time(), seal_read=""
+        moved_on, approver=_APPROVER, decided_at=time.time(), seal_read="", audits=()
     )
 
     # --- a reject no listing reported first still writes one row and raises one alert ----------

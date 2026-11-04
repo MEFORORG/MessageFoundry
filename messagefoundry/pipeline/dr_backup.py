@@ -66,6 +66,7 @@ from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
+from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
@@ -79,6 +80,7 @@ from messagefoundry.store.backup_codec import (
 )
 from messagefoundry.store.base import (
     DbaDelegatedError,
+    StoreCipherConfigError,
     build_store_cipher,
     resolve_active_key,
     resolve_decrypt_keys,
@@ -93,10 +95,29 @@ from messagefoundry.store.cipher_cells import (
 )
 from messagefoundry.store.crypto import (
     StoreKeylessError,
+    _decode_key,
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.transports.file import (
+    _FLAG_BACKUP_SEMANTICS,
+    _FLAG_OPEN_REPARSE_POINT,
+    _NAME_SURROGATE,
+    _SHARE_ALL,
+    _WIN_UNSUPPORTED,
+    _attribute_tag,
+    _fd_for,
+    _handle_final_path,
+    _os_handle,
+    _Replaced,
+    _Unconfined,
+    _win_create,
+    _win_hold_dirs,
+    _win_lstat,
+    _win_open_file,
+    _win_release,
+)
 
 __all__ = [
     "BackupRunner",
@@ -104,6 +125,7 @@ __all__ = [
     "RestoreResult",
     "VerifyResult",
     "BackupError",
+    "RESTORE_NEEDS_A_DESTINATION",
     "run_restore",
     "run_restore_verify",
 ]
@@ -195,7 +217,7 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: begin false-refusing legal archives the day that cap was raised.
 #:
 #: **:data:`_MAX_CONFIG_BYTES` is NOT that second term, and must not be read as one.** It is a
-#: restore-EXTRACT bound: its only read is in :func:`_restore_config_members`, which runs solely when
+#: restore-EXTRACT bound: its only read is in :func:`_extract_config_members`, which runs solely when
 #: ``--config-to`` was given and solely AFTER the decrypt this ceiling exists to bound. The build side
 #: (:func:`_add_config_dir`) tars the config dir with no cap at all, and the verify path never extracts
 #: config. So a `.mfbak` can legally carry a config bundle larger than ``_MAX_CONFIG_BYTES``; that is
@@ -218,6 +240,8 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 #: produce: ``config_unreadable_files`` holds one relative path per file or folder the config
 #: digest left out, uncapped (vault BACKLOG #3765). A list long enough to pass this cap writes an
 #: archive this read refuses, so a verify reports FAIL and a restore refuses it.
+#: ``config_skipped_files`` is capped at :data:`_MAX_SKIPPED_RECORDED` for that reason (vault
+#: BACKLOG #5233).
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -284,15 +308,46 @@ class BackupResult:
     #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
     #: next backup's sweep retries the directory.
     staging_leftover: str | None = None
-    #: Whether the archive carries the config dir under ``config/``, the dir this pass read, and,
-    #: when it could not be read, the fault's class name (vault BACKLOG #3094). A full run with
-    #: ``config_bundled`` false and a fault still succeeds: the store snapshot is worth keeping.
+    #: Whether the archive carries a config file under ``config/``, the dir this pass read, and,
+    #: when it could not be read, the fault's class name (vault BACKLOG #3094), or
+    #: :data:`CONFIG_WALK_ADDED_NOTHING` when the walk added no regular file (vault BACKLOG #5220).
+    #: A full run with ``config_bundled`` false still succeeds: the store snapshot is worth keeping.
     config_bundled: bool = False
     config_dir: str | None = None
     config_bundle_error: str | None = None
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
     #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
+    #: What the archive walk passed over (vault BACKLOG #5233), at most
+    #: :data:`_MAX_SKIPPED_RECORDED` of them, and how many there were in all. What they mean for
+    #: the archive is in the ``include_config`` row of ``docs/CONFIGURATION.md``.
+    config_skipped_files: tuple[str, ...] = ()
+    config_skipped_count: int = 0
+
+
+#: The ``config_bundle_error`` a pass records when its config walk added no regular file, as for an
+#: empty dir or one holding only links (vault BACKLOG #5220). Every other value there is an exception
+#: class name, so this one is spelled so it cannot be read as one.
+CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
+
+#: How many of the paths the archive walk passed over a pass records by name, and how many bytes
+#: of the manifest's JSON they may take (vault BACKLOG #5233); the record also carries the total.
+#: A config dir can hold any number of links, such as a linked package tree, and a list long
+#: enough to pass :data:`_MAX_MANIFEST_BYTES` would make the whole archive, store snapshot
+#: included, one that verify and restore refuse.
+_MAX_SKIPPED_RECORDED = 1000
+_MAX_SKIPPED_BYTES = 256 * 1024
+
+
+def _capped_skips(skipped: tuple[str, ...]) -> tuple[str, ...]:
+    """The leading ``skipped`` paths that fit both caps above, each measured as the manifest
+    encodes it (``json.dumps`` escapes every non-ASCII character to six bytes)."""
+    size = 0
+    for i, rel in enumerate(skipped[:_MAX_SKIPPED_RECORDED]):
+        size += len(json.dumps(rel)) + 2  # the separator ", "
+        if size > _MAX_SKIPPED_BYTES:
+            return skipped[:i]
+    return skipped[:_MAX_SKIPPED_RECORDED]
 
 
 @dataclass(frozen=True)
@@ -306,10 +361,25 @@ class _ConfigBundle:
     #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
     #: of the whole bundle (vault BACKLOG #3765).
     left_out: tuple[str, ...] = ()
+    #: What the archive walk passed over, the first :data:`_MAX_SKIPPED_RECORDED` of them, and how
+    #: many in all; set by :meth:`after_walk` (vault BACKLOG #5233).
+    skipped: tuple[str, ...] = ()
+    skipped_count: int = 0
+
+    def after_walk(self, added: int, skipped: tuple[str, ...]) -> _ConfigBundle:
+        """This bundle as the record states it once the walk has run, with what the walk passed
+        over: a bundled pass whose walk added no regular file carries no config, so it is recorded
+        as not bundled, with :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG
+        #5220)."""
+        walked = replace(self, skipped=_capped_skips(skipped), skipped_count=len(skipped))
+        if self.bundled and added == 0:
+            return replace(walked, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
+        return walked
 
     def manifest_fields(self) -> dict[str, object]:
-        """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
-        directory path, a digest, an exception class name and relative config file names."""
+        """The fields the manifest and the ``dr_backup`` audit row both carry: a directory path, a
+        digest, an exception class name, and relative paths from the operator's config dir. No
+        message content, but a path carries whatever name the operator gave the file."""
         return {
             "config_fingerprint": self.fingerprint,
             "config_bundled": self.bundled,
@@ -317,6 +387,8 @@ class _ConfigBundle:
             "config_dir": str(self.path) if self.path is not None else None,
             "config_bundle_error": self.error,
             "config_unreadable_files": list(self.left_out),
+            "config_skipped_files": list(self.skipped),
+            "config_skipped_count": self.skipped_count,
         }
 
 
@@ -326,7 +398,9 @@ class RestoreResult:
     counts, and one-way fingerprints only (never a body or key bytes)."""
 
     archive_path: str
-    store_path: str
+    #: ``None`` when only a CONFIG-ONLY archive's config bundle was restored (vault BACKLOG #5233);
+    #: ``store_bytes`` is then 0 and ``row_counts`` empty.
+    store_path: str | None
     store_bytes: int
     row_counts: dict[str, int]
     encrypted: bool
@@ -534,6 +608,30 @@ class BackupRunner:
 
     async def _do_backup(self, now: float, *, force_config_only: bool = False) -> BackupResult:
         s = self._settings
+        # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
+        # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
+        # --config-only flag forces config-only even on SQLite.
+        config_only = force_config_only or self._is_server_db()
+        # Read once, so the space check, the archive's config/ members and its fingerprint all name
+        # one directory even if a reload lands during the pass.
+        config_dir = self._current_config_dir()
+        if self._is_server_db() and not s.config_only_on_server_db:
+            raise BackupError(
+                "snapshot",
+                f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
+                "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
+            )
+        if config_only and (config_dir is None or not s.include_config):
+            # A config-only archive without its config holds nothing to restore, yet it would verify
+            # and take a keep-N slot from an archive that does (vault BACKLOG #5220). Refused before
+            # any I/O; a dir that cannot be listed, and a walk that adds no file, are refused below.
+            why = (
+                "no config dir is loaded"
+                if config_dir is None
+                else "[backup].include_config is false"
+            )
+            raise BackupError("snapshot", f"config-only backup: {why}; nothing to archive")
+
         dest_dir = Path(s.destination)
         self._ensure_destination(dest_dir)
 
@@ -555,20 +653,6 @@ class BackupRunner:
         # charged to the DEK's row, which is where that store's own values are counted too.
         salt = self._store_salt() if key is not None else None
 
-        # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
-        # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
-        # --config-only flag forces config-only even on SQLite.
-        config_only = force_config_only or self._is_server_db()
-        # Read once, so the space check, the archive's config/ members and its fingerprint all name
-        # one directory even if a reload lands during the pass.
-        config_dir = self._current_config_dir()
-        if self._is_server_db() and not s.config_only_on_server_db:
-            raise BackupError(
-                "snapshot",
-                f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
-                "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
-            )
-
         ext = _ENCRYPTED_EXT if key is not None else _PLAINTEXT_EXT
         stamp = _utc_stamp(now)
         inst = _safe_segment(self._instance) or "instance"
@@ -587,30 +671,37 @@ class BackupRunner:
         # age, so a sibling engine shard's live run survives it, and only by this account's owner:
         # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
         # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
-        # owner a new directory of this process gets, as `_process_owner` reads it. When that read
-        # answers, a volume a killed run filled is freed before this run needs room for its own
-        # directory, and a run whose open fails still sweeps. On Windows the read is itself a probe
-        # directory written in the OS temp dir: when that write fails, or a sibling's sweep removes
-        # the probe before its owner is read, it answers None, and both this sweep and the OS-temp
-        # sweep below are off for this run. The staging root is then swept only by the space check's
-        # probe below, when the run is short, and by this run's own directory's owner once it is
-        # open. Where the staging root gives a directory another owner, the space check below sweeps
-        # by that one too before it refuses. Off the loop, like the rest.
+        # owner a new entry in the staging root gets, learned by `_probe_owner` from a probe it creates
+        # and removes there, and reads through the descriptor it created, so a rename in the staging
+        # root cannot choose it. Never the process's own owner as such: on a share whose
+        # server sets the owner, a directory carrying that one may have been made by another
+        # principal (BACKLOG #4988). The probe is a write, so on a volume it cannot be created on,
+        # such as one a killed run filled, `_fallback_root_owner` keys the sweep on the process's
+        # owner only when the staging root itself carries it, which a root this account made on such
+        # a share does not. When neither answers, this sweep is off; the space check below probes once more when
+        # the run is short, and this run's own directory's owner sweeps once it is open. A run whose
+        # open fails still sweeps. Off the loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
-        early_owner = await asyncio.to_thread(_process_owner)
-        if early_owner is not None:
-            await asyncio.to_thread(_sweep_owned, staging_root, early_owner, own=None)
+        process_owner = await asyncio.to_thread(_process_owner)
+        probed = await asyncio.to_thread(_probe_owner, staging_root)
+        root_owner = probed
+        if root_owner is None:
+            root_owner = await asyncio.to_thread(_fallback_root_owner, staging_root, process_owner)
+        swept_by: list[object] = []
+        if root_owner is not None:
+            swept_by.append(root_owner)
+            await asyncio.to_thread(_sweep_owned, staging_root, root_owner, own=None)
         # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine leaves
-        # its decrypted copy there. Each backup sweeps it too, by the process's own owner: a verify
-        # this account ran there made its directory with that owner, whatever owner a share's server
-        # gives this run's staging directory.
-        await asyncio.to_thread(_sweep_os_temp, early_owner)
-        # After those sweeps, which free what dead runs left when they ran (both are off when the
-        # owner read above answered None), and before this run's directory is opened or any of its
-        # bytes is staged. It is not before every write: the owner probes, above on Windows and below
-        # on a short run, are bare directories written first. A run that cannot fit fails here with kind `space`, naming the volume, not half-way through
-        # a multi-GB write.
-        swept_by: list[object] = [] if early_owner is None else [early_owner]
+        # its decrypted copy there. Each backup sweeps it too, by the owner a new directory there
+        # gets, as `_process_owner` reads it: a verify this account ran there made its directory
+        # with that owner, whatever owner a share's server gives this run's staging directory. On
+        # Windows that read is a probe in the OS temp dir, and when it answers None this sweep is
+        # off for this run.
+        await asyncio.to_thread(_sweep_os_temp, process_owner)
+        # After those sweeps, which free what dead runs left when they ran, and before this run's
+        # directory is opened or any of its bytes is staged. It is not before every write: the
+        # owner probes, above and below on a short run, are written first. A run that cannot fit
+        # fails here with kind `space`, naming the volume, not half-way through a multi-GB write.
         shortfall = await asyncio.to_thread(
             self._space_shortfall,
             staging_root,
@@ -618,20 +709,18 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
-        if shortfall is not None:
-            # On a share whose server sets the owner, or where the early read failed, the early sweep
-            # missed what this account's killed run left, and it would refuse every later run until
-            # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
-            # removed before this returns. Only when that owner is not one a sweep above already went
-            # by, sweep by it and check once more whatever the sweep counted: a leftover it emptied
-            # but could not remove is not counted, yet frees the space. No run directory is open yet, so a refusal still leaves no lock or marker.
-            # Residuals, at least: the probe is a write, so on a volume full to the last block
-            # `mkdtemp` can fail and the refusal stands; and a sibling shard's sweep can remove a
-            # live probe before its owner is read, which answers None and skips this sweep.
-            probed = await asyncio.to_thread(_probe_owner, staging_root)
-            if probed is not None and probed not in swept_by:
-                swept_by.append(probed)
-                await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
+        if shortfall is not None and probed is None:
+            # The early probe answered None, so the early sweep may have missed what this account's
+            # killed run left, and it would refuse every later run until someone deleted it. Probe
+            # once more and, only when that owner is not one a sweep above already went by, sweep by
+            # it and check once more whatever the sweep counted: a leftover it emptied but could not
+            # remove is not counted, yet frees the space. No run directory is open yet, so a refusal
+            # still leaves no lock or marker. When this probe cannot be created either, the refusal
+            # stands.
+            again = await asyncio.to_thread(_probe_owner, staging_root)
+            if again is not None and again not in swept_by:
+                swept_by.append(again)
+                await asyncio.to_thread(_sweep_owned, staging_root, again, own=None)
                 shortfall = await asyncio.to_thread(
                     self._space_shortfall,
                     staging_root,
@@ -677,8 +766,10 @@ class BackupRunner:
         staging_leftover: str | None = None
         try:
             # Swept again by this run's own directory's owner only where no sweep above went by it,
-            # such as a share whose server sets the owner, or where the early read failed.
-            own_owner = await asyncio.to_thread(_owner_of, work.path)
+            # such as where no staging-root probe above could be created. Read from the descriptor
+            # of the lock file this run created there, never by path, so a rename in the staging
+            # root cannot choose it.
+            own_owner = await asyncio.to_thread(work.owner)
             if own_owner is None:
                 log.warning(
                     "DR staging: cannot read the owner of %s, so %s is not swept",
@@ -718,7 +809,8 @@ class BackupRunner:
             bundle = await asyncio.to_thread(self._inspect_config, config_dir)
             if config_only and bundle.error is not None:
                 # A config-only archive without its config holds nothing to restore, yet it would
-                # verify and take a keep-N slot from an archive that does. It fails instead.
+                # verify and take a keep-N slot from an archive that does. It fails instead. A walk
+                # that adds no file is refused in the build, which is where the walk runs.
                 raise BackupError(
                     "snapshot",
                     f"config-only backup: the config dir {config_dir} could not be read "
@@ -729,6 +821,9 @@ class BackupRunner:
                     snapshot_sha256,
                     row_counts,
                     archive_bytes,
+                    # What the archive carries, as its manifest records it (vault BACKLOG #5220,
+                    # #5233).
+                    bundle,
                     staging_leftover,
                 ) = await asyncio.to_thread(
                     self._build_in_staging,
@@ -804,6 +899,8 @@ class BackupRunner:
             config_dir=str(bundle.path) if bundle.path is not None else None,
             config_bundle_error=bundle.error,
             config_unreadable_files=bundle.left_out,
+            config_skipped_files=bundle.skipped,
+            config_skipped_count=bundle.skipped_count,
         )
 
     async def _verify_and_publish(
@@ -983,12 +1080,12 @@ class BackupRunner:
         now: float,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int, str | None]:
+    ) -> tuple[str, dict[str, int], int, _ConfigBundle, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
-        thread. Returns the build's result plus the release's leftover sentence (``None`` when no file
-        in the directory still holds plaintext). Releasing here, not on the loop, is what makes a
-        cancelled build clean up after itself: it keeps running on this thread, and the directory goes
-        only once it has let go of the files."""
+        thread. Returns the build's four values, then the release's leftover sentence (``None`` when
+        no file in the directory still holds plaintext). Releasing here, not on the loop, is what
+        makes a cancelled build clean up after itself: it keeps running on this thread, and the
+        directory goes only once it has let go of the files."""
         if not work.claim():
             raise OSError(f"the backup staging directory {work.path} was released before the build")
         try:
@@ -1008,6 +1105,10 @@ class BackupRunner:
             leftover = work.release()
             if leftover is None:
                 raise
+            if isinstance(exc, BackupError):
+                # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
+                # same reason, and a note would not reach the audit row or the alert.
+                raise BackupError(exc.kind, f"{leftover}; the build failed: {exc}") from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
@@ -1030,10 +1131,11 @@ class BackupRunner:
         secure: bool,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int]:
+    ) -> tuple[str, dict[str, int], int, _ConfigBundle]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
-        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a file in
+        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes, walked)``, the last
+        ``bundle`` as the manifest records it once the walk has run. The tar goes to a file in
         ``work_dir`` (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the
         archive. That tar is plaintext, so with ``secure`` it is locked to its owner before its first
         byte, the way the restore path locks its own staged tar.
@@ -1048,25 +1150,6 @@ class BackupRunner:
             snapshot_sha256 = _sha256_file(snap_path)
             row_counts = _count_tables(snap_path)
 
-        manifest = {
-            "format": "mfbak",
-            # The .mfbak archive format version — parity with the AAD-bound codec header (ADR 0049
-            # "What's in the archive"). The header's value is authoritative for decode; this is the
-            # human-/tooling-readable copy inside the manifest.
-            "format_version": FORMAT_VERSION,
-            "engine_version": self._engine_version,
-            "instance": self._instance,
-            "created_utc": _utc_iso(now),
-            "snapshot_method": self._settings.snapshot_method,
-            "config_only": config_only,
-            "backend": self._backend_value(),
-            "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-            **bundle.manifest_fields(),
-            "snapshot_sha256": snapshot_sha256,
-            "row_counts": row_counts,
-        }
-        manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
-
         # In the run's own staging directory, which the caller releases on every exit.
         tar_path = work_dir / "archive.tar"
         with open(tar_path, "wb") as tar_fh:
@@ -1074,8 +1157,42 @@ class BackupRunner:
             with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
+                added = 0
+                skipped: tuple[str, ...] = ()
                 if bundle.bundled and bundle.path is not None:
-                    self._add_config_dir(tar, bundle.path)
+                    added, skipped = self._add_config_dir(tar, bundle.path)
+                walked = bundle.after_walk(added, skipped)
+                if config_only and added == 0:
+                    # Before the archive is written, so nothing is published or pruned: an archive of
+                    # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
+                    # The verdict leads the message, ahead of the path. A staging leftover, when
+                    # there is one, is put ahead of both by `_build_in_staging`.
+                    raise BackupError(
+                        "snapshot",
+                        "config-only backup: the config walk added no regular file, so there is "
+                        f"nothing to archive (config dir {bundle.path})",
+                    )
+                # Built after the walk, so `config_bundled` says whether a config file was added,
+                # not whether the walk was asked to run (vault BACKLOG #5220), and
+                # `config_skipped_files` names what the walk passed over (vault BACKLOG #5233).
+                manifest = {
+                    "format": "mfbak",
+                    # The .mfbak archive format version — parity with the AAD-bound codec header
+                    # (ADR 0049 "What's in the archive"). The header's value is authoritative for
+                    # decode; this is the human-/tooling-readable copy inside the manifest.
+                    "format_version": FORMAT_VERSION,
+                    "engine_version": self._engine_version,
+                    "instance": self._instance,
+                    "created_utc": _utc_iso(now),
+                    "snapshot_method": self._settings.snapshot_method,
+                    "config_only": config_only,
+                    "backend": self._backend_value(),
+                    "key_id": key_id,  # one-way fingerprint, NEVER key bytes
+                    **walked.manifest_fields(),
+                    "snapshot_sha256": snapshot_sha256,
+                    "row_counts": row_counts,
+                }
+                manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -1108,31 +1225,105 @@ class BackupRunner:
             dst.flush()
             os.fsync(dst.fileno())
         archive_bytes = out_path.stat().st_size
-        return snapshot_sha256, row_counts, archive_bytes
+        return snapshot_sha256, row_counts, archive_bytes, walked
 
-    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> None:
+    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> tuple[int, tuple[str, ...]]:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
-        ``connections.toml``, ``codesets/``, fixtures). Symlinks are NOT followed (a symlink out of the
-        bundle would smuggle an arbitrary host file into the archive); only regular files are added.
+        ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
+        arbitrary host file into the archive, so the walk aims to add only regular files and does
+        NOT follow at least: a symlinked file, a symlinked directory, and on Windows a junction or
+        volume mount point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads
+        them. A filesystem mounted below ``base`` on POSIX is not a link, and is walked. ``base``
+        itself is the operator's configured directory and is walked whatever it is. At least each
+        directory link the walk lists as a directory is named in one WARNING, since the loader and
+        the config digest may read through it.
+
+        Not covered, at least: the walk reads each entry, then lists or opens it by name, so a path
+        swapped for a link in between is followed. The swaps that reach it include at least these.
+        A directory swapped for a junction in that gap is descended, as :func:`_walk_unfollowed`
+        says, and the files behind it are bundled. A parent folder swapped for a junction after the
+        walk had already decided to descend into the folder lets ``tar.add`` open each name listed
+        under the folder through the junction. A swapped file adds one member, since ``tar.add`` is
+        not recursive. This walk does not close that race, and this docstring does not bound who
+        can win it; closing it is separate work.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
-        killed editor's leftover is not config."""
-        for path in sorted(base.rglob("*")):
-            if path.is_symlink() or not path.is_file():
+        killed editor's leftover is not config. So is the backup's own staging, which a data dir
+        inside the config dir puts there (BACKLOG #1174): its plaintext snapshot and the tar being
+        written must not ride in the bundle.
+
+        Returns how many regular files it added, which a config-only pass needs (vault BACKLOG
+        #5220), and what it passed over, so the archive records what it does not carry (vault
+        BACKLOG #5233): sorted paths relative to ``base``, ``.`` for ``base`` itself, as
+        :func:`~messagefoundry.config.fingerprint.describe_left_out` reads them. What that names,
+        and what it does not, is stated once, in the ``include_config`` row of
+        ``docs/CONFIGURATION.md``."""
+        pruned: list[str] = []
+        unlisted: list[str] = []
+        found: list[Path] = []
+        for dirpath, dirs, files in _walk_unfollowed(base, pruned, unlisted):
+            # Pruned here, before the walk descends them, so a link inside one is not reported.
+            dirs[:] = [
+                d
+                for d in dirs
+                if not (atomic_edit.is_candidate_dir_name(d) or _is_staging_dir(Path(dirpath, d)))
+            ]
+            found.extend(Path(dirpath, name) for name in files)
+        links = sorted(Path(p).relative_to(base).as_posix() for p in pruned)
+        if links:
+            log.warning(
+                "DR backup: the config bundle of %s does not follow a directory link, so it leaves "
+                "out: %s",
+                base,
+                scrub_log_argument(", ".join(links)),
+            )
+        # What is passed over as neither a link nor config: unlisted folders, then files below.
+        passed_over = {Path(p).relative_to(base).as_posix() for p in unlisted}
+        # The names this walk added as regular members, which a second hard link may name; their
+        # count is the regular files it added.
+        regular_names: set[str] = set()
+        # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
+        for path in sorted(found):
+            rel = path.relative_to(base)
+            if _is_config_edit_artifact(rel):
                 continue
-            if _is_config_edit_artifact(path.relative_to(base)):
+            try:
+                st = path.lstat()
+                regular = stat.S_ISREG(st.st_mode) and not _stat_names_another_path(st)
+            except FileNotFoundError:
+                # Gone since the listing, such as an editor's save probe: no longer config.
                 continue
-            if any(
-                _is_staging_dir(base / parent)
-                for parent in path.relative_to(base).parents
-                if parent != Path(".")
-            ):
-                # A data dir inside the config dir puts the backup's own staging there (BACKLOG
-                # #1174): its plaintext snapshot and the tar being written must not ride in the bundle.
+            except OSError:
+                regular = False
+            if not regular:
+                passed_over.add(rel.as_posix())
                 continue
-            rel = path.relative_to(base).as_posix()
-            tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel}")
+            before = len(tar.getmembers())
+            tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
+            # Counted from the member tar wrote, so a path swapped for a link or a folder after the
+            # check above does not count as a file, nor one tar skipped, such as a socket.
+            members = tar.getmembers()
+            last = members[-1] if len(members) > before else None
+            # A second name of a file this walk already added is carried too, so it is not passed
+            # over: tar stores it as a link member naming that one, and a restore writes it as a
+            # copy of that file's bytes (`_extract_config_members`) (vault BACKLOG #5233).
+            if last is not None and last.isreg():
+                regular_names.add(last.name)
+            elif not (last is not None and last.islnk() and last.linkname in regular_names):
+                passed_over.add(rel.as_posix())
+        if passed_over:
+            from messagefoundry.config.fingerprint import describe_left_out
+
+            log.warning(
+                "DR backup: the config bundle of %s leaves out %d path(s) it could not list or add "
+                "as a regular file, first %d by name: %s",
+                base,
+                len(passed_over),
+                min(len(passed_over), _MAX_SKIPPED_RECORDED),
+                scrub_log_argument(describe_left_out(sorted(passed_over)[:_MAX_SKIPPED_RECORDED])),
+            )
+        return len(regular_names), tuple(sorted(passed_over | set(links)))
 
     # --- keep-N retention ----------------------------------------------------
 
@@ -1249,6 +1440,8 @@ class BackupRunner:
             "config_dir": result.config_dir,
             "config_bundle_error": result.config_bundle_error,
             "config_unreadable_files": list(result.config_unreadable_files),
+            "config_skipped_files": list(result.config_skipped_files),
+            "config_skipped_count": result.config_skipped_count,
             "snapshot_sha256": result.snapshot_sha256,
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
@@ -1295,12 +1488,10 @@ class BackupRunner:
 
     def _resolve_key(self) -> bytes | None:
         """The 32-byte store DEK via the ADR 0019 KeyProvider seam, or ``None`` (identity cipher)."""
-        import base64
-
         key_b64 = resolve_active_key(self._store_settings, posture=self._hop_posture)  # type: ignore[arg-type]
         if not key_b64:
             return None
-        return base64.b64decode(key_b64)
+        return _decode_store_key(key_b64)
 
     def _current_config_dir(self) -> Path | None:
         """The config dir this pass backs up: the constructor's value, or what its callable names
@@ -1315,8 +1506,9 @@ class BackupRunner:
 
         A directory that is gone or cannot be listed is not bundled, and the archive records that
         with the fault's class name (vault BACKLOG #3094). The fold and the archive walk both list
-        through ``glob``, which swallows that error, so without this check the archive would carry
-        an empty ``config/``, and an empty-bundle digest, under a clean success. A full pass still
+        through calls that swallow that error (``glob``, ``os.walk``), so without this check the
+        archive would carry an empty ``config/``, and an empty-bundle digest, under a clean
+        success. A full pass still
         goes on, because the store snapshot is worth keeping; a config-only pass fails, in
         :meth:`_do_backup`. The digest itself catches what
         :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
@@ -1325,7 +1517,9 @@ class BackupRunner:
         unreadable is recorded beside it, so the record does not read as the digest of the whole
         bundle (vault BACKLOG #3765), and logged at WARNING when the bundle is being archived. On a
         bundled pass that list reaches a record only for what the walk passes over, at least a
-        folder it cannot list, and for a lock gone by the walk. Each warning names the directory
+        folder it cannot list, and for a lock gone by the walk. What the walk itself passes over is
+        recorded apart, by :meth:`_add_config_dir` (vault BACKLOG #5233), since this digest is
+        taken before the walk runs and can read through a link. Each warning names the directory
         and an error class, a scrubbed reason or a relative file name, never config content. With
         ``include_config`` off nothing is bundled, so a listing fault is not one the operator needs
         to hear about, and none is recorded; the digest is still taken, so its left-out list is."""
@@ -1613,7 +1807,7 @@ def _verify_archive_blocking(
             # After the key precheck, so a verify that was never going to stage pays for no scan, and
             # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
             # Inside this block, so even a fault in the sweep still releases this run's directory.
-            _sweep_abandoned_staging(staging_root, owned_like=work.path)
+            _sweep_abandoned_staging(staging_root, owner=work.owner(), own=work.path)
         # A standalone verify holds the decrypted tar and the extracted store at once, each about the
         # archive's size (BACKLOG #1174, PR 1771 defect 3). The backup's own verify is covered by the
         # backup's check, which counts this peak on its staging root.
@@ -1720,9 +1914,8 @@ def _fd_walk(
     and every child is opened relative to its parent's with ``O_NOFOLLOW``. Unlike ``os.fwalk`` it
     reports every listing and open failure to ``onerror`` and walks on: a directory that will not list
     or open, or one swapped for a link after it was listed, is reported and is never the end of the
-    walk. One case is skipped silently: an entry whose ``is_dir`` raises is listed as a file, so if it
-    is a directory it is never walked, and the fail-safe's ``lstat`` of it then finds no regular file
-    and reports nothing."""
+    walk. An entry whose ``is_dir`` raises is listed as a file, so if it is a directory it is never
+    walked; the fail-safe's ``lstat`` of it then finds a directory and reports it (BACKLOG #4989)."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("the descriptor walk runs only on POSIX")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -1762,14 +1955,9 @@ def _fd_walk(
             os.close(fd)
 
 
-#: The walk the truncate fail-safe uses, named here so a test can refuse a listing without patching
-#: every caller's walk. POSIX walks by descriptor (:func:`_fd_walk`). Windows has no such walk, so there
-#: it goes by path and each directory's and file's final path is checked instead (see
-#: :func:`_empty_files_in_place`).
-if sys.platform == "win32":
-    _walk = os.walk
-else:
-    _walk = _fd_walk
+#: The POSIX walk the truncate fail-safe uses, named here so a test can refuse a listing without
+#: patching every caller's walk. Windows walks by held handle instead (:func:`_win_held_walk`).
+_walk = _fd_walk
 
 
 def _empty_files_in_place(staging: Path) -> list[str]:
@@ -1787,13 +1975,12 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     - POSIX: :func:`_fd_walk` hands over a descriptor per directory and opens each child directory with
       ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
-    - Windows: ``staging`` and each directory under it are opened without following a reparse point
-      that names another path, and must lie under ``staging``'s final path, or the directory is left
-      unwalked and reported without its name. Each file is opened the same way, and its final path
-      must lie under ``staging``'s too. A reparse point that names no path (a cloud, deduplicated or
-      tiered file) is opened again so its filter serves it, and must still be the same file.
+    - Windows: :func:`_win_held_walk` holds each directory, and the ones above it, while it is checked,
+      listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
+      its final path must lie under ``staging``'s.
 
-    What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
+    What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
+    ``mefor-verify-*`` staging row."""
     unproven: list[str] = []
 
     def _unlisted(exc: OSError) -> None:
@@ -1806,44 +1993,11 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     walked = False
     if sys.platform == "win32":
-        try:
-            inside = _win_real_directory(staging)
-        except OSError as exc:
-            if getattr(exc, "winerror", None) in _WIN_FINAL_PATH_UNSUPPORTED:
-                # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM
-                # disks) cannot name a handle's final path, so nothing here can be shown to lie
-                # inside the directory. Truncating by path instead is what BACKLOG #2420 removed,
-                # so nothing is emptied, and that is said, without any file's name.
-                log.warning(
-                    "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
-                    "cannot report a file's final path, so no file in it was emptied",
-                    staging,
-                )
-            _unlisted(exc)
-            return unproven
-        for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
+        for dirpath, dirnames, filenames, inside in _win_held_walk(staging, unproven, _report):
             walked = True
-            # Checked before any of its entries is opened or named: a directory swapped for a
-            # junction after its listing, or reached through one, is not walked.
-            try:
-                outside = not _win_real_directory(Path(dirpath)).startswith(inside)
-            except NotADirectoryError:
-                outside = True
-            except OSError as exc:
-                dirnames[:] = []
-                _unlisted(exc)
-                continue
-            if outside:
-                dirnames[:] = []
-                _report(_OUTSIDE_REASON)
-                continue
             # Never descend through a link or a junction, which `os.walk` follows even with
             # `followlinks=False`.
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
-            ]
+            dirnames[:] = [d for d in dirnames if not _is_dir_link(os.path.join(dirpath, d))]
             for name in filenames:
                 _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
     else:
@@ -1861,10 +2015,15 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
 
-#: The Win32 errors ``GetFinalPathNameByHandleW`` returns on a volume that does not support it:
-#: ``ERROR_INVALID_FUNCTION``, ``ERROR_NOT_SUPPORTED`` and ``ERROR_INVALID_PARAMETER``, the set
-#: ``transports/file.py`` treats as "this volume does not do that".
-_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50, 87})
+
+class _HardLinked(OSError):
+    """The opened file has a second link, so it is not truncated (see :func:`_vet_for_truncate`).
+    Never carries a name."""
+
+
+class _Outside(OSError):
+    """Windows: the file opened as itself has a final path outside the staging directory, so it is
+    not truncated and is reported as :data:`_OUTSIDE_REASON`. Never carries a name."""
 
 
 def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
@@ -1872,19 +2031,30 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
     ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
-    path on Windows, as :func:`_win_real_directory` returns it. The ``lstat`` first only skips a link
-    or a hard link without opening it; the check that decides is the one on the open handle."""
+    path on Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a
+    hard link without opening it; the check that decides is the one on the open handle."""
     name = entry.name
     try:
-        st = (
-            os.lstat(entry)
-            if dir_fd is None
-            else os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        )
+        if dir_fd is not None:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        elif sys.platform == "win32":
+            # Not `os.lstat`, which opens a cloud, deduplicated or tiered file through its filter.
+            st, tag = _win_lstat(entry)
+            if tag & _NAME_SURROGATE:
+                return None  # a link, skipped as below; `os.fstat` calls a file symlink regular
+        else:
+            st = os.lstat(entry)
     except FileNotFoundError:
         return None
     except OSError:
         return name
+    # A directory here is one the walk took for a file because reading its type raised, so nothing
+    # in it was walked or emptied: report it, or the teardown would call the tree clean and raise no
+    # cleanup alert while it may still hold plaintext (BACKLOG #4989). A junction, which Windows
+    # reports as a directory, never reaches here: it names another path, so the Windows screen above
+    # skips it by its reparse tag, which `os.fstat` does not carry.
+    if stat.S_ISDIR(st.st_mode):
+        return f"{name}/ (not walked)"
     # A link is never followed: truncating through one would empty a file outside the directory, and
     # the link itself holds no plaintext.
     if not stat.S_ISREG(st.st_mode):
@@ -1894,194 +2064,254 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
-        fd = _open_unfollowed(entry, dir_fd)
+        fd = _open_unfollowed(entry, dir_fd, inside)
     except FileNotFoundError:
         return None
-    except OSError:
-        return name
+    except OSError as exc:
+        return _not_truncated(name, exc)
     try:
-        if inside is not None and not _win_final_path(fd).startswith(inside):
-            return _OUTSIDE_REASON
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or _names_another_path(fd):
-            return f"{name} (changed while being emptied, not truncated)"
-        if opened.st_nlink > 1:
-            return f"{name} (hard-linked, not truncated)"
+        # Checked on the handle that truncates: POSIX's only check, and on Windows the reopened
+        # handle of a file a filter serves (the handle opened as itself was checked before that,
+        # inside test included, and the reopen must be that same file).
+        _vet_for_truncate(fd)
         os.ftruncate(fd, 0)
-    except OSError:
-        return name
+    except OSError as exc:
+        return _not_truncated(name, exc)
     finally:
         os.close(fd)
     return None
 
 
-def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
+def _not_truncated(name: str, exc: OSError) -> str:
+    """What the fail-safe reports for the file ``name`` it did not truncate, by why."""
+    if isinstance(exc, _Outside):
+        return _OUTSIDE_REASON
+    if isinstance(exc, _HardLinked):
+        return f"{name} (hard-linked, not truncated)"
+    if isinstance(exc, (_Unconfined, _Replaced)):
+        # The name became a link or not a regular file, or the Windows reopen that lets a filter
+        # serve the file reached another one. A swap, not something reached through a link.
+        return f"{name} (changed while being emptied, not truncated)"
+    return name
+
+
+def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int:
     """Open ``entry`` for writing without following a link at its last component, and return a
-    descriptor. A test seam.
+    descriptor. A test seam. ``dir_fd`` and ``inside`` are as :func:`_truncate_unfollowed` takes
+    them.
 
     POSIX opens ``entry.name`` relative to ``dir_fd`` (``entry`` itself without one) with
     ``O_NOFOLLOW``, so a link there fails with ``ELOOP``. ``O_NONBLOCK`` too, so a FIFO swapped in
     after the check fails at once rather than holding the teardown's thread until a reader comes; it
     also makes an open that breaks a file lease fail rather than wait, and that file is reported.
 
-    Windows opens ``entry`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, so a link or junction there is
-    opened as itself, which the caller's check then refuses. A reparse point that names no path is
-    opened again so its filter serves its data, and must be the same file, or this raises."""
+    Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
+    connector's own open: as itself, refusing a link or junction there (``_Unconfined``), and
+    refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
+    file, the file opened as itself must have a final path under ``inside`` (``_Outside``) and pass
+    :func:`_vet_for_truncate`, so a file reached outside the directory, through a directory turned
+    into a junction in place, is never served by its filter (BACKLOG #4992).
+
+    A name that is gone once the file was opened as itself, as when it is renamed away before the
+    reopen, raises ``_Replaced``, not ``FileNotFoundError``: the caller reads that as nothing to
+    empty, and the file still holds its bytes under another name."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
-        fd = _win_open(entry, access, _WIN_OPEN_REPARSE_POINT, os.O_RDWR)
+        opened: list[bool] = []
+
+        def vet(fd: int) -> None:
+            opened.append(True)
+            if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
+                raise _Outside("outside the directory")
+            _vet_for_truncate(fd)
+
         try:
-            attributes, tag = _win_attribute_tag(fd)
-            if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and not tag & _WIN_NAME_SURROGATE:
-                first = os.fstat(fd)
-                os.close(fd)
-                fd = -1
-                fd = _win_open(entry, access, 0, os.O_RDWR)
-                again = os.fstat(fd)
-                if (again.st_dev, again.st_ino) != (first.st_dev, first.st_ino):
-                    raise OSError(errno.ESTALE, "not the file first opened", str(entry))
-        except OSError:
-            if fd >= 0:
-                os.close(fd)
+            return _win_open_file(entry, access, vet=vet, fd_flags=os.O_RDWR)
+        except FileNotFoundError as exc:
+            if opened:
+                raise _Replaced("gone after it was opened") from exc
             raise
-        return fd
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
     if dir_fd is None:
         return os.open(entry, flags)
     return os.open(entry.name, flags, dir_fd=dir_fd)
 
 
-#: Win32 constants for the fail-safe: ``FILE_FLAG_OPEN_REPARSE_POINT``, the bit a reparse tag carries
-#: when it names another path (a symbolic link, a junction), and ``FileAttributeTagInfo``.
-_WIN_OPEN_REPARSE_POINT = 0x00200000
 #: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
 #: lock file or marker planted as a link. Windows has none, and follows one there.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
-_WIN_NAME_SURROGATE = 0x20000000
-_WIN_FILE_ATTRIBUTE_TAG_INFO = 9
+#: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
+#: read at least by :func:`_owner_of`, :func:`_names_another_path` and :func:`_stat_names_another_path`.
+#: :func:`_truncate_unfollowed` reads the same bit as ``_NAME_SURROGATE``.
+_WIN_NAME_SURROGATE = _NAME_SURROGATE
+
+# The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
+# helpers (`_win_hold_dirs`, `_win_open_file`, `_handle_final_path`), the ones the file connector
+# confines its drops with, so one copy of that code serves both (BACKLOG #4992).
 
 
-@functools.cache
-def _win_api() -> Any:
-    """``kernel32`` with the prototypes the Windows half of :func:`_empty_files_in_place` uses."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    from ctypes import wintypes
+def _vet_for_truncate(fd: int) -> None:
+    """Refuse, on the open file, what the fail-safe never truncates: something that is not a regular
+    file, or a file with a second link.
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-    kernel32.GetFinalPathNameByHandleW.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-    ]
-    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
-    kernel32.GetFileInformationByHandleEx.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    return kernel32
+    On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
+    filter serve a reparse point that names no path, and the screen before that open is
+    :func:`_win_lstat`, not ``os.lstat`` (BACKLOG #4992). What still reaches a filter first is
+    listed in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise _Unconfined("not a regular file")
+    if st.st_nlink > 1:
+        raise _HardLinked("a second link")
 
 
-def _win_open(path: Path, access: int, flags: int, fd_flags: int) -> int:
-    """Open ``path`` with the given ``CreateFileW`` flags, sharing everything, and return a descriptor
-    that owns the handle."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
+def _win_final_path(handle: int) -> str:
+    """The final path of the object open on the OS ``handle``, every link and junction resolved, in
+    ``os.path.normcase`` form. A test seam: the one call whose failure can mean the volume cannot
+    report a final path at all."""
+    return os.path.normcase(_handle_final_path(handle))
 
-    api = _win_api()
-    handle = api.CreateFileW(
-        str(path),
-        access,
-        0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-        None,
-        3,  # OPEN_EXISTING
-        flags,
-        None,
+
+def _win_unlisted(
+    unproven: list[str], where: Path, exc: OSError, *, final_path: bool = False
+) -> None:
+    """Report the directory ``where`` as not listed, by its own name, and log the error it met as
+    itself (BACKLOG #4992).
+
+    Only a failed final-path query (``final_path``) with ``ERROR_INVALID_FUNCTION``,
+    ``ERROR_NOT_SUPPORTED`` or ``ERROR_INVALID_PARAMETER`` is read as a volume that cannot report a
+    final path. The same codes from an open or an attribute query mean something else, and are logged
+    as what they are."""
+    unproven.append(f"{where.name}/ (not listed)")
+    if final_path and getattr(exc, "winerror", None) in _WIN_UNSUPPORTED:
+        # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM disks)
+        # cannot name a handle's final path, so nothing here can be shown to lie inside the
+        # directory. Truncating by path instead is what BACKLOG #2420 removed, so nothing is
+        # emptied, and that is said, without any file's name.
+        log.warning(
+            "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
+            "cannot report a file's final path, so no file in it was emptied",
+            where,
+        )
+        return
+    log.warning(
+        "DR staging: the truncate fail-safe could not open or list %s, so no file in it was "
+        "emptied: %s",
+        where,
+        safe_exc(exc),
     )
-    if handle is None or handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _win_held_walk(
+    staging: Path, unproven: list[str], report: Callable[[str | None], None]
+) -> Iterator[tuple[str, list[str], list[str], str]]:
+    """Windows: walk ``staging`` top down, as ``os.walk`` does, yielding ``(dirpath, dirnames,
+    filenames, inside)`` for each directory, where ``inside`` is ``staging``'s final path with a
+    trailing separator, for a prefix test. A caller that prunes ``dirnames`` in place prunes the walk.
+
+    Each directory is HELD by :func:`_win_hold_dirs`, with every directory between it and
+    ``staging``, and ``staging`` itself: opened as themselves, refused if one names another path, and
+    shared for reading and writing but not for delete, so that, at least, none can be renamed or
+    replaced by another directory or a junction. The hold does not stop a held directory that is
+    empty being turned into a junction in place, which needs only write-attributes access; the
+    backup staging row of docs/PHI.md section 2 names that residual. It is held before it is
+    checked and listed, and until the caller has emptied its files and resumes the walk (BACKLOG
+    #4992), the order :func:`_fd_walk` keeps with its descriptors.
+
+    A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
+    ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
+    junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
+    as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
+    held_root = _win_hold_root(staging, unproven)
+    if held_root is None:
+        return
+    root, inside = held_root
     try:
-        return msvcrt.open_osfhandle(handle, fd_flags | os.O_BINARY)
-    except BaseException:
-        api.CloseHandle(handle)
-        raise
-
-
-def _win_attribute_tag(fd: int) -> tuple[int, int]:
-    """The attributes and reparse tag of the object open on ``fd``. ``os.fstat`` reports no tag."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
-
-    info = (ctypes.c_uint32 * 2)()  # FILE_ATTRIBUTE_TAG_INFO: FileAttributes, ReparseTag
-    if not _win_api().GetFileInformationByHandleEx(
-        msvcrt.get_osfhandle(fd), _WIN_FILE_ATTRIBUTE_TAG_INFO, info, ctypes.sizeof(info)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return info[0], info[1]
-
-
-def _names_another_path(fd: int) -> bool:
-    """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
-    symbolic link or a junction opened as itself. Always ``False`` on POSIX, where ``O_NOFOLLOW``
-    already refused one."""
-    if sys.platform != "win32":
-        return False
-    attributes, tag = _win_attribute_tag(fd)
-    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _WIN_NAME_SURROGATE)
-
-
-def _win_final_path(fd: int) -> str:
-    """The final path of the object open on ``fd``, every link and junction resolved, in
-    ``os.path.normcase`` form."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
-
-    size = 512
-    while True:
-        buf = ctypes.create_unicode_buffer(size)
-        got = _win_api().GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, size, 0)
-        if got == 0:
-            raise ctypes.WinError(ctypes.get_last_error())
-        if got < size:
-            return os.path.normcase(buf.value)
-        size = got + 1  # too small: `got` is the size it needs
-
-
-def _win_real_directory(path: Path) -> str:
-    """The final path of ``path`` with a trailing separator, for a prefix test. Opened without
-    following a reparse point; raises ``OSError`` when it cannot be opened, is not a directory, or is
-    itself a link or junction."""
-    # FILE_READ_ATTRIBUTES, with FILE_FLAG_BACKUP_SEMANTICS so a directory opens at all.
-    fd = _win_open(path, 0x00000080, 0x02000000 | _WIN_OPEN_REPARSE_POINT, os.O_RDONLY)
-    try:
-        attributes = getattr(os.fstat(fd), "st_file_attributes", 0)
-        if not attributes & stat.FILE_ATTRIBUTE_DIRECTORY or _names_another_path(fd):
-            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", str(path))
-        return _win_final_path(fd).rstrip("\\") + "\\"
+        stack = [staging]
+        while stack:
+            where = stack.pop()
+            held = _win_hold_below(staging, where, inside, unproven, report)
+            if held is None:
+                continue
+            try:
+                try:
+                    with os.scandir(where) as listing:
+                        entries = list(listing)
+                except OSError as exc:
+                    _win_unlisted(unproven, where, exc)
+                    continue
+                dirnames: list[str] = []
+                filenames: list[str] = []
+                for entry in entries:
+                    # Not followed: a link to a directory is listed as a file, and its lstat skips it.
+                    (dirnames if entry.is_dir(follow_symlinks=False) else filenames).append(
+                        entry.name
+                    )
+                yield os.fspath(where), dirnames, filenames, inside
+                stack.extend(where / name for name in reversed(dirnames))
+            finally:
+                _win_release(held)
     finally:
-        os.close(fd)
+        _win_release(root)
+
+
+def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] | None:
+    """Hold ``staging`` itself and return its handle with its final path, or ``None`` once what
+    stopped it is reported. A link or a junction there is never walked."""
+    try:
+        root = _win_hold_dirs(staging.parent, (staging.name,))
+    except _Unconfined:
+        unproven.append(f"{staging.name}/ (not listed)")
+        log.warning(
+            "DR staging: the truncate fail-safe did not walk %s, which is a link, a junction or not "
+            "a directory, so no file in it was emptied",
+            staging,
+        )
+        return None
+    except OSError as exc:
+        _win_unlisted(unproven, staging, exc)
+        return None
+    try:
+        return root, _win_final_path(root[0]).rstrip("\\") + "\\"
+    except OSError as exc:
+        _win_release(root)
+        _win_unlisted(unproven, staging, exc, final_path=True)
+        return None
+
+
+def _win_hold_below(
+    staging: Path,
+    where: Path,
+    inside: str,
+    unproven: list[str],
+    report: Callable[[str | None], None],
+) -> list[int] | None:
+    """Hold every directory from below ``staging`` down to ``where`` and return their handles, or
+    ``None`` once what refused it is reported. ``staging`` itself is held by the caller."""
+    try:
+        held = _win_hold_dirs(staging, where.relative_to(staging).parts)
+    except _Unconfined:
+        report(_OUTSIDE_REASON)
+        return None
+    except OSError as exc:
+        _win_unlisted(unproven, where, exc)
+        return None
+    if not held:  # `staging` itself, checked by _win_hold_root
+        return held
+    try:
+        outside = not (_win_final_path(held[-1]).rstrip("\\") + "\\").startswith(inside)
+    except OSError as exc:
+        _win_release(held)
+        _win_unlisted(unproven, where, exc, final_path=True)
+        return None
+    if outside:
+        _win_release(held)
+        report(_OUTSIDE_REASON)
+        return None
+    return held
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
@@ -2164,8 +2394,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
 _SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
-#: The bare directory :func:`_probe_owner` makes to learn the owner a new directory gets. Never a
-#: staging directory; a leaked one is empty, and the sweep removes it by ``rmdir`` alone.
+#: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file. Never a
+#: staging directory; a leaked one is empty, and the sweep removes it only while it is empty. The
+#: sweep also removes an empty probe-named directory by ``rmdir`` alone.
 _OWNER_PROBE_PREFIX = "mefor-owner-probe-"
 
 #: The server-DB staging root, a dot-prefixed directory under the backup destination.
@@ -2247,6 +2478,11 @@ class _Staging:
         self._released = False
         self._claimed = False
 
+    def owner(self) -> object | None:
+        """The owner of the lock file this run created in the directory, read from its descriptor
+        (:func:`_owner_of_fd`), never by path. Called before the directory is released."""
+        return _owner_of_fd(self._fd, self.path / _LOCK_NAME)
+
     def claim(self) -> bool:
         """Called by a worker before it touches the directory. ``False`` if it is already gone."""
         with self._mutex:
@@ -2318,11 +2554,72 @@ def _is_config_edit_artifact(rel: Path) -> bool:
     )
 
 
+def _walk_unfollowed(
+    root: Path, pruned: list[str] | None = None, unlisted: list[str] | None = None
+) -> Iterator[tuple[str, list[str], list[str]]]:
+    """``os.walk(root)``, top-down, that does not descend a directory link below ``root``, as
+    :func:`_is_dir_link` reads one: at least a symlinked directory and, on Windows, a junction or
+    volume mount point, which ``os.walk`` descends even with ``followlinks=False`` (vault BACKLOG
+    #5221). A directory whose ``lstat`` fails is not descended either. Each pruned directory's path
+    is appended to ``pruned`` when one is given, and each folder ``os.walk`` could not list, ``root``
+    included, to ``unlisted`` (vault BACKLOG #5233). A caller may prune the yielded directory list
+    further, as with ``os.walk``. The read and the descent are by name, so a directory swapped for a
+    link between them is descended."""
+
+    def record_unlisted(exc: OSError) -> None:
+        # os.walk names the folder it failed to list. With no name the folder is unknown, so root
+        # is recorded: that overstates the loss rather than let it pass unrecorded.
+        if unlisted is None:
+            return
+        name = os.fsdecode(exc.filename) if exc.filename is not None else str(root)
+        # A subfolder gone since its parent was listed is no longer config; root gone is a loss.
+        if isinstance(exc, FileNotFoundError) and name != str(root):
+            return
+        unlisted.append(name)
+
+    for dirpath, dirs, files in os.walk(root, onerror=record_unlisted, followlinks=False):
+        kept = []
+        for d in dirs:
+            full = os.path.join(dirpath, d)
+            if not _is_dir_link(full, unreadable=True):
+                kept.append(d)
+            elif pruned is not None:
+                pruned.append(full)
+        dirs[:] = kept
+        yield dirpath, dirs, files
+
+
+def _is_dir_link(path: str, *, unreadable: bool = False) -> bool:
+    """Whether ``path`` names another path: a symlink, or on Windows a name-surrogate reparse point,
+    at least a junction or a volume mount point. Read by ``lstat``, never by a following ``stat``. A
+    reparse point that names no other path, such as a cloud placeholder or a deduplicated file, is
+    not one, so it is walked as what it holds; the same rule as :func:`_owner_of`. ``unreadable`` is
+    the answer when the ``lstat`` fails: the config walk prunes such an entry, and the staging walk,
+    which reports what it cannot list, lets ``os.walk`` try it as it did before."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return unreadable
+    return _stat_names_another_path(st)
+
+
+def _stat_names_another_path(st: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a link as :func:`_is_dir_link` reads one, for a file or a
+    folder. On Windows a name-surrogate reparse point other than a symlink, such as a WSL link,
+    reads as ``S_IFREG``, so the mode alone does not say."""
+    reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISLNK(st.st_mode) or bool(
+        reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
+    )
+
+
 def _tree_size(root: Path) -> int:
-    """The total size of the regular files under ``root``, never following a link, which is also
-    what ``_add_config_dir`` puts in the archive. 0 when ``root`` cannot be walked."""
+    """The total size of the regular files under ``root``, on the walk ``_add_config_dir`` uses
+    (:func:`_walk_unfollowed`), so a directory link it passes over is not counted. Unlike that
+    walk it does not skip the backup's own staging or a config editor's lock file. 0 when ``root``
+    cannot be walked."""
     total = 0
-    for dirpath, dirs, files in os.walk(root, followlinks=False):
+    for dirpath, dirs, files in _walk_unfollowed(root):
         # Candidate directories are pruned, as _add_config_dir skips their files.
         dirs[:] = [d for d in dirs if not atomic_edit.is_candidate_dir_name(d)]
         for name in files:
@@ -2533,36 +2830,395 @@ def _process_owner() -> object | None:
     without creating one in the staging root. ``None`` when it cannot be read.
 
     POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
-    directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
+    file made in the OS temp dir by :func:`_probe_owner`, since a local NTFS entry takes the token's
     default owner wherever it is made. On a share whose server sets the owner this answer differs
-    from what a directory there gets, and the backup then sweeps by its own directory's owner too.
-    On Windows this is ``None`` when the probe cannot be made, or a sibling's sweep removes it before
-    its owner is read; the backup then skips its early staging-root sweep and its OS-temp sweep."""
+    from what a directory there gets, so the backup keys its OS-temp sweep on it, and sweeps its
+    staging root by :func:`_probe_owner` of that root, or by this answer only as
+    :func:`_fallback_root_owner` allows (BACKLOG #4988). On Windows this is ``None`` when the probe
+    cannot be made; the backup then skips its OS-temp sweep."""
     if sys.platform != "win32":
         return os.geteuid()
     return _probe_owner(None)
 
 
-def _probe_owner(root: Path | None) -> object | None:
-    """The owner a directory this process makes under ``root`` gets, as :func:`_owner_of` reports
-    it, learned by making a bare ``mefor-owner-probe-*`` directory there and removing it. ``None``
-    for the OS temp dir; ``None`` returned when the probe cannot be made or its owner read, and
-    nothing is created when ``root`` does not exist.
+@functools.cache
+def _win_api() -> Any:
+    """``kernel32`` with the prototypes the Windows owner probe uses (:func:`_win_create_owner_probe`,
+    :func:`_win_sd_as_sddl`). The staging fail-safe's opens go through ``transports/file.py``'s own
+    helpers instead (BACKLOG #4992)."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    from ctypes import wintypes
 
-    The probe holds no file, no lock and no marker, so it is never a staging directory. One whose
-    removal fails is left empty, and the next sweep of that root by its owner removes it
-    (:func:`_sweep_owned`).
-    A sibling shard's sweep can remove a probe before its owner is read here; that answers ``None``,
-    and the caller only skips a sweep."""
-    try:
-        probe = Path(tempfile.mkdtemp(prefix=_OWNER_PROBE_PREFIX, dir=root))
-    except OSError:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    return kernel32
+
+
+@functools.cache
+def _win_security_api() -> Any:
+    """``advapi32`` with the prototypes :func:`_win_owner_of_handle` uses."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    pvoid_p = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.c_void_p,
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        pvoid_p,
+        ctypes.c_void_p,
+    ]
+    return advapi32
+
+
+def _win_sd_as_sddl(descriptor: Any, info: int) -> str | None:
+    """The ``info`` parts of the security descriptor ``descriptor`` as SDDL, or ``None`` (logged)
+    when it cannot be rendered."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    from ctypes import wintypes
+
+    text = wintypes.LPWSTR()
+    if not _win_security_api().ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor, 1, info, ctypes.byref(text), None
+    ):
+        log.warning(
+            "DR staging: a security descriptor could not be rendered as SDDL: Win32 status %d",
+            ctypes.get_last_error(),
+        )
         return None
     try:
-        return _owner_of(probe)
+        return text.value
     finally:
-        with contextlib.suppress(OSError):
-            probe.rmdir()
+        _win_api().LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _win_handle_sddl(handle: int, info: int) -> str | None:
+    """The ``info`` parts of the security descriptor of the object open as ``handle``, read with
+    ``GetSecurityInfo`` on the handle, never by path, as SDDL. ``None`` (logged) when it cannot be
+    read. The handle needs ``READ_CONTROL``."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    descriptor = ctypes.c_void_p()
+    status = _win_security_api().GetSecurityInfo(
+        handle,
+        1,  # SE_FILE_OBJECT
+        info,
+        None,
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        log.warning("DR staging: GetSecurityInfo could not read a handle: Win32 status %d", status)
+        return None
+    try:
+        return _win_sd_as_sddl(descriptor, info)
+    finally:
+        _win_api().LocalFree(descriptor)
+
+
+def _win_owner_of_handle(handle: int) -> object | None:
+    """The owner SID of the object open as ``handle``, read with ``GetSecurityInfo`` on the handle,
+    never by path, in the form :func:`_owner_of` reports (SDDL, aliases resolved), so the two compare.
+    ``None`` when it cannot be read. The handle needs ``READ_CONTROL``."""
+    return _owner_from_sddl(_win_handle_sddl(handle, 0x00000001))  # OWNER_SECURITY_INFORMATION
+
+
+def _owner_from_sddl(sddl: str | None) -> object | None:
+    """The owner SID an SDDL string names, aliases resolved, so :func:`_owner_of` and
+    :func:`_owner_of_fd` answer in one form. ``None`` when it names none."""
+    from messagefoundry.store.store import _SDDL_OWNER, _resolve_sid
+
+    found = _SDDL_OWNER.search(sddl) if sddl else None
+    return _resolve_sid(found.group(1)) if found else None
+
+
+@contextlib.contextmanager
+def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
+    """Create an empty ``mefor-owner-probe-*`` file under ``root`` (the OS temp dir when ``None``)
+    with ``O_CREAT | O_EXCL``, yield its descriptor and path, and remove it on exit. A test seam.
+    Raises ``OSError`` on entry when it cannot be created.
+
+    POSIX: ``mkstemp``, removed on exit by name only when, at a check just before, its name still
+    names the object it created: after a rename swap the name holds someone else's object, which is
+    theirs to remove. A swap between that check and the unlink can still remove the swapped-in
+    object. A removal that fails is logged and left for the next sweep. Windows:
+    :func:`_win_create_owner_probe`, created with a protected access list and opened
+    delete-on-close, so the file is deleted when its handle closes, wherever a rename has put it by
+    then, and nothing is ever removed by its name."""
+    if sys.platform == "win32":
+        fd, probe = _win_create_owner_probe(Path(tempfile.gettempdir()) if root is None else root)
+        try:
+            yield fd, probe
+        finally:
+            os.close(fd)
+        return
+    fd, name = tempfile.mkstemp(prefix=_OWNER_PROBE_PREFIX, dir=root)
+    try:
+        yield fd, Path(name)
+    finally:
+        try:
+            made, named = os.fstat(fd), os.lstat(name)
+            if (made.st_dev, made.st_ino) == (named.st_dev, named.st_ino):
+                os.unlink(name)
+        except FileNotFoundError:
+            pass  # a sibling's sweep, or a rename, already took the name
+        except OSError as exc:
+            log.warning("DR staging: could not remove owner probe %s: %s", name, safe_exc(exc))
+        os.close(fd)
+
+
+def _win_create_owner_probe(directory: Path) -> tuple[int, Path]:
+    """Create the Windows owner probe under ``directory`` and return a descriptor owning its handle,
+    and its path. Raises ``OSError`` when it cannot be created as asked.
+
+    The probe carries, from the ``CreateFileW`` call that creates it, the protected access list
+    :mod:`messagefoundry.restricted_file` writes on a key file: full control for SYSTEM,
+    Administrators and the creating account, and nothing inherited from ``directory``. So no access
+    entry inherited from the staging root gives another account ``WRITE_OWNER`` on it, and none can
+    re-own it before its owner is read and choose the owner the sweep goes by (BACKLOG #4988). The
+    list is read back from the handle before the probe is used, and a probe whose list is not
+    protected, or is not exactly the list the create asked for, as on a server that does not
+    apply the list a create asks for, is closed and refused. ``CREATE_NEW`` with
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name already taken, by a file or by a link, and
+    ``FILE_FLAG_DELETE_ON_CLOSE`` deletes the probe when the handle closes, wherever a rename has
+    put it by then."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows owner probe runs only on Windows")
+    import msvcrt
+    from ctypes import wintypes
+
+    from messagefoundry.config.wiring import _win32_config_source_probes
+    from messagefoundry.restricted_file import _expected_access, _protected_sddl
+    from messagefoundry.store.store import _parse_sddl_dacl
+
+    self_sid = _win32_config_source_probes().self_sid
+    if self_sid is None:
+        raise OSError("this process's own account could not be read, so no probe was made")
+    advapi32, kernel32 = _win_security_api(), _win_api()
+    dacl_info = 0x00000004  # DACL_SECURITY_INFORMATION
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = (
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        )
+
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        _protected_sddl(_expected_access(self_sid, ())), 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # The list as Windows renders it, so the read-back below compares like with like.
+        rendered = _win_sd_as_sddl(descriptor, dacl_info)
+        asked = _parse_sddl_dacl(rendered) if rendered is not None else None
+        if asked is None:
+            raise OSError("the probe's access list could not be built")
+        attributes = _SecurityAttributes(
+            ctypes.sizeof(_SecurityAttributes), descriptor.value, False
+        )
+        for _attempt in range(100):
+            probe = directory / f"{_OWNER_PROBE_PREFIX}{os.urandom(8).hex()}"
+            handle = kernel32.CreateFileW(
+                str(probe),
+                0x00020000 | 0x00010000,  # READ_CONTROL, for the owner read; DELETE, for the close
+                0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                ctypes.byref(attributes),
+                1,  # CREATE_NEW
+                # FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE
+                0x00000100 | _FLAG_OPEN_REPARSE_POINT | 0x04000000,
+                None,
+            )
+            if handle is not None and handle != ctypes.c_void_p(-1).value:
+                break
+            error = ctypes.get_last_error()
+            if error not in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS: another name
+                raise ctypes.WinError(error)
+        else:
+            raise FileExistsError(f"no free owner probe name under {directory}")
+    finally:
+        kernel32.LocalFree(descriptor)
+    try:
+        sddl = _win_handle_sddl(handle, dacl_info)
+        got = _parse_sddl_dacl(sddl) if sddl is not None else None
+        if got is None or not got.protected or set(got.aces) != set(asked.aces):
+            raise OSError(
+                f"owner probe in {directory} does not carry the protected access list it was "
+                "created with, so its owner is not read"
+            )
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY), probe
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _probe_owner(root: Path | None) -> object | None:
+    """The owner a new entry this process makes under ``root`` gets, as :func:`_owner_of` reports
+    it, learned from a ``mefor-owner-probe-*`` file made there (:func:`_owner_probe`) and removed
+    again. ``root`` ``None`` is the OS temp dir. ``None`` when the probe cannot be created or its
+    owner read; nothing is created when ``root`` does not exist.
+
+    The owner is read from the descriptor that created the probe (:func:`_owner_of_fd`): ``fstat`` on
+    POSIX, ``GetSecurityInfo`` on its handle on Windows. It is never read by path, so an account that
+    can rename entries in ``root`` cannot swap another object in at its name and choose the answer;
+    nor can a sibling engine shard's sweep removing it first. An empty file needs no data block, so
+    it can often be created on a volume full to the last block, though not on one out of inodes or
+    MFT records (BACKLOG #4988).
+
+    The probe holds no lock and no marker, so it is never a staging directory. One whose removal
+    fails is left empty, and the next sweep of that root by its owner removes it
+    (:func:`_sweep_owned`)."""
+    owner: object | None = None
+    try:
+        with _owner_probe(root) as (fd, name):
+            owner = _owner_of_fd(fd, name)
+    except FileNotFoundError:
+        pass  # no such root (or no temp dir): nothing to probe, and nothing to sweep there
+    except OSError as exc:
+        # The probe's creation, or its close once the owner was read, which keeps that owner.
+        # `_owner_of_fd` itself never raises.
+        log.warning(
+            "DR staging: owner probe in %s failed: %s",
+            "the OS temp dir" if root is None else root,
+            safe_exc(exc),
+        )
+    return owner
+
+
+def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
+    """The owner of the object open as ``fd``, read from the descriptor, never by path: ``fstat`` on
+    POSIX, ``GetSecurityInfo`` on its handle on Windows, in the form :func:`_owner_of` reports.
+    ``None`` when it cannot be read.
+
+    ``opened_as`` is the path ``fd`` was opened at. It is never read here: it is the seam a test's
+    stand-in for a share whose server sets the owner keys on, as it keys :func:`_owner_of` on a
+    path."""
+    del opened_as
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            return _win_owner_of_handle(msvcrt.get_osfhandle(fd))
+        except OSError as exc:
+            log.warning("DR staging: could not read an owner from a handle: %s", safe_exc(exc))
+            return None
+    try:
+        return os.fstat(fd).st_uid
+    except OSError as exc:
+        log.warning("DR staging: could not read an owner from a descriptor: %s", safe_exc(exc))
+        return None
+
+
+def _open_for_owner(root: Path) -> int:
+    """Open the directory ``root`` for :func:`_owner_of_fd` and return a descriptor. POSIX follows a
+    link, as the sweep and the staging open do. Windows opens a link or junction as itself, with
+    ``READ_CONTROL`` and ``FILE_READ_ATTRIBUTES``, so the caller can refuse it."""
+    if sys.platform == "win32":
+        # READ_CONTROL | FILE_READ_ATTRIBUTES, through `transports/file.py`'s own open; its
+        # FILE_FLAG_BACKUP_SEMANTICS lets a directory open at all.
+        return _fd_for(
+            _win_create(
+                root,
+                0x00020000 | 0x00000080,
+                _SHARE_ALL,
+                _FLAG_OPEN_REPARSE_POINT | _FLAG_BACKUP_SEMANTICS,
+            )
+        )
+    return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+def _names_another_path(fd: int) -> bool:
+    """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
+    symbolic link or a junction opened as itself. Always ``False`` on POSIX, where the caller's open
+    follows a link as the sweep does."""
+    if sys.platform != "win32":
+        return False
+    attributes, tag = _attribute_tag(_os_handle(fd))
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _WIN_NAME_SURROGATE)
+
+
+def _fallback_root_owner(root: Path, process: object | None) -> object | None:
+    """The owner the backup's early staging-root sweep goes by when :func:`_probe_owner` of ``root``
+    answers ``None``, such as on a volume a killed run filled: ``process``, the process's own owner
+    as :func:`_process_owner` reads it, and only when ``root`` itself carries that owner. ``None``
+    otherwise, and the early sweep is then off. A root that does not exist answers ``None`` with no
+    log line, since there is nothing to sweep; any other refused probe is logged at WARNING.
+
+    The gate is what keeps BACKLOG #4988 closed. On a share whose server sets the owner, what this
+    account makes there, its staging root among it, carries the server's choice, so the gate fails
+    and no directory carrying the process's own owner, which another principal may have made there,
+    is swept by it. Where a new entry gets the process's owner, a root this account made carries it,
+    so the sweep frees a killed run's leftover before the space check, as it did before the probe.
+    The root is opened (:func:`_open_for_owner`) and its owner read from that descriptor; on Windows
+    a link or junction root is refused, as :func:`_owner_of` refuses one. What the gate leaves open
+    is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row."""
+    if not os.path.isdir(root):
+        return None
+    log.warning(
+        "DR staging: could not learn the owner a new entry in %s gets from a probe there", root
+    )
+    if process is None:
+        return None
+    try:
+        fd = _open_for_owner(root)
+    except OSError as exc:
+        log.warning(
+            "DR staging: could not open staging root %s to read its owner: %s", root, safe_exc(exc)
+        )
+        return None
+    try:
+        if _names_another_path(fd):
+            log.warning(
+                "DR staging: staging root %s is a link or junction; its owner is not read", root
+            )
+            return None
+        return process if _owner_of_fd(fd, root) == process else None
+    except OSError as exc:
+        log.warning(
+            "DR staging: could not read the owner of staging root %s: %s", root, safe_exc(exc)
+        )
+        return None
+    finally:
+        os.close(fd)
 
 
 def _owner_of(path: Path) -> object | None:
@@ -2584,14 +3240,12 @@ def _owner_of(path: Path) -> object | None:
         return None
     if sys.platform != "win32":
         return st.st_uid
-    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl, _resolve_sid
+    from messagefoundry.store.store import _read_dacl_sddl
 
-    sddl = _read_dacl_sddl(path, owner=True)
-    found = _SDDL_OWNER.search(sddl) if sddl else None
-    return _resolve_sid(found.group(1)) if found else None
+    return _owner_from_sddl(_read_dacl_sddl(path, owner=True))
 
 
-def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
+def _sweep_abandoned_staging(root: Path, *, owner: object | None, own: Path) -> int:
     """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
 
     A directory is removed only when its lock file exists, its lock can be taken, and it holds the
@@ -2600,18 +3254,24 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
     never consulted. Returns how many directories were removed.
 
-    ``owned_like`` names a directory this run just created, and only a directory with its owner is a
-    candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
-    standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
+    ``own`` names a directory this run just created, left alone, and only a directory with ``owner``
+    is a candidate; nothing is swept when ``owner`` is ``None``, an owner that could not be read. It
+    is required (BACKLOG #2420). A standalone verify passes, for the OS temp dir, which can be
+    shared, :meth:`_Staging.owner` of its own directory: the owner of the lock file it created
+    there, read from its descriptor, never by path, so a rename in ``root`` cannot choose it
+    (BACKLOG #4988). A backup sweeps both the OS
     temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
-    with :func:`_sweep_owned` by the same rule, keyed on the process's own owner. Another account
-    could plant a directory in either holding a lock file and a marker, and the teardown must never
-    run on a tree it controls."""
-    owner = _owner_of(owned_like)
+    with :func:`_sweep_owned` by the same rule: the staging root keyed on the owner a probe there
+    gets (:func:`_probe_owner`), or on the process's owner only as :func:`_fallback_root_owner`
+    allows, and the OS temp dir on :func:`_process_owner`.
+    Another account could plant a directory in either holding a lock file and a marker, and the
+    teardown must never run on a tree it controls."""
     if owner is None:
-        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
+        log.warning(
+            "DR staging: this run's owner for %s could not be read, so %s is not swept", own, root
+        )
         return 0
-    return _sweep_owned(root, owner, own=owned_like)
+    return _sweep_owned(root, owner, own=own)
 
 
 def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
@@ -2629,16 +3289,32 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         probe = entry.name.startswith(_OWNER_PROBE_PREFIX)
         if not probe and not entry.name.startswith(_SWEPT_PREFIXES):
             continue
+        path = Path(entry.path)
         try:
+            if probe and entry.is_file(follow_symlinks=False):
+                # A probe file `_probe_owner` failed to remove. Only an empty one with this
+                # owner goes, and `unlink` removes the name itself, never what a link names.
+                st = entry.stat(follow_symlinks=False)
+                if st.st_size == 0 and _owner_of(path) == owner:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        log.warning(
+                            "DR staging: could not remove leaked owner probe %s: %s",
+                            path,
+                            safe_exc(exc),
+                        )
+                continue
             if not entry.is_dir(follow_symlinks=False) or os.path.isjunction(entry.path):
                 continue
         except OSError:
             continue
-        path = Path(entry.path)
         if path == own:
             continue  # this run's own directory, held live
         if probe:
-            # A probe `_probe_owner` failed to remove. `rmdir` alone, which refuses a directory that
+            # A probe-named directory. `rmdir` alone, which refuses a directory that
             # holds anything and never follows a link, so nothing but an empty directory goes.
             if _owner_of(path) == owner:
                 with contextlib.suppress(OSError):
@@ -2748,11 +3424,8 @@ def _verify_in_staging(
 
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     integrity_ok, integrity_msg = _integrity_check(snap)
-    raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
     row_counts = _count_tables(snap)
+    manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if not integrity_ok:
         return VerifyResult(
             "FAIL",
@@ -2761,35 +3434,15 @@ def _verify_in_staging(
             manifest_counts=manifest_counts,
             reason=f"integrity_check failed: {integrity_msg}",
         )
-    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
-    #
-    # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
-    # `_count_tables` derives its table set from the file it is given, so `row_counts` here
-    # reflects the RESTORED snapshot's own schema, which can legitimately be a superset of
-    # what an OLDER manifest recorded — a manifest written before this table set was widened
-    # (or before a later table existed at all) has fewer keys than the archive it describes
-    # really has tables. `run_restore_verify` is explicitly a standalone check of an OLDER
-    # archive (see its docstring and the AC-5 comment above), so that gap is an ordinary
-    # thing to hit, not tampering, and dict equality would FAIL every such archive on sight.
-    # A table the manifest tracked but the snapshot's schema no longer has (dropped, or never
-    # existed there) reads as a 0, the same convention the old fixed-list `_count_tables` used
-    # for a table absent from the schema — so a manifest count of 0 for it still passes, and a
-    # nonzero one still correctly FAILs (real data loss). A table `row_counts` has that the
-    # manifest never tracked is not compared at all: an older manifest cannot be faulted for
-    # not knowing about a table it never counted.
-    mismatches = {
-        table: (manifest_counts[table], row_counts.get(table, 0))
-        for table in manifest_counts
-        if row_counts.get(table, 0) != manifest_counts[table]
-    }
-    if mismatches:
+    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot, and a compare that
+    # read nothing); :func:`_compare_row_counts` says why it is keyed off the manifest's tables.
+    if count_refusal is not None:
         return VerifyResult(
             "FAIL",
             integrity_ok=True,
             row_counts=row_counts,
             manifest_counts=manifest_counts,
-            reason=f"row-count mismatch on {sorted(mismatches)}: "
-            f"snapshot={row_counts} manifest={manifest_counts}",
+            reason=count_refusal,
         )
     decrypted_cells = 0
     if full:
@@ -2821,6 +3474,26 @@ def _verify_in_staging(
     )
 
 
+def _decode_store_key(key_b64: str) -> bytes:
+    """One base64 store key as the 32 bytes it names, by the rule ``open_store`` applies.
+
+    A key that is not strict base64 of 32 bytes raises :class:`StoreCipherConfigError`, which the
+    ``restore-verify`` and ``restore`` commands report as "could not start" and exit 2, and a backup
+    run records as a failed backup (BACKLOG #4878). Its text is the decoder's fixed sentence. The
+    decoder, ``_decode_key``, already raises its ``ValueError`` with no chain (BACKLOG #3471); this
+    wrapper changes only the type, so the callers' ``StoreCipherConfigError`` handling reaches it,
+    and raises outside the handler so the new error carries no chain either."""
+    try:
+        decoded = _decode_key(key_b64, "a store encryption key")
+    except ValueError as exc:
+        reason = str(exc)
+    else:
+        key = bytes(decoded)
+        decoded[:] = bytes(len(decoded))  # best effort: the decoder's copy exists to be wiped
+        return key
+    raise StoreCipherConfigError(reason)
+
+
 async def run_restore_verify(
     archive_path: str,
     *,
@@ -2838,8 +3511,6 @@ async def run_restore_verify(
     ``allow_unencrypted`` (``[backup].allow_unencrypted``, default off) mirrors the write-side fail-closed:
     with it off, a plaintext archive is refused (``KEY_MISMATCH``) when a store key is configured (ASVS
     5.2.3 downgrade guard)."""
-    import base64
-
     # The decrypt-capable keyring, NOT just the active key: a backup taken under a key that has since
     # been retired (a routine WP-5 rotation) must still verify, or ADR 0048's cold-seed activation would
     # falsely refuse a perfectly recoverable archive (AC-5: compare to the resolved key, incl. retired).
@@ -2847,7 +3518,7 @@ async def run_restore_verify(
     # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
     # command holds none, and `None` counts as enforcing on that hop.
     keys = [
-        base64.b64decode(k)
+        _decode_store_key(k)
         for k in resolve_decrypt_keys(
             store_settings,  # type: ignore[arg-type]
             posture=posture,
@@ -2919,7 +3590,7 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     has fewer keys than a snapshot's schema really has — and that is expected, not tampering:
     ``run_restore_verify`` is a standalone check of an archive from any earlier point (AC-5), so an
     older, narrower manifest is an ordinary thing to verify. The compare in
-    :func:`_verify_archive_blocking` is written to tolerate exactly that (keyed off the manifest's
+    :func:`_compare_row_counts` is written to tolerate exactly that (keyed off the manifest's
     own keys, not dict equality) — this function only ever reports what IS in the schema, and does
     not itself guarantee cross-build equality.
 
@@ -3239,13 +3910,13 @@ def _extract_member(
 ) -> Path | None:
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
-    ``secure`` locks the output file to its owner with the store's own primitive the moment it exists,
-    BEFORE the first byte is streamed into it. The restore path passes it: its staging directory sits
-    on the destination volume, where ``TemporaryDirectory`` inherits whatever the parent grants on
-    Windows, and the file is the whole decrypted store. Securing it after the stream, the way
+    ``secure`` hands the output file to the store's own best-effort ``_secure_file`` the moment it
+    exists, BEFORE the first byte is streamed into it; what that leaves is not always owner-only on
+    Windows (ADR 0163). The restore path passes it: its staging directory sits on the destination
+    volume, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
-    under the inherited ACL for as long as the write takes. The verify path passes it everywhere but
-    ``.mefor-staging`` (BACKLOG #1174).
+    under the inherited ACL for as long as the write takes. The verify path passes it on each staging
+    root it uses, ``.mefor-staging`` included (BACKLOG #1174).
 
     Path-traversal-safe by construction, NOT by an after-the-fact check: the member's *stored name* is
     never used as a filesystem path — we look the member up by name, then stream its CONTENT to a fixed
@@ -3266,6 +3937,12 @@ def _extract_member(
             member = tar.getmember(name)
         except KeyError:
             return None
+        # A member of that name that is not a file is refused, not read as absent: absent, it sent
+        # the config-only restore route and this one to each other (vault BACKLOG #5233), since
+        # :func:`_tar_has_member` counts it as present. Nor is a link member followed, which would
+        # read another member's bytes as this one's.
+        if not member.isreg():
+            raise tarfile.TarError(f"archive {name} member is not a regular file")
         if member.size > max_member_bytes:
             raise tarfile.TarError(
                 f"archive member exceeds the restore extract cap ({max_member_bytes} bytes)"
@@ -3352,20 +4029,14 @@ _DECRYPT_REFUSAL = (
 )
 
 
-#: What a restore undoes, said once for the refusal and the CLI summary (BACKLOG #2614).
-REAPPLY_NOTICE = (
-    "The restored accounts, password hashes, roles and factors are the archive's: every disable, "
-    "delete, role change and reset made after its newest audit row must be re-applied by hand."
-)
-
-
 def restored_accounts_notice(sessions_revoked: int) -> str:
-    """The CLI summary's whole notice: what to re-apply, and what the restore already did. Worded
-    from the count the restore's own revoke returned, so it never claims more than it ended."""
+    """The CLI summary's whole notice: what to re-apply (BACKLOG #5094), and what the restore
+    already did. Worded from the count the restore's own revoke returned, so it never claims more
+    than it ended."""
     return (
-        f"{REAPPLY_NOTICE} The restore ended {sessions_revoked} open session(s) in the store it "
-        "placed, and the first engine start on this store ends every session again and records "
-        "the restore."
+        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the "
+        "store it placed, and the first engine start on this store ends every session again and "
+        "records the restore."
     )
 
 
@@ -3380,13 +4051,17 @@ def _refuse_an_old_archive(
     last_audit_at: float | None,
     max_age_seconds: float,
     now: float,
+    config_only: bool = False,
 ) -> None:
     """Refuse an archive taken more than ``max_age_seconds`` before ``now``, or one that does not
     say when it was taken (BACKLOG #2614). A restore undoes every account change made after the
     archive, so the older it is the more an operator must re-apply, and the refusal names the
     time after which that is so. The caller words how to override it; the CLI's
-    ``--allow-old-archive`` skips this check."""
-    newest = utc_or_unknown(last_audit_at)
+    ``--allow-old-archive`` skips this check.
+
+    ``config_only`` words the refusal for the config-only route (vault BACKLOG #5233), which places
+    no store: there is no audit row to name and no account change to undo, and what an old bundle
+    brings back is old config."""
     kind = "age"
     if archive_created_at is None:
         taken = "the archive does not say when it was taken"
@@ -3406,10 +4081,20 @@ def _refuse_an_old_archive(
             f"the archive was taken {utc_or_unknown(archive_created_at)}, "
             f"{age / 86400:.1f} days ago, past the {max_age_seconds / 86400:g}-day limit"
         )
+    if config_only:
+        raise BackupError(
+            kind,
+            f"Nothing was written: {taken}. Its config bundle brings back the connection settings, "
+            "router and handler code and any secrets the config dir held when the archive was "
+            "taken, so a config change made after that must be re-applied by hand.",
+        )
+    # Short, and pointing at the notice rather than carrying it (BACKLOG #5094): the refusal's
+    # point is that nothing was written. The CLI adds how to override it.
     raise BackupError(
         kind,
-        f"{taken}. Its newest audit row is {newest}. A restore of it would bring the accounts back "
-        f"as they were then. {REAPPLY_NOTICE} Nothing was written.",
+        f"Nothing was written: {taken}. Its newest audit row is {utc_or_unknown(last_audit_at)}. "
+        "A restore undoes what was changed after the archive was taken, and that must be "
+        f"re-applied by hand. {RESTORE_NOTICE_POINTER}",
     )
 
 
@@ -3431,7 +4116,7 @@ def _codec_refusal(exc: BackupCodecError) -> BackupError:
 async def run_restore(
     archive_path: str,
     *,
-    dest_store_path: str | Path,
+    dest_store_path: str | Path | None,
     store_settings: object,
     config_dest: str | Path | None = None,
     max_age_seconds: float | None = None,
@@ -3458,22 +4143,24 @@ async def run_restore(
     refused before the store is extracted (see :func:`_refuse_colliding_config_members`), as is a
     ``config_dest`` sitting under ``dest_store_path`` (:func:`_refuse_config_dest_under_the_store`).
 
+    ``dest_store_path=None`` with a ``config_dest`` restores ONLY the config bundle of a CONFIG-ONLY
+    archive, which carries no store (vault BACKLOG #5233); an archive that carries one is refused
+    there. See :func:`_restore_blocking`.
+
     **There is deliberately no ``allow_unencrypted`` here**, unlike :func:`run_restore_verify`. The
     downgrade guard stays at its strictest on the one path that writes bytes to disk. It carried such a
     parameter and nothing ever set it: the CLI documented in a comment that it withheld it on purpose,
     so the refusal's own remedy (*"set [backup].allow_unencrypted"*) named a setting this path does not
     read — a prescription an operator would have followed to no effect. The parameter is gone and the
     refusal now says the true thing: a plaintext archive restores only on a box with no store key."""
-    import base64
-
     keys = [
-        base64.b64decode(k)
+        _decode_store_key(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
     return await asyncio.to_thread(
         _restore_blocking,
         archive_path=archive_path,
-        dest_store_path=Path(dest_store_path),
+        dest_store_path=Path(dest_store_path) if dest_store_path is not None else None,
         config_dest=Path(config_dest) if config_dest is not None else None,
         keys=keys,
         max_age_seconds=max_age_seconds,
@@ -3483,7 +4170,7 @@ async def run_restore(
 def _restore_blocking(
     *,
     archive_path: str,
-    dest_store_path: Path,
+    dest_store_path: Path | None,
     config_dest: Path | None,
     keys: list[bytes],
     max_age_seconds: float | None,
@@ -3515,7 +4202,22 @@ def _restore_blocking(
     undoing it would delete a placed, verified store to answer a directory that could not be
     deleted, and leave the operator with no store, no bundle, and the plaintext staging directory
     still on disk. It raises ``BackupError("cleanup", ...)`` naming the directory instead, with the
-    store and bundle intact."""
+    store and bundle intact.
+
+    **``dest_store_path`` is ``None`` only for a CONFIG-ONLY archive's bundle (vault BACKLOG #5233).**
+    A server-DB store's archive carries no store, so ``--to`` has nothing to name, and the refusal that
+    meets ``--to`` on such an archive used to offer ``--config-to``, an option of this same command that
+    reached the same refusal first. With ``config_dest`` alone, the archive is decrypted under the
+    same key, downgrade and size checks, its manifest is read, the age refusal applies, and then only
+    its config bundle is extracted, under every check :func:`_extract_config_members` applies. An
+    archive that carries a store is refused on this route, at its first tar member where the store
+    leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by the store member
+    itself: its store is the restore. One whose manifest does not mark it config-only is refused
+    there too. One whose manifest marks it config-only while it carries a store is refused as
+    malformed on both routes once the manifest is read. Where its store leads the tar, the guard
+    on the config-only route refuses it before the manifest is read and sends the operator to
+    ``--to``, which then refuses it as malformed, so the two routes end in that refusal rather
+    than sending the operator back and forth."""
     import sqlite3
 
     from messagefoundry.store.store import (
@@ -3525,6 +4227,11 @@ def _restore_blocking(
         write_restore_marker,
     )
 
+    # Where the staging directory goes: beside the store, or on the config-only route beside the
+    # bundle's directory, for the same reason (the decrypted archive stays on the destination volume).
+    anchor = dest_store_path if dest_store_path is not None else config_dest
+    if anchor is None:
+        raise BackupError("destination", RESTORE_NEEDS_A_DESTINATION)
     if not Path(archive_path).is_file():
         raise BackupError("archive", f"no archive at {archive_path}")
     _refuse_existing_destination(dest_store_path, config_dest)
@@ -3560,7 +4267,20 @@ def _restore_blocking(
             "restores only on a box with no store key configured.",
         )
 
-    dest_store_path.parent.mkdir(parents=True, exist_ok=True)
+    # The config-only route stages in the RESOLVED parent: an unresolved `.` (or `""`) is its own
+    # parent, which would stage the decrypted archive inside the bundle's own directory.
+    staging_parent = anchor.parent if dest_store_path is not None else anchor.resolve().parent
+    if dest_store_path is None and staging_parent == anchor.resolve():
+        raise BackupError(
+            "destination",
+            f"--config-to {anchor} is a filesystem root, so there is no directory beside it to stage "
+            "the decrypted archive in; choose a directory below it",
+        )
+    # The directories this call creates, for its staging and for the bundle, read before the first
+    # mkdir, so a restore that does not complete removes them again: a refusal that says nothing was
+    # written must not leave a new --config-to, or a new ancestor of it or of --to, behind (vault
+    # BACKLOG #5233). A directory that was already there is never in this list.
+    made_dirs = _missing_dirs(staging_parent, config_dest)
     # The rollback's three facts, kept outside the staging block so the `finally` can read them after
     # it: whether the store was published (before that, every refusal already leaves nothing behind),
     # which config paths this restore created, and whether the restore itself completed. `finally`
@@ -3578,6 +4298,9 @@ def _restore_blocking(
     config_written: list[Path] = []
     staging: Path | None = None
     try:
+        # Inside the `try`, so a parent that cannot be made meets the `staging is None` refusal
+        # below, and the `finally` removes what the mkdir made before it failed.
+        staging_parent.mkdir(parents=True, exist_ok=True)
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
         # by a hard link rather than a second multi-GB copy, and the decrypted PHI never lands on a
         # shared temp volume that may be less protected than the store's own.
@@ -3585,23 +4308,30 @@ def _restore_blocking(
         # "Less protected than the store's own" is a claim about the VOLUME, and it does not carry to
         # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
         # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
-        # 3.14.6) rather than inheriting the parent's. The two files staged inside it are the whole
-        # decrypted archive and the whole store -- both full-body PHI at rest (docs/PHI.md section 3).
-        # So each is locked to its owner with the store's own primitive the moment it exists and
-        # before its first byte is written. Best-effort and non-fatal, per that primitive's contract.
+        # 3.14.6) rather than inheriting the parent's. The files staged inside it are the whole
+        # decrypted archive and, on the store route, the whole extracted store. Both can be full-body
+        # PHI at rest (docs/PHI.md section 3), the archive on the config-only route too when a
+        # store-carrying archive is decrypted whole before it is refused, and an archive can also
+        # carry a config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
+        # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
+        # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
         # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
         # a file carries the temp directory's entries explicitly (it removes inherited entries only;
         # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
         # published DACL. A follow-up recorded in ADR 0163.
-        with tempfile.TemporaryDirectory(
-            prefix="mefor-restore-", dir=dest_store_path.parent
-        ) as tmp:
+        with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=staging_parent) as tmp:
             staging = Path(tmp)
             tar_path = staging / "archive.tar"
-            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as dst:
+            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as tar_fh:
                 src = _HashingReader(raw_src)
                 _secure_file(tar_path)
+                # On the config-only route a store-carrying archive is refused at its first tar
+                # member, not after the whole store is decrypted beside --config-to only to be
+                # refused after it; the checks after the decrypt stay the authority (vault BACKLOG
+                # #5233).
+                guard = _StoreMemberGuard(tar_fh) if dest_store_path is None else None
+                dst: BinaryIO = cast(BinaryIO, guard) if guard is not None else tar_fh
                 if match_key is not None:
                     # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome
                     # here, not a bug: refuse the way the destination check does rather than escape as
@@ -3646,6 +4376,8 @@ def _restore_blocking(
                                 "destination volume",
                             )
                         dst.write(buf)
+                if guard is not None:
+                    guard.finish()
 
             # `_read_manifest_from_tar` reports every way the manifest can be unusable -- absent, a
             # directory, over the cap, not UTF-8, not JSON, not an object -- as `tarfile.TarError`
@@ -3660,12 +4392,71 @@ def _restore_blocking(
                 raise BackupError(
                     "restore", f"archive manifest could not be read: {safe_exc(exc)}"
                 ) from exc
-            if manifest.get("config_only"):
+            config_only = bool(manifest.get("config_only"))
+            # The members themselves, then the manifest's word, on BOTH routes and by one check. A
+            # manifest that says config-only over an archive that carries a store is malformed:
+            # each route used to send the operator to the other, `--to` trusting the manifest and
+            # `--config-to` the member (vault BACKLOG #5233). Neither restores it, store dropped or
+            # bundle dropped. On the config-only route `_StoreMemberGuard` can still meet a store
+            # that leads the tar before the manifest is read; it sends the operator to `--to`,
+            # which then refuses here.
+            # Read only where the answer is used: a store route that is not config-only finds a
+            # missing or non-file store member in `_extract_member` anyway.
+            carries_store = (config_only or dest_store_path is None) and _tar_has_member(
+                tar_path, _STORE_MEMBER
+            )
+            if config_only and carries_store:
+                raise BackupError("restore", _CONTRADICTORY_ARCHIVE_REFUSAL)
+            if dest_store_path is None:
+                if carries_store:
+                    raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
+                if not config_only:
+                    # No store, and no word that there should be none: neither route restores it,
+                    # so the refusal does not send the operator to --to.
+                    raise BackupError(
+                        "restore",
+                        "the archive's manifest does not mark it CONFIG-ONLY, yet it carries no "
+                        f"{_STORE_MEMBER}; refusing to restore it on either route",
+                    )
+                # The age refusal binds here too: an old bundle brings back old credentials and old
+                # router and handler code, and --max-age-days / --allow-old-archive say what they
+                # say on every route (BACKLOG #2614).
+                archive_created_at = _manifest_time(manifest)
+                if max_age_seconds is not None:
+                    _refuse_an_old_archive(
+                        archive_created_at=archive_created_at,
+                        last_audit_at=None,
+                        max_age_seconds=max_age_seconds,
+                        now=time.time(),
+                        config_only=True,
+                    )
+                # `published` before the first write, as the store route sets it once the store is
+                # placed: from here a failure leaves files this restore made, and the `finally`
+                # removes exactly the ones `config_written` records.
+                published = True
+                config_files = _restore_config_members(tar_path, anchor, written=config_written)
+                result = RestoreResult(
+                    archive_path=archive_path,
+                    store_path=None,
+                    store_bytes=0,
+                    row_counts={},
+                    encrypted=encrypted,
+                    key_id=key_id,
+                    config_dir=str(anchor),
+                    config_files=config_files,
+                    archive_sha256=src.digest.hexdigest(),
+                    archive_created_at=archive_created_at,
+                )
+                # The restore is whole from here, as on the store route below.
+                completed = True
+                return result
+            if config_only:
                 raise BackupError(
                     "restore",
                     "this is a CONFIG-ONLY archive (a server-DB store's backup is DBA-delegated, "
                     "BACKLOG #52) — it carries no store to restore; restore the database from the "
-                    "DBA's own backup and use --config-to for the config bundle",
+                    "DBA's own backup, and restore the config bundle with this command's "
+                    "--config-to <dir> and no --to",
                 )
             # Before the store is extracted, let alone published: a config member aimed at the store's
             # own path is a destination refusal, and finding it here costs neither the extract nor a
@@ -3757,29 +4548,59 @@ def _restore_blocking(
             # The restore is whole from here. Nothing after this line may roll it back.
             completed = True
     except OSError as exc:
+        if staging is None:
+            # The staging directory itself could not be made (an unwritable parent, say), so
+            # nothing was decrypted or written: a refusal line, not a traceback.
+            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
         if not completed:
-            raise
+            # A refusal already leaving the block, found anywhere in the chain: an OSError raised
+            # on its way out (the staging teardown, whose rmtree retry chains its own first
+            # failure, or a close-time flush) would otherwise replace it with a traceback.
+            refusal = _refusal_in_flight(exc)
+            if refusal is None:
+                # No refusal behind it: the OSError is the failure itself, such as a full volume
+                # mid-decrypt. A refusal line rather than a traceback, on both routes; the
+                # `finally` still rolls back what was published.
+                raise BackupError("restore", f"the restore failed: {safe_exc(exc)}") from exc
+            if not staging.exists():
+                raise refusal from exc
+            # The teardown failed, and the directory holds decrypted archive content.
+            raise BackupError(
+                refusal.kind,
+                f"{str(refusal).rstrip('.')}. Separately, the restore's own staging directory "
+                f"{staging}, beside the destination, could not be removed ({safe_exc(exc)}) and "
+                "still holds decrypted archive content: delete it by hand once nothing holds it "
+                "open",
+            ) from refusal
         # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
         # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
         # open). The store and bundle are intact; what is left is the plaintext staging directory,
         # which its own remover just failed to delete. A BackupError, so the CLI prints a refusal
         # line rather than a traceback, and a kind of its own, so the line does not read as the
         # restore having failed. The `finally` below sees `completed` and leaves the restore alone.
-        bundle = f", and the config bundle at {config_dest}" if config_dest is not None else ""
+        intact: list[str] = []
+        if dest_store_path is not None:
+            intact.append(f"the restored store at {dest_store_path}")
+        if config_dest is not None:
+            intact.append(f"the config bundle at {config_dest}")
+        held = "archive and store" if dest_store_path is not None else "archive"
         raise BackupError(
             "cleanup",
             f"the restore completed, but its staging directory {staging} could not be removed: "
-            f"{safe_exc(exc)}. Intact: the restored store at {dest_store_path}{bundle}. The staging "
-            "directory still holds the decrypted archive and store: delete it by hand once nothing "
+            f"{safe_exc(exc)}. Intact: {', and '.join(intact)}. The staging "
+            f"directory still holds the decrypted {held}: delete it by hand once nothing "
             "holds it open. Do not re-run the restore; the destination is now in use.",
         ) from exc
     finally:
         if published and not completed:
             _discard_partial_restore(dest_store_path, config_written)
+        if not completed:
+            # After the staging directory's own teardown and the rollback, so each is empty again.
+            _remove_made_dirs(made_dirs)
 
     return RestoreResult(
         archive_path=archive_path,
-        store_path=str(dest_store_path),
+        store_path=str(dest_store_path) if dest_store_path is not None else None,
         store_bytes=store_bytes,
         row_counts=row_counts,
         encrypted=encrypted,
@@ -3793,7 +4614,166 @@ def _restore_blocking(
     )
 
 
-def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None:
+def _staging_refusal(parent: Path, anchor: Path, exc: OSError) -> str:
+    """The refusal for a restore that could not make ``parent``, or its staging directory in it."""
+    return (
+        f"could not create {parent}, or the restore's staging directory in it ({safe_exc(exc)}). "
+        f"The restore stages the decrypted archive there, beside {anchor}, so that directory must "
+        "exist or be creatable, and be writable. Nothing was decrypted"
+    )
+
+
+def _refusal_in_flight(exc: BaseException) -> BackupError | None:
+    """The first :class:`BackupError` in ``exc``'s ``__context__`` chain, or ``None``."""
+    seen: set[int] = set()
+    link = exc.__context__
+    while link is not None and id(link) not in seen:
+        if isinstance(link, BackupError):
+            return link
+        seen.add(id(link))
+        link = link.__context__
+    return None
+
+
+def _missing_dirs(*paths: Path | None) -> list[Path]:
+    """Each of ``paths`` that is not ``None``, and each of their ancestors, that does not exist yet,
+    resolved and deepest first: what a ``mkdir(parents=True)`` of each is about to create."""
+    missing: set[Path] = set()
+    for path in paths:
+        if path is None:
+            continue
+        probe = path.resolve()
+        while probe != probe.parent and not probe.exists():
+            missing.add(probe)
+            probe = probe.parent
+    return sorted(missing, key=lambda p: len(p.parts), reverse=True)
+
+
+def _remove_made_dirs(dirs: list[Path]) -> None:
+    """Remove the directories :func:`_missing_dirs` recorded, deepest first, each only while it is
+    empty. Best-effort, like :func:`_discard_partial_restore`, because it runs while a failure is
+    already propagating. A directory that holds something stays, and so do its ancestors, because
+    ``rmdir`` refuses each of them in turn."""
+    for path in dirs:
+        # A path the mkdir never got to (an ancestor is a regular file, say) is not a directory,
+        # and there is nothing of this restore's to remove or to report there.
+        if not path.is_dir():
+            continue
+        try:
+            path.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.warning("left the directory %s this restore created: %s", path, safe_exc(exc))
+
+
+class _StoreMemberGuard:
+    """Writes the decrypted tar through to ``raw``, and refuses before any of it lands when its first
+    member is the store (vault BACKLOG #5233). Used only on the config-only route, where a
+    store-carrying archive is refused anyway: the backup writes the store first, so this catches it
+    at the first frames instead of after a multi-GB decrypt. The member scan after the decrypt stays
+    the authority, for an archive that puts its store anywhere else.
+
+    It HOLDS every write until :data:`_GUARD_HEAD_BYTES` have arrived (or :meth:`finish` is called
+    at the end of a shorter stream), then reads the first member from them with :mod:`tarfile`, not
+    from the first 512-byte block, because ``tar.add`` can open with a PAX extended header that
+    carries the member's real name (measured on Windows). Holding is what makes "before any of it
+    lands" true whatever frame size the archive was sealed with. A head that does not parse is left
+    to the checks after the decrypt.
+
+    It offers :meth:`write` and :meth:`finish` and nothing else, so any other file method raises
+    ``AttributeError``. It once forwarded the rest to the raw file, which would answer without the
+    held bytes: ``writelines`` would land bytes past the check, and ``tell`` would report a position
+    short of what was written. Nothing called them: the decrypt and the plaintext copy only write."""
+
+    def __init__(self, raw: BinaryIO) -> None:
+        self._raw = raw
+        self._held: list[bytes] = []
+        self._held_bytes = 0
+        self._released = False
+
+    def write(self, data: bytes) -> int:
+        if self._released:
+            return self._raw.write(data)
+        self._held.append(bytes(data))
+        self._held_bytes += len(data)
+        if self._held_bytes >= _GUARD_HEAD_BYTES:
+            self._release()
+        return len(data)
+
+    def finish(self) -> None:
+        """Check and write what is still held: the end of a stream shorter than the head."""
+        if not self._released:
+            self._release()
+
+    def _release(self) -> None:
+        self._released = True
+        head = b"".join(self._held)
+        self._held = []
+        if _first_member_name(head) == _STORE_MEMBER:
+            raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
+        self._raw.write(head)
+
+
+def _first_member_name(head: bytes) -> str | None:
+    """The name of the first member of the tar that ``head`` opens, or ``None`` if it does not parse."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(head), mode="r:") as tar:
+            first = tar.next()
+    except (tarfile.TarError, OSError, ValueError) as exc:
+        # The type alone, never the message: these bytes are decrypted archive content, and a
+        # parse error's message is not known never to quote them.
+        log.debug(
+            "the config-only restore could not read the decrypted tar's first member (%s); the "
+            "checks after the decrypt decide whether it carries a store",
+            type(exc).__name__,
+        )
+        return None
+    return None if first is None else first.name
+
+
+def _tar_has_member(tar_path: Path, name: str) -> bool:
+    """Does the tar at ``tar_path`` carry a member of exactly ``name``, of any type? Looked up the
+    way :func:`_extract_member` looks the store up, which refuses a member of that name that is not
+    a regular file rather than read it as absent, so the two cannot disagree (vault BACKLOG
+    #5233)."""
+    try:
+        with tarfile.open(tar_path, "r:") as tar:
+            tar.getmember(name)
+    except KeyError:
+        return False
+    except (tarfile.TarError, OSError) as exc:
+        raise BackupError("restore", safe_exc(exc)) from exc
+    return True
+
+
+#: How much of the decrypted tar :class:`_StoreMemberGuard` reads its first member from: room for a
+#: PAX extended header and the header after it, many times over.
+_GUARD_HEAD_BYTES = 64 * 1024
+
+
+#: A restore given neither destination (vault BACKLOG #5233). The CLI checks it before it loads
+#: any settings; this primitive refuses it for every other caller.
+RESTORE_NEEDS_A_DESTINATION = (
+    "a restore needs --to <new store path>, or --config-to <dir> alone for a CONFIG-ONLY "
+    "archive's config bundle"
+)
+
+#: The config-only route's refusal of an archive that carries a store (vault BACKLOG #5233).
+_CARRIES_A_STORE_REFUSAL = (
+    "this archive carries a store, so restoring it needs --to <new store path>; --config-to "
+    "alone restores only a CONFIG-ONLY archive's config bundle"
+)
+
+#: Both routes' refusal of an archive whose manifest marks it config-only over a store member
+#: (vault BACKLOG #5233). It names no other route, because each route would send it to the other.
+_CONTRADICTORY_ARCHIVE_REFUSAL = (
+    f"the archive is malformed: its manifest marks it CONFIG-ONLY, yet it carries a {_STORE_MEMBER} "
+    "member; refusing to restore it on either route"
+)
+
+
+def _discard_partial_restore(dest_store_path: Path | None, written: list[Path]) -> None:
     """Remove what a failed :func:`_restore_blocking` published -- the store it placed, then every
     config member and directory it recorded creating, newest first -- so the destination is left as the
     restore found it and the retry is the same command again.
@@ -3809,16 +4789,22 @@ def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None
 
     The store is unlinked, never overwritten-and-truncated: :func:`_place_restored_store` creates it
     exclusively, so a file at that path when this runs is one the failed restore made. ``config_dest``
-    itself is never in the ledger (see :func:`_restore_config_members`). A directory this restore
+    itself is never in the ledger (see :func:`_extract_config_members`). A directory this restore
     created is removed only while empty; one that gained a stranger's file since is kept and logged.
 
     Best-effort by construction. It runs while an exception is already propagating, so a cleanup error
     must never replace the failure the operator needs to read -- it is logged and swallowed. A restore
-    that could not clean up is a worse report, not a different outcome."""
-    try:
-        dest_store_path.unlink(missing_ok=True)
-    except OSError as exc:
-        log.warning("could not remove the partially restored store at %s: %s", dest_store_path, exc)
+    that could not clean up is a worse report, not a different outcome.
+
+    ``dest_store_path`` is ``None`` on the config-only route, which places no store (vault BACKLOG
+    #5233), so only the recorded config paths are removed."""
+    if dest_store_path is not None:
+        try:
+            dest_store_path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(
+                "could not remove the partially restored store at %s: %s", dest_store_path, exc
+            )
     for path in reversed(written):
         try:
             if path.is_dir() and not path.is_symlink():
@@ -3829,53 +4815,107 @@ def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None
             log.warning("could not remove the partially restored config member %s: %s", path, exc)
 
 
-def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
-    """``integrity_check`` + the manifest row-count compare on the extracted ``store.db``, run on the
-    exact file about to be placed. Same two checks (and the same helpers) as
-    :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore summary.
+def _compare_row_counts(
+    manifest: dict[str, object], row_counts: dict[str, int]
+) -> tuple[dict[str, int], str | None]:
+    """The manifest's recorded counts, and the reason the snapshot's ``row_counts`` fail the compare
+    against them (``None`` when they agree). The one compare both :func:`_verify_in_staging` (the
+    archive verify) and :func:`_verify_extracted_store` (restore's pre-place check) run.
 
-    The compare is keyed off the MANIFEST's own keys rather than dict equality, for the reason
-    :func:`_verify_archive_blocking` gives at its step 4: :func:`_count_tables` derives its table set
-    from the snapshot's own ``sqlite_master`` (BACKLOG #1722), so a manifest written before that set
-    was widened records fewer tables than the archive really has. Restoring an archive taken by an
-    EARLIER build is the ordinary case for this subcommand, so dict equality would refuse on sight the
-    archives a restore exists to accept. A table the manifest tracked that the snapshot's schema lacks
-    reads as 0, so a manifest count of 0 still passes and a nonzero one still raises: real data loss is
-    still caught. A table the snapshot has that the manifest never tracked is not compared at all."""
-    integrity_ok, integrity_msg = _integrity_check(snap)
-    if not integrity_ok:
-        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
-    row_counts = _count_tables(snap)
+    Keyed off the MANIFEST's own tables, not dict equality (BACKLOG #1722 follow-up).
+    :func:`_count_tables` derives its table set from the file it is given, so ``row_counts`` reflects
+    the snapshot's own schema, which can legitimately be a superset of what an OLDER manifest
+    recorded: one written before this table set was widened (or before a later table existed) has
+    fewer keys than the archive really has tables. Verifying or restoring an archive taken by an
+    earlier build is ordinary (AC-5), so dict equality would refuse every such archive on sight. A
+    table the manifest tracked that the snapshot's schema lacks reads as 0, so a manifest count of 0
+    for it still agrees and a nonzero one is real data loss. A table the snapshot has that the
+    manifest never tracked is not compared at all.
+
+    Because the compare walks the manifest's tables, it reads nothing when the manifest records none
+    (``row_counts`` empty or missing), and nothing of the snapshot when the two share no table, the
+    case of a snapshot whose schema holds no table at all: every manifest count then reads as 0. A PASS there would certify counts nobody compared, the shape BACKLOG #2186 produced
+    when the backup and the verify both counted an empty stand-in, so at least those refuse (BACKLOG
+    #5056). A full archive never legitimately has either: its manifest lists every table of its
+    store, and even the oldest, four-table manifest names ``messages``. A config-only archive carries
+    no snapshot and returns before this compare. A ``row_counts`` that is not a mapping, or a count
+    that is not a non-negative integer, refuses too, rather than being coerced (``3.9`` read as
+    ``3``) or raising out of the verify."""
     raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
+    manifest_counts: dict[str, int] = {}
+    if raw_counts is not None and not isinstance(raw_counts, dict):
+        return manifest_counts, (
+            f"the manifest's row counts are a {type(raw_counts).__name__}, not a mapping of table "
+            "to count, so they cannot be compared"
+        )
+    malformed: list[str] = []
+    for table, count in (raw_counts or {}).items():
+        # bool is an int subclass, and a float, a string or a null is not a row count.
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            manifest_counts[str(table)] = count
+        else:
+            malformed.append(str(table))
+    if malformed:
+        return manifest_counts, (
+            f"the manifest's row counts for {sorted(malformed)} are not non-negative integers, so "
+            "they cannot be compared"
+        )
+    if not manifest_counts:
+        return manifest_counts, (
+            "the manifest records no row counts, so the row-count compare would read nothing; a "
+            "full archive's manifest lists every table of its store"
+        )
     mismatches = sorted(
         table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
     )
     if mismatches:
-        raise BackupError(
-            "verify",
-            f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
-            f"snapshot={row_counts} manifest={manifest_counts}",
+        return manifest_counts, (
+            f"row-count mismatch on {mismatches} (a torn snapshot or a wrong manifest): "
+            f"snapshot={row_counts} manifest={manifest_counts}"
         )
+    # After the mismatch check, so a truncated snapshot against nonzero counts still reads as the
+    # data loss it is; what reaches here is an all-zero manifest agreeing with tables it never saw.
+    if not manifest_counts.keys() & row_counts.keys():
+        return manifest_counts, (
+            f"the manifest's {len(manifest_counts)} table(s) share none with the archive's store.db "
+            f"({len(row_counts)} table(s)), so the row-count compare would read nothing"
+        )
+    return manifest_counts, None
+
+
+def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
+    """``integrity_check`` + the manifest row-count compare (:func:`_compare_row_counts`) on the
+    extracted ``store.db``, run on the exact file about to be placed. Same two checks (and the same
+    helpers) as :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore
+    summary."""
+    integrity_ok, integrity_msg = _integrity_check(snap)
+    if not integrity_ok:
+        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
+    row_counts = _count_tables(snap)
+    _manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
+    if count_refusal is not None:
+        raise BackupError("verify", count_refusal)
     return row_counts
 
 
-def _refuse_existing_destination(dest_store_path: Path, config_dest: Path | None) -> None:
+def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path | None) -> None:
     """Refuse every destination that already holds something, BEFORE any decrypt work. Restoring over a
     live store is unrecoverable and a CLI cannot ask for permission, so the answer is no and the message
     names the path the operator must move or choose differently.
 
     The last arm refuses a pair of destinations that are individually empty and still collide, because
     this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
-    needs the archive's member list and so runs later, in :func:`_refuse_colliding_config_members`."""
-    for path in (
-        dest_store_path,
-        *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
-    ):
-        if path.exists():
-            raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+    needs the archive's member list and so runs later, in :func:`_refuse_colliding_config_members`.
+
+    ``dest_store_path`` is ``None`` on the config-only route (vault BACKLOG #5233): there is no store
+    to place, so only the config destination is checked."""
+    if dest_store_path is not None:
+        for path in (
+            dest_store_path,
+            *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+        ):
+            if path.exists():
+                raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
     if config_dest is not None:
         # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
         # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
@@ -3892,7 +4932,8 @@ def _refuse_existing_destination(dest_store_path: Path, config_dest: Path | None
                 f"refusing to restore the config bundle into the non-empty directory {config_dest} — "
                 "choose an empty or absent --config-to path",
             )
-        _refuse_config_dest_under_the_store(dest_store_path, config_dest)
+        if dest_store_path is not None:
+            _refuse_config_dest_under_the_store(dest_store_path, config_dest)
 
 
 def _refuse_config_dest_under_the_store(dest_store_path: Path, config_dest: Path) -> None:
@@ -3939,7 +4980,7 @@ def _refuse_colliding_config_members(
     Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
     restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
     the store is the same collision, and refusing it here beats refusing it after placement. The
-    exclusive create in :func:`_restore_config_members` is the backstop under this, not the control."""
+    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control."""
     published = {
         _norm_for_compare(p)
         for p in (
@@ -3947,11 +4988,23 @@ def _refuse_colliding_config_members(
             *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
         )
     }
+    seen: set[str] = set()
     try:
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
-                if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+                if not _is_config_payload_member(member):
                     continue
+                # A hard link the extractor will refuse is refused here, before the store is
+                # extracted, verified and placed only to be rolled back (vault BACKLOG #5233).
+                # The whole restore is refused, store included; the refusal says the store alone
+                # restores, because this check runs only when --config-to was given.
+                if member.islnk() and member.linkname not in seen:
+                    raise BackupError(
+                        "restore",
+                        f"{_dangling_link_refusal(member)}. The store alone restores: run the "
+                        "same command without --config-to",
+                    )
+                seen.add(member.name)
                 out = config_dest / member.name[len(_CONFIG_PREFIX) :]
                 if _norm_for_compare(out) not in published:
                     continue
@@ -3968,6 +5021,23 @@ def _refuse_colliding_config_members(
         # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
         # must be a refusal, not a traceback out of a check whose whole job is to refuse.
         raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _dangling_link_refusal(member: tarfile.TarInfo) -> str:
+    """The refusal for a hard-link config member that names no config file extracted before it."""
+    return (
+        f"archive carries a config member {member.name!r} that is a hard link to "
+        f"{member.linkname!r}, which names no config member earlier in the archive; "
+        "refusing to restore it rather than leave that name out"
+    )
+
+
+def _is_config_payload_member(member: tarfile.TarInfo) -> bool:
+    """Is ``member`` one the restore writes into the config bundle: a ``config/`` member that is a
+    regular file or a hard link (vault BACKLOG #5233)? One predicate, because the pre-extract
+    collision check (:func:`_refuse_colliding_config_members`) must see every member the extractor
+    (:func:`_extract_config_members`) writes."""
+    return (member.isfile() or member.islnk()) and member.name.startswith(_CONFIG_PREFIX)
 
 
 def _norm_for_compare(path: Path) -> Path:
@@ -4035,14 +5105,33 @@ def _place_restored_store(src: Path, dest: Path) -> int:
 def _restore_config_members(
     tar_path: Path, config_dest: Path, *, written: list[Path] | None = None
 ) -> int:
+    """:func:`_extract_config_members`, with an ``OSError``, ``ValueError`` or ``tarfile.TarError``
+    it does not word itself made a refusal (vault BACKLOG #5233). At least these are covered: a
+    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. Any other
+    exception type still escapes as it did. Unguarded, each left the restore as a CLI
+    traceback, on the config-only route and the store route alike. The caller's ``finally`` still
+    rolls back what ``written`` records."""
+    try:
+        return _extract_config_members(tar_path, config_dest, written=written)
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        raise BackupError(
+            "restore", f"could not restore the config bundle into {config_dest}: {safe_exc(exc)}"
+        ) from exc
+
+
+def _extract_config_members(
+    tar_path: Path, config_dest: Path, *, written: list[Path] | None = None
+) -> int:
     """Extract the archive's ``config/`` members into ``config_dest`` and return how many files landed.
 
     ``written`` is the caller's ledger of what this call created -- every directory it made under
     ``config_dest`` and every file it opened, each appended BEFORE any bytes land in it and in creation
     order, so :func:`_discard_partial_restore` can walk it backwards. ``config_dest`` itself is never
-    recorded: an absent one is re-created by a retry, and one the operator prepared may carry ACLs
-    worth more than the tidiness of deleting it. A file the exclusive create refused is not recorded
-    either, because it is not this call's to remove.
+    recorded: one the operator prepared may carry ACLs worth more than the tidiness of deleting it.
+    An absent one that a failed restore created is removed while still empty, by
+    :func:`_restore_blocking` from its own list of the directories it made (vault BACKLOG #5233). A
+    file the exclusive create refused is not recorded either, because it is not this call's to
+    remove.
 
     It cannot reuse :func:`_extract_member`, which streams ONE member to a single fixed output name;
     a config bundle is many files that must keep their relative layout. It carries the same ASVS 5.2.3
@@ -4057,6 +5146,19 @@ def _restore_config_members(
 
     The restored bundle can carry secrets (``connections.toml``), so each file is locked to its owner.
 
+    **A hard-link member is restored, never skipped (vault BACKLOG #5233).** ``tar.add`` stores the
+    second name of a hard-linked file as a link member (``LNKTYPE``) naming the first, and this loop
+    used to take regular members alone, so that name was silently missing from the restored bundle.
+    It now lands as its own regular file, a copy of the bytes of the member it names, under every
+    check a regular member gets: the name gate and the containment backstop on its OWN name, the size
+    caps on the bytes it carries, and the exclusive create. The bytes are read only from a regular
+    config member this call has ALREADY extracted, looked up by exact name, so the link cannot reach
+    the store, the manifest, a later member, or anything outside the archive, and no OS link is made
+    in the destination. A link member naming anything else is refused, naming both names. Any other
+    member type (a directory, a symlink, a device) is still not extracted. A link carries no bytes of
+    its own, so a few link headers can write a large member several times over: what bounds that is
+    the bundle's aggregate byte and member-count caps below, which count every landed copy.
+
     An archive with no config member is a REFUSAL, not a quiet empty directory — see :func:`run_restore`.
     """
     from messagefoundry.parsing.sniff import archive_member_name_reason
@@ -4066,9 +5168,12 @@ def _restore_config_members(
     root = config_dest.resolve()
     landed = 0
     total = 0
+    # Each config member extracted so far, by its exact name, mapped to the regular member whose
+    # bytes it carries. A hard-link member reads its bytes from here and nowhere else.
+    extracted: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(tar_path, "r:") as tar:
         for member in tar.getmembers():
-            if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+            if not _is_config_payload_member(member):
                 continue
             if landed >= _MAX_CONFIG_MEMBERS:
                 raise BackupError(
@@ -4088,12 +5193,21 @@ def _restore_config_members(
                     "archive carries a config member that resolves outside the destination; "
                     "refusing to extract it",
                 )
-            if member.size > _MAX_RESTORE_MEMBER_BYTES:
+            data = member
+            if member.islnk():
+                # Looked up by exact name among members already extracted, never through tarfile's
+                # own link resolution, which normalizes the name and would hand back any earlier
+                # member it matches, the store included.
+                target = extracted.get(member.linkname)
+                if target is None:
+                    raise BackupError("restore", _dangling_link_refusal(member))
+                data = target
+            if data.size > _MAX_RESTORE_MEMBER_BYTES:
                 raise BackupError(
                     "restore",
                     f"config member exceeds the restore extract cap ({_MAX_RESTORE_MEMBER_BYTES} bytes)",
                 )
-            src = tar.extractfile(member)
+            src = tar.extractfile(data)
             if src is None:
                 continue
             # The directories this member's mkdir is about to CREATE, deepest first, read before the
@@ -4170,10 +5284,15 @@ def _restore_config_members(
                     fh.write(buf)
             total += streamed
             landed += 1
+            extracted[member.name] = data
     if landed == 0:
+        # "At least": the two settings are not the only causes (vault BACKLOG #5233). A backup whose
+        # walk of the config dir adds no regular file also writes an archive with no config member.
         raise BackupError(
             "restore",
-            "the archive carries no config bundle, so there is nothing for --config-to to restore "
-            "(the backup was taken with [backup].include_config=false, or with no config dir loaded)",
+            "the archive carries no config bundle, so there is nothing for --config-to to restore. "
+            "At least these leave an archive with none: the backup was taken with "
+            "[backup].include_config=false, or with no config dir loaded, or its walk of the config "
+            "dir added no regular file, such as a dir that is empty or holds only symbolic links",
         )
     return landed

@@ -68,8 +68,9 @@ def test_guard_ignores_non_tcp(conn_type: ConnectorType) -> None:
 # --- certificate-revocation posture: serve-time refusal for in-process off-loopback [api] TLS -----
 #
 # ADR 0078 (ASVS 12.1.4): the engine performs NO OCSP/CRL revocation (stdlib ssl has none; on-prem
-# offline-by-default). So an in-process, off-loopback [api] TLS bind must PROVE revocation in front —
-# a declared TLS-terminating proxy OR the MEFOR_TLS_REVOCATION_ATTESTED opt-out — else `serve` refuses.
+# offline-by-default). So an in-process, off-loopback [api] TLS bind needs the
+# MEFOR_TLS_REVOCATION_ATTESTED opt-out, else `serve` refuses. A declared TLS-terminating proxy no
+# longer exempts it (BACKLOG #4636).
 # Patterned on the exposed-bind gate assertions in test_cli.py (main(["serve", ...]) → 2/0, uvicorn +
 # the app + the SSL-context builder mocked so no socket/cert is touched). `--env dev` is synthetic, so
 # the keyless / open-egress / MFA-at-exposure gates stay quiet and only the revocation gate is tested.
@@ -109,6 +110,8 @@ def test_serve_refuses_inprocess_tls_offloopback_without_attestation(
     assert "in-process TLS on non-loopback" in err
     assert "12.1.4" in err
     assert "MEFOR_TLS_REVOCATION_ATTESTED=1" in err
+    # No terminator is declared here, so the message must not tell the operator about one.
+    assert "does not exempt this bind" not in err
 
 
 def test_serve_inprocess_tls_offloopback_attested_starts(
@@ -151,11 +154,59 @@ def test_serve_loopback_inprocess_tls_starts(
     assert "in-process TLS on non-loopback" not in capsys.readouterr().err
 
 
-def test_serve_proxy_terminated_offloopback_starts(
+def _proxy_terminated_offloopback_toml(tmp_path: Path) -> None:
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        'security.enforcement = "warn"\n'
+        # An operator certificate, so the proxy re-encrypts to the engine: BACKLOG #4636 refuses a
+        # plaintext proxy-to-engine hop off loopback. The engine then terminates TLS itself.
+        '[api]\ntls_terminated_upstream = true\ntls_cert_file = "cert.pem"\ntrusted_proxies = ["10.0.0.7"]\n'
+        'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("attested", [False, True], ids=["unattested", "attested"])
+def test_serve_proxy_terminated_offloopback_needs_the_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    attested: bool,
+) -> None:
+    # AC-3, as BACKLOG #4636 amended it: a declared TLS-terminating proxy (tls_terminated_upstream +
+    # trusted_proxies) no longer exempts an off-loopback bind from the revocation gate. Off loopback
+    # the engine terminates the proxy hop's TLS itself on the operator certificate, and the
+    # declaration does not attest that the proxy checks that certificate's revocation, so it is
+    # refused without the attestation and starts with it.
+    monkeypatch.chdir(tmp_path)
+    if attested:
+        monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    else:
+        monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    _mock_start(monkeypatch)
+    _proxy_terminated_offloopback_toml(tmp_path)
+    rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
+    err = capsys.readouterr().err
+    if attested:
+        assert rc == 0
+        assert "in-process TLS on non-loopback" not in err
+    else:
+        assert rc == 2
+        assert "in-process TLS on non-loopback" in err
+        assert "does not exempt this bind" in err
+        assert "MEFOR_TLS_REVOCATION_ATTESTED=1" in err
+
+
+def test_serve_loopback_plaintext_terminator_stays_exempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # AC-3: a declared TLS-terminating proxy (tls_terminated_upstream + trusted_proxies) is "revocation
-    # proven in front" — the engine terminates no TLS itself, so the gate passes without attestation.
+    # The terminator the revocation gate still exempts: a proxy on the same machine in front of a
+    # loopback bind, speaking plaintext to it (the BACKLOG #1179 acknowledgement). The engine
+    # terminates no TLS there, so there is no in-process certificate to revoke.
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     _mock_start(monkeypatch)
@@ -164,9 +215,9 @@ def test_serve_proxy_terminated_offloopback_starts(
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
         "alerts.security_notifications_required = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
-        'security.enforcement = "warn"\n'
-        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        'security.local_access_only = true\nsecurity.enforcement = "warn"\n'
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["127.0.0.1"]\n'
+        "plaintext_upstream_hop_acknowledged = true\n"
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )

@@ -81,7 +81,7 @@ jobs:
       # uv via the SHA-pinned action (ci.yml's pin), not an unpinned `pip install uv`: a version pin
       # does not satisfy Scorecard PinnedDependenciesID and this repo already carries two such findings.
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # NO CACHE, unlike every other setup-uv use in this repo. Left at the default this would be
           # the only workflow here that BOTH restores a dependency cache AND is reachable from a
@@ -194,7 +194,7 @@ jobs:
         with:
           python-version-file: ci/python-version
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # No cache, for the release-tag cache-poisoning reason given on dast-auth's copy above.
           enable-cache: false

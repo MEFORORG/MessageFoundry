@@ -1568,6 +1568,7 @@ def _store_with_accounts(path: Path, *, lockable: bool) -> StoreSettings:
                 password_hash="h",
                 must_change_password=not lockable,
                 password_generated=not lockable,
+                audits=(),
             )
             await handle.upsert_role(role_id=Role.VIEWER.value, display_name="Viewer")
             await handle.set_user_roles("u-1", [Role.VIEWER.value], assigned_by="test")

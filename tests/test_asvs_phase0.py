@@ -198,8 +198,12 @@ def test_webhook_allows_plaintext_http_with_insecure_escape(
 
 
 def test_webhook_rejects_host_outside_allowlist() -> None:
-    t = WebhookTransport("https://evil.example/hook", allowed_hosts=("ok.example",), posture=_WARN)
-    with pytest.raises(ValueError):
+    # Refused at the build since BACKLOG #5088 (a tightening), and still at every POST.
+    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
+        WebhookTransport("https://evil.example/hook", allowed_hosts=("ok.example",), posture=_WARN)
+    t = WebhookTransport("https://ok.example/hook", allowed_hosts=("ok.example",), posture=_WARN)
+    t.url = "https://evil.example/hook"
+    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
         t._post({"type": "t", "connection": "c"})
 
 

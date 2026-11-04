@@ -49,7 +49,7 @@ connector does with those keys: a client certificate counts only with ``tls`` on
 both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, and a static
 ``Authorization`` credential not at all when SMART or OAuth2 replaces that header with a minted token.
 
-**Out of scope, stated so the silence is not read as coverage.**
+**Out of scope, at least these, stated so the silence is not read as coverage.**
 
 * LISTENERS (inbound MLLP, TCP, X12, DICOM, HTTP). There the partner presents a credential to the
   engine, not the other way round, and this inventory lists only credentials the engine presents. A
@@ -59,7 +59,12 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   reported here. The HTTP listener's intake-authentication gate (``check_http_intake_auth``) asks
   only whether an off-loopback listener has an effective peer control, which a narrow
   ``source_ip_allowlist`` with no credential satisfies, and never whether a credential is static.
-* Plugin connector types this module does not know. They are not guessed at.
+* What a builder presents when code outside the shipped transports registers it with
+  ``register_source``/``register_destination``, new or replacing a shipped one. As the
+  *Classification* paragraph says, the builder is never read: a connection is judged by its
+  :class:`~messagefoundry.config.models.ConnectorType` member, its direction and its settings keys.
+  A connection with no rule for its member and direction is not listed, so the gate does not
+  refuse it; ``_connection_hop`` and ``_DIALLED_INBOUND`` say which have one.
 * A generic-ODBC database hop that sets no top-level ``username``/``password``. The database arm
   does not read ``odbc_params``; ``static_credential_db_hops`` says what those keywords can carry.
 * A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
@@ -414,8 +419,9 @@ def _connection_hop(
     return None
 
 
-#: Inbound connection types that DIAL their peer. Every other inbound type is a listener or has no
-#: peer at all. DATABASE (``DatabasePoll``) dials too, and the database arm covers it.
+#: Inbound connection types that DIAL their peer. Every other inbound type the shipped transports
+#: build is a listener or has no peer at all. DATABASE (``DatabasePoll``) dials too, and the database
+#: arm covers it.
 _DIALLED_INBOUND = frozenset({ConnectorType.REMOTEFILE, ConnectorType.FILE})
 
 

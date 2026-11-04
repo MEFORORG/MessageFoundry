@@ -41,6 +41,7 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
 )
 from messagefoundry.parsing.binary import (
+    DocRefError,
     chunk_b64,
     is_doc_ref,
     iter_obx_documents,
@@ -50,8 +51,10 @@ from messagefoundry.parsing.binary import (
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store import MessageStatus, MessageStore, StreamingAttachmentsUnsupported
+from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.receipt import RefusalKind
+from tests.test_wiring_engine import _mllp_client, _until_message
 
 
 @pytest.fixture
@@ -442,7 +445,9 @@ async def test_in_flight_budget_exceeded_naks(store: MessageStore) -> None:
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
-    assert _ack_code(ack) == "AE"  # detach refused (backpressure) → NAK AE
+    # Detach refused; the body alone is over the whole budget, so no re-send could fit: final, AR
+    # (BACKLOG #5078). The budget held by concurrent detaches, AE, is the control further down.
+    assert _ack_code(ack) == "AR"
     msgs = await _messages(store)
     assert msgs[0]["status"] == MessageStatus.ERROR.value
     assert "streaming detach failed" in msgs[0]["error"]
@@ -452,7 +457,8 @@ async def test_in_flight_budget_exceeded_naks(store: MessageStore) -> None:
 
 async def test_unsupported_backend_naks(store: MessageStore) -> None:
     # A streaming inbound against a backend that does not advertise streaming support raises the
-    # not-supported error at detach → NAK AE + ERROR, never accepted-and-dropped. SQLite, SQL Server, AND
+    # not-supported error at detach → NAK AR + ERROR (final: the same body fails the same way on every
+    # re-send, BACKLOG #5078), never accepted-and-dropped. SQLite, SQL Server, AND
     # Postgres now all support streaming (each sets supports_streaming_attachments=True), so this forces the
     # flag OFF as a unit seam to exercise a legacy/opt-out backend — it no longer describes SS/PG.
     store.supports_streaming_attachments = (
@@ -465,7 +471,7 @@ async def test_unsupported_backend_naks(store: MessageStore) -> None:
 
     ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
 
-    assert _ack_code(ack) == "AE"
+    assert _ack_code(ack) == "AR"
     assert (await _messages(store))[0]["status"] == MessageStatus.ERROR.value
 
 
@@ -508,7 +514,7 @@ async def test_zero_budget_admits_a_detach_that_a_positive_budget_refuses(
 ) -> None:
     # CHARACTERIZATION PIN, NOT A FAIL-WITHOUT-THE-FIX TEST — it passes on a pristine tree by design.
     # It fixes the MEANING of the shipped default so a later "0 = auto" reading cannot land quietly:
-    # the same body that a budget of 10 refuses (AE) is accepted (AA) at 0. Both arms are asserted in
+    # the same body that a budget of 10 refuses (AR) is accepted (AA) at 0. Both arms are asserted in
     # ONE test against ONE body, so it cannot degrade into an assertion the zero arm alone satisfies.
     b64 = _big_b64(2000)
     raw = _hl7_with_doc(b64).encode("utf-8")
@@ -520,7 +526,7 @@ async def test_zero_budget_admits_a_detach_that_a_positive_budget_refuses(
         stream_inflight_budget_bytes=10,
         egress=EgressSettings(deny_by_default=False),
     )
-    assert _ack_code(await refused._handle_inbound(ic, raw)) == "AE"
+    assert _ack_code(await refused._handle_inbound(ic, raw)) == "AR"
 
     unlimited = RegistryRunner(
         _registry(ic),
@@ -701,3 +707,116 @@ def test_an_escape_outside_obx_5_5_does_not_refuse_the_document() -> None:
     b64 = _big_b64(300)
     msg = Message.parse(_hl7_with_doc(b64, obx_type="App\\T\\lication"))
     assert [(occ, doc) for occ, doc, _ct in iter_obx_documents(msg)] == [(1, b64)]
+
+
+# --- MLLP detach refusals take the receipt path's class (BACKLOG #5078) ---------------------------
+#
+# Owner ruling of 2026-11-03 (decision log d20261104T032854299-7235a9, stamped in UTC): MLLP follows
+# the engine convention, AR for a refusal the engine treats as final and AE for one a re-send may
+# clear. The receipt path classes a body alone over the whole budget OVERSIZE and an unsupported
+# backend or a malformed handle PERMANENT, so each answers AR on MLLP; only a budget held by
+# concurrent detaches is TEMPORARY, AE. Each case is sent by the engine's own MLLP outbound to the
+# engine's own streaming listener, so the class is the one the real MLLPDestination reads.
+
+
+async def _bad_handle_put_attachment(chunks: object, content_type: str) -> str:
+    """A put_attachment that returns a content address make_doc_ref refuses, so the detach raises
+    DocRefError after the store call (the only way that refusal reaches the detach arm)."""
+    return "not-a-sha256"
+
+
+async def _send_streaming_end_to_end(
+    store: MessageStore, *, budget: int = 0, busy: int = 0
+) -> tuple[NegativeAckError, RegistryRunner]:
+    """Send one over-threshold MDM from the engine's own MLLP outbound to a running streaming MLLP
+    inbound and return the NAK the outbound raised, once the listener has recorded the ERROR row.
+    ``busy`` stands in for detaches already in flight on the runner's stream budget."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "mllp_in",
+            ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
+            router="r",
+            content_type=ContentType.HL7V2,
+            stream_threshold_bytes=500,
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        stream_inflight_budget_bytes=budget,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    runner._stream_inflight_bytes = busy
+    try:
+        port = runner._sources["mllp_in"].sockport  # type: ignore[attr-defined]
+        with pytest.raises(NegativeAckError) as raised:
+            await _mllp_client(port).send(_hl7_with_doc(_big_b64(2000)))
+        await _until_message(store, MessageStatus.ERROR.value, channel_id="mllp_in")
+    finally:
+        await runner.stop()
+    return raised.value, runner
+
+
+def _refusal_for(case: str) -> Exception:
+    """One instance of the refusal each case raises, for the classification both listeners share."""
+    if case == "alone_over_budget":
+        return wiring_runner._StreamBudgetExceeded("over", alone=True)
+    if case == "unsupported_backend":
+        return StreamingAttachmentsUnsupported("no streaming")
+    return DocRefError("malformed")
+
+
+@pytest.mark.parametrize(
+    ("case", "receipt_kind"),
+    [
+        ("alone_over_budget", RefusalKind.OVERSIZE),
+        ("unsupported_backend", RefusalKind.PERMANENT),
+        ("malformed_handle", RefusalKind.PERMANENT),
+    ],
+)
+async def test_a_final_detach_refusal_is_ar_to_the_engines_mllp_outbound(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, case: str, receipt_kind: RefusalKind
+) -> None:
+    """Mutation: answer every non-escape detach refusal AE again, as before the ruling. Red: the
+    outbound's NAK is code AE and not permanent, for each of the three."""
+    budget = 0
+    if case == "alone_over_budget":
+        budget = 10  # the body alone is far over it, so no re-send could ever fit
+    elif case == "unsupported_backend":
+        store.supports_streaming_attachments = False
+    else:
+        monkeypatch.setattr(store, "put_attachment", _bad_handle_put_attachment)
+
+    nak, _ = await _send_streaming_end_to_end(store, budget=budget)
+
+    assert nak.code == "AR"
+    assert nak.permanent is True
+    msgs = await _messages(store)
+    assert [m["status"] for m in msgs] == [MessageStatus.ERROR.value]
+    assert "streaming detach failed" in msgs[0]["error"]
+    # The receipt path classes the same refusal by the same function, so the two cannot split.
+    assert wiring_runner._detach_refusal_kind(_refusal_for(case)) is receipt_kind
+
+
+async def test_control_a_budget_held_by_concurrent_detaches_is_ae_to_the_engines_mllp_outbound(
+    store: MessageStore,
+) -> None:
+    """Control: the same path with a budget the body fits once the concurrent detaches finish. That
+    refusal is TEMPORARY on the receipt path, so MLLP answers AE and the outbound retries it; the AR
+    above is the final refusals' own class, not every detach refusal's. Mutation: answer every
+    detach refusal AR. Red: AR here."""
+    nak, runner = await _send_streaming_end_to_end(store, budget=1_000_000, busy=999_000)
+
+    assert nak.code == "AE"
+    assert nak.permanent is False
+    msgs = await _messages(store)
+    assert "(backpressure)" in msgs[0]["error"]
+    assert runner._stream_inflight_bytes == 999_000  # the refusal reserved nothing
+    assert (
+        wiring_runner._detach_refusal_kind(wiring_runner._StreamBudgetExceeded("busy", alone=False))
+        is RefusalKind.TEMPORARY
+    )
