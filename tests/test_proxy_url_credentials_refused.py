@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A proxy URL credential never reaches a proxy in cleartext (vault BACKLOG #2572, #3410).
+"""A proxy URL credential is refused before it reaches a proxy, in cleartext (vault BACKLOG #2572,
+#3410) and over a verified TLS leg (vault BACKLOG #4909), on the engine's urllib openers.
 
 urllib turns a user and a password in a proxy URL into a ``Proxy-Authorization: Basic`` header. To a
 proxy reached over plain TCP that header crosses the network in cleartext. The Vault hop has refused

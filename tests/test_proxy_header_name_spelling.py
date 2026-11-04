@@ -554,7 +554,8 @@ def _https_proxy_for_http_only(
     proxy: _WireProxy, *, admitted: bool
 ) -> urllib.request.OpenerDirector:
     """Only ``http`` is proxied, to a proxy written ``https://``, on a context that fully
-    verifies. That is the one leg that reaches a proxy over TLS first."""
+    verifies. That is one leg that reaches a proxy over TLS first; a bypass list naming the
+    proxy's own host is another."""
     handler = LoopbackDirectProxyHandler(
         {"http": f"https://{proxy.address}"}, caller_header_admitted=admitted
     )

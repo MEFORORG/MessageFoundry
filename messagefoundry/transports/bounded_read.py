@@ -771,7 +771,10 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
     :func:`build_strict_opener` puts this on every opener it builds, in place of the stock class.
 
     **It also refuses a request that would send a web-proxy credential to a proxy in cleartext**
-    (vault BACKLOG #2572, #3410, #3416). :class:`ProxyCredentialsRefusedError` states the rule.
+    (vault BACKLOG #2572, #3410, #3416). On a TLS leg that fully verifies the proxy it does not
+    raise: it marks the request, and the strict https handler raises before it dials (vault
+    BACKLOG #4909), so the two handlers hold that refusal together.
+    :class:`ProxyCredentialsRefusedError` states the rule.
     The check is made here, per request and per proxy, because this method sees every proxy a
     request is handed to, from every source: the environment, the system settings, and a
     ``proxy_url`` an operator configured. It is not made when the handler is built. Shared openers
@@ -877,11 +880,11 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     records, not yet ruled. So on an opener :func:`build_strict_opener` makes, a credential from
     a proxy URL, the environment or the system proxy settings is refused on every leg its proxy
     handler judges, and so is a caller-set header no connection admitted. The requests-based
-    Vault hop is not such an opener: it still sends an ``HTTPS_PROXY`` credential to an
-    ``https://`` proxy over TLS. The proxy handler judges the leg, and the strict https handler
-    raises the refusal before it dials, once the request is still bound for the proxy over TLS.
-    That way a request urllib hands back for a ``CONNECT`` is refused in the cleartext text
-    instead, and a context that does not verify the proxy keeps its own text.
+    Vault hop is not such an opener; ``docs/CONFIGURATION.md`` says what it would still send. The
+    proxy handler judges the leg, and the strict https handler raises the refusal before it dials,
+    once the request is still bound for the proxy over TLS. That way a request urllib hands back
+    for a ``CONNECT`` is refused in the cleartext text instead, and a context that does not verify
+    the proxy keeps its own text.
 
     **The one exception.** A caller-set header that its connection admitted when it was built is
     sent on the leg to the proxy that connection's ``transports.rest.ProxyConfig`` names: a
@@ -939,6 +942,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
+    * A plainly spelled header on a request routed to a proxy over a verified TLS leg other than
+      through a proxy handler this module makes, such as by a caller's own ``set_proxy``. The
+      refusal on that leg reads a mark only that proxy handler sets, so such a request is not
+      refused by it. No engine code was found to route a request that way.
 
     A :class:`urllib.error.URLError`, on purpose. It is the class urllib raises for a request it
     could not send, so each hop treats this refusal as it treats that. At least the REST, SOAP,
@@ -990,7 +997,9 @@ def _sends_cleartext_proxy_credentials(
     unless the leg is cleartext and would be refused for another reason too. That leaves the
     cleartext text where it applies, and gives a verified TLS leg a text that is true of it.
     A credential from a proxy URL, or a plain header no connection admitted, on the TLS leg gets
-    the TLS leg's own text (vault BACKLOG #4909). The name predates that leg."""
+    the TLS leg's own text (vault BACKLOG #4909), unless an oddly spelled header rides along: that
+    is refused at once in the spelling text, even where urllib would then hand the request back
+    for a cleartext ``CONNECT``. The name predates that leg."""
     try:
         # The parser proxy_open runs, so the two readings cannot differ (vault BACKLOG #2965).
         scheme, user, password, _ = read_like_urllib(proxy)
