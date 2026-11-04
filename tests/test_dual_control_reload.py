@@ -1847,7 +1847,9 @@ async def test_a_directory_unlistable_only_at_the_trust_walk_is_audited_unreadab
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         op = await _token(c, "op")
         # The strict read already failed, as the test above has it, so the load reads lax.
-        monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
+        monkeypatch.setattr(
+            Engine, "_reload_snapshot_blocking", staticmethod(lambda path, value_file=None: None)
+        )
         _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost, answers_is_dir=True)
         monkeypatch.setattr(wiring, "config_source_trust_paths", _walk)
         r = await c.post("/config/reload", json={}, headers=op)
@@ -2025,7 +2027,9 @@ async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
         op = await _token(c, "op")
         # The strict read already failed, as test_a_directory_lost_after_the_target_check_is_not_
         # audited_as_missing_inline has it, so the load reads lax.
-        monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
+        monkeypatch.setattr(
+            Engine, "_reload_snapshot_blocking", staticmethod(lambda path, value_file=None: None)
+        )
         lost = _lose_the_share_at_the_access_read(monkeypatch, (tmp_path / "cfg").resolve())
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
