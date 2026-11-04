@@ -43,6 +43,7 @@ What the sender hears (BACKLOG #5078):
 | Strict outcome | MLLP / TCP | `Http()` |
 |---|---|---|
 | the body fails validation | `AR`: final, the same body fails the same way on a re-send | `422` |
+| the validator faulted (an unexpected exception inside it, which may be the engine's) | `AE` | `422` |
 | the body is over strict validation's own size cap | `AR` | `413` |
 | the validate began and ran past `validation.strict_timeout_s` | `AE` | `422` |
 | the timeout fired before any worker thread began the validate | `AE` | `503` with `Retry-After` |

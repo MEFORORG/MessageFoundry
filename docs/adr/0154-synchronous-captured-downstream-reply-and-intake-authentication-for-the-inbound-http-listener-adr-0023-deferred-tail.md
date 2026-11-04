@@ -1557,9 +1557,13 @@ re-send multiplies nothing.
 default executor had 32 workers there. A conformant ADT^A01 through the listener's own validate
 helper, unloaded, 20 runs: median 2.9 ms, max 4.6 ms. Then all 32 workers were held by unrelated
 blocking work, and the same body was validated under a 0.5 s timeout, 5 trials: each timed out at
-0.512 to 0.515 s, and each reported that the validate never began. The tests
-`tests/test_strict_refusal_classes.py` pin both arms against a real queue: a one-worker pool held by
-a blocker gives `503` and a validate that never runs, and the same pool free gives `422`.
+0.512 to 0.515 s, and each reported that the validate never began. The tests in
+`tests/test_strict_refusal_classes.py` pin both arms against a real queue, reading the receipt
+handler's refusal kind, not an HTTP status: a one-worker pool held by a blocker gives a TEMPORARY
+refusal, and the same pool free gives a PERMANENT one. The kind-to-status mapping (`503`, `422`) is
+`_refusal_status` in `transports/http_listener.py`, pinned by `tests/test_ingress_refusal_kinds.py`.
+The lock protocol itself is pinned by a direct test of `_StrictValidateRun`; the receipt-path arms
+cannot see it, because cancelling the executor future already skips a queued job.
 
 **What it does not cover, so the cost of 2026-10-30 is narrowed, not removed.**
 
@@ -1571,10 +1575,13 @@ a blocker gives `503` and a validate that never runs, and the same pool free giv
 * Load that slows a validate after it began, such as other threads holding the GIL. It was not
   measured, and the discriminator does not see it.
 
-**MLLP is unchanged.** Both timeouts still answer `AE`; only the stored reason tells them apart. The
-same change made a strict-validation failure answer `AR` on MLLP, the final code, matching the
-receipt path's `422` and `413` for it (BACKLOG #5078). The engine's own MLLP outbound dead-letters
-`AR` at once and retries `AE`.
+**MLLP is unchanged.** Both timeouts still answer `AE` with the same MSA-3 text; only the stored
+reason tells them apart, so an unauthenticated sender cannot read the engine's thread-pool state off
+the NAK. The same change made a strict-validation failure answer `AR` on MLLP, the final code,
+matching the receipt path's `422` and `413` for it (BACKLOG #5078). A validator fault, an unexpected
+exception inside `validate()` that may be the engine's own, such as a `MemoryError` under load,
+stays `AE` (`ValidationResult.fault`); the receipt path still answers it `422`. The engine's own
+MLLP outbound dead-letters `AR` at once and retries `AE`.
 
 **What else is unchanged.** Strict validation's own size cap stays the engine default, 16 MiB,
 whatever the inbound's `max_message_bytes`. `docs/HL7-VALIDATION.md` says so for operators. The dry

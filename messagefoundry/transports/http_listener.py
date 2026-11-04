@@ -1511,7 +1511,8 @@ class HttpSource(SourceConnector):
             # owner ruling of 2026-09-30 answers a temporary refusal 503 with Retry-After and keeps a
             # permanent one at 422. Which refusals are temporary, the one 413 for over-size and the
             # ERROR row's id in the body are Manager decision d20261030T155119571-255c98 (BACKLOG #2105);
-            # the unusable codec name joined the temporary class later, under BACKLOG #2431. Returns False:
+            # at least the unusable codec name (BACKLOG #2431) and a strict-validation timeout that
+            # never began (BACKLOG #5078) joined the temporary class later. Returns False:
             # this is a post-record refusal with no connection-event kind of its own, so the outer
             # ``closed`` still fires. The drain gets the receipt-sized budget in both modes: this is a
             # fixed few dozen bytes, never the partner-sized body reply_write_timeout exists for.

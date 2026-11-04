@@ -240,12 +240,18 @@ class ValidationResult:
 
     ``oversize`` is True when the message failed :func:`validate`'s ``max_bytes`` cap, measured on
     the text that function itself normalizes, so a caller can answer a size refusal as one without
-    re-deriving that measurement (BACKLOG #2105)."""
+    re-deriving that measurement (BACKLOG #2105).
+
+    ``fault`` is True when an error came from one of this function's defensive catch-alls rather
+    than from hl7apy's own verdict or a size cap: an unexpected exception, which may be the engine's
+    (a ``MemoryError`` under load) rather than the body's. A listener that answers a strict failure
+    as final reads it to keep such a refusal retryable (BACKLOG #5078)."""
 
     ok: bool
     version: str | None
     errors: list[str]
     oversize: bool = False
+    fault: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -308,10 +314,11 @@ def validate(
     except HL7apyException as exc:
         return ValidationResult(False, expected_version, [f"parse error: {exc}"])
     except Exception as exc:  # defensive: never let validation crash the pipeline
-        return ValidationResult(False, expected_version, [f"parse error: {exc}"])
+        return ValidationResult(False, expected_version, [f"parse error: {exc}"], fault=True)
 
     version = getattr(message, "version", None)
     errors: list[str] = []
+    fault = False
 
     if expected_version and version and expected_version != version:
         errors.append(f"version mismatch: message is {version}, channel expects {expected_version}")
@@ -342,6 +349,7 @@ def validate(
         errors.append(str(exc))
     except Exception as exc:  # defensive
         errors.append(str(exc))
+        fault = True
     else:
         # Only when hl7apy found nothing, and only the first, keeping the one-error contract.
         if references is not None:
@@ -350,5 +358,6 @@ def validate(
                     errors.append(choice_error)
             except Exception as exc:  # defensive, as above
                 errors.append(str(exc))
+                fault = True
 
-    return ValidationResult(ok=not errors, version=version, errors=errors)
+    return ValidationResult(ok=not errors, version=version, errors=errors, fault=fault)

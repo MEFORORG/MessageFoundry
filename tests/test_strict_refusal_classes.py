@@ -193,7 +193,9 @@ async def test_a_timeout_that_never_began_is_temporary_on_the_receipt_path(
     rows = await _error_rows(store)
     assert len(rows) == 1 and rows[0]["status"] == MessageStatus.ERROR.value
     assert "strict-validation timed out after 0.1s waiting for a worker thread" in rows[0]["error"]
-    # Nothing was left running: once the worker frees, the abandoned validate does not start.
+    # Nothing was left running: once the worker frees, the abandoned validate does not start. This
+    # is the outcome, not a control for the lock: cancelling the executor future already skips a
+    # queued job. The lock is pinned by the direct test of _StrictValidateRun below.
     await asyncio.sleep(0.2)
     assert one_worker.calls == []
 
@@ -222,8 +224,29 @@ async def test_a_timeout_that_never_began_is_still_ae_on_mllp(
     finally:
         held.set()
     assert ack is not None and "MSA|AE|" in ack
+    # The wire carries the same text for both causes, so a sender cannot read pool state off MSA-3.
+    assert "worker thread" not in ack
+    assert "strict-validation timed out after 0.1s" in ack
     rows = await _error_rows(store)
     assert "waiting for a worker thread" in rows[0]["error"]
+
+
+async def test_a_validator_fault_stays_ae_on_mllp(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fault inside validate()'s defensive catch-all may be the engine's (a MemoryError under
+    load), so it is not answered as final. Mutation: answer every ``not ok`` AR. Red: AR here."""
+    import hl7apy.parser
+
+    def _engine_fault(*_: Any, **__: Any) -> Any:
+        raise MemoryError
+
+    monkeypatch.setattr(hl7apy.parser, "parse_message", _engine_fault)
+    ic = _strict_ic(ConnectorType.MLLP)
+    ack = await _runner(store, ic)._handle_inbound(ic, _ADT.encode("ascii"))
+    assert ack is not None and "MSA|AE|" in ack
+    rows = await _error_rows(store)
+    assert "strict-validation failed: parse error" in rows[0]["error"]
 
 
 def test_an_abandoned_run_never_validates_and_a_begun_one_reports_it(

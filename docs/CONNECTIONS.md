@@ -736,11 +736,11 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 
 - **`503`** with `Retry-After` when the refusal is temporary: the engine's own, not the body's.
   At least three refusals are classed so: the streaming detach's in-flight budget, while other
-  detaches hold it, and an inbound `encoding` naming no text codec, which refuses every body until
-  an operator fixes the name (BACKLOG #2431), so a sender re-sending every few seconds meanwhile
-  leaves one `ERROR` row per attempt. Re-send the same body later. A body larger than that whole
-  budget is over-size instead. A third is a strict-validation timeout that fired before any worker
-  thread began the validate, so nothing is known of the body (BACKLOG #5078).
+  detaches hold it; a strict-validation timeout that fired before any worker thread began the
+  validate, so nothing is known of the body (BACKLOG #5078); and an inbound `encoding` naming no
+  text codec, which refuses every body until an operator fixes the name (BACKLOG #2431), so a
+  sender re-sending every few seconds meanwhile leaves one `ERROR` row per attempt. Re-send the
+  same body later. A body larger than the whole in-flight budget is over-size instead.
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
   with `max_message_bytes`. Strict validation keeps its own 16 MiB cap, which does NOT follow

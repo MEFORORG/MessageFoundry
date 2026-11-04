@@ -913,15 +913,14 @@ class _StrictValidateTimedOut(Exception):
     as the validate, so under load a body can time out before it is ever looked at. That body says
     nothing about itself, and it left no thread behind, so a receipt source answers it as temporary.
     One that had started stays final: it may be the slow body the timeout exists for, and its
-    thread is still running. ``reason`` is value-free, only the numeric timeout."""
+    thread is still running. ``reason`` is value-free, only the numeric timeout, and goes to the
+    stored ``ERROR`` row. ``ack_text`` is what goes on the wire in MSA-3: the same for both causes,
+    so an unauthenticated sender cannot read the engine's thread-pool state off the NAK."""
 
     def __init__(self, timeout: float, *, started: bool) -> None:
         self.started = started
-        self.reason = (
-            f"strict-validation timed out after {timeout}s"
-            if started
-            else f"strict-validation timed out after {timeout}s waiting for a worker thread"
-        )
+        self.ack_text = f"strict-validation timed out after {timeout}s"
+        self.reason = self.ack_text if started else f"{self.ack_text} waiting for a worker thread"
         super().__init__(self.reason)
 
 
@@ -966,10 +965,18 @@ async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResu
             asyncio.to_thread(run, text, ic.validation.hl7_version), timeout
         )
     except TimeoutError:
-        assert timeout is not None  # wait_for(None) never times out
-        raise _StrictValidateTimedOut(timeout, started=run.abandon()) from None
-    assert result is not None  # only an abandoned run returns None, and nothing awaits that one
-    return result
+        started = run.abandon()
+    except BaseException:
+        # Cancelled (engine stop, connection teardown): nobody will await the result, so a run not
+        # yet begun must not begin.
+        run.abandon()
+        raise
+    else:
+        assert result is not None  # only an abandoned run returns None, and nothing awaits that one
+        return result
+    # Raised outside the handler, so the TimeoutError is not on the chain and needs no suppressing.
+    assert timeout is not None  # wait_for(None) never times out
+    raise _StrictValidateTimedOut(timeout, started=started)
 
 
 # The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
@@ -8529,10 +8536,11 @@ class RegistryRunner:
                 # path below it quotes no field. AE whether or not the validate had begun: a timeout
                 # that began may still be load (ADR 0154's amendment of 2026-11-03), so it is not
                 # answered as final here (BACKLOG #5078).
-                timed_out = exc.reason
-                mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
+                mid = await self._record_refused(ic, raw, text, error=exc.reason, peek=peek)
                 ack = (
-                    build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
+                    build_ack(peek, code="AE", text=exc.ack_text, ack_mode=ack_mode)
+                    if reply
+                    else None
                 )
                 if ack is not None and self._capture_ack_enabled(ic):
                     await self._capture_ack(
@@ -8541,7 +8549,7 @@ class RegistryRunner:
                         ack_code="AE",
                         ack_phase="strict",
                         ack_body=None,
-                        detail=timed_out,
+                        detail=exc.reason,
                     )
                 return ack
             if not result.ok:
@@ -8553,13 +8561,16 @@ class RegistryRunner:
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
                 mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                # AR, not AE (BACKLOG #5078): the body fails the same way on every re-send, which the
-                # receipt path answers as final (422, or 413 for validate()'s own size cap), and an AE
-                # invited a sender, the engine's own MLLP outbound included, to retry it. The NAK goes
-                # back to the partner that SENT this message (their own data) and is transient (never
-                # persisted), so it may carry the fuller, bounded validation text.
+                # AR, not AE (BACKLOG #5078): hl7apy's verdict or the size cap fails the body the same
+                # way on every re-send, which the receipt path answers as final (422, or 413 for
+                # validate()'s own size cap), and an AE invited a sender, the engine's own MLLP
+                # outbound included, to retry it. A validator FAULT (validate()'s defensive catch-all,
+                # a MemoryError under load among them) may be the engine's, so it stays AE. The NAK
+                # goes back to the partner that SENT this message (their own data) and is transient
+                # (never persisted), so it may carry the fuller, bounded validation text.
+                nak_code = "AE" if result.fault else "AR"
                 ack = (
-                    build_ack(peek, code="AR", text=joined[:200], ack_mode=ack_mode)
+                    build_ack(peek, code=nak_code, text=joined[:200], ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8569,7 +8580,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AR",
+                        ack_code=nak_code,
                         ack_phase="strict",
                         ack_body=None,
                         detail=persisted,
