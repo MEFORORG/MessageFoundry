@@ -86,7 +86,9 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
+    InsecureHopRefused,
     RevocationHopGuard,
+    StoreTlsRefused,
     current_hop_posture,
     harden_cipher_suites,
     harden_crl_check,
@@ -108,6 +110,7 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
+    _carries_a_codec_error,
     acquire_pooled,
     driver_sqlstate,
     warm_pool_connections,
@@ -214,6 +217,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
@@ -240,11 +244,15 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EpochBump,
+    EpochRaise,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
+    KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -267,6 +275,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -310,6 +319,8 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     global_epoch_or_refuse,
+    global_epoch_raise,
+    global_epoch_unmoved,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -338,7 +349,9 @@ from messagefoundry.store.store import (
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
+    require_ingress_audit,
     require_notify_email,
+    require_operator_audit,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -1429,6 +1442,9 @@ _PG_REVOKE_ALL_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE revoked_at IS NULL"
     " AND ($2::text IS NULL OR token_hash != $2)"
 )
+#: The `$n` twin of store.py's ``_END_DECLINED_KEPT_SESSION_SQL`` (follow-up to BACKLOG #4975):
+#: the per-account sweep narrowed to one token.
+_PG_END_DECLINED_KEPT_SESSION_SQL: Final = _PG_REVOKE_USER_SESSIONS_SQL + " AND token_hash=$3"
 #: Whether the account holds at least one passkey.
 _PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
@@ -1554,7 +1570,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     if (
         settings.trust_server_certificate or not settings.encrypt
     ) and not weakened_tls_escape_permitted(posture):
-        raise ValueError(
+        raise StoreTlsRefused(
             "Postgres TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
             "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
@@ -1581,7 +1597,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
-    ctx = _verifying_context(settings)
+    ctx = _verifying_context_at_open(settings)
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
@@ -1589,6 +1605,40 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # so the verdict reached here holds for every connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
+
+
+def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
+    """:func:`_verifying_context`, with its ``ValueError`` typed as :class:`StoreTlsRefused`
+    (BACKLOG #5000), for :func:`_build_ssl` at the open only. The pool's per-connection rebuild
+    calls the builder directly, so a refusal there is not typed.
+
+    The builder refuses the hop's own TLS settings with a ``ValueError``, at least for the pin
+    file, the CRL file and its dates, and the suites; typed, such a refusal is could not start
+    rather than the CLI floor's exit 1. Not an ``OSError`` that is also a ``ValueError``, such as a
+    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and
+    keeps its own type. Nor an ``OSError`` alone, such as a CRL file the engine may not read, which
+    this does not catch (a pin file it may not read arrives as a ``ValueError`` naming the setting,
+    and is typed).
+
+    **A codec error is neither quoted nor chained**, as
+    :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
+    #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
+    has one on its chain is refused with a fixed text naming the settings and the class, raised
+    outside the handler. Not its ``codec_safe_str`` rendering: the CRL judge re-raises a codec
+    error as a ``ValueError`` whose own text already quotes the byte, which that rendering prints
+    whole. Every other ``ValueError`` keeps its text and its chain."""
+    try:
+        return _verifying_context(settings)
+    except ValueError as exc:
+        if isinstance(exc, (InsecureHopRefused, OSError)):
+            raise
+        if not _carries_a_codec_error(exc):
+            raise StoreTlsRefused(str(exc)) from exc
+        kind = type(exc).__name__
+    raise StoreTlsRefused(
+        "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
+        f"[store].ssl_crl_file or the system trust store: a {kind} from a codec error, not quoted"
+    )
 
 
 def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
@@ -1607,6 +1657,7 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
         except OSError as exc:
             # A missing file raises a bare FileNotFoundError with no path. Name the setting, since the
             # pool re-reads this file on every new connection and it can vanish after the load check.
+            # A ValueError: `_build_ssl` types it at the open (#5000); a pool connect leaves it be.
             raise ValueError(
                 f"[store].ssl_root_cert ({settings.ssl_root_cert!r}) could not be read: {exc}"
             ) from exc
@@ -4231,6 +4282,7 @@ class PostgresStore:
         skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
         inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
         we couldn't reference. Empty/None → the byte-identical no-detach path."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -5638,17 +5690,17 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # A missing row is a corrupt reference. A NULL body means retention erased the
-                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
-                    # snapshot made the purge's token blank skip it, while the same statement still
-                    # erased the reply. This branch is the only control for that, and the reply
-                    # must never become a child message. A missing row is damage, not an erasure,
-                    # so that token is not blanked: its sealed reference is the evidence.
+                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that
+                    # re-pended this token after the purge's snapshot made the purge's token blank
+                    # skip it, while the same statement still erased the reply. This branch is the
+                    # only control for that, and the reply must never become a child message. A
+                    # missing row is damage, not an erasure, so that token is not blanked: its
+                    # sealed reference is the evidence.
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            "re-ingress ref corrupt",
+                            REINGRESS_ARTIFACT_MISSING,
+                            "re-ingress reply missing",
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -7387,6 +7439,7 @@ class PostgresStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -7478,6 +7531,7 @@ class PostgresStore:
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
         the outbound row is created only when it returned a row (ADR 0090 §4). ``audit``'s row
         commits with the resend, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -7689,6 +7743,7 @@ class PostgresStore:
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
         re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies.
         ``audit``'s row commits with the resubmit, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -7849,6 +7904,7 @@ class PostgresStore:
         pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
         same reason, and the same file pins it. ``audit``'s row commits with the replay, zero
         included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
@@ -7906,6 +7962,7 @@ class PostgresStore:
         even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
         oldest row from that producer, the lane head only when no other inbound feeds the
         destination. Returns the number cancelled."""
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
         # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
@@ -8507,7 +8564,7 @@ class PostgresStore:
         ]
 
     async def _append_operator_audit[R](
-        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row inside its transaction (BACKLOG #2624), so an
         append that fails rolls the mutation back. ``written`` tees the row once the commit lands.
@@ -8829,7 +8886,7 @@ class PostgresStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638); the Store protocol states the contract. The row is read ``FOR UPDATE``, as
@@ -9268,7 +9325,7 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -9387,14 +9444,17 @@ class PostgresStore:
             await self._write_user(conn, user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
-    async def _bump_session_epoch(self, conn: Any, user_id: str) -> None:
+    async def _bump_session_epoch(self, conn: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
-        transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
-        record that fails its seal does not stop the revoke that called this."""
+        transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
+        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
+        the revoke that called this, and reports no raise."""
+        bump = EpochBump()
         try:
-            await self._write_user(conn, user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(conn, user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -9454,7 +9514,7 @@ class PostgresStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=$4` on the old name makes it a compare-and-set; AuthStore says
@@ -9745,7 +9805,7 @@ class PostgresStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -10578,12 +10638,13 @@ class PostgresStore:
 
     async def _global_session_epoch(self, conn: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
-        return global_epoch_or_refuse(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
+        return global_epoch_or_refuse(await self._global_session_epoch_value(conn))
 
-    async def _session_epoch(self, conn: Any, user_id: str) -> int:
-        """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
-        row = await conn.fetchrow("SELECT session_epoch FROM users WHERE id=$1", user_id)
-        return 0 if row is None else int(row["session_epoch"])
+    async def _global_session_epoch_value(self, conn: Any) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
+        value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        return None if value is None else int(value)
 
     def row_sealer(self) -> RowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
@@ -10699,31 +10760,51 @@ class PostgresStore:
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+    ) -> RevokeResult:
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
+        and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row is touched, the order
-        ``create_session`` takes them in. The borrow is :meth:`_after_commit_txn`'s, for the reason
-        it gives."""
+        ``create_session`` takes them in. The kept session is checked against the global epoch
+        too, read here without a lock clause as every reader of it is, and without refusing a
+        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
+        (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
-            await self._bump_session_epoch(conn, user_id)
+            raised = await self._bump_session_epoch(conn, user_id)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
                 now,
                 user_id,
                 except_token_hash,
             )
-            if except_token_hash is not None:
-                epoch = await self._session_epoch(conn, user_id)
-                await self._write_session(
-                    conn,
-                    except_token_hash,
-                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
-                )
-        return _rowcount(status)
+            if except_token_hash is None:
+                return RevokeResult(_rowcount(status))
+            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
+            return await self._keep_or_end_session(
+                conn,
+                _rowcount(status),
+                except_token_hash,
+                KeptSessionRestamp(user_id, raised, unmoved),
+                now,
+            )
+
+    async def _keep_or_end_session(
+        self, conn: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+    ) -> RevokeResult:
+        """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
+        ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
+        ``MessageStore._keep_or_end_session`` states the contract."""
+        if restamp.kept(await self._write_session(conn, token_hash, restamp)):
+            return RevokeResult(revoked, kept=True)
+        status = await conn.execute(
+            _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash
+        )
+        ended = _rowcount(status) == 1
+        return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -10736,14 +10817,17 @@ class PostgresStore:
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
         Raises the store's global session epoch first (BACKLOG #5091), which ends every session
         minted before it whatever account it belongs to, then the epoch of each account its read of
         the account list returns, then ends the sessions it finds and re-seals the kept one under
-        both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that leaves.
+        both new epochs, when it carried both epochs those raises replaced
+        (:class:`KeptSessionRestamp`, BACKLOG #4975), and otherwise ends and counts it
+        (:meth:`_keep_or_end_session`); docs/SECURITY.md, *Limits of the session sweep*, says what
+        that leaves.
 
         The raise is first so a second revoke of every account waits on that one row, holding
         nothing, until this one commits. Nothing else locks the row: every reader of the global
@@ -10751,30 +10835,43 @@ class PostgresStore:
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            current = global_epoch_or_refuse(
-                await conn.fetchval(
-                    "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+            global_raised = global_epoch_raise(
+                global_epoch_or_refuse(
+                    await conn.fetchval(
+                        "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1"
+                        " RETURNING epoch"
+                    )
                 )
             )
-            for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
-                await self._bump_session_epoch(conn, str(row["id"]))
+            raised = {
+                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]))
+                for row in await conn.fetch("SELECT id FROM users ORDER BY id")
+            }
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
-            if except_token_hash is not None:
-                owner = await conn.fetchval(
-                    "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
-                )
-                if owner is not None:
-                    epoch = await self._session_epoch(conn, str(owner))
-                    await self._write_session(
-                        conn,
-                        except_token_hash,
-                        lambda s: replace(s, user_epoch=epoch, global_epoch=current),
-                    )
-        return _rowcount(status)
+            revoked = _rowcount(status)
+            if except_token_hash is None:
+                return RevokeResult(revoked)
+            owner = await conn.fetchval(
+                "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
+            )
+            if owner is None:
+                return RevokeResult(revoked)
+            owner = str(owner)
+            return await self._keep_or_end_session(
+                conn,
+                revoked,
+                except_token_hash,
+                KeptSessionRestamp(owner, raised.get(owner), global_raised),
+                now,
+            )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a Postgres database's
-        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`.
+
+        So a DBA restore of this store is not recorded at start: no session is ended, and no
+        ``store_restored`` row or alert is written. docs/SECURITY.md, *A restored store brings its
+        sessions back*, names the steps an operator takes by hand (BACKLOG #5092)."""
         return None
 
     async def enforce_session_cap(
@@ -11107,10 +11204,10 @@ class PostgresStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
         retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns the number of dead rows purged.
+        Ported, not stubbed. Returns a :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -11132,14 +11229,22 @@ class PostgresStore:
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
                 purged = _rowcount(result)
+                cleared = _rowcount(
+                    await conn.execute(
+                        "UPDATE queue SET last_error=NULL"
+                        f" WHERE status=$1 AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                        OutboxStatus.DEAD.value,
+                        *cutoff_params,
+                    )
+                )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row, release its
                 # streaming attachment here — the deferred half of the per-MESSAGE dead-row split with
@@ -11150,7 +11255,7 @@ class PostgresStore:
                     older_than, connection_cutoffs
                 )
                 await self._release_message_attachments(conn, rel_where, rel_params)
-        return purged
+        return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention) and

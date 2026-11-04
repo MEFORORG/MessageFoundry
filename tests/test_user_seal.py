@@ -76,7 +76,11 @@ def _raw_for(path: Path) -> Any:
 
 async def _user(store: MessageStore, user_id: str) -> None:
     await store.create_user(
-        user_id=user_id, username=user_id, auth_provider="local", password_generated=False
+        user_id=user_id,
+        username=user_id,
+        auth_provider="local",
+        password_generated=False,
+        audits=(),
     )
 
 

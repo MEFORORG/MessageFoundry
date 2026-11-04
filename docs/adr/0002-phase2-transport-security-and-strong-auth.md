@@ -31,8 +31,8 @@
   symbol against the tree on 2026-09-09, because line numbers rot and symbols do not: **WP-13a** is
   `build_api_ssl_context` and `ensure_api_tls_material` ([api/tls.py](../../messagefoundry/api/tls.py)),
   imported and called on the `serve` path ([__main__.py](../../messagefoundry/__main__.py)) for every
-  topology that terminates TLS in-process -- a declared `[api].tls_terminated_upstream` proxy is the
-  deliberate exception, where `ensure_api_tls_material` returns `None` and the serve path builds no
+  topology that terminates TLS in-process -- a declared `[api].tls_terminated_upstream` proxy with no
+  `[api].tls_cert_file` is the deliberate exception, where `ensure_api_tls_material` returns `None` and the serve path builds no
   context at all
   ([ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
   decision 3); **WP-13b** is `_mllp_ssl_context`
@@ -307,6 +307,14 @@ flagged under *Consequences*. This is the honest 12.1.4 posture — **Pass with 
 control** (fail-closed by default + a documented opt-out), not a claim of in-engine OCSP. The
 MLLP-over-TLS per-connection enforced gate and the Postgres/REST/SOAP client paths are scope-adjacent
 residuals tracked in ADR 0078.
+
+*(Note 2026-11-04: a declared proxy is no longer a proof form off loopback, BACKLOG #4636. `serve`
+now refuses a plaintext proxy-to-engine hop on a non-loopback bind, so a proxy in front of one
+re-encrypts to an operator certificate the engine serves itself, and that bind needs
+`MEFOR_TLS_REVOCATION_ATTESTED=1`. At least any loopback bind, a same-machine proxy in front or
+not, still starts without it, and so does an off-loopback bind with no operator certificate, which
+only `[security].enforcement = warn` with the insecure-bind escape starts. ADR 0078's notes of the same date carry the change; this paragraph keeps its original
+wording.)*
 
 ## Options considered
 

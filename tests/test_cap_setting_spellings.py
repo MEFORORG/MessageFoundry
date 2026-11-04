@@ -117,6 +117,9 @@ _OFF_BY_ZERO = [
     pytest.param(_TCP_IN, "max_connections", "max_connections", id="tcp-in-max_connections"),
     pytest.param(_X12_IN, "max_connections", "max_connections", id="x12-in-max_connections"),
     pytest.param(_HTTP_IN, "max_connections", "max_connections", id="http-in-max_connections"),
+    pytest.param(
+        _HTTP_IN, "max_handshakes_per_host", "max_handshakes_per_host", id="http-in-handshakes"
+    ),
     # bytes
     pytest.param(_TCP_IN, "max_frame_bytes", "max_frame_bytes", id="tcp-in-max_frame_bytes"),
     pytest.param(_TCP_OUT, "max_frame_bytes", "max_frame_bytes", id="tcp-out-max_frame_bytes"),
@@ -434,6 +437,9 @@ _INT_CAPS = [
     pytest.param(_HTTP_IN, "max_connections", "max_connections", id="http-in-max_connections"),
     pytest.param(
         _HTTP_IN, "max_connections_per_host", "max_connections_per_host", id="http-in-per_host"
+    ),
+    pytest.param(
+        _HTTP_IN, "max_handshakes_per_host", "max_handshakes_per_host", id="http-in-handshakes"
     ),
     pytest.param(_HTTP_IN, "max_body_bytes", "max_body_bytes", id="http-in-max_body_bytes"),
     pytest.param(_HTTP_IN, "max_header_bytes", "max_header_bytes", id="http-in-max_header_bytes"),

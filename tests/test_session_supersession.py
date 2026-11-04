@@ -515,6 +515,7 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
         auth_provider="ad",
         directory_object_id="guid-jdoe",
         password_generated=False,
+        audits=(),
     )
     await service.bind_federated_subject(
         jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"

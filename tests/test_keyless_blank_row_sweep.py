@@ -55,8 +55,8 @@ async def test_keyless_blank_contract(case: Any, tmp_path: pathlib.Path) -> None
     db = tmp_path / "blank.db"
     key = generate_key()
 
-    async def open_keyed() -> MessageStore:
-        return await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
+    async def open_keyed(**kw: Any) -> MessageStore:
+        return await MessageStore.open(db, cipher=contract.keyed_cipher(make_cipher, key, **kw))
 
     fetch, raw = _adapters(db)
     keyless = await MessageStore.open(db)

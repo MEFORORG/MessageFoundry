@@ -952,7 +952,8 @@ def test_a_caller_set_header_is_refused_over_unverified_tls(family: str) -> None
 
 @pytest.mark.parametrize("family", list(_UNVERIFIED))
 def test_an_admitted_caller_set_header_is_still_refused_over_unverified_tls(family: str) -> None:
-    """The exception covers cleartext legs only. The guard that admits a caller-set header never
+    """The exception covers a cleartext leg and a TLS leg that fully verifies the proxy, never an
+    unverified one. The guard that admits a caller-set header never
     reads the TLS context, so on a leg whose context does not fully verify the proxy the admitted
     header is refused like any other, and the proxy is never dialled (vault BACKLOG #3418)."""
     with _WireProxy() as proxy:
@@ -982,17 +983,25 @@ def test_admission_never_carries_a_proxy_url_credential_to_a_second_proxy() -> N
 
 
 @pytest.mark.parametrize("build", [build_strict_opener, rest._no_redirect_opener])
-def test_control_a_verifying_opener_reaches_the_proxy_over_tls_first(
+def test_an_environment_proxy_credential_is_refused_over_verified_tls(
     monkeypatch: pytest.MonkeyPatch, build: Callable[[], urllib.request.OpenerDirector]
 ) -> None:
-    """The same leg on a verifying opener is let through, as the #3410 fix lets it: the proxy sees
-    one connection, TLS first, and no cleartext request head."""
+    """The same leg on a verifying opener, leg 2 of vault BACKLOG #4909. It was let through, TLS
+    first, until decision d20261031T213402506-5d928c refused an environment credential on it: now
+    nothing is dialled. The control is a credential-free proxy, which still gets one connection,
+    TLS first, and no cleartext request head."""
     with _WireProxy() as proxy:
         monkeypatch.setenv("HTTP_PROXY", f"https://{_CRED}@{proxy.address}")
+        _refused(build(), _HTTP_TARGET, "#4909")
+    assert proxy.connections == 0
+
+    with _WireProxy() as proxy:
+        monkeypatch.setenv("HTTP_PROXY", f"https://{proxy.address}")
         _open_and_discard(build(), _HTTP_TARGET)
     assert proxy.connections == 1
     assert proxy.tls_first == 1
     assert proxy.cleartext == []
+    # The caller-set half of this leg is pinned in tests/test_proxy_header_name_spelling.py.
 
 
 @pytest.mark.parametrize(
@@ -1023,14 +1032,21 @@ def test_a_rest_send_over_an_unverified_proxy_leg_is_refused(
     assert proxy.connections == 0
 
 
-def test_control_a_rest_send_over_a_verifying_proxy_leg_reaches_the_proxy(
+def test_a_rest_send_over_a_verifying_proxy_leg_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same destination with TLS verification left on. ``proxy_url = "default"`` gives it a
-    per-connection opener that reads ``HTTP_PROXY`` when it is built; the shared opener read the
-    environment at import. The proxy gets one connection, TLS first."""
+    """The same destination with TLS verification left on, leg 2 of vault BACKLOG #4909.
+    ``proxy_url = "default"`` gives it a per-connection opener that reads ``HTTP_PROXY`` when it
+    is built; the shared opener read the environment at import. Before #4909 the proxy got one
+    connection, TLS first. Now the send is refused and nothing is dialled. The control is the same
+    destination behind a credential-free proxy, which gets one connection, TLS first."""
     with _WireProxy() as proxy:
         monkeypatch.setenv("HTTP_PROXY", f"https://{_CRED}@{proxy.address}")
+        _send_refused(_rest(_HTTP_TARGET, accepted=True, proxy_url="default"), "#4909")
+    assert proxy.connections == 0
+
+    with _WireProxy() as proxy:
+        monkeypatch.setenv("HTTP_PROXY", f"https://{proxy.address}")
         dest = _rest(_HTTP_TARGET, accepted=True, proxy_url="default")
         with contextlib.suppress(DeliveryError):
             asyncio.run(dest.send('{"a": 1}'))

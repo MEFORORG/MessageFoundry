@@ -302,13 +302,13 @@ def _anonymizers(side: Any) -> tuple[Callable[..., str], ...]:
     return (side.anon.anonymize, side.anon.anonymize_checked)
 
 
-#: Every short line in both places, but for one: a leading ``MSH|^~\&`` IS the message header,
-#: which this check does not walk. The parser reads that line in shape (BACKLOG #2589).
+#: Every short line in both places. A leading ``MSH|^~\&`` IS the message header, the line the
+#: separators come from, and a header below three split fields is refused like any other short
+#: header line (BACKLOG #3001).
 _SHORT_CASES = [
     pytest.param(line, place, id=f"{name}-{place}")
     for name, line in _SHORT_LINES.items()
     for place in ("later", "leading")
-    if not (place == "leading" and line.startswith("MSH"))
 ]
 
 

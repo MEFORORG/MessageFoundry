@@ -26,7 +26,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, session_seal_ok
+from messagefoundry.store.store import MessageStore, RevokeResult, session_seal_ok
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
 RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
@@ -42,6 +42,7 @@ async def _user(store: Any, user_id: str) -> None:
         password_hash="h",
         now=time.time(),
         password_generated=False,
+        audits=(),
     )
 
 
@@ -78,7 +79,9 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
 
     # --- every account's sessions end, but the kept one ----------------------------------------
     revoked = await store.revoke_all_sessions(except_token_hash=hash_token(kept))
-    assert revoked >= 2
+    assert revoked.count >= 2
+    assert revoked.kept  # re-stamped in the revoke's own transaction (BACKLOG #4975)
+    assert not revoked.ended_kept
     assert await service.identity_for_token(second) is None
     assert await service.identity_for_token(other) is None
     survivor = await store.get_session(hash_token(kept))
@@ -102,14 +105,73 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     # --- with no exception, the kept session ends too ------------------------------------------
     fresh = await _mint(store, bob)
     assert await service.identity_for_token(fresh) is not None  # control
-    assert await store.revoke_all_sessions() >= 2
+    everything = await store.revoke_all_sessions()
+    assert everything.count >= 2 and not everything.kept  # nothing to keep, so nothing kept
     assert await service.identity_for_token(kept) is None
     assert await service.identity_for_token(fresh) is None
 
     # --- an exception naming no row excepts nothing ---------------------------------------------
     late = await _mint(store, alice)
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(mint_token())) >= 1
+    nobody = await store.revoke_all_sessions(except_token_hash=hash_token(mint_token()))
+    assert nobody.count >= 1 and not nobody.kept
     assert await service.identity_for_token(late) is None
+
+    # --- a kept session a sweep missed is ended, not stamped back to validity (BACKLOG #4975) ----
+    # Its restored sealed copy stands where a missed row would: live, sealed, an epoch behind on
+    # its account's epoch and on the global one. test_b5091_global_session_epoch.py holds the case
+    # behind on the global epoch alone. The revoke ends it in its own transaction and counts it
+    # (follow-up to BACKLOG #4975); the shared server database makes the count a floor here, and
+    # test_the_revoke_all_count_is_exact_on_sqlite pins it exactly.
+    missed = await _mint(store, alice)
+    snapshot = await store.get_session(hash_token(missed))
+    assert snapshot is not None
+    assert (await store.revoke_all_sessions()).count >= 1
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(missed)),
+    )
+    result = await store.revoke_all_sessions(except_token_hash=hash_token(missed))
+    assert result.count >= 1 and not result.kept and result.ended_kept
+    left = await store.get_session(hash_token(missed))
+    assert left is not None and left.revoked_at is not None  # ended, in the same transaction
+    assert (left.user_epoch, left.global_epoch) == (snapshot.user_epoch, snapshot.global_epoch)
+    assert await service.identity_for_token(missed) is None
+
+    # --- and one behind on its account's epoch alone, as a per-account sweep's miss leaves it ---
+    # The per-account revoke raises no global epoch, so the copy is current on that one: the
+    # re-stamp must check the account's epoch too.
+    behind = await _mint(store, alice)
+    snapshot = await store.get_session(hash_token(behind))
+    assert snapshot is not None
+    assert (await store.revoke_user_sessions(alice)).count >= 1
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(behind)),
+    )
+    account = await store.get_user(alice)
+    assert account is not None
+    assert snapshot.global_epoch == account.global_session_epoch  # current on the global epoch
+    assert snapshot.user_epoch == account.session_epoch - 1  # one account epoch behind
+    result = await store.revoke_all_sessions(except_token_hash=hash_token(behind))
+    assert result.count >= 1 and not result.kept and result.ended_kept
+    left = await store.get_session(hash_token(behind))
+    assert left is not None and left.revoked_at is not None
+    assert (left.user_epoch, left.global_epoch) == (snapshot.user_epoch, snapshot.global_epoch)
+    assert await service.identity_for_token(behind) is None
+
+    # --- and a current one whose account's record fails its seal --------------------------------
+    # The account's epoch cannot be raised, so nothing is stamped and the session is ended. The
+    # control is the same shape with the record's seal intact. Last, because the bent record
+    # refuses every later read of the account.
+    current = await _mint(store, alice)
+    result = await store.revoke_all_sessions(except_token_hash=hash_token(current))
+    assert result.kept and not result.ended_kept  # control
+    assert await service.identity_for_token(current) is not None
+    await raw("UPDATE users SET authz_seal=? WHERE id=?", ("mfseal:v1:b4975:bogus", alice))
+    result = await store.revoke_all_sessions(except_token_hash=hash_token(current))
+    assert result.count >= 1 and not result.kept and result.ended_kept
+    left = await store.get_session(hash_token(current))
+    assert left is not None and left.revoked_at is not None
 
 
 @pytest.fixture
@@ -144,16 +206,33 @@ async def test_the_revoke_all_contract_holds_on_sqlite(
 async def test_the_revoke_all_count_is_exact_on_sqlite(keyed: tuple[MessageStore, Path]) -> None:
     """On a store this test owns the count is exact, which the shared-database contract cannot
     assert: two accounts, three sessions, one kept."""
-    store, _path = keyed
+    store, path = keyed
     await _user(store, "u1")
     await _user(store, "u2")
     kept = await _mint(store, "u1")
     await _mint(store, "u1")
     await _mint(store, "u2")
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(kept)) == 2
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(kept)) == 0
-    assert await store.revoke_all_sessions() == 1
-    assert await store.revoke_all_sessions() == 0
+    keep = hash_token(kept)
+    kept_answer = RevokeResult(2, kept=True, ended_kept=False)
+    assert await store.revoke_all_sessions(except_token_hash=keep) == kept_answer
+    assert await store.revoke_all_sessions(except_token_hash=keep) == RevokeResult(0, True, False)
+    assert await store.revoke_all_sessions() == RevokeResult(1, kept=False, ended_kept=False)
+    assert await store.revoke_all_sessions() == RevokeResult(0, kept=False, ended_kept=False)
+    # Follow-up to BACKLOG #4975: a kept session the revoke declines is ended and counted, beside
+    # one other session. Its restored copy is behind on both epochs, as a missed row is.
+    missed = await _mint(store, "u1")
+    snapshot = await store.get_session(hash_token(missed))
+    assert snapshot is not None
+    assert await store.revoke_all_sessions() == RevokeResult(1, kept=False, ended_kept=False)
+    await _sqlite_raw(path)(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(missed)),
+    )
+    await _mint(store, "u2")
+    assert await store.revoke_all_sessions(except_token_hash=hash_token(missed)) == RevokeResult(
+        2, kept=False, ended_kept=True
+    )
+    assert await store.revoke_all_sessions() == RevokeResult(0, kept=False, ended_kept=False)
 
 
 @pytest.mark.skipif(

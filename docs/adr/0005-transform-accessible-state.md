@@ -104,7 +104,9 @@ Example:
 ```python
 @handler("anonymize")
 def anonymize(msg):
-    mrn = msg["PID-3.1"]
+    mrn = (msg["PID-3.1"] or "").rstrip(" ")
+    if not mrn:
+        return Send("OB_DOWNSTREAM", msg)
     anon = state_get("patient_anon", mrn)
     ops = []
     if anon is None:
@@ -113,6 +115,10 @@ def anonymize(msg):
     msg.set("PID-3.1", anon)
     return [Send("OB_DOWNSTREAM", msg), *ops]
 ```
+
+**Amended 2026-11-03 (BACKLOG #4917):** the example strips trailing spaces and skips an empty MRN,
+as `docs/CONFIGURATION.md` does, because `SetState` refuses an empty key and one ending in a space
+(BACKLOG #1588). The full list of key rules is in `docs/CONFIGURATION.md`, *Transform state*.
 
 ## Consequences
 

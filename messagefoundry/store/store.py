@@ -967,6 +967,11 @@ _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 #: The ``last_error`` of a re-ingress token whose ``response`` artifact retention erased (BACKLOG
 #: #1560). The server backends import it for their own ``ingress_handoff``.
 REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
+#: The ``last_error`` of a re-ingress token whose ``response`` row is gone altogether. Retention keeps
+#: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
+#: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
+REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
+
 
 #: The ``error`` of a re-ingress child whose body failed its HL7 peek, when the worker passes no reason
 #: of its own. The server backends import it, and so does the re-ingress worker, which leads it with
@@ -979,6 +984,24 @@ REINGRESS_PEEK_FAILED: Final = "re-ingress body failed HL7 peek"
 _REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
     "body_ref", "q.body_ref"
 )
+
+
+@dataclass(frozen=True)
+class DeadLetterPurge:
+    """What one ``purge_dead_letters`` call did (BACKLOG #4996). Counts only, never content.
+
+    ``bodies`` is the dead rows whose ``payload`` it blanked, whatever that payload held: the
+    retention audit's purged count. It is a body (on a keyed store, a sealed empty body too), a
+    store-once row's ``shared_body`` key, or a re-ingress token's reply reference. Blanking that
+    reference leaves the reply in ``response.body`` until :meth:`MessageStore.purge_message_bodies`
+    erases it. A row whose payload was already blank is not counted. ``errors_cleared`` is the dead
+    rows whose ``last_error`` it nulled, a payload-blanked row included. It is counted apart because
+    a row whose payload was already blank can still hold error text, which may carry PHI, and a pass
+    that clears only that text must still write its audit row. The backends' docstrings point here."""
+
+    bodies: int = 0
+    errors_cleared: int = 0
+
 
 #: The ``handler_name`` stamped on a pass-through COMPLETION MARKER (BACKLOG #1580). A marker is the
 #: already-terminal ``stage='outbound'`` row :meth:`MessageStore._insert_passthrough_marker` writes so
@@ -1328,8 +1351,9 @@ GLOBAL_SESSION_EPOCH_SQL: Final = "(SELECT epoch FROM global_session_epoch WHERE
 #: The head of every user reader, on every backend: the row, and the global epoch beside it.
 USER_READ_SQL: Final = f"SELECT *, {GLOBAL_SESSION_EPOCH_SQL} AS global_session_epoch FROM users"
 #: Raised by every read or raise of the global epoch that finds no row, so a sign-in, a session
-#: check and an every-account revoke all refuse the same way; a revoke rolls back. Each schema
-#: seeds the row.
+#: check and an every-account revoke all refuse the same way; a revoke rolls back. The one read
+#: that does not raise is the per-account revoke's check of the session it keeps, which logs this
+#: and ends that session instead (``global_epoch_unmoved``). Each schema seeds the row.
 GLOBAL_SESSION_EPOCH_MISSING: Final = (
     "the store's global_session_epoch row is missing, so no session can be stamped or checked and"
     " the every-account session revoke cannot end every session"
@@ -1908,6 +1932,16 @@ _COUNT_USER_SESSIONS_SQL: Final = (
 )
 #: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
 _EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
+#: Ends the session a revoke was asked to keep but declined to re-stamp (``KeptSessionRestamp``),
+#: in the revoke's own transaction and as its sweep ends the rest (follow-up to BACKLOG #4975).
+#: The per-account sweep's own statement, narrowed to the one token, so it ends only a session
+#: that sweep's clause would have ended. Binds ``(now, user_id, token_hash)``. A plain literal, as
+#: the count beside the sweep is, so the transaction-verb guard can read it; keep it in step with
+#: :data:`_REVOKE_USER_SESSIONS_SQL`.
+_END_DECLINED_KEPT_SESSION_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
+    " AND token_hash=?"
+)
 
 
 @dataclass(frozen=True)
@@ -2817,6 +2851,144 @@ def new_user_record(
 #: A change to one user record, for a backend's ``_write_user``: the new record, or ``None`` to
 #: write nothing (a condition the old statement carried in its WHERE did not hold).
 UserChange = Callable[[UserAuthzRecord], UserAuthzRecord | None]
+
+
+class EpochRaise(NamedTuple):
+    """One raise of a session epoch: the value it replaced and the value it wrote (BACKLOG #4975).
+    A revoke re-stamps the session it keeps only when that session carried :attr:`before`. An
+    epoch a revoke checks but does not raise is one with :attr:`before` equal to :attr:`after`
+    (:func:`global_epoch_unmoved`)."""
+
+    before: int
+    after: int
+
+
+class EpochBump:
+    """A :data:`UserChange` that raises the account's session epoch and keeps the epoch it raised
+    from (BACKLOG #4975). ``_write_user`` calls it with the record it read under the account's lock,
+    so :attr:`before` is the value that write replaced, not a separate read. A backend's
+    ``_bump_session_epoch`` passes it to ``_write_user`` and reports :meth:`raised`."""
+
+    def __init__(self) -> None:
+        self.before: int | None = None
+
+    def __call__(self, record: UserAuthzRecord) -> UserAuthzRecord:
+        self.before = record.row.session_epoch
+        return record.bump_epoch()
+
+    def raised(self, updated: UserAuthzRecord | None) -> EpochRaise | None:
+        """The raise ``_write_user`` reported, or ``None`` when it wrote nothing: no row, or a
+        compare lost to a concurrent write. A record that fails its seal raises instead."""
+        if updated is None or self.before is None:
+            return None
+        return EpochRaise(self.before, updated.row.session_epoch)
+
+
+def global_epoch_raise(after: int) -> EpochRaise:
+    """The raise of the store's global session epoch that wrote ``after`` (BACKLOG #4975, #5091).
+
+    Exact: the global raise is one ``UPDATE`` that adds one to the row it holds locked, and one
+    that matches no row refuses the whole revoke, so no revoke goes on with that epoch unmoved.
+    The per-account raise instead keeps the value it replaced (:class:`EpochBump`), as Lander
+    decision d20261101T013132231-ef9540 asks of its guard, so that guard rests on no assumption
+    about what ``bump_epoch`` adds or about which failures stop the write."""
+    return EpochRaise(after - 1, after)
+
+
+def global_epoch_unmoved(current: int | None) -> EpochRaise | None:
+    """The store's global session epoch as a per-account revoke sees it: ``current``, read in
+    that revoke's own transaction, which raises no global epoch (follow-up to BACKLOG #4975).
+
+    The kept session must carry it to be stamped, and its global stamp is left at it, so a
+    session behind on the global epoch alone is declined, and ended, as one behind on its
+    account's epoch is. ``None`` where the read found no row (:data:`GLOBAL_SESSION_EPOCH_MISSING`
+    says what refuses then): nothing can be checked against it, so the kept session is declined
+    and ended, and the revoke still ends the rest rather than roll back and keep them live. The
+    missing row is logged, since every other read of it refuses loudly."""
+    if current is None:
+        log.warning(
+            "%s; the session this revoke was asked to keep is not re-stamped, and if it is a live"
+            " session of this account it will be ended with the rest",
+            GLOBAL_SESSION_EPOCH_MISSING,
+        )
+        return None
+    return EpochRaise(current, current)
+
+
+@dataclass(frozen=True, slots=True)
+class RevokeResult:
+    """What ``revoke_user_sessions`` and ``revoke_all_sessions`` did (BACKLOG #4975).
+
+    :attr:`count` is how many sessions the revoke ended, the one it was asked to keep included
+    when it ended that one. :attr:`kept` is True only when the revoke re-stamped the session it
+    was asked to keep, in its own transaction, with the epochs it raised
+    (:class:`KeptSessionRestamp`); a revoke given no session to keep reports False. It says what
+    the revoke did, not what a later request sees: the gate's other checks, such as expiry, still
+    apply to a kept session, and a later revoke can still end it. :attr:`ended_kept` is True when
+    the revoke declined to re-stamp that session and ended it instead, in the same transaction
+    (follow-up to BACKLOG #4975); that row is in :attr:`count`."""
+
+    count: int
+    kept: bool = False
+    ended_kept: bool = False
+
+    @property
+    def others(self) -> int:
+        """How many sessions the revoke ended besides the one it was asked to keep."""
+        return self.count - self.ended_kept
+
+
+class KeptSessionRestamp:
+    """The change a revoke applies to the session it keeps (BACKLOG #2592, #4975, #5091).
+
+    The new epochs go onto the kept session only when it is ``user_id``'s and carried the epochs
+    the revoke raised from: its account's (``raised``) and the store's global one
+    (``global_epoch``). The every-account revoke raises the global epoch and passes
+    :func:`global_epoch_raise`; the per-account revoke raises none and passes
+    :func:`global_epoch_unmoved`, so the session keeps its global stamp and must already carry the
+    current one. A kept session an earlier sweep missed is behind on one of them; stamping it
+    would make it valid again. With no account raise, as where the account's record fails its
+    seal, or no global epoch read, nothing is stamped. A session of ``user_id`` this declines is
+    then ended by the revoke in the same transaction (follow-up to BACKLOG #4975); a session of
+    another account, which that revoke's sweep does not reach, is declined and left as it is.
+
+    A backend passes it to ``_write_session`` and reports :meth:`kept` with what that returned,
+    so the revoke says whether it stamped the session from the same transaction that did it."""
+
+    def __init__(
+        self, user_id: str, raised: EpochRaise | None, global_epoch: EpochRaise | None
+    ) -> None:
+        self._user_id = user_id
+        self._raised = raised
+        self._global_epoch = global_epoch
+        self._stamped = False
+
+    @property
+    def user_id(self) -> str:
+        """The account whose session this stamps; a revoke ends a declined session only if it is
+        this account's."""
+        return self._user_id
+
+    def __call__(self, s: SessionRecord) -> SessionRecord:
+        raised, global_epoch = self._raised, self._global_epoch
+        self._stamped = False
+        if (
+            raised is None
+            or global_epoch is None
+            or s.user_id != self._user_id
+            or not session_epochs_current(
+                s, user_epoch=raised.before, global_epoch=global_epoch.before
+            )
+        ):
+            return s
+        self._stamped = True
+        return replace(s, user_epoch=raised.after, global_epoch=global_epoch.after)
+
+    def kept(self, written: SessionRecord | None) -> bool:
+        """Whether the write ``_write_session`` reported carried the new epochs: False when it
+        wrote nothing (no unrevoked row, or a compare lost to a concurrent write) or when this
+        change left the session as it was. A session whose seal fails raises there instead."""
+        return written is not None and self._stamped
 
 
 def full_authentication_clear(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
@@ -5815,6 +5987,29 @@ async def settle_audit_ranges(
         )
 
 
+#: The refusals of :func:`roll_audit_key_range` that no re-run, restored key or new key clears,
+#: because the roll verifies the whole chain first (BACKLOG #4934, #4935). Each is the start of the
+#: refusal's text, so :func:`audit_roll_refused_for_good` reads the same strings the roll writes.
+_ROLL_NO_GENESIS = "the audit chain does not open with a genesis row naming its key"
+_ROLL_UNAUTHENTICATED = "the audit chain's key ranges do not authenticate"
+_ROLL_BROKEN = "refusing to roll a broken audit chain"
+_ROLL_BROKEN_UNDER_ACTIVE = "the audit chain is under the active key but does not verify"
+_ROLL_REFUSED_FOR_GOOD = (
+    _ROLL_NO_GENESIS,
+    _ROLL_UNAUTHENTICATED,
+    _ROLL_BROKEN,
+    _ROLL_BROKEN_UNDER_ACTIVE,
+)
+
+
+def audit_roll_refused_for_good(message: str) -> bool:
+    """Whether ``message``, a refusal :func:`roll_audit_key_range` returned, is one no re-run clears,
+    under any key, a new one included: a chain that does not verify, or rows with no genesis row
+    (BACKLOG #4934, #4935). ``False`` for the refusals a re-run or a restored key can clear, such as
+    a missing range key or a head that moved during the roll."""
+    return message.startswith(_ROLL_REFUSED_FOR_GOOD)
+
+
 async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     """``rotate-key``'s audit step (BACKLOG #1904): open a range under the ACTIVE key.
 
@@ -5828,13 +6023,16 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     the key the chain names for that range is not configured (BACKLOG #1945).
 
     OFFLINE ONLY: another process keeps the range it read at open, so an engine left running would go
-    on appending under the old key after the range row and break the chain."""
+    on appending under the old key after the range row and break the chain.
+
+    A refusal no re-run clears starts with one of :data:`_ROLL_REFUSED_FOR_GOOD`; a new one goes
+    there too, or ``rotate-key`` names no way out after it (BACKLOG #4934, #4935)."""
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
     if not host._audit_chain_keyed:
         if host._audit_chain_unkeyed:
             return False, (
-                "the audit chain does not open with a genesis row naming its key, so it has no "
-                "keyed range to roll; run `messagefoundry audit-verify`"
+                f"{_ROLL_NO_GENESIS}, so it has no keyed range to roll; run "
+                "`messagefoundry audit-verify`"
             )
         return True, "audit chain is keyless; no keyed range to roll"
     if active_id is None:
@@ -5842,14 +6040,14 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     if not host._audit_ranges_trusted:
         return (
             False,
-            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+            f"{_ROLL_UNAUTHENTICATED}; run `messagefoundry audit-verify`",
         )
     current, current_from = host._audit_range_key_id, host._audit_range_from
     # A keyed, trusted chain was settled at open, which sets all three. The test narrows the types.
     if current is None or current_from is None or not host._audit_range_keys:
         return (
             False,
-            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+            f"{_ROLL_UNAUTHENTICATED}; run `messagefoundry audit-verify`",
         )
     # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
     # key when the chain's own current range is under a key that is not configured. Read as the
@@ -5884,8 +6082,8 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     )
     if not ok:
         if current == active_id:
-            return False, f"the audit chain is under the active key but does not verify: {msg}"
-        return False, f"refusing to roll a broken audit chain: {msg}"
+            return False, f"{_ROLL_BROKEN_UNDER_ACTIVE}: {msg}"
+        return False, f"{_ROLL_BROKEN}: {msg}"
     if len(rows) < current_from:
         # The log is shorter than the range this handle read at open: rows went missing while it
         # was open. A shorter chain still verifies, so this is the one place the roll can see it.
@@ -5930,6 +6128,29 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         f"audit chain range from seq={current_from} closed ({closes['rows']} row(s)); a new range "
         f"under the active key opens at seq={host._audit_range_from}"
     )
+
+
+def audit_chain_rolled(store: object) -> bool | None:
+    """Whether the keyed audit chain's newest range is under the store's ACTIVE key, as the open
+    settled it (BACKLOG #4942, #4936). ``rotate-key`` rolls the chain only after both data passes, so
+    after a key change a chain that has not rolled says no run has got that far on this key.
+
+    ``None`` when the store has no keyed chain to ask, or no key: a keyless store, a backend
+    without one, or a chain whose rows open with no genesis row. ``False`` for ranges the open could
+    not authenticate, since the caller withholds a stamp on ``False``, and an unknown answer must
+    not lift that hold. Read by attribute, so a store that is not an :class:`AuditRangeHost` answers
+    ``None``. No I/O: the open already read the chain."""
+    if not getattr(store, "_audit_chain_keyed", False):
+        return None
+    active = audit_active_key_id(
+        getattr(store, "_audit_mac_key", None), getattr(store, "_audit_mac_fn", None)
+    )
+    if active is None:
+        return None
+    if not getattr(store, "_audit_ranges_trusted", False):
+        return False
+    keys = getattr(store, "_audit_range_keys", None)
+    return bool(isinstance(keys, list) and keys and keys[-1] == active)
 
 
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
@@ -6110,8 +6331,13 @@ _OWNER_ONLY = stat.S_IRUSR | stat.S_IWUSR  # 0o600
 
 
 def _current_user() -> str | None:
-    """The current OS user for an owner-only DACL, with a fallback when ``%USERNAME%`` is empty
-    (some NSSM/service contexts) — ``getpass.getuser`` consults the process token, not just env."""
+    """The current OS user for an owner-only DACL: ``%USERNAME%``, or when that is empty (some
+    NSSM/service contexts) ``getpass.getuser``. That reads ``LOGNAME``, ``USER``, ``LNAME`` and
+    ``USERNAME`` from the environment, in that order; on Windows it has no ``pwd`` database to fall
+    back on, so with none of them set it raises ``OSError`` and this returns ``None``. So on
+    Windows, the one platform :func:`_secure_file` calls this on, every source is an environment
+    variable, never the process token, and an inherited or overridden variable names whoever it
+    says."""
     user = os.environ.get("USERNAME")
     if user:
         return user
@@ -7155,6 +7381,13 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
+DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the caller's own per-result
+statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
+alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
+missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
+The one exception is an operator inject, which always writes a message, so its ``None`` return is
+refused too (BACKLOG #5071, :func:`require_ingress_audit`).
+
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
 not read chain state."""
@@ -7521,17 +7754,101 @@ async def _audit_row_mac_verifies(
     )
 
 
-def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
-    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
-    if audit is None:
-        return ()
+def require_operator_audit(audit: object, mutation: str) -> None:
+    """Refuse a missing operator audit before ``mutation`` writes anything (BACKLOG #5069).
+
+    Every operator mutation's ``audit`` is required with no default, so mypy refuses a typed caller
+    that leaves it out or passes ``None``. This is the runtime half, for a caller mypy does not
+    check: an explicit ``None``, or anything else that is not callable, raises :class:`TypeError`.
+    Each mutation calls it first, so the refusal writes nothing."""
+    if not callable(audit):
+        raise TypeError(
+            f"{mutation} needs an operator audit, a callable that builds its audit row; got "
+            f"{type(audit).__name__} (BACKLOG #5069)"
+        )
+
+
+#: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
+#: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
+#: origin is a decision: the test classifies every member as operator or not.
+OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
+
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin
+) -> OperatorAudit[str] | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+
+    Before anything is written, an operator origin with no audit or with one that is not callable,
+    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
+    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+    It keys on ``origin``, so it cannot see an operator's inject written with the default
+    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
+    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
+    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
+    ``audit`` and always writes ``operator_upload``."""
+    operator = origin in OPERATOR_ORIGINS
+    if not operator:
+        if audit is not None:
+            # An audit is an operator's inject; with this origin the message would be labelled
+            # as a receipt, so the caller forgot the origin.
+            raise TypeError(
+                f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
+                " inject names its operator origin (BACKLOG #5071)"
+            )
+        return None
+    if not callable(audit):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
+            f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    build = audit
+
+    def row_required(message_id: str) -> AuditAppend:
+        row = build(message_id)
+        if row is None:
+            raise TypeError(
+                "an operator inject's audit returned no row, and an inject always writes a"
+                " message, so it always records one (BACKLOG #5071)"
+            )
+        return row
+
+    return row_required
+
+
+def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend, ...]:
+    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624).
+
+    A return that is neither ``None`` nor an :class:`AuditAppend` raises :class:`TypeError`
+    (BACKLOG #5069); a ``None`` RETURN stays allowed, see :data:`OperatorAudit`. ``None`` in place
+    of ``audit`` raises here too. Each mutation already refused it at entry, before any write; this
+    is the backstop for a mutation that forgets that line, and here the raise rolls it back."""
+    require_operator_audit(audit, "an operator mutation")
     row = audit(result)
-    return () if row is None else (row,)
+    if row is None:
+        return ()
+    if not isinstance(row, AuditAppend):
+        raise TypeError(
+            f"an operator audit returned {type(row).__name__}, not an AuditAppend or None"
+            " (BACKLOG #5069)"
+        )
+    return (row,)
 
 
 def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
     """``audit`` when the mutation changed a row, otherwise nothing (vault BACKLOG #3217). The
-    operator alert mutations take one, so an unknown or resolved id records no row."""
+    operator alert mutations take one, so an unknown or resolved id records no row.
+
+    Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
+    here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
+    #5069)."""
+    if not isinstance(audit, AuditAppend):
+        raise TypeError(
+            f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
+            " (BACKLOG #5069)"
+        )
     return lambda applied: audit if applied else None
 
 
@@ -7851,7 +8168,15 @@ def _security_events_where(username: str, until: float | None) -> tuple[str, lis
     inclusive because a directory account's birth row is written with ``created_at`` as its own
     ``ts``. It is a read filter, so the hash-chained ``audit_log`` is untouched. It does not cover a row that keeps its ``created_at``
     while its name or holder changes: a directory rename onto the name, or a ``provision-admin``
-    repair of an existing row. Rows under the name from before either change still show."""
+    repair of an existing row. Rows under the name from before either change still show.
+
+    At least these residuals are open too, rather than accepted (BACKLOG #3378). SQL Server
+    compares ``actor = ?`` under the column's collation, so under a case-insensitive one the feed
+    also shows rows recorded under a case variant of the name. Its ``=`` also ignores trailing
+    spaces under any collation. A failed sign-in records the name as typed, so a row under the name
+    with trailing spaces shows too. #3072 is the same compare in the rename path. ``ts`` and
+    ``created_at`` are each stamped by the host that wrote them. So on a server store that several
+    hosts share, clock skew between them can move a row across the bound."""
     params: list[Any] = [username, username]
     clause = (
         " WHERE actor = ? AND action LIKE 'auth.%'"
@@ -8622,7 +8947,8 @@ class SecretRotationMetaRow:
     ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value.
 
     One row tracks no secret: the rotation record, ``secret_key`` ``rotate-key:incomplete`` (BACKLOG
-    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on and has not
+    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on, or a start
+    found changed with the keyed audit chain not rolled to it (BACKLOG #4942), and no run has
     finished, unsealed, or blank once one finished. Its dates are when it first opened, or when a
     run closed it."""
 
@@ -9631,8 +9957,9 @@ class MessageStore:
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
         values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
-        only on a surface with no marker and no ciphertext, under the opt-out too, and they count as
-        something to seal, so the marker can never be written over them unsealed. All identifiers
+        only by the open that writes the marker on a surface holding no ciphertext, under the
+        opt-out too (BACKLOG #4996). There they count as something to seal, so that open never
+        writes the marker over them unsealed. All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
@@ -11220,6 +11547,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -12873,7 +13201,8 @@ class MessageStore:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
-        is dead-lettered as a corrupt reference and keeps its reference as the evidence."""
+        is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
+        evidence."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -12974,9 +13303,7 @@ class MessageStore:
             )
             art = await cur.fetchone()
             if art is None:
-                return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
-                )
+                return await _consume_dead(REINGRESS_ARTIFACT_MISSING, "re-ingress reply missing")
             if art["body"] is None:
                 return await _consume_dead(
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
@@ -13138,8 +13465,8 @@ class MessageStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
         parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
-        prior handoff) or its reference is malformed, and ``""`` if the artifact is gone, which
-        ``ingress_handoff`` then dead-letters. The
+        prior handoff) or its reference is malformed, and ``""`` if the artifact row is missing, its
+        body was erased, or the reply was empty; :meth:`ingress_handoff` tells those apart. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
         peek and the raw always agree."""
         async with self._read() as db:
@@ -13834,6 +14161,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, and the row commits with the
         replay (BACKLOG #2624, :data:`OperatorAudit`)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
@@ -13963,6 +14291,7 @@ class MessageStore:
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
         origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
         ``new_message_id`` (vault BACKLOG #2615)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -14194,6 +14523,7 @@ class MessageStore:
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
         ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -14374,6 +14704,7 @@ class MessageStore:
         **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
         BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
         its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -14432,6 +14763,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
@@ -15471,7 +15803,7 @@ class MessageStore:
         ]
 
     async def _append_operator_audit[R](
-        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
         that fails rolls the mutation back with it. ``written`` tees the row once the commit lands."""
@@ -15479,7 +15811,7 @@ class MessageStore:
         written.add(audits, await self._append_audits(audits, now=written.now))
 
     async def _commit_operator_noop[R](
-        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Audit an operator mutation that found nothing to change (BACKLOG #2624). Its row may be
         the only write, so commit only when there is one: a bare commit would count a transaction."""
@@ -15824,7 +16156,7 @@ class MessageStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638). The Store protocol states the contract: the row is read and checked in the write,
@@ -16325,7 +16657,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -16547,7 +16879,7 @@ class MessageStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says why
@@ -16682,7 +17014,7 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -17978,17 +18310,23 @@ class MessageStore:
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
-        caller's current session — "sign out everywhere else"). Returns the number revoked.
+        caller's current session — "sign out everywhere else"), which is kept only when it is
+        re-stamped below and is otherwise ended too. Returns the number revoked and
+        whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy
-        of any of those rows resolves to nothing. The kept session is re-sealed under the new epoch
-        through :meth:`_write_session`; if its own seal does not verify, that raises
-        :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
+        of any of those rows resolves to nothing. The kept session is re-sealed through
+        :meth:`_write_session`, under the new epoch only when it carried the epoch the raise
+        replaced and the current global epoch, read in this transaction without refusing a
+        missing row (:func:`global_epoch_unmoved`, :class:`KeptSessionRestamp`, BACKLOG #4975);
+        otherwise it is ended with the rest and counted (:meth:`_keep_or_end_session`). If its
+        own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
+        revokes included, rolls back."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._bump_session_epoch(user_id)
+            raised = await self._bump_session_epoch(user_id)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
@@ -17997,14 +18335,31 @@ class MessageStore:
                     (now, user_id, except_token_hash),
                 )
             revoked = int(cur.rowcount)
-            if except_token_hash is not None:
-                epoch = await self._session_epoch(user_id)
-                await self._write_session(
-                    except_token_hash,
-                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+            if except_token_hash is None:
+                result = RevokeResult(revoked)
+            else:
+                unmoved = global_epoch_unmoved(await self._global_session_epoch_value())
+                result = await self._keep_or_end_session(
+                    revoked, except_token_hash, KeptSessionRestamp(user_id, raised, unmoved), now
                 )
             await self._commit()
-        return revoked
+        return result
+
+    async def _keep_or_end_session(
+        self, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+    ) -> RevokeResult:
+        """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside the
+        revoke's writer transaction (follow-up to BACKLOG #4975). ``revoked`` is the sweep's count;
+        an ended kept session is added to it. A declined session left live would be refused at
+        its next request anyway, but meanwhile it would hold a slot under the session cap and its
+        refusal would read as a seal failure, so it is ended here, as the sweep ends the rest."""
+        if restamp.kept(await self._write_session(token_hash, restamp)):
+            return RevokeResult(revoked, kept=True)
+        cur = await self._db.execute(
+            _END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash)
+        )
+        ended = cur.rowcount == 1
+        return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -18023,21 +18378,25 @@ class MessageStore:
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
         :meth:`AuthStore.revoke_all_sessions`."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            revoked = await self._revoke_all_sessions_in_txn(except_token_hash, now)
+            result = await self._revoke_all_sessions_in_txn(except_token_hash, now)
             await self._commit()
-        return revoked
+        return result
 
-    async def _revoke_all_sessions_in_txn(self, except_token_hash: str | None, now: float) -> int:
+    async def _revoke_all_sessions_in_txn(
+        self, except_token_hash: str | None, now: float
+    ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
         The store's global session epoch is raised first (BACKLOG #5091), then every account's
         epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
-        row is re-sealed under its own account's new epoch and the new global one.
+        row is re-sealed under its own account's new epoch and the new global one, when it carried
+        both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
+        otherwise ended and counted (:meth:`_keep_or_end_session`).
 
         The first statement is a write, which takes SQLite's write lock, so the reads below run
         under it: another process (an engine shard, or the engine beside
@@ -18049,8 +18408,9 @@ class MessageStore:
         if cur.rowcount != 1:
             raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
-        for row in await cur.fetchall():
-            await self._bump_session_epoch(str(row[0]))
+        raised = {
+            str(row[0]): await self._bump_session_epoch(str(row[0])) for row in await cur.fetchall()
+        }
         # Spelled at the call, not built from a constant, so the BEGIN guard in
         # `tests/test_writer_txn_is_the_only_begin.py` can read it.
         cur = await self._db.execute(
@@ -18060,19 +18420,21 @@ class MessageStore:
         )
         revoked = int(cur.rowcount)
         if except_token_hash is None:
-            return revoked
-        kept = await self._db.execute(
+            return RevokeResult(revoked)
+        cur = await self._db.execute(
             "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
         )
-        owner = await kept.fetchone()
-        if owner is not None:
-            epoch = await self._session_epoch(str(owner[0]))
-            current = await self._global_session_epoch()
-            await self._write_session(
-                except_token_hash,
-                lambda s: replace(s, user_epoch=epoch, global_epoch=current),
-            )
-        return revoked
+        owner = await cur.fetchone()
+        if owner is None:
+            return RevokeResult(revoked)
+        user_id = str(owner[0])
+        global_raised = global_epoch_raise(await self._global_session_epoch())
+        return await self._keep_or_end_session(
+            revoked,
+            except_token_hash,
+            KeptSessionRestamp(user_id, raised.get(user_id), global_raised),
+            now,
+        )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Record a restore once: revoke every session, append ``store_restored`` and delete the
@@ -18103,7 +18465,7 @@ class MessageStore:
                 last_audit_at=finite_or_none(row[2]),
                 restored_at=now if (at := finite_or_none(row[3])) is None else at,
                 sessions_revoked=int(row[4] or 0)
-                + await self._revoke_all_sessions_in_txn(None, now),
+                + (await self._revoke_all_sessions_in_txn(None, now)).count,
             )
             audit = AuditAppend(
                 action=STORE_RESTORED_ACTION,
@@ -18132,29 +18494,31 @@ class MessageStore:
         tee_audits((audit,), appended, ts=now)
         return record
 
-    async def _session_epoch(self, user_id: str) -> int:
-        """The account's session epoch, read on the writer connection inside the caller's
-        transaction (BACKLOG #2592). 0 for an account that is not there."""
-        cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
-        row = await cur.fetchone()
-        return 0 if row is None else int(row["session_epoch"])
-
     async def _global_session_epoch(self) -> int:
         """The store's global session epoch (BACKLOG #5091), read on the writer connection inside
         the caller's transaction."""
+        return global_epoch_or_refuse(await self._global_session_epoch_value())
+
+    async def _global_session_epoch_value(self) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
         cur = await self._db.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         row = await cur.fetchone()
-        return global_epoch_or_refuse(None if row is None else row[0])
+        return None if row is None or row[0] is None else int(row[0])
 
-    async def _bump_session_epoch(self, user_id: str) -> None:
+    async def _bump_session_epoch(self, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
-        transaction (BACKLOG #2592). An account whose record fails its seal is refused on every
-        read already, so the revoke that called this goes ahead without the raise: ending sessions
-        needs no key, and refusing it would keep them live."""
+        transaction (BACKLOG #2592), and report the raise, or ``None`` where none was written
+        (:meth:`EpochBump.raised`, BACKLOG #4975). An account whose record fails its seal is
+        refused on every read already, so the revoke that called this goes ahead without the
+        raise, and reports none: ending sessions needs no key, and refusing it would keep them
+        live."""
+        bump = EpochBump()
         try:
-            await self._write_user(user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def enforce_session_cap(
         self,
@@ -18662,13 +19026,14 @@ class MessageStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` — their own
         retention window, separate from :meth:`purge_message_bodies` because a dead row stays
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
-        Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+        Idempotent: a re-run matches no row. Returns a :class:`DeadLetterPurge`, which says what
+        each of its counts covers (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
         ``ingress`` row and a handler raise the ``routed`` row
@@ -18717,12 +19082,19 @@ class MessageStore:
                 f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                 (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
             )
+            # Two statements, so each count is its own rowcount (DeadLetterPurge, BACKLOG #4996).
             cur = await self._db.execute(
-                "UPDATE queue SET payload='', last_error=NULL "
-                "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
-                f"AND updated_at < {cutoff_sql}",
+                "UPDATE queue SET payload='' "
+                f"WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
                 (OutboxStatus.DEAD.value, *cutoff_params),
             )
+            purged = int(cur.rowcount)
+            cur = await self._db.execute(
+                "UPDATE queue SET last_error=NULL "
+                f"WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                (OutboxStatus.DEAD.value, *cutoff_params),
+            )
+            cleared = int(cur.rowcount)
             # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
             # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
             # still-replayable dead row, per the negated live-holder predicate), release its streaming
@@ -18744,7 +19116,7 @@ class MessageStore:
                 ),
             )
             await self._commit()
-            return int(cur.rowcount)
+            return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention).

@@ -56,6 +56,7 @@ async def _assert_directory_identity_contract(store: Any) -> None:
         directory_object_id=BOUND_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_user(
         user_id="dir-other",
@@ -64,6 +65,7 @@ async def _assert_directory_identity_contract(store: Any) -> None:
         directory_object_id=OTHER_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_user(
         user_id="dir-unbound",
@@ -72,6 +74,7 @@ async def _assert_directory_identity_contract(store: Any) -> None:
         password_hash="h",
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
 
     # Precondition, not decoration: if the INSERT dropped the value the lookup below would be
@@ -122,6 +125,7 @@ async def _assert_directory_id_compare_is_byte_exact(store: Any) -> None:
         directory_object_id=CASE_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # The control is what makes the miss below a fact about CASE rather than about the row being
     # absent, the column being unwritten, or the id being misspelt in this file.
@@ -150,6 +154,7 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
         directory_object_id=BOUND_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
 
     # 1. The column itself permits a second row on the same id. Asserting this is not endorsing the
@@ -162,6 +167,7 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
         directory_object_id=BOUND_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
 
     # 2. The control that IS in force: a repeated username violates UNIQUE(username) with the
@@ -176,6 +182,7 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
             directory_object_id=OTHER_GUID,
             now=1_000.0,
             password_generated=False,
+            audits=(),
         )
     except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
         name = type(exc).__name__ + "".join(t.__name__ for t in type(exc).__mro__)
@@ -223,6 +230,7 @@ async def _assert_username_refresh_contract(store: Any) -> None:
         directory_object_id=RENAME_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_user(
         user_id="squatter",
@@ -231,13 +239,14 @@ async def _assert_username_refresh_contract(store: Any) -> None:
         directory_object_id=SQUATTER_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
 
     # 1. THE ORDINARY REFRESH. The row keeps its id and its binding; only the label moves. Both
     #    halves are asserted: a write that moved the row would pass a name check alone, and a write
     #    that did nothing would pass an id check alone.
     assert await store.set_user_username(
-        "rename-me", "jdoe-married", expected_username="jdoe", now=2_000.0
+        "rename-me", "jdoe-married", expected_username="jdoe", now=2_000.0, audits=()
     ), "a refresh that applied reported no write"
     moved = await store.get_user_by_username("jdoe-married")
     assert moved is not None, "the refresh did not apply"
@@ -253,7 +262,7 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     #    only reason the subquery exists. A backend that dropped the guard would raise its own
     #    integrity class here and take the reconciler pass down with it.
     assert not await store.set_user_username(
-        "rename-me", "taken", expected_username="jdoe-married", now=3_000.0
+        "rename-me", "taken", expected_username="jdoe-married", now=3_000.0, audits=()
     ), "a refresh the guard refused reported a write"
     still = await store.get_user_by_directory_object_id(RENAME_GUID)
     assert still is not None and still.username == "jdoe-married", (
@@ -275,7 +284,7 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     before = await store.get_user("rename-me")
     assert before is not None
     assert await store.set_user_username(
-        "rename-me", "jdoe-married", expected_username="jdoe-married", now=4_000.0
+        "rename-me", "jdoe-married", expected_username="jdoe-married", now=4_000.0, audits=()
     )
     same = await store.get_user_by_username("jdoe-married")
     assert same is not None and same.id == "rename-me"
@@ -289,7 +298,7 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     #    match some other row. The expected name is one another row DOES hold, so a backend that
     #    dropped `id=?` would rename that row and fail here, rather than matching nothing by luck.
     assert not await store.set_user_username(
-        "no-such-user", "ghost", expected_username="taken", now=5_000.0
+        "no-such-user", "ghost", expected_username="taken", now=5_000.0, audits=()
     )
     assert await store.get_user_by_username("ghost") is None
     squatter = await store.get_user("squatter")
@@ -303,12 +312,12 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     #    compare on the old name can stop this write; a backend that dropped it would apply the
     #    write and return True.
     assert await store.set_user_username(
-        "rename-me", "jdoe-wins", expected_username="jdoe-married", now=6_000.0
+        "rename-me", "jdoe-wins", expected_username="jdoe-married", now=6_000.0, audits=()
     )
     stale_before = await store.get_user("rename-me")
     assert stale_before is not None and stale_before.username == "jdoe-wins"
     assert not await store.set_user_username(
-        "rename-me", "jdoe-loses", expected_username="jdoe-married", now=7_000.0
+        "rename-me", "jdoe-loses", expected_username="jdoe-married", now=7_000.0, audits=()
     ), "a write on a stale expected name reported success"
     stale_after = await store.get_user("rename-me")
     assert stale_after is not None and stale_after.username == "jdoe-wins", (
@@ -382,6 +391,7 @@ async def _assert_username_compare_is_byte_exact(store: Any) -> None:
         directory_object_id=SQUATTER_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_user(
         user_id="case-mover",
@@ -390,18 +400,19 @@ async def _assert_username_compare_is_byte_exact(store: Any) -> None:
         directory_object_id=RENAME_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # The control: a byte-identical collision IS refused, so the success below is a fact about case
     # rather than about the guard being absent.
     assert not await store.set_user_username(
-        "case-mover", "Alice", expected_username="bob", now=2_000.0
+        "case-mover", "Alice", expected_username="bob", now=2_000.0, audits=()
     ), "a refused byte-identical collision reported a write"
     assert (await store.get_user("case-mover")).username == "bob", (
         "the guard did not refuse a byte-identical collision"
     )
 
     assert await store.set_user_username(
-        "case-mover", "alice", expected_username="bob", now=3_000.0
+        "case-mover", "alice", expected_username="bob", now=3_000.0, audits=()
     ), "a rename differing only in case reported no write"
     moved = await store.get_user("case-mover")
     assert moved is not None and moved.username == "alice", (

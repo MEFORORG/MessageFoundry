@@ -179,8 +179,11 @@ def _refuse_an_unrevoked_ai_hop(
       only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing or unknown posture.
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
-      through, never off a setting. Today that is rest.py's shared import-time opener, which
-      loads no CRL, so it is ``False``, and no CRL lever is built for this hop.
+      through, never off a setting. It is ``True`` only when that context checks a CRL
+      (``context_checks_revocation``) and does not skip time validity
+      (``skips_validity_period``), which would accept a CRL past its ``nextUpdate`` (vault
+      BACKLOG #5086). Today that is rest.py's shared import-time opener, which loads no CRL and
+      does not skip time validity, so it is ``False``, and no CRL lever is built for this hop.
     * An attestation with no reason or a blank one, and a reason holding a control character or a
       lone surrogate, are refused here as at settings load, so a broker built directly cannot
       cross with no recorded reason or forge a log line through it.
@@ -236,8 +239,8 @@ def _refuse_an_unrevoked_ai_hop(
         refusal = str(exc)
     if refusal is not None:
         raise AiBrokerError(refusal)
-    # capture() reads the process-wide variable into its own field and the CRL flag off the
-    # context, the same two reads every RevocationHopGuard hop makes; disposition() asks
+    # capture() reads the process-wide variable into its own field and the CRL and time-validity
+    # flags off the context, the same reads every RevocationHopGuard hop makes; disposition() asks
     # revocation_hop_disposition, logging and raising nothing. Its cell, description and
     # connection are never rendered here: the texts below are this hop's own. disposition() is
     # never None, since a posture is held.
@@ -259,9 +262,11 @@ def _refuse_an_unrevoked_ai_hop(
     )
     if disposition is HopDisposition.ALLOW:
         # Not when the context's CRL is a real check: that hop crossed on it, not on the
-        # attestation, and the line would be a false record. No CRL reaches it today; a later CRL
-        # lever must revisit this arm and the refusal's lever text together.
-        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_is_a_check
+        # attestation, and the line would be a false record. `crl_checked` is the same one field
+        # the disposition read, False for a CRL on a context that skips time validity (vault
+        # BACKLOG #5086). No CRL reaches it today; a later CRL lever must revisit this arm and the
+        # refusal's lever text together.
+        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_checked
         if crossed_on_attestation and _first_crossing("attested", host):
             log_attested_crossing(
                 logger,

@@ -162,6 +162,7 @@ async def _assert_single_counter_policy(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     t0 = 1_000.0
 
@@ -235,6 +236,7 @@ async def _assert_escalation(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     staged_cell = await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(
@@ -242,7 +244,12 @@ async def _assert_escalation(store: Any) -> None:
     )
     # A directory account, with TOTP enrolled too: NEITHER lock escalates (ADR 0197 Decision 5).
     await store.create_user(
-        user_id="lock-ad", username="lock-ad", auth_provider="ad", now=1.0, password_generated=False
+        user_id="lock-ad",
+        username="lock-ad",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
     )
     staged_cell = await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(
@@ -255,6 +262,7 @@ async def _assert_escalation(store: Any) -> None:
         auth_provider="local",
         password_hash="h",
         password_generated=False,
+        audits=(),
     )
 
     expected_escalated = [LOCKOUT_SECONDS * 2**k for k in range(4)] + [MAX_LOCKOUT_SECONDS] * 2
@@ -330,6 +338,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     # Not discoverable: no way past under any rule, so the fixed length. Well formed in every other
     # respect (today's id-hash scheme, the relying party the rule names), so discoverable=False is
@@ -398,6 +407,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.add_webauthn_credential(
         _cred("lock-pk-ad", "resident", id_hash=_LOCK_PK_AD, rp_id="t", discoverable=True)
@@ -435,6 +445,7 @@ async def _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(
             password_hash="h",
             now=1.0,
             password_generated=False,
+            audits=(),
         )
         await store.add_webauthn_credential(
             _cred(
@@ -479,6 +490,7 @@ async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     t0 = 30_000.0
     # Two cycles of the sign-in lock, then two of the second-step lock, on one row.
@@ -544,6 +556,7 @@ async def _assert_generated_credential(store: Any) -> None:
         must_change_password=True,
         password_generated=True,
         now=1.0,
+        audits=(),
     )
     user = await store.get_user("gen-u1")
     assert user is not None and user.password_generated is True, "create_user dropped the flag"
@@ -596,6 +609,7 @@ async def _assert_generated_credential(store: Any) -> None:
         password_hash="h",
         password_generated=False,
         now=1.0,
+        audits=(),
     )
     user = await store.get_user("gen-u2")
     assert user is not None and user.password_generated is False
@@ -607,6 +621,7 @@ async def _assert_generated_credential(store: Any) -> None:
             password_hash=None,
             password_generated=True,
             now=1.0,
+            audits=(),
         )
     except ValueError:
         pass
@@ -634,6 +649,7 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
         must_change_password=True,
         password_generated=True,
         now=1.0,
+        audits=(),
     )
 
     async def rotate() -> bool:
@@ -717,6 +733,7 @@ async def _assert_an_unknown_totp_behaves_as_an_enabled_one(store: Any, kind: st
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
@@ -770,6 +787,7 @@ async def _assert_a_stale_pre_read_still_escalates(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     cell = await store.set_totp_secret("lock-st1", secret="JBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(
@@ -827,6 +845,7 @@ async def _assert_no_verdict_falls_back_to_the_enabled_rule(store: Any, race: st
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
 
     async def enrol(secret: str, now: float) -> None:
@@ -891,6 +910,7 @@ async def _assert_a_wrong_password_below_the_threshold_opens_no_cell(store: Any)
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
@@ -928,6 +948,7 @@ async def _assert_refused_totp_keeps_the_fixed_sign_in_lock(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     cell = await store.set_totp_secret(
         "lock-rf1", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=1.0
@@ -959,6 +980,7 @@ async def _assert_refused_totp_is_no_way_past(store: Any) -> None:
         must_change_password=True,
         password_generated=False,
         now=1.0,
+        audits=(),
     )
     cell = await store.set_totp_secret(
         "rot-rf1", secret="totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", now=2.0
@@ -1010,6 +1032,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
         must_change_password=True,
         password_generated=True,
         now=1.0,
+        audits=(),
     )
     # No TOTP: the conditional write is refused and changes nothing.
     assert not await store.set_password(

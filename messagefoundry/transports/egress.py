@@ -23,7 +23,7 @@ from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, EgressSettings
-from messagefoundry.config.wiring import WiringError
+from messagefoundry.config.wiring import WiringError, resolve_env_settings
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.db_endpoint import database_dial_endpoint, port_or_zero
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
@@ -137,7 +137,8 @@ def check_lookup_allowed(
         )
     if egress.allowed_db:
         # Both callers build the SQL Server preset whatever `settings` say (neither DatabaseLookup
-        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting.
+        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting, and a driver the
+        # preset refuses is refused here too (BACKLOG #4873).
         refusal = _database_refusal(settings, egress.allowed_db, dialect="sqlserver")
         if refusal is not None:
             log.warning("connect denied: %s %r %s", label, name, refusal)
@@ -373,10 +374,13 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
 
     Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
     least check, start, operator start and test), from :func:`check_fhir_lookup_allowed`, its
-    FhirLookup twin, and from the runner's ``_build_fhir_lookup_executor``, which logs it once per
-    lookup however many builds it makes. All run on env-resolved
-    settings, so this sees a URL that ``env()`` supplied. A reload skips it on the builds that
-    follow its build check, which has already warned; :func:`check_egress_allowed` says how.
+    FhirLookup twin, and from :func:`warn_url_query_credentials_before_build`, the runner's one
+    pre-build step for both kinds, which logs it at a start and an operator start before anything
+    in that connection's own build can fail; those builds then skip it in
+    :func:`check_egress_allowed`. All run on
+    env-resolved settings, so this sees a URL that ``env()`` supplied. A reload skips it on the
+    builds that follow its build check, which has already warned; :func:`check_egress_allowed` says
+    how.
     docs/SECURITY-LOOSENING.md is the source of record for where it fires.
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
@@ -385,14 +389,48 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
         return
     names = credential_query_params(url)
     if names:
+        # The label sits mid-sentence with no ":" or "=" after it (BACKLOG #4998). Written as
+        # "FhirLookup 'LK_TOKEN': the ...", the log scrubber reads the quoted name, ending in a
+        # credential word, as a label and its colon, and every configured sink would get
+        # "'LK_TOKEN=<redacted> endpoint ...". caplog reads the record before the handler filters
+        # run, so only a test through a filtered handler sees that.
         log.warning(
-            "%s: the endpoint url carries a credential in its query string (parameter(s) "
+            "the endpoint url of %s carries a credential in its query string (parameter(s) "
             "%s). It rides the request line, so the partner's and any proxy's access log will hold "
             "it. Move it to a header if the partner accepts one (bearer_token, basic auth, or a "
             "headers table supplied whole by env()); see docs/SECURITY-LOOSENING.md (ASVS 14.2.1).",
             label,
             ", ".join(names),
         )
+
+
+def warn_url_query_credentials_before_build(
+    label: str,
+    declared: Mapping[str, Any],
+    env_values: Mapping[str, Any],
+    *,
+    connection: str,
+) -> None:
+    """The query-credential WARNING as one step BEFORE a build, for an outbound and a FhirLookup
+    alike (BACKLOG #4997). ``declared`` is the connection's settings as configured, ``env()``
+    references and all; ``connection`` is the name ``resolve_env_settings`` reports a failure
+    under.
+
+    It resolves the ``url`` ALONE, so a URL is still read when another setting fails to resolve,
+    and nothing a build checks can stop the line. A ``url`` that does not resolve has nothing to
+    read, and logs an INFO line naming the connection instead. Resolution itself does no I/O."""
+    try:
+        resolved = resolve_env_settings(
+            {"url": declared.get("url")}, env_values, connection=connection
+        )
+    except WiringError:  # names the key, never a value
+        # No ":" or "=" after the label, for the reason on warn_url_query_credentials.
+        log.info(
+            "the url of %s did not resolve, so the URL query-credential check could not read it",
+            label,
+        )
+        return
+    warn_url_query_credentials(label, resolved)
 
 
 def check_egress_allowed(
@@ -411,8 +449,10 @@ def check_egress_allowed(
     outright (fail-closed); with the list set, the per-list matching below is unchanged.
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
-    refusal. A reload passes it for the builds that follow its build check, which has already
-    logged the warning for this reload (vault BACKLOG #2910)."""
+    refusal. The runner's lane builds pass it: a start, an operator start and a schedule window's
+    opening log the line in :func:`warn_url_query_credentials_before_build` just before the build
+    (BACKLOG #4997), and a reload's builds follow its build check, which has logged it (vault
+    BACKLOG #2910)."""
     # ASVS 14.2.1: a recorded loosening, never a silent one. Before every refusal, so a lane a
     # refusal takes down is still recorded.
     if warn_query_credentials:
@@ -725,9 +765,10 @@ def _database_refusal(
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
     dialect's connection string sends. A host no entry names is refused as unlisted, before its
     port is read. Once the host is listed, a port the reading cannot settle is refused, whatever
-    the entries for that host say. An entry that pins a port admits only that port, compared as a
-    number on both sides. A connection whose port the engine cannot read matches an entry that
-    names no port, and never one that pins one."""
+    the entries for that host say, and so is a driver or ``server`` the SQL Server preset refuses
+    (BACKLOG #4873); both arrive as the reading's ``conflict``. An entry that pins a port admits
+    only that port, compared as a number on both sides. A connection whose port the engine cannot
+    read matches an entry that names no port, and never one that pins one."""
     if dialect is None:
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)

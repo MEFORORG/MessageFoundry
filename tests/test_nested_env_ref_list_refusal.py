@@ -109,8 +109,21 @@ def _http_subjects(value: Any) -> Any:
     )
 
 
+def _mllp_subjects(value: Any) -> Any:
+    """``MLLP`` built with ``value`` as its whole ``tls_client_subjects`` (BACKLOG #4907)."""
+    return messagefoundry.MLLP(
+        port=2575,
+        tls=True,
+        tls_cert_file="cert.pem",
+        tls_key_file="key.pem",
+        tls_ca_file="ca.pem",
+        tls_client_subjects=value,
+    )
+
+
 TABLE_OF_LIST_SETTINGS: dict[tuple[str, str], Callable[[Any], Any]] = {
     ("Http", "intake_client_subjects"): _http_subjects,
+    ("MLLP", "tls_client_subjects"): _mllp_subjects,
 }
 
 #: The two shapes a nested reference reaches a factory in. Code-first gives an ``EnvRef``;

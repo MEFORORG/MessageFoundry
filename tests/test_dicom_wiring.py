@@ -48,7 +48,9 @@ def test_dicom_factory_builds_dimse_spec() -> None:
     assert spec.settings["ae_title"] == "MEFOR_SCP"
     assert spec.settings["port"] == 11112
     assert spec.settings["calling_ae_allowlist"] == ["MODALITY1"]
-    assert spec.settings["max_object_bytes"]  # a default cap is set
+    # No cap written when none is given: each role applies its own default, which
+    # tests/test_dicom_scu_abort_bound.py pins for both (vault BACKLOG #4908).
+    assert "max_object_bytes" not in spec.settings
 
 
 def test_content_type_dicom_is_binary() -> None:

@@ -484,6 +484,11 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
         # Comments are skipped wherever they sit, and T-SQL block comments nest.
         "SELECT 1; -- trailing note",
         "SELECT /* nested /* deep */ still */ 1",
+        # The #4954 words as data: in a literal, a T-SQL quoted identifier, a longer name or a comment.
+        "SELECT note FROM t WHERE note = 'BEGIN TRAN RECEIVE UPDATETEXT WRITETEXT'",
+        'SELECT [updatetext], "writetext" FROM t',
+        "SELECT begin_ts, received_at, updatetext_flag, writetext_count FROM t",
+        "SELECT 1 -- BEGIN TRAN\n",
     ],
 )
 def test_read_only_statements_still_admitted(stmt: str) -> None:
@@ -768,6 +773,57 @@ def test_any_mysql_executable_comment_is_refused_on_the_generic_dialect_only() -
 def test_mysql_comment_reads_are_still_admitted_on_the_generic_dialect(stmt: str) -> None:
     """Control for item 2: a read with MySQL comments still passes both scans."""
     database._require_read_only(stmt, dialect="generic")
+
+
+# --- T-SQL statements the keyword list lacked (BACKLOG #4954) ------------------------------------
+#
+# Each row is `(statement, the keyword it must be refused for)`. Every statement opens with SELECT
+# and carries no `;`, because T-SQL needs none between most statements. A bare RECEIVE needs one
+# before it, per the T-SQL docs (read, not run against a server), so its row chains it inside
+# WAITFOR, which needs none. `BEGIN` is refused as a bare word, so each BEGIN TRAN form is refused
+# for that one word. The #1658 rows of
+# test_write_shaped_select_and_cte_rejected test the same no-`;` shape for verbs listed before.
+
+_TSQL_VERBS_THE_LIST_LACKED = [
+    ("SELECT 1 WAITFOR (RECEIVE TOP (1) * FROM dbo.inbound_queue), TIMEOUT 0", "RECEIVE"),
+    ("SELECT 1 BEGIN TRAN", "BEGIN"),
+    ("SELECT 1 BEGIN TRANSACTION", "BEGIN"),
+    ("SELECT 1 begin tran t1", "BEGIN"),
+    ("SELECT 1 BEGIN DISTRIBUTED TRANSACTION", "BEGIN"),
+    ("SELECT 1 UPDATETEXT patients.note @ptr 0 NULL 'x'", "UPDATETEXT"),
+    ("SELECT 1 WRITETEXT patients.note @ptr 'x'", "WRITETEXT"),
+]
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize(("stmt", "keyword"), _TSQL_VERBS_THE_LIST_LACKED)
+def test_a_tsql_verb_the_list_lacked_is_refused(stmt: str, keyword: str, dialect: str) -> None:
+    """Red mutation: drop the keyword from _SQL_WRITE_KEYWORDS and its rows pass."""
+    with pytest.raises(DbLookupError, match=f"found a '{keyword}' keyword"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "quoted"),
+    [
+        # T-SQL quotes a name in brackets, or in double quotes under QUOTED_IDENTIFIER ON.
+        ("sqlserver", '[{n}], "{n}"'),
+        # MySQL quotes a name in backticks (a double-quoted word is a string there by default);
+        # PostgreSQL in double quotes.
+        ("generic", '`{n}`, "{n}"'),
+    ],
+)
+@pytest.mark.parametrize(("name", "keyword"), [("begin", "BEGIN"), ("receive", "RECEIVE")])
+def test_a_name_spelled_like_a_new_keyword_fails_closed_until_quoted(
+    name: str, keyword: str, dialect: str, quoted: str
+) -> None:
+    """An unquoted column named like one of the words is refused on either dialect, and the column
+    quoted the way that dialect's databases quote a name is admitted. That is a false refusal of a
+    valid read for `receive` on any dialect and for `begin` on a generic one; T-SQL reserves
+    `begin`, so there it is no valid read."""
+    with pytest.raises(DbLookupError, match=f"found a '{keyword}' keyword"):
+        database._require_read_only(f"SELECT {name} FROM t", dialect=dialect)
+    database._require_read_only(f"SELECT {quoted.format(n=name)} FROM t", dialect=dialect)
 
 
 def test_lookup_dsn_is_read_only() -> None:

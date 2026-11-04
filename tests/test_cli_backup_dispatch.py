@@ -121,6 +121,39 @@ def test_backup_json_summary_writes_verified_archive(tmp_path, key_b64, capsys) 
         assert field in payload
     assert payload["key_id"]  # a real fingerprint, not None
     assert payload["row_counts"].get("queue", 0) >= 1
+    # The control for the skipped-list test below: a whole bundle names nothing (vault #5233).
+    assert (payload["config_bundled"], payload["config_bundle_error"]) == (True, None)
+    assert "config_skipped_files" not in payload
+
+
+@pytest.mark.parametrize("as_json", [True, False], ids=["json", "text"])
+def test_backup_summary_names_what_the_config_bundle_left_out(
+    tmp_path, key_b64, capsys, as_json
+) -> None:
+    """A symlinked config file is not archived, so the summary names it, beside
+    ``config_bundled``, which alone would read as a whole bundle (vault BACKLOG #5233)."""
+    db = tmp_path / "msg.db"
+    asyncio.run(_seed_store(db, key_b64))
+    cfg = Path(_config_dir(tmp_path))
+    outside = tmp_path / "outside.toml"
+    outside.write_text("# outside the bundle\n", encoding="utf-8")
+    try:
+        (cfg / "connections.toml").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("a symlink cannot be made here (Windows without the privilege)")
+    toml = _service_toml(tmp_path, key_b64=key_b64, destination=str(tmp_path / "b"))
+    argv = ["backup", "--config", str(cfg), "--service-config", toml, "--db", str(db)]
+    rc = main([*argv, "--json"] if as_json else argv)
+    assert rc == 0
+    captured = capsys.readouterr()
+    if as_json:
+        payload = _json_line(captured.out)
+        assert payload["config_bundled"] is True
+        assert payload["config_skipped_files"] == ["connections.toml"]
+        assert payload["config_skipped_count"] == 1
+    else:
+        assert "config_bundled=True" in captured.out
+        assert "WARNING: the config bundle left out connections.toml\n" in captured.err
 
 
 # --- (2) flag plumbing: --config-only / --no-verify / --full-verify ----------

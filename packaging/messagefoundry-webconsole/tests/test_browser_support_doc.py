@@ -210,7 +210,7 @@ async def test_each_fetch_metadata_rows_absence_verdict_matches_the_middleware()
 
 
 def _fake_request(headers: dict[str, str]) -> Any:
-    # A POST: the row is the form-POST row, and the check keeps its earlier rule on a GET.
+    # A POST: the row is the form-POST row; a GET has rows of its own in the docstring table.
     return origin_check_request("POST", headers)
 
 

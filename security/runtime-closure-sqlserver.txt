@@ -39,12 +39,12 @@ httptools==0.8.0
 httpx==0.28.1
 idna==3.20
 ldap3==2.9.1
-opentelemetry-api==1.45.1
+opentelemetry-api==1.45.2
 psutil==7.2.2
 pyasn1==0.6.5
 pycparser==3.0
-pydantic==2.14.1
-pydantic-core==2.50.1
+pydantic==2.14.2
+pydantic-core==2.50.2
 pyodbc==5.3.0
 pyspnego==0.12.4
 sspilib==0.6.0
@@ -53,7 +53,7 @@ tomlkit==0.15.2
 truststore==0.10.5
 typing-extensions==4.16.0
 typing-inspection==0.4.4
-tzdata==2026.5
+tzdata==2026.6
 uvicorn==0.54.0
 uvloop==0.23.0
 websockets==17.2

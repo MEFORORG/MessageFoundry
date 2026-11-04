@@ -22,6 +22,7 @@ Nothing here dials: construction reads settings only. All certificates and CRLs 
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import logging
 import ssl
@@ -470,18 +471,41 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
     assert "connection 'OB_PACS';" in str(exc.value)
 
 
+def _guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
+    """The test hop under an enforcing posture; ``over`` replaces any default, attestation too."""
+    kwargs: dict[str, Any] = {
+        "host": REMOTE,
+        "cell": "test",
+        "description": "verified TLS egress (no revocation check)",
+        "attested": False,
+        "context": context,
+        "posture": ENFORCING,
+        "connection": "OB_TEST",
+    }
+    kwargs.update(over)
+    return RevocationHopGuard.capture(**kwargs)
+
+
 def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
-    return RevocationHopGuard.capture(
-        host=REMOTE,
-        cell="test",
-        description="verified TLS egress (no revocation check)",
-        attested=True,
-        attested_reason=REASON,
-        context=context,
-        posture=ENFORCING,
-        connection="OB_TEST",
-        **over,
-    )
+    return _guard(context, **{"attested": True, "attested_reason": REASON, **over})
+
+
+#: A phrase only the expiry-relaxed record carries; ``EXPIRY_RELAXED_WAYS_ACROSS`` does not hold it,
+#: so it tells the new wording from that remedy text (BACKLOG #5089).
+_RELAXED_DETAIL = (
+    "at least the validity periods of the peer certificate, the intermediates and the trust anchor "
+    "are not"
+)
+
+#: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089).
+_RELAXED_CROSSING = (
+    "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
+)
+
+#: The suffix the MLLP, DICOM SCU and FTPS call sites put on their description only on a hop that
+#: keeps the validity-period check: on a relaxed hop it would lead the record with "no revocation
+#: check" before the record says a CRL there still refuses a leaf it lists (BACKLOG #5089).
+_UNRELAXED_DESCRIPTION = "(no revocation check)"
 
 
 def _crl_context(*, skip_validity: bool) -> ssl.SSLContext:
@@ -504,14 +528,111 @@ def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
 
 def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -> None:
     """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check that may
-    silence the line. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
-    the condition cannot be ``self.crl_checked``, which is what this arm tells apart."""
+    silence the line. ``crl_checked`` is False on it without the caller's ``expiry_relaxed`` (vault
+    BACKLOG #5086), so the hop crosses on its attestation, ALLOW, and keeps the line. It carries the
+    relaxed words, which say no CRL is credited: the context skips the check, so they are true here,
+    and since #5086 nothing credits that CRL for them to contradict. Before #5086 this guard credited
+    the CRL and kept the unrelaxed words (#5089's version of this test pinned that)."""
     guard = _attested_guard(_crl_context(skip_validity=True))
-    assert guard.crl_checked is True
+    assert guard.crl_checked is False
+    assert guard.expiry_relaxed is True
     assert guard.disposition() is HopDisposition.ALLOW
     with _guard_log() as log:
         guard.enforce_construction()
-    assert "crossed without certificate revocation checking" in log.audit, log.state()
+    assert _RELAXED_CROSSING in log.audit, log.state()
+    assert _RELAXED_DETAIL in log.audit, log.state()
+    assert EXPIRY_RELAXED_WAYS_ACROSS in log.audit, log.state()
+    # The control: a context that keeps the check, with no CRL, keeps the unrelaxed words.
+    with _guard_log() as plain:
+        _attested_guard(ssl.create_default_context()).enforce_construction()
+    assert "crossed without certificate revocation checking" in plain.audit, plain.state()
+    assert _RELAXED_DETAIL not in plain.audit, plain.state()
+
+
+def _relaxed_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
+    """An unattested hop under an enforcing posture that says it skips validity-period checks."""
+    return _guard(context, **{"expiry_relaxed": True, **over})
+
+
+def test_expiry_relaxed_alone_denies_a_crl_on_the_context_its_credit() -> None:
+    """``expiry_relaxed=True`` settles the CRL half by itself (BACKLOG #5089). A caller that passes
+    it with the context it dials with, and that context loads a CRL, is refused exactly as the same
+    hop handed no context is: the owner's 2026-10-05 ruling (vault BACKLOG #2978) forbids that CRL
+    admitting the hop with no attestation. The control is the same CRL context without the flag,
+    which that CRL admits."""
+    ctx = _crl_context(skip_validity=False)
+    assert context_checks_revocation(ctx) is True
+    assert _relaxed_guard(ctx, expiry_relaxed=False).disposition() is HopDisposition.ALLOW
+    with_crl, without = _relaxed_guard(ctx), _relaxed_guard(None)
+    assert with_crl.crl_checked is False
+    assert with_crl.disposition() is without.disposition() is HopDisposition.REFUSE
+    with pytest.raises(InsecureHopRefused, match="revocation") as refused:
+        with_crl.enforce_construction()
+    with pytest.raises(InsecureHopRefused, match="revocation") as refused_bare:
+        without.enforce_construction()
+    assert str(refused.value) == str(refused_bare.value)
+    # The attestation is still the lever, and its record is kept: the CRL is no check here.
+    with _guard_log() as log:
+        _relaxed_guard(ctx, attested=True, attested_reason=REASON).enforce_construction()
+    assert _RELAXED_CROSSING in log.audit, log.state()
+
+
+def test_expiry_relaxed_alone_names_the_relaxed_remedy() -> None:
+    """The other half: an omitted ``ways_across`` becomes ``EXPIRY_RELAXED_WAYS_ACROSS``, so the
+    record never tells the operator to configure the CRL the same sentence says earns no credit. A
+    hop that passes its own sentence keeps it."""
+    with pytest.raises(InsecureHopRefused) as refused:
+        _relaxed_guard(_crl_context(skip_validity=False)).enforce_construction()
+    text = str(refused.value)
+    assert _RELAXED_DETAIL in text
+    assert EXPIRY_RELAXED_WAYS_ACROSS in text
+    assert "Configure [tls].crl_file" not in text
+    with pytest.raises(InsecureHopRefused) as own:
+        _relaxed_guard(None, ways_across="Set [x].y_attested.").enforce_construction()
+    assert "Set [x].y_attested." in str(own.value)
+    assert EXPIRY_RELAXED_WAYS_ACROSS not in str(own.value)
+
+
+def test_an_unattested_time_skipping_crl_is_refused_without_the_flag() -> None:
+    """The case #5089 left open. A CRL past ``nextUpdate`` passes a ``NO_CHECK_TIME`` context at
+    the handshake, so that CRL is no revocation check and must not cross an enforcing hop on its
+    own, whether or not the caller passes ``expiry_relaxed`` (vault BACKLOG #5086, owner ruling
+    2026-11-03). Before #5086 a guard handed such a context WITHOUT the flag credited the bare CRL
+    flag, so it was ALLOWed with no attestation and no line. The keep-time CRL is the control: it
+    is a check, and it still crosses. The refusal offers only levers that can cross it, never the
+    CRL it already has; a caller's own ``ways_across`` still wins."""
+    relaxed = _guard(_crl_context(skip_validity=True))
+    assert relaxed.crl_checked is False
+    assert relaxed.disposition() is HopDisposition.REFUSE
+    with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+        relaxed.enforce_construction()
+    assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+    assert "Configure [tls].crl_file" not in str(exc.value)
+    own = _guard(_crl_context(skip_validity=True), ways_across="")
+    assert own.ways_across == ""
+    # A hop that is not a connection is refused the same way.
+    not_a_connection = _guard(_crl_context(skip_validity=True), connection=None)
+    assert not_a_connection.disposition() is HopDisposition.REFUSE
+    assert not_a_connection.ways_across == EXPIRY_RELAXED_WAYS_ACROSS
+    # The rule holds for a guard built directly too, not only through capture().
+    with pytest.raises(ValueError, match="cannot credit a CRL"):
+        dataclasses.replace(relaxed, crl_checked=True)
+    kept = _guard(_crl_context(skip_validity=False))
+    assert kept.ways_across is None
+    assert kept.disposition() is HopDisposition.ALLOW
+    kept.enforce_construction()
+
+
+def test_an_unattested_crl_on_a_context_that_skips_time_validity_warns_when_not_enforcing() -> None:
+    """The same CRL earns no credit on a non-enforcing instance either, so the hop takes the WARN
+    any unchecked off-box hop takes there, where the bare CRL flag used to ALLOW it with no line
+    (vault BACKLOG #5086). The posture-blind read is what ``docs/SECURITY-LOOSENING.md`` states
+    for ``tls_allow_expired`` ("in either posture"). The keep-time CRL is the control."""
+    relaxed = _guard(_crl_context(skip_validity=True), posture=NOT_ENFORCING)
+    assert relaxed.crl_checked is False
+    assert relaxed.disposition() is HopDisposition.WARN
+    kept = _guard(_crl_context(skip_validity=False), posture=NOT_ENFORCING)
+    assert kept.disposition() is HopDisposition.ALLOW
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
@@ -525,29 +646,16 @@ def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declar
     assert named.audit.endswith(f"([x].y_attested; reason: {REASON})"), named.state()
 
 
-def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_check(
-    bare_crl: str,
-) -> None:
+def test_an_attested_hop_whose_crl_is_a_check_records_no_crossing(bare_crl: str) -> None:
     """What the attested-crossing line says, read off the context the association really dials
     with. A CRL on a hop that keeps the time check is a check, so the hop crossed on it and a line
-    saying it crossed without one would be false. ``tls_allow_expired`` sets
-    ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
-    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. The
-    relaxed SCU hands the guard no context (ADR 0173 §13), so it crosses on its attestation, not its
-    CRL, and this half does not reach ``crl_is_a_check``; the guard-level test above pins that
-    field. This limb moves a log line, never a disposition."""
+    saying it crossed without one would be false. The relaxed half, where the line stays, is
+    ``test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited``. This limb moves
+    a log line, never a disposition."""
     with active_hop_posture(ENFORCING), _guard_log() as checked:
         kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
     assert context_checks_revocation(kept._ssl) is True
     assert not checked.audit, checked.state()
-    relaxed_cfg = _scu(REMOTE, attested=True, policy=_crl_policy(bare_crl))
-    relaxed_cfg.settings["tls_allow_expired"] = True
-    with active_hop_posture(ENFORCING), _guard_log() as relaxed:
-        skipped = DicomScuDestination(relaxed_cfg)
-    assert context_checks_revocation(skipped._ssl) is True
-    assert "crossed without certificate revocation checking" in relaxed.audit, relaxed.state()
-    assert "connection 'OB_PACS';" in relaxed.audit, relaxed.state()
-    assert REASON in relaxed.audit, relaxed.state()
 
 
 def test_a_dicom_tls_association_is_admitted_when_a_crl_reaches_its_own_context(
@@ -792,10 +900,12 @@ def test_a_crl_does_not_admit_an_ftps_hop_that_ignores_certificate_expiry(bare_c
         assert "tls_allow_expired" in str(exc.value)
         assert "Configure [tls].crl_file" not in str(exc.value)
         assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+        assert _RELAXED_DETAIL in str(exc.value)
         with pytest.raises(InsecureHopRefused, match="revocation") as exc:
             RemoteFileDestination(_ftps(REMOTE, allow_expired=True, policy=_crl_policy(bare_crl)))
         assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
         assert "Configure [tls].crl_file" not in str(exc.value)
+        assert _RELAXED_DETAIL in str(exc.value)
         # The control: the same hop without the relaxation is admitted by that CRL.
         RemoteFileSource(_poll(REMOTE, policy=_crl_policy(bare_crl)))
         # And the attestation still crosses it.
@@ -848,6 +958,41 @@ def test_a_crl_still_refuses_a_listed_leaf_on_a_context_that_skips_validity_chec
     assert (
         _handshake(client(next_update=lapsed, relaxed=True), server, host) == "certificate revoked"
     )
+
+
+@pytest.mark.parametrize("direction", ["destination", "source"])
+def test_an_expiry_relaxed_ftps_hop_with_a_crl_is_worded_as_relaxed(
+    bare_crl: str, direction: str
+) -> None:
+    """Both FTPS directions word a ``tls_allow_expired`` hop as relaxed (BACKLOG #5089): the
+    attested crossing's line under an enforcing posture, and the WARNING when not enforcing. The
+    CRL reaches the context each time, so the record is the relaxation's."""
+    policy = _crl_policy(bare_crl)
+
+    def build(*, attested: bool) -> RemoteFileDestination | RemoteFileSource:
+        if direction == "destination":
+            return RemoteFileDestination(
+                _ftps(REMOTE, allow_expired=True, attested=attested, policy=policy)
+            )
+        return RemoteFileSource(_poll(REMOTE, allow_expired=True, attested=attested, policy=policy))
+
+    with active_hop_posture(ENFORCING), _guard_log() as crossed:
+        hop = build(attested=True)
+    assert context_checks_revocation(hop._client.tls_context) is True
+    shipped = _shipped(crossed.audit)
+    assert f"REMOTEFILE ftps {direction}" in shipped, crossed.state()
+    assert _RELAXED_CROSSING in shipped, crossed.state()
+    assert _RELAXED_DETAIL in shipped, crossed.state()
+    assert "NO certificate revocation checking" not in shipped, crossed.state()
+    verb = "upload" if direction == "destination" else "poll"
+    assert f"verified FTPS {verb} to {REMOTE}: the peer" in shipped, crossed.state()
+    assert _UNRELAXED_DESCRIPTION not in shipped, crossed.state()
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as warned:
+        build(attested=False)
+    revocation = [m for m in warned.messages if f"REMOTEFILE ftps {direction}" in m]
+    assert revocation, warned.state()
+    assert all(_RELAXED_DETAIL in m for m in revocation), warned.state()
+    assert not any(_UNRELAXED_DESCRIPTION in m for m in revocation), warned.state()
 
 
 @pytest.mark.parametrize("shape", ["missing", "not a crl"])
@@ -1129,7 +1274,7 @@ def _assert_refused_for_the_relaxation(
     built: list[ssl.SSLContext], exc: pytest.ExceptionInfo[InsecureHopRefused], connection: str
 ) -> None:
     # The CRL did reach the context the hop built, so this is the relaxation's refusal and not a CRL
-    # that never arrived: a guard that read that context's CRL flag would have admitted it.
+    # that never arrived: a guard that credited that context's bare CRL flag would have admitted it.
     assert len(built) == 1
     assert context_checks_revocation(built[0]) is True
     assert skips_validity_period(built[0]) is True
@@ -1138,6 +1283,9 @@ def _assert_refused_for_the_relaxation(
     assert EXPIRY_RELAXED_WAYS_ACROSS in text
     assert "Configure [tls].crl_file" not in text
     assert f"connection '{connection}';" in text
+    assert _RELAXED_DETAIL in text
+    # The call site's description does not lead the relaxed record with less than it then says.
+    assert _UNRELAXED_DESCRIPTION not in text
 
 
 def test_a_crl_does_not_admit_an_mllp_destination_that_ignores_certificate_expiry(
@@ -1167,8 +1315,16 @@ def test_an_expiry_relaxed_mllp_destination_crosses_on_its_attestation_and_is_au
     assert dest._ssl is not None and context_checks_revocation(dest._ssl) is True
     assert dest._revocation_guard is not None
     assert dest._revocation_guard.crl_checked is False
+    assert dest._revocation_guard.expiry_relaxed is True
     shipped = _shipped(log.audit)
     assert "connection 'OB_MLLP';" in shipped and REASON in shipped, log.state()
+    # The kept line words the hop as what it is (BACKLOG #5089): the CRL that reached it still
+    # refuses a leaf it lists, so the unrelaxed "NO certificate revocation checking" would over-state.
+    assert _RELAXED_CROSSING in shipped, log.state()
+    assert _RELAXED_DETAIL in shipped, log.state()
+    assert "NO certificate revocation checking" not in shipped, log.state()
+    assert f"verified MLLP-over-TLS egress to {REMOTE}: the peer" in shipped, log.state()
+    assert _UNRELAXED_DESCRIPTION not in shipped, log.state()
 
 
 def test_a_crl_still_admits_an_mllp_destination_that_checks_expiry(bare_crl: str) -> None:
@@ -1215,9 +1371,14 @@ def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
     # The CRL reached the context, so the missing credit is the relaxation's.
     assert context_checks_revocation(dest._ssl) is True
     assert [guard.crl_checked for guard in guards] == [False]
+    assert [guard.expiry_relaxed for guard in guards] == [True]
     shipped = _shipped(log.audit)
     assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
     assert "DICOM C-STORE client (SCU) over TLS" in shipped
+    assert _RELAXED_CROSSING in shipped, log.state()
+    assert _RELAXED_DETAIL in shipped, log.state()
+    assert f"verified DICOM-over-TLS association to {REMOTE}: the peer" in shipped, log.state()
+    assert _UNRELAXED_DESCRIPTION not in shipped, log.state()
 
 
 def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str) -> None:
@@ -1231,8 +1392,34 @@ def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str
     assert mllp._ssl is not None and context_checks_revocation(mllp._ssl) is True
     assert context_checks_revocation(scu._ssl) is True
     revocation = [m for m in log.messages if "revocation" in m]
-    assert any("verified MLLP-over-TLS egress" in m for m in revocation), log.state()
-    assert any("verified DICOM-over-TLS association" in m for m in revocation), log.state()
+    for hop in ("verified MLLP-over-TLS egress", "verified DICOM-over-TLS association"):
+        lines = [m for m in revocation if hop in m]
+        assert lines, log.state()
+        # Each WARNING words the hop as relaxed (BACKLOG #5089), not as one with no check at all.
+        assert all(_RELAXED_DETAIL in m for m in lines), log.state()
+        assert not any("NO certificate revocation checking" in m for m in lines), log.state()
+        assert not any(_UNRELAXED_DESCRIPTION in m for m in lines), log.state()
+
+
+def test_an_unrelaxed_hop_keeps_its_no_revocation_check_description() -> None:
+    """The control for the relaxed arms' ``_UNRELAXED_DESCRIPTION`` checks: without
+    ``tls_allow_expired`` and with no CRL, each call site still leads its record with it, so an
+    assertion that it is absent can fail (BACKLOG #5089)."""
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+        MLLPDestination(_mllp(REMOTE))
+        DicomScuDestination(_scu(REMOTE))
+        RemoteFileDestination(_ftps(REMOTE))
+        RemoteFileSource(_poll(REMOTE))
+    for hop in (
+        "verified MLLP-over-TLS egress",
+        "verified DICOM-over-TLS association",
+        "verified FTPS upload",
+        "verified FTPS poll",
+    ):
+        lines = [m for m in log.messages if hop in m and "revocation" in m]
+        assert lines, log.state()
+        assert all(f"{hop} {_UNRELAXED_DESCRIPTION} to {REMOTE}:" in m for m in lines), log.state()
+        assert not any(_RELAXED_DETAIL in m for m in lines), log.state()
 
 
 def test_a_crl_still_admits_a_dicom_scu_that_checks_expiry(bare_crl: str) -> None:

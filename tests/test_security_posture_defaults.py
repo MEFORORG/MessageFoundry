@@ -88,6 +88,7 @@ def _pairs(
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
     path_form_hops: tuple[str, ...] = (),
+    ech_hops: tuple[str, ...] = (),
     api: ApiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
     cert_monitor: CertMonitorSettings | None = None,
@@ -110,6 +111,7 @@ def _pairs(
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
         path_form_fhir_hops=path_form_hops,
+        ech_cleartext_sidecar_hops=ech_hops,
         api=api or ApiSettings(),
         approvals=approvals or ApprovalsSettings(),
         cert_monitor=cert_monitor or CertMonitorSettings(),
@@ -169,6 +171,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -208,6 +211,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -244,6 +248,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -366,6 +371,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -541,6 +547,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2185,6 +2192,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=_terminated(ack=True),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2535,6 +2543,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     # strict AEAD allow-list to that one hop, and leaving it unset is the shipped posture every other
     # connection already has. A reader that reported it would be reporting operators who hardened.
     "tls_ciphers": "opt-in AEAD allow-list on one hop -- a tightening, not a deviation to report",
+    # BACKLOG #4907. A TIGHTENING, like tls_ciphers and tls_ca_pin above: setting it refuses a
+    # verified MLLP sender whose certificate names no listed subject under its issuing CA, and
+    # leaving it unset is the shipped posture of every mTLS listener.
+    "tls_client_subjects": "opt-in MLLP sender allowlist -- a tightening, not a deviation to report",
     # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
     "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
     # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses
@@ -2770,12 +2782,166 @@ async def test_posture_route_does_not_name_a_transaction_form_update(engine: Eng
     assert body["loosenings_scope"] is None
 
 
+def _ech_sidecar_registry(*, named: bool = True) -> Any:
+    """REST outbounds through an ECH sidecar. ``OB_ECH_HTTP`` and ``OB_ECH_ENV`` are named, and
+    are left out when ``named`` is false; the https sidecar, the switched-off key and the plain REST
+    beside them are the controls."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        env,
+    )
+
+    url = {"url": "https://partner.example.org/ingest"}
+    shapes: dict[str, dict[str, object]] = {
+        "OB_ECH_HTTPS": {"ech_egress": True, "ech_sidecar": "https://127.0.0.1:8123"},
+        "OB_ECH_OFF": {"ech_egress": False, "ech_sidecar": "http://127.0.0.1:8123"},
+        # The build refuses an off-host sidecar, so no hop to it is ever made.
+        "OB_ECH_REMOTE": {"ech_egress": True, "ech_sidecar": "http://sidecar.example.org:8123"},
+        "OB_PLAIN": {},
+    }
+    if named:
+        shapes["OB_ECH_HTTP"] = {"ech_egress": True, "ech_sidecar": "HTTP://127.0.0.1:8123"}
+        shapes["OB_ECH_ENV"] = {"ech_egress": True, "ech_sidecar": env("ECH_SIDECAR")}
+    reg = Registry()
+    for name, extra in shapes.items():
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.REST, settings={**url, **extra})
+            )
+        )
+    return reg
+
+
+def test_the_ech_cleartext_sidecar_is_actually_wired() -> None:
+    """ADR 0139: driven through its reader AND through ``security_loosenings``. The https sidecar,
+    the switched-off key, the off-host sidecar the build refuses and the plain REST connection are
+    the controls that must not be named."""
+    from messagefoundry.config.wiring import UNRESOLVED_ECH_SIDECAR, ech_cleartext_sidecar_hops
+
+    found = ech_cleartext_sidecar_hops(_ech_sidecar_registry())
+    assert found == [
+        ("OB_ECH_ENV", UNRESOLVED_ECH_SIDECAR),
+        ("OB_ECH_HTTP", "an http:// sidecar"),
+    ]
+    risk = dict(_pairs(ech_hops=tuple(name for name, _ in found)))["ech_sidecar"]
+    assert "OB_ECH_HTTP" in risk and "OB_ECH_ENV" in risk
+    for control in ("OB_ECH_HTTPS", "OB_ECH_OFF", "OB_ECH_REMOTE", "OB_PLAIN"):
+        assert control not in risk
+    assert "CLEARTEXT" in risk and "every request header" in risk
+    assert "ech_sidecar" not in _names()  # control: nothing declared, nothing named
+
+
+@pytest.mark.parametrize(
+    ("value", "listed"),
+    [("http://127.0.0.1:8123", True), ("https://127.0.0.1:8123", False)],
+    ids=["resolves-http", "resolves-https"],
+)
+def test_the_ech_reader_resolves_an_env_sidecar_with_the_values(value: str, listed: bool) -> None:
+    """With the instance's values the reader reads an env() sidecar as the build does: one that
+    resolves to http is named as an http sidecar, and one that resolves to https, the control, is
+    not named at all."""
+    from messagefoundry.config.wiring import ech_cleartext_sidecar_hops
+
+    found = dict(
+        ech_cleartext_sidecar_hops(_ech_sidecar_registry(), env_values={"ech_sidecar": value})
+    )
+    assert ("OB_ECH_ENV" in found) is listed
+    if listed:
+        assert found["OB_ECH_ENV"] == "an http:// sidecar"
+
+
+@pytest.mark.parametrize(
+    ("extra", "deployed", "listed"),
+    [
+        # An env() ech_egress beside a literal https sidecar: the sidecar alone rules it out.
+        ({"ech_egress": "ENV", "ech_sidecar": "https://127.0.0.1:8123"}, True, False),
+        # ...and beside a literal http one it is possibly on.
+        ({"ech_egress": "ENV", "ech_sidecar": "http://127.0.0.1:8123"}, True, True),
+        # A literal ech_egress=False rules out an env() sidecar.
+        ({"ech_egress": False, "ech_sidecar": "ENV"}, True, False),
+        # A not-deployed connection with an env() value is never built, so it is skipped...
+        ({"ech_egress": True, "ech_sidecar": "ENV"}, False, False),
+        # ...and its control: the same connection deployed is listed as possibly.
+        ({"ech_egress": True, "ech_sidecar": "ENV"}, True, True),
+        # A not-deployed literal http sidecar is still read, as the DATABASE readers read one.
+        ({"ech_egress": True, "ech_sidecar": "http://127.0.0.1:8123"}, False, True),
+    ],
+    ids=[
+        "env-egress-https",
+        "env-egress-http",
+        "off-env-sidecar",
+        "dark-env",
+        "deployed-env",
+        "dark-literal",
+    ],
+)
+def test_the_ech_reader_branches(extra: dict[str, object], deployed: bool, listed: bool) -> None:
+    """Each arm of the reader with no env values, as ``messagefoundry check`` reads it. ``"ENV"``
+    stands for an env() reference."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        ech_cleartext_sidecar_hops,
+        env,
+    )
+
+    settings = {
+        "url": "https://partner.example.org/ingest",
+        **{key: env(key) if value == "ENV" else value for key, value in extra.items()},
+    }
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_X", ConnectionSpec(type=ConnectorType.REST, settings=settings), deployed=deployed
+        )
+    )
+    assert bool(ech_cleartext_sidecar_hops(reg)) is listed
+
+
+async def test_posture_route_names_an_http_ech_sidecar(engine: Engine) -> None:
+    """``GET /security/posture`` reads the set off the live graph."""
+    engine.add_registry(_ech_sidecar_registry())
+    body = await _posture_body(engine)
+    entry = next(
+        e
+        for e in body["loosenings"]  # type: ignore[union-attr]
+        if e["switch"] == "ech_sidecar"
+    )
+    assert "OB_ECH_HTTP" in entry["risk"] and "OB_ECH_HTTPS" not in entry["risk"]
+    # The engine was built with no env values, so the env() sidecar is listed with the marker.
+    assert "OB_ECH_ENV (possibly:" in entry["risk"]
+
+
+async def test_posture_route_does_not_name_an_https_ech_sidecar(engine: Engine) -> None:
+    """The control for the test above: with the http sidecar and the env() one removed, the https
+    sidecar beside them names nothing."""
+    engine.add_registry(_ech_sidecar_registry(named=False))
+    body = await _posture_body(engine)
+    assert "ech_sidecar" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
+    assert body["loosenings_scope"] is None
+
+
 def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
     """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
     for every listed hop. It now conditions that on the hop leaving the name check on."""
     risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
     assert "hostname match and key usage are still fully verified" not in risk
     assert "tls_check_hostname=false" in risk
+
+
+def test_the_expiry_entry_no_longer_claims_the_whole_chain_is_verified() -> None:
+    """CORRECTED 2026-11-03 (vault BACKLOG #5089): the entry said "the chain signature and key usage
+    are still fully verified". The relaxation also skips at least the other chain certificates'
+    validity periods and a CRL's own window, and the entry now says so."""
+    risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
+    assert "still fully verified" not in risk
+    assert "validity periods of the intermediates and the trust anchor" in risk
+    assert "a CRL's own validity window" in risk
 
 
 def test_the_revocation_attestation_is_actually_wired() -> None:
@@ -2903,6 +3069,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2954,6 +3121,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -2996,6 +3164,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -3039,6 +3208,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -3411,6 +3581,119 @@ def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
     unresolved = dict(static_credential_db_hops(reg))
     assert "unresolved env()" in unresolved["OB_ENV"] and "env(d)" not in unresolved["OB_ENV"]
     assert "possibly generic" in dict(unverified_generic_db_hops(reg))["OB_ENV"]
+
+
+def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
+    """BACKLOG #5053. The classifier judges a TLS keyword by the driver family, so the posture
+    reader resolves an ``env()`` ``odbc_driver`` as it resolves an ``env()`` dialect: a psqlODBC
+    name with ``SSLmode=verify-full`` is delegated, as the build delegates it. With no value, or
+    on a connection that is not deployed (ADR 0111 AC-1, where the cast never runs), the hop is
+    listed under a reason that says the name was not read, and a no-TLS value is still named."""
+    from messagefoundry.config.wiring import (
+        UNRESOLVED_DRIVER_REASON,
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+    from messagefoundry.transports.database import UNPLACED_DRIVER_REASON
+
+    cast_ran: list[str] = []
+
+    def driver_cast(value: object) -> str:
+        cast_ran.append(str(value))
+        return str(value)
+
+    def outbound(name: str, *, deployed: bool) -> None:
+        reg.add_outbound(
+            build_outbound_connection(
+                name,
+                Database(
+                    server="db.example.invalid",
+                    dialect="generic",
+                    odbc_driver=env(f"{name.lower()}_driver", cast=driver_cast),  # type: ignore[arg-type]
+                    odbc_params={"SSLmode": "verify-full"},
+                    statement="INSERT INTO r (a) VALUES (:a)",
+                ),
+                deployed=deployed,
+            )
+        )
+
+    reg = Registry()
+    outbound("OB_LIVE", deployed=True)
+    outbound("OB_DARK", deployed=False)
+    values = {"ob_live_driver": "PostgreSQL Unicode", "ob_dark_driver": "PostgreSQL Unicode"}
+    resolved = dict(unverified_generic_db_hops(reg, env_values=values))
+    assert "OB_LIVE" not in resolved
+    # The dark connection's driver is never resolved, so it is listed as unread, not as unplaced.
+    assert resolved["OB_DARK"].startswith(UNRESOLVED_DRIVER_REASON)
+    assert cast_ran == ["PostgreSQL Unicode"], "only the deployed connection's value is resolved"
+    # The control: the same live hop with a value that names no family is listed.
+    listed = dict(unverified_generic_db_hops(reg, env_values={**values, "ob_live_driver": "MySQL"}))
+    assert listed["OB_LIVE"].startswith(UNPLACED_DRIVER_REASON)
+    # No values: the driver is unresolved, so the hop is listed rather than guessed clear, and the
+    # reason says the name was not read rather than that it cannot be placed.
+    unread = dict(unverified_generic_db_hops(reg))["OB_LIVE"]
+    assert unread.startswith(UNRESOLVED_DRIVER_REASON)
+    # A no-TLS value never depended on the driver, so a dark connection still reports it.
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_DARK_OFF",
+            Database(
+                server="db.example.invalid",
+                dialect="generic",
+                odbc_driver=env("ob_dark_off_driver", cast=driver_cast),  # type: ignore[arg-type]
+                odbc_params={"SSLmode": "disable"},
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+            deployed=False,
+        )
+    )
+    off = dict(unverified_generic_db_hops(reg, env_values=values))["OB_DARK_OFF"]
+    assert off.startswith("TLS is explicitly not required: SSLmode=disable")
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        # At risk on every family: the reason they all give, never "possibly delegated".
+        ({}, "no TLS keyword is set in odbc_params"),
+        ({"sslcert": "client.pem"}, "a TLS keyword is set in odbc_params, but no TLS mode"),
+        ({"SSLmode": "on"}, "no TLS mode is set in odbc_params that any driver family"),
+        # Some family counts the mode set, so the hop is possibly delegated.
+        ({"SSLmode": "verify-full"}, "possibly delegated"),
+        ({"Encrypt": "yes"}, "possibly delegated"),
+    ],
+)
+def test_an_unread_env_driver_is_possibly_delegated_only_where_a_family_clears_it(
+    params: dict[str, str], expected: str
+) -> None:
+    """Review of BACKLOG #5053. An unresolved ``env()`` ``odbc_driver`` was labelled possibly
+    delegated whatever ``odbc_params`` held, so a hop with no TLS keyword, at risk on every driver,
+    read as one whose risk depended on the driver."""
+    from messagefoundry.config.wiring import (
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_UNREAD",
+            Database(
+                server="db.example.invalid",
+                dialect="generic",
+                odbc_driver=env("ob_unread_driver"),  # type: ignore[arg-type]
+                odbc_params=params,
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    assert expected in dict(unverified_generic_db_hops(reg))["OB_UNREAD"]
 
 
 def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:

@@ -326,7 +326,11 @@ async def test_the_check_reads_the_set_the_revoke_ends(engine: Engine) -> None:
     service = await _service(engine)
     for user_id, provider in (("ada", "ad"), ("dis", "ad"), ("len", "local")):
         await engine.store.create_user(
-            user_id=user_id, username=user_id, auth_provider=provider, password_generated=False
+            user_id=user_id,
+            username=user_id,
+            auth_provider=provider,
+            password_generated=False,
+            audits=(),
         )
         await engine.store.create_session(
             token_hash=f"h-{user_id}", user_id=user_id, expires_at=time.time() + 3600
