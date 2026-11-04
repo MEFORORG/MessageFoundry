@@ -1718,13 +1718,15 @@ client build refuses it without `vault_revocation_attested`; `[secrets]`
 says why.
 
 **A credential in a proxy URL is refused at least where it would reach a proxy in cleartext.** The
-urllib hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy
-`https://` does not by itself exempt the credential. Every leg the rule refuses, an example of a
-leg it lets through, and what it does not check are stated once, on
+urllib hops refuse it on each request, the verified TLS leg to an `https://` proxy included (vault
+BACKLOG #4909). Every leg the rule refuses, and what it does not check, are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). A connection's own
 `proxy_url` fails its build with a credential in it ([CONNECTIONS.md](CONNECTIONS.md)), and an
 `[egress].proxy_url` with one is refused at config load. The Vault clients
 refuse a credentialed proxy not written `https://`, when they are built and again on each send.
+They are not urllib hops, so vault BACKLOG #4909 does not reach them: a Vault client would still
+send a proxy credential to an `https://` proxy over TLS. That is measured for one in
+`HTTPS_PROXY`, and read from the code for at least one in `ALL_PROXY` or the system proxy settings.
 
 **The leg to the proxy is not always TLS, even for a proxy written `https://`.** The other
 documents link here rather than restate it.
