@@ -5810,6 +5810,29 @@ async def settle_audit_ranges(
         )
 
 
+#: The refusals of :func:`roll_audit_key_range` that no re-run, restored key or new key clears,
+#: because the roll verifies the whole chain first (BACKLOG #4934, #4935). Each is the start of the
+#: refusal's text, so :func:`audit_roll_refused_for_good` reads the same strings the roll writes.
+_ROLL_NO_GENESIS = "the audit chain does not open with a genesis row naming its key"
+_ROLL_UNAUTHENTICATED = "the audit chain's key ranges do not authenticate"
+_ROLL_BROKEN = "refusing to roll a broken audit chain"
+_ROLL_BROKEN_UNDER_ACTIVE = "the audit chain is under the active key but does not verify"
+_ROLL_REFUSED_FOR_GOOD = (
+    _ROLL_NO_GENESIS,
+    _ROLL_UNAUTHENTICATED,
+    _ROLL_BROKEN,
+    _ROLL_BROKEN_UNDER_ACTIVE,
+)
+
+
+def audit_roll_refused_for_good(message: str) -> bool:
+    """Whether ``message``, a refusal :func:`roll_audit_key_range` returned, is one no re-run clears,
+    under any key, a new one included: a chain that does not verify, or rows with no genesis row
+    (BACKLOG #4934, #4935). ``False`` for the refusals a re-run or a restored key can clear, such as
+    a missing range key or a head that moved during the roll."""
+    return message.startswith(_ROLL_REFUSED_FOR_GOOD)
+
+
 async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     """``rotate-key``'s audit step (BACKLOG #1904): open a range under the ACTIVE key.
 
@@ -5823,13 +5846,16 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     the key the chain names for that range is not configured (BACKLOG #1945).
 
     OFFLINE ONLY: another process keeps the range it read at open, so an engine left running would go
-    on appending under the old key after the range row and break the chain."""
+    on appending under the old key after the range row and break the chain.
+
+    A refusal no re-run clears starts with one of :data:`_ROLL_REFUSED_FOR_GOOD`; a new one goes
+    there too, or ``rotate-key`` names no way out after it (BACKLOG #4934, #4935)."""
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
     if not host._audit_chain_keyed:
         if host._audit_chain_unkeyed:
             return False, (
-                "the audit chain does not open with a genesis row naming its key, so it has no "
-                "keyed range to roll; run `messagefoundry audit-verify`"
+                f"{_ROLL_NO_GENESIS}, so it has no keyed range to roll; run "
+                "`messagefoundry audit-verify`"
             )
         return True, "audit chain is keyless; no keyed range to roll"
     if active_id is None:
@@ -5837,14 +5863,14 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     if not host._audit_ranges_trusted:
         return (
             False,
-            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+            f"{_ROLL_UNAUTHENTICATED}; run `messagefoundry audit-verify`",
         )
     current, current_from = host._audit_range_key_id, host._audit_range_from
     # A keyed, trusted chain was settled at open, which sets all three. The test narrows the types.
     if current is None or current_from is None or not host._audit_range_keys:
         return (
             False,
-            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+            f"{_ROLL_UNAUTHENTICATED}; run `messagefoundry audit-verify`",
         )
     # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
     # key when the chain's own current range is under a key that is not configured. Read as the
@@ -5879,8 +5905,8 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     )
     if not ok:
         if current == active_id:
-            return False, f"the audit chain is under the active key but does not verify: {msg}"
-        return False, f"refusing to roll a broken audit chain: {msg}"
+            return False, f"{_ROLL_BROKEN_UNDER_ACTIVE}: {msg}"
+        return False, f"{_ROLL_BROKEN}: {msg}"
     if len(rows) < current_from:
         # The log is shorter than the range this handle read at open: rows went missing while it
         # was open. A shorter chain still verifies, so this is the one place the roll can see it.
@@ -5925,6 +5951,29 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         f"audit chain range from seq={current_from} closed ({closes['rows']} row(s)); a new range "
         f"under the active key opens at seq={host._audit_range_from}"
     )
+
+
+def audit_chain_rolled(store: object) -> bool | None:
+    """Whether the keyed audit chain's newest range is under the store's ACTIVE key, as the open
+    settled it (BACKLOG #4942, #4936). ``rotate-key`` rolls the chain only after both data passes, so
+    after a key change a chain that has not rolled says no run has got that far on this key.
+
+    ``None`` when the store has no keyed chain to ask, or no key: a keyless store, a backend
+    without one, or a chain whose rows open with no genesis row. ``False`` for ranges the open could
+    not authenticate, since the caller withholds a stamp on ``False``, and an unknown answer must
+    not lift that hold. Read by attribute, so a store that is not an :class:`AuditRangeHost` answers
+    ``None``. No I/O: the open already read the chain."""
+    if not getattr(store, "_audit_chain_keyed", False):
+        return None
+    active = audit_active_key_id(
+        getattr(store, "_audit_mac_key", None), getattr(store, "_audit_mac_fn", None)
+    )
+    if active is None:
+        return None
+    if not getattr(store, "_audit_ranges_trusted", False):
+        return False
+    keys = getattr(store, "_audit_range_keys", None)
+    return bool(isinstance(keys, list) and keys and keys[-1] == active)
 
 
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
@@ -8708,7 +8757,8 @@ class SecretRotationMetaRow:
     ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value.
 
     One row tracks no secret: the rotation record, ``secret_key`` ``rotate-key:incomplete`` (BACKLOG
-    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on and has not
+    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on, or a start
+    found changed with the keyed audit chain not rolled to it (BACKLOG #4942), and no run has
     finished, unsealed, or blank once one finished. Its dates are when it first opened, or when a
     run closed it."""
 

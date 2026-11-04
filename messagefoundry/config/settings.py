@@ -6686,9 +6686,10 @@ class SecretRotationSettings(_Section):
     keeps its alert-only behaviour. Opting in tightens the posture; leaving it empty is not reported
     as a loosening.
 
-    The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
-    engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
-    watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
+    The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): a keyed start persists a
+    non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK
+    off it, except for a key the rotation record holds, which ``reconcile_rotation_meta`` states
+    (BACKLOG #3737, #4942), so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
     **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC credentials the engine holds are
     tracked too — each is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG #3472)
     and its clock reset when the secret no longer matches it (rotation auto-detected). The broader
@@ -6703,8 +6704,9 @@ class SecretRotationSettings(_Section):
     )
     # Store DEK tracking: the operator MAY record when the store encryption key was last rotated (ISO
     # YYYY-MM-DD) + how long it may live. When unset, the DEK is tracked LIVE-BY-DEFAULT off a persisted
-    # tracked-since stamp (ASVS 13.3.4, BACKLOG #282): the engine records the DEK key-id + first-seen date
-    # in store meta at first keyed start, so the operator date is an OVERRIDE, not a prerequisite. These
+    # tracked-since stamp (ASVS 13.3.4, BACKLOG #282): a keyed start records the DEK key-id + first-seen
+    # date in store meta, unless the rotation record holds that key (BACKLOG #3737, #4942), so the
+    # operator date is an OVERRIDE, not a prerequisite. These
     # are DATES, not the key — never a secret value.
     store_key_last_rotated: str | None = None
     store_key_max_age_days: int = 365  # rotate the store DEK within this many days of last_rotated
