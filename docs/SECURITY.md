@@ -256,18 +256,25 @@ decision 3). Unless you also supply `[api].tls_cert_file`, the hop from the prox
 deploying site's job. So `serve` refuses to start that topology (exit 2) until
 `[api].plaintext_upstream_hop_acknowledged = true` is set. It refuses in **every** mode, under
 `enforce` or `warn`. **The acknowledgement covers a proxy on the same machine only, with the engine
-bound to loopback** (BACKLOG #4636, the owner's ruling on BACKLOG #1179): `localhost`, any address
-in `127.0.0.0/8`, or `::1`. On any other bind host, an empty one included, `serve` refuses the
-plaintext hop (exit 2), acknowledged or not, in every mode, and names that host. Bind the engine to
-loopback, or set an operator `tls_cert_file` as below. A proxy on another machine therefore always
-reaches the engine over TLS. The setting records that the operator took the hop on; it secures nothing by itself. It is a listed
+bound to loopback** (BACKLOG #4636, the owner's ruling on BACKLOG #1179). Loopback here is the one
+definition every bind decision in `serve` reads, `[api].is_loopback`: exactly `127.0.0.1`, `::1` or
+`localhost`. On any other bind host, another `127.0.0.0/8` address and an empty host included,
+`serve` refuses the plaintext hop (exit 2), acknowledged or not, in every mode, and names that host.
+Bind the engine to loopback, or set an operator `tls_cert_file` as below. The refusal reads the
+engine's bind host only. It cannot see a forwarder on the same machine (a port proxy, `socat`, an
+SSH tunnel) that relays a remote proxy's plaintext to the loopback listener, so ruling that out stays
+the site's job. With the proxy on that machine, `trusted_proxies` names the address the engine sees
+it connect from, usually `127.0.0.1`. The setting records that the operator took the hop on; it
+secures nothing by itself. It is a listed
 loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each start reports it. With an operator
 `tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
 `messagefoundry.toml` it finds, so the commit/CI gate catches both refusals before `serve` does. A
-bind host given only as `serve --host` is not in that file, so the check reads the file's host. With
+bind host given only as `serve --host` is not in that file, so the check judges the file's host. The
+shipped service installer always passes `--host`, so on that path the check and `serve` can disagree
+on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs
 `MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
 skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.

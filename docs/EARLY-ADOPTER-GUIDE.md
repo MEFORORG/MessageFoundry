@@ -459,7 +459,8 @@ below are what you do about it. Complete this checklist **before any real PHI fl
       `tls_min_version` ≥ 1.2, opt-in mTLS via `tls_client_ca_file`) **or** front it with a TLS terminator
       (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`, plus the required
       `[api].plaintext_upstream_hop_acknowledged = true` when no `[api].tls_cert_file` is set: the
-      proxy-to-engine hop is then plaintext and securing it is your job). Without a terminator the engine
+      proxy-to-engine hop is then plaintext and securing it is your job, and it is accepted only with
+      the proxy on the same machine and the engine on loopback, BACKLOG #4636). Without a terminator the engine
       serves TLS anyway, but with no operator certificate it uses a self-signed placeholder. So a
       non-loopback bind **without** an operator certificate (or a trusted terminator) is **refused at
       startup**. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it

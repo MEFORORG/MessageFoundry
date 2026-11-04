@@ -387,10 +387,10 @@ The one row that *does* vary:
 > [api]
 > tls_terminated_upstream = true
 > plaintext_upstream_hop_acknowledged = true  # required: the proxy->engine hop is plaintext, and yours to secure
-> trusted_proxies = ["10.20.0.5"]        # the proxy's DIRECT TCP peer address, not a broad range
-> # On THIS (loopback-bind) topology the two Posture-B attestations only WARN if you omit them; they
-> # become an exit 2 once the bind itself is off-loopback. Declare them anyway — the warning is the
-> # record that the proxy->engine hop was considered.
+> trusted_proxies = ["127.0.0.1"]        # the proxy's DIRECT TCP peer address: on this machine, loopback
+> # On THIS (loopback-bind) topology the two Posture-B attestations only WARN if you omit them; with
+> # an operator tls_cert_file and an off-loopback bind they become an exit 2. Declare them anyway —
+> # the warning is the record that the proxy->engine hop was considered.
 > proxy_intra_service_auth = "mtls"      # how the proxy->engine hop is authenticated (attestation only)
 > proxy_tls_min_version = "1.3"          # the TLS floor the proxy negotiates with browsers
 > ```

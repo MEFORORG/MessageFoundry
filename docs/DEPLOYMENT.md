@@ -886,7 +886,8 @@ a PHI instance with **no** allow-list populated, and `block_unlisted_outbound` n
   [Revocation-guard behavior](#revocation-guard-behavior)), and a PHI instance behind a **declared**
   terminator also needs `[api].proxy_intra_service_auth` + `[api].proxy_tls_min_version` (off-loopback:
   refuse; loopback-behind-proxy: warn). A declared terminator with no `[api].tls_cert_file` also needs
-  `[api].plaintext_upstream_hop_acknowledged` in every mode, loopback or not (BACKLOG #1179).
+  `[api].plaintext_upstream_hop_acknowledged` in every mode (BACKLOG #1179), and off loopback it is
+  refused even then (BACKLOG #4636).
 - **MLLP inbound** ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py),
   `check_mllp_tls_exposure`): a non-loopback MLLP source without `tls=true` raises a `WiringError` at
   wiring time (before the engine starts). Override (dev only): `serve --allow-insecure-bind`, under the

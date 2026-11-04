@@ -32,8 +32,8 @@ from typing import Any
 import pytest
 from _docs_toml import TOML_FENCE_RE, dedent
 
+from messagefoundry.api.tls import plaintext_upstream_hop_off_loopback
 from messagefoundry.config.settings import ApiSettings, SecuritySettings
-from messagefoundry.config.tls_policy import is_loopback_hop_host
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -139,7 +139,7 @@ def test_every_plaintext_terminator_block_binds_loopback(path: Path) -> None:
         if api.get("tls_cert_file"):
             continue  # the engine serves that hop over TLS, so any bind host is allowed
         host = _bind_host(security)
-        assert host and is_loopback_hop_host(host), (
+        assert not _refused_off_loopback(host), (
             f"{rel} line {lineno} prints a copy-pasteable [api].tls_terminated_upstream = true block "
             f"with no [api].tls_cert_file on the non-loopback bind host {host!r}. serve refuses that "
             f"plaintext proxy-to-engine hop (exit 2) in every mode, acknowledged or not. Keep the "
@@ -147,9 +147,17 @@ def test_every_plaintext_terminator_block_binds_loopback(path: Path) -> None:
         )
 
 
+def _refused_off_loopback(host: str) -> bool:
+    """serve's own predicate, on a plaintext terminator bound to ``host``."""
+    api = ApiSettings(host=host, tls_terminated_upstream=True, trusted_proxies=["127.0.0.1"])
+    return plaintext_upstream_hop_off_loopback(api)
+
+
 def test_the_bind_host_reading_has_a_positive_control() -> None:
-    # Without this the loopback guard above could pass because _bind_host always read loopback.
+    # Without this the loopback guard above could pass because _bind_host always read loopback, or
+    # because the predicate never refused.
     assert _bind_host({}) == "127.0.0.1"
+    assert not _refused_off_loopback(_bind_host({}))
     nic = {"local_access_only": False, "listen_address": "0.0.0.0"}
     assert _bind_host(nic) == "0.0.0.0"
-    assert not is_loopback_hop_host(_bind_host(nic))
+    assert _refused_off_loopback(_bind_host(nic))
