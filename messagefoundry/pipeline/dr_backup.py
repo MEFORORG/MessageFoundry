@@ -601,9 +601,7 @@ class BackupRunner:
         # rest.
         staging_root, secure = self._staging_root(dest_dir)
         root_owner = await asyncio.to_thread(_probe_owner, staging_root)
-        swept_by: list[object] = []
         if root_owner is not None:
-            swept_by.append(root_owner)
             await asyncio.to_thread(_sweep_owned, staging_root, root_owner, own=None)
         # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine leaves
         # its decrypted copy there. Each backup sweeps it too, by the owner a new directory there
@@ -634,10 +632,9 @@ class BackupRunner:
             # is a write, so on a volume full to the last block `mkdtemp` can fail and the refusal
             # stands; and a sibling shard's sweep can remove a live probe before its owner is read,
             # which answers None and skips this sweep.
-            probed = await asyncio.to_thread(_probe_owner, staging_root)
-            if probed is not None:
-                swept_by.append(probed)
-                await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
+            root_owner = await asyncio.to_thread(_probe_owner, staging_root)
+            if root_owner is not None:
+                await asyncio.to_thread(_sweep_owned, staging_root, root_owner, own=None)
                 shortfall = await asyncio.to_thread(
                     self._space_shortfall,
                     staging_root,
@@ -691,7 +688,7 @@ class BackupRunner:
                     work.path,
                     staging_root,
                 )
-            elif own_owner not in swept_by:
+            elif own_owner != root_owner:
                 await asyncio.to_thread(_sweep_owned, staging_root, own_owner, own=work.path)
             snap_path: Path | None = None
             if not config_only:
@@ -2615,9 +2612,8 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
     temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
     with :func:`_sweep_owned` by the same rule, keyed on the owner a new directory in each gets.
-    Another account
-    could plant a directory in either holding a lock file and a marker, and the teardown must never
-    run on a tree it controls."""
+    Another account could plant a directory in either holding a lock file and a marker, and the
+    teardown must never run on a tree it controls."""
     owner = _owner_of(owned_like)
     if owner is None:
         log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)

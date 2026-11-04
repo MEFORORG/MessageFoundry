@@ -372,35 +372,54 @@ async def test_a_backup_that_will_not_fit_opens_no_staging_directory(tmp_path, m
     assert opened == []
 
 
-def _share_owner_for(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _share_owner_for(
+    data: Path, monkeypatch: pytest.MonkeyPatch, *, made_by_another: Path | None = None
+) -> None:
     """A server-owner stand-in: everything made under ``data`` reports the share's owner, not the
-    process's, as on an SMB or NFS share whose server sets the owner."""
+    process's, as on an SMB or NFS share whose server sets the owner. ``made_by_another`` is a
+    directory another principal made there that carries the owner this process's own directories
+    get elsewhere, as SYSTEM on the file server can."""
     real_owner = dr_backup._owner_of
 
     def owner(path: Path) -> object | None:
         p = Path(path).absolute()
-        if p != data and p.is_relative_to(data):
+        if p != made_by_another and p != data and p.is_relative_to(data):
             return "share-owner"
         return real_owner(path)
 
     monkeypatch.setattr(dr_backup, "_owner_of", owner)
 
 
-def _first_root_probe_answers_none(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The early probe of ``data`` answers None, as when a sibling shard's sweep removes it before
-    its owner is read, so the early sweep is off and only the space check's probe sweeps (BACKLOG
-    #4988 moved the early sweep onto the staging root's probed owner)."""
+def _root_probe_answers_none(
+    data: Path, monkeypatch: pytest.MonkeyPatch, *, first: int | None = 1
+) -> None:
+    """The probe of ``data`` answers None for its ``first`` calls (every call when ``None``), as
+    when a sibling shard's sweep removes it before its owner is read. The early sweep is then off
+    (BACKLOG #4988 keyed it on the staging root's probed owner)."""
     real_probe = dr_backup._probe_owner
     calls: list[Path] = []
 
     def probe(root: Path | None) -> object | None:
         if root is not None and Path(root).absolute() == data:
             calls.append(root)
-            if len(calls) == 1:
+            if first is None or len(calls) <= first:
                 return None
         return real_probe(root)
 
     monkeypatch.setattr(dr_backup, "_probe_owner", probe)
+
+
+def _exists_at_open(monkeypatch: pytest.MonkeyPatch, path: Path) -> list[bool]:
+    """Whether ``path`` still exists at each staging open, in order."""
+    seen: list[bool] = []
+    real_open = dr_backup._open_staging
+
+    def recording_open(root: Path, prefix: str, *, secure: bool):
+        seen.append(path.exists())
+        return real_open(root, prefix, secure=secure)
+
+    monkeypatch.setattr(dr_backup, "_open_staging", recording_open)
+    return seen
 
 
 def _recording_open(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
@@ -429,7 +448,7 @@ async def test_a_killed_runs_leftover_on_a_server_owner_share_is_freed_before_sp
     data = (tmp_path / "data").absolute()
     dead = _abandoned(data, "mefor-backup-")
     _share_owner_for(data, monkeypatch)
-    _first_root_probe_answers_none(data, monkeypatch)
+    _root_probe_answers_none(data, monkeypatch)
 
     class _Usage:
         def __init__(self, free: int) -> None:
@@ -459,7 +478,7 @@ async def test_a_leftover_emptied_but_not_removed_by_the_probe_sweep_still_lets_
     dead = _abandoned(data, "mefor-backup-")
     heavy = dead / "archive.tar"
     _share_owner_for(data, monkeypatch)
-    _first_root_probe_answers_none(data, monkeypatch)
+    _root_probe_answers_none(data, monkeypatch)
     real_teardown = dr_backup._teardown_staging
 
     def emptied_not_removed(path: Path) -> str | None:
