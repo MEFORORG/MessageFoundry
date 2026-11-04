@@ -7,13 +7,10 @@ A fault there used to escape the runner with no message row. For a fault that re
 body, every retrying source then live-locked on it: the file source left the file for its next
 scan, and MLLP answered AE and closed on every resend.
 
-Such a fault, one ``_attachment_body_fault`` names (an encoding failure, SQLite's DataError, a
-server driver's SQLSTATE class 22), is now recorded as ONE ``ERROR`` row and answered as a temporary
-refusal: ``AE`` from the MLLP path, a temporary refusal from a receipt source. Every other fault,
-a store fault that may clear among them, still propagates exactly as before: the transport NAKs and
-closes, a TCP inbound with no reply holds the frame (BACKLOG #5022), and a poll source leaves its
-input for the next scan. Recording a transient fault would have finished a body that a retry could
-have stored, and past the refused-body allowance a listener's row keeps only the head.
+Such a fault, one ``wiring_runner._attachment_body_fault`` names (its docstring is the rule), is now
+recorded as ONE ``ERROR`` row and answered as a temporary refusal: ``AE`` from the MLLP path, a
+temporary refusal from a receipt source. Every other fault, a store fault that may clear among them,
+still propagates exactly as before, and the tests below pin what each source then does with it.
 
 If the ``ERROR`` write fails too, the store is down, and the failure propagates to the transport
 exactly as BACKLOG #1608 pins for the ingress commit (``tests/test_ack_after_commit_invariant.py``).
@@ -63,6 +60,10 @@ class _ServerDriverError(RuntimeError):
     def __init__(self, sqlstate: str, text: str) -> None:
         super().__init__(text)
         self.sqlstate = sqlstate
+
+
+class _PyodbcDataError(RuntimeError):
+    """Shaped like ``pyodbc.DataError``: the SQLSTATE is ``args[0]``, with no ``sqlstate``."""
 
 
 class _ErrorWriteFailed(RuntimeError):
@@ -117,6 +118,10 @@ TRANSIENT = [
         lambda: _ServerDriverError("23000", "duplicate key in attachment"), id="sqlstate-23000"
     ),
     pytest.param(lambda: CipherError("vault transit unreachable"), id="cipher"),
+    # A decode failure is a driver's or a service's reply, not the document being written.
+    pytest.param(
+        lambda: UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), id="decode"
+    ),
 ]
 
 
@@ -319,6 +324,50 @@ async def test_a_long_content_type_is_bounded_before_the_write(
     assert await _attachment_types(store) == [stored]
     (row,) = await _rows(store)
     assert f":{stored}" in row["raw"]  # the skeleton's handle names the same type
+
+
+async def test_a_label_holding_a_nul_is_downgraded_before_the_write(store: MessageStore) -> None:
+    # An HL7 \X00\ escape decodes to a NUL, which PostgreSQL TEXT refuses on every resend.
+    runner, ic = _runner(store, ConnectorType.MLLP)
+
+    ack = await runner._handle_inbound(
+        ic, _doc_hl7(type_of_data="Applic\\X00\\ation").encode("utf-8")
+    )
+
+    assert _msa_code(ack) == "AA"
+    assert await _attachment_types(store) == ["application/octet-stream"]
+
+
+def test_the_content_type_bound_is_the_sql_server_column_width() -> None:
+    # The bound copies the store's DDL, so a change to the column must move it too.
+    from messagefoundry.store import sqlserver
+
+    source = Path(sqlserver.__file__).read_text(encoding="utf-8")
+    width = wiring_runner._ATTACHMENT_CONTENT_TYPE_MAX
+    assert f"content_type NVARCHAR({width}) NOT NULL" in source
+
+
+async def test_a_pyodbc_shaped_class_22_fault_is_the_documents(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SQL Server's driver carries the SQLSTATE in args[0], read only for a server driver's own
+    # error. The stand-in joins the production list, as tests/test_keyless_chain_every_command.py
+    # does for drivers a leg may not have installed; a RuntimeError keeps it inside the catch.
+    from messagefoundry.store import base as store_base
+
+    drivers = store_base.store_driver_errors()
+    monkeypatch.setattr(store_base, "store_driver_errors", lambda: (*drivers, _PyodbcDataError))
+    runner, ic = _runner(store, ConnectorType.MLLP)
+    text = "[22001] String or binary data would be truncated. Truncated value: 'DOE^JANE'. (2628)"
+    monkeypatch.setattr(
+        store, "put_attachment", _FaultingPut(store, fault=lambda: _PyodbcDataError("22001", text))
+    )
+
+    ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
+
+    assert _msa_code(ack) == "AE"
+    error = (await _rows(store))[0]["error"]
+    assert "SQLSTATE 22001" in error and "DOE^JANE" not in error
 
 
 # --- a receipt source: a TEMPORARY refusal that names the row ------------------------------------

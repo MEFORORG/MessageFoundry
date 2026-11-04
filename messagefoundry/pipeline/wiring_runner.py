@@ -952,7 +952,8 @@ def _attachment_body_fault(exc: BaseException) -> str | None:
     or ``None`` for any other fault, which the detach then lets propagate (BACKLOG #1619).
 
     A fault is the body's only when it is positively known to recur for that body: a document or
-    label that cannot be encoded (``UnicodeError``), SQLite's "string or blob too big"
+    label that cannot be encoded (``UnicodeEncodeError``; a decode failure may be a driver's or a
+    service's, not the document's), SQLite's "string or blob too big"
     (``sqlite3.DataError``), or a server driver's SQLSTATE class 22, a data exception such as SQL
     Server's 2628 truncation (``driver_sqlstate``). Anything unclassified counts as transient,
     because propagating never consumes the input: the transport NAKs and closes, a TCP inbound with
@@ -971,7 +972,7 @@ def _attachment_body_fault(exc: BaseException) -> str | None:
     while here a recorded fault ends the body and a propagated one keeps the input, so only the
     write needs a transient-or-deterministic split."""
     name = f"{type(exc).__module__}.{type(exc).__qualname__}"
-    if isinstance(exc, (UnicodeError, sqlite3.DataError)):
+    if isinstance(exc, (UnicodeEncodeError, sqlite3.DataError)):
         return name
     if isinstance(exc, (sqlite3.Error, OSError)):
         return None  # no SQLSTATE to read, and the read would retry the absent drivers' imports
@@ -1528,7 +1529,7 @@ class RegistryRunner:
         # The inbounds whose source polls a shared resource (a directory, a table): the engine consumes
         # the only copy of what it reads, so a refusal there is always stored whole. Set at bind.
         self._refusals_kept_whole: set[str] = set()
-        # Built now, so a detach's first attachment fault does not import a driver on the event loop.
+        # Built now, so the detach's catch does not first import a driver on the event loop.
         store_call_errors()
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
@@ -8317,10 +8318,14 @@ class RegistryRunner:
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
-                # A label longer than the narrowest column is downgraded the same way (BACKLOG #1619).
+                # A label some backend's column cannot hold is downgraded the same way: one longer
+                # than the narrowest column, or one holding a NUL (an HL7 \X00\ escape decodes to
+                # one), which PostgreSQL TEXT refuses. Either would fail every resend (BACKLOG #1619).
                 safe_ct = content_type
-                if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)) or (
-                    len(content_type) > _ATTACHMENT_CONTENT_TYPE_MAX
+                if (
+                    not attachment_mime_agrees(content_type, b64_head(verbatim_b64))
+                    or "\x00" in content_type
+                    or len(content_type) > _ATTACHMENT_CONTENT_TYPE_MAX
                     or utf16_units(content_type) > _ATTACHMENT_CONTENT_TYPE_MAX
                 ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
