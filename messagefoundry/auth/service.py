@@ -11767,9 +11767,10 @@ class AuthService:
         """Admin: end every account's sessions at once (BACKLOG #2614), for a suspected
         compromise where walking the accounts one by one would leave the rest live meanwhile.
         ``keep_token_hash`` names the caller's own session for the revoke to keep, so the
-        administrator who ran it is not signed out mid-response where the revoke re-stamps it. Returns the count and whether that session was kept. Audited
-        even when the count is zero, because the act itself is the record an investigator looks
-        for. The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
+        administrator who ran it is not signed out mid-response where the revoke re-stamps it.
+        Returns the count and whether that session was kept. Audited even when the count is zero,
+        because the act itself is the record an investigator looks for. The host command
+        ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as

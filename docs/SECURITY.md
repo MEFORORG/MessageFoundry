@@ -5450,9 +5450,10 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   already hold does not unlock a terminate, and the grant is single-use.
 - **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your other sessions. The
   current one is kept only when the revoke re-stamps it. Otherwise it is ended too, in the
-  revoke's own transaction, or by a fallback sweep where its own seal fails; *Limits of the
-  session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says
-  when. Same `session_terminate` re-proof gate.
+  revoke's own transaction, or, where its own seal fails, by the seal-failure handler before a
+  fallback sweep ends the rest; *Limits of the session sweep* under
+  [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says when. Same
+  `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 
