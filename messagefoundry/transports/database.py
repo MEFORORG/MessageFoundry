@@ -63,7 +63,13 @@ from decimal import Decimal
 from functools import partial
 from typing import Any, NamedTuple
 
-from messagefoundry.auth.anchor_path import WinProbe, _win_probe, windows_chain
+from messagefoundry.auth.anchor_path import (
+    SHARE_CAUSE,
+    WinProbe,
+    _win_probe,
+    subst_target,
+    windows_chain,
+)
 from messagefoundry.auth.trust_anchors import (
     ENCRYPTION_HEADER_SCOPE,
     PRIVATE_KEY_SCOPE,
@@ -711,10 +717,6 @@ _DRIVE_REMOTE = 4
 _DRIVE_NO_ROOT_DIR = 1
 _DRIVE_UNKNOWN = 0
 
-#: The first component of a rooted, driveless link target that names the NT object namespace
-#: (``\Device\Mup\host\share``), which ``windows_chain`` would read as a folder on the link's drive.
-_NT_OBJECT_ROOTS = frozenset({"device", "global??", "??"})
-
 
 class _LeavesHost(Exception):
     """Raised through :func:`~messagefoundry.auth.anchor_path.windows_chain` by a reader that met
@@ -740,10 +742,10 @@ def _windows_drive_type(root: str) -> int:
 
 
 def _windows_drive_target(drive: str) -> str | None:
-    """The folder a ``subst`` drive stands for, or ``None`` for a real volume or no device at all,
-    as ``anchor_path.windows_host_readers`` reads it: ``QueryDosDeviceW`` answers ``\\??\\C:\\...``
-    for a substituted drive. Any other failure of the query raises ``OSError``, so the walk does
-    not clear the path: a subst drive it could not read would hide the links behind it."""
+    """The folder a ``subst`` drive stands for, whole, or ``None`` for a real volume or no device
+    at all, as ``anchor_path.windows_host_readers`` reads it (``anchor_path.subst_target``). Any
+    other failure of the query raises ``OSError``, so the walk does not clear the path: a subst
+    drive it could not read would hide the links behind it."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive target is read only on Windows")
     import ctypes
@@ -757,7 +759,7 @@ def _windows_drive_target(drive: str) -> str | None:
         if error == _ERROR_FILE_NOT_FOUND:  # no such device: the drive type then says no volume
             return None
         raise OSError(f"the drive {drive} could not be read (winerror {error})")
-    return buf.value[4:] if buf.value.startswith("\\??\\") else None
+    return subst_target(buf.value)
 
 
 #: ``QueryDosDeviceW``'s answer for a drive letter with no device behind it.
@@ -774,11 +776,16 @@ def _windows_path_verdict(
 ) -> bool | None:
     """The best-effort verdict on whether a Windows ``path`` leads off this host, from a walk of it
     with :func:`~messagefoundry.auth.anchor_path.windows_chain`. ``True``: the walk found the path
-    leads to another host. ``None``: the walk could not finish, and its cause is logged at DEBUG.
+    leads to another host. ``None``: the walk could not finish; a path-free class of its cause is
+    logged at WARNING and the whole cause, which can name the path, at DEBUG (:func:`_not_cleared`).
     ``False``: the walk found nothing that leads off the host, which is not proof the path is
     local. ``probe``, ``drive_type``, ``drive_target`` and ``cwd`` are the walk's inputs, passed in
     so a test can stand in for the file system. ``docs/CONNECTIONS.md``, Generic ODBC, states the
-    check's limits."""
+    check's limits.
+
+    A walk that reaches a share (``anchor_path.SHARE_CAUSE``), such as through a ``subst`` drive
+    onto one, is ``True`` (vault BACKLOG #5197 item 11). A link whose target is rooted with no drive
+    is ``None``, as ``windows_chain`` answers it (item 9)."""
 
     def volume_cause(root: str) -> str | None:
         kind = drive_type(root)
@@ -801,8 +808,6 @@ def _windows_path_verdict(
             text = target.strip()
             if _is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
                 raise _LeavesHost
-            if text[:1] in "\\/" and text.lstrip("\\/").split("\\")[0].lower() in _NT_OBJECT_ROOTS:
-                raise OSError("the link names an NT object path")  # the walk reports it: unclear
         return kind, target
 
     try:
@@ -814,12 +819,24 @@ def _windows_path_verdict(
     except _PathEnds:
         return False
     except OSError as exc:  # a reader the walk does not guard, such as drive_target
-        logger.debug("DATABASE file keyword path not cleared: %s", exc)
+        _not_cleared(f"a drive could not be read: {type(exc).__name__}", exc)
         return None
+    if cause is not None and cause.kind == SHARE_CAUSE:
+        return True  # the walk reached a share, as through a subst drive onto \??\UNC\host\share
     if cause is not None:
-        logger.debug("DATABASE file keyword path not cleared: %s", cause)
+        _not_cleared(cause.kind, cause)
         return None
     return False
+
+
+def _not_cleared(kind: str, detail: object) -> None:
+    """Log why the walk did not clear a file keyword path: ``kind``, which names no path, at
+    WARNING, so the operator who meets the refusal sees a reason, and ``detail``, which can name
+    the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197 item 22)."""
+    logger.warning(
+        "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
+    )
+    logger.debug("DATABASE file keyword path not cleared: %s", detail)
 
 
 #: A link target :func:`_is_remote_spelling` matches that :func:`_windows_path_verdict` does not
@@ -844,7 +861,7 @@ def _path_verdict(text: str) -> bool | None:
             cwd=os.getcwd,
         )
     except (OSError, ValueError) as exc:
-        logger.debug("DATABASE file keyword path not cleared: %s", type(exc).__name__)
+        _not_cleared(f"the check could not run: {type(exc).__name__}", type(exc).__name__)
         return None
 
 
@@ -854,12 +871,17 @@ def _path_verdict(text: str) -> bool | None:
 FileVerdicts = Mapping[str, bool | None]
 
 
+def _sent_text(value: object) -> str:
+    """The text the build sends for a file keyword's ``value``: its ``str()``, so ``0`` is judged
+    and read as the ``"0"`` the driver gets, where truthiness skipped it (vault BACKLOG #5197 item
+    15). Empty for ``None``, which the build refuses rather than sends."""
+    return "" if value is None else str(value)
+
+
 def file_keyword_verdicts(value: object) -> FileVerdicts:
-    """:data:`FileVerdicts` for ``value``, empty for a falsy one. A spelling the spelling check
-    refuses is ``True`` and is not walked."""
-    if not value:
-        return {}
-    raw = str(value)
+    """:data:`FileVerdicts` for ``value``, empty when no text is sent (:func:`_sent_text`). A
+    spelling the spelling check refuses is ``True`` and is not walked."""
+    raw = _sent_text(value)
     return {
         p: True if _is_remote_spelling(p) else _path_verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
@@ -870,29 +892,30 @@ def file_keyword_verdicts(value: object) -> FileVerdicts:
 def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> bool:
     """Whether a file keyword's ``value`` must be refused. ``True`` when any spelling's verdict is
     ``True``, or the trimmed spelling's verdict is ``None``. ``False`` otherwise, including for a
-    falsy value and for a padded spelling whose verdict alone is ``None``. ``False`` is not proof
-    the path is local. ``verdicts`` are this value's (:func:`file_keyword_verdicts`) when the
-    caller already has them; otherwise they are computed here. ``docs/CONNECTIONS.md``, Generic
-    ODBC, states the check's limits."""
-    if not value:
+    value that sends no text (:func:`_sent_text`) and for a padded spelling whose verdict alone is
+    ``None``. ``False`` is not proof the path is local. ``verdicts`` are this value's
+    (:func:`file_keyword_verdicts`) when the caller already has them; otherwise they are computed
+    here. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    sent = _sent_text(value)
+    if not sent:
         return False
     if verdicts is None:
         verdicts = file_keyword_verdicts(value)
-    trimmed = str(value).strip()
+    trimmed = sent.strip()
     return True in verdicts.values() or (bool(trimmed) and verdicts.get(trimmed) is None)
 
 
 def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -> tuple[str, ...]:
     """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
-    since a driver may trim it. Empty for a falsy value and for a value :func:`names_another_host`
-    refuses; otherwise every spelling in ``verdicts``. A returned spelling is not proof the path is
+    since a driver may trim it. Empty for a value that sends no text (:func:`_sent_text`) and for
+    a value :func:`names_another_host` refuses; otherwise every spelling in ``verdicts``. A returned spelling is not proof the path is
     local (``docs/CONNECTIONS.md``, Generic ODBC). Any value, a ``Path`` too, is read as its
     ``str()``, the text the build sends.
 
     ``verdicts`` are the value's, from the judgement that decided whether it is refused; pass them
     whenever there is one, so the path is judged once. Without them they are computed here, and a
     caller must treat an empty answer for a set value as its own refusal."""
-    if not value:
+    if not _sent_text(value):
         return ()
     if verdicts is None:
         verdicts = file_keyword_verdicts(value)
@@ -1105,7 +1128,7 @@ def _driver_file_spellings(
     are computed here."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
     value = named.get(keyword)
-    if not value:
+    if not _sent_text(value):
         return
     given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
     if names_another_host(value, given):
