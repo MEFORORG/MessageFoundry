@@ -6883,6 +6883,8 @@ class RegistryRunner:
             self._log_left_in_flight(kind, name, claims.ids)
             return
         abandon = self._hold_abandon(kind, name)
+        if claims.deaths.count and await self._dead_worker_wrote(kind, name, claims.ids):
+            claims.close_deaths(kind, name)  # it moved the lane on: the next death is another row's
         if claims.deaths.count >= 2:
             delay = _capped_backoff(
                 _WORKER_ERROR_BACKOFF_SECONDS, claims.deaths.count - 2, _REPEND_RETRY_CAP_SECONDS
@@ -6966,6 +6968,34 @@ class RegistryRunner:
             ):
                 return
         await run(name, claims=claims)
+
+    async def _dead_worker_wrote(self, kind: str, name: str, ids: Sequence[str]) -> bool:
+        """Whether a dead per-lane worker wrote any of the rows it died holding, ``ids`` (BACKLOG
+        #4607). A run of deaths otherwise closes only on a settled pass, so a worker that dies after
+        delivering a row, every time, would read as stuck on it.
+
+        Measured as the pooled twin measures it (``StageDispatcher._dead_head_resolved``): fewer of
+        the lane's rows in flight at this stage than it held means one was written. A read that
+        fails, or another holder of the lane's rows, reads as not written."""
+        if not ids:
+            return False
+        stage = {
+            "delivery": Stage.OUTBOUND,
+            "router": Stage.INGRESS,
+            "transform": Stage.ROUTED,
+            "response": Stage.RESPONSE,
+        }[kind]
+        try:
+            inflight = await self.store.inflight_by_lane(stage=stage.value)
+        except Exception:  # noqa: BLE001 — the reading only; the run of deaths stays open
+            log.debug(
+                "%s worker %r: could not read the in-flight rows a dead worker held",
+                kind,
+                name,
+                exc_info=True,
+            )
+            return False
+        return inflight.get(name, (0, 0.0))[0] < len(ids)
 
     @staticmethod
     def _log_left_in_flight(kind: str, name: str, ids: Sequence[str]) -> None:

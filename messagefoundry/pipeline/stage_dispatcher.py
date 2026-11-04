@@ -1568,8 +1568,40 @@ class StageDispatcher:
                 count_label=IN_THIS_RUN,
             )
 
+    async def _dead_head_resolved(self, lane: str, ids: list[str]) -> bool:
+        """Whether a dead serializer's body wrote the row it died on, ``ids[drain_index]``
+        (BACKLOG #4607). ``drain_index`` moves past a row only when the body returns, so a death
+        after the row's terminal write, still inside the body or in the runner's per-stage adapter
+        after it, reads as zero progress, and under ``stop`` a lane that delivers at every death
+        would be STOPped.
+
+        Measured, not inferred: the dead serializer's rows from ``drain_index`` on, the noted extras
+        with them, are counted against the lane's in-flight rows at this stage. Fewer in flight
+        means one of them was written, and since they are worked oldest-first, the first was. A
+        read that fails, a body that had finished, or another holder of the lane's rows reads as
+        not written, which is the zero-progress reading this had before. A body that re-pended the
+        row itself before dying (``mark_failed``) reads as written too: a retry that spends one of
+        the row's attempts, not a machinery fault on the row."""
+        st = self._states.get(lane)
+        if st is None or st.drained is not None or not ids:
+            return False
+        i = min(st.drain_index, len(ids) - 1)
+        held = len(ids) - i + len(st.held_extra_ids)
+        try:
+            inflight = await self._store.inflight_by_lane(stage=self._stage.value)
+        except Exception:  # noqa: BLE001 — the reading only; the recovery proceeds as zero progress
+            log.debug(
+                "StageDispatcher %s lane %s: could not read the in-flight rows a dead serializer "
+                "held; recovering it as zero progress",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+            return False
+        return inflight.get(lane, (0, 0.0))[0] < held
+
     def _dead_serializer_outcome(
-        self, lane: str, ids: list[str]
+        self, lane: str, ids: list[str], *, head_resolved: bool = False
     ) -> tuple[_LaneOutcome, list[str], list[str]]:
         """What a replacement for a dead serializer applies (:meth:`_on_lane_task_done`). Returns
         ``(outcome, rows to date to its park_until, rows to release)``.
@@ -1588,6 +1620,10 @@ class StageDispatcher:
         lane at its cadence whenever the row that killed it was not the first, the spin fix A
         collapses.
 
+        With ``head_resolved`` (:meth:`_dead_head_resolved`) row ``i`` was written before the death,
+        so the body counts as past it: the recovery made progress, and only the rows after it are
+        dated.
+
         Pure: a serializer that died INSIDE its terminal transition may already have counted its
         fault on the streak, so the streak read is the one that transition found
         (:func:`_found_streak`); :meth:`_run_lane` puts it back before the replay counts it once."""
@@ -1600,6 +1636,8 @@ class StageDispatcher:
             park_until = self._clock() + self._infra_backoff(streak)
             return replace(outcome, park_until=park_until), [head[0]], list(tail)
         i = min(st.drain_index, max(len(ids) - 1, 0))
+        if head_resolved:
+            i += 1
         streak = _found_streak(st) if i == 0 else 0
         park_until = self._clock() + self._infra_backoff(streak)
         outcome = _LaneOutcome(
@@ -1675,7 +1713,11 @@ class StageDispatcher:
                         claimed + (len(st_r.held_extra_ids) if st_r is not None else 0),
                     ),
                 )
-            outcome, head_ids, tail_ids = self._dead_serializer_outcome(lane, recover_ids)
+            # Read only once the lane may be written: a stop or a superseded lease sends nothing.
+            resolved = held is None and await self._dead_head_resolved(lane, recover_ids)
+            outcome, head_ids, tail_ids = self._dead_serializer_outcome(
+                lane, recover_ids, head_resolved=resolved
+            )
             if st_r is not None and st_r.transition_streak is not None:
                 # A death inside the terminal transition: the replay below counts the fault once.
                 st_r.infra_error_streak, st_r.transition_streak = st_r.transition_streak, None
@@ -1788,7 +1830,9 @@ class StageDispatcher:
         st.transition_streak = st.infra_error_streak  # #4607: see _dead_serializer_outcome
         self._release_lane_slot(st)
         st.held_extra_ids.clear()
-        if not recover:  # #4607: this serializer survived its body, so a run of deaths ends
+        # #4607: a run of deaths ends when a serializer survives its body, or when the one it
+        # recovers had moved the lane on before it died, so the next death is another row's.
+        if not recover or outcome.made_progress:
             self._close_serializer_deaths(lane, st)
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
