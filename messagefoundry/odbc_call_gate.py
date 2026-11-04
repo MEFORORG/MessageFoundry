@@ -20,7 +20,12 @@ can use them without importing the store.
 
 Standard library only: nothing here imports aioodbc or pyodbc. It recognises an aioodbc connection
 by its bound ``_execute`` method, and reaches its raw handles through ``_conn``, ``_executor`` and a
-cursor's ``_impl``, as aioodbc 0.5.0 names them.
+cursor's ``_impl``, as aioodbc 0.5.0 names them. ``pyproject.toml`` pins aioodbc to that release
+for this reason (BACKLOG #5005). For the call gate, a cursor's ``_impl`` is read only in
+:func:`raw_cursor`, so the DATABASE connector and the store's pooled cursor read it one way. Other
+readers outside the gate remain, at least the store's ``_sync_setinputsizes`` (ADR 0114), so a move
+of the pin still greps the engine for the name. Where a real aioodbc object
+lacks a name the gate needs, ERROR is logged once per process for each type, not on every borrow.
 """
 
 from __future__ import annotations
@@ -38,11 +43,42 @@ __all__ = [
     "abandon_one_shot",
     "call_gate",
     "close_one_shot",
+    "drop_handle",
     "install_call_gate",
     "raw_closer",
+    "raw_cursor",
+    "report_once",
 ]
 
 log = logging.getLogger(__name__)
+
+#: The (check, type) pairs already reported by :func:`report_once` in this process.
+_REPORTED: set[tuple[str, str]] = set()
+
+
+def report_once(check: str, obj: Any, message: str) -> None:
+    """Log ``message`` at ERROR the first time ``check`` fails for ``obj``'s type, and never again
+    for that pair (BACKLOG #5005). ``message`` takes the type's name as its one ``%s``. A pool
+    borrows on every send, so logging each time buried the one line that matters under copies of
+    it; the condition is a property of the installed aioodbc, so one line says it all."""
+    name = type(obj).__qualname__
+    key = (check, f"{type(obj).__module__}.{name}")
+    if key in _REPORTED:
+        return
+    _REPORTED.add(key)
+    log.error(message + "; logged once per process", name)
+
+
+def drop_handle(conn: Any) -> Any:
+    """Take ``conn``'s pyodbc connection off it and return that, or ``None`` when it has none.
+
+    A plain attribute write, so a caller can make it before any await. aioodbc 0.5.0 derives
+    ``Connection.closed`` from ``_conn``, so its pool never lends a connection with none again, and
+    its ``__del__`` closes only a handle the connection still holds."""
+    raw = getattr(conn, "_conn", None)
+    if raw is not None:
+        conn._conn = None
+    return raw
 
 
 class CallGate:
@@ -155,18 +191,22 @@ def install_call_gate(conn: Any) -> None:
     on a cancellation must also drop its ``_conn``, as the SQL Server store's detach does, rather
     than leave the close to the collector. A connection without a bound ``_execute`` (a test
     double) is left alone and keeps the pre-gate behaviour. A real aioodbc connection that cannot
-    be gated is logged at ERROR, because it brings the native crash back; the store's live suite
-    also pins that a pooled connection is gated.
+    be gated is logged at ERROR, because it brings the native crash back. That is logged once per
+    process for its type, not on every borrow (BACKLOG #5005); every later borrow of such a
+    connection goes ungated just the same. The store's live suite also pins that a pooled
+    connection is gated.
     """
     if call_gate(conn) is not None:
         return
     execute = getattr(conn, "_execute", None)
     if not inspect.ismethod(execute):
         if type(conn).__module__.startswith("aioodbc"):
-            log.error(
+            report_once(
+                "_execute",
+                conn,
                 "odbc: aioodbc %s has no bound _execute to gate; a cancelled call can free ODBC"
-                " handles under a running statement (BACKLOG #2049)",
-                type(conn).__qualname__,
+                " handles under a running statement (BACKLOG #2049), and no connection of this"
+                " type is gated",
             )
         return
     gate = CallGate()
@@ -206,7 +246,7 @@ def abandon_one_shot(conn: Any, cur: Any) -> bool:
     raw = getattr(conn, "_conn", None)
     if gate is None or raw is None:
         return False
-    _hand_off(conn, raw, _raw_cursor(cur), gate, logging.WARNING)
+    _hand_off(conn, raw, raw_cursor(cur), gate, logging.WARNING)
     return True
 
 
@@ -232,7 +272,7 @@ async def close_one_shot(conn: Any, cur: Any) -> None:
     with no ``_impl`` takes that path too, which is logged at ERROR, as an ungateable connection
     is: aioodbc renamed what this reads."""
     raw = getattr(conn, "_conn", None)
-    raw_cur = _raw_cursor(cur)
+    raw_cur = raw_cursor(cur)
     if raw is None or (cur is not None and raw_cur is None):
         await _close_through_methods(conn, cur)
         return
@@ -241,16 +281,22 @@ async def close_one_shot(conn: Any, cur: Any) -> None:
         await asyncio.wait((closing,))
 
 
-def _raw_cursor(cur: Any) -> Any:
-    """``cur``'s pyodbc cursor, or ``None``. A real aioodbc cursor without one is logged at ERROR,
-    as an ungateable connection is: aioodbc renamed what this reads, and the cursor is then left
-    for the collector or closed outside the one-shot job."""
+def raw_cursor(cur: Any) -> Any:
+    """``cur``'s pyodbc cursor (aioodbc 0.5.0's ``_impl``), or ``None``: the one place the engine
+    reads that name for the call gate (BACKLOG #5005).
+
+    ``None`` sends the caller to its fallback, which closes the cursor through its own ``close()``
+    outside the gate, or leaves it to the collector. A test double takes that path silently. A
+    real aioodbc cursor without one is logged at ERROR, once per process for its type, as an
+    ungateable connection is: aioodbc renamed what this reads, so every such cursor takes the
+    fallback."""
     raw_cur = getattr(cur, "_impl", None)
     if raw_cur is None and cur is not None and type(cur).__module__.startswith("aioodbc"):
-        log.error(
-            "odbc: aioodbc %s has no _impl; a one-shot exit cannot hand its cursor to the call"
-            " gate (BACKLOG #2394)",
-            type(cur).__qualname__,
+        report_once(
+            "_impl",
+            cur,
+            "odbc: aioodbc %s has no _impl; its cursors are closed outside the call gate, beside"
+            " any call still running (BACKLOG #2394)",
         )
     return raw_cur
 
@@ -262,7 +308,7 @@ def _hand_off(
     handle. The close's future, or ``None`` when the running call took it or none was scheduled."""
     if raw_cur is not None:
         gate.abandon(raw_cur)
-    conn._conn = None  # first, and await-free: aioodbc's __del__ closes only a handle it holds
+    drop_handle(conn)  # first, and await-free: aioodbc's __del__ closes only a handle it holds
     if gate.close_after_running_call(raw):
         return None
     return _schedule_close(conn, partial(gate.close, raw), level)

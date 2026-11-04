@@ -36,6 +36,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.store.sqlserver as sqlserver
+from messagefoundry import odbc_call_gate
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.odbc_call_gate import call_gate, close_one_shot, install_call_gate
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
@@ -407,10 +408,13 @@ class _RenamedCursor:
 
 
 async def test_a_real_cursor_with_no_raw_handle_is_logged_at_error(
-    rig: _Rig, caplog: pytest.LogCaptureFixture
+    rig: _Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The one-shot exits read aioodbc's ``_impl``. A real cursor without it cannot be handed to
     the gate, and that must not pass silently; a stand-in's missing ``_impl`` is not logged."""
+    # Logged once per process for each type (BACKLOG #5005), so an earlier test or a rerun that
+    # reported this type would leave nothing to see here.
+    monkeypatch.setattr(odbc_call_gate, "_REPORTED", set())
     rig.release.set()
     conn = AioConn(rig.raw(blocks=never), rig.executor)
     install_call_gate(conn)
