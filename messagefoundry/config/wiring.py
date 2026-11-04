@@ -4017,12 +4017,19 @@ def Direct(
     )
 
 
+class _RoleDefault:
+    """The type of :data:`_ROLE_DEFAULT`, so ``help(DICOM)`` and a signature show what it means."""
+
+    def __repr__(self) -> str:
+        return "<each role's default>"
+
+
 #: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
 #: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
 #: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
 #: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
 #: Not ``_UNSET``, which is ``env()``'s.
-_ROLE_DEFAULT: Any = object()
+_ROLE_DEFAULT: Any = _RoleDefault()
 
 
 def DICOM(

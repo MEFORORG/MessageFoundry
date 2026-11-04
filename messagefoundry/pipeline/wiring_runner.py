@@ -629,12 +629,22 @@ async def _forget_dead_payload(
     retry cap (vault BACKLOG #4908). The row has left the lane, so a connector's memory of its sends
     would only shorten a replay of it. ``sent`` is ``None`` when no live send was attempted. By
     ``getattr``, as ``consumes_metadata`` is read, so a stand-in connector without the hook is still
-    a connector."""
+    a connector. Best effort: it runs after the DEAD write, inside the arm that still has the alert
+    checks to run, so a failure is logged by type and goes no further."""
     if not failed.dead or sent is None:
         return
     forget = getattr(connector, "forget_payload", None)
-    if forget is not None:
+    if forget is None:
+        return
+    try:
         await forget(sent)
+    except Exception as exc:  # noqa: BLE001 - a connector's cache hook must not skip the alert checks
+        log.warning(
+            "delivery worker: %s.forget_payload failed after a dead-letter (%s); its memory of that "
+            "row's sends is kept",
+            type(connector).__name__,
+            type(exc).__name__,
+        )
 
 
 def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: str) -> None:

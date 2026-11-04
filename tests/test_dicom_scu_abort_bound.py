@@ -313,8 +313,9 @@ def test_the_key_is_the_whole_object_so_two_objects_of_one_size_never_share_it(
     assert dicom_module._unanswered_key(b"abcd") == first, "a re-send meets its own count"
 
 
-def _without_uid(patient_name: str) -> bytes:
-    """A synthetic SR with no SOP Instance UID in its data set."""
+def _two_without_uid() -> tuple[bytes, bytes]:
+    """Two synthetic SRs with no SOP Instance UID, alike but for one letter of the patient name, so
+    one size. From one data set, since the UIDs make_sr_part10 generates vary in length."""
     _needs_dicom()
     from io import BytesIO
 
@@ -322,17 +323,21 @@ def _without_uid(patient_name: str) -> bytes:
 
     from tests._dicom_sample import make_sr_part10
 
-    ds = dcmread(BytesIO(make_sr_part10(patient_name=patient_name)))
+    ds = dcmread(BytesIO(make_sr_part10()))
     del ds.SOPInstanceUID
-    out = BytesIO()
-    ds.save_as(out)
-    return out.getvalue()
+    made = []
+    for name in ("Doe^Jane^A", "Doe^Jane^B"):
+        ds.PatientName = name
+        out = BytesIO()
+        ds.save_as(out)
+        made.append(out.getvalue())
+    return made[0], made[1]
 
 
 async def test_two_objects_with_no_uid_keep_their_own_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first, second = _without_uid("Doe^Jane^A"), _without_uid("Doe^Jane^B")
+    first, second = _two_without_uid()
     assert len(first) == len(second) and first != second, "CONTROL: one size, two objects"
     monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(first) - 1)
     scu = _uncapped_scu(1, "PACS_SCP")
@@ -434,8 +439,86 @@ async def test_the_final_refusal_names_no_cause_it_cannot_know(
         final = scu._count_unanswered(_key(7), 4)
     assert final is not None
     text = str(final)
-    assert "no response (an abort or a timeout)" in text
+    assert "no response (an abort, a timeout or an error raised mid-store)" in text
     assert "engine SCP" not in text
+
+
+class _RejectsTheContext:
+    """An association the peer answered but with no accepted presentation context: permanent."""
+
+    is_established = False
+    rejected_contexts = ["the one proposed"]
+    accepted_contexts: list[str] = []
+
+    def release(self) -> None:
+        pass
+
+
+async def test_a_permanent_refusal_drops_the_count_so_a_replay_gets_every_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 1: only the retry cap dropped the count, so a row the runner dead-lettered on another
+    # permanent refusal kept it, and a replay went final early.
+    _needs_dicom()
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
+    scu = _uncapped_scu(1, "PACS_SCP")
+    limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
+    payload = _carry(data)
+    monkeypatch.setattr(scu, "_associate", lambda ae: _ResetMidStore())
+    for _ in range(limit - 1):
+        with pytest.raises(DeliveryError):
+            await scu.send(payload)
+    assert len(scu._unanswered) == 1
+    monkeypatch.setattr(scu, "_associate", lambda ae: _RejectsTheContext())
+    with pytest.raises(NegativeAckError) as refused:
+        await scu.send(payload)
+    assert refused.value.permanent and refused.value.code == "no-accepted-context"
+    assert scu._unanswered == {}
+    monkeypatch.setattr(scu, "_associate", lambda ae: _ResetMidStore())
+    outcomes = []
+    for _ in range(limit):
+        try:
+            await scu.send(payload)
+        except NegativeAckError:
+            outcomes.append("final")
+        except DeliveryError:
+            outcomes.append("re-send")
+    assert outcomes == ["re-send"] * (limit - 1) + ["final"]
+
+
+async def test_an_answered_store_with_nothing_counted_pays_no_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 1: the key was hashed before every association of an object over the ceiling.
+    _needs_dicom()
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
+    real, hashed = dicom_module._unanswered_key, []
+
+    def counting(object_bytes: bytes) -> int | None:
+        hashed.append(len(object_bytes))
+        return real(object_bytes)
+
+    monkeypatch.setattr(dicom_module, "_unanswered_key", counting)
+    with _scp_that_aborts([0x0000, None]) as port:
+        scu = _uncapped_scu(port, "PACS_SCP")
+        assert await _outcomes(scu, data, 1) == ["stored"]
+        assert hashed == []
+        # CONTROL: an unanswered end of the same object does hash it.
+        assert await _outcomes(scu, data, 1) == ["re-send"]
+    assert hashed == [len(data)]
+
+
+def test_the_factorys_role_default_reads_as_what_it_means() -> None:
+    import inspect
+
+    default = inspect.signature(DICOM).parameters["max_object_bytes"].default
+    assert repr(default) == "<each role's default>"
 
 
 # --- The delivery worker's half: forget_payload once the retry cap dead-letters the row -----------
@@ -486,5 +569,43 @@ async def test_the_worker_forgets_a_payload_only_when_the_retry_cap_dead_letters
         assert dest.calls == 3
         if max_attempts is not None:
             assert dead == 1 and len(payloads) == 1 and dest.forgotten == list(payloads)
+    finally:
+        await store.close()
+
+
+class _ForgetBreaks(_FailsAndRemembers):
+    async def forget_payload(self, payload: str) -> None:
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+
+async def test_a_failing_forget_hook_is_logged_and_the_arm_still_finishes(
+    tmp_path: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 1: the hook ran unguarded inside the except arm, so an error from it skipped the alert
+    # checks that follow the dead-letter.
+    from messagefoundry.config.models import RetryPolicy
+    from messagefoundry.store import MessageStore
+    from tests.test_retry_exhausted_log import FAST, OUT, _enqueue, _stepped_runner
+
+    store = await MessageStore.open(tmp_path / "engine.db")
+    try:
+        runner = _stepped_runner(store, _ForgetBreaks(), RetryPolicy(max_attempts=1, **FAST))
+        checked: list[str] = []
+
+        async def alert_checks(name: str) -> None:
+            checked.append(name)
+
+        monkeypatch.setattr(runner, "_delivery_failure_alert_checks", alert_checks)
+        await _enqueue(store, 1)
+        item = await store.claim_next_fifo(OUT, now=1e12)
+        assert item is not None
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner"):
+            await runner._process_delivery_item(OUT, item)
+        assert await store.count_dead(allowed_channels=None) == 1
+        assert checked == [OUT]
+        assert any(
+            "forget_payload failed" in r.getMessage() and "RuntimeError" in r.getMessage()
+            for r in caplog.records
+        )
     finally:
         await store.close()

@@ -215,8 +215,10 @@ def _unanswered_key(object_bytes: bytes) -> int | None:
     one at or under :data:`_ENGINE_SCP_ABORT_PAST_BYTES`, which is never counted. A hash of the whole
     object, so a re-send of the same outbound row always meets its own count, and two objects,
     one with no SOP instance UID included, share one only on a 64-bit collision. Python's ``hash``
-    is SipHash under a per-process random key, so that is about one chance in 10**10 across a full
-    map, and no sender can aim for one. Not a security use, so not a crypto primitive."""
+    is SipHash under a per-process random key while ``PYTHONHASHSEED`` is unset or random, so that
+    is about one chance in 10**10 across a full map, and no sender can aim for one. With the seed
+    fixed, a sender could, and the cost is that one object goes final early. Not a security use, so
+    not a crypto primitive."""
     if len(object_bytes) <= _ENGINE_SCP_ABORT_PAST_BYTES:
         return None
     return hash(object_bytes)
@@ -2474,6 +2476,18 @@ class DicomScuDestination(DestinationConnector):
         )
 
     def _c_store(self, object_bytes: bytes) -> None:
+        """Blocking: :meth:`_store_object`, then drop the object's unanswered count on any permanent
+        refusal. The runner dead-letters that row, or holds it on a lane-stopping fault, so a count
+        left behind would only shorten a later send of it (vault BACKLOG #4908). The final
+        ``unanswered-over-ceiling`` refusal has already dropped its own."""
+        try:
+            self._store_object(object_bytes)
+        except NegativeAckError as exc:
+            if exc.permanent:
+                self._forget_object(object_bytes)
+            raise
+
+    def _store_object(self, object_bytes: bytes) -> None:
         """Blocking: parse → associate → C-STORE → classify. Runs on a worker thread (``to_thread``),
         never the loop. ``load_dcmread`` is called first (outside the try) so a missing ``[dicom]`` extra
         surfaces as a deploy ``RuntimeError`` (internal error), not a per-message data ``ERROR``.
@@ -2513,7 +2527,6 @@ class DicomScuDestination(DestinationConnector):
                 permanent=True,
             ) from exc
         sop_instance = str(getattr(dataset, "SOPInstanceUID", "") or "")
-        unanswered_key = _unanswered_key(object_bytes)
         ae = self._build_ae()
         ae.add_requested_context(sop_class, transfer_syntax)
         assoc = self._associate(ae)
@@ -2550,7 +2563,7 @@ class DicomScuDestination(DestinationConnector):
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
             # No response either, so it counts toward the same bound as an empty status below.
-            final = self._count_unanswered(unanswered_key, len(object_bytes))
+            final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
             if final is not None:
                 raise final from exc
             raise DeliveryError(
@@ -2559,13 +2572,13 @@ class DicomScuDestination(DestinationConnector):
         finally:
             assoc.release()
         if getattr(status_ds, "Status", None) is None:
-            final = self._count_unanswered(unanswered_key, len(object_bytes))
+            final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
             if final is not None:
                 raise final
         else:
             # Any status, a refusal included, means the peer answers this object: so the count,
             # which is of unanswered ends in a row, starts again.
-            self._forget_unanswered(unanswered_key)
+            self._forget_object(object_bytes)
         self._classify(status_ds, sop_class=sop_class, sop_instance=sop_instance)
 
     def _count_unanswered(self, key: int | None, size: int) -> NegativeAckError | None:
@@ -2574,7 +2587,9 @@ class DicomScuDestination(DestinationConnector):
         ``key`` is :func:`_unanswered_key`'s, ``None`` for an object that is never counted. The lane
         would otherwise re-send it at its head until the retry policy ran out, or without end under
         ``max_attempts=None``; a permanent refusal is dead-lettered whatever that policy says. The
-        refusal names no cause: the SCU cannot tell a peer's abort from its own DIMSE timeout."""
+        refusal names no cause: the SCU cannot tell a peer's abort from its own DIMSE timeout. The
+        key is hashed only here and in :meth:`_forget_object`, so a store that is answered with
+        nothing counted pays no hash."""
         if key is None:
             return None
         with self._unanswered_lock:
@@ -2586,8 +2601,8 @@ class DicomScuDestination(DestinationConnector):
                 return None
         return NegativeAckError(
             f"DICOM C-STORE client (SCU) to {self._host}:{self._port}: an object of {size} bytes, "
-            f"over {_ENGINE_SCP_ABORT_PAST_BYTES} bytes, ended with no response (an abort or a "
-            f"timeout) {count} times in a row (no retry)",
+            f"over {_ENGINE_SCP_ABORT_PAST_BYTES} bytes, ended with no response (an abort, a "
+            f"timeout or an error raised mid-store) {count} times in a row (no retry)",
             code="unanswered-over-ceiling",
             permanent=True,
         )
@@ -2599,6 +2614,13 @@ class DicomScuDestination(DestinationConnector):
             return
         with self._unanswered_lock:
             self._unanswered.pop(key, None)
+
+    def _forget_object(self, object_bytes: bytes) -> None:
+        """:meth:`_forget_unanswered` for ``object_bytes``, hashing it only when a count could be
+        held for it."""
+        if len(object_bytes) <= _ENGINE_SCP_ABORT_PAST_BYTES or not self._unanswered:
+            return
+        self._forget_unanswered(_unanswered_key(object_bytes))
 
     async def forget_payload(self, payload: str) -> None:
         """Drop the unanswered count of a row the delivery worker dead-lettered at its retry cap, so
@@ -2615,7 +2637,7 @@ class DicomScuDestination(DestinationConnector):
             object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE client (SCU)")
         except NegativeAckError:
             return  # a body no send could carry was never counted
-        self._forget_unanswered(_unanswered_key(object_bytes))
+        self._forget_object(object_bytes)
 
     def _classify(self, status_ds: Any, *, sop_class: str, sop_instance: str) -> None:
         """Map the C-STORE response status onto the retry model. PHI-safe: only the status + routing

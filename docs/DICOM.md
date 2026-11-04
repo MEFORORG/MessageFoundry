@@ -147,7 +147,7 @@ The abort changes what a sender of a large object sees. `0xC010` is a final refu
 does not retry. A failed association reads as transient, and a sender whose own cap is above twice
 this SCP's would retry such an object for as long as it is sent. This engine's own C-STORE client
 defaults to 32 MiB, twice the 16 MiB ingress ceiling, so at its default no engine SCP left at its
-own default aborts an object it sends (vault BACKLOG #4908). With that cap raised or removed, an
+own default aborts an object it sends for the object's size (vault BACKLOG #4908). With that cap raised or removed, an
 object over 32 MiB that ends with no response three times in a row is dead-lettered as final,
 whatever the retry policy. An engine SCP whose `max_object_bytes` was set lower aborts smaller
 objects, and the client still re-sends those; set the client's `max_object_bytes` to that SCP's
