@@ -43,6 +43,8 @@ _CREDENTIAL_PROXIES = (
 )
 #: A synthetic endpoint URL with a password, which refuse_url_credentials refuses.
 _CREDENTIAL_ENDPOINT = "https://svc:SYNTHPW@partner.example.org/api"
+#: The build's refusal for a credential in proxy_url, so a case cannot pass on another one.
+_BUILD_REFUSAL = "web-proxy URL credentials"
 
 
 @pytest.fixture
@@ -78,14 +80,14 @@ def _refuse(url: str) -> None:
 
 
 _CASES = [
-    *((_build, proxy, InsecureHopRefused) for proxy in _CREDENTIAL_PROXIES),
+    *((_build, proxy, (InsecureHopRefused, _BUILD_REFUSAL)) for proxy in _CREDENTIAL_PROXIES),
     # The gate judges the host and leaves the credential to the build, so these values pass it.
     *((_gate, proxy, None) for proxy in _CREDENTIAL_PROXIES),
     # An unencoded '/' in the password reads as a path, which the one proxy parse refuses.
-    (_gate, "http://svc:SYNTH/PW@proxy.example.org:3128", WiringError),
+    (_gate, "http://svc:SYNTH/PW@proxy.example.org:3128", (WiringError, "refused before the")),
     # The endpoint readers share the split.
     (_scheme, _CREDENTIAL_ENDPOINT, None),
-    (_refuse, _CREDENTIAL_ENDPOINT, ValueError),
+    (_refuse, _CREDENTIAL_ENDPOINT, (ValueError, "must not carry credentials")),
 ]
 
 
@@ -93,10 +95,12 @@ _CASES = [
 def test_a_credential_is_read_with_no_urlsplit_cache_key(
     read: Callable[[str], None],
     url: str,
-    refusal: type[Exception] | None,
+    refusal: tuple[type[Exception], str] | None,
     urlsplit_cache: Callable[[], Any],
 ) -> None:
-    with pytest.raises(refusal) if refusal else contextlib.nullcontext():
+    # The refusal's text is matched, so the zero is measured on the path that refuses for the
+    # credential and not on one that refuses earlier for something else.
+    with pytest.raises(refusal[0], match=refusal[1]) if refusal else contextlib.nullcontext():
         read(url)
     assert urlsplit_cache().currsize == 0, url
     # Control: the cached split of the same value is a key, so the zero above was measured.
@@ -104,14 +108,19 @@ def test_a_credential_is_read_with_no_urlsplit_cache_key(
     assert urlsplit_cache().currsize == 1, url
 
 
-@pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR])
+@pytest.mark.parametrize("proxy", _CREDENTIAL_PROXIES)
+@pytest.mark.parametrize(
+    "kind",
+    [ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR, ConnectorType.DICOMWEB],
+)
 def test_a_whole_connector_build_leaves_no_key_for_a_refused_proxy_credential(
-    kind: ConnectorType, urlsplit_cache: Callable[[], Any]
+    kind: ConnectorType, proxy: str, urlsplit_cache: Callable[[], Any]
 ) -> None:
     """``build_destination`` runs the egress gate and the connector's constructor, and splits the
     endpoint URL cached on the way, so the key count is not zero. The question is whether the proxy
-    value is a key: a split of it after the build is then a hit."""
-    proxy = _CREDENTIAL_PROXIES[0]
+    value is a key: a split of it after the build is then a hit. That finds only a key made by
+    the one-argument ``urlsplit(proxy)``; a split with other arguments, or of a string derived
+    from the value, is a different key and is not seen here."""
     dest = Destination(
         name="OB_SYNTH",
         type=kind,
@@ -120,7 +129,7 @@ def test_a_whole_connector_build_leaves_no_key_for_a_refused_proxy_credential(
     egress = EgressSettings(
         allowed_http=["partner.example.org"], allowed_proxy=["proxy.example.org"]
     )
-    with pytest.raises(InsecureHopRefused):
+    with pytest.raises(InsecureHopRefused, match=_BUILD_REFUSAL):
         build_destination(dest, egress=egress)
     hits = urlsplit_cache().hits
     urllib.parse.urlsplit(proxy)
@@ -134,7 +143,7 @@ def test_an_unparseable_url_is_still_refused_with_nothing_of_it_on_the_chain() -
     """The uncached split raises the same NFKC ValueError, so the refusal still fires, and it is
     raised outside the handler, so the ValueError quoting the netloc is not its context (#1796)."""
     # U+FF03 FULLWIDTH NUMBER SIGN normalises under NFKC to '#', which urlsplit refuses in a netloc.
-    url = "https://svc:SYNTH＃PW@host.example.org/path"
+    url = "https://svc:SYNTH\uff03PW@host.example.org/path"
     for call in (_scheme, _refuse):
         with pytest.raises(ValueError, match="url is not a URL that can be parsed") as caught:
             call(url)
