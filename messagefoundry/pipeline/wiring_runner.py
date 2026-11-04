@@ -528,7 +528,9 @@ class _LaneClaims:
 
     ``deaths`` is the lane's run of deaths with no settled pass between them. It backs off the
     death's traceback in the supervisor and paces a replacement that follows a repeat death.
-    :meth:`settle` closes it, on a pass that resolved its batch. Not on a claim that finds nothing:
+    :meth:`settle` closes it, on a pass that resolved its batch, and so does a replacement that
+    reads one of the dead worker's rows written (:meth:`RegistryRunner._dead_worker_wrote`). Not on
+    a claim that finds nothing:
     a replacement's re-pend dates its rows into the future, so the lane reads empty until the row
     that killed the workers is due again. A death that comes :data:`_DEATH_RUN_QUIET_SECONDS` or
     more after the run's last one (``last_death``) starts a new run instead, so rare unrelated
