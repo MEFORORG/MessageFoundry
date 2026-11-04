@@ -248,6 +248,14 @@ def test_a_get_with_an_empty_or_unknown_sec_fetch_site_is_decided_by_origin() ->
         webconsole_auth.assert_same_origin(
             request("GET", {"sec-fetch-site": value, "origin": EVIL_ORIGIN})
         )
+    # Writes are unchanged, and which branch refuses one is pinned: an empty line is absence, so
+    # Origin decides; an unknown value is refused before Origin is read.
+    for value, branch in (("", _CROSS_ORIGIN), ("x", _UNRECOGNISED)):
+        with pytest.raises(HTTPException) as refused:
+            webconsole_auth.assert_same_origin(
+                request("POST", {"sec-fetch-site": value, "origin": EVIL_ORIGIN})
+            )
+        assert (refused.value.status_code, refused.value.detail) == (403, branch), value
     # control: a GET with neither header passes (R4, R4b); absent Sec-Fetch-Site and a foreign
     # Origin is refused by the same branch as the narrowed values above
     webconsole_auth.assert_same_origin(request("GET", {}))

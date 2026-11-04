@@ -829,23 +829,17 @@ def assert_same_origin(request: Request) -> None:
     # "GET" and nothing wider, to match require_ui's own definition of a write.
     write = request.method != "GET"
     site = _sec_fetch_site(request)
-    # Whether the Sec-Fetch-Site line decides the request, so Origin is never read. On a write an
-    # EMPTY line names no provenance, so it is absence, as an empty Origin is below; any other
-    # non-empty value is refused just after. On a GET only the four named values decide; an empty
-    # or unknown one is absence, so Origin decides (B291-R1).
-    settled_by_site = bool(site) if write else site in _KNOWN_FETCH_SITE
-    if settled_by_site:
+    # Only the four named values decide the request, so Origin is never read; on any method.
+    if site in _KNOWN_FETCH_SITE:
         # assert_not_cross_site's test, on the value already read.
         if site in _CROSS_ORIGIN_FETCH:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request rejected")
-        # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
-        # values are four exact lowercase tokens; anything else (an unknown token, another case,
-        # padding) is not a browser naming this request same-origin, so it fails closed.
-        if write and site not in _SAME_ORIGIN_FETCH:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "unrecognised Sec-Fetch-Site value rejected"
-            )
         return
+    # Any other non-empty value (an unknown token, another case, padding, a folded list) is not a
+    # browser naming this request same-origin, so a write fails closed on it. On a GET it counts as
+    # absent and Origin decides (B291-R1), as an EMPTY line does on every method.
+    if write and site:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "unrecognised Sec-Fetch-Site value rejected")
     origin = request.headers.get("origin")
     if not origin:
         if write:
@@ -1235,10 +1229,11 @@ def _issue_continuation(request: Request, next_path: str) -> None:
       same-site GET. A GET with ``Sec-Fetch-Site: none`` issues nothing either: that is a typed URL,
       a bookmark, or a link opened from outside the browser, such as one in an email, and a crafted
       link of that kind must not pre-arm a grant. The page asks again, and the re-auth from the
-      console's own navigation then issues it. A client that sends no ``Sec-Fetch-Site`` at all is
-      judged only by the origin check, and a top-level GET carries no ``Origin`` either, which that
-      check accepts. So on a browser without Fetch Metadata, a link opened from outside the browser
-      still issues the page; this rule does not close that case. A window-only unlock page (one that
+      console's own navigation then issues it. A client that sends no ``Sec-Fetch-Site`` at all, or
+      a value the origin check does not recognise, is judged by its ``Origin``, as
+      :func:`assert_same_origin`'s table says, and a top-level GET carries no ``Origin`` either,
+      which that check accepts. So on a browser without Fetch Metadata, a link opened from outside
+      the browser still issues the page; this rule does not close that case. A window-only unlock page (one that
       binds no action) is never issued: it always continues, so an entry would only fill the
       per-session cap and evict a pending ``auto_retry`` issue."""
     token = session_token(request)
