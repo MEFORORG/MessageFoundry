@@ -1309,29 +1309,30 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
-        "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+        "the store (and optionally the config bundle), or with --config-to alone a CONFIG-ONLY "
+        "archive's config bundle. REFUSES to overwrite anything (ADR 0049, #60)",
         epilog=RESTORE_ROLLBACK_NOTICE,
         formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
     # Vault BACKLOG #5233: --to is not argparse-required, because a CONFIG-ONLY archive (a server-DB
-    # store's backup) carries no store for it to name. A run with neither --to nor --config-to is
-    # refused by the restore primitive itself, before the archive is opened.
+    # store's backup) carries no store for it to name. `_restore` refuses a run with neither.
     restore.add_argument(
         "--to",
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
         "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
-        "except for a CONFIG-ONLY archive, whose bundle --config-to restores alone",
+        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "whose bundle --config-to restores alone",
     )
     restore.add_argument(
         "--config-to",
         default=None,
         help="also restore the archive's config bundle into this directory (must be empty or absent). "
-        "Without --to, restore ONLY the config bundle of a CONFIG-ONLY archive (a server-DB store's "
-        "backup); an archive that carries a store is then refused. Refused when the archive carries "
-        "no config bundle, or when one of its members would be written over the store this restore "
-        "places at --to",
+        "Without --to, restore ONLY the config bundle of a CONFIG-ONLY archive (backup --config-only, "
+        "or a server-DB store's backup); an archive that carries a store is then refused. Refused "
+        "when the archive carries no config bundle, or when one of its members would be written over "
+        "the store this restore places at --to",
     )
     restore.add_argument(
         "--service-config",
@@ -11339,7 +11340,9 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
 
 
 def _restore(args: argparse.Namespace) -> int:
-    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
+    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``),
+    or with ``--config-to`` and no ``--to`` the config bundle of a CONFIG-ONLY archive (vault BACKLOG
+    #5233).
 
     The engine could write an archive and verify one, and had no way to restore one; ADR 0048's cold seed
     is the consumer (restore here, then activate onto the restored store). Verifies the archive first and
@@ -11347,8 +11350,17 @@ def _restore(args: argparse.Namespace) -> int:
     overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
     counts, fingerprints — never a body or key bytes)."""
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.pipeline.dr_backup import BackupError, run_restore
+    from messagefoundry.pipeline.dr_backup import (
+        RESTORE_NEEDS_A_DESTINATION,
+        BackupError,
+        run_restore,
+    )
 
+    # Before the settings load, so a broken service config cannot hide this usage error.
+    if args.to is None and args.config_to is None:
+        return _emit_error(
+            f"restore failed (destination): {RESTORE_NEEDS_A_DESTINATION}", as_json=args.json
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -11393,9 +11405,9 @@ def _restore(args: argparse.Namespace) -> int:
         "sessions_revoked": result.sessions_revoked,
         # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
         # prints it.
-        # None on the config-only route (vault BACKLOG #5233): it places no store, so it rolls
-        # nothing back.
-        "rollback_notice": RESTORE_ROLLBACK_NOTICE if result.store_path is not None else None,
+        # Carried on the config-only route too (vault BACKLOG #5233): it places no store, but the
+        # store it sends the operator to restore by other means rolls back the same changes.
+        "rollback_notice": RESTORE_ROLLBACK_NOTICE,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,
@@ -11413,7 +11425,11 @@ def _restore(args: argparse.Namespace) -> int:
         )
         print(f"  encrypted={result.encrypted} key_id={result.key_id}")
         print(f"  archive taken {payload['archive_created_at']}")
-        print("  It carries no store: restore the database from the DBA's own backup.")
+        print(
+            "  It carries no store. Restore the store by other means: a whole-store archive with "
+            "--to, or on a server-DB store the DBA's own backup. That restore rolls back the store: "
+            f"{RESTORE_ROLLBACK_NOTICE}"
+        )
     else:
         print(f"OK: restored {result.store_path} ({result.store_bytes} bytes) from {args.archive}")
         print(
