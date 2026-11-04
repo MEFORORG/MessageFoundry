@@ -1269,7 +1269,8 @@ At least these, read 2026-10-26:
 - **File.** Bounded by its own `_STOP_GRACE_S` for a blocked share call. When cut, it never cancels
   a poll task that is inside a store call, so the task exits at its next stop check.
 - **Database.** An uncancelled `stop()` joins the poll task with no timeout of its own, through an
-  `asyncio.wait` that a cancel does not forward. A cancel that lands while a row is in its row step,
+  `asyncio.wait` that a cancel does not forward. *(Superseded 2026-11-03: it now has a bound of its
+  own outside a store call. See this bullet's *Amended 2026-11-03 (BACKLOG #4685)* note below.)* A cancel that lands while a row is in its row step,
   from the handler call (parse, validation and the store commit) through the mark, waits up to
   `_ROW_STEP_GRACE_S` for that step, but only while this node leads: `_stop` is set, so the task
   marks the row and exits at its next stop check. A cancel anywhere else cuts the task at once, at
@@ -1304,7 +1305,11 @@ At least these, read 2026-10-26:
   close only: a statement the cancel abandoned on a driver thread is not waited for. A pool close
   that times out leaves the connections it had not closed yet to the driver. A close failure after
   a cancel is logged, never raised over the cancel. An uncancelled `stop()` closes the pool with no
-  bound, as before.
+  bound, as before. *(Superseded in part 2026-11-03: this no longer holds for every uncancelled
+  `stop()`. At least one that cuts its poll task waits for the pool as a cancelled stop does, as the
+  Database bullet's *Amended 2026-11-03 (BACKLOG #4685)* note below says, and one that waits while a
+  connection is held back behind a cancelled borrow stops waiting at a bound (BACKLOG #2394,
+  `DatabaseSource.aclose()`). Stopping the wait closes nothing the driver still holds.)*
 
   A committed row is left unmarked, a duplicate, when its step outlasts the grace, when a second
   cancel reaches it, or when the node does not lead. That can now happen to several Database stops
@@ -1331,9 +1336,30 @@ At least these, read 2026-10-26:
   at the stop check leaves the row unmarked, and the next poll reads it again. The test reads only
   the statement's shape, so a poll it does not catch can still claim at the select;
   `docs/CONNECTIONS.md`, *Database source*, names at least the shapes it misses.
+
+  *Amended 2026-11-03 (BACKLOG #4685):* an uncancelled `stop()` now has a bound of its own. It
+  waits `POLL_STOP_GRACE_S` (5 s, `transports/base.py`, the figure `FileSource.stop()` uses) for
+  the poll task, then cuts it, logs a WARNING, and joins and closes the pool as a cancelled stop
+  does, bounded by `_CUT_JOIN_TIMEOUT_S` and `_POOL_CLOSE_TIMEOUT_S`. It never cuts the handler
+  call: while the task is inside one it keeps waiting a grace at a time, and the grace restarts
+  when the call ends, so that wait is only as bounded as the store. As on the cancel path, a cut
+  ends the task's awaits only: a mark `UPDATE` already running on a driver thread can still commit
+  there, and a row whose mark does not commit re-emits, a duplicate. The cancel path above is
+  unchanged. So the fence paragraph's *an uncancelled DEMOTE stop still lets its in-flight row
+  step finish* now holds for the hand-off and for a mark that ends within a grace of it; the
+  task's wait on a longer mark is cut.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
-  `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
+  `gather` cancels the poll task. *(Superseded for RemoteFile 2026-11-03: its join is no longer a
+  `gather`, and a cut cancels the poll task itself. See this bullet's *Amended 2026-11-03 (BACKLOG
+  #4685)* note below.)* Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.
+
+  *Amended 2026-11-03 (BACKLOG #4685):* an uncancelled RemoteFile `stop()` now waits
+  `POLL_STOP_GRACE_S` for the poll task, then cancels it and logs a WARNING, and that bound never
+  cancels the task inside a store call: a hand-off, or a leave-mode ledger read or write. A stop
+  also skips the ledger prune, as File's does. When cut, it still cancels the poll task at once,
+  wherever it is, as above. Timer is unchanged, and has no grace bound by design: its only awaits
+  are the stop signal and the hand-off, so such a bound could only ever wait on a store call.
 - **Loopback, PassThrough.** `stop()` returns at once.
 
 ### Tests
@@ -1376,7 +1402,9 @@ At least these were found in review and are left as they were, because the seria
 too: a stop that fails on every attempt keeps every later `start()` from building the graph; a
 re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops;
 an uncancelled Database `stop()`, and RemoteFile and Timer `stop()`, still join their poll task
-with no bound of their own; and
+with no bound of their own (*amended 2026-11-03, BACKLOG #4685:* Database and RemoteFile are now
+bounded outside a store call, and Timer needs no bound; see *What this relies on, per connector*);
+and
 a stop failure in `start()`'s failed-start unwind replaces the start error, which survives only as
 `__context__`. Also as the serial loop did: when `Engine.stop()`'s own `registry_runner.stop()`
 re-raises a stop failure, nothing retries it, so the drain side is never torn down,

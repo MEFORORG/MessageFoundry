@@ -114,11 +114,13 @@ from messagefoundry.parsing.split import split_batch_bytes
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
+    POLL_STOP_GRACE_S,
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
     InboundHandler,
     NegativeAckError,
+    PollStopGuard,
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
@@ -2760,6 +2762,8 @@ class RemoteFileSource(SourceConnector):
         self._other_form_warned_at: float | None = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # The poll task inside a store call, which an ordinary stop() never cuts (BACKLOG #4685).
+        self._stop_guard = PollStopGuard()
         # BACKLOG #2193 slice (a): the poll sends the same FTP login and reads message files, so it
         # takes the upload's guard. Its [tls].crl_file arrives through the policy (#2370), and its
         # attestation is the inbound's typed tls_revocation_attested pair. Last of the checks, so a
@@ -2791,11 +2795,48 @@ class RemoteFileSource(SourceConnector):
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
+        """Stop polling, bounded even when a remote call is blocked (BACKLOG #4685).
+
+        The poll task sees the stop signal between files and between a batch file's hand-offs, so
+        it usually returns at once. It cannot leave a remote call early: at least every connect,
+        listing, retrieve, move and scan runs on a thread, bounded only by its own timeouts. So
+        after :data:`POLL_STOP_GRACE_S` the task is cancelled and the abandonment is logged, as
+        ``FileSource.stop()`` does. The thread finishes on its own. A file is moved only after every
+        one of its messages is handed off, so an interrupted file is read again whole on the next
+        start (at-least-once).
+
+        **This bound never cancels a store call**, that is, any await wrapped in
+        ``_stop_guard.store_call()``: at least a pipeline hand-off and a leave-mode ledger read or
+        write. :class:`PollStopGuard` says how long stop() then waits. A cancel of stop() itself
+        still cancels the task at once, wherever it is, as the ``gather`` join before this bound
+        did (ADR 0157 Amendment B; BACKLOG #4686 holds that case)."""
         self._stop.set()
-        if self._task is not None:
-            # return_exceptions: a faulted poll task must not re-raise here — stop() runs during reload
-            # quiesce, outside its rollback (mirrors the File / DATABASE sources).
-            await asyncio.gather(self._task, return_exceptions=True)
+        task = self._task
+        if task is None:
+            return
+        try:
+            finished = await self._stop_guard.join(task, POLL_STOP_GRACE_S)
+        except asyncio.CancelledError:
+            task.cancel()
+            # Joined, as the gather join was, so the task has unwound before stop() raises.
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if not finished:
+            task.cancel()
+            logger.warning(
+                "REMOTEFILE source %s: the poll task did not stop within %.1fs, most likely a "
+                "remote call blocked on an unreachable server; cancelled it. The blocked call "
+                "finishes on its own thread. A file it was working on is read again on the next "
+                "start unless that call moves or deletes it, so one whose messages were all "
+                "handed off can re-emit them as duplicates.",
+                self._connection or _where(self._host, self._remote_dir),
+                POLL_STOP_GRACE_S,
+            )
+        # return_exceptions: a faulted poll task must not re-raise here — stop() runs during reload
+        # quiesce, outside its rollback (mirrors the File / DATABASE sources). It also collects the
+        # cancellation from the arm above.
+        await asyncio.gather(task, return_exceptions=True)
+        if self._task is task:
             self._task = None
 
     async def test_connection(self) -> None:
@@ -3079,8 +3120,7 @@ class RemoteFileSource(SourceConnector):
                 continue
             if stopped:
                 # A stop arrived before the file's last message: the whole file stays, and the next
-                # start hands it over again (at-least-once, as the File source does). Break, not
-                # return, so the prune below still bounds what this poll recorded.
+                # start hands it over again (at-least-once, as the File source does).
                 break
             await self._after_processing(path, name, len(raw))
             disposed += 1
@@ -3088,10 +3128,11 @@ class RemoteFileSource(SourceConnector):
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
                 await self._leave_record(file_key)
                 newly_recorded += 1
-        if newly_recorded and self.processed_ledger is not None:
-            await (
-                self.processed_ledger.prune()
-            )  # bound growth (age + count), only when something new
+        if newly_recorded and self.processed_ledger is not None and not self._stop.is_set():
+            # Bound growth (age + count), only when something new. Skipped once a stop is signalled,
+            # as the File source does, so stop() never waits out housekeeping.
+            with self._stop_guard.store_call():
+                await self.processed_ledger.prune()
 
     async def _hand_off(self, raw: bytes) -> bool:
         """Hand one retrieved file to the pipeline, one message at a time; return True when a stop
@@ -3119,7 +3160,8 @@ class RemoteFileSource(SourceConnector):
         for message in messages:
             if self._stop.is_set():
                 return True
-            await self._handler(message)
+            with self._stop_guard.store_call():  # an ordinary stop() never cuts it (#4685)
+                await self._handler(message)
         return False
 
     def _at_ceiling(self, disposed: int, remaining: int) -> bool:
@@ -3346,7 +3388,9 @@ class RemoteFileSource(SourceConnector):
         ``forms`` is :meth:`_file_key_forms`, so a row written under an older scheme still counts."""
         if self._seen_touch(forms[0]):
             return True
-        if await ledger_holds(self.processed_ledger, forms):
+        with self._stop_guard.store_call():
+            held = await ledger_holds(self.processed_ledger, forms)
+        if held:
             self._seen_add(forms[0])
             return True
         return False
@@ -3355,7 +3399,8 @@ class RemoteFileSource(SourceConnector):
         """Mark a leave-in-place file ingested: the durable ledger (a HASHED key) + the bounded cache."""
         self._seen_add(file_key)
         if self.processed_ledger is not None:
-            await self.processed_ledger.mark_processed(file_key)
+            with self._stop_guard.store_call():
+                await self.processed_ledger.mark_processed(file_key)
 
     async def _after_processing(self, path: str, name: str, read_size: int) -> None:
         if self._after_read == "leave":
