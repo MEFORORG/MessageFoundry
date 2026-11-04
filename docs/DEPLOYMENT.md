@@ -259,8 +259,9 @@ and the cleartext-hop authority) apply to a loopback-bound engine **exactly** as
 one. What follows about *binding* is what changes when you deliberately put a listener on a routable
 address.
 
-**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless you
-configure a certificate (`[api].tls_cert_file`) or trust an upstream TLS terminator, and every inbound
+**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* without a
+certificate (`[api].tls_cert_file`), and a certificate alone does not start one;
+[SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the rule. Every inbound
 **listen** type — MLLP, HTTP, DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at
 wiring time.
 
@@ -491,7 +492,7 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
      engine can verify neither the proxy→engine internal hop nor the proxy's negotiated TLS floor, so
      it asks you to declare both. [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)
      says when a missing one refuses.
-2. **Web console (`/ui`)** — an off-loopback `/ui` **requires** in-process TLS, with or without a
+2. **Web console (`/ui`)** — an off-loopback `/ui` **requires** an operator certificate, with or without a
    declared terminator in front: off loopback a terminator alone is refused, as
    [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says;
    `--allow-insecure-bind` does **not** cover the browser surface. The console is also on-by-default for
@@ -564,7 +565,7 @@ self-signed placeholder).
 
 | Channel | Bind default | TLS support | Auth | Ingress/egress gate | Off-loopback guarded? |
 |---|---|---|---|---|---|
-| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **always required**; no setting turns it off, and `serve` refuses to start without it on any bind (vault BACKLOG #2719) | — (auth-gated) | **Yes** — refused without an operator certificate, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default) |
+| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **always required**; no setting turns it off, and `serve` refuses to start without it on any bind (vault BACKLOG #2719) | — (auth-gated) | **Yes** — refused without an operator certificate; [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the rule and its one dev escape |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
 | **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `intake_auth`: `api_key`, `bearer` or `mtls_subject` (no HTTP Basic mode). Default `none` | per-connection `source_ip_allowlist` — defaults to no restriction | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`), **and** `check_http_intake_auth` refuses a non-loopback listener with *no* effective peer control under `enforce`, and warns under `warn`. The caveat above lists what counts |
 | **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* verifiable peer control is refused at construction, on every instance. An IP allow-list counts only when it meets the floors in the caveat above (vault BACKLOG #2622); mTLS counts. A calling-AE allow-list alone does not count (BACKLOG #316) |
@@ -905,7 +906,7 @@ a PHI instance with **no** allow-list populated, and `block_unlisted_outbound` n
   refusals also name `tls_hop_attested`: a per-connection attestation, with its mandatory reason, that
   the hop is secured by other means. It ALLOWs the bind on an enforcing instance and is reported as a
   loosening ([CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested)).
-- **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires in-process TLS and is refused without it — `--allow-insecure-bind` does not cover it.
+- **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires an operator certificate and is refused without it — `--allow-insecure-bind` does not cover it.
 
 ### Exit codes — a startup-stage refusal exits **3**, not 2
 

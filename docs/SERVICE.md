@@ -10,8 +10,8 @@ engine drains its connections cleanly (the ASGI lifespan calls `engine.stop()`).
 This is the localhost, single-machine setup: the service binds `127.0.0.1` and authentication is
 already required (it is on by default). Networked deployment is **built but deliberate** — bind
 off-loopback with `[security].local_access_only = false` + `[security].listen_address`, and an
-off-loopback API bind is *refused at startup* unless TLS is configured (`[api].tls_cert_file`, or a
-trusted upstream terminator). See [DEPLOYMENT.md](DEPLOYMENT.md) for the exposure checklist and
+off-loopback API bind is *refused at startup* without an operator certificate (`[api].tls_cert_file`);
+[SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the rule. See [DEPLOYMENT.md](DEPLOYMENT.md) for the exposure checklist and
 [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md) for operating this service from another PC.
 
 Before going live, hand your endpoint-security and firewall admins the

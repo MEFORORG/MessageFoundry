@@ -51,7 +51,7 @@ operational notes.
 | Control | Where | Confirmed behavior |
 |---|---|---|
 | API/WSS in-process TLS (WP-13a) | [`api/tls.py`](../messagefoundry/api/tls.py) `build_api_ssl_context`; [`config/settings.py`](../messagefoundry/config/settings.py) `ApiSettings.tls_*` | `PROTOCOL_TLS_SERVER`, `minimum_version` from `tls_min_version` (1.2/1.3 floor), `load_cert_chain(cert, key, password)`, optional ciphers, inherited KEX groups (approved-group pin inert until Python 3.15 - see [PHI.md](PHI.md) §4) + strict X.509; opt-in mTLS via `tls_client_ca_file` → `CERT_REQUIRED`. Wired into the single `uvicorn.run(...)` via `ssl_context_factory` ([`__main__.py`](../messagefoundry/__main__.py) `_serve`, its `run_kwargs`). |
-| API bind guard ("exposed" gate) | [`__main__.py`](../messagefoundry/__main__.py) `_serve`, the `if not settings.api.is_loopback:` gate | A non-loopback bind (`[security].local_access_only = false` with a non-loopback `listen_address`, or a non-loopback `serve --host`) → **allow** if `tls_enabled`, **allow** if `tls_terminated_upstream` (+`trusted_proxies`), **warn** and serve on the self-signed placeholder if `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) is set under `[security].enforcement = warn`, else **refuse (exit 2)**. Under the default `enforce` the flag is inert, so the bind refuses. No bind runs without sign-in, whatever `--allow-insecure-bind` says. The load refuses the removed `[auth].enabled` and `[security].require_sign_in` keys (vault BACKLOG #2719, #2825). |
+| API bind guard ("exposed" gate) | [`__main__.py`](../messagefoundry/__main__.py) `_serve`, the `if not settings.api.is_loopback:` gate | A non-loopback bind (`[security].local_access_only = false` with a non-loopback `listen_address`, or a non-loopback `serve --host`) → **allow** if `tls_enabled`, **refuse** a `tls_terminated_upstream` bind with no `tls_cert_file` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)), **warn** and serve on the self-signed placeholder if `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) is set under `[security].enforcement = warn`, else **refuse (exit 2)**. Under the default `enforce` the flag is inert, so the bind refuses. No bind runs without sign-in, whatever `--allow-insecure-bind` says. The load refuses the removed `[auth].enabled` and `[security].require_sign_in` keys (vault BACKLOG #2719, #2825). |
 | MFA-at-exposure gate | [`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block | Exposed (a non-loopback bind, a declared TLS-terminating proxy, or a set `[api].trusted_proxies`, vault BACKLOG #2251) + **not** `require_mfa`: **refuse** under `[security].enforcement = enforce`, the default, unless `[security].allow_single_factor_admin_when_exposed` is set; **warn** otherwise. It reads neither the PHI tier nor the kind of account. `require_mfa` gates every account `[security].require_mfa_scope` covers -- `every_local_account` by default, directory accounts included (BACKLOG #1144). |
 | MLLP-over-TLS (WP-13b) | [`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_mllp_ssl_context`; `MLLP(...)` in [`config/wiring.py`](../messagefoundry/config/wiring.py) | Per-connection `tls=true`. Inbound presents `tls_cert_file`/`tls_key_file`; `tls_ca_file` opts into mTLS (`CERT_REQUIRED`). Outbound verifies the peer (`tls_verify=true` default; `false` refused unless `MEFOR_ALLOW_INSECURE_TLS`), optional client cert. `start_server(ssl=)` / `open_connection(ssl=, server_hostname=)`. TLS 1.2+. |
 | MLLP exposed gate | [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) `check_mllp_tls_exposure` | A non-loopback MLLP listener **without** `tls=true` raises `WiringError` at wiring time (before start); a per-connection `tls_hop_attested`, with its mandatory `tls_hop_attested_reason`, permits it with a warning. `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) does the same only under `[security].enforcement = warn`, and is inert under the default `enforce`. Loopback or `tls=true` pass. Sibling `check_dimse_tls_exposure` covers DICOM SCP. |
@@ -78,14 +78,16 @@ the gate. The right topology depends on the orchestrator.
 
 | Orchestration | API plane | MLLP data plane | Why |
 |---|---|---|---|
-| **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443` | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
+| **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443`, and the operator's `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)) | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
 | **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` + `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055) | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
 | **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS, re-encrypted** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP>]` + an operator `tls_cert_file` the proxy trusts + `MEFOR_TLS_REVOCATION_ATTESTED=1` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and [API revocation gate](SECURITY.md#api-revocation-gate) say why); do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
 
 ### The three options, justified
 
 - **(a) In-process TLS (WP-13a) — default for the shipped image.** Bind `[security].listen_address = "0.0.0.0"` with `[security].local_access_only = false`,
-  mount `tls_cert_file`/`tls_key_file`, publish `8443`. The bind guard sees `tls_enabled` → allows;
+  mount `tls_cert_file`/`tls_key_file`, publish `8443`. The bind guard sees `tls_enabled` → allows,
+  and the [API revocation gate](SECURITY.md#api-revocation-gate) then needs the operator's
+  `MEFOR_TLS_REVOCATION_ATTESTED=1`;
   HSTS engages on `https`, `/ws/stats` is `wss`. One image, no second process. Best for "docker run
   it and go" and for the byte-identical multi-instance rollout ADR 0017 wants.
 
@@ -137,7 +139,7 @@ bind host is all that matters.
 |---|---|---|---|
 | (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`), plus `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)); sign-in is always on (vault BACKLOG #2719) |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
-| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them); and `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)) |
+| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)); also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b; [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says when a missing one refuses); and `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
 MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].bind_host`, typically
@@ -175,6 +177,8 @@ port = 8443
 tls_cert_file = "/etc/mefor/tls/api.crt"
 tls_key_file  = "/etc/mefor/tls/api.key"     # tls_key_password via MEFOR_API_TLS_KEY_PASSWORD if encrypted
 # tls_client_ca_file = "/etc/mefor/tls/console-ca.crt"  # opt-in mTLS for the console
+# Off loopback this bind also needs MEFOR_TLS_REVOCATION_ATTESTED=1 in the container's environment;
+# docs/SECURITY.md, "API revocation gate", says what setting it attests.
 ```
 
 ```toml
@@ -194,7 +198,7 @@ tls_key_file  = "/etc/mefor/tls/api.key"
 trusted_proxies = ["10.4.2.7"]                # the proxy's EXACT address(es) — see the warning below
 # Posture-B attestations. The browser's TLS ends in the proxy container, so the engine cannot see the
 # floor the proxy offers browsers, nor who the peer on its own TLS listener is; both are operator
-# DECLARATIONS and an off-loopback PHI instance REFUSES to start without them.
+# DECLARATIONS, and under the default enforce this off-loopback bind REFUSES to start without them.
 # "network": the engine port is on the internal Docker network and is NOT published to the host —
 # that unpublished, proxy-only segment is the isolation this value names. Use "mtls" (which also
 # needs [api].tls_client_ca_file) if the proxy reaches the engine across anything wider.
@@ -211,7 +215,7 @@ proxy_tls_min_version = "1.2"
 [security]
 local_access_only = true                      # the sidecar faces the network; the engine does not
 serve_web_console = true                      # a declared terminator is "exposed": without this, no /ui
-web_console_public_address = "https://mefor.example.org"  # the sidecar's origin; required under enforce
+web_console_public_address = "https://mefor.example.org"  # the sidecar's origin; required here
 
 [api]
 port = 8765
@@ -444,7 +448,8 @@ The console stays a **host-side process**; only its target URL changes.
 ## Appendix — quick decision summary
 
 - **Ship the image defaulting to in-process TLS (a):** `host=0.0.0.0:8443`, mount cert/key, MLLP
-  `tls=true`. Self-contained, fewest moving parts, fits the byte-identical multi-instance model.
+  `tls=true`; the operator must also attest revocation with `MEFOR_TLS_REVOCATION_ATTESTED=1`
+  ([API revocation gate](SECURITY.md#api-revocation-gate)), which the image cannot do for them. Self-contained, fewest moving parts, fits the byte-identical multi-instance model.
 - **Document same-pod sidecar (b) as the k8s-preferred pattern:** engine stays loopback-bound, gate
   passes trivially, the hardened proxy is the only exposed surface and the home for mTLS + revocation.
 - **The bind guards do the right thing in a container already** — there is no container-specific

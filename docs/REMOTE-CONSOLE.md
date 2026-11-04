@@ -34,7 +34,7 @@ switches to `[security]` and setting them in `[api]` is now **refused at config 
 
 ### How hard is the TLS requirement?
 
-**For the browser console, absolute.** An off-loopback `/ui` bind without in-process TLS is refused at
+**For the browser console, absolute.** An off-loopback `/ui` bind without an operator certificate is refused at
 startup, with or without a declared TLS-terminating proxy in front
 ([SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)), and `serve --allow-insecure-bind`
 explicitly does **not** cover it — the flag was scoped to the JSON API on its self-signed placeholder,

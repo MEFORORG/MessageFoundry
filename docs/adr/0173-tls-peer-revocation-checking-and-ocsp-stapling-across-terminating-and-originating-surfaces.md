@@ -614,7 +614,10 @@ and `settings.py:3675` defaults enforcement to `SecurityEnforcement.ENFORCE`. Th
 at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so the only relaxations are
 loopback, a proven terminator, an attestation, or a non-PHI posture. *(Note 2026-10-27: on an
 outbound hop the "proven terminator" arm is gone; the docstring of `revocation_hop_disposition`
-says why. The sentence keeps its original wording.)*
+says why. The sentence keeps its original wording.)* *(Note 2026-11-04, BACKLOG #4636: for the
+`[api]` in-process bind the sentence is wrong too. That gate reads no posture and no enforcement
+level, and no terminator clears it; [SECURITY.md, API revocation gate](../SECURITY.md#api-revocation-gate)
+states the rule.)*
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
 `RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test

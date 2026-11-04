@@ -31,8 +31,8 @@
   symbol against the tree on 2026-09-09, because line numbers rot and symbols do not: **WP-13a** is
   `build_api_ssl_context` and `ensure_api_tls_material` ([api/tls.py](../../messagefoundry/api/tls.py)),
   imported and called on the `serve` path ([__main__.py](../../messagefoundry/__main__.py)) for every
-  topology that terminates TLS in-process -- a declared `[api].tls_terminated_upstream` proxy is the
-  deliberate exception, where `ensure_api_tls_material` returns `None` and the serve path builds no
+  topology that terminates TLS in-process -- a declared `[api].tls_terminated_upstream` proxy with no
+  `[api].tls_cert_file` is the deliberate exception, where `ensure_api_tls_material` returns `None` and the serve path builds no
   context at all
   ([ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
   decision 3); **WP-13b** is `_mllp_ssl_context`

@@ -1515,8 +1515,8 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
 - **Residual (documented, not a claimed control):** a shared clinical workstation, browser devtools, or a
   malicious browser extension can observe on-screen PHI while a session is open — the same physical/endpoint
-  exposure any operator screen has. Restrict `/ui` to managed hosts; it never binds off-loopback without TLS
-  (refused even under `--allow-insecure-bind`).
+  exposure any operator screen has. Restrict `/ui` to managed hosts; it never binds off-loopback without an
+  operator certificate (refused even under `--allow-insecure-bind`).
 
 > **Scope:** M1 is read-only. Safe operator actions (replay, start/stop) + a CSRF token stack land in M2;
 > the `/ws/stats` browser channel and any parse-tree endpoint are also M2. A full ASVS L3 re-assessment of
@@ -2785,7 +2785,7 @@ traceability:
 
 - **DB + `-wal`/`-shm` owner-only permissions on create** (`_secure_file`, §2) — **SQLite store only**; on SQL Server / Postgres the engine creates no database file and calls `_secure_file` never. Was P0-1.
 - **`dryrun`/`generate` redact bodies by default; `--show-phi` to opt in** (§7) — was P0-2.
-- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. `serve --allow-insecure-bind` relaxes this refusal only under `[security].enforcement = warn`, and is inert under the default `enforce`. §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
+- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the bind rule and its one dev escape, and §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
 - **At-rest body encryption (AES-256-GCM) + required volume encryption** (§3) — was P1-1.
 - **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
   [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`

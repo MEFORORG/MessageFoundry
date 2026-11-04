@@ -128,6 +128,8 @@ spec:
             - { name: MEFOR_API_PORT, value: "8443" }
             - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/api.crt" }
             - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/api.key" }
+            # Off loopback serve also refuses this certificate bind until you attest revocation with
+            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # MLLP() must set tls=True (exposure gate)
             - { name: MEFOR_SECURITY_REQUIRE_MFA, value: "true" }       # covers directory accounts too; off + exposed = refused under enforce
             - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }
