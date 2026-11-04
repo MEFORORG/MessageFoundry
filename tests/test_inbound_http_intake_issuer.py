@@ -354,27 +354,20 @@ def _wrapped(der: bytes, label: str = "CERTIFICATE") -> bytes:
 
 
 @pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
-def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
+def test_an_unparsable_certificate_in_the_trust_store_refuses_the_build(
     caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
     """Driven at the index builder: a block OpenSSL loads but ``cryptography`` refuses, a CA with
-    bytes after its DER, is what this warns about. Under either label the context loads a CA from,
-    such a block names no issuer and is counted, so the "could not be parsed" warning
-    ``docs/SECURITY.md`` promises fires. The shipped index never reads a legacy-label block, so
-    there it would not (BACKLOG #4948). The good CA beside it is still named."""
+    bytes after its DER, refuses the build under either label the context loads a CA from, naming
+    the listener's file. Counted and skipped instead, it left a CA the handshake trusts out of the
+    index, which can hide a same-DN twin (BACKLOG #4948)."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     cadata = (_pem(good[0]) + _wrapped(_der(odd[0]) + b"\x30\x00", label)).decode("ascii")
     assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads the odd block
-    subjects = {"CN=Acme CA": [SUBJECT], "CN=Odd CA": [SUBJECT]}
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
-        index = _client_issuer_index("IB_PARTNER", cadata, subjects)
-    assert index is not None and index.unreadable == 1
-    assert set(index.unmatched_keys(subjects)) == {"CN=Odd CA"}
-    warned = [r.getMessage() for r in caplog.records]
-    assert any("1 certificate(s) in tls_ca_file could not be parsed" in m for m in warned), warned
-    # Control: the same store without the junk block warns about nothing.
-    caplog.clear()
+    with pytest.raises(ValueError, match=r"IB_PARTNER: tls_ca_file: .*cannot be parsed"):
+        _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
+    # Control: the same store without the junk block builds and warns about nothing.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         _client_issuer_index("IB_PARTNER", _pem(good[0]).decode("ascii"), {"CN=Acme CA": [SUBJECT]})
     assert not caplog.records
@@ -389,24 +382,28 @@ def _v4(cert: x509.Certificate) -> bytes:
     return der.replace(v3, b"\xa0\x03\x02\x01\x03")
 
 
-def test_a_version_4_ca_names_nothing_and_does_not_end_the_build(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A CA OpenSSL loads with version 4 is refused by ``cryptography`` with ``InvalidVersion``. In
-    the shipped code it raises out of the index, and so out of the listener's and the API's context
-    build. It now names
-    nothing and is counted, the "could not be parsed" warning fires, and the good CA beside it is
-    still named (BACKLOG #4948)."""
+def _odd_twin(cert: x509.Certificate, shape: str) -> bytes:
+    """``cert`` as one PEM block that OpenSSL loads and ``cryptography`` refuses, by ``shape``."""
+    if shape == "v4":
+        return _wrapped(_v4(cert))
+    if shape == "trailing-der":
+        return _wrapped(_der(cert) + b"\x30\x00")
+    lines = _pem(cert).split(b"\n")
+    lines[1] += b"\x00junk"  # "nul-text": a NUL and more text inside a base64 line
+    return b"\n".join(lines)
+
+
+def test_a_version_4_ca_refuses_the_build() -> None:
+    """A CA OpenSSL loads with version 4 is refused by ``cryptography`` with ``InvalidVersion``,
+    which is not a ``ValueError``. In the shipped code it raises out of the index, and so out of
+    the listener's and the API's context build. It still refuses that build, now as a
+    ``ValueError`` naming the file (BACKLOG #4948)."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
-    cadata = (_pem(good[0]) + _wrapped(_v4(odd[0]))).decode("ascii")
+    cadata = (_pem(good[0]) + _odd_twin(odd[0], "v4")).decode("ascii")
     assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads it
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
-        index = _client_issuer_index("IB_PARTNER", cadata, {})
-    assert index is not None and index.unreadable == 1
-    assert set(index.unmatched_keys(["CN=Acme CA", "CN=Odd CA"])) == {"CN=Odd CA"}
-    warned = [r.getMessage() for r in caplog.records]
-    assert any("1 certificate(s) in tls_ca_file could not be parsed" in m for m in warned), warned
+    with pytest.raises(ValueError, match=r"IB_PARTNER: tls_ca_file: .*cannot be parsed"):
+        _client_issuer_index("IB_PARTNER", cadata, {})
 
 
 def test_a_version_4_leaf_names_no_issuer() -> None:
@@ -454,7 +451,7 @@ _AFTER = {
     "crlf": ("\r", True),
     "control": ("\x0b", True),
     # Bytes OpenSSL strips that cryptography refuses after a BEGIN marker: the index hands
-    # cryptography the line OpenSSL read, so these name their CA rather than count unreadable.
+    # cryptography the line OpenSSL read, so these name their CA rather than refuse the build.
     "nul": ("\x00", True),
     "soh": ("\x01", True),
     "us": ("\x1f", True),
@@ -502,7 +499,6 @@ def test_the_index_reads_a_block_where_the_context_loads_it(
     # The measured premise, so the check below cannot pass by OpenSSL loading nothing.
     assert loaded == (2 if loads and label in ("CERTIFICATE", "X509 CERTIFICATE") else 1)
     index = IssuerIndex(cadata)
-    assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Plain CA"]) == {}  # control: always read
     probe_read = index.unmatched_keys(["CN=Probe"]) == {}
     assert probe_read == (loaded == 2), (label, before, after, pinned, loaded)
@@ -533,7 +529,6 @@ def test_a_stray_begin_marker_hides_no_block_after_it(note: str, stray: str) -> 
     ).decode("ascii")
     assert _openssl_loads(cadata) == 3  # the premise: every block loads past the note
     index = IssuerIndex(cadata)
-    assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Mid CA"]) == {}
     assert index.unmatched_keys(["CN=Dup CA"])["CN=Dup CA"].startswith("names 2 loaded CA")
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), dup2)[0])
@@ -597,7 +592,6 @@ def test_a_certificate_nested_in_another_block_is_not_indexed(
     cadata = (outer_block + _labelled(good[0], inner)).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Good CA"}  # the premise: OpenSSL skips the nested CA
     index = IssuerIndex(cadata)
-    assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Good CA"]) == {}  # control: what OpenSSL loaded is named
     assert "CN=Evil CA" in index.unmatched_keys(["CN=Evil CA"])
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), evil)[0])
@@ -615,8 +609,7 @@ def test_a_certificate_nested_in_another_block_is_not_indexed(
 def test_a_base64_line_wrapped_at_a_piece_boundary_is_read(width: int, newline: str) -> None:
     """OpenSSL reads a long line in 254-byte pieces, and a LF left alone by a full piece ends that
     line rather than being a blank line. The index must not hand ``cryptography`` a blank line in
-    the body there, or a CA OpenSSL loads would be counted unreadable and every partner under it
-    refused (BACKLOG #4948)."""
+    the body there, or a CA OpenSSL loads would refuse the build (BACKLOG #4948)."""
     plain = _ca(_dn((NameOID.COMMON_NAME, "Plain CA")))
     wide = _ca(_dn((NameOID.COMMON_NAME, "Wide CA")))
     b64 = "".join(_pem(wide[0]).decode("ascii").splitlines()[1:-1])
@@ -626,7 +619,6 @@ def test_a_base64_line_wrapped_at_a_piece_boundary_is_read(width: int, newline: 
     cadata = _pem(plain[0]).decode("ascii") + block
     assert _loaded_subjects(cadata) == {"CN=Plain CA", "CN=Wide CA"}  # the premise
     index = IssuerIndex(cadata)
-    assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Plain CA", "CN=Wide CA"]) == {}
 
 
@@ -641,7 +633,6 @@ def test_a_label_is_compared_up_to_a_nul_as_openssl_compares_it() -> None:
     cadata = (block + _pem(good[0])).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Odd CA", "CN=Good CA"}  # the premise
     index = IssuerIndex(cadata)
-    assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Odd CA", "CN=Good CA"]) == {}
 
 
@@ -655,49 +646,109 @@ def test_a_label_is_compared_up_to_a_nul_as_openssl_compares_it() -> None:
         pytest.param(b"\n", b"\x00A", id="blank-then-nul-over-64"),
     ],
 )
-def test_a_body_line_with_a_nul_names_no_ca_openssl_did_not_load(head: bytes, tail: bytes) -> None:
+def test_a_body_line_with_a_nul_where_openssl_stops_refuses_the_build(
+    head: bytes, tail: bytes
+) -> None:
     """OpenSSL reads a body line past its first NUL in at least two checks, and on these shapes it
     silently stops loading the file there, so the intermediate after the root is never loaded. The
-    index must not read the line only up to the NUL and name that intermediate: a client sending it
-    as its own intermediate verifies through the root, and a subject listed under the intermediate
-    would be admitted. The index reads the whole line, which ``cryptography`` refuses, so the block
-    is counted and names no issuer (BACKLOG #4948)."""
+    index must not name that intermediate: a client sending it as its own intermediate verifies
+    through the root, and a subject listed under the intermediate would be admitted. The build
+    refuses (BACKLOG #4948)."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
     lines = _pem(inter[0]).split(b"\n")
     lines[1] = head + lines[1] + tail
     cadata = (_pem(root[0]) + b"\n".join(lines)).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Root CA"}  # the premise: OpenSSL stops after the root
-    index = IssuerIndex(cadata)
-    assert index.unreadable == 1
-    assert index.unmatched_keys(["CN=Root CA"]) == {}  # control
-    assert "CN=Inter CA" in index.unmatched_keys(["CN=Inter CA"])
-    control = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), root)[0])
-    assert index.issuer_of(control) == "CN=Root CA"
-    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), inter)[0])
-    assert index.issuer_of(leaf) == ""
+    with pytest.raises(ValueError, match="the client CA file: "):
+        IssuerIndex(cadata)
+    IssuerIndex(_pem(root[0]).decode("ascii"))  # control: the root alone builds
 
 
-def test_a_ca_whose_base64_line_has_a_nul_and_more_base64_is_counted_unreadable() -> None:
+def test_a_ca_whose_base64_line_has_a_nul_and_more_base64_refuses_the_build() -> None:
     """OpenSSL loads a CA whose base64 line has a NUL and more base64 after it. The index reads
-    the whole line, which ``cryptography`` refuses, so it counts that CA as unreadable and names
-    no issuer under it: a deliberate fail-closed difference, since cutting the line at the NUL
-    named CAs on the shapes above that OpenSSL never loaded. The CA beside it is still named
-    (BACKLOG #4948)."""
+    the whole line, which ``cryptography`` refuses, so the build refuses: counted and skipped, the
+    CA would be one the handshake trusts and the index misses (BACKLOG #4948)."""
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
-    lines = _pem(odd[0]).split(b"\n")
-    lines[1] += b"\x00junk"
-    cadata = (b"\n".join(lines) + _pem(good[0])).decode("ascii")
+    cadata = (_odd_twin(odd[0], "nul-text") + _pem(good[0])).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Odd CA", "CN=Good CA"}  # the premise
-    index = IssuerIndex(cadata)
-    assert index.unreadable == 1
-    assert index.unmatched_keys(["CN=Good CA"]) == {}
-    assert "CN=Odd CA" in index.unmatched_keys(["CN=Odd CA"])
-    control = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), good)[0])
-    assert index.issuer_of(control) == "CN=Good CA"
-    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), odd)[0])
-    assert index.issuer_of(leaf) == ""
+    with pytest.raises(ValueError, match="cannot be parsed"):
+        IssuerIndex(cadata)
+
+
+@pytest.mark.parametrize("shape", ["v4", "trailing-der", "nul-text"])
+def test_a_same_dn_twin_cryptography_cannot_parse_refuses_the_build(shape: str) -> None:
+    """Two loaded CAs share a DN under different keys, and ``cryptography`` refuses one of them.
+    OpenSSL loads both, so the handshake verifies a leaf under either. Counted as unreadable and
+    dropped, the refused one left the other looking unambiguous, so a leaf under it was named
+    although the two cannot be told apart. The build must refuse instead (BACKLOG #4948)."""
+    twin1, twin2 = (_ca(_dn((NameOID.COMMON_NAME, "Acme CA"))) for _ in range(2))
+    cadata = (_pem(twin1[0]) + _odd_twin(twin2[0], shape)).decode("ascii")
+    assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads both twins
+    with pytest.raises(ValueError, match="cannot be parsed"):
+        IssuerIndex(cadata)
+    # Controls: with both twins readable the name is ambiguous, and with one alone it is named.
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), twin1)[0])
+    assert IssuerIndex((_pem(twin1[0]) + _pem(twin2[0])).decode("ascii")).issuer_of(leaf) == ""
+    assert IssuerIndex(_pem(twin1[0]).decode("ascii")).issuer_of(leaf) == "CN=Acme CA"
+
+
+_FILLER = b"aGVsbG8gd29ybGQ=\n"  # base64 for a non-certificate block's own body
+
+#: Blocks after which OpenSSL 3.5.7 silently stops loading a file, while a PEM scan reads on.
+_SILENT_STOPS = {
+    "empty-foo": b"-----BEGIN FOO-----\n-----END FOO-----\n",
+    "colon-label": b"-----BEGIN FOO:BAR-----\n" + _FILLER + b"-----END FOO:BAR-----\n",
+    "blank-then-long": (
+        b"-----BEGIN FOO-----\n" + _FILLER + b"\n" + b"QUFB" * 20 + b"\n-----END FOO-----\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("stop", list(_SILENT_STOPS))
+def test_a_block_where_openssl_silently_stops_refuses_the_build(stop: str) -> None:
+    """OpenSSL silently stops loading the file at each of these blocks, so the intermediate after
+    them is never loaded, and a client sending it as its own intermediate verifies through the
+    root. The PEM scan reads on and finds that intermediate, so the index would name it, and a
+    subject listed under it would be admitted. The check against what OpenSSL loaded refuses the
+    build, whatever the scan models (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
+    cadata = (_pem(root[0]) + _SILENT_STOPS[stop] + _pem(inter[0])).decode("ascii")
+    assert _loaded_subjects(cadata) == {"CN=Root CA"}  # the premise: OpenSSL stops after the root
+    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) from this file"):
+        IssuerIndex(cadata)
+    # Control: with that block after the intermediate, OpenSSL loads both and the index names both.
+    tail = (_pem(root[0]) + _pem(inter[0]) + _SILENT_STOPS[stop]).decode("ascii")
+    assert _loaded_subjects(tail) == {"CN=Root CA", "CN=Inter CA"}
+    assert IssuerIndex(tail).unmatched_keys(["CN=Root CA", "CN=Inter CA"]) == {}
+
+
+def test_a_silent_stop_in_tls_ca_file_refuses_the_listener(tmp_path: Path) -> None:
+    """The refusal reaches the listener's start, naming it and its file (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
+    cadata = _pem(root[0]) + _SILENT_STOPS["empty-foo"] + _pem(inter[0])
+    with pytest.raises(ValueError, match=r"HTTP source .*: tls_ca_file: .*loads 1 certificate"):
+        _source(tmp_path, [], {"CN=Inter CA": [SUBJECT]}, cadata=cadata)
+
+
+def test_the_check_reads_what_openssl_lists_and_counts() -> None:
+    """The premise the check rests on: ``get_ca_certs`` lists a CA as DER and not a pinned
+    anchor, which only the count holds. A key rollover file, two CAs sharing a DN with a third
+    between them, builds: on OpenSSL 3.5.7 a reload of the second twin there keeps a second copy,
+    so a check resting on OpenSSL dropping a duplicate would refuse it (BACKLOG #4948)."""
+    ca = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))[0]
+    pinned = _pinned("Pinned")
+    ctx = _openssl_context((_pem(ca) + _pem(pinned)).decode("ascii"))
+    assert ctx.get_ca_certs(binary_form=True) == [_der(ca)]
+    assert ctx.cert_store_stats() == {"x509": 2, "crl": 0, "x509_ca": 1}
+    twin1, twin2 = (_ca(_dn((NameOID.COMMON_NAME, "Dup CA"))) for _ in range(2))
+    mid = _ca(_dn((NameOID.COMMON_NAME, "Mid CA")))[0]
+    index = IssuerIndex((_pem(twin1[0]) + _pem(mid) + _pem(twin2[0])).decode("ascii"))
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), twin2)[0])
+    assert index.issuer_of(leaf) == ""  # the twins stay ambiguous
 
 
 @pytest.mark.parametrize(
@@ -709,12 +760,11 @@ def test_a_ca_whose_base64_line_has_a_nul_and_more_base64_is_counted_unreadable(
         pytest.param(True, "FOO", id="other-label-over-a-certificate"),
     ],
 )
-def test_a_begin_with_no_end_counts_the_rest_as_unreadable(nested: bool, label: str) -> None:
+def test_a_begin_with_no_end_refuses_the_build(nested: bool, label: str) -> None:
     """A BEGIN marker with no END line of its label after it makes OpenSSL refuse the file. The
-    index must not silently stop reading there, as if the rest of the file held nothing: the rest
-    is counted as unreadable, so the start warning fires. A whole certificate block after an
-    unclosed other-label BEGIN is inside that block to OpenSSL, so the index must not name it
-    either (BACKLOG #4948)."""
+    index must not silently stop reading there, as if the rest of the file held nothing, so the
+    build refuses too. A whole certificate block after an unclosed other-label BEGIN is inside that
+    block to OpenSSL, so the index must not name it either (BACKLOG #4948)."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
     evil = _ca(_dn((NameOID.COMMON_NAME, "Evil CA")))
     if nested:  # an unclosed BEGIN, then a whole certificate block
@@ -724,10 +774,9 @@ def test_a_begin_with_no_end_counts_the_rest_as_unreadable(nested: bool, label: 
     cadata = (_pem(good[0]) + rest).decode("ascii")
     with pytest.raises(ssl.SSLError):  # the premise: OpenSSL refuses the file
         _openssl_loads(cadata)
-    index = IssuerIndex(cadata)
-    assert index.unreadable > 0
-    assert index.unmatched_keys(["CN=Good CA"]) == {}  # control: the block before it is named
-    assert "CN=Evil CA" in index.unmatched_keys(["CN=Evil CA"])
+    with pytest.raises(ValueError, match="the TLS library refuses this file"):
+        IssuerIndex(cadata)
+    IssuerIndex(_pem(good[0]).decode("ascii"))  # control: the block before it alone builds
 
 
 @pytest.mark.parametrize(

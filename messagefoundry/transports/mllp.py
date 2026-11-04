@@ -1904,18 +1904,13 @@ def _sender_issuer_lookup(
     Returns the lookup from a leaf's DER to the subject of the loaded CA whose key signed it, or
     ``""``. A key naming no loaded CA, or two loaded CAs with one subject and different keys, would
     refuse every sender under it with nothing in the log, so each is warned about here, as the
-    inbound HTTP listener does for ``intake_client_subjects``."""
+    inbound HTTP listener does for ``intake_client_subjects``. Raises ``ValueError``, refusing the
+    start, when the index cannot hold exactly what the TLS library loaded
+    (:class:`~messagefoundry.pki.IssuerIndex`)."""
     # Lazy: pki pulls in cryptography, which a listener without the allowlist never needs.
     from messagefoundry.pki import IssuerIndex
 
-    index = IssuerIndex(cadata)
-    if index.unreadable:
-        logger.warning(
-            "MLLP listener %s: %d certificate(s) in tls_ca_file could not be parsed for "
-            "tls_client_subjects; no sender certificate is admitted under them",
-            name,
-            index.unreadable,
-        )
+    index = IssuerIndex(cadata, label=f"{_tls_label('MLLP listener', name)}: tls_ca_file")
     for issuer in index.unmatched_keys(subjects):
         logger.warning(
             "MLLP listener %s: tls_client_subjects issuer %r names no CA certificate loaded from "

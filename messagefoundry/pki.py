@@ -19,8 +19,9 @@ import datetime
 import ipaddress
 import logging
 import os
+import ssl
 import string
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Set
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -597,7 +598,7 @@ _UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWa
 #: (:func:`_crl_extensions`). It stays here for any other deprecation the parse warns of, so such
 #: a CA is skipped alone rather than ending the whole judgment (vault BACKLOG #3506).
 #: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
-#: :class:`IssuerIndex` also counts a loaded CA that raises one as unreadable, and its ``issuer_of``
+#: :class:`IssuerIndex` also refuses a file holding a CA that raises one, and its ``issuer_of``
 #: names no issuer for a client LEAF that raises one, so narrowing this tuple reaches both (BACKLOG
 #: #4948).
 _UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
@@ -1652,23 +1653,25 @@ class IssuerIndex:
     only when ``verify_directly_issued_by`` holds: its subject equals the leaf's issuer name exactly
     AND its key verifies the leaf's signature. A client-sent intermediate is never a loaded CA, so it
     never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
-    itself, whether or not it is marked as a CA."""
+    itself, whether or not it is marked as a CA.
 
-    def __init__(self, cadata: str) -> None:
+    The index holds exactly the certificates OpenSSL loads from ``cadata``, or the build raises
+    ``ValueError`` naming ``label`` (BACKLOG #4948). :func:`_pem_certificate_blocks` finds them, but
+    it models OpenSSL's PEM reader and is not that reader, so the result is then checked against
+    OpenSSL itself (:func:`_refuse_unless_openssl_loads`). A CA the index named but OpenSSL never
+    loaded could be named for a leaf whose chain ran through a client-sent copy of it; a CA OpenSSL
+    loaded but the index missed could hide a same-DN twin, so a leaf under one would be named
+    although the two cannot be told apart. A certificate block ``cryptography`` cannot parse
+    refuses too, as the index could not say whether OpenSSL holds it."""
+
+    def __init__(self, cadata: str, *, label: str = "the client CA file") -> None:
         seen: set[bytes] = set()  # de-duplicates a certificate listed twice
         self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
         # Distinct KEYS per rendered subject. A re-issued CA certificate with the same key, or a root
         # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
         # are, because the map names only the name.
         self._subject_keys: dict[str, set[bytes]] = {}
-        self.unreadable = 0
         for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
-            if block is None:
-                # A BEGIN with no END line, or an END of another label, and the scan has ended.
-                # OpenSSL refuses such a file, so a context that loaded these bytes disagrees with
-                # this model; count it rather than read nothing.
-                self.unreadable += 1
-                break
             try:
                 cert = x509.load_pem_x509_certificate(block)
                 subject = cert.subject.rfc4514_string()
@@ -1676,14 +1679,18 @@ class IssuerIndex:
                 key = cert.public_key().public_bytes(
                     serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
                 )
-            except (*_UNREADABLE_CA, UnsupportedAlgorithm):
-                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
-                continue
+            except (*_UNREADABLE_CA, UnsupportedAlgorithm) as exc:
+                raise ValueError(
+                    f"{label}: a certificate in this file cannot be parsed for the mTLS issuer "
+                    "map, though the TLS library may load it, so the map could not hold what the "
+                    "handshake trusts. Remove or re-issue that certificate"
+                ) from exc
             if der in seen:
                 continue  # the same certificate twice is one anchor
             seen.add(der)
             self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
             self._subject_keys.setdefault(subject, set()).add(key)
+        _refuse_unless_openssl_loads(cadata, seen, label=label)
 
     def issuer_of(self, leaf_der: bytes) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
@@ -1729,6 +1736,61 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
+def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str) -> None:
+    """Raise ``ValueError`` unless ``indexed``, certificate DERs, holds exactly the CA
+    certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``, and as many
+    other certificates as it loads (BACKLOG #4948). This is the authority; the PEM scan only
+    proposes.
+
+    Asked of a scratch context, as ``config.tls_policy.crl_scratch_context`` asks one about a CRL
+    file, so the live context is never written to. ``get_ca_certs`` lists every CA certificate the
+    store holds, as DER, so the CA sets are compared directly, both ways. A certificate the index
+    holds that is not in that list must be one OpenSSL reads as no CA, asked of a context holding
+    it alone, or it would be a CA the index read and OpenSSL never loaded. OpenSSL lists no other
+    certificate, so those are compared by count. An uncounted difference there names nothing: in a
+    chain OpenSSL verifies, a certificate it reads as no CA can sign nothing, and so is never the
+    issuer the index names for a leaf it did not itself load as an anchor.
+
+    The comparison never rests on OpenSSL dropping a certificate it was given twice: it does not
+    always (measured on OpenSSL 3.5.7, two CAs sharing a DN with another CA between them), and a
+    copy it keeps twice makes this refuse rather than accept."""
+    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots
+    try:
+        scratch.load_verify_locations(cadata=cadata)
+    except (ssl.SSLError, ValueError):
+        # The live context loaded these bytes first, so it refused them too.
+        raise ValueError(
+            f"{label}: the TLS library refuses this file, so the mTLS issuer map could not hold "
+            "what the handshake trusts"
+        ) from None
+    listed = scratch.get_ca_certs(binary_form=True)
+    loaded = scratch.cert_store_stats()["x509"]
+    cas = set(listed)
+    if (
+        len(cas) != len(listed)
+        or not cas <= indexed
+        or loaded != len(indexed)
+        or not all(_loads_as_no_ca(der) for der in indexed - cas)
+    ):
+        raise ValueError(
+            f"{label}: the TLS library loads {loaded} certificate(s) from this file, which are not "
+            f"the {len(indexed)} the mTLS issuer map read, so the map could name a CA the handshake "
+            "never trusts or miss one it does. Write each certificate as a plain PEM block, with "
+            "nothing else between the blocks"
+        )
+
+
+def _loads_as_no_ca(der: bytes) -> bool:
+    """Whether OpenSSL loads the certificate ``der`` and reads it as no CA, in a context alone."""
+    alone = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        alone.load_verify_locations(cadata=der)
+    except ssl.SSLError:
+        return False
+    stats = alone.cert_store_stats()
+    return stats["x509"] == 1 and stats["x509_ca"] == 0
+
+
 #: PEM labels OpenSSL's ``load_verify_locations(cadata=)`` loads a certificate from and
 #: ``cryptography`` parses, at least: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE``, measured
 #: on OpenSSL 3.5.7 (BACKLOG #4948). Missing the legacy one left a CA the handshake trusts out of
@@ -1769,18 +1831,17 @@ def _pem_reader_lines(pem: bytes) -> Iterator[bytes]:
         at = stop
 
 
-def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
+def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, as OpenSSL's
-    reader would find it, at least on the shapes measured (BACKLOG #4948). ``None`` stands for the
-    rest of the file when OpenSSL would refuse it there, and ends the scan.
+    reader would find it, at least on the shapes measured (BACKLOG #4948).
 
     Lines are read as :func:`_pem_reader_lines` reads them. A block of ANY label opens at a line that
     starts ``-----BEGIN `` and ends ``-----``, so a marker in a comment opens none. It ends at the
     next line starting ``-----END ``, whatever lies between: OpenSSL reads every line up to it as
     the body. The body of a block under another label is skipped whole, as OpenSSL skips it, so a
     certificate nested inside such a block is never read. An END line naming another label, or no
-    END line at all, makes OpenSSL refuse the file; the rest is then counted as unreadable rather
-    than read as nothing.
+    END line at all, makes OpenSSL refuse the file, so the scan ends there; the check against
+    OpenSSL then refuses it too.
 
     A certificate block is handed on rebuilt from the lines OpenSSL's reader splits it into, so
     ``cryptography`` never sees the trailing bytes OpenSSL stripped. A NUL with text after it
@@ -1788,17 +1849,16 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
     data-line length limit, and on some shapes stops loading the file there, so a line cut at the
     NUL would name a CA the context never loaded.
 
-    Loadable shapes still differ, at least these. Some fail closed, as the index counts the block
-    as unreadable, so it names no issuer and warns: at least a block missing its END line before
-    the next block, and a CA whose base64 line has a NUL with more text after it, which OpenSSL
-    loads. Others fail OPEN, and this scan does not close them: OpenSSL silently stops loading the
-    file at some blocks of any label, while this scan reads on and names CAs it never loaded, at
-    least the CAs after that block and on some shapes the block's own. Measured on OpenSSL 3.5.7,
-    those include at least a block whose body decodes to no data (such as an empty block, or one
-    whose only lines follow a ``Name: value`` header line with no blank line after it), a block
-    whose body opens with a blank line, or with a header line and a blank line, and holds a data
-    line over 64 characters, and a block with a ``:`` in a body line, after a NUL or not, which
-    OpenSSL reads as a header line."""
+    This scan still differs from OpenSSL on shapes it can load, at least these. A CA whose base64
+    line has a NUL with more text after it is loaded by OpenSSL, and this scan hands
+    ``cryptography`` the whole line, which it refuses. OpenSSL silently stops loading the file at
+    some blocks of any label, while this scan reads on: measured on OpenSSL 3.5.7, at least a block
+    whose body decodes to no data (such as an empty block, or one whose only lines follow a
+    ``Name: value`` header line with no blank line after it), a block whose body opens with a
+    blank line, or with a header line and a blank line, and holds a data line over 64 characters,
+    and a block with a ``:`` in its label or in a body line, which OpenSSL reads as a header line.
+    :class:`IssuerIndex` refuses every such file, because it checks this scan's result against
+    what OpenSSL loaded (:func:`_refuse_unless_openssl_loads`)."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
@@ -1815,7 +1875,6 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
         else:
             end = b""  # no END line at all
         if end != b"-----END " + label + b"-----":
-            yield None  # no END, or one of another label: OpenSSL refuses the file
-            return
+            return  # no END, or one of another label: OpenSSL refuses the file
         if keep:
             yield b"\n".join([b"-----BEGIN " + label + b"-----", *body, end, b""])
