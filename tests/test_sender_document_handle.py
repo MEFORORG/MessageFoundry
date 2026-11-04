@@ -992,30 +992,30 @@ async def _no_read(_sha256: str) -> str | None:
 
 def _copy_in_nte_component(field_sep: str, msh2: str, value: str) -> str:
     """A well-formed MDM^T02 under MSH-1 ``field_sep`` and MSH-2 ``msh2``, with a small ED Base64
-    document in ``OBX-5.5`` and ``value`` set into ``NTE-3.1``. Every field is written with
-    ``Message.set``, so a delimiter that is a letter or digit is escaped in the fixed text too and
-    the OBX keeps its shape. ``NTE-3.1`` is a component set, which escapes every delimiter in
-    ``value``."""
+    document in ``OBX-5.5`` and ``value`` set into ``NTE-3.1``. Every value is a component set,
+    which escapes every delimiter in it, so a delimiter that is a letter or digit is escaped in the
+    fixed text too and each field reads back as written."""
     msg = Message.parse(f"MSH{field_sep}{msh2}{field_sep}\rOBX{field_sep}1{field_sep}ED\r")
-    for path, text in [
-        ("MSH-7", "20260101120000"),
+    fields = [
+        ("MSH-7.1", "20260101120000"),
         ("MSH-9.1", "MDM"),
         ("MSH-9.2", "T02"),
-        ("MSH-10", "MSGID001"),
-        ("MSH-12", "2.5"),
-        ("OBX-3", "PDF"),
+        ("MSH-10.1", "MSGID001"),
+        ("MSH-12.1", "2.5"),
+        ("OBX-3.1", "PDF"),
         ("OBX-5.2", "Application"),
         ("OBX-5.3", "PDF"),
         ("OBX-5.4", "Base64"),
         ("OBX-5.5", _b64(10)),
-        ("OBX-11", "F"),
-    ]:
+        ("OBX-11.1", "F"),
+    ]
+    for path, text in fields:
         msg.set(path, text)
     msg.add_segment(f"NTE{field_sep}1")
     msg.set("NTE-3.1", value)
     payload = msg.encode()
     parsed = Message.parse(payload)
-    assert (parsed.field("OBX-5.4"), parsed.field("OBX-5.5")) == ("Base64", _b64(10))
+    assert [parsed.field(path) for path, _ in fields] == [text for _, text in fields]
     assert parsed.field("NTE-3.1") == value
     return payload
 
@@ -1054,17 +1054,48 @@ async def test_a_copy_whose_delimiters_escape_its_address_is_refused(
         await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
 
 
+@pytest.mark.parametrize("msh2", ["a~\\&", "^~0&"], ids=["component-a", "escape-0"])
+async def test_a_bare_marker_under_a_lowercase_hex_delimiter_is_refused(
+    store: MessageStore, msh2: str
+) -> None:
+    """Fail closed: under such delimiters no address after a marker can be read, so even a marker
+    that names none counts as a copy. Through the delivery gate it dead-letters at once, rather
+    than re-pending on the lane, and nothing reaches the partner."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    payload = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")
+    assert may_hold_doc_ref(payload)
+    with pytest.raises(UnreattachableDocumentError):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+    _mid, rows = await _deliver(store, runner, payload)
+
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(rows)
+
+
 @pytest.mark.parametrize(
     "msh2",
-    ["^~\\&", ":~\\&", "A~\\&", "^~\\B"],
-    ids=["default", "colon-component", "uppercase-component", "uppercase-subcomponent"],
+    ["^~\\&", ":~\\&", "m~\\&", "^g\\&", "A~\\&", "^~\\B"],
+    ids=[
+        "default",
+        "colon-component",
+        "marker-letter-component",
+        "lowercase-non-hex-repetition",
+        "uppercase-component",
+        "uppercase-subcomponent",
+    ],
 )
 async def test_a_bare_marker_under_delimiters_with_no_lowercase_hex_is_carried_as_text(
     msh2: str,
 ) -> None:
     """The control: no delimiter is a lowercase hex digit, nothing is bound, and the marker names
-    no address, so the payload is carried unchanged. An uppercase hex delimiter escapes nothing in
-    a lowercase address, so it does not count."""
+    no address, so the payload is carried unchanged. A lowercase letter outside a-f, a marker
+    letter included, and an uppercase hex letter escape nothing in a lowercase address, so they
+    do not count."""
     from messagefoundry.parsing.binary import reattach_documents_in_hl7
 
     payload = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")

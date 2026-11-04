@@ -839,7 +839,7 @@ async def reattach_documents_in_hl7(
             # address, or may name one its delimiters escaped: a child that inherited none,
             # because its only handle sits outside OBX-5.5, would otherwise send the engine's
             # handle with no document. A bare marker in a message that holds nothing names no
-            # document, so it is carried as text where every delimiter is a non-hex character.
+            # document, so it is carried as text where no delimiter is a lowercase hex digit.
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, markers
 
