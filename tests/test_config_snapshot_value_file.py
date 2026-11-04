@@ -88,7 +88,7 @@ def test_the_snapshot_holds_the_bytes_it_read_and_answers_them_after_an_edit(
     cfg, value_file = _layout(tmp_path)
     snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
     value_file.write_text(_UNREVIEWED, encoding="utf-8")
-    assert snapshot.value_file == value_file.resolve()
+    assert snapshot.value_file == value_file.absolute()
     assert snapshot.covers_environment_file(value_file)
     assert snapshot.environment_file(value_file) == _APPROVED.encode()
     # Another file in the same folder is not covered.
@@ -122,6 +122,45 @@ def test_the_value_file_is_read_by_the_path_an_open_resolves(tmp_path: Path) -> 
     # The bytes an open of the same path reads: on POSIX the linked file, while Windows folds
     # ``..`` before it opens, and ``realpath`` there does the same.
     assert snapshot.environment_file(via) == via.read_bytes()
+
+
+def test_a_value_file_that_is_itself_a_link_is_covered_by_the_path_asked_for(
+    tmp_path: Path,
+) -> None:
+    """A ConfigMap-style layout: the value file links to a file of another name elsewhere. The
+    provider asks by the link's path, and the snapshot answers the bytes it read through it."""
+    cfg, value_file = _layout(tmp_path, None)
+    target = tmp_path / "data" / "shared-values"
+    target.parent.mkdir()
+    target.write_bytes(_APPROVED.encode())
+    try:
+        value_file.symlink_to(target)
+    except OSError:
+        pytest.skip("this account cannot create a file link")
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+    assert "@value-file/dev.toml" in snapshot.files
+    assert snapshot.covers_environment_file(value_file)
+    assert snapshot.environment_file(value_file) == _APPROVED.encode()
+
+
+def test_a_strict_read_does_not_accept_a_lax_fault_it_is_handed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config import snapshot as snapshot_module
+
+    cfg, value_file = _layout(tmp_path)
+    real_read = snapshot_module._read
+
+    def _read(path: Path) -> bytes:
+        if path == value_file.absolute():
+            raise PermissionError(13, "denied", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(snapshot_module, "_read", _read)
+    lax = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=False)
+    assert lax.unreadable == ("@value-file/dev.toml",)
+    with pytest.raises(PermissionError):
+        with_value_file(lax, value_file, strict=True)
 
 
 def test_a_value_file_in_the_config_directory_is_not_read_twice(tmp_path: Path) -> None:

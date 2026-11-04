@@ -314,20 +314,26 @@ def with_value_file(
     bytes and a reload parses them (:meth:`ConfigSnapshot.environment_file`; vault BACKLOG #2596).
 
     ``value_file`` is the path a start reads, ``<base_dir>/<dir>/<env>.toml``, wherever
-    ``[environments].base_dir`` puts it; it is read and recorded by its resolved path. Returns
-    ``snapshot`` itself when ``value_file`` is ``None``, sits in the snapshot's ``environments/``
-    folder, which the snapshot already read, or is the file the snapshot already holds. A file that is not there is
-    held as absent, so creating one changes the digest. With ``strict`` a fault reading it raises
-    its ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. It is read as
-    :func:`read_config_snapshot` reads a file, following links. Its access list is not vetted
-    here: a caller that gates on the bytes vets the file and its folder before this read."""
+    ``[environments].base_dir`` puts it. It is read by that path, so the open resolves it as the
+    provider's open of the same path does, links before ``..``, and it is recorded by that path made
+    absolute, not folded or resolved, so the provider's path matches it even when the file is a
+    link. Returns ``snapshot`` itself when ``value_file`` is ``None``, sits in the snapshot's
+    ``environments/`` folder, which the snapshot already read, or is the file the snapshot already
+    holds, unless ``strict`` and the held read was a fault. A file that is not there is held as
+    absent, so creating one changes the digest. With ``strict`` a fault reading it raises its
+    ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. A name that is not a
+    ``.toml`` file raises ``ValueError``. Its access list is not vetted here: a caller that gates
+    on the bytes vets the file and its folder before this read."""
     if value_file is None:
         return snapshot
-    # Resolved as an open resolves it, links before ``..``, so the file read here is the file a
-    # provider's open of the same path reads; ``abspath`` folds ``..`` as text and can name another.
-    path = Path(os.path.realpath(value_file))
-    if snapshot.covers_environment_file(path):
+    path = Path(value_file).absolute()
+    folder = snapshot._folder_of(path)
+    if folder == _ENVIRONMENTS_DIR:
         return snapshot
+    if folder == _VALUE_FILE_DIR:
+        held_fault = any(rel.startswith(_VALUE_FILE_PREFIX) for rel in snapshot.unreadable)
+        if not (strict and held_fault):
+            return snapshot
     files = {k: v for k, v in snapshot.files.items() if not k.startswith(_VALUE_FILE_PREFIX)}
     unreadable = {rel for rel in snapshot.unreadable if not rel.startswith(_VALUE_FILE_PREFIX)}
     rel = _check_rel(_VALUE_FILE_PREFIX + path.name)

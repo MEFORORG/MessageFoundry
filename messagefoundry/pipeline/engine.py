@@ -2721,9 +2721,9 @@ class Engine:
 
     def _value_file(self) -> Path | None:
         """The value file this engine's provider reads, wherever ``[environments].base_dir`` puts
-        it, which a reload's snapshot holds and at least the approval, reload, provenance and
-        start digests fold (vault BACKLOG #2596). ``None`` for a provider that names none, or no
-        provider."""
+        it, which a reload's snapshot holds and the engine's config digests fold; ADR 0041's
+        2026-11-03 amendment says which (vault BACKLOG #2596). ``None`` for a provider that names
+        none, or no provider."""
         provider = self._env_values_provider
         if isinstance(provider, SnapshotEnvValuesProvider):
             return provider.value_file
@@ -2740,10 +2740,10 @@ class Engine:
         kwargs: dict[str, Any] = {}
         if snapshot is not None:
             kwargs["snapshot"] = snapshot
-        value_file = self._value_file()
-        if value_file is not None:
-            kwargs["value_file"] = value_file
         try:
+            value_file = self._value_file()
+            if value_file is not None:
+                kwargs["value_file"] = value_file
             # A direct call, so the crypto inventory scanner, which follows a call it can see,
             # keeps the hash on its record. A snapshot that holds the value file is not read again.
             return config_fingerprint_detail(path, **kwargs), None
@@ -2799,8 +2799,9 @@ class Engine:
             # The path can come from a client's config_dir, so it is scrubbed for CodeQL
             # py/log-injection as the reload refusal logs scrub theirs.
             log.warning(
-                "config content digest failed for %s: %s",
+                "config content digest failed for %s (environment value file %s): %s",
                 scrub_log_argument(str(path)),
+                scrub_log_argument(str(value_file)) if value_file is not None else "none",
                 safe_exc(exc),
             )
             return None
@@ -2844,14 +2845,20 @@ class Engine:
             return snapshot
         try:
             # Vetted before it is read, as the config directory is: the bytes read here are the
-            # ones a reload applies (vault BACKLOG #2596, step 4).
+            # ones a reload applies (vault BACKLOG #2596, step 4). The folder a link leads to too,
+            # since its writer could replace the target between this check and the read.
+            folders = [value_file.parent]
+            target = Path(os.path.realpath(value_file)).parent
+            if target != value_file.parent:
+                folders.append(target)
             assert_trusted_start_paths(
-                [value_file],
-                lead="refusing to read environment values from",
-                folders=[value_file.parent],
+                [value_file], lead="refusing to read environment values from", folders=folders
             )
             return with_value_file(snapshot, value_file, strict=True)
-        except OSError as exc:
+        except WiringError:
+            raise  # the trust check's refusal, which is a ValueError too
+        except (OSError, ValueError) as exc:
+            # ValueError: a provider's value file not named ``*.toml``, which no snapshot holds.
             log.warning(
                 "environment value file %s could not be read into the reload's snapshot: %s. "
                 "A released reload is refused; any other reload reads the values from disk",
