@@ -5809,8 +5809,9 @@ def create_app(
         console's flag route for a direction that names neither side. A change to that refusal has
         to be made in at least those three places."""
         rr = engine.registry_runner
+        wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
-            req.direction != "inbound"
+            wrong_direction
             or not identity.can_access_channel(name)
             # inbound_names(), as the engine's own guard reads it: an engine shard's view holds only
             # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
@@ -5822,7 +5823,7 @@ def create_app(
                 name,
                 client_ip(request),
                 # The row's marker, for a row that names an in-scope inbound (BACKLOG #3378).
-                flag_direction_not_inbound=req.direction != "inbound",
+                flag_direction_not_inbound=wrong_direction,
             )
         try:
             await engine.set_connection_flag(
@@ -9645,8 +9646,6 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
-        # docs/SECURITY.md, the GET /alerts/rules paragraph, says what a scoped caller reads of
-        # the id and why (BACKLOG #3378).
         show_ids = _user.allowed_channels is None
 
         config = AlertsConfig(
@@ -9674,7 +9673,7 @@ def create_app(
                     cooldown_seconds=r.cooldown_seconds,
                     # #146: report the COUNT of per-rule recipients, never the addresses (secret-guard parity).
                     recipient_count=len(r.recipients) if r.recipients else 0,
-                    # #138 — the operator rule label ({rule_id}); see show_ids (#3378)
+                    # #138 — the operator rule label ({rule_id}); withheld per the docstring (#3378)
                     id=r.id if show_ids else None,
                     control_action=r.control_action,  # #144 — auto-remediation action
                     control_target=r.control_target,
