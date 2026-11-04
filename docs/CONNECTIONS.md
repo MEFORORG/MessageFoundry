@@ -2315,11 +2315,15 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 pattern: `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue**
 (`DELETE … WHERE id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor); the
 connector just runs whatever statement you declare, bound from the row. They are not equally safe. A
-high-water mark can move its cursor past a row that was never handed off, even with the poll's stop
-at a failed row (BACKLOG #4921): at least in the cases *Reliability* below names, and when a row
-commits after a row with a higher cursor value was already polled and marked, as concurrent inserts
-into an identity or sequence column can do. Unless the feed can afford to lose such a row, mark with a
-status column or a delete-from-queue whose `WHERE` matches only the row handed off, by a unique key.
+high-water mark can leave a row that was never handed off behind its cursor, even with the poll's
+stop at a failed row (BACKLOG #4921). It does at least in the cases *Reliability* below names, and in
+two more with no handler failure at all. Over a cursor column with ties and a `>` predicate, a row
+not yet handed off that shares its cursor value with a row already marked is never selected, such as
+one that falls just past the `poll_max_rows` cut. And a row that commits after a row with a higher cursor value was
+already polled and marked is never selected either, as concurrent inserts into an identity or
+sequence column can do. The engine never reads a row lost those two ways, so nothing records it.
+Unless the feed can afford such a loss, mark with a status column or a delete-from-queue whose
+`WHERE` matches only the row handed off, by a unique key.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
@@ -2327,7 +2331,8 @@ pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefl
 **unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
 `poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
 `mark_statement` over a `poll_statement` that does not return rows in cursor order, or over a
-cursor column that is not unique (below).
+cursor column that is not unique (below). A high-water mark loses a row in further cases, in cursor
+order too; *Mark mechanism* above names them.
 **With a `mark_statement`, a handler failure also stops the
 poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
 next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on: no
