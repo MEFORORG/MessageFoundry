@@ -458,10 +458,25 @@ def _three_children() -> tuple[str, str, list[tuple[str, str]]]:
     return low, high, children
 
 
-async def test_postgres_links_every_child_in_one_sorted_pass() -> None:
+def _expected_passes(low: str, high: str, collected: bool) -> list[tuple[str, tuple]]:
+    """The calls one inheritance pass over :func:`_three_children` makes, the lower document's
+    links left out where a purge collected its header first, one link per call."""
+    low_links = [] if collected else [("link", ("c2", low)), ("link", ("c3", low))]
+    return [
+        ("fetch", ("parent",)),
+        ("incref", (2, low)),
+        *low_links,
+        ("incref", (2, high)),
+        ("link", ("c1", high)),
+        ("link", ("c2", high)),
+    ]
+
+
+@pytest.mark.parametrize("collected", [False, True], ids=["held", "header-collected"])
+async def test_postgres_links_every_child_in_one_sorted_pass(collected: bool) -> None:
     """The Postgres inheritance, offline: one incref per document, by the number of children that
-    name it, in content-address order, then that document's links. A handle-free body reads
-    nothing."""
+    name it, in content-address order, then that document's links, none where the incref found no
+    header. A handle-free body reads nothing."""
     from messagefoundry.store.postgres import PostgresStore
 
     low, high, children = _three_children()
@@ -475,11 +490,11 @@ async def test_postgres_links_every_child_in_one_sorted_pass() -> None:
         async def execute(self, sql: str, *args: object) -> str:
             assert sql.startswith("UPDATE attachment SET refcount = refcount + $1")
             calls.append(("incref", args))
-            return "UPDATE 1"
+            return "UPDATE 0" if collected and args[1] == low else "UPDATE 1"
 
         async def executemany(self, sql: str, rows: list[tuple[str, str]]) -> None:
             assert "inherited" in sql
-            calls.append(("link", tuple(rows)))
+            calls.extend(("link", tuple(row)) for row in rows)
 
     store = object.__new__(PostgresStore)
     await store._inherit_attachments(_Conn(), "parent", [("c4", _hl7("plain"))])
@@ -487,19 +502,13 @@ async def test_postgres_links_every_child_in_one_sorted_pass() -> None:
 
     await store._inherit_attachments(_Conn(), "parent", children)
 
-    assert calls == [
-        ("fetch", ("parent",)),
-        ("incref", (2, low)),
-        ("link", (("c2", low), ("c3", low))),
-        ("incref", (2, high)),
-        ("link", (("c1", high), ("c2", high))),
-    ]
+    assert calls == _expected_passes(low, high, collected)
 
 
+@pytest.mark.parametrize("collected", [False, True], ids=["held", "header-collected"])
 @pytest.mark.parametrize("sync", [False, True], ids=["async", "sync"])
-async def test_sql_server_links_every_child_in_one_sorted_pass(sync: bool) -> None:
-    """The SQL Server inheritance and its synchronous twin, offline, in the same order as the
-    Postgres one."""
+async def test_sql_server_links_every_child_in_one_sorted_pass(sync: bool, collected: bool) -> None:
+    """The SQL Server inheritance and its synchronous twin, offline, as the Postgres one."""
     from messagefoundry.store.sqlserver import SqlServerStore
 
     low, high, children = _three_children()
@@ -518,8 +527,10 @@ async def test_sql_server_links_every_child_in_one_sorted_pass(sync: bool) -> No
         def _fetchall(self) -> list[tuple[str]]:
             return [(high,), (low,)]
 
-        def _fetchone(self) -> tuple[str]:
-            return (self.last[1],)  # the incref found the header
+        def _fetchone(self) -> tuple[str] | None:
+            if collected and self.last[1] == low:
+                return None  # a purge collected the header first
+            return (self.last[1],)
 
     class _AsyncCursor(_Cursor):
         async def execute(self, sql: str, params: tuple = ()) -> None:
@@ -528,7 +539,7 @@ async def test_sql_server_links_every_child_in_one_sorted_pass(sync: bool) -> No
         async def fetchall(self) -> list[tuple[str]]:
             return self._fetchall()
 
-        async def fetchone(self) -> tuple[str]:
+        async def fetchone(self) -> tuple[str] | None:
             return self._fetchone()
 
     class _SyncCursor(_Cursor):
@@ -538,24 +549,60 @@ async def test_sql_server_links_every_child_in_one_sorted_pass(sync: bool) -> No
         def fetchall(self) -> list[tuple[str]]:
             return self._fetchall()
 
-        def fetchone(self) -> tuple[str]:
+        def fetchone(self) -> tuple[str] | None:
             return self._fetchone()
 
     store = object.__new__(SqlServerStore)
-    if sync:
-        store._inherit_attachments_sync(_SyncCursor(), "parent", children)
-    else:
-        await store._inherit_attachments(_AsyncCursor(), "parent", children)
+    for batch in ([("c4", _hl7("plain"))], children):
+        if sync:
+            store._inherit_attachments_sync(_SyncCursor(), "parent", batch)
+        else:
+            await store._inherit_attachments(_AsyncCursor(), "parent", batch)
+        if batch is not children:
+            assert calls == []  # a handle-free body reads nothing
 
-    assert calls == [
-        ("fetch", ("parent",)),
-        ("incref", (2, low)),
-        ("link", ("c2", low)),
-        ("link", ("c3", low)),
-        ("incref", (2, high)),
-        ("link", ("c1", high)),
-        ("link", ("c2", high)),
-    ]
+    assert calls == _expected_passes(low, high, collected)
+
+
+async def test_server_retention_decrefs_in_python_order_whatever_the_collation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Postgres and SQL Server retention decrefs take the header locks in the order the
+    inheritance and ingress increfs take them, sorted in Python, even where the database's
+    collation returned the rows in another order."""
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    low, high, _children = _three_children()
+    released: list[tuple[str, int]] = []
+
+    async def _decref(_conn: object, ref: str, count: int = 1) -> None:
+        released.append((ref, count))
+
+    class _PgConn:
+        async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
+            return [{"attachment_id": high, "n": 1}, {"attachment_id": low, "n": 2}]
+
+        async def execute(self, sql: str, *args: object) -> str:
+            return "DELETE 3"
+
+    class _MsCursor:
+        description = (("attachment_id",), ("n",))
+
+        async def execute(self, sql: str, params: object = ()) -> None:
+            return None
+
+        async def fetchall(self) -> list[tuple[str, int]]:
+            return [(high, 1), (low, 2)]
+
+    pg = object.__new__(PostgresStore)
+    monkeypatch.setattr(pg, "_decref_attachment", _decref)
+    await pg._release_message_attachments(_PgConn(), "message_id=$1", ["m"])
+    ms = object.__new__(SqlServerStore)
+    monkeypatch.setattr(ms, "_decref_attachment", _decref)
+    await ms._release_message_attachments(_MsCursor(), "message_id=?", ("m",))
+
+    assert released == [(low, 2), (high, 1)] * 2
 
 
 async def test_several_passthrough_children_of_one_transform_each_hold_their_documents(

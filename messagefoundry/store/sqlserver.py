@@ -11386,8 +11386,9 @@ class SqlServerStore:
         no double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
         holds. ``where`` is a code-controlled fragment (never user input); ``params`` binds it identically
         in both statements."""
-        # ORDER BY: the decrefs take the header locks in content-address order, as the ingress and
-        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle.
+        # The decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
+        # in Python as those are, so the database collation does not decide the order.
         await cur.execute(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
             f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
@@ -11397,7 +11398,7 @@ class SqlServerStore:
         releases = [dict(zip(cols, r)) for r in await cur.fetchall()]  # noqa: B905
         if not releases:
             return
-        for row in releases:
+        for row in sorted(releases, key=lambda r: str(r["attachment_id"])):
             await self._decref_attachment(cur, row["attachment_id"], int(row["n"]))
         # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
         await cur.execute(f"DELETE FROM message_attachment WHERE {where}", params)

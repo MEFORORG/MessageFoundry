@@ -8264,15 +8264,16 @@ class RegistryRunner:
                 if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
+                # Dropped once stored, before the splice below copies OBX-5 and before the scan
+                # reads the next document, so the loop holds one copy at a time, as the budget
+                # assumes (BACKLOG #5099).
+                del document, verbatim_b64
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
                 )
                 if ref not in refs:
                     refs.append(ref)
                 detached += 1
-                # Dropped before the scan reads the next document, so the loop holds one value at
-                # a time, as the budget assumes (BACKLOG #5099).
-                del document, verbatim_b64
             if detached == 0:
                 # An over-threshold body with no detachable document (e.g. a large non-ED message): keep
                 # it byte-identical — no attachment, no skeleton re-encode divergence, no ref to incref.

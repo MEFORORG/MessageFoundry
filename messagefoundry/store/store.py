@@ -1041,11 +1041,17 @@ def inheritance_plan(
     pass-through Sends makes several. The caller increfs each address once, by the number of
     children naming it, in this order. So on Postgres and SQL Server, where one transaction runs
     one ``transform_handoff``, the transaction takes each document's header lock once, in the order
-    the ingress increfs and the retention decrefs take them, however many children it makes."""
+    the ingress increfs and the retention decrefs take them, however many children it makes. The
+    order is Python's, on the lowercase hex addresses, as those paths sort them too, so no
+    database collation decides it. A body several children carry is parsed once."""
     held = list(held)
+    named_by_body: dict[str, list[str]] = {}
     naming: dict[str, list[str]] = {}
     for child_id, body in children:
-        for ref in attachments_named(held, body):
+        refs = named_by_body.get(body)
+        if refs is None:
+            refs = named_by_body[body] = attachments_named(held, body)
+        for ref in refs:
             naming.setdefault(ref, []).append(child_id)
     return sorted(naming.items())
 

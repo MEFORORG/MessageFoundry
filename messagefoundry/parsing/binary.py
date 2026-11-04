@@ -504,8 +504,10 @@ def iter_obx_documents(
             "would be detached from it; refusing a body delivery would refuse after the ACK"
         )
     for occ in documents:
-        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
+        # OBX-5.2 first: its read splits OBX-5 into a copy of the whole field, which would sit
+        # beside the value if the value were read first.
         ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
+        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
         yield occ, data_b64, ed_type
         # Dropped before the next read, so no two documents' values are held here at once.
         del data_b64
@@ -514,7 +516,8 @@ def iter_obx_documents(
 def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool, bool]:
     """Read one OBX's ``OBX-5.5`` for :func:`iter_obx_documents` and return whether the OBX is ED
     Base64, whether its value is a document the detach lifts out, and whether that value holds the
-    handle marker. The value lives only in this frame, so the scan holds one at a time. Raises
+    handle marker. The value lives only in this frame, and is dropped before the OBX-2 and
+    OBX-5.4 reads, whose splits copy the field again, so the scan holds one copy at a time. Raises
     :class:`InboundDocRefError` when the value is a live handle (BACKLOG #5099): every OBX is
     read, as the delivery re-attach resolves a handle in any ``OBX-5.5`` first repetition."""
     value = message.field("OBX-5.5", occurrence=occ) or ""
@@ -523,14 +526,15 @@ def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool,
             f"OBX occurrence {occ}: OBX-5.5 already holds a document handle, which only the "
             "engine writes; refusing a received value that would name a stored attachment"
         )
-    if not _is_base64_ed(message, occ):
-        return False, False, False
     # Not a tombstone: one resolves nothing, so it rides as text.
-    if not value or is_document_tombstone(value) or len(value) < min_b64_len:
-        return True, False, False
+    detachable = bool(value) and not is_document_tombstone(value) and len(value) >= min_b64_len
     # Kept beside the whole-body check: unlike that one, it does not rest on ``received`` being
     # the text the message was parsed from. It costs one pass over the value.
-    return True, True, DOC_REF_MARKER in value
+    holds_marker = detachable and DOC_REF_MARKER in value
+    del value
+    if not _is_base64_ed(message, occ):
+        return False, False, False
+    return True, detachable, holds_marker
 
 
 def _received_holds_marker(message: Message, received: str) -> bool:

@@ -7040,8 +7040,9 @@ class PostgresStore:
         join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
         an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
         (numbered from ``$1``); ``params`` binds it identically in both statements."""
-        # ORDER BY: the decrefs take the header locks in content-address order, as the ingress and
-        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle.
+        # The decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
+        # in Python as those are, so the database collation does not decide the order.
         rows = await conn.fetch(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
             f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
@@ -7049,7 +7050,7 @@ class PostgresStore:
         )
         if not rows:
             return
-        for r in rows:
+        for r in sorted(rows, key=lambda r: str(r["attachment_id"])):
             await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
         # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
         await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
