@@ -340,11 +340,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "can authenticate the engine only by pinning that exact certificate, handed over out of "
         "band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
         "X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI crosses the network "
-        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which off loopback also needs "
-        "MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate), and "
+        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file; off loopback it also needs "
+        "MEFOR_TLS_REVOCATION_ATTESTED=1, docs/SECURITY.md, API revocation gate), and "
         "per-connection tls where the connector has it (raw-TCP and X12 have none). It relaxes no "
-        "other API refusal, at least the /ui, plaintext proxy hop, revocation and proxy "
-        "declaration refusals.",
+        "other API refusal, at least the /ui, plaintext proxy hop and revocation refusals.",
     )
 
     supervise = sub.add_parser(
@@ -3473,7 +3472,7 @@ def _serve(args: argparse.Namespace) -> int:
                 "engine only by pinning that exact certificate, handed over out of band; any other "
                 "client cannot tell the engine from an on-path attacker presenting a certificate of "
                 "its own. "
-                "Configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
+                f"For real remote access, {off_loopback_certificate_remedy()}.",
                 file=sys.stderr,
             )
         elif insecure_bind_ok:
@@ -3811,7 +3810,8 @@ def _serve(args: argparse.Namespace) -> int:
             "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
             "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
             "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
-            "an operator certificate ([api].tls_cert_file) or a proxy in front of a loopback "
+            "an operator certificate (off loopback: "
+            f"{off_loopback_certificate_remedy()}) or a proxy in front of a loopback "
             "engine, + [security].web_console_public_address (see docs/SECURITY.md, Off-loopback "
             "browser console, and docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
@@ -3829,7 +3829,7 @@ def _serve(args: argparse.Namespace) -> int:
     # declared proxy, where the engine would serve https on the minted placeholder (ADR 0172). The
     # message says that, rather than "without TLS" (BACKLOG #1672).
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
-    # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
+    # #1361). This gate is reachable TWO ways, and each remediation is verified by a test:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
     #     REFUSES local_access_only=true beside a non-loopback listen_address, so an operator who only
     #     set listen_address never gets here, and adding local_access_only=true to the config that
@@ -3846,7 +3846,9 @@ def _serve(args: argparse.Namespace) -> int:
     #     command line) leaves this refusal firing, rc 2, because the flag still wins. Measured
     #     2026-09-21. The fix on this route is to drop or change the flag. The message names it
     #     through loopback_levers, which on this route reads "serve --host, which overrides
-    #     [security].listen_address". The test above drives the FILE route only.
+    #     [security].listen_address".
+    #     tests/test_cli.py::test_serve_ui_offloopback_refusal_names_the_host_flag drives this route
+    #     and the remedy back through serve.
     # The certificate remedy is off_loopback_certificate_remedy, which names the revocation
     # attestation: off loopback a certificate bind meets the API revocation gate above. The loopback
     # remedy is for local access; a same-machine proxy in front of it owes what docs/SECURITY.md,

@@ -2191,6 +2191,12 @@ def test_serve_ui_offloopback_refusal_names_the_host_flag(
         (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
     )
     assert "serve --host, which overrides [security].listen_address" in refusal, refusal
+    # The remedy the message names, applied: change the flag to loopback, and serve starts.
+    argv[-1] = "127.0.0.1"
+    rc = main(argv)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _UI_OFFLOOPBACK_REFUSAL not in err
 
 
 def test_serve_ui_offloopback_certificate_remedy_starts_with_the_attestation(

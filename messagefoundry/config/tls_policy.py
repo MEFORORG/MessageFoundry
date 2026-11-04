@@ -2444,7 +2444,7 @@ def phi_read_hop_disposition(
     The data-path analogue of :func:`insecure_hop_disposition` for the API's PHI-read RESPONSE path
     (raw view / attachment download / summary). A production-PHI instance whose API serve hop is NOT
     proven secure — not loopback, no operator certificate, not a declared TLS-terminating proxy — REFUSES to
-    put PHI on that hop rather than emitting it where no trust store vouches for the engine. Reuses the ONE authority so the API decides
+    put PHI on that hop rather than emitting it over a hop not proven secure. Reuses the ONE authority so the API decides
     identically to the transport cells, and the production-PHI clamp (``audited_opt_out``, supplied
     already clamped by the caller) stays the single authority for the global escape.
 

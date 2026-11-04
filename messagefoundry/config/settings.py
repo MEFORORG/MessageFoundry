@@ -10238,7 +10238,8 @@ def security_loosenings(
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored, where the gate reads this dial; "
                 "at least the plaintext proxy hop, API revocation and /ui refusals read none "
-                "and still refuse (docs/SECURITY.md, Enforcement model)",
+                "and still refuse (docs/SECURITY.md: Plaintext proxy hop, API revocation gate, "
+                "Off-loopback browser console)",
             )
         )
     # Vault BACKLOG #2599: the config-source escape, named whenever it is LIVE. It is an environment

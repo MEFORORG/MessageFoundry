@@ -419,7 +419,7 @@ so the browser warns until you import that file into the trust store or configur
 certificate. The engine renews that certificate by itself at startup once less than a third of its lifetime is left (about 122 of its 365 days), and audits the renewal. The renewed certificate is a new one, so import it again, and replace any copy you pass to `--cacert`. See [SERVICE.md](SERVICE.md). Nothing else is needed for the local case. Off-loopback the console
 is **opt-in**: an exposed instance serves `/ui` only when `[security].serve_web_console = true` is set
 explicitly — a default-on console on an exposed bind quietly degrades to the JSON API with a warning —
-and it additionally requires TLS, plus `[security].web_console_public_address` behind a declared
+and it additionally requires an operator certificate ([SECURITY.md](SECURITY.md), *Off-loopback browser console*), plus `[security].web_console_public_address` behind a declared
 TLS-terminating proxy (see [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md)). The former PySide6 desktop console
 was retired in favour of this browser console (BACKLOG #103); PySide6 now backs only the standalone
 test harness (`pip install "messagefoundry[harness]"`).

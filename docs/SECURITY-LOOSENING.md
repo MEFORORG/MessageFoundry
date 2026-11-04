@@ -405,7 +405,10 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   [API revocation gate](SECURITY.md#api-revocation-gate) say what each one needs.
 - **Still refused:** either bind under `[security].enforcement = enforce`, the shipped default — the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
-  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
+  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`. In every mode it also leaves at
+  least the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals, the
+  [API revocation gate](SECURITY.md#api-revocation-gate) and the off-loopback `/ui` certificate refusal
+  in place.
 
 ### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)
 > **Not a loosening — the inverse.** The console is **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
@@ -418,7 +421,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   (a non-loopback host, a declared TLS-terminating proxy, a set `[api].trusted_proxies`, or a set
   `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
-  (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
+  (`serve_web_console = true` with an operator certificate + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback is refused without an operator
   `[api].tls_cert_file`, and that refusal holds even under
   `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared
@@ -708,7 +711,7 @@ is refused, so an opt-out does nothing and is not reported.
   **AUDIT** line is a gate's own, and not every gate writes one at `warn`: [*The switches*](#the-switches)
   says so.
 - **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
-  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. So are the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals and the [API revocation gate](SECURITY.md#api-revocation-gate), which read no enforcement level. `enforcement` is **binary** (no `off`), and **nothing silences a
+  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. So are the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals, the [API revocation gate](SECURITY.md#api-revocation-gate) and the off-loopback `/ui` certificate refusal, which read no enforcement level. `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.

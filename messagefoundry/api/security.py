@@ -1576,7 +1576,7 @@ def enforce_phi_read_hop(request: Request) -> None:
     the instance posture + whether the serve hop is loopback / operator certificate / proxy-terminated) and
     stashed it on ``app.state``. When it is :attr:`~HopDisposition.REFUSE` — a production-PHI instance
     whose serve hop is NOT proven secure — a PHI-read is refused with a PHI-free 403 rather than putting a
-    body / summary on a hop no trust store vouches for. ALLOW / WARN (the loopback-dev / non-prod-PHI / synthetic / TLS cases)
+    body / summary on a hop not proven secure. ALLOW / WARN (the loopback-dev / non-prod-PHI / synthetic / TLS cases)
     return silently, so a legitimate lane is byte-identical. Unset (an app built before this seam) → ALLOW.
 
     Call it from the PHI-read routes (folded into :func:`require_phi_read`; the step-up search route calls

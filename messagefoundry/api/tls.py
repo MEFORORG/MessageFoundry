@@ -343,12 +343,14 @@ def plaintext_upstream_hop_off_loopback_remedy(loopback_lever: str) -> str:
 
 
 def off_loopback_certificate_remedy() -> str:
-    """The certificate half of an off-loopback API remedy, as a clause: an operator certificate
-    and, because off loopback that bind meets the API revocation gate, the attestation. Shared by
-    :func:`plaintext_upstream_hop_off_loopback_remedy` and ``serve``'s /ui refusal, so the two
-    cannot drift on what a certificate bind needs."""
+    """The certificate half of an off-loopback API remedy, as one clause: an operator certificate
+    AND, because off loopback that bind meets the API revocation gate, the attestation. The two
+    steps are joined inside the clause so a caller's own "either ... or" list cannot split them.
+    Every refusal that prescribes a certificate uses it: at least the two exposed-bind refusals,
+    :func:`plaintext_upstream_hop_off_loopback_remedy`, the /ui refusal and warnings in ``serve``,
+    and the PHI-read 403. Keep it free of any proxy step, since most of them have no proxy."""
     return (
-        "set [api].tls_cert_file (and [api].tls_key_file unless the key is in that PEM), set "
+        "set [api].tls_cert_file (and [api].tls_key_file unless the key is in that PEM) and set "
         f"{TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment"
     )
 

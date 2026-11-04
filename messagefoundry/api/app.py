@@ -23,7 +23,8 @@ refuse that opt-in beside an auth service or auth settings. Only embedders and t
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
 engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
-``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
+``[api].tls_terminated_upstream`` with no ``[api].tls_cert_file`` declares a reverse proxy
+terminating TLS in front and speaking
 plaintext to the engine, and :func:`messagefoundry.api.tls.ensure_api_tls_material` returns
 ``None`` there, so nothing is minted; docs/SECURITY.md, Plaintext proxy hop, says when ``serve``
 accepts that plaintext hop. *Always serves TLS*
