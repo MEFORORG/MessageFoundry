@@ -177,7 +177,8 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     if index.unreadable:
         log.warning(
             "[api].tls_client_ca_file: %d certificate(s) could not be parsed for the mTLS identity "
-            "map; no client certificate can map under them",
+            "map; no client certificate can map under them, unless the same certificate is loaded "
+            "from another block",
             index.unreadable,
         )
     if index.unconfirmed:

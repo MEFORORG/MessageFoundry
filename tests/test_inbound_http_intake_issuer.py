@@ -295,23 +295,54 @@ async def test_two_loaded_cas_with_one_name_and_different_keys_admit_neither(
 def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
     caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
-    """Driven at the index builder: a block OpenSSL loads but ``cryptography`` refuses is what this
-    warns about, and a trust store the listener's context loads cannot be made to hold one here, so
-    the builder is handed the text directly. Under either label the context loads a CA from, such a
-    block names no issuer and is counted: fail closed, with a warning (BACKLOG #4948)."""
+    """Driven at the index builder: a block OpenSSL loads but ``cryptography`` refuses, a CA with
+    bytes after its DER, is what this warns about. Under either label the context loads a CA from,
+    such a block names no issuer and is counted once: fail closed, with a warning. The good CA
+    beside it is still named (BACKLOG #4948)."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
-    junk = f"-----BEGIN {label}-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END {label}-----\n"
+    odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
+    junk = (
+        _wrapped(_der(odd[0]) + b"\x30\x00")
+        .replace("BEGIN CERTIFICATE", f"BEGIN {label}")
+        .replace("END CERTIFICATE", f"END {label}")
+    )
     cadata = _pem(good[0]).decode("ascii") + junk
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=cadata)
+    assert len(ctx.get_ca_certs()) == 2  # the premise: OpenSSL loads the odd block
+    subjects = {"CN=Acme CA": [SUBJECT], "CN=Odd CA": [SUBJECT]}
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
-        index = _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
-    assert index is not None and index.unreadable == 1
+        index = _client_issuer_index("IB_PARTNER", cadata, subjects)
+    assert index is not None and (index.unreadable, index.unconfirmed) == (1, 0)
+    assert set(index.unmatched_keys(subjects)) == {"CN=Odd CA"}
     warned = [r.getMessage() for r in caplog.records]
     assert any("1 certificate(s) in tls_ca_file could not be parsed" in m for m in warned), warned
+    assert any("'CN=Odd CA'" in m and "1 certificate(s) set aside above" in m for m in warned), (
+        warned
+    )
     # Control: the same store without the junk block warns about nothing.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         _client_issuer_index("IB_PARTNER", _pem(good[0]).decode("ascii"), {"CN=Acme CA": [SUBJECT]})
     assert not caplog.records
+
+
+def test_a_refused_copy_of_a_ca_does_not_unname_a_good_copy(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One CA in a good block and in a block ``cryptography`` refuses: the good block names it, the
+    refused one is counted once, and the warning says the refusal holds unless the same certificate
+    is loaded from another block (BACKLOG #4948)."""
+    ca = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    cadata = _pem(ca[0]).decode("ascii") + _wrapped(_der(ca[0]) + b"\x30\x00")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        index = _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
+    assert index is not None and (index.unreadable, index.unconfirmed) == (1, 0)
+    assert index.unmatched_keys(["CN=Acme CA"]) == {}
+    warned = [r.getMessage() for r in caplog.records]
+    assert (
+        len(warned) == 1 and "unless the same certificate is loaded from another block" in warned[0]
+    )
 
 
 def _pinned(cn: str) -> x509.Certificate:
@@ -488,9 +519,9 @@ def test_a_ca_the_context_skipped_is_not_named_when_the_counts_coincide() -> Non
     assert ctx.cert_store_stats()["x509"] == 2  # ...and Z did
     index = IssuerIndex(cadata)
     unmatched = index.unmatched_keys(["CN=A CA", "CN=B CA", "CN=Z pinned"])
-    assert set(unmatched) == {"CN=B CA", "CN=Z pinned"}
-    # B is set aside, and Z is held by the context but read from no block: each counted once.
-    assert (index.unreadable, index.unconfirmed) == (0, 2)
+    # B is set aside and counted once; Z, which the context holds, is found by the loose pass.
+    assert set(unmatched) == {"CN=B CA"}
+    assert (index.unreadable, index.unconfirmed) == (0, 1)
 
 
 def test_one_unreadable_pinned_certificate_does_not_drop_the_good_ones() -> None:
@@ -518,22 +549,29 @@ def test_one_unreadable_pinned_certificate_does_not_drop_the_good_ones() -> None
         assert index.issuer_of(_der(cert)) == cert.subject.rfc4514_string()
 
 
-def test_a_pinned_certificate_the_scan_missed_is_counted_and_the_rest_are_kept() -> None:
-    """A pinned certificate OpenSSL loads from a block the scan skips cannot be listed back from a
-    context, so it names nothing and is counted, and the pinned certificate the scan read is still
-    named."""
+def test_a_pinned_certificate_the_scan_missed_is_named_only_where_the_context_holds_it() -> None:
+    """A pinned certificate cannot be listed back from a context, so one OpenSSL loads from a block
+    the scan skips is looked for with a marker anywhere on a line, as origin/main's scan read it,
+    and named only where loading it adds nothing to the context's store. ``Missed`` starts the
+    second 254-byte piece of a long line, which OpenSSL loads; ``Skipped`` follows text on its
+    line, which OpenSSL does not. The loose pass finds both, and names only the one held."""
     ca = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
-    read, missed = _pinned("Read pinned"), _pinned("Missed pinned")
+    read, missed, skipped = _pinned("Read pinned"), _pinned("Missed pinned"), _pinned("Skipped")
     cadata = (
         _pem(ca[0]).decode("ascii")
         + _pem(read).decode("ascii")
         + "y" * 254
         + _pem(missed).decode("ascii")
+        + "x "
+        + _pem(skipped).decode("ascii")
     )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=cadata)
+    assert ctx.cert_store_stats()["x509"] == 3  # the premise: Missed loads, Skipped does not
     index = IssuerIndex(cadata)
-    unmatched = index.unmatched_keys(["CN=Acme CA", "CN=Read pinned", "CN=Missed pinned"])
-    assert set(unmatched) == {"CN=Missed pinned"}
-    assert (index.unreadable, index.unconfirmed) == (0, 1)
+    keys = ["CN=Acme CA", "CN=Read pinned", "CN=Missed pinned", "CN=Skipped"]
+    assert set(index.unmatched_keys(keys)) == {"CN=Skipped"}
+    assert (index.unreadable, index.unconfirmed) == (0, 0)
 
 
 def _v4(cert: x509.Certificate) -> bytes:

@@ -1455,8 +1455,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.Name.from_rfc4514_string",
             "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
-            # BACKLOG #4948: IssuerIndex's throwaway cadata= trial load (_context_load), read back
-            # with get_ca_certs and cert_store_stats. It verifies no peer.
+            # BACKLOG #4948: IssuerIndex's throwaway cadata= trial loads (_scratch_context,
+            # _adds_nothing), read back with get_ca_certs and cert_store_stats. They verify no peer.
             "tls_context:.load_verify_locations()",
             "tls_context:ssl.SSLContext",
             # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL

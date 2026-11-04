@@ -720,7 +720,8 @@ def _client_issuer_index(
     if index.unreadable:
         logger.warning(
             "HTTP source %s: %d certificate(s) in tls_ca_file could not be parsed for "
-            "intake_client_subjects; no client certificate is admitted under them",
+            "intake_client_subjects; no client certificate is admitted under them, unless the same "
+            "certificate is loaded from another block",
             name,
             index.unreadable,
         )
@@ -732,15 +733,19 @@ def _client_issuer_index(
             name,
             index.unconfirmed,
         )
+    set_aside = index.unreadable + index.unconfirmed
     for issuer in index.unmatched_keys(subjects):
         # pki's own reason names the API's file, so this line states both causes in this
         # listener's terms rather than quote it.
         logger.warning(
             "HTTP source %s: intake_client_subjects issuer %r names no CA certificate loaded from "
-            "tls_ca_file, or names several with one subject and different keys; no client "
+            "tls_ca_file, or names several with one subject and different keys%s; no client "
             "certificate is admitted under it",
             name,
             issuer,
+            f", or names one of the {set_aside} certificate(s) set aside above"
+            if set_aside
+            else "",
         )
     return index
 
