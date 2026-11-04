@@ -53,6 +53,7 @@ from tests._replay_settle_contract import (
     assert_replayed_routed_row_settles,
 )
 from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
+from tests._undecryptable_reply_contract import SPOILS as UNDECRYPTABLE_REPLY_SPOILS
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -6283,7 +6284,7 @@ async def test_queue_tag_contract(store) -> None:
 
 
 def _raw_adapters(s) -> tuple[Any, Any]:
-    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    """``(raw, fetch)`` for the contracts below, on pooled connections, outside the store."""
 
     async def raw(sql: str, params: tuple[Any, ...]) -> None:
         async with s._pool.acquire() as conn:
@@ -6320,6 +6321,24 @@ async def test_erased_reply_contract(store, case, keyed) -> None:
     )
     try:
         await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("spoil", UNDECRYPTABLE_REPLY_SPOILS, ids=lambda s: s.__name__)
+async def test_undecryptable_reply_contract(store, spoil) -> None:
+    """BACKLOG #4995: a reply body that does not decrypt is dead-lettered with its reference kept and
+    the loopback lane moves, the same contract the SQLite suite runs, on a keyed handle."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests import _undecryptable_reply_contract as contract
+
+    raw, fetch = _raw_adapters(store)
+    sealed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await contract.assert_lane_moves_past_an_undecryptable_reply(sealed, fetch, raw, spoil)
     finally:
         await sealed.close()
 

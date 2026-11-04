@@ -10324,7 +10324,24 @@ class RegistryRunner:
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
-        body = await self.store.response_body_for_work_row(item.id) or ""
+        try:
+            body = await self.store.response_body_for_work_row(item.id) or ""
+        except CipherError as exc:
+            # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
+            # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
+            # does an unopenable payload; the token keeps its reference for a replay. The handoff
+            # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
+            # any CipherError the handoff raises still takes the fault arm.
+            log.warning(
+                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                name,
+                item.id,
+                type(exc).__name__,
+            )
+            await self.store.dead_letter_now(
+                item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
+            )
+            return _ItemOutcome.PROCESSED, None
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
         # HL7 body meets the same ceiling inside Peek.parse.
