@@ -38,8 +38,8 @@ its opening backoff sleep and ``await release_claimed`` in ``_adopt_abandoned``)
 ``await process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
 ``await`` — the conservation law (``slots_free + processing_lanes + reserved == max_processing_lanes``)
 and the ``busy_violations`` counter assert this holds. A dead serializer's replacement returns its
-slot on entry, since it holds no payload (BACKLOG #4607), and ``processing_lanes`` counts only
-serializers that hold one.
+slot on entry, since it holds no payload (BACKLOG #4607), so while one runs the law counts
+``processing_lanes`` less the replacements.
 """
 
 from __future__ import annotations
@@ -1655,13 +1655,15 @@ class StageDispatcher:
                 # retries are: a successor may own these rows, and every write is guarded only by
                 # status='inflight'. Not the leader, the lane stays held, so a flap under the same
                 # lease resumes the re-pend rather than let a later row overtake these; another
-                # lease, a pause or a stop ends the hold with them in flight.
+                # lease or a stop ends the hold with them in flight. A pause does not: no write of
+                # these rows has been sent, and a lane paused with them INFLIGHT would read
+                # quiesced and, on resume, claim past them.
                 held = await wait_to_retry(
                     0.0,
                     poll=_LANE_ERROR_BACKOFF_SECONDS,
                     sleep=self._slept_into_stop,
                     fence=fence,
-                    abandon=functools.partial(self._hold_abandoned, lane),
+                    abandon=None,
                     not_leader=functools.partial(
                         log.warning,
                         "StageDispatcher %s lane %s: this node is not the leader, so the %d "
@@ -2507,11 +2509,7 @@ class StageDispatcher:
 
     @property
     def processing_lanes(self) -> int:
-        """Serializers holding a processing slot: a dead serializer's replacement holds none
-        (BACKLOG #4607), so the conservation law holds while one runs."""
-        return sum(
-            1 for lane in self._lane_tasks if (st := self._states.get(lane)) and st.slot_held
-        )
+        return len(self._lane_tasks)
 
     @property
     def paused_count(self) -> int:

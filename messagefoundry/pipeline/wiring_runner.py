@@ -6881,14 +6881,16 @@ class RegistryRunner:
             # are: a successor may have claimed these rows, and reschedule_claimed is guarded only
             # by status='inflight'. Not the leader, the replacement holds the lane and polls, as
             # the hold does, so a flap under the same lease resumes the re-pend rather than let
-            # the worker claim past the rows; another lease or the lane's pause or halt ends the
-            # hold with them in flight for that successor's recovery or the next start.
+            # the worker claim past the rows; another lease or a stop ends the hold with them in
+            # flight for that successor's recovery or the next start. A pause or halt does not:
+            # no write of these rows has been sent, and the worker's pause gate would mark the
+            # lane quiesced with them INFLIGHT.
             held = await wait_to_retry(
                 0.0,
                 poll=_WORKER_ERROR_BACKOFF_SECONDS,
                 sleep=self._stop_or_sleep,
                 fence=fence,
-                abandon=abandon,
+                abandon=None,
                 not_leader=functools.partial(
                     log.warning,
                     "%s worker %r: this node is not the leader, so the %d row(s) its predecessor "
@@ -6928,6 +6930,15 @@ class RegistryRunner:
             if ended is HoldResult.STOPPED:
                 self._log_left_in_flight(kind, name, claims.ids)
                 return
+            if ended is not HoldResult.LANDED:
+                log.warning(
+                    "%s worker %r: the re-pend of %d row(s) its predecessor died holding did not "
+                    "land (%s); they stay in flight until a store recovery path re-pends them",
+                    kind,
+                    name,
+                    len(claims.ids),
+                    ended.name.lower(),
+                )
             claims.ids.clear()
             # The re-pend dated the rows one backoff ahead, and no wake is armed for that date, so
             # a worker that claimed now would find nothing and wait on its lane's idle backstop.

@@ -452,18 +452,22 @@ def _processing_dispatcher(
     return dispatcher, st
 
 
-@pytest.mark.parametrize("case", ["flap", "stopped-while-not-leading"])
+@pytest.mark.parametrize("case", ["flap", "paused-during-a-flap", "stopped-while-not-leading"])
 async def test_a_pooled_replacement_holds_its_lane_while_not_the_leader(
     case: str, db: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R3-2, R3-5 and R3-6. A flap under an unchanged lease is waited out and the dead
     serializer's row is re-pended: before the repair the row was left INFLIGHT under the same
     epoch and the lane parked, so a later row could overtake it. A stop while it waits leaves the
-    row in flight, and quiesce no longer reports zero rows INFLIGHT. The replacement returns its
-    slot on entry, since it holds no payload."""
+    row in flight, and quiesce no longer reports zero rows INFLIGHT. A pause does not end the
+    wait: no write has been sent, so a lane paused then would read quiesced with the row INFLIGHT
+    and claim past it on resume. The replacement returns its slot on entry, since it holds no
+    payload."""
     monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
-    flap = _Flap(lost=2 if case == "flap" else None)
-    dispatcher, _ = _processing_dispatcher(db)
+    flap = _Flap(lost=None if case == "stopped-while-not-leading" else 2)
+    dispatcher, st = _processing_dispatcher(db)
+    st.pause_pending = case == "paused-during-a-flap"
+    monkeypatch.setattr(dispatcher, "_to_paused", lambda lane, st: None)
     monkeypatch.setattr(dispatcher, "_park", lambda lane, st, until: None)
     row = await _claimed_ingress_row(db)
     task = asyncio.ensure_future(
@@ -471,7 +475,7 @@ async def test_a_pooled_replacement_holds_its_lane_while_not_the_leader(
     )
     await _until(lambda: flap.reads >= 1)
     assert dispatcher.slots_free == dispatcher._max_processing_lanes  # returned on entry
-    if case == "flap":
+    if case != "stopped-while-not-leading":
         await asyncio.wait_for(task, timeout=5.0)
         assert await _ingress_inflight(db) == 0  # re-pended, so nothing can overtake it
         assert dispatcher._stranded_on_stop == set()
