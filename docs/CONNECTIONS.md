@@ -488,13 +488,16 @@ certificate after the check; anything the sender has not yet had read stays with
   row and the event name the connection and peer address, never a certificate field.
 - Each refusal is charged one failed attempt against the peer's address, under the HTTP listener's
   failed-attempt budget at the `Http()` defaults: 10 per address per minute, and 60 per minute
-  across all addresses. This listener has no setting to change or turn off those figures. A peer
-  that has spent its budget is closed unread once its handshake completes, before its certificate
-  is compared, whatever certificate it now presents, as the HTTP listener answers it `429`. That is
-  written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited` connection event,
-  and leaves no message row, since nothing was read. A listed sender behind the same address is
-  closed too while the budget is spent; a listed sender that connected or sent a message inside the
-  window is exempt from the 60-per-minute arm. The count is in process, so each engine shard keeps its own.
+  across all addresses. This listener has no setting to change or turn off those figures. An
+  address that has spent its own budget is closed unread once its handshake completes, before its
+  certificate is compared, whatever certificate it now presents, as the HTTP listener answers it
+  `429`; a listed sender behind that address is closed too while its budget is spent. The
+  60-per-minute arm is read only once the compare has refused a sender, since it bounds refusals
+  and a listed sender makes none: an unlisted sender is closed unread while that arm is spent, and
+  a listed sender is never closed by it, however many refusals other addresses have made. A close
+  on either arm is written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited`
+  connection event, and leaves no message row, since nothing was read. The count is in process,
+  so each engine shard keeps its own.
 
 The stored reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate
 field, since a subject can name a person; the log line gives the connection name and peer address,

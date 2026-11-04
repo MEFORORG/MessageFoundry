@@ -73,8 +73,9 @@ _LOGIN_ENTRY_POINTS = frozenset(
 #: a parameter of a connector factory. ``None`` = always available (Local needs no switch). ``mTLS`` is
 #: the fifth pathway and the first non-interactive one; HTTP intake authentication is the sixth, on the
 #: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway). MLLP intake
-#: authentication, ``tls_client_subjects``, is the seventh, under the same ruling: a client-certificate
-#: check WITH a subject list authenticates a submitting peer (BACKLOG #4907).
+#: authentication, ``tls_client_subjects``, is the seventh, counted by the record's criterion rather
+#: than by that ruling, which named ``intake_auth`` only: a connector-factory parameter that
+#: authenticates a submitting peer by a subject list is a pathway (BACKLOG #4907).
 _PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**Local**": None,
     "**AD**": (AuthSettings, "ad_enabled"),

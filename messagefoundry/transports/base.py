@@ -484,6 +484,17 @@ class IntakeRateLimiter(Protocol):
         """Whether ``peer`` may make another attempt. **Read-only** — never records one."""
         ...
 
+    def check_peer(self, peer: str) -> bool:
+        """Whether ``peer``'s OWN per-address budget admits another attempt, the global arm unread.
+        **Read-only**, as :meth:`check` is.
+
+        For a source that can tell a listed peer apart before anything is read, as MLLP's
+        ``tls_client_subjects`` can (BACKLOG #4907): it consults this before the compare and the
+        global arm only once the compare has refused, so refusals from other addresses can never
+        close a listed sender unread.
+        """
+        ...
+
     def charge_failure(self, peer: str) -> None:
         """Record one FAILED attempt against ``peer``. Called only on the refusal branch."""
         ...

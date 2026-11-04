@@ -758,6 +758,62 @@ async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
     assert any("has spent its failed-attempt budget" in m for m in logged), logged
 
 
+async def test_refusals_from_other_addresses_never_close_a_listed_sender(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """The global arm bounds refusals, and a listed sender drives none, so it is consulted only once
+    the compare has refused. Unlisted senders from six addresses spend the whole global budget, each
+    inside its own per-address budget; a listed sender from a fresh address is then still accepted,
+    where reading the global arm before the compare closed it unread, and MLLP has no setting that
+    turns that arm off. Two controls: an unlisted sender from a fresh address is closed unread by
+    the spent global arm, and a listed certificate from an address that spent its OWN budget is
+    still closed unread before the compare, as ADR 0154 D6 requires."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    events: list[tuple[str, str | None, str | None]] = []
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}),
+        store,
+        events=events,
+    )
+    refused_bundle, listed_bundle = _bundle(tmp_path, other), _bundle(tmp_path, named)
+    per_peer, glob = INTAKE_AUTH_RATE_LIMIT_DEFAULT, INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
+    spenders = [f"127.0.0.{2 + i}" for i in range(-(-glob // per_peer))]
+    try:
+        refused = 0
+        for host in spenders:
+            for _ in range(per_peer):
+                if refused == glob:
+                    break
+                got = await _send_from(source, refused_bundle, _frame(_ADT), local_host=host)
+                assert b"MSA|AR|" in got, (host, refused, got)
+                refused += 1
+        assert refused == glob
+        fresh_listed = await _send_from(
+            source, listed_bundle, _frame(_ADT), local_host="127.0.0.50"
+        )
+        fresh_unlisted = await _send_from(
+            source, refused_bundle, _frame(_ADT), local_host="127.0.0.51"
+        )
+        own_budget_listed = await _send_from(
+            source, listed_bundle, _frame(_ADT), local_host=spenders[0]
+        )
+    finally:
+        await source.stop()
+    assert b"MSA|AA|" in fresh_listed, fresh_listed
+    assert fresh_unlisted == b""
+    assert own_budget_listed == b""
+    limited = [e for e in events if e[0] == "auth_rate_limited"]
+    assert limited == [
+        ("auth_rate_limited", "127.0.0.51", _SENDER_RATE_LIMITED),
+        ("auth_rate_limited", spenders[0], _SENDER_RATE_LIMITED),
+    ]
+    listed = await store.list_messages(allowed_channels=None, limit=glob + 10)
+    statuses = sorted(row["status"] for row in listed)
+    assert statuses == sorted(
+        [MessageStatus.ERROR.value] * glob + [MessageStatus.RECEIVED.value]
+    ), statuses
+
+
 class _Limiter:
     """A failed-attempt budget that admits everyone and records each call."""
 
@@ -766,6 +822,10 @@ class _Limiter:
 
     def check(self, peer: str) -> bool:
         self.calls.append(("check", peer))
+        return True
+
+    def check_peer(self, peer: str) -> bool:
+        self.calls.append(("check_peer", peer))
         return True
 
     def charge_failure(self, peer: str) -> None:
@@ -778,11 +838,11 @@ class _Limiter:
 async def test_a_listed_sender_is_noted_at_every_message_and_never_charged(
     tmp_path: Path, store: MessageStore
 ) -> None:
-    """ADR 0154 D6's two invariants on this listener: the budget is consulted before the subject is
-    compared, and a listed sender is never charged. It is noted as authenticated at the accept and
-    at every message, as HTTP notes a partner at every request, so one that has held a connection
-    for hours is still exempt from the global arm when it reconnects. The control is a refused
-    sender, which is charged and never noted."""
+    """ADR 0154 D6's two invariants on this listener: the address's own budget is consulted before
+    the subject is compared, and a listed sender is never charged. A listed sender never reaches the
+    global arm (``check``); it is noted as authenticated at the accept and at every message, as HTTP
+    notes a partner at every request. The control is a refused sender, which reads the global arm
+    once its compare has refused, is charged and is never noted."""
     named, other = _ca("Partner CA"), _ca("Other CA")
     source = await _wired(
         _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}), store
@@ -800,9 +860,13 @@ async def test_a_listed_sender_is_noted_at_every_message_and_never_charged(
     finally:
         await source.stop()
     assert b"MSA|AA|CTRL4907" in got and b"MSA|AA|CTRL4908" in got
-    assert listed_calls[0] == ("check", "127.0.0.1")
+    assert listed_calls[0] == ("check_peer", "127.0.0.1")
     assert listed_calls[1:] == [("success", "127.0.0.1")] * 3, listed_calls
-    assert limiter.calls == [("check", "127.0.0.1"), ("charge", "127.0.0.1")]
+    assert limiter.calls == [
+        ("check_peer", "127.0.0.1"),
+        ("check", "127.0.0.1"),
+        ("charge", "127.0.0.1"),
+    ]
 
 
 async def _send_raw_until(source: MLLPSource, bundle: Path, wire: bytes, until: bytes) -> bytes:

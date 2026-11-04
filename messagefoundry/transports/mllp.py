@@ -2273,37 +2273,31 @@ class MLLPSource(SourceConnector):
         none is accepted and dropped. With no refusal wired (a source built outside the runner)
         nothing could record its messages, so none is read.
 
-        The decision is held to the inbound HTTP listener's posture for ``mtls_subject`` (ADR 0154
-        D6): the injected failed-attempt budget is consulted read-only BEFORE the certificate is
-        compared, so a peer that has spent it is closed unread, whatever certificate it now
-        presents, as HTTP answers it ``429``; a refused sender is charged one failed attempt; a
-        listed one is noted as authenticated, which exempts it from the budget's global arm. Each
-        refusal writes the connection event and the audit row HTTP writes for the same decision.
-        The log line, the event and the audit row name the peer address only, never the
-        certificate: a subject can name a person."""
+        The injected failed-attempt budget follows ADR 0154 D6. The address's own arm is consulted
+        read-only BEFORE the certificate is compared, so an address that has spent it is closed
+        unread, whatever certificate it now presents. The global arm is consulted only once the
+        compare has refused: it bounds the volume of refusals and the audit writes they drive, and
+        a listed sender drives none. That leaves no way for refusals from other addresses to close
+        a listed sender unread, which matters because MLLP has no setting that turns the global arm
+        off. A refused sender is charged one failed attempt; a listed one is noted as
+        authenticated. Each refusal writes the connection event and the audit row the HTTP listener
+        writes for the same decision. The log line, the event and the audit row name the peer
+        address only, never the certificate: a subject can name a person."""
         assert self._handler is not None
         if self._client_subjects is None:
             return self._handler, False
         peer = peer_host or "unknown"
         limiter = self.intake_rate_limiter
-        if limiter is not None and not limiter.check(peer):
-            if count := self._budget_log.note(peer):
-                logger.warning(
-                    "MLLP listener %s: the sender at %s has spent its failed-attempt budget for "
-                    "tls_client_subjects; closing the connection unread (%d refused so far)",
-                    self._pacing_name,
-                    peer,
-                    count,
-                )
-            await self._emit_event(
-                "auth_rate_limited", peer_host=peer_host, reason=_SENDER_RATE_LIMITED
-            )
-            await self._audit_sender_refusal("auth_rate_limited", peer_host)
+        if limiter is not None and not limiter.check_peer(peer):
+            await self._refuse_spent_budget(peer, peer_host)
             return None
         if self._sender_listed(writer):
             if limiter is not None:
                 limiter.note_success(peer)
             return self._handler, False
+        if limiter is not None and not limiter.check(peer):
+            await self._refuse_spent_budget(peer, peer_host)
+            return None
         if limiter is not None:
             limiter.charge_failure(peer)
         handle = self.refuse_unlisted_sender
@@ -2323,6 +2317,22 @@ class MLLPSource(SourceConnector):
         await self._emit_event("auth_subject_denied", peer_host=peer_host, reason=_SENDER_DENIED)
         await self._audit_sender_refusal("auth_subject_denied", peer_host)
         return None if handle is None else (handle, True)
+
+    async def _refuse_spent_budget(self, peer: str, peer_host: str | None) -> None:
+        """Log, emit and audit a ``tls_client_subjects`` sender closed unread on a spent
+        failed-attempt budget, its own address's or, for an unlisted sender, the global one."""
+        if count := self._budget_log.note(peer):
+            logger.warning(
+                "MLLP listener %s: the sender at %s has spent its failed-attempt budget for "
+                "tls_client_subjects; closing the connection unread (%d refused so far)",
+                self._pacing_name,
+                peer,
+                count,
+            )
+        await self._emit_event(
+            "auth_rate_limited", peer_host=peer_host, reason=_SENDER_RATE_LIMITED
+        )
+        await self._audit_sender_refusal("auth_rate_limited", peer_host)
 
     async def _audit_sender_refusal(self, kind: str, peer_host: str | None) -> None:
         """Write the tamper-evident ``audit_log`` row for a ``tls_client_subjects`` refusal, under
@@ -2657,9 +2667,10 @@ class MLLPSource(SourceConnector):
                     return  # closed unread: the sender keeps whatever it had not had read
                 handle, unlisted = admitted
                 # BACKLOG #4907: a listed sender is noted as authenticated at every frame, as the
-                # HTTP listener notes one at every request, so a partner that has held one
-                # connection for hours is still exempt from the budget's global arm when it
-                # reconnects. None while the allowlist is off or for a refused sender.
+                # HTTP listener notes one at every request. Unlike HTTP's, this listener's admission
+                # never reads the global arm for a listed sender (`_admit_sender`), so the note does
+                # not decide whether the partner gets in. None while the allowlist is off or for a
+                # refused sender.
                 listed_limiter = (
                     self.intake_rate_limiter
                     if self._client_subjects is not None and not unlisted

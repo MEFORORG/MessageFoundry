@@ -203,6 +203,9 @@ class _CountingLimiter:
         self.checks.append(peer)
         return self.allow
 
+    def check_peer(self, peer: str) -> bool:  # MLLP's; the HTTP listener reads check
+        raise AssertionError("the HTTP listener consults check, never check_peer")
+
     def charge_failure(self, peer: str) -> None:
         self.charges.append(peer)
 
