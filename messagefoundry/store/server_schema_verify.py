@@ -58,10 +58,11 @@ that reads it. A store whose marker already matches is not re-read at open: the 
 skips the batch and this check together, so a change made by hand after the marker was written is not
 seen until the batch next changes.
 
-The rule is one-sided, as on SQLite: a missing table, column or index refuses, and so does a column of
-another type, nullability or numbering, an index whose name matches but whose table, key columns,
-direction, uniqueness or partial flag differ, and a name the batch needed that another kind of object
-holds. An EXTRA column or index is tolerated.
+The rule is one-sided, as on SQLite. What refuses includes at least: a missing table, column or index;
+a column of another type, nullability or numbering, or on SQL Server of a collation the batch
+declares; an index whose name matches but whose table, key columns, direction, key options,
+uniqueness or partial flag differ, or that cannot serve; and a name the batch needed that another
+kind of object holds. An EXTRA column or index is tolerated.
 """
 
 from __future__ import annotations
@@ -168,7 +169,8 @@ _TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s*(?:(?:NON)?CLUSTERED\s*)?\("
 _PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
 _PLAIN_NAME = re.compile(r'^(?:\[?[A-Za-z_][\w$]*\]?|"[^"]+")$')
 #: A key that is an expression: a call such as ``left(actor, 200)``, or a parenthesised expression.
-_EXPR_KEY = re.compile(r'^(?:"?\w+"?\s*)?\(')
+#: The catalog qualifies a function its search path does not reach, as ``pg_catalog."left"(...)``.
+_EXPR_KEY = re.compile(r'^(?:(?:"?\w+"?\s*\.\s*)?"?\w+"?\s*)?\(')
 #: A key's trailing ``NULLS FIRST`` or ``NULLS LAST``, with or without a direction before it.
 _NULLS_ORDER = re.compile(r"\s*\bNULLS\s+(?:FIRST|LAST)$", re.I)
 _DIRECTION = re.compile(r"\s+(ASC|DESC)$", re.I)
@@ -1071,10 +1073,9 @@ def server_schema_differences(
         problems.extend(
             f"table {table!r} is missing column {col!r}" for col in sorted(expected.columns[table])
         )
+    unread = skip_tables | empty
     rest = SchemaShape(
-        MappingProxyType(
-            {t: c for t, c in expected.columns.items() if t not in skip_tables | empty}
-        ),
+        MappingProxyType({t: c for t, c in expected.columns.items() if t not in unread}),
         expected.rowid_columns,
         MappingProxyType(
             {n: s for n, s in expected.named_indexes.items() if n not in skip_indexes}

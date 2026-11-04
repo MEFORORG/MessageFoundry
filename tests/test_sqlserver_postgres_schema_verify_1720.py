@@ -1439,3 +1439,14 @@ def test_the_live_read_adds_a_collation_after_a_column_key_only() -> None:
     from messagefoundry.store import postgres
 
     assert "AND i.indkey[k - 1] <> 0" in postgres._LIVE_INDEXES_SQL
+    # ruleutils prints a collation that is not the column's, the database default included.
+    assert "<> 100" not in postgres._LIVE_INDEXES_SQL
+
+
+def test_a_schema_qualified_function_key_reads_as_an_expression() -> None:
+    """The catalog qualifies a function the search path does not reach, so the live key must still
+    read as ``<expr>``, as the declared one does."""
+    assert key_column('pg_catalog."left"(actor, 200)') == "<expr>"
+    assert key_column("ext.f(col) DESC") == "<expr> DESC"
+    shape = declared_schema(("CREATE INDEX ix ON t (pg_catalog.lower(a))",))
+    assert shape.named_indexes["ix"].columns == ("<expr>",)

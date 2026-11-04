@@ -1323,7 +1323,7 @@ _LIVE_INDEXES_SQL = (
     " (i.indisvalid AND i.indisready) AS usable, am.amname::text AS method,"
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
     "   || COALESCE((SELECT ' COLLATE ' || pg_catalog.quote_ident(co.collname::text)"
-    "     FROM pg_catalog.pg_collation co WHERE co.oid = i.indcollation[k - 1] AND co.oid <> 100"
+    "     FROM pg_catalog.pg_collation co WHERE co.oid = i.indcollation[k - 1]"
     "     AND i.indkey[k - 1] <> 0"
     "     AND co.oid IS DISTINCT FROM (SELECT ka.attcollation FROM pg_catalog.pg_attribute ka"
     "       WHERE ka.attrelid = i.indrelid AND ka.attnum = i.indkey[k - 1])), '')"

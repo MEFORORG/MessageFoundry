@@ -89,10 +89,9 @@ def test_a_marker_from_before_the_live_schema_check_takes_the_slow_path() -> Non
     assert hashlib.sha256(pg_input.encode()).hexdigest() == postgres._schema_hash()
     ms_input = unchecked + f"\nschema_check_rev={rev}"
     assert hashlib.sha256(ms_input.encode()).hexdigest() == sqlserver._schema_hash()
+    # SQL Server alone wrote a revision before this one; Postgres's earlier marker is pg_before.
     previous = "\n".join(sqlserver._SCHEMA) + f"\nschema_check_rev={rev - 1}"
     assert hashlib.sha256(previous.encode()).hexdigest() != sqlserver._schema_hash()
-    pg_previous = pg_before + f"\nschema_check_rev={rev - 1}"
-    assert hashlib.sha256(pg_previous.encode()).hexdigest() != postgres._schema_hash()
 
 
 def test_sqlserver_schema_hash_tracks_the_check_revision(monkeypatch: pytest.MonkeyPatch) -> None:
