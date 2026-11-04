@@ -11,7 +11,7 @@
 # wrote the PEP 440 canonical form. The release.yml version gates compare PEP 440 versions, so none
 # reds on that, but prose that says the backend canonicalises `Version:` (at least in release.yml,
 # tests/test_release_pipeline.py and tests/test_version.py) now holds only for a canonical __version__.
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 # Single source of truth for the version: hatchling reads __version__ from the package module, so the
@@ -573,7 +573,7 @@ release-tools = [
 #                  disagree.
 ci-quality = [
     "diff-cover==10.6.0",
-    "mutmut==3.8.0",
+    "mutmut==3.8.1",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3.1",
 ]
