@@ -211,6 +211,12 @@ class ConfigSnapshot:
 
     def __post_init__(self) -> None:
         checked = {_check_rel(rel): bytes(data) for rel, data in self.files.items()}
+        if self.value_file is None and any(
+            rel.startswith(_VALUE_FILE_PREFIX) for rel in (*checked, *self.unreadable)
+        ):
+            # Bytes no reload could serve (environment_file matches a held value_file only), so
+            # a digest of them would cover values nothing applies.
+            raise ValueError("a config snapshot holds a value file only with its value_file path")
         object.__setattr__(self, "files", MappingProxyType(dict(sorted(checked.items()))))
         # In path order, as the loader ran them when it globbed the directory: without case on
         # Windows, so a bundle's load order, and which file a duplicate-name refusal names, stay
@@ -301,7 +307,10 @@ class ConfigSnapshot:
             if held is not None:
                 held_path = self._held_path(folder, held[0][len(prefix) :])
                 if present:
-                    data = held[1]
+                    # Only the same file: in a folder set to tell case apart this spelling is
+                    # another file, created since, and refused below as one.
+                    if is_regular_file(held_path) and os.path.samefile(value_file, held_path):
+                        data = held[1]
                 elif not is_regular_file(held_path):
                     # Gone under the spelling it was read by too, so never no file: the bytes the
                     # snapshot holds stood for a file that is not there now.

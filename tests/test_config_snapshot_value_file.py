@@ -228,14 +228,22 @@ def test_a_sandbox_worker_is_not_sent_the_value_file(tmp_path: Path) -> None:
 
 
 def test_a_snapshot_holds_one_value_file_by_a_plain_name() -> None:
+    where = Path("values/x.py").absolute()
     with pytest.raises(ValueError):
-        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/a/b.toml": b""})
+        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/a/b.toml": b""}, value_file=where)
     with pytest.raises(ValueError):
-        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/..": b""})
-    held = ConfigSnapshot(directory=Path("cfg"), files={"@value-file/x.py": b""})
+        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/..": b""}, value_file=where)
+    held = ConfigSnapshot(directory=Path("cfg"), files={"@value-file/x.py": b""}, value_file=where)
     # Any name, and never a module: a load runs none of it.
     assert held.files and held.modules == () and held.loaded().files == {}
-    assert ConfigSnapshot(directory=Path("cfg"), files={"@value-file/dev.toml": b""}).files
+
+
+def test_a_snapshot_holds_value_file_bytes_only_with_the_value_file_s_path() -> None:
+    """Without the path, no reload could serve those bytes, and a digest would cover them."""
+    with pytest.raises(ValueError, match="value_file"):
+        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/dev.toml": b""})
+    with pytest.raises(ValueError, match="value_file"):
+        ConfigSnapshot(directory=Path("cfg"), files={}, unreadable=("@value-file/dev.toml",))
 
 
 def test_serve_s_provider_parses_the_value_file_from_the_snapshot(

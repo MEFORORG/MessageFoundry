@@ -1893,7 +1893,8 @@ started together, can each raise it; the alert list folds them into one instance
   when it is the loaded one. With no graph running, `drift` is `false`. A backup compares nothing:
   it records what its `config_fingerprint` left out as `config_unreadable_files`.
 - A start's fingerprint is of the bytes its load read, plus the environment value file where that
-  sits outside the config directory, which it reads from disk after the load. A start resolves
+  sits outside the config directory's `environments/` folder, which it reads from disk after the
+  load. A start resolves
   `env()` values earlier, when the engine is built, so for a value file either way that means
   bytes read after the values came from it; [`SECURITY.md`](SECURITY.md) lists that as a limit of
   the dual-control digest. Just after the load it fingerprints

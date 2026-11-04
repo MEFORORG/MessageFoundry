@@ -2530,8 +2530,10 @@ during the load is neither run nor recorded. The limits below name at least one 
 from disk instead. The digest covers `serve`'s environment value file wherever
 `[environments].base_dir` puts it: in the config directory's `environments/` folder, or elsewhere,
 where the release reads it into the snapshot after vetting the file, its folder, and the folder of
-each link along a chain of file links from it. A value file it cannot read refuses the reload,
-released or not, rather than being read again from disk. `serve` parses
+each link along a chain of file links from it. Where that value file alone cannot be read, the
+reload is refused, released or not, rather than reading it again from disk. Where the config
+directory cannot be read whole, a value file in its `environments/` folder included, a released
+reload is refused and an ungated one still reads the values from disk. `serve` parses
 it from the same snapshot, so an edit to it during the load does not apply, and a value file
 created or removed since the snapshot is refused. Every engine shard and cluster node shares one
 config directory by contract, and is expected to read the same value file too. Nothing checks
