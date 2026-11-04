@@ -198,7 +198,12 @@ QUOTED_FAMILIES: tuple[Family, ...] = tuple(
         name=f"quoted_{case.name}",
         line=case.line,
         secret=case.fragments[-1],
-        patterns=("_CREDENTIAL_KV",),
+        # An ODBC line's ``;PWD=`` member is hidden by the connection-string member pass too (BACKLOG
+        # #5030), so a family over one declares both, or disabling one leaves the other doing the work.
+        patterns=(
+            "_CREDENTIAL_KV",
+            *(("_CONNECTION_STRING_MEMBER",) if ";PWD=" in case.line else ()),
+        ),
     )
     for case in QUOTED_VALUES
 )
@@ -271,7 +276,14 @@ FAMILIES: tuple[Family, ...] = (
         name="odbc_pwd",
         line="odbc conn Driver={ODBC Driver 18};UID=svc;PWD=wt-0dbc_Pass-60;",
         secret="wt-0dbc_Pass-60",
-        patterns=("_CREDENTIAL_KV",),
+        patterns=("_CREDENTIAL_KV", "_CONNECTION_STRING_MEMBER"),
+    ),
+    Family(
+        # A key glued to its credential word, which no label pattern reads (BACKLOG #5030).
+        name="connection_string_member",
+        line="odbc conn Driver={ODBC Driver 18};UID=svc;sslpassword=wt-Ss1_Memb-92 x;Server=db",
+        secret="wt-Ss1_Memb-92",
+        patterns=("_CONNECTION_STRING_MEMBER",),
     ),
     Family(
         name="dsn_inline_password",

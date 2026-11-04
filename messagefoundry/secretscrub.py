@@ -931,8 +931,9 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # to the same stops, so ``;sslpassword={a;b} c`` is hidden whole, and an unclosed "{" takes the rest
 # of the line, as ``_ODBC_BRACED_OVERRUN`` does for the label pattern. An empty value is no match.
 #
-# LINEAR. A match starts only right after a ";", the key run and every value walk are possessive,
-# and the lookbehinds are a fixed set of fixed widths. A plain walk stops at the next ";", so walks
+# LINEAR. A match starts only AT a ";", which group 1 takes with the key so the replacement keeps it,
+# so the key run cannot be entered mid-word; the key run and every value walk are possessive, and
+# the lookbehinds are a fixed set of fixed widths. A plain walk stops at the next ";", so walks
 # from two starts never overlap; a braced walk that crosses a ";" ends the match beyond it, and the
 # scan resumes there. ``tests/test_connection_string_member_scrub.py`` pins the time on a long line.
 #
@@ -958,7 +959,7 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # and the fragments to ``_ODBC_BRACED`` and ``_ODBC_BRACED_OVERRUN``. ``support/redact.py`` imports
 # this one object and runs it after its own PHI pass, so the bundle has no copy to drift.
 _CONNECTION_STRING_MEMBER = re.compile(
-    r"(?i)(?<=;)([A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
+    r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
     r"|(?<=secret)|(?<=credential)|(?<=token)))="
     r"(?:\{(?:[^}]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|['\"]?[^;'\"\r\n]++)"
 )

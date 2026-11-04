@@ -281,7 +281,9 @@ QUOTED_FAMILIES: tuple[Family, ...] = tuple(
         name=f"quoted_{case.name}",
         line=case.line,
         secret=case.fragments[-1],
-        patterns=(case.pattern,),
+        # An ODBC line's ``;PWD=`` member is hidden by the connection-string member pass too (BACKLOG
+        # #5030), so a family over one declares both, or disabling one leaves the other doing the work.
+        patterns=(case.pattern, *(("_CONNECTION_STRING_MEMBER",) if ";PWD=" in case.line else ())),
     )
     for case in QUOTED_VALUES
 )
@@ -349,7 +351,14 @@ FAMILIES: tuple[Family, ...] = (
         name="odbc_pwd",
         line="odbc conn Driver={ODBC Driver 18};UID=svc;PWD=pw-0dbc_Pass-33;",
         secret="pw-0dbc_Pass-33",
-        patterns=("_CREDENTIAL_KV",),
+        patterns=("_CREDENTIAL_KV", "_CONNECTION_STRING_MEMBER"),
+    ),
+    Family(
+        # A key glued to its credential word, which no label pattern reads (BACKLOG #5030).
+        name="connection_string_member",
+        line="odbc conn Driver={ODBC Driver 18};UID=svc;sslpassword=pw-Ss1_Memb-91 x;Server=db",
+        secret="pw-Ss1_Memb-91",
+        patterns=("_CONNECTION_STRING_MEMBER",),
     ),
     Family(
         name="secret_kv",
@@ -2578,9 +2587,16 @@ def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
 
     The PHI pass judges whole lines by their shape, so a change to what the secret passes hand it can
     flip its verdict on a line either way, for reasons outside these patterns. Measured: one fuzz line
-    in 150,000 that the PHI pass redacted whole under the old secret passes and not under the new."""
+    in 150,000 that the PHI pass redacted whole under the old secret passes and not under the new.
+
+    The connection-string member pass (BACKLOG #5030) goes too. It is not one of the five patterns
+    compared, it runs after all of them, and on each side it hides a different span of what they
+    left, so leaving it on compares it with itself. That it only adds redaction is held by
+    ``tests/test_connection_string_member_scrub.py``."""
     monkeypatch.setattr(redact_mod, "_redact_phi", lambda text: text)
     monkeypatch.setattr(redact_mod, "_LONG_B64", NEVER_MATCHES)
+    monkeypatch.setattr(redact_mod, "_CONNECTION_STRING_MEMBER", NEVER_MATCHES)
+    monkeypatch.setattr(scrub_mod, "_CONNECTION_STRING_MEMBER", NEVER_MATCHES)
 
 
 #: The two surfaces the differential compares. ``CredentialScrubFilter`` is left out because it runs

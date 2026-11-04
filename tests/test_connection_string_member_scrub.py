@@ -230,7 +230,8 @@ def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None
     assert sorted(words) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
     assert secretscrub._ODBC_BRACED in pattern
     assert secretscrub._ODBC_BRACED_OVERRUN in pattern
-    assert bundle_redact._CONNECTION_STRING_MEMBER is secretscrub._CONNECTION_STRING_MEMBER
+    in_bundle = vars(bundle_redact)["_CONNECTION_STRING_MEMBER"]
+    assert in_bundle is secretscrub._CONNECTION_STRING_MEMBER
 
 
 @pytest.mark.parametrize(
