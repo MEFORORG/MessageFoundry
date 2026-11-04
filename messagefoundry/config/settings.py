@@ -1660,7 +1660,7 @@ class ApiSettings(_Section):
     # 0143 — the console is the operator UI, effectively core); disable with [security].serve_web_console=
     # false (a surface-reducing opt-out). When on, the engine mounts /ui + /ui/static and accepts an
     # HttpOnly session cookie CONFINED to /ui (the JSON API stays Authorization-header-only). Off a
-    # loopback host it requires exposure_protected (see serve gate) — the UI is a stricter surface.
+    # loopback host it requires tls_cert_file (see serve gate) — the UI is a stricter surface.
     serve_ui: bool = True
     # The browser-facing external origin of the /ui dashboard when it is reached OFF-loopback through a
     # reverse proxy that does NOT preserve the Host header (ADR 0065). The same-origin CSRF + CSWSH checks

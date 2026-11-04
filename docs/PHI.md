@@ -38,7 +38,7 @@ levels:
   (MLLP-over-TLS), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
   not cross the LAN in cleartext — and can't accidentally: the bind-guards **refuse a non-loopback
   *plaintext* listener**, at least MLLP, raw TCP and X12 (ADR 0002 §0). An off-loopback API bind needs
-  an operator certificate or a declared TLS-terminating proxy (§4).
+  an operator certificate (§4).
 - **Inbound web-service listener** (a partner calling *into* MEFOR) — **built**, as the inbound
   [`Http(...)` listener](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023). It is a
   distinct surface with its own controls: TLS or mTLS, `source_ip_allowlist`, and `intake_auth`, which
@@ -2785,7 +2785,7 @@ traceability:
 
 - **DB + `-wal`/`-shm` owner-only permissions on create** (`_secure_file`, §2) — **SQLite store only**; on SQL Server / Postgres the engine creates no database file and calls `_secure_file` never. Was P0-1.
 - **`dryrun`/`generate` redact bodies by default; `--show-phi` to opt in** (§7) — was P0-2.
-- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`) or a declared TLS-terminating proxy** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. `serve --allow-insecure-bind` relaxes this refusal only under `[security].enforcement = warn`, and is inert under the default `enforce`. §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
+- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. `serve --allow-insecure-bind` relaxes this refusal only under `[security].enforcement = warn`, and is inert under the default `enforce`. §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
 - **At-rest body encryption (AES-256-GCM) + required volume encryption** (§3) — was P1-1.
 - **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
   [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`

@@ -39,7 +39,7 @@ startup, with or without a declared TLS-terminating proxy in front
 ([SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)), and `serve --allow-insecure-bind`
 explicitly does **not** cover it — the flag was scoped to the JSON API on its self-signed placeholder,
 never the browser surface. So the deployment this page describes cannot be brought up without a real
-certificate.
+certificate or a declared proxy in front of a loopback engine.
 
 **For the JSON API alone, it is a ladder with an operator off-switch** — worth knowing, because a
 reviewer who reads "refused at startup" as an architectural guarantee will be wrong about a
@@ -367,7 +367,7 @@ mTLS here is **transport authentication only** unless you also populate
 | `https://…/ui` returns 404, engine started fine | The console auto-degraded to JSON-only: `[security].serve_web_console` was left at its default on an exposed instance, or the `messagefoundry-webconsole` wheel is missing. Both print a stderr warning at startup — check the service log. |
 | Engine won't start: `refusing to serve behind an upstream TLS terminator … without [api].plaintext_upstream_hop_acknowledged` | Option B with no `tls_cert_file`: the proxy-to-engine hop is plaintext and yours to secure. Set `plaintext_upstream_hop_acknowledged = true` under `[api]` once it is. |
 | Engine won't start: `refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API bind host …` | Option B with no `tls_cert_file` on a bind that is not loopback. The refusal names both ways out; [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) explains them. |
-| Engine won't start: `refusing to serve the browser ops dashboard … without an operator certificate or a declared TLS-terminating proxy` | An off-loopback `/ui` bind with neither of those. The engine would still encrypt the hop on its generated self-signed placeholder, but no trust store vouches for that certificate, so the browser surface refuses it. Configure `tls_cert_file` (Option A), or Option B with the engine kept on loopback behind a proxy on the same machine. `--allow-insecure-bind` does **not** cover `/ui`. |
+| Engine won't start: `refusing to serve the browser ops dashboard … without an operator certificate` | An off-loopback `/ui` bind without one. The engine would still encrypt the hop on its generated self-signed placeholder, but no trust store vouches for that certificate, so the browser surface refuses it. Configure `tls_cert_file` (Option A), or Option B with the engine kept on loopback behind a proxy on the same machine. `--allow-insecure-bind` does **not** cover `/ui`. |
 | Engine won't start: `…serve_web_console=true needs the web console package` | Install `messagefoundry-webconsole` (or set `serve_web_console = false` for a JSON-only engine). |
 | Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without an operator certificate on the JSON API. The engine would serve the placeholder there too, and refuses it for the same reason. Same fix as above. |
 | Engine won't start: `refusing to serve the API with in-process TLS on non-loopback host … performs NO certificate revocation check` | The [API revocation gate](SECURITY.md#api-revocation-gate). Set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the **service environment** (not the TOML), or move to Option B with the engine on loopback and let the proxy do revocation. |

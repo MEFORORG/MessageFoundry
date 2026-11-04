@@ -418,7 +418,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
-  operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
+  operator `[api].tls_cert_file`), and that refusal holds even under
   `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared
   terminator (`[api].tls_terminated_upstream`). Under `enforce` it also refuses one behind a proxy named
   in `[api].trusted_proxies` alone, for the ASVS 12.1.1 probe (vault BACKLOG #3538; the

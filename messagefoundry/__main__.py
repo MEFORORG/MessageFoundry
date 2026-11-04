@@ -3818,7 +3818,7 @@ def _serve(args: argparse.Namespace) -> int:
 
     # The browser ops dashboard ([api].serve_ui, ADR 0065) is a STRICTER surface than the JSON API: it
     # puts an HttpOnly session cookie and PHI-rendering HTML on the wire. An off-loopback /ui bind
-    # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
+    # therefore REQUIRES exposure_protected (in-process TLS) and is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
     # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
@@ -3851,12 +3851,12 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
-            f"non-loopback host {settings.api.host!r} without an operator certificate or a "
-            "declared TLS-terminating proxy. The only certificate available is the engine's "
+            f"non-loopback host {settings.api.host!r} without an operator certificate. The only "
+            "certificate available is the engine's "
             "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
             "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
-            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies, which off "
-            "loopback also needs that certificate, BACKLOG #4636); "
+            "TLS-terminating proxy in front of a loopback engine ([api].tls_terminated_upstream + "
+            "trusted_proxies, BACKLOG #4636); "
             "--allow-insecure-bind does not cover it, and neither does "
             "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
             "address (127.0.0.1) for local-only access, or configure one of those two.",

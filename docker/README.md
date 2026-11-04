@@ -153,7 +153,7 @@ against one case that matters, described under
 
 Reaching the engine through a published port requires binding **off-loopback inside the container**
 (Docker NAT forwards to the container interface, not its loopback). The startup bind guard then requires
-TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by design.
+TLS (A), or it **refuses to start** — by design.
 
 ## Volumes & secrets
 
