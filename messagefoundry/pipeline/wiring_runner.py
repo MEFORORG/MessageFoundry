@@ -1087,11 +1087,12 @@ class _StreamBudgetExceeded(Exception):
 class _AttachmentWriteFailed(Exception):
     """The store's ``put_attachment`` refused a document for a fault in the document itself, one
     :func:`_attachment_body_fault` names, so every resend of the same body meets it again: a
-    PERMANENT refusal, answered as an escaped document is (``AR`` on MLLP, ``422`` on HTTP), as the
-    Manager's decisions d20261104T042552411-c23337 and d20261104T081642325-1a4f74 set (BACKLOG
+    PERMANENT refusal, which :func:`_detach_refusal_kind` answers as it does an escaped document, as
+    the Manager's decisions d20261104T042552411-c23337 and d20261104T081642325-1a4f74 set (BACKLOG
     #1619). Propagating it left a retrying source re-reading that body forever, and a TEMPORARY
-    answer would invite a conforming sender to resend it forever. Every other ``put_attachment``
-    fault still propagates, as a store fault always has."""
+    answer would invite a conforming sender to resend it forever. Any other ``put_attachment`` fault
+    that is not already one of :data:`_DETACH_REFUSALS` (at least ``StreamingAttachmentsUnsupported``
+    is) still propagates, as a store fault always has."""
 
 
 #: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
@@ -8442,7 +8443,8 @@ class RegistryRunner:
                 kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns a refusal — never accepted-and-dropped.
+        # refusal records ERROR + returns a refusal — never accepted-and-dropped. A put_attachment
+        # fault that is not the document's propagates with no row (_attachment_body_fault, #1619).
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8879,7 +8881,8 @@ class RegistryRunner:
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
         # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
         # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. A
-        # failed ERROR write propagates to the transport instead (BACKLOG #1608).
+        # put_attachment fault that is not the document's (_attachment_body_fault, #1619) and a
+        # failed ERROR write (BACKLOG #1608) propagate to the transport instead, with no row.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
