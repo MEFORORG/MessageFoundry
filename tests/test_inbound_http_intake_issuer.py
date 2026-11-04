@@ -669,10 +669,30 @@ def test_a_body_line_with_a_nul_names_no_ca_openssl_did_not_load(head: bytes, ta
     cadata = (_pem(root[0]) + b"\n".join(lines)).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Root CA"}  # the premise: OpenSSL stops after the root
     index = IssuerIndex(cadata)
-    assert index.unreadable > 0
+    assert index.unreadable == 1
     assert index.unmatched_keys(["CN=Root CA"]) == {}  # control
     assert "CN=Inter CA" in index.unmatched_keys(["CN=Inter CA"])
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), inter)[0])
+    assert index.issuer_of(leaf) == ""
+
+
+def test_a_ca_whose_base64_line_has_a_nul_and_more_base64_is_counted_unreadable() -> None:
+    """OpenSSL loads a CA whose base64 line has a NUL and more base64 after it. The index reads
+    the whole line, which ``cryptography`` refuses, so it counts that CA as unreadable and names
+    no issuer under it: a deliberate fail-closed difference, since cutting the line at the NUL
+    named CAs on the shapes above that OpenSSL never loaded. The CA beside it is still named
+    (BACKLOG #4948)."""
+    odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
+    good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
+    lines = _pem(odd[0]).split(b"\n")
+    lines[1] += b"\x00junk"
+    cadata = (b"\n".join(lines) + _pem(good[0])).decode("ascii")
+    assert _loaded_subjects(cadata) == {"CN=Odd CA", "CN=Good CA"}  # the premise
+    index = IssuerIndex(cadata)
+    assert index.unreadable == 1
+    assert index.unmatched_keys(["CN=Good CA"]) == {}
+    assert "CN=Odd CA" in index.unmatched_keys(["CN=Odd CA"])
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), odd)[0])
     assert index.issuer_of(leaf) == ""
 
 

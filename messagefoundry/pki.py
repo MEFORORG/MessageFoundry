@@ -1786,15 +1786,19 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
     ``cryptography`` never sees the trailing bytes OpenSSL stripped. A body line is handed on
     whole, NULs included: OpenSSL reads past a NUL in at least its header check and its data-line
     length limit, and on some shapes stops loading the file there, so a line cut at the NUL would
-    name a CA the context never loaded. At least three loadable shapes still differ. Two fail closed, as the index counts each as
-    unreadable, so it names no issuer and warns: a block missing its END line before the next
-    block, and a block with a NUL and more text in a body line, which OpenSSL loads on some shapes.
-    The third fails OPEN, and this scan does not close it: OpenSSL silently stops loading the file
-    at some blocks of any label, while this scan reads on and names the CAs after them. Measured on
-    OpenSSL 3.5.7, those include at least a block whose body decodes to no data (such as an empty
-    block, or one whose only lines follow a ``Name: value`` header line with no blank line after
-    it), a block whose body opens with a blank line and holds a data line over 64 characters, and
-    a block with a body line holding a NUL and then a ``:``."""
+    name a CA the context never loaded.
+
+    Loadable shapes still differ, at least these. Some fail closed, as the index counts the block
+    as unreadable, so it names no issuer and warns: at least a block missing its END line before
+    the next block, and a CA whose base64 line has a NUL and more base64 after it, which OpenSSL
+    loads. Others fail OPEN, and this scan does not close them: OpenSSL silently stops loading the
+    file at some blocks of any label, while this scan reads on and names CAs it never loaded, at
+    least the CAs after that block and on some shapes the block's own. Measured on OpenSSL 3.5.7,
+    those include at least a block whose body decodes to no data (such as an empty block, or one
+    whose only lines follow a ``Name: value`` header line with no blank line after it), a block
+    whose body opens with a blank line, or with a header line and a blank line, and holds a data
+    line over 64 characters, and a block with a body line holding a NUL and then a ``:``, a header
+    line to OpenSSL."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
@@ -1807,8 +1811,7 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
             if end.startswith(b"-----END "):
                 break
             if keep:
-                # Whole, NULs included: failing closed rests on cryptography refusing them.
-                body.append(end)
+                body.append(end)  # whole, NULs included: cutting at one named unloaded CAs
         else:
             end = b""  # no END line at all
         if end != b"-----END " + label + b"-----":
