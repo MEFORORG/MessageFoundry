@@ -1725,10 +1725,17 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
 # CTE-terminal forms (`WITH c AS (...) DELETE ...`) fall to the same scan. DDL is included for the
-# reason a chained `DROP` is refused: a lookup has no business carrying it.
+# reason a chained `DROP` is refused: a lookup has no business carrying it. `RECEIVE` dequeues a
+# Service Broker message (a bare one needs a `;` before it, per the T-SQL docs, but one inside
+# `WAITFOR (RECEIVE ...)` needs none) and `UPDATETEXT`/`WRITETEXT` write a text column. `BEGIN` is refused as a
+# bare word, which covers every `BEGIN TRAN` form: `SELECT 1 BEGIN TRAN` would leave
+# `@@TRANCOUNT` at 1 on a pooled autocommit connection. An unquoted name spelled like one of these
+# words is refused too, failing closed: at least a PostgreSQL column `begin` on the generic dialect,
+# and on any dialect a column `receive`, which T-SQL does not reserve.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
         "ALTER",
+        "BEGIN",
         "CREATE",
         "DELETE",
         "DENY",
@@ -1739,9 +1746,12 @@ _SQL_WRITE_KEYWORDS = frozenset(
         "INSERT",
         "INTO",
         "MERGE",
+        "RECEIVE",
         "REVOKE",
         "TRUNCATE",
         "UPDATE",
+        "UPDATETEXT",
+        "WRITETEXT",
     }
 )
 
@@ -1919,8 +1929,9 @@ def _require_read_only(
     identifiers are skipped, and then three rules apply:
 
     1. it must *begin* (after comments and whitespace) with the word ``SELECT`` or ``WITH``;
-    2. no write or authority keyword (at least ``INSERT``/``UPDATE``/``DELETE``/``MERGE``/``INTO``/
-       ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
+    2. no keyword :data:`_SQL_WRITE_KEYWORDS` lists (at least ``INSERT``/``UPDATE``/``DELETE``/
+       ``MERGE``/``INTO``/``EXEC``, DDL and the ``BEGIN`` of ``BEGIN TRAN``) may appear outside a
+       literal or a comment; a write or transaction-control verb it does not list passes;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
 
     Rule 2 also refuses a ``CALL`` word inside an open ODBC ``{`` escape (``{call p}``,
@@ -3305,10 +3316,13 @@ class DatabaseSource(SourceConnector):
 
     The File source's *process-then-mark-done* shape (at-least-once), with a query instead of a
     directory: a cooperatively-cancellable background loop runs the operator-declared ``poll_statement``
-    (a read-only ``SELECT`` of the next batch; a writing poll is refused at construction, BACKLOG
-    #2178), hands each row to the handler as a body, and — **only after the
-    handler returns** — runs the optional ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that
-    row's columns) so the row isn't re-read. A crash before the mark re-emits the row next poll
+    (a read-only ``SELECT`` of the next batch; at least a poll of a writing shape is refused at
+    construction, BACKLOG #2178, but not every writing poll: at least a ``SELECT`` that calls a
+    function which writes, and a T-SQL second statement with no ``;`` whose verb the test does not
+    list, pass, see :func:`_read_only_poll_refusal`), hands each row to the
+    handler as a body, and — **only after the handler returns** — runs the optional
+    ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that row's columns) so the row isn't
+    re-read. A crash before the mark re-emits the row next poll
     (at-least-once); the downstream pipeline must tolerate duplicates. Poll errors are logged-not-fatal
     (a bad poll never kills the poller, mirroring the File source).
 
@@ -3322,7 +3336,9 @@ class DatabaseSource(SourceConnector):
     that bounds the leadership-transition duplicate window, the engine can't enforce row claim/mark
     atomicity here: it's on the operator's SQL. The claim is ``mark_statement``, run per row after the
     handler returns, so a row both nodes read in the brief transition window is a duplicate, the same
-    at-least-once class as a crash mid-poll, never a loss. ``poll_statement`` must not claim; see
+    at-least-once class as a crash mid-poll, and not a loss, **provided** ``poll_statement`` writes
+    nothing and ``mark_statement`` marks only the row it was bound from. A poll that claims rows as
+    it reads them can lose a row it claimed and never handed off. ``poll_statement`` must not claim; see
     :func:`_read_only_poll_refusal`.
     """
 
