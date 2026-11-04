@@ -31,11 +31,12 @@ import operator
 import os
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+import time
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Final, Protocol, runtime_checkable
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
@@ -59,6 +60,7 @@ __all__ = [
     "CONNECTION_EVENT_KINDS",
     "ConnectionEventSink",
     "IntakeAuditSink",
+    "INTAKE_AUDIT_ACTIONS",
     "IntakeRateLimiter",
     "IntakeGate",
     "intake_open",
@@ -106,6 +108,8 @@ __all__ = [
     "peer_ip_allowed",
     "probe_tcp_reachable",
     "DEFAULT_MAX_ITEMS_PER_POLL",
+    "POLL_STOP_GRACE_S",
+    "PollStopGuard",
     "cap_setting",
     "count_setting",
     "float_setting",
@@ -460,6 +464,19 @@ ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 # ``detail`` carries the mode and the outcome only.
 IntakeAuditSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
+#: ``connection_event`` kind -> ``audit_log`` action for an intake refusal (ADR 0154 D6), the one
+#: map both listeners that refuse a peer at intake read: the HTTP listener for ``intake_auth``, and
+#: the MLLP listener for ``tls_client_subjects`` (BACKLOG #4907), whose refused sender is audited
+#: under the same actions as HTTP's ``mtls_subject``. The kinds double as the ``connection_event``
+#: vocabulary, which CI derives from the literal emit call sites and asserts against
+#: ``docs/PHI.md`` section 7 and ``CONNECTION_EVENT_KINDS`` as an exact set, so a kind added here
+#: without those two is a build failure, by design.
+INTAKE_AUDIT_ACTIONS: Final[Mapping[str, str]] = {
+    "intake_auth_failed": "intake.auth_failed",
+    "auth_subject_denied": "intake.auth_subject_denied",
+    "auth_rate_limited": "intake.auth_rate_limited",
+}
+
 
 class IntakeRateLimiter(Protocol):
     """The failed-attempt budget an intake-authenticating source consults (ADR 0154 D6).
@@ -468,7 +485,8 @@ class IntakeRateLimiter(Protocol):
     and synchronous is honest: the underlying sliding window completes without awaiting, so it is
     atomic on the event loop.
 
-    The three methods exist separately because the budget is charged on **failure only**. Consulting
+    Consulting, charging and noting are separate methods because the budget is charged on **failure
+    only**; :meth:`check_peer` is a narrower read of the same budget. Consulting
     and charging in one call — which is what the shipped ``allow()`` does — would turn a
     brute-force bound into a per-peer throughput cap, silently refusing an authenticated partner's
     traffic pre-ingress, where it is not even counted.
@@ -476,6 +494,17 @@ class IntakeRateLimiter(Protocol):
 
     def check(self, peer: str) -> bool:
         """Whether ``peer`` may make another attempt. **Read-only** — never records one."""
+        ...
+
+    def check_peer(self, peer: str) -> bool:
+        """Whether ``peer``'s OWN per-address budget admits another attempt, the global arm unread.
+        **Read-only**, as :meth:`check` is.
+
+        For a source that can tell a listed peer apart before anything is read, as MLLP's
+        ``tls_client_subjects`` can (BACKLOG #4907): it consults this before the compare and the
+        global arm only once the compare has refused, so refusals from other addresses can never
+        close a listed sender unread.
+        """
         ...
 
     def charge_failure(self, peer: str) -> None:
@@ -1183,6 +1212,69 @@ def check_file_key(file_key: str, *, write: bool) -> None:
         raise FileKeyError("a dedup-ledger key's digest is not 64 lowercase hex")
 
 
+#: How long an ordinary stop() of a Database or RemoteFile source waits for its poll task before it
+#: gives up on a blocked external call (BACKLOG #4685). The figure is FileSource's own
+#: ``_STOP_GRACE_S`` (BACKLOG #1620), the bound this one mirrors.
+POLL_STOP_GRACE_S = 5.0
+
+
+class PollStopGuard:
+    """Bounds a poll source's ordinary stop() without ever cutting a store call (BACKLOG #4685).
+
+    The poll task wraps each store call, at least a pipeline hand-off or a processed-ledger read or
+    write, in :meth:`store_call`. :meth:`join` then waits for the task: a grace at a time while it
+    is inside a store call, and a full grace after the last one ended, so the task always gets a
+    whole grace to reach its next stop check. Once a grace passes outside a store call it returns False, and the
+    caller cancels the task. That is safe there because the task is blocked on an external call (at
+    least a listing, a retrieve or a driver call), and the next poll does that call's work again
+    (at-least-once). The wait is so bounded for a blocked external call, and only as bounded as the
+    store for a store call, as ``FileSource.stop()``'s is.
+
+    The inside mark is keyed by task, so a cut task unwinding late cannot clear the mark of a task
+    a later start() made. The end time is not: a late one can only lengthen a grace."""
+
+    def __init__(self) -> None:
+        self._inside: asyncio.Task[Any] | None = None
+        self._ended = 0.0
+
+    @contextlib.contextmanager
+    def store_call(self) -> Iterator[None]:
+        """Mark the current task as inside a store call, which :meth:`join` never gives up on."""
+        me = asyncio.current_task()
+        self._inside = me
+        try:
+            yield
+        finally:
+            if self._inside is me:
+                self._inside = None
+            self._ended = time.monotonic()
+
+    def inside(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is inside a store call now."""
+        return self._inside is task
+
+    async def join(self, task: asyncio.Task[Any], grace: float) -> bool:
+        """Wait for ``task``: True once it is done, False when the caller should give up on it.
+
+        Waits through :func:`asyncio.wait`, so a cancel of the caller is not forwarded into
+        ``task``; the caller decides what a cancel does to it."""
+        if grace <= 0:
+            raise ValueError("a stop grace must be positive")  # zero would spin in a store call
+        deadline = time.monotonic() + grace
+        while True:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=max(0.0, deadline - time.monotonic())
+            )
+            if done:
+                return True
+            if self.inside(task):
+                deadline = time.monotonic() + grace  # never cut a store call; look again in a grace
+                continue
+            deadline = max(deadline, self._ended + grace)
+            if time.monotonic() >= deadline:
+                return False
+
+
 class DeliveryError(Exception):
     """A destination failed to deliver. Triggers retry/backoff in the pipeline.
 
@@ -1326,9 +1418,12 @@ class DeliveryResponse:
     A capturing ``send`` returns one of these instead of ``None``; a non-capturing ``send`` returns
     ``None`` exactly as before (byte-identical). The transport hands back the **already-derived**
     outcome it computed anyway (the MSA-1 family, the HTTP status, a SOAP fault) so the store never
-    re-parses the encrypted-at-rest body to reconstruct it.
+    re-parses the stored body to reconstruct it.
 
-    * ``body`` — the partner's reply text, already decoded by the transport (PHI; encrypted at rest).
+    * ``body`` — the partner's reply text, already decoded by the transport (PHI). The store cipher
+      covers it at rest only when a store key is configured; a keyless store writes it in
+      plaintext. ``docs/PHI.md`` section 3 says when ``serve`` accepts a keyless store (BACKLOG
+      #5017).
     * ``outcome`` — one of :data:`RESPONSE_OUTCOMES`. ``accepted`` (a positive reply), ``rejected`` (a
       partner ``<Fault>``/negative content on an otherwise-OK transport), ``unparseable`` (a reply
       frame **was received** but its content could not be parsed — **never** "no reply was received",
@@ -1338,11 +1433,14 @@ class DeliveryResponse:
       only when a store key is configured. The store passes it through ``safe_text(detail,
       limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
       knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
-      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. It does not catch
-      every identifier: at least a lone surname such as ``Smith``, an identifier such as
-      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
-      ``response_get(dest).detail``, so a connector author keeps partner free text out of
-      ``detail``.
+      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. A ``detail`` longer
+      than the scan window loses its tail unscanned and gains a ``[redaction bound: dropped N more
+      chars unscanned]`` marker (BACKLOG #5017). ``docs/PHI.md`` section 3, *The store's
+      200-character bound*, is the one statement of the window, both notes, and when a stored value
+      can run past 200 characters. The scrub does not catch every identifier: at least a lone
+      surname such as ``Smith``, an identifier such as ``MRN7731`` and a resource id such as
+      ``Patient/12345`` read back unchanged through ``response_get(dest).detail``, so a connector
+      author keeps partner free text out of ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
@@ -1535,6 +1633,16 @@ class SourceConnector(abc.ABC):
     #: poll sources and the timer consult it. The loopback and pass-through sources read nothing.
     intake_gate: IntakeGate | None = None
 
+    #: Optional refusal for a message from a sender whose verified certificate is not on its
+    #: inbound's certificate-subject allowlist (BACKLOG #4907), **injected by the runner after
+    #: build**, the same runtime-injection shape as :attr:`on_connection_event`. The runner
+    #: records the message as an ``ERROR`` row, then returns the ``AR`` reply where the inbound
+    #: answers in HL7, else ``None``, so a refused message is counted and logged rather than
+    #: accepted and dropped. Only the MLLP listener's ``tls_client_subjects`` calls it so far.
+    #: ``None`` (a direct build) means nothing can record such a message, and a listener that
+    #: refuses a sender then reads none of its messages.
+    refuse_unlisted_sender: InboundHandler | None = None
+
     @abc.abstractmethod
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1650,6 +1758,14 @@ class DestinationConnector(abc.ABC):
         :meth:`send` runs: on a simulate (shadow) outbound, and on each MLLP batch member with
         ``rewrite=False``, because a member sits in the envelope as stored and :meth:`send` applies
         any delimiter rewrite to the whole envelope, not to the member."""
+        return None
+
+    async def forget_payload(self, payload: str) -> None:
+        """Drop any state this connector keeps in memory about ``payload`` across sends. The delivery
+        worker calls it once the store has dead-lettered a single row it sent ``payload`` for at the
+        retry policy's ``max_attempts``, so a replay of that row starts clean. The default is a no-op:
+        at least the DICOM C-STORE SCU overrides it, for its count of unanswered stores of a large
+        object (vault BACKLOG #4908)."""
         return None
 
     async def validate_startup(self) -> None:

@@ -74,13 +74,14 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
 
 ## 3. Encryption in transit — no PHI on the wire in cleartext
 
-- **API / WSS:** in-process TLS (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`), or an upstream
-  TLS terminator (`tls_terminated_upstream` + `trusted_proxies`). A non-loopback API bind with neither is
-  **refused at startup**. The engine's self-signed placeholder certificate does not count
+- **API / WSS:** in-process TLS (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`), with or
+  without an upstream TLS terminator (`tls_terminated_upstream` + `trusted_proxies`) in front. The
+  engine's self-signed placeholder certificate does not count as an operator certificate
   ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
-  Behind a terminator with no `tls_cert_file`, the proxy-to-engine hop is
-  **plaintext** and not encrypted by the engine. Your site must keep it private, and `serve` requires
-  `[api].plaintext_upstream_hop_acknowledged` to say so (see `docs/CONFIGURATION.md`).
+  [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) says when `serve` refuses a
+  non-loopback bind without one. Behind a terminator with no `tls_cert_file`, the proxy-to-engine
+  hop is **plaintext** and not encrypted by the engine; when `serve` accepts that is
+  [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop).
 - **MLLP data plane:** **MLLP-over-TLS** (`tls=True` per connection). A non-loopback MLLP listener without
   TLS is **refused at wiring time** (`check_mllp_tls_exposure`). For partners that cross a WAN, prefer the
   **edge-relay** topology ([`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) §5) so MLLP stays on the LAN and
@@ -161,7 +162,10 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
   default). Do **not** enable the plaintext UDP/TCP forwarder for PHI-adjacent log metadata; if you must,
   front it with a TLS sidecar/collector first.
 - **In-engine TLS revocation is delegated** ([ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)).
-  For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy (Topology B).
+  For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy in front of a
+  loopback-bound engine (the same-pod sidecar in [`../docker/README.md`](../docker/README.md)). An
+  off-loopback certificate bind meets the [API revocation gate](SECURITY.md#api-revocation-gate)
+  whether or not a proxy is in front.
 - **API cert rotation needs a pod restart** (uvicorn builds the TLS context once; MLLP certs hot-reload on
   `/config/reload`, except a key the shipped manifests' `copy-tls` copies, which needs a new pod too:
   [`docker/README.md`](../docker/README.md), *Cert rotation*). Plan a rolling restart for API-cert renewal.

@@ -69,6 +69,17 @@ this line.**
 
 ### Security
 
+- **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
+  /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
+  before the engine handler's scope check, so on a first deployment such a caller's probe there
+  would have left no `auth.channel_denied` row. It now writes that row, marked
+  `"flag_direction_not_inbound": true`, and answers the 403 the handler gives a non-inbound target.
+  An all-channels caller still gets the 404. Needs an engine whose `messagefoundry.api.message_scope`
+  has `CONNECTION_DENIED_DETAIL` and whose `audit_channel_denied` takes
+  `flag_direction_not_inbound`, which no published engine does yet. As for BACKLOG #1624 above, the
+  release that carries this raises the `messagefoundry` floor to the engine release that adds them:
+  the seam digest covers neither a module constant nor that callback's signature, so the handshake
+  will not catch an older engine. (BACKLOG #3378)
 - **On a GET, the same-origin check reads `Origin` when `Sec-Fetch-Site` is empty or unknown.**
   Such a value now counts as absent there, so a foreign `Origin` beside it is refused. Before, any
   present value settled a GET and `Origin` was never read. A value an intermediary folded from two

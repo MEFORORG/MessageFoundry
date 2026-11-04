@@ -935,6 +935,7 @@ def test_the_scaffold_names_one_loosening_and_it_is_the_state_acknowledgement(
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=settings.api,
             approvals=settings.approvals,
             cert_monitor=settings.cert_monitor,

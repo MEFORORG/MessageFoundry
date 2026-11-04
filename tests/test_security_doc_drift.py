@@ -679,7 +679,8 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 # (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors;
 # +1 BACKLOG #2298: a session whose temporary credential lapsed is ended.
 _CONTEXT_TABLE_A_ROWS = 43
-_CONTEXT_TABLE_B_ROWS = 13
+# +1 BACKLOG #4907 (Table B): the MLLP listener's expected-sender allowlist, tls_client_subjects.
+_CONTEXT_TABLE_B_ROWS = 14
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
 #: exactly one of these — the assertion that turns "no composite risk score" from a phrase the doc
@@ -1718,6 +1719,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "its code claims are pinned by AST and by calling the functions"
     ),
     ("test_docs_security_pathways.py", "_config_row"): "slices a CONFIGURATION.md table row",
+    (
+        "test_docs_security_pathways.py",
+        "test_the_docker_manifests_say_what_require_encryption_does",
+    ): (
+        "reads the comment on each docker manifest line that sets MEFOR_STORE_REQUIRE_ENCRYPTION "
+        "(vault BACKLOG #4178); what the setting does is pinned by calling "
+        "keyless_opt_out_refusal in tests/test_security_config.py"
+    ),
     (
         "test_docs_security_pathways.py",
         "test_the_guide_keeps_the_corrected_crl_signature_sentences",

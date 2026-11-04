@@ -1231,7 +1231,9 @@ def test_receiver_figures_match_their_constants() -> None:
     assert _sig_default(wiring.File, "max_decompressed_members") == DEFAULT_MAX_DECOMPRESSED_MEMBERS
     assert _sig_default(wiring.Http, "max_body_bytes") == DEFAULT_MAX_BODY_BYTES
     assert _sig_default(wiring.Http, "max_header_bytes") == DEFAULT_MAX_HEADER_BYTES
-    assert _sig_default(wiring.DICOM, "max_object_bytes") == DEFAULT_MAX_OBJECT_BYTES
+    # DICOM() quotes no number: left unset it writes no max_object_bytes, so the SCP reads
+    # DEFAULT_MAX_OBJECT_BYTES itself and no literal can drift from it (vault BACKLOG #4908).
+    assert "max_object_bytes" not in wiring.DICOM(ae_title="MEFOR_SCP").settings
     assert _sig_default(wiring.MLLP, "max_frame_bytes") == DEFAULT_MAX_FRAME_BYTES
     assert _sig_default(wiring.Tcp, "max_frame_bytes") == DEFAULT_MAX_FRAME_BYTES
     assert _sig_default(wiring.X12, "max_interchange_bytes") == DEFAULT_MAX_INTERCHANGE_BYTES

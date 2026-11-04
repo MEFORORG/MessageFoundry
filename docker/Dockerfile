@@ -34,15 +34,29 @@
 # rebuild. The pin also freezes the base's Debian packages: a fix reaches the image only when that
 # digest moves, and a build from an older checkout keeps that checkout's digest.
 #
-# CA STORES, INSPECTED 2026-10-26 FOR linux/amd64 ONLY (BACKLOG #3905, GHSA-6q48-6c7w-9gw2). The
-# base holds at least three CA bundles no lock controls: Debian's ca-certificates in /etc/ssl/certs,
-# the certifi the system pip vendors, and the same inside the ensurepip pip wheel, which is where
-# the pip that `python -m venv` puts in /opt/venv comes from. The previous digest carried
-# "emSign ECC Root CA - G3" in all three; this one carries it in none (ca-certificates
-# 20250419~deb12u2, pip 26.2.2). The certifi installed into /opt/venv is the locked one in
-# docker/locks/. Nothing re-inspects a later digest or another platform:
-# tests/test_container_build_pins.py refuses only the known-bad digests.
-FROM python:3.14-slim-bookworm@sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1 AS python-base
+# CA STORES (BACKLOG #3905, GHSA-6q48-6c7w-9gw2). The base holds at least three CA bundles no
+# lock controls: Debian's ca-certificates in /etc/ssl/certs, the certifi the system pip vendors,
+# and the same inside the ensurepip pip wheel, which is where the pip that `python -m venv` puts in
+# /opt/venv comes from. The certifi installed into /opt/venv is the locked one in docker/locks/.
+#
+# INSPECTED 2026-10-26, linux/amd64 ONLY (engine PR 2558): under the index
+# sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1, the amd64 manifest
+# (recorded only as 0a8fba2d...) carried "emSign ECC Root CA - G3" in none of the three
+# (ca-certificates 20250419~deb12u2, pip 26.2.2). Under the index it replaced,
+# sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83, the amd64 manifest
+# sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf carried it in all three.
+# No other platform under either index was inspected.
+#
+# NOT INSPECTED: the index engine PR 2778 (Dependabot, 2026-11-04) moves the pin to,
+# sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527. The Lander's review of
+# that PR recorded on 2026-11-04, in its hold comment: the tag python:3.14-slim-bookworm unchanged,
+# 516b51cb the official image for that tag that day, built from the same docker-library revision,
+# with Python 3.14.10 and the same 69 Debian packages at the same versions on linux/amd64,
+# ca-certificates 20250419~deb12u2 among them. That record holds no CA-bundle reading, and a Debian
+# package list cannot show the two pip-vendored certifi bundles at all. A later digest the pin
+# moves to is inspected by nothing: tests/test_container_build_pins.py refuses only the known-bad
+# digests, so check this block against the FROM line when it moves.
+FROM python:3.14-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
 FROM python-base AS builder-base
@@ -117,7 +131,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # WORKDIR is writable so a relative File-output / store path still lands on the volume, not a read-only layer.
 WORKDIR /var/lib/mefor
 USER 10001
-# API (in-process TLS / plaintext-behind-proxy) + MLLP data plane. Documentation only; publish per topology.
+# API (TLS; plaintext only to a proxy on the engine's loopback) + MLLP data plane. Documentation only; publish per topology.
 EXPOSE 8443 8765 2575
 # Liveness probe: GET /health is tokenless and always 200 (it answers even before the engine finishes
 # starting, so it is a pure liveness signal, not readiness; there is no unauthenticated readiness
@@ -142,8 +156,8 @@ EXPOSE 8443 8765 2575
 # loopback. -k skips VERIFICATION on a hop that never leaves the container's network namespace; it
 # does not skip encryption and it cannot reach a cleartext socket.
 #
-# NOT COVERED, deliberately: [api].tls_terminated_upstream, where a proxy terminates TLS in front
-# and the engine speaks plaintext to it. ADR 0172 mints nothing there, so that deployment must
+# NOT COVERED, deliberately: [api].tls_terminated_upstream with no [api].tls_cert_file, where a
+# proxy terminates TLS in front and the engine speaks plaintext to it. ADR 0172 mints nothing there, so that deployment must
 # override this HEALTHCHECK rather than have the image infer a plaintext hop from a TLS failure.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS -k "https://127.0.0.1:${MEFOR_API_PORT:-8765}/health" || exit 1

@@ -75,6 +75,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         attested_hops=(),
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
+        ech_cleartext_sidecar_hops=(),
         api=ApiSettings(),
         approvals=ApprovalsSettings(),
         cert_monitor=CertMonitorSettings(),
@@ -891,8 +892,9 @@ _EXPOSED = (
     "security.allow_unencrypted_phi = true\n"
     "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
     "alerts.security_notifications_required = false\n"
+    # local_access_only = false is what names the allow-list loosening. listen_address keeps its
+    # loopback default, because BACKLOG #4636 refuses the plaintext proxy-to-engine hop off loopback.
     "security.local_access_only = false\n"
-    'security.listen_address = "0.0.0.0"\n'
     "security.delete_message_bodies_after_days = 30\n"
     # The Posture-B attestations. A box declared synthetic used to skip this gate; BACKLOG
     # #1279 retired the declaration, so a declared terminator needs both or the start refuses,
