@@ -756,10 +756,11 @@ SITES: dict[str, Site] = {
         "#5221).",
     ),
     "messagefoundry/pipeline/engine.py::Engine._value_file_folders": Site(
-        1,
+        2,
         REVIEWED,
-        "A file link's own target, joined to the folder holding the link, only to name the folder "
-        "the vet checks before the value file is read; nothing is opened or written through it "
+        "A file link's own target, joined to the real folder holding the link, and that hop's "
+        "name re-joined to its own resolved folder, only to name the folder the vet checks "
+        "before the value file is read; nothing is opened or written through either "
         "(vault BACKLOG #2596).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
