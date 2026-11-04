@@ -269,14 +269,16 @@ KNOWN_FINDINGS: tuple[KnownFinding, ...] = (
     KnownFinding(
         target="binary_carriage",
         summary=(
-            "strip_documents and extract_obx_document raise a bare ValueError ('cannot determine "
-            "HL7 separators') on an MSH-led HL7 body whose MSH-2 carries fewer than four encoding "
-            "characters. Peek.parse and Message.parse both accept such a body, and build_ack "
-            "answers it AA; Message.field then raises on the first read. The store backends' "
-            "retention document-strip pass calls strip_documents with no try, so on first "
-            "deployment one such stored body would abort that pass on every run. "
-            "iter_obx_documents refuses such a body as UnreadableDelimitersError instead, which the "
-            "over-threshold ingress detach records (BACKLOG #5099)."
+            "extract_obx_document raises a bare ValueError ('cannot determine HL7 separators') on "
+            "an MSH-led HL7 body whose MSH-2 carries fewer than four encoding characters. "
+            "Peek.parse and Message.parse both accept such a body, and build_ack answers it AA; "
+            "Message.field then raises on the first read. On first deployment a Handler that "
+            "called extract_obx_document on such a body would get a bare ValueError, not the "
+            "BinaryCarriageError that function documents. strip_documents no longer raises on it: "
+            "it returns such a body unchanged, so the retention document-strip pass skips the row "
+            "rather than aborting. iter_obx_documents refuses such a body as "
+            "UnreadableDelimitersError, which the over-threshold ingress detach records "
+            "(BACKLOG #5099)."
         ),
         discriminator=(
             "the exception is a bare ValueError whose message starts 'cannot determine HL7 "
@@ -665,9 +667,9 @@ def _binary_carriage(data: bytes) -> None:
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
       document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
-      verbatim ``NonVerbatimDocumentError``, and for a body with an OBX whose MSH-1 and MSH-2 name
-      no delimiters ``UnreadableDelimitersError`` (BACKLOG #5099) -- and ``extract_obx_document``
-      on every OBX, whose refusal is ``BinaryCarriageError``.
+      verbatim ``NonVerbatimDocumentError``, and for a body with an OBX and no MSH, or an MSH-2
+      shorter than four characters, ``UnreadableDelimitersError`` (BACKLOG #5099) -- and
+      ``extract_obx_document`` on every OBX, whose refusal is ``BinaryCarriageError``.
 
     The HL7 half carries the only carve-outs in this file, one per registered known finding: see
     :data:`KNOWN_FINDINGS` and :func:`_is_known_binary_carriage_finding`.

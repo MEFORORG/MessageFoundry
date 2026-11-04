@@ -1771,6 +1771,22 @@ def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> No
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
+def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> None:
+    """The over-threshold detach stores such a body as an ``ERROR`` row, and a smaller one is
+    ingested as before. The retention pass calls ``strip_documents`` on each stored body with no
+    ``try``, so it must leave this one as it is rather than raise, or one row would abort the pass
+    on every run (BACKLOG #5099)."""
+    from messagefoundry.parsing.binary import strip_documents
+
+    body = _SHORT_MSH2_DOCUMENT
+    assert "OBX" in body and body.startswith("MSH")
+    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
+    # The control: the same document under a full MSH-2 is stripped.
+    readable = _hl7(_b64(2000))
+    stripped, documents, _reclaimed = strip_documents(readable, pruned_at=0.0)
+    assert documents == 1 and stripped != readable
+
+
 def test_another_fault_in_the_separator_read_is_not_blamed_on_the_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1810,7 +1826,7 @@ async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_befo
     receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "MSH-1 and MSH-2 name no delimiters" in ack
+    assert ack is not None and "no MSH, or MSH-2 shorter than four characters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2

@@ -268,17 +268,18 @@ from an MSH it cannot always find. They are registered separately because their 
 consequences differ:
 
 * **An MSH-led body whose MSH-2 carries fewer than four encoding characters.** `Peek.parse` and
-  `Message.parse` accept it and `build_ack` answers it `AA`; then `strip_documents` and
-  `extract_obx_document` let the `ValueError` out. The retention document-strip pass calls
-  `strip_documents` with no `try`, so on first deployment one such stored body would abort that
-  pass on every run.
+  `Message.parse` accept it and `build_ack` answers it `AA`; then `extract_obx_document` lets the
+  `ValueError` out, so a Handler that called it on such a body would get a bare `ValueError` on
+  first deployment, not the `BinaryCarriageError` that function documents. `strip_documents` no
+  longer raises on it: it returns such a body unchanged, so the retention document-strip pass,
+  which calls it with no `try`, skips the row rather than aborting (BACKLOG #5099).
 * **An FHS- or BHS-led body with no MSH.** `Peek.parse` refuses it but `Message.parse` accepts it,
   and `extract_obx_document` then raises. A Handler that parsed such a body
   with `Message.parse` would get a bare `ValueError` from `extract_obx_document` on first deployment,
   not the `BinaryCarriageError` that function documents. `strip_documents` is not affected.
 
 On either shape `iter_obx_documents` no longer lets the bare `ValueError` out: a body with an OBX
-whose MSH-1 and MSH-2 name no delimiters is its named refusal, `UnreadableDelimitersError`, a
+and no MSH, or an MSH-2 shorter than four characters, is its named refusal, `UnreadableDelimitersError`, a
 `ValueError` subclass (BACKLOG #5099). Only the first shape reaches the over-threshold ingress
 detach, which records a body of it that has an OBX as `ERROR`; the listener's parse refuses the
 second before any detach.

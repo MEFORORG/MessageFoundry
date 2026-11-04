@@ -30,8 +30,8 @@ document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a re
 handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
 under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
 document the splice would not set back verbatim
-(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX whose
-MSH-1 and MSH-2 name no delimiters
+(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX and
+no MSH, or an MSH-2 shorter than four characters
 (:class:`~messagefoundry.parsing.binary.UnreadableDelimitersError`), each an
 ``ERROR`` row on a streaming inbound, which the dry-run never raises because it never detaches. A ``str`` body, which
 only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
@@ -135,18 +135,18 @@ __all__ = [
 STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
 
 #: The stored reason for an HL7 body refused because it holds the document handle marker under
-#: delimiters that are a base64 character, or that its MSH-1 and MSH-2 do not name (BACKLOG
-#: #5099). It names no byte of the body.
+#: delimiters that are a base64 character, or that cannot be read because it has no MSH or its
+#: MSH-2 is shorter than four characters (BACKLOG #5099). It names no byte of the body.
 DOC_REF_MARKER_REFUSED_REASON = (
     "document handle refused: the body holds the handle marker, and a delimiter is a base64 "
-    "character or MSH-1 and MSH-2 do not name them"
+    "character, or the body has no MSH or an MSH-2 shorter than four characters"
 )
 
 
 def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: one that holds
     the document handle marker under a delimiter in the base64 alphabet, or the raw marker under
-    an MSH-2 too short to name the delimiters, which delivery would refuse on every outbound (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`,
+    an MSH-2 shorter than four characters, which delivery would refuse on every outbound (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`,
     BACKLOG #5099). Pure, so both listeners and the dry-run run the one check."""
     if marker_under_base64_delimiters(Message(peek.message), text):
         return DOC_REF_MARKER_REFUSED_REASON

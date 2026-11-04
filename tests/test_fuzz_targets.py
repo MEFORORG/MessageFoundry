@@ -641,12 +641,15 @@ def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> No
     assert any(f.reproducer == SHORT_MSH2_REPRODUCER for f in KNOWN_FINDINGS)
     text = SHORT_MSH2_REPRODUCER.decode("ascii")
     assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
+    message = Message.parse(text)
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        strip_documents(text, pruned_at=0.0)
-    # The detach scan's half is fixed: it refuses the body by name, which both listeners record
-    # (BACKLOG #5099).
+        extract_obx_document(message)
+    # The retention strip's half is fixed: it returns the body unchanged, so the pass skips the
+    # row rather than aborting. The detach scan's half is fixed too: it refuses the body by name,
+    # which both listeners record (BACKLOG #5099).
+    assert strip_documents(text, pruned_at=0.0) == (text, 0, 0)
     with pytest.raises(UnreadableDelimitersError):
-        list(iter_obx_documents(Message.parse(text), received=text))
+        list(iter_obx_documents(message, received=text))
     assert _is_short_msh2_shape(text)
     assert not _is_batch_header_shape(text)
 

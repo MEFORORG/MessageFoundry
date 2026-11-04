@@ -933,7 +933,7 @@ class _StreamBudgetExceeded(Exception):
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. A body with an OBX whose MSH-1 and MSH-2 name no delimiters is one of them,
+#: by one alone. A body with an OBX and no MSH, or an MSH-2 shorter than four characters, is one,
 #: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
@@ -8238,7 +8238,7 @@ class RegistryRunner:
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
         delivery's splice would not set back verbatim, and
         :class:`~messagefoundry.parsing.binary.UnreadableDelimitersError` for a body with an OBX
-        whose MSH-1 and MSH-2 name no delimiters (BACKLOG #5099) — each, as one of
+        and no MSH, or an MSH-2 shorter than four characters (BACKLOG #5099) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
@@ -8609,7 +8609,7 @@ class RegistryRunner:
                     nak_code, nak_text = "AR", "OBX-5.5 document holds a delimiter or control"
                 elif isinstance(exc, UnreadableDelimitersError):
                     # The header, not a document: no OBX-5.5 of this body can be read.
-                    nak_code, nak_text = "AR", "MSH-1 and MSH-2 name no delimiters"
+                    nak_code, nak_text = "AR", "no MSH, or MSH-2 shorter than four characters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_code, nak_text = "AR", "document under base64 delimiters"
@@ -9175,7 +9175,8 @@ class RegistryRunner:
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
             # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or its
-            # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809), or a handle is
+            # separators cannot be read: no MSH, or an MSH-2 shorter than four characters (vault
+            # BACKLOG #2809), or a handle is
             # malformed, names an attachment its message does not hold, or sits outside the
             # splice, or the splice would escape a character of its stored value (BACKLOG #5099).
             # The same payload fails the same way on every attempt, so a retry could never succeed:
