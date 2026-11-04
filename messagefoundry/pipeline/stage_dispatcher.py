@@ -1819,6 +1819,8 @@ class StageDispatcher:
             # here that its rows did not come back. Counts only, never content. A dead serializer's
             # replacement may have sent no write at all, so its lane is counted against quiesce
             # (#4607); a body's own first writes were sent, as before step 2.
+            if recover and not unlanded:
+                return  # it owed no write: nothing it held is in flight
             if recover:
                 self._stranded_on_stop.add(lane)
             log.warning(

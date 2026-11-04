@@ -529,12 +529,13 @@ class _LaneClaims:
     ``deaths`` is the lane's run of deaths with no settled pass between them. It backs off the
     death's traceback in the supervisor and paces a replacement that follows a repeat death.
     :meth:`settle` closes it, on a pass that resolved its batch, and so does a replacement that
-    reads the row the dead worker died on written (:meth:`RegistryRunner._dead_worker_wrote`). On
+    reads that the dead worker wrote a row it held (:meth:`RegistryRunner._dead_worker_wrote`). On
     an UNORDERED lane a settled pass closes it only once it has resolved every row the run's
-    deaths held in common (``suspects``): fresh rows sort ahead of a re-pended row there, so a pass
+    deaths all held (``suspects``): fresh rows sort ahead of a re-pended row there, so a pass
     that never reached the row killing the workers would otherwise close the run at every death,
-    with no backoff and no page. A row the dead worker wrote before it died stays a suspect until
-    the next death drops it, so such a run may stay open until the quiet gap below. Not on
+    with no backoff and no page. A row that kills every worker is held at every death, so a death
+    holding none of the suspects starts a new run, as a far-apart one does; a row the dead worker
+    wrote before it died stays a suspect until the next death drops it or starts a new run. Not on
     a claim that finds nothing:
     a replacement's re-pend dates its rows into the future, so the lane reads empty until the row
     that killed the workers is due again. A death that comes :data:`_DEATH_RUN_QUIET_SECONDS` or
@@ -6804,8 +6805,14 @@ class RegistryRunner:
             log.error("%s worker %r exited unexpectedly; respawning", kind, name, exc_info=exc)
             return
         now = time.monotonic()
-        if claims.deaths.count and now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS:
-            claims.close_deaths(kind, name)  # far apart: an unrelated death starts a new run
+        held = set(claims.ids)
+        if claims.deaths.count and (
+            now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS
+            or (held and claims.suspects and not held & claims.suspects)
+        ):
+            # Far apart, or holding none of the rows every earlier death held: an unrelated death
+            # starts a new run.
+            claims.close_deaths(kind, name)
         claims.last_death = now
         claims.note_death()
         claims.deaths = claims.deaths.record(
@@ -7000,9 +7007,11 @@ class RegistryRunner:
         await run(name, claims=claims)
 
     async def _dead_worker_wrote(self, kind: str, name: str, claims: _LaneClaims) -> bool:
-        """Whether a dead per-lane worker wrote the row it died on (BACKLOG #4607). A run of
-        deaths otherwise closes only on a settled pass, so a worker that dies after delivering its
-        row, every time, would read as stuck on it.
+        """Whether a dead per-lane worker wrote a row it died holding, so its death made progress
+        (BACKLOG #4607). A run of deaths otherwise closes only on a settled pass, so a worker that
+        dies after delivering its row, every time, would read as stuck on it. On a router or
+        transform lane that row may be one before the row it died on, as a pooled death past the
+        first row of its prefix counts as progress; the run then restarts on that row.
 
         Measured as the pooled twin measures it (``StageDispatcher._dead_rows_in_flight``), from
         the lane's rows in flight at this stage. On a router or transform lane, which claims a
