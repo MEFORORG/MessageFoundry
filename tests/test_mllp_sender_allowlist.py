@@ -107,7 +107,10 @@ def _san_bundle(tmp_path: Path, signer: _CaPair, *, cn: str, dns: str) -> Path:
 
 
 def _settings(
-    tmp_path: Path, trusted: list[x509.Certificate], subjects: dict[str, list[str]] | None
+    tmp_path: Path,
+    trusted: list[x509.Certificate],
+    subjects: dict[str, list[str]] | None,
+    **extra: Any,
 ) -> dict[str, Any]:
     """An MLLP inbound's settings through the ``MLLP()`` factory: loopback, mTLS against ``trusted``."""
     cert, key = _self_signed(tmp_path)
@@ -120,6 +123,7 @@ def _settings(
         tls_key_file=str(key),
         tls_ca_file=str(ca_file),
         tls_client_subjects=subjects,
+        **extra,
     )
     return {**spec.settings, "host": "127.0.0.1"}
 
@@ -135,12 +139,13 @@ def _runner(
     store: MessageStore,
     content_type: ContentType = ContentType.HL7V2,
     ack_mode: AckMode = AckMode.ORIGINAL,
+    encoding: str = "utf-8",
 ) -> tuple[RegistryRunner, InboundConnection]:
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
             name=_INBOUND,
-            spec=ConnectionSpec(ConnectorType.FILE, {}),
+            spec=ConnectionSpec(ConnectorType.FILE, {"encoding": encoding}),
             router="r",
             content_type=content_type,
             ack_mode=ack_mode,
@@ -158,7 +163,7 @@ async def _wired(
     ack_mode: AckMode = AckMode.ORIGINAL,
 ) -> MLLPSource:
     """The listener started with the runner's handler and refusal, as ``_start_inbound`` wires them."""
-    runner, ic = _runner(store, content_type, ack_mode)
+    runner, ic = _runner(store, content_type, ack_mode, str(settings.get("encoding") or "utf-8"))
     source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings, ack_mode=ack_mode))
     source.content_type = content_type
     source.refuse_unlisted_sender = runner._make_unlisted_sender_refusal(ic)
@@ -602,3 +607,22 @@ def test_an_outbound_that_sets_the_allowlist_is_refused(tmp_path: Path) -> None:
     """
     with pytest.raises(WiringError, match="tls_client_subjects names the senders an inbound"):
         load_config(_config(tmp_path, toml))
+
+
+async def test_a_header_the_charset_cannot_decode_still_gets_its_ar(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """On an ``ascii`` inbound, a byte the charset refuses in MSH must not reach the AR as U+FFFD,
+    which would not re-encode and would leave the sender with no reply after the row was written."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}, encoding="ascii"),
+        store,
+    )
+    body = b"MSH|^~\\&|ACM\xe9|FAC|MF|FAC|20260101||ADT^A01|CTRL4907|P|2.5\rPID|1\r"
+    try:
+        got = await _send_raw(source, _bundle(tmp_path, other), b"\x0b" + body + b"\x1c\r")
+    finally:
+        await source.stop()
+    assert b"MSA|AR|" in got, got
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]

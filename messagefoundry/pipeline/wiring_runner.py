@@ -947,21 +947,24 @@ _UNLISTED_SENDER_ERROR = (
     "allowlist under its issuing CA"
 )
 _UNLISTED_SENDER_NAK_TEXT = "sender not permitted"
-#: How far into a refused body the AR's header echo looks for the end of MSH, as the MLLP
-#: listener's own handler-fault NAK does, so a large refused body is never parsed whole to echo it.
+#: How far into a refused body the AR's header echo looks for the end of MSH, so a large refused
+#: body is never parsed whole to echo it. The MLLP listener's handler-fault NAK bounds its own scan
+#: separately, at a larger figure; an MSH longer than this is echoed from its first part only.
 _UNLISTED_SENDER_HEADER_SCAN_BYTES = 4096
 
 
 def _header_segment(raw: bytes, encoding: str) -> str:
     """The first segment of a refused body, decoded in the inbound's charset, for the AR's echo.
 
-    Bounded and lenient: an unreadable or missing MSH leaves ``build_ack`` to fall back to its own
-    header defaults, and nothing past the first segment break is read."""
+    Bounded and lenient: nothing past the first segment break is read, and a segment that does not
+    decode strictly gives ``""``, so ``build_ack`` falls back to its own header defaults. Strict, not
+    ``errors="replace"``: a U+FFFD echoed into the AR would not re-encode under a charset such as
+    ``ascii``, and the reply would then fail to frame after the row was written."""
     prefix = raw[:_UNLISTED_SENDER_HEADER_SCAN_BYTES].lstrip()
     breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
     try:
-        return prefix[: min(breaks, default=len(prefix))].decode(encoding, errors="replace")
-    except LookupError:
+        return prefix[: min(breaks, default=len(prefix))].decode(encoding)
+    except (LookupError, UnicodeDecodeError):
         return ""
 
 

@@ -2751,7 +2751,8 @@ def _mllp_client_subjects(value: Any, *, tls: Any, tls_ca_file: Any) -> dict[str
     if not tls or not tls_ca_file:
         raise WiringError(
             f"{setting} needs tls=True and tls_ca_file: without a client CA the listener requests "
-            "no certificate, so no sender could be listed"
+            "no certificate, so no sender could be listed. It is an inbound setting; an outbound "
+            "connection refuses it whatever else is set"
         )
     unqualified = [
         n for names in subjects.values() for n in names if not QUALIFIED_CERT_NAME.fullmatch(n)

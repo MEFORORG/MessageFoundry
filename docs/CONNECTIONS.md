@@ -469,8 +469,11 @@ accepted and dropped.
 - On an inbound that is not HL7 v2, or whose `ack_mode` is `none`, there is no HL7 reply to give.
   The message is recorded the same way, then the connection closes with nothing written; the close
   is that feed's refusal.
-- If the `ERROR` row cannot be written, no `AR` is sent. The sender gets the listener's `AE`, the
-  one any inbound-handler fault gets, so it resends.
+- If the `ERROR` row cannot be written, no `AR` is sent. On an inbound that replies in HL7 the
+  sender gets the listener's `AE`, the one any inbound-handler fault gets, so it resends. On any
+  other inbound nothing is sent and the connection closes; that message is then recorded only by a
+  `handler_error` connection event and an ERROR log line, not as a row, which is the gap the
+  `SourceConnector` docstring names for a sender that waits for no reply.
 
 The connection closes after that first read, because the certificate cannot change within the
 session; anything the sender has not yet had read stays with it. The connection caps bound how

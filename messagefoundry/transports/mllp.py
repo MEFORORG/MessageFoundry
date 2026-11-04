@@ -2215,7 +2215,10 @@ class MLLPSource(SourceConnector):
         if self._client_subjects is None:
             return True
         ssl_object = writer.get_extra_info("ssl_object")
-        peercert = ssl_object.getpeercert() if ssl_object is not None else None
+        try:
+            peercert = ssl_object.getpeercert() if ssl_object is not None else None
+        except ValueError:  # ssl's "handshake not done": nothing verified, so refuse
+            return False
         if not peercert:
             return False
         verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
@@ -2557,9 +2560,9 @@ class MLLPSource(SourceConnector):
                     handshaking = False
                     if self._stopping:
                         return  # the handshake finished after stop() began: refuse it unread
-                # BACKLOG #4907: a verified certificate outside tls_client_subjects. Its first
-                # frame is handed to the runner's refusal, which records it as ERROR before
-                # answering AR, so it is never accepted and dropped. The line names the peer
+                # BACKLOG #4907: a verified certificate outside tls_client_subjects. The frames
+                # of its first read go to the runner's refusal, which records each as ERROR
+                # before answering AR, so none is accepted and dropped. The line names the peer
                 # address only, never the certificate: a subject can name a person.
                 unlisted = not self._sender_listed(writer)
                 handle: InboundHandler | None = (
@@ -2568,10 +2571,14 @@ class MLLPSource(SourceConnector):
                 if unlisted and (count := self._unlisted_log.note(peer_host or "unknown")):
                     logger.warning(
                         "MLLP listener %s: the verified certificate of the sender at %s is not on "
-                        "tls_client_subjects under its issuing CA; the messages of its first read "
-                        "are recorded as ERROR and the connection closes (%d refused so far)",
+                        "tls_client_subjects under its issuing CA; %s (%d refused so far)",
                         self._pacing_name,
                         peer_host or "unknown",
+                        "messages completed by its first read are recorded as ERROR, then the "
+                        "connection closes"
+                        if handle is not None
+                        else "nothing can record its messages here, so none is read and the "
+                        "connection closes",
                         count,
                     )
                 if handle is None:
