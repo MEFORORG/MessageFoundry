@@ -1034,7 +1034,7 @@ def _windows_path_verdict(
         return True
     except _PathEnds:
         return False
-    except OSError as exc:  # a reader the walk does not guard: drive_target, or cwd
+    except OSError as exc:  # a reader the walk does not guard: cwd, or the drive type
         _not_cleared(
             f"a drive or the working directory could not be read: {type(exc).__name__}", exc
         )

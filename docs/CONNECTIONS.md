@@ -2086,7 +2086,10 @@ BACKLOG #5197): a link whose target is rooted with no drive (`\RPC Control\...`,
 a drive-relative spelling (`C:ca.pem`, `D:link\ca.pem`); a name in the path that ends in a space
 or a dot; a link whose target starts with a device prefix written with forward slashes
 (`//?/S:/ca.pem`); a stream name after a link; and a `subst` drive whose target cannot be read.
-A `subst` drive onto a share counts as leading to another host.
+The check reads the path one name at a time, so a name ending in a space or a dot, or a stream
+name, counts only when every folder before it exists; a path that ends at a missing folder first
+is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
+another host.
 When the check cannot finish, a WARNING names the kind of cause, never the path; the path is
 logged at DEBUG only. The value is judged as the text the build sends, so `0` is checked as the
 path `0`. The check is defence in depth, not a guarantee. It misses at least: links to some
