@@ -3522,12 +3522,12 @@ def _serve(args: argparse.Namespace) -> int:
             f"{settings.api.host!r}: the engine terminates TLS itself but performs NO certificate "
             "revocation check (stdlib ssl has no OCSP/CRL fetch; the engine is offline-by-default), so "
             "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). A declared "
-            "[api].tls_terminated_upstream does not exempt this bind: the engine still terminates "
-            "the proxy-to-engine hop's TLS itself (BACKLOG #4636). Set "
+            "[api].tls_terminated_upstream does not exempt this bind: behind one, the engine still "
+            "terminates the proxy-to-engine hop's TLS itself (BACKLOG #4636). Set "
             "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
-            "certificates this engine serves and accepts, or keep the engine on loopback "
-            "([security].local_access_only = true) behind a revocation-checking reverse proxy on "
-            "the same machine. See "
+            "certificates this engine serves and accepts, or bind the engine to loopback "
+            "([security].local_access_only, [security].listen_address or serve --host) behind a "
+            "revocation-checking reverse proxy on the same machine. See "
             "docs/adr/0078-certificate-revocation-posture.md.",
             file=sys.stderr,
         )

@@ -36,7 +36,8 @@ validator) without crossing the engine's one-way dependency boundaries. The cont
   performs no revocation, ``serve`` must **refuse to start** an in-process, off-loopback ``[api]`` TLS
   bind unless the operator attests (``MEFOR_TLS_REVOCATION_ATTESTED``) that a revocation-checking PKI
   backs its certificates. A declared upstream terminator does not exempt such a bind (BACKLOG #4636).
-  Secure default = refuse; loopback and plaintext binds never trip it (byte-identical start). This
+  Secure default = refuse; a loopback bind and a bind with no operator certificate never trip it
+  (byte-identical start). This
   module owns the pure predicate + the env read; the ``_serve`` gate wires them.
 """
 
@@ -1020,12 +1021,18 @@ def in_process_tls_revocation_refused(
     **A declared upstream terminator does not exempt the bind** (BACKLOG #4636, Manager decision
     d20261104T080839080-981796). Off loopback, ``serve`` refuses a plaintext proxy-to-engine hop, so a
     terminator in front of an off-loopback bind means the engine terminates TLS itself on that hop,
-    with an operator certificate and, under mTLS, a client certificate it accepts. The proxy's own
-    revocation checks cover the browser's hop, not this one. The plaintext terminator the predicate
-    still exempts is the loopback one, through ``not tls_enabled``: it terminates no TLS in the engine.
+    with an operator certificate and, under mTLS, a client certificate it accepts. The WP-15
+    declaration says a proxy terminates the browser's hop. It does not attest that the proxy checks
+    the revocation of the engine's certificate on the hop behind it, and the engine cannot observe
+    whether it does, so only the attestation clears the bind.
 
-    Pure predicate so the ``_serve`` gate stays a one-liner and is unit-testable in isolation; the
-    loopback default, a plaintext bind and an attested bind start **byte-identically**."""
+    Exempt, and starting **byte-identically**: any loopback bind (``is_loopback``, whatever it
+    serves, the loopback plaintext terminator included); an attested bind; and a bind with no
+    operator certificate (``not tls_enabled``). Off loopback that last case is the engine's minted
+    self-signed placeholder, which only ``[security].enforcement = warn`` with
+    ``--allow-insecure-bind`` (or ``require_encryption_for_remote = false``) starts; no PKI issued
+    it, so there is nothing to revoke. Pure predicate
+    so the ``_serve`` gate stays a one-liner and is unit-testable in isolation."""
     return tls_enabled and not is_loopback and not attested
 
 

@@ -72,8 +72,9 @@ explicit operator opt-out.
    d20261104T080839080-981796. The first bullet keeps its original wording. Since #4636 `serve`
    refuses a plaintext proxy-to-engine hop on any bind host that is not loopback, so off loopback a
    declared proxy re-encrypts to the engine, and the engine terminates that hop's TLS itself on an
-   operator certificate. The proxy's revocation checks cover the browser's hop and not that
-   certificate, so the attestation is now the only proof form for an off-loopback in-process bind.
+   operator certificate. The WP-15 declaration does not attest that the proxy checks that
+   certificate's revocation, and the engine cannot observe whether it does, so the attestation is now
+   the only proof form for an off-loopback in-process bind.
    A proxy on the same machine in front of a loopback bind still never reaches the gate, as the
    loopback case in decision 3 says. The same holds for "proxy-terminated deployments" in the
    *Opt-out* paragraph below.)*
@@ -145,7 +146,9 @@ gate and start **byte-identically** — the default `127.0.0.1` posture is compl
   decision d20261104T080839080-981796, the way engine PR 2578 removed `proxy_proven` from
   `revocation_hop_disposition`. It returns `False` for the loopback, plaintext and attested cases,
   and `True` for an unattested in-process off-loopback TLS bind, a declared terminator in front of
-  it included. A loopback plaintext terminator is the plaintext case.)*
+  it included. A loopback plaintext terminator is exempt as a loopback case. The plaintext case is a
+  bind with no operator certificate; off loopback that is the minted self-signed placeholder, which
+  only `[security].enforcement = warn` with the insecure-bind escape starts.)*
   → `tests/test_tls_policy.py::test_in_process_tls_revocation_refused_matrix`
 
 ## Options considered

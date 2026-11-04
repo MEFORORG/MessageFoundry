@@ -381,8 +381,11 @@ The console stays a **host-side process**; only its target URL changes.
 1. **In-engine TLS revocation is delegated (ADR 0002, accepted).** The in-process API-TLS and direct
    MLLP-over-TLS paths do **not** do live OCSP/CRL — a revoked-but-unexpired cert is not rejected by
    the engine itself (`harden_verify_flags` does strict RFC 5280 *path* validation, not revocation).
-   For **enforced revocation**, use topology (b) with an **OCSP-must-staple** terminator + the org PKI.
-   Document this for any topology-(a) deployment that has a revocation requirement.
+   An **OCSP-must-staple** terminator + the org PKI enforces revocation for the browser's hop. Only
+   the loopback (c to b) topology keeps the engine off the gate; topologies (a) and (b) both serve
+   in-process TLS off loopback and need `MEFOR_TLS_REVOCATION_ATTESTED=1`, which attests that the
+   org PKI enforces revocation for the engine's certificate too (BACKLOG #4636). Document this for
+   any topology-(a) or (b) deployment that has a revocation requirement.
 
 2. **MLLP TLS private keys may be passphrase-encrypted (BUILT in the container work).** `_mllp_ssl_context`
    now plumbs `password=` into `load_cert_chain` on both the inbound and outbound paths, fed by a

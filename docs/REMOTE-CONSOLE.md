@@ -122,7 +122,8 @@ presents must be backed by a revocation-checking PKI — short-lived / ACME-rota
 OCSP-must-staple issuer, or a trust store that consults CRLs. If you cannot make that claim
 honestly, **use Option B instead, with the engine on loopback**: a revocation-checking proxy on the
 same machine in front of a loopback bind never reaches the gate. Option B off loopback does not
-avoid it, because the engine then terminates TLS on its own certificate (BACKLOG #4636). It is blanket and process-wide — it also clears the outbound
+avoid it, because the engine then terminates TLS on its own certificate (BACKLOG #4636). The
+attestation is blanket and process-wide — it also clears the outbound
 revocation refusals on this engine's verifying TLS connectors, so read
 [`DEPLOYMENT.md`](DEPLOYMENT.md) § *Revocation-guard behavior* before setting it
 ([ADR 0078](adr/0078-certificate-revocation-posture.md)).

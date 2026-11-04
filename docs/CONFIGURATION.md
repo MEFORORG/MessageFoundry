@@ -389,7 +389,8 @@ The one row that *does* vary:
 > plaintext_upstream_hop_acknowledged = true  # required: the proxy->engine hop is plaintext, and yours to secure
 > trusted_proxies = ["127.0.0.1"]        # the proxy's DIRECT TCP peer address: on this machine, loopback
 > # On THIS (loopback-bind) topology the two Posture-B attestations only WARN if you omit them; with
-> # an operator tls_cert_file and an off-loopback bind they become an exit 2. Declare them anyway —
+> # an operator tls_cert_file and an off-loopback bind they become an exit 2, and that bind also
+> # needs MEFOR_TLS_REVOCATION_ATTESTED=1. Declare them anyway —
 > # the warning is the record that the proxy->engine hop was considered.
 > proxy_intra_service_auth = "network"   # how the proxy->engine hop is authenticated (attestation only)
 > proxy_tls_min_version = "1.3"          # the TLS floor the proxy negotiates with browsers
@@ -416,7 +417,9 @@ The one row that *does* vary:
 > gate reads neither the data label nor `[security].enforcement`, so a synthetic lab box hits it
 > too), and the terminator additionally needs **`[api].proxy_intra_service_auth`** *and*
 > **`[api].proxy_tls_min_version`** on a PHI instance under `enforcement = enforce` with an
-> off-loopback bind (the rows above). Both are `exit 2`, both land before the console gates, and
+> off-loopback bind (the rows above). That off-loopback terminator bind carries an operator
+> `tls_cert_file`, so it is in-process TLS and needs the revocation attestation as well (BACKLOG
+> #4636). Both are `exit 2`, both land before the console gates, and
 > `--allow-insecure-bind` covers neither. The worked recipes are
 > [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md) §1 Options A/B and [DEPLOYMENT.md](DEPLOYMENT.md) § *Before
 > you expose off-loopback*. Full runbook + reverse-proxy-mTLS reference

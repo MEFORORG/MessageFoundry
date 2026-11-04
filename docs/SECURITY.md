@@ -272,11 +272,13 @@ not required. The proxy must then speak https to the engine and trust that certi
 request through it fails. Off loopback that bind is in-process TLS, so the
 [ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate applies to it: `serve`
 refuses it (exit 2) unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set in the service environment.
-The declared terminator does not exempt it, because the proxy's revocation checks cover the
-browser's hop and not the engine's own certificate (BACKLOG #4636). Setting the acknowledgement without `tls_terminated_upstream` is refused at
+The declared terminator does not exempt it: the declaration does not attest that the proxy checks
+the revocation of the engine's certificate on the hop behind it, and the engine cannot observe
+whether it does (BACKLOG #4636). Setting the acknowledgement without `tls_terminated_upstream` is refused at
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
-`messagefoundry.toml` it finds, so the commit/CI gate catches both refusals before `serve` does, for
-the bind host that file names. A bind host given only as `serve --host` is not in that file, so the
+`messagefoundry.toml` it finds, so the commit/CI gate catches both plaintext-hop refusals before
+`serve` does, for the bind host that file names. It does not read the revocation attestation, which
+`serve` reads from its own environment, so a green check does not mean the revocation gate passes. A bind host given only as `serve --host` is not in that file, so the
 check judges the file's host. The shipped service installer always passes `--host`, so on that path
 the check and `serve` can disagree on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs

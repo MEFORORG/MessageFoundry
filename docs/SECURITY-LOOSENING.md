@@ -359,8 +359,10 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **Still refused:** an off-box bind with no operator certificate, with or without a declared
   TLS-terminating proxy (BACKLOG #4636).
   The engine's self-signed placeholder does not count. Under the default `enforce`, nothing lifts this.
-  Under `[security].enforcement = warn`, `require_encryption_for_remote = false` (below) or
-  `--allow-insecure-bind` lets the bind serve on the placeholder.
+  With no declared proxy, under `[security].enforcement = warn`, `require_encryption_for_remote = false`
+  (below) or `--allow-insecure-bind` lets the bind serve on the placeholder. With a declared proxy,
+  nothing lifts it in any mode: the engine mints no placeholder there, and `serve` refuses the
+  plaintext hop.
 - **`serve --host <non-loopback>` counts as this deviation**, even with no `[security]` block in the file.
   The flag is merged after the `[security]` desugar so it wins over the config, and the loader then folds
   the effective bind back into the posture view: `local_access_only` reads `false` and `listen_address`
