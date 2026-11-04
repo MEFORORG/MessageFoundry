@@ -2726,9 +2726,11 @@ class RevocationHopGuard:
         ``declaration`` is the setting :attr:`declaration` says it is; omitted, the record names a
         connection's flag.
 
-        A context that skips time validity earns no CRL credit (:attr:`crl_checked`). With no
-        ``ways_across`` of its own, such a hop names :data:`EXPIRY_RELAXED_WAYS_ACROSS`, since the
-        default offers ``[tls].crl_file``, a lever that cannot cross it (SDS-3.7)."""
+        A context that skips time validity earns no CRL credit (:attr:`crl_checked`). A connection
+        handing one over with no ``ways_across`` of its own names
+        :data:`EXPIRY_RELAXED_WAYS_ACROSS`, since the default offers ``[tls].crl_file``, a lever
+        that cannot cross it (SDS-3.7). That text names a connection's flags, so a hop that is not
+        a connection keeps the default and passes its own sentence instead (BACKLOG #1498)."""
         expiry_relaxed = context is not None and skips_validity_period(context)
         return cls(
             host=host,
@@ -2739,7 +2741,7 @@ class RevocationHopGuard:
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context) and not expiry_relaxed,
             ways_across=EXPIRY_RELAXED_WAYS_ACROSS
-            if ways_across is None and expiry_relaxed
+            if ways_across is None and expiry_relaxed and connection is not None
             else ways_across,
             attested_reason=attested_reason,
             connection=connection,

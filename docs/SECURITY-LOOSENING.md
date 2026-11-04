@@ -1797,8 +1797,9 @@ count is above `0` (vault BACKLOG #2613).
   this said "No posture gate keys on it", which was false once the call sites handed the guard no
   context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged.
   *(Note 2026-11-03: `capture` changed since. It gives a CRL on a context that skips time validity
-  no credit itself (vault BACKLOG #5086), so a hop handed such a context is refused unless
-  attested too, and names the `tls_allow_expired` remedy unless its caller passes another.)*
+  no credit itself (vault BACKLOG #5086), so a hop handed such a context is decided as above
+  in either posture, and a connection's refusal names the `tls_allow_expired` remedy unless its
+  caller passes another.)*
   The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —

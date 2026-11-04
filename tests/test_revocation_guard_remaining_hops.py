@@ -532,6 +532,18 @@ def test_an_unattested_crl_on_a_context_that_skips_time_validity_is_refused() ->
     assert "Configure [tls].crl_file" not in str(exc.value)
     own = _capture_guard(_crl_context(skip_validity=True), attested=False, ways_across="")
     assert own.ways_across == ""
+    # That remedy names a connection's flags, so a hop that is not a connection is not given it.
+    not_a_connection = RevocationHopGuard.capture(
+        host=REMOTE,
+        cell="test",
+        description="verified TLS egress (no revocation check)",
+        attested=False,
+        context=_crl_context(skip_validity=True),
+        posture=ENFORCING,
+        connection=None,
+    )
+    assert not_a_connection.ways_across is None
+    assert not_a_connection.disposition() is HopDisposition.REFUSE
     kept = _capture_guard(_crl_context(skip_validity=False), attested=False)
     assert kept.ways_across is None
     assert kept.disposition() is HopDisposition.ALLOW

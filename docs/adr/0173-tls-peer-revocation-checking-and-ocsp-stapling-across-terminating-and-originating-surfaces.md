@@ -776,8 +776,10 @@ validity earns no credit, and such a hop is refused under an enforcing posture u
 (vault BACKLOG #5086, owner ruling 2026-11-03). The call sites below still pass no context there,
 which now changes no disposition. The remedy a refusal names comes from the `ways_across` a call
 site passes: MLLP, the DICOM SCU and FTPS pass `EXPIRY_RELAXED_WAYS_ACROSS`, REST, SOAP and FHIR
-still name the default (§13, *Left open*), and a caller that hands `capture()` the relaxed context
-with no `ways_across` gets `EXPIRY_RELAXED_WAYS_ACROSS` from it.)* The
+still name the default (§13, *Left open*), and a connection that hands `capture()` the relaxed
+context with no `ways_across` gets `EXPIRY_RELAXED_WAYS_ACROSS` from it. Unlike the 2026-10-30
+correction, which the paragraph's closing sentence says changed no disposition, this one does: such
+a hop is refused where the guard used to admit it.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.

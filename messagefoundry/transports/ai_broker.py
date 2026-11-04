@@ -236,8 +236,8 @@ def _refuse_an_unrevoked_ai_hop(
         refusal = str(exc)
     if refusal is not None:
         raise AiBrokerError(refusal)
-    # capture() reads the process-wide variable into its own field and the CRL flag off the
-    # context, the same two reads every RevocationHopGuard hop makes; disposition() asks
+    # capture() reads the process-wide variable into its own field and the CRL and time-validity
+    # flags off the context, the same reads every RevocationHopGuard hop makes; disposition() asks
     # revocation_hop_disposition, logging and raising nothing. Its cell, description and
     # connection are never rendered here: the texts below are this hop's own. disposition() is
     # never None, since a posture is held.
