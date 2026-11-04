@@ -1254,6 +1254,8 @@ class BackupRunner:
         # What is passed over as neither a link nor config: unlisted folders, then files below.
         passed_over = {Path(p).relative_to(base).as_posix() for p in unlisted}
         added = 0
+        # The names this walk added as regular members, which a second hard link may name.
+        regular_names: set[str] = set()
         # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
         for path in sorted(found):
             rel = path.relative_to(base)
@@ -1275,10 +1277,15 @@ class BackupRunner:
             # Counted from the member tar wrote, so a path swapped for a link or a folder after the
             # check above does not count as a file, nor one tar skipped, such as a socket.
             members = tar.getmembers()
-            if len(members) > before and members[-1].isreg():
+            last = members[-1] if len(members) > before else None
+            if last is not None and last.isreg():
                 added += 1
-            else:
+                regular_names.add(last.name)
+            elif last is None or not (last.islnk() and last.linkname in regular_names):
                 passed_over.add(rel.as_posix())
+            # Otherwise a second name of a file this walk already added: tar stores it as a link
+            # member naming that one, and a restore writes it as a copy of that file's bytes
+            # (:func:`_extract_config_members`), so the archive carries it (vault BACKLOG #5233).
         if passed_over:
             from messagefoundry.config.fingerprint import describe_left_out
 
