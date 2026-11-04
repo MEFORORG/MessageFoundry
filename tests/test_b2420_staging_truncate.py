@@ -326,16 +326,8 @@ async def test_the_os_temp_sweep_is_keyed_on_the_process_owner(tmp_path, monkeyp
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     dead_verify = _abandoned(tmp_path / "ostemp", "mefor-verify-")
     data = (tmp_path / "data").absolute()
-    real_owner = dr_backup._owner_of
-
-    def owner(path: Path) -> object | None:
-        p = Path(path).absolute()
-        # Everything the run makes in its data dir carries the share's owner.
-        if p != data and p.is_relative_to(data):
-            return "share-owner"
-        return real_owner(path)
-
-    monkeypatch.setattr(dr_backup, "_owner_of", owner)
+    # Everything the run makes in its data dir carries the share's owner, its owner probe included.
+    _share_owner_for(data, monkeypatch)
     try:
         result = await runner.run_once(now=1.0)
     finally:
@@ -557,8 +549,9 @@ async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
 
 
 async def test_a_leaked_owner_probe_is_swept_by_the_next_run(tmp_path, monkeypatch) -> None:
-    """A probe whose removal failed is an empty directory with no lock. The next sweep of its root
-    removes it, and leaves a probe-named directory that holds anything."""
+    """An empty probe-named directory with no lock, as an earlier build's directory probe whose
+    removal failed left. The next sweep of its root removes it, and leaves a probe-named directory
+    that holds anything."""
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
     leaked = Path(tempfile.mkdtemp(prefix="mefor-owner-probe-", dir=data))

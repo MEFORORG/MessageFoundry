@@ -628,18 +628,18 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
-        if shortfall is not None:
-            # The early sweep may have missed what this account's killed run left, as when its probe
-            # answered None, and it would refuse every later run until someone deleted it. Probe
+        if shortfall is not None and probed is None:
+            # The early probe answered None, so the early sweep may have missed what this account's
+            # killed run left, and it would refuse every later run until someone deleted it. Probe
             # once more and, only when that owner is not one a sweep above already went by, sweep by
             # it and check once more whatever the sweep counted: a leftover it emptied but could not
             # remove is not counted, yet frees the space. No run directory is open yet, so a refusal
             # still leaves no lock or marker. When this probe cannot be created either, the refusal
             # stands.
-            probed = await asyncio.to_thread(_probe_owner, staging_root)
-            if probed is not None and probed not in swept_by:
-                swept_by.append(probed)
-                await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
+            again = await asyncio.to_thread(_probe_owner, staging_root)
+            if again is not None and again not in swept_by:
+                swept_by.append(again)
+                await asyncio.to_thread(_sweep_owned, staging_root, again, own=None)
                 shortfall = await asyncio.to_thread(
                     self._space_shortfall,
                     staging_root,
@@ -2677,12 +2677,19 @@ def _probe_owner(root: Path | None) -> object | None:
     The probe holds no lock and no marker, so it is never a staging directory. One whose removal
     fails is left empty, and the next sweep of that root by its owner removes it
     (:func:`_sweep_owned`)."""
-    # `_owner_of_fd` never raises, so an `OSError` here is the probe's creation or its removal.
+    owner: object | None = None
     try:
         with _owner_probe(root) as (fd, name):
-            return _owner_of_fd(fd, name)
-    except OSError:
-        return None
+            owner = _owner_of_fd(fd, name)
+    except OSError as exc:
+        # The probe's creation, or its removal once the owner was read, which keeps that owner.
+        # `_owner_of_fd` itself never raises.
+        log.warning(
+            "DR staging: owner probe in %s failed: %s",
+            tempfile.gettempdir() if root is None else root,
+            safe_exc(exc),
+        )
+    return owner
 
 
 def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
@@ -2732,10 +2739,8 @@ def _fallback_root_owner(root: Path, process: object | None) -> object | None:
     is swept by it. Where a new entry gets the process's owner, a root this account made carries it,
     so the sweep frees a killed run's leftover before the space check, as it did before the probe.
     The root is opened (:func:`_open_for_owner`) and its owner read from that descriptor; on Windows
-    a link or junction root is refused, as :func:`_owner_of` refuses one. What it leaves open: a
-    staging root another principal made on such a share, carrying the process's owner, passes the
-    gate; and a root another account owns, such as a data dir the root account made, fails it, so
-    there the early sweep is off on a volume no probe can be created on."""
+    a link or junction root is refused, as :func:`_owner_of` refuses one. What the gate leaves open
+    is listed once, in docs/PHI.md section 2's staging row."""
     if not os.path.isdir(root):
         return None
     log.warning(
@@ -2745,13 +2750,22 @@ def _fallback_root_owner(root: Path, process: object | None) -> object | None:
         return None
     try:
         fd = _open_for_owner(root)
-    except OSError:
+    except OSError as exc:
+        log.warning(
+            "DR staging: could not open staging root %s to read its owner: %s", root, safe_exc(exc)
+        )
         return None
     try:
         if _names_another_path(fd):
+            log.warning(
+                "DR staging: staging root %s is a link or junction; its owner is not read", root
+            )
             return None
         return process if _owner_of_fd(fd, root) == process else None
-    except OSError:
+    except OSError as exc:
+        log.warning(
+            "DR staging: could not read the owner of staging root %s: %s", root, safe_exc(exc)
+        )
         return None
     finally:
         os.close(fd)
@@ -2794,7 +2808,9 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
     standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
     temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
-    with :func:`_sweep_owned` by the same rule, keyed on the owner a new directory in each gets.
+    with :func:`_sweep_owned` by the same rule: the staging root keyed on the owner a probe there
+    gets (:func:`_probe_owner`), or on the process's owner only as :func:`_fallback_root_owner`
+    allows, and the OS temp dir on :func:`_process_owner`.
     Another account could plant a directory in either holding a lock file and a marker, and the
     teardown must never run on a tree it controls."""
     owner = _owner_of(owned_like)

@@ -148,6 +148,34 @@ async def test_a_full_volume_still_frees_a_killed_runs_leftover_before_space_ref
         r.levelno == logging.WARNING and "could not learn the owner" in r.getMessage()
         for r in caplog.records
     )
+    # The failed probe's own cause is logged, not swallowed.
+    assert any(
+        "owner probe in" in r.getMessage() and "No space left" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_a_short_run_whose_early_probe_answered_does_not_probe_again(
+    tmp_path, monkeypatch
+) -> None:
+    """The second probe on a shortfall runs only when the early probe answered None, as docs/PHI.md
+    says. When the early probe answered, the early sweep already went by that owner, so a short run
+    refuses with `space` after one probe, writing no second probe into a nearly full root."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    probes = _root_probe_answers_none(data, monkeypatch, first=0)  # records, never refuses
+
+    class _Usage:
+        free = 1
+
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: _Usage())
+    try:
+        with pytest.raises(dr_backup.BackupError) as caught:
+            await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert caught.value.kind == "space"
+    assert len(probes) == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the descriptor-read probe is POSIX only")
