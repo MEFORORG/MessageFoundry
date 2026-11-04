@@ -603,15 +603,15 @@ async def reconcile_rotation_meta(
         changed_fp = dek_changed(prior, fingerprint)
         record = stored.get(ROTATION_RECORD_ID)
         hold = None if changed_fp is False else _rotation_hold(record, fingerprint)
-        opened = False
         if changed_fp and hold is None and audit_rolled is False:
             # BACKLOG #4942, #4936: no rotate-key run has rolled the chain to this key, so data may
             # still be under the prior one. Opened as the command opens it, dates kept, so the run
-            # that completes finds it and closes it, and a later start reads the same dates.
+            # that completes finds it and closes it, and a later start reads the same dates. It
+            # always writes here: the stamp changed, and a record naming this key would have held.
+            # Re-read for those dates, which `dated` below takes when there is no stamp.
             await open_rotation_record(meta_store, dek_key_id, today.isoformat())
             record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-            hold = _rotation_hold(record, fingerprint)
-            opened = hold is not None
+            hold = _OPENED_AT_START
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.
@@ -620,7 +620,7 @@ async def reconcile_rotation_meta(
         if hold is not None:
             # BACKLOG #3737. Nothing is written, so the run that completes still sees a change and
             # stamps it.
-            log.warning(_OPENED_AT_START if opened else hold)
+            log.warning(hold)
         elif changed_fp:
             last_rotated = today  # rotation auto-detected, so reset the clock
         elif changed_fp is None:

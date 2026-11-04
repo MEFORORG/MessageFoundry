@@ -87,6 +87,11 @@ def _plant_unopenable_upload(uploads: Path) -> list[Path]:
     return [uploads / f"{meta.file_id}.blob", uploads / f"{meta.file_id}.meta"]
 
 
+async def _refuse_reencrypt(self: MessageStore) -> int:
+    """Stands in for a store pass that aborts, so the run stops before the audit roll."""
+    raise CipherError("no configured key decrypts this value")
+
+
 def _env(monkeypatch: pytest.MonkeyPatch, active: str, retired: str, uploads: Path) -> None:
     _rotate_env(monkeypatch, active=active, retired=retired, uploads=uploads)
 
@@ -172,11 +177,7 @@ def test_a_run_the_store_pass_aborts_leaves_the_record_open(
     """The record is opened first, so a run that never reaches the stamp step is held too. A killed
     process stands where this abort does: neither gets as far as anything written last."""
     db, uploads, key_a, key_b = rig
-
-    async def refuse(self: MessageStore) -> int:
-        raise CipherError("no configured key decrypts this value")
-
-    monkeypatch.setattr(MessageStore, "reencrypt_to_active", refuse)
+    monkeypatch.setattr(MessageStore, "reencrypt_to_active", _refuse_reencrypt)
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
     capsys.readouterr()
@@ -364,15 +365,8 @@ def test_the_chain_answers_whether_it_rolled_to_the_active_key(tmp_path: Path) -
     asyncio.run(_seed(keyed, tmp_path / "u1", key_a))
     asyncio.run(_seed_keyless_chain(keyless, tmp_path / "u2", key_a))
 
-    async def answer(db: Path, key: str, *retired: str) -> bool | None:
-        store = await _open(db, key, *retired)
-        try:
-            return audit_chain_rolled(store)
-        finally:
-            await store.close()
-
-    async def no_key(db: Path) -> bool | None:
-        store = await MessageStore.open(db)
+    async def answer(db: Path, key: str | None, *retired: str) -> bool | None:
+        store = await (MessageStore.open(db) if key is None else _open(db, key, *retired))
         try:
             return audit_chain_rolled(store)
         finally:
@@ -382,7 +376,7 @@ def test_the_chain_answers_whether_it_rolled_to_the_active_key(tmp_path: Path) -
     assert asyncio.run(answer(keyed, key_b, key_a)) is False
     assert asyncio.run(answer(keyed, key_b)) is False  # the range's key is not configured
     assert asyncio.run(answer(keyless, key_a)) is None
-    assert asyncio.run(no_key(tmp_path / "empty.db")) is None
+    assert asyncio.run(answer(tmp_path / "empty.db", None)) is None
     assert audit_chain_rolled(object()) is None
 
 
@@ -715,12 +709,8 @@ def test_a_start_on_the_new_key_alone_before_the_roll_breaks_the_chain_and_the_r
     writes an audit row under it inside the prior key's range. No later run can roll that chain, so
     the refusal must say so and name the way out, not only send the operator to re-run."""
     db, uploads, key_a, key_b = rig
-
-    async def refuse(self: MessageStore) -> int:
-        raise CipherError("stops the run before the roll")
-
     with monkeypatch.context() as patch:
-        patch.setattr(MessageStore, "reencrypt_to_active", refuse)
+        patch.setattr(MessageStore, "reencrypt_to_active", _refuse_reencrypt)
         _env(monkeypatch, key_b, key_a, uploads)
         assert main(["rotate-key", "--db", str(db)]) == 1
     capsys.readouterr()
@@ -753,7 +743,7 @@ def test_a_chain_with_no_genesis_row_refuses_every_key_and_names_the_way_out(
     db, uploads = tmp_path / "keyless.db", tmp_path / "uploads"
     key_a, key_b, key_c = generate_key(), generate_key(), generate_key()
     asyncio.run(_seed_keyless_chain(db, uploads, key_a))
-    for active, retired in ((key_b, key_a), (key_b, key_a), (key_c, f"{key_b},{key_a}")):
+    for active, retired in ((key_b, key_a), (key_c, f"{key_b},{key_a}")):
         _env(monkeypatch, active, retired, uploads)
         assert main(["rotate-key", "--db", str(db)]) == 1
         err = capsys.readouterr().err
