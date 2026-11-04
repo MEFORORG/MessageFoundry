@@ -578,8 +578,8 @@ def structural_phi_hits(
 
     A line no rule can reach (kinds include at least a malformed segment id, a short header line,
     and a bare line under a header with no readable version; see :func:`_line_is_malformed`) is a
-    hit by itself, whatever it holds: the anonymizer passed it through untouched, and a wrapped name or note is exactly
-    what such a line tends to carry.
+    hit by itself, whatever it holds: the anonymizer passed it through untouched, and a wrapped
+    name or note is exactly what such a line tends to carry.
 
     A dashed SSN or punctuated phone that the message's own field separator cuts across fields
     is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465)."""
