@@ -312,10 +312,10 @@ is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
   `proxy_intra_service_auth`.
 - **Any proxy in `[api].trusted_proxies`**, in either shape, owes `[security].web_console_public_address`
   under `enforce`, on a loopback bind too: without it, `serve` refuses to start. The ASVS 12.1.1 probe
-  dials that address at start under `enforce`, and `serve` refuses when it cannot reach it, when it
+  dials that address at start under `enforce`, and `serve` refuses at least when it cannot reach it, when it
   accepts TLS 1.0 or 1.1, or when it does not negotiate TLS 1.3.
 - **The web console behind a declared terminator** needs `[security].web_console_public_address` in
-  every enforcement mode: `serve` refuses to serve the console without it. Behind a declared
+  every enforcement mode: `serve` refuses to start without it. Behind a declared
   terminator the console is served only when `[security].serve_web_console = true` is set.
 
 ### API revocation gate
