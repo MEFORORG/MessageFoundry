@@ -2104,9 +2104,10 @@ the same permission set on the same method reds CI until it is listed here.
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
 > by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
 > #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
-> flag request from that actor whose direction is not `inbound`, through the JSON route or the
-> web console's (BACKLOG #3378). The row does not say which, so read the actor's other requests
-> around it before closing it as a wrong-engine-shard request.
+> flag request refused for its direction. Such a row's detail carries
+> `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
+> direction (BACKLOG #3378). The JSON route writes it for a direction of `outbound`, and the web
+> console's flag route for any direction other than `inbound`.
 > With an engine bound but not started there is no graph and no name exists. Every route still
 > checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
 > first three routes and 404 from the control routes, with no denial row. With no engine bound at
@@ -2116,13 +2117,18 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name the running graph does not have. The web
-> console's twin gives a scoped caller the same 403 and denial row for a direction other than
-> `inbound` or `outbound`; an all-channels caller gets 404 for it (BACKLOG #3378).
+> reaches the engine, which answers 409 for a name the running graph does not have. The JSON
+> route validates the body before any of this, so a direction other than `inbound` or `outbound`
+> gets a 422 there with no denial row, scoped caller or not. The web console's twin reads the
+> direction itself: for such a direction it gives a scoped caller the 403 and a denial row, and an
+> all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. Each rule it shows has a null `id`, because the
-> id is free text that can hold any connection name (BACKLOG #3378). When it withholds at least one rule, it writes an
+> scope, and `control_target` is unset or in it. Each rule it shows has a null `id` (BACKLOG
+> #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> connection name in it, and nothing can tell a label that names one from one that does not. An
+> all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is
+> shown. When it withholds at least one rule, it writes an
 > `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
 > contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
 > or a defect in `AUDIT_WRITE_DEFECTS` loses, is logged at ERROR and the read still answers. A row

@@ -105,6 +105,19 @@ async def test_ui_flag_bad_direction_from_a_scoped_caller_is_the_audited_403(
         assert sorted(row["channel_id"] for row in rows) == ["IB_A", "IB_B"]
         # ADR 0150: a console denial names the browser's host, as the JSON route's does.
         assert all(row["client"] for row in rows), rows
+        # The marker tells the IB_A row, an inbound the scope lists, from a request asked of the
+        # wrong engine shard (docs/SECURITY.md).
+        assert all(json.loads(row["detail"])["flag_direction_not_inbound"] is True for row in rows)
+        # The control: the console's out-of-scope refusal for a good direction carries no marker.
+        r = await c.post(
+            "/ui/connections/IB_B/flag",
+            data={"direction": "inbound", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 403, r.text[:300]
+        rows = await engine.store.list_audit(actor="dep", action="auth.channel_denied")
+        unmarked = [json.loads(row["detail"]) for row in rows]
+        assert unmarked.count({"channel": "IB_B"}) == 1, unmarked
     async with ui_client(engine, service) as c:
         await cookie_login(c, "wide")
         r = await c.post(

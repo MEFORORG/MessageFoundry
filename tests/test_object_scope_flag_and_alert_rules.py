@@ -111,6 +111,35 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
         assert (await _flag(c, toml_engine, hw, "OB_TOML", "outbound"))[0] == 200
 
 
+async def test_flag_direction_refusal_row_carries_its_marker(
+    toml_engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378: a flag request refused for its direction can name an inbound inside the
+    actor's own scope, which a wrong-engine-shard request does too. Its denial row carries
+    ``flag_direction_not_inbound`` so the two are told apart. The control: an out-of-scope inbound
+    refused with the right direction carries no marker. A direction that is neither side is a 422
+    with no denial row, before any scope check."""
+    service = await _service(toml_engine, admin_write_rate_limit=False)
+    await _user(service, "own", Role.DEPLOYMENT, ["IB_TOML"])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(toml_engine, auth=service)),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "own")
+        assert (await _flag(c, toml_engine, h, "IB_TOML", "outbound"))[:2] == (403, _DENIED)
+        assert (await _flag(c, toml_engine, h, "IB_NOPE", "inbound"))[:2] == (403, _DENIED)
+        status, _, audit = await _flag(c, toml_engine, h, "IB_TOML", "sideways")
+        assert status == 422
+        assert not [a for a in audit if a[0] == "auth.channel_denied"], audit
+    rows = await toml_engine.store.list_audit(actor="own", action="auth.channel_denied")
+    details = {row["channel_id"]: json.loads(row["detail"]) for row in rows}
+    assert details == {
+        "IB_TOML": {"channel": "IB_TOML", "flag_direction_not_inbound": True},
+        "IB_NOPE": {"channel": "IB_NOPE"},
+    }
+    assert await toml_engine.store.list_connection_flags() == set()
+
+
 async def test_flag_with_no_graph_checks_the_scope_first(engine: Engine) -> None:  # noqa: F811
     """With no registry runner the scope still decides first: a name outside it gets the audited
     403, and a name inside it reaches the engine, which refuses it 409 for its own reason."""

@@ -5545,14 +5545,21 @@ def create_app(
             await _deny_connection(engine, identity, name, client)
 
     async def _deny_connection(
-        engine: Engine, identity: Identity, name: str, client: str | None
+        engine: Engine,
+        identity: Identity,
+        name: str,
+        client: str | None,
+        *,
+        flag_direction_not_inbound: bool = False,
     ) -> NoReturn:
         # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
         # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
         # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
         # A name that fails the connection-name rule is recorded with no channel by the audit
         # helper itself (BACKLOG #3031).
-        await _audit_channel_denied(engine, identity, name, client)
+        await _audit_channel_denied(
+            engine, identity, name, client, flag_direction_not_inbound=flag_direction_not_inbound
+        )
         raise HTTPException(403, CONNECTION_DENIED_DETAIL)
 
     async def _resolve_connection(
@@ -5809,7 +5816,14 @@ def create_app(
             # its own inbounds, and a caller's in-scope inbound on a sibling is no denial.
             or (rr is not None and name not in rr.registry.inbound_names())
         ):
-            await _deny_connection(engine, identity, name, client_ip(request))
+            await _deny_connection(
+                engine,
+                identity,
+                name,
+                client_ip(request),
+                # The row's marker, for a row that names an in-scope inbound (BACKLOG #3378).
+                flag_direction_not_inbound=req.direction != "inbound",
+            )
         try:
             await engine.set_connection_flag(
                 name,
@@ -9616,14 +9630,11 @@ def create_app(
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
-        Such a caller also gets every rule's ``id`` as null (BACKLOG #3378). The id is the
-        operator's free-text label, so whoever writes ``[alerts]`` can put any connection name in
-        it, and nothing here can tell a label that names one from a label that does not. Shown, on
-        a first deployment it would hand a scoped caller a name outside its scope that the two
-        fields above were filtered to hide. An all-channels caller still reads every id.
+        What such a caller reads of each rule's ``id``, and why, is stated once in
+        ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG #3378).
 
         A read that withholds at least one rule writes an audit row; see
-        :func:`_audit_alert_rules_withheld`. A withheld id writes none: the rule itself is shown."""
+        :func:`_audit_alert_rules_withheld`."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
@@ -9634,6 +9645,8 @@ def create_app(
             )
 
         rules = [r for r in alerts.rules if visible(r)]
+        # docs/SECURITY.md, the GET /alerts/rules paragraph, says what a scoped caller reads of
+        # the id and why (BACKLOG #3378).
         show_ids = _user.allowed_channels is None
 
         config = AlertsConfig(
@@ -9661,7 +9674,7 @@ def create_app(
                     cooldown_seconds=r.cooldown_seconds,
                     # #146: report the COUNT of per-rule recipients, never the addresses (secret-guard parity).
                     recipient_count=len(r.recipients) if r.recipients else 0,
-                    # #138 — the operator rule label ({rule_id}); null to a scoped caller (#3378)
+                    # #138 — the operator rule label ({rule_id}); see show_ids (#3378)
                     id=r.id if show_ids else None,
                     control_action=r.control_action,  # #144 — auto-remediation action
                     control_target=r.control_target,

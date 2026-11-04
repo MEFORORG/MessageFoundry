@@ -186,13 +186,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         direction = form.get("direction", "")
         if direction not in ("inbound", "outbound"):
-            # BACKLOG #3378: a channel-scoped caller gets the audited refusal the API handler gives
-            # every target outside its scope, never this 404. The 404 returned before that handler's
-            # scope check, so on a first deployment such a caller's probe here would leave no
-            # denial row. A bad direction names no inbound, and a scoped caller may flag only an
-            # inbound, so the refusal is the one it would get for any other non-inbound target.
+            # BACKLOG #3378: for a bad direction, a channel-scoped caller gets the audited 403 the
+            # API handler gives a non-inbound target, not the 404 below. That 404 returns before the
+            # handler's scope check, so on a first deployment such a caller's probe here would leave
+            # no denial row. The row carries the handler's flag-direction marker, so it reads as
+            # this refusal rather than as a request asked of the wrong engine shard.
             if identity.allowed_channels is not None:
-                await core.audit_channel_denied(engine, identity, name, client_ip(request))
+                await core.audit_channel_denied(
+                    engine, identity, name, client_ip(request), flag_direction_not_inbound=True
+                )
                 raise HTTPException(403, CONNECTION_DENIED_DETAIL)
             raise HTTPException(404, "unknown connection direction")
         req = ConnectionFlagRequest(
