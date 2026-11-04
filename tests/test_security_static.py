@@ -62,8 +62,10 @@ invariants can't silently regress.
   ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
   longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
   ``<Value-x>``.
-  ``_code_text`` takes the text from the next ``>`` after the first match to the next ``</``. That
-  is an ad-hoc same-type extraction, deliberately out of the clause's scope, as are at least
+  ``_code_text`` takes the text from the next ``>`` after the first match to the next ``</``,
+  searching only inside the Fault ``_FAULT_RE`` matched, and yields an empty code for a self-closing
+  element, from text holding another element's start tag, or from text its own close tag does not
+  end. That is an ad-hoc same-type extraction, deliberately out of the clause's scope, as are at least
   ``_FAULT_RE``, ``_WSSE_FAULT_RE``, ``_SENDER_RE`` and ``_RECEIVER_RE``. The fault-code text drives
   at least retry versus dead-letter.
 """

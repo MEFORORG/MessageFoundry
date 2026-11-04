@@ -147,9 +147,11 @@ The fault code is found without a parser too. `_FAULTCODE_RE` / `_CODEVALUE_RE` 
 optional whitespace, an optional prefix of word characters, dots and hyphens ending in `:`, and the name
 `faultcode` or `Value` in any case with no word character after it, so a longer name that goes on with
 at least `.`, `-` or `:`, such as `<faultcode.detail>` or `<Value-x>`, matches too. `_code_text` takes the text from
-the next `>` after the first match to the next `</`, with `str.find`. *(Corrected 2026-11-04, for the
-fault-code sentences: until BACKLOG #2827 made the scan linear, the two patterns captured the code text
-themselves.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
+the next `>` after the first match to the next `</`, with `str.find`, searching only from the `_FAULT_RE`
+match to that Fault's close tag. It yields an empty code when the element is self-closing, when that text holds another element's start tag, or when the `</` is not the
+element's own close tag. *(Corrected 2026-11-04, for the fault-code sentences: until BACKLOG #2827 made
+the scan linear, the two patterns captured the code text themselves, from the first match anywhere in
+the reply, the Header included, and an empty `<faultcode/>` took the next element's text as its code.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
 `tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports
