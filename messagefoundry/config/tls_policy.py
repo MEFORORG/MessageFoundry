@@ -2795,7 +2795,9 @@ class RevocationHopGuard:
         the context it dials with, as at least the MLLP destination, the DICOM SCU and FTPS do.
         ``tests/test_revocation_guard_census.py`` fails on a new site that reaches
         :func:`relax_verify_expiry` by name, and on a listed hop whose guard call drops the flag
-        while handing over some other context."""
+        while handing over some other context, in at least the shapes its own controls pin. It
+        reads call shapes by name, not what the code evaluates to, so some such call sites pass
+        it; ADR 0173 §4.3's note of 2026-11-04 says what it reads."""
         expiry_relaxed = expiry_relaxed or (context is not None and skips_validity_period(context))
         return cls(
             host=host,
