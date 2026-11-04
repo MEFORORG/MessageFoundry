@@ -659,6 +659,8 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
     #: Per parsed file, each ``from ... import name as other`` pair, re-read on every pass so an
     #: alias of a name that is reached only later, or in a file visited earlier, is still followed.
     imports: dict[str, list[tuple[str, str]]] = {}
+    #: Each unit's loaded names, read once when its file is parsed rather than on every pass.
+    loads: dict[str, set[str]] = {}
     reached: dict[str, _Unit] = {}
     grew = True
     while grew:
@@ -667,8 +669,9 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
             if rel not in units:
                 if not any(name in source for name in names):
                     continue
-                tree = ast.parse(source)
+                tree = parse_source(source)
                 units[rel] = _units(rel, tree)
+                loads.update((unit.key, _loads(unit.node)) for unit in units[rel])
                 imports[rel] = [
                     (alias.name, alias.asname)
                     for imp in ast.walk(tree)
@@ -681,7 +684,7 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
                     names.add(asname)
                     grew = True
             for unit in units[rel]:
-                if unit.key in reached or not _loads(unit.node) & names:
+                if unit.key in reached or not loads[unit.key] & names:
                     continue
                 reached[unit.key] = unit
                 grew = True
