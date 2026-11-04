@@ -85,6 +85,7 @@ from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import codec_safe_str, safe_text
+from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
@@ -183,7 +184,12 @@ from messagefoundry.store.sealed_cache import (
     new_state_cache,
     sealed_reference_set,
 )
-from messagefoundry.store.server_schema_verify import declared_schema, refuse_short_schema
+from messagefoundry.store.server_schema_verify import (
+    ColumnShape,
+    declared_schema,
+    mssql_live_type,
+    refuse_short_schema,
+)
 from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
@@ -2712,29 +2718,24 @@ _SCHEMA: list[str] = [
 ]
 
 
-# The revision of the live-schema check _ensure_schema runs after the batch and before the marker
-# (BACKLOG #1720). That check is Python, so the content hash cannot see it, and a store marked before
-# it existed would take the fast path past it forever. Bump this when the check changes what it
-# refuses. It is NOT for migrations: those still live in _SCHEMA, which moves the hash on its own.
-# 1 (BACKLOG #1720): the check is added.
-_SCHEMA_CHECK_REV = 1
-
-
 def _schema_hash() -> str:
     """Content hash of the shipped DDL batch, plus the live-schema check's revision. The
     ``schema_meta`` marker stores it; a match at open means this exact batch already ran and passed
     that check, so the batch (and its exclusive applock) is skipped. Any edit to ``_SCHEMA`` — new
     table, new index, a B10-style guarded migration — changes the hash and forces one full
     (idempotent) run, so a migration has no version constant to forget to bump. On-open migrations
-    MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code. Only the check,
-    which cannot live there, has ``_SCHEMA_CHECK_REV``."""
-    payload = "\n".join(_SCHEMA) + f"\nschema_check_rev={_SCHEMA_CHECK_REV}"
+    MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code. Only the
+    live-schema check, which cannot live there, has a revision: ``SCHEMA_CHECK_REV``, defined once
+    in :mod:`~messagefoundry.store.server_schema_verify` for both server backends (BACKLOG #5062).
+    It is NOT for migrations: those still live in ``_SCHEMA``, which moves the hash on its own."""
+    payload = "\n".join(_SCHEMA) + f"\nschema_check_rev={server_schema_verify.SCHEMA_CHECK_REV}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _declared_schema() -> SchemaShape:
-    """What the live-schema check expects: every object the batch declares (BACKLOG #1720)."""
-    return declared_schema(tuple(_SCHEMA))
+    """What the live-schema check expects: every object the batch declares (BACKLOG #1720), with
+    each column's type, nullability, numbering and declared collation (BACKLOG #5085)."""
+    return declared_schema(tuple(_SCHEMA), "sqlserver")
 
 
 def _object_kind_label(type_desc: object) -> str | None:
@@ -2756,10 +2757,13 @@ def _live_columns_sql(count: int) -> str:
 
     ``OBJECT_ID`` resolves each name the way the batch's unqualified DDL did, in the login's default
     schema and then ``dbo``. The object's type is read too, so a name held by something other than a
-    user table is named as such. The placeholder list is built from a count, never from a name."""
+    user table is named as such. Each column's type, size, nullability, identity and collation are
+    read for :func:`~messagefoundry.store.server_schema_verify.mssql_live_type` (BACKLOG #5085). The
+    placeholder list is built from a count, never from a name; the caller runs none for zero."""
     values = ", ".join(["(?)"] * count)
     return (
-        "SELECT v.name, o.type_desc, c.name"
+        "SELECT v.name, o.type_desc, c.name, TYPE_NAME(c.user_type_id), c.max_length, c.precision,"
+        " c.scale, c.is_nullable, c.is_identity, c.collation_name"
         f" FROM (VALUES {values}) AS v(name)"
         " LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(v.name)"
         " LEFT JOIN sys.columns AS c ON c.object_id = o.object_id AND o.type = 'U'"
@@ -4775,6 +4779,9 @@ class SqlServerStore:
                     lock_bounded = True
                     try:
                         await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
+                        # Read before the batch runs, so DDL the live-schema check cannot read
+                        # fails here, not after the batch (BACKLOG #5062). Cached per process.
+                        _declared_schema()
                         for statement in _SCHEMA:
                             await cur.execute(statement)
                         # BACKLOG #1720: before the marker, on this cursor and under its lifted
@@ -4825,19 +4832,36 @@ class SqlServerStore:
         what is not. Reads only."""
         expected = _declared_schema()
         tables = sorted(expected.columns)
-        await cur.execute(_live_columns_sql(len(tables)), tables)
-        # Lower-cased, as the DDL reader spells a name for this backend's default collations.
-        column_rows = [
-            (table, _object_kind_label(kind), None if column is None else str(column).lower())
-            for table, kind, column in await cur.fetchall()
-        ]
+        column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
+        # `VALUES ()` is a syntax error, so a batch that declared nothing reads nothing.
+        if tables:
+            await cur.execute(_live_columns_sql(len(tables)), tables)
+            for row in await cur.fetchall():
+                table, kind, column, type_name, length, precision, scale = row[:7]
+                nullable, identity, collation = row[7:]
+                shape = (
+                    None
+                    if type_name is None
+                    else ColumnShape(
+                        mssql_live_type(str(type_name), int(length), int(precision), int(scale)),
+                        bool(nullable),
+                        bool(identity),
+                        None if collation is None else str(collation),
+                    )
+                )
+                # Lower-cased, as the DDL reader spells a name for this backend's collations.
+                name = None if column is None else str(column).lower()
+                column_rows.append((table, _object_kind_label(kind), name, shape))
         names = sorted(expected.named_indexes)
         pairs = [v for name in names for v in (expected.named_indexes[name].table, name)]
-        await cur.execute(_live_indexes_sql(len(names)), pairs)
+        index_rows: list[Any] = []
+        if names:
+            await cur.execute(_live_indexes_sql(len(names)), pairs)
+            index_rows = list(await cur.fetchall())
         taken: dict[str, str] = {}
         unusable: dict[str, str] = {}
         found: dict[str, tuple[bool, bool, dict[int, str]]] = {}
-        for row in await cur.fetchall():
+        for row in index_rows:
             name, index_id, unique, has_filter, disabled, hypothetical, stats_id = row[:7]
             ordinal, column, desc = row[7:]
             if index_id is None:

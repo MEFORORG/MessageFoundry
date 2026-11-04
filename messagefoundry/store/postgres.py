@@ -95,6 +95,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
@@ -195,6 +196,7 @@ from messagefoundry.store.sealed_cache import (
     sealed_reference_set,
 )
 from messagefoundry.store.server_schema_verify import (
+    ColumnShape,
     declared_schema,
     key_column,
     refuse_short_schema,
@@ -1267,13 +1269,21 @@ _FIFO_OUT_SEQ_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq"
     " ON queue(stage, destination_name, status, seq)"
 )
-#: What the live-schema check expects: the batch, then every index the migration builds. The
-#: migration's columns are in the batch's CREATE TABLE statements already, so it adds none here.
+# The pre-ADR-0060 FIFO index names the migration drops once their seq-trailing successors exist.
+# Constants for the same reason as the builds above: the check reads what the migration runs, so a
+# name dropped here is not expected (BACKLOG #5062).
+_FIFO_IN_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_in"
+_FIFO_OUT_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_out"
+#: What the live-schema check expects: the batch, then every index the migration builds or drops, in
+#: the order it runs them. The migration's columns are in the batch's CREATE TABLE statements
+#: already, so it adds none here; a test holds each ADD's type and nullability to that CREATE TABLE.
 _MIGRATION_INDEX_DDL: Final = (
     _BODY_REF_INDEX_DDL,
     _LEASE_INDEX_DDL,
     _FIFO_IN_SEQ_INDEX_DDL,
     _FIFO_OUT_SEQ_INDEX_DDL,
+    _FIFO_IN_DROP_DDL,
+    _FIFO_OUT_DROP_DDL,
     _RECEIVED_INDEX_DDL,
 )
 
@@ -1281,16 +1291,27 @@ _MIGRATION_INDEX_DDL: Final = (
 # Each name is resolved the way the batch's unqualified DDL resolved it: a table through the search
 # path, and an index in the namespace of the table it is declared on, which is where CREATE INDEX IF
 # NOT EXISTS looked for it. The relkind is read too, so a name held by another kind of relation is
-# named as such. Every name travels as a bound array, never spliced.
+# named as such. Every name travels as a bound array, never spliced. Each column's type is read as
+# format_type() prints it, with its NOT NULL and whether the server numbers it, an identity or a
+# SERIAL's nextval() default (BACKLOG #5085). Every row carries current_schema(), the schema the
+# batch's unqualified DDL resolved into, for the refusal to name.
 _LIVE_COLUMNS_SQL = (
-    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col"
+    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col,"
+    " pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull,"
+    " (a.attidentity <> '' OR pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%')"
+    " AS numbered, pg_catalog.current_schema()::text AS schema_name"
     " FROM pg_catalog.unnest($1::text[]) AS t(name)"
     " LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(t.name)"
     " LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0"
     " AND NOT a.attisdropped AND c.relkind IN ('r', 'p')"
+    " LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
 )
-# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC. pg_get_indexdef with a column
-# number prints that key column alone: its name, or the expression. The two arrays are zipped with
+# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC and bit 1 NULLS FIRST.
+# pg_get_indexdef with a column number prints that key column alone, its name or the expression, and
+# none of its options, so a collation other than the column's, an operator class that is not its
+# type's default, and a NULLS order other than the direction's default are added after it (BACKLOG
+# #5062). The DDL reader refuses all three, so a live key carrying one compares unequal. Each vector
+# is zero-based, so key k is at k - 1. The two name arrays are zipped with
 # ROWS FROM and one unnest each: the parser rewrites a multi-argument unnest in FROM into that form
 # only when the name is unqualified, so pg_catalog.unnest($1, $2) finds no such function.
 _LIVE_INDEXES_SQL = (
@@ -1298,7 +1319,15 @@ _LIVE_INDEXES_SQL = (
     " i.indisunique AS uniq, (i.indpred IS NOT NULL) AS partial,"
     " (i.indisvalid AND i.indisready) AS usable, am.amname::text AS method,"
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
+    "   || COALESCE((SELECT ' COLLATE ' || pg_catalog.quote_ident(co.collname::text)"
+    "     FROM pg_catalog.pg_collation co WHERE co.oid = i.indcollation[k - 1] AND co.oid <> 100"
+    "     AND co.oid IS DISTINCT FROM (SELECT ka.attcollation FROM pg_catalog.pg_attribute ka"
+    "       WHERE ka.attrelid = i.indrelid AND ka.attnum = i.indkey[k - 1])), '')"
+    "   || COALESCE((SELECT ' ' || oc.opcname::text FROM pg_catalog.pg_opclass oc"
+    "     WHERE oc.oid = i.indclass[k - 1] AND NOT oc.opcdefault), '')"
     "   || CASE WHEN (i.indoption[k - 1]::int & 1) = 1 THEN ' DESC' ELSE '' END"
+    "   || CASE (i.indoption[k - 1]::int & 3) WHEN 2 THEN ' NULLS FIRST'"
+    "     WHEN 1 THEN ' NULLS LAST' ELSE '' END"
     "   FROM pg_catalog.generate_series(1, i.indnkeyatts::int) AS k ORDER BY k) AS cols"
     " FROM ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))"
     " AS q(name, tbl)"
@@ -1309,7 +1338,6 @@ _LIVE_INDEXES_SQL = (
     " LEFT JOIN pg_catalog.pg_class t ON t.oid = i.indrelid"
     " LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
 )
-_CURRENT_SCHEMA_SQL = "SELECT pg_catalog.current_schema()::text AS schema_name"
 _RELKINDS: Final = MappingProxyType(
     {
         "r": "table",
@@ -1335,16 +1363,22 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
 
 
 def _declared_schema() -> SchemaShape:
-    """What the live-schema check expects: the batch, then every index the migration builds."""
-    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL))
+    """What the live-schema check expects: the batch, then every index the migration builds or drops,
+    with each column's type and nullability as PostgreSQL's catalog spells them."""
+    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL), "postgres")
 
 
 def _schema_hash() -> str:
     """Content hash of the shipped DDL batch + the migration revision. The ``schema_meta`` marker
     stores it; a match at open means this exact batch (and migration pass) already ran, so both —
     and the schema advisory lock — are skipped (ADR 0064). Any edit to ``_SCHEMA`` changes the hash
-    automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``."""
-    payload = "\n".join(_SCHEMA) + f"\nmigration_rev={_MIGRATION_REV}"
+    automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``, and a change
+    to what the live-schema check refuses bumps the one ``SCHEMA_CHECK_REV`` both backends hash."""
+    payload = (
+        "\n".join(_SCHEMA)
+        + f"\nmigration_rev={_MIGRATION_REV}"
+        + f"\nschema_check_rev={server_schema_verify.SCHEMA_CHECK_REV}"
+    )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -2155,6 +2189,9 @@ class PostgresStore:
                 # tightens: a stricter role- or database-configured lock_timeout is kept. Local to
                 # this transaction, so it reverts at commit or rollback.
                 await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(wait * 1000))
+                # Read before the batch runs, so DDL the live-schema check cannot read fails here
+                # and not after the batch has done its work (BACKLOG #5062). Cached per process.
+                _declared_schema()
                 try:
                     for statement in _SCHEMA:
                         await conn.execute(statement)
@@ -2291,10 +2328,18 @@ class PostgresStore:
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
         expected = _declared_schema()
-        column_rows = [
-            (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"])
-            for r in await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
-        ]
+        column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
+        schema: object = None
+        for r in await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns)):
+            schema = r["schema_name"]
+            shape = (
+                None
+                if r["type"] is None
+                else ColumnShape(str(r["type"]), not r["notnull"], bool(r["numbered"]))
+            )
+            column_rows.append(
+                (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"], shape)
+            )
         names = sorted(expected.named_indexes)
         tables = [expected.named_indexes[name].table for name in names]
         taken: dict[str, str] = {}
@@ -2319,10 +2364,8 @@ class PostgresStore:
                 bool(r["uniq"]),
                 bool(r["partial"]),
             )
-        # The schema the batch's unqualified DDL resolved into, for the refusal to name: with
+        # schema is the one the batch's unqualified DDL resolved into, for the refusal to name: with
         # [store].db_schema unset that is the search path's first schema, which the settings omit.
-        schema_rows = await conn.fetch(_CURRENT_SCHEMA_SQL)
-        schema = schema_rows[0]["schema_name"] if schema_rows else None
         refuse_short_schema(
             self.backend.value,
             self._settings.database,
@@ -2385,8 +2428,8 @@ class PostgresStore:
         # neutral (the claim orders by seq and names no index, ADR 0059) — pure speed restoration.
         await conn.execute(_FIFO_IN_SEQ_INDEX_DDL, timeout=float("inf"))
         await conn.execute(_FIFO_OUT_SEQ_INDEX_DDL, timeout=float("inf"))
-        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
-        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
+        await conn.execute(_FIFO_IN_DROP_DDL, timeout=float("inf"))
+        await conn.execute(_FIFO_OUT_DROP_DDL, timeout=float("inf"))
         await conn.execute(_RECEIVED_INDEX_DDL, timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(

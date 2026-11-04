@@ -34,10 +34,15 @@ from messagefoundry.config.settings import SchemaManagement, StoreSettings
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.schema_verify import IndexShape, SchemaShape
 from messagefoundry.store.server_schema_verify import (
+    ColumnShape,
     ServerSchemaMismatchError,
+    ServerSchemaShape,
+    declared_column,
     declared_schema,
     key_column,
     live_shape,
+    mssql_live_type,
+    refuse_short_schema,
     server_schema_differences,
 )
 from tests._server_schema_rows import mssql_declared, mssql_live_rows, pg_declared, pg_live_rows
@@ -49,10 +54,14 @@ _FIFO = "ix_queue_fifo_in_seq"
 _FIFO_SHAPE = IndexShape("queue", ("stage", "channel_id", "status", "seq"), False, False)
 
 
+def _shapes(shape: SchemaShape) -> Mapping[str, Mapping[str, ColumnShape]]:
+    return shape.column_shapes if isinstance(shape, ServerSchemaShape) else {}
+
+
 def _without_column(shape: SchemaShape, table: str, column: str) -> SchemaShape:
     cols = dict(shape.columns)
     cols[table] = cols[table] - {column}
-    return live_shape(cols, shape.named_indexes)
+    return live_shape(cols, shape.named_indexes, _shapes(shape))
 
 
 def _with_index(shape: SchemaShape, name: str, index: IndexShape | None) -> SchemaShape:
@@ -61,7 +70,13 @@ def _with_index(shape: SchemaShape, name: str, index: IndexShape | None) -> Sche
         del indexes[name]
     else:
         indexes[name] = index
-    return live_shape(shape.columns, indexes)
+    return live_shape(shape.columns, indexes, _shapes(shape))
+
+
+def _with_column(shape: SchemaShape, table: str, column: str, col: ColumnShape) -> SchemaShape:
+    shapes = {t: dict(c) for t, c in _shapes(shape).items()}
+    shapes[table][column] = col
+    return live_shape(shape.columns, shape.named_indexes, shapes)
 
 
 # --- what each batch declares --------------------------------------------------------------------
@@ -146,6 +161,8 @@ def test_every_index_the_postgres_migration_builds_is_one_the_check_reads() -> N
     ]
     assert literals  # positive control: the walk sees the migration's ALTER literals
     assert not [s for s in literals if re.search(r"CREATE\s+(UNIQUE\s+)?INDEX", s, re.I)]
+    # BACKLOG #5062: an index the migration drops is read too, so it is not expected.
+    assert not [s for s in literals if re.search(r"DROP\s+INDEX", s, re.I)]
     built = set(re.findall(r"execute\(\s*(_[A-Z_]+_DDL)\b", source))
     declared = {
         name
@@ -303,7 +320,11 @@ def test_the_refusal_names_where_it_looked_and_scopes_its_remedy() -> None:
     text = str(ServerSchemaMismatchError("postgres", "mf", ["x"]))
     assert ". In database 'mf'; the open refused" in text
     remedy = text[text.index("Rename or drop") :]
-    assert "add a missing column as this build declares it" in remedy
+    # BACKLOG #5085: a column of another type or nullability is told to be altered, not dropped.
+    assert (
+        "add a missing column, or alter a column of another type or nullability, as this build"
+        " declares it" in remedy
+    )
     # The rename-or-drop remedy is scoped to a taken name or an index, never to a whole table.
     rename = remedy[: remedy.index(";")]
     assert rename == (
@@ -488,6 +509,7 @@ class _TwoSchemaPgConn(_PgConn):
                 for table, cols in self.other.columns.items()
             },
             self.other.named_indexes,
+            _shapes(self.other),
         )
 
     async def fetch(self, sql: str, *args: Any) -> list[Any]:
@@ -828,3 +850,345 @@ async def test_live_sqlserver_open_refuses_a_table_missing_a_column(
         await (await bounded(admin.settings, "open over the short table", opened)).close()
     assert "table 'transit_bound_attestation' is missing column 'audit_hash'" in str(caught.value)
     assert await _sqlserver_marker_rows(admin, db) == 0
+
+
+# --- BACKLOG #5085: column type, nullability and numbering ------------------------------------------
+
+
+def test_each_backend_declares_column_types_as_its_catalog_spells_them() -> None:
+    """Literal expectations, not read back from the parser: one column of each kind per backend."""
+    pg = pg_declared().column_shapes
+    assert pg["queue"]["seq"] == ColumnShape("bigint", False, True)  # BIGSERIAL
+    assert pg["queue"]["owner"] == ColumnShape("text", True)
+    assert pg["queue"]["lease_expires_at"] == ColumnShape("double precision", True)
+    assert pg["webauthn_credentials"]["credential_id_hash"] == ColumnShape(
+        "character varying(128)", False
+    )
+    assert pg["sessions"]["seal"] == ColumnShape("text", False)
+    # Renamed in place by the batch on an older store; built under the new name on a new one.
+    assert "owner" not in pg["search_presets"] and "owner_user_id" in pg["search_presets"]
+    ms = mssql_declared().column_shapes
+    assert ms["webauthn_credentials"]["credential_id_hash"] == ColumnShape("nvarchar(128)", False)
+    assert ms["secret_rotation_meta"]["fingerprint"] == ColumnShape("nvarchar(max)", False)
+    assert ms["users"]["oidc_issuer"] == ColumnShape("nvarchar(256)", True)
+    assert ms["users"]["totp_enabled"] == ColumnShape("bit", False)
+    assert any(c.identity for t in ms.values() for c in t.values())
+    assert any(c.collation == "latin1_general_100_bin2" for t in ms.values() for c in t.values())
+
+
+def test_every_column_the_postgres_migration_adds_matches_the_batch() -> None:
+    """The check takes each column's shape from the batch's CREATE TABLE, so a column
+    ``_migrate_lease_columns`` adds to an older table with another type or nullability would be
+    refused on every upgraded store. Pin that each ADD builds the same column."""
+    from messagefoundry.store import postgres
+
+    source = inspect.getsource(postgres.PostgresStore._migrate_lease_columns)
+    adds = re.findall(r'ALTER TABLE (\w+) ADD COLUMN (\w+ [^"]+)"', source)
+    adds += [
+        ("users", f"{c} {t}") for c, t in re.findall(r'^\s+\("(\w+)", "([^"]+)"', source, re.M)
+    ]
+    assert len(adds) >= 20  # positive control: the reads found the migration's ADDs
+    declared = pg_declared().column_shapes
+    wrong = [
+        f"{table}: {text}"
+        for table, text in adds
+        if declared_column("postgres", text) != declared[table][text.split()[0]]
+    ]
+    assert not wrong, wrong
+
+
+@pytest.mark.parametrize(
+    ("dialect", "text", "expected"),
+    [
+        ("postgres", "a INT PRIMARY KEY", ColumnShape("integer", False)),
+        ("postgres", "a BIGSERIAL", ColumnShape("bigint", False, True)),
+        ("postgres", "a INTEGER GENERATED ALWAYS AS IDENTITY", ColumnShape("integer", False, True)),
+        ("postgres", "a VARCHAR(64)", ColumnShape("character varying(64)", True)),
+        ("postgres", "a NUMERIC(10, 2) NOT NULL", ColumnShape("numeric(10,2)", False)),
+        ("postgres", "a TIMESTAMPTZ", ColumnShape("timestamp with time zone", True)),
+        (
+            "postgres",
+            "a TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL DEFAULT ''",
+            ColumnShape("text", False),
+        ),
+        ("sqlserver", "a INT IDENTITY(1,1) PRIMARY KEY", ColumnShape("int", False, True)),
+        ("sqlserver", "a NVARCHAR(MAX) NULL", ColumnShape("nvarchar(max)", True)),
+        ("sqlserver", "a FLOAT NOT NULL DEFAULT 0", ColumnShape("float", False)),
+        (
+            "sqlserver",
+            "a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL",
+            ColumnShape("nvarchar(64)", False, False, "latin1_general_100_bin2"),
+        ),
+        (
+            "sqlserver",
+            "a NVARCHAR(32) NOT NULL CONSTRAINT df_a DEFAULT N'x'",
+            ColumnShape("nvarchar(32)", False),
+        ),
+    ],
+)
+def test_a_column_definition_reads_as_its_shape(
+    dialect: Any, text: str, expected: ColumnShape
+) -> None:
+    assert declared_column(dialect, text) == expected
+
+
+@pytest.mark.parametrize(
+    ("dialect", "text", "match"),
+    [
+        ("postgres", "a GEOMETRY", "does not compare"),
+        ("postgres", 'a TEXT COLLATE "C"', "collation is not compared"),
+        ("postgres", "a TEXT NOT NULL NULL", "both NULL and NOT NULL"),
+        ("postgres", "a TEXT GENERATED ALWAYS AS (b) STORED", "cannot read"),
+        ("sqlserver", "a INT", "leaves NULL to the session"),
+        ("sqlserver", "a AS (b + 1)", "does not compare"),
+        ("sqlserver", "a NVARCHAR(10) SPARSE NULL", "cannot read"),
+    ],
+)
+def test_a_column_definition_the_check_cannot_compare_raises(
+    dialect: Any, text: str, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        declared_column(dialect, text)
+
+
+def test_live_sqlserver_types_spell_as_declared_ones() -> None:
+    for declared, live in (
+        ("NVARCHAR(256)", ("nvarchar", 512, 0, 0)),
+        ("NVARCHAR(MAX)", ("nvarchar", -1, 0, 0)),
+        ("VARCHAR(64)", ("varchar", 64, 0, 0)),
+        ("FLOAT", ("float", 8, 53, 0)),
+        ("INT", ("int", 4, 10, 0)),
+        ("DECIMAL(10, 2)", ("decimal", 9, 10, 2)),
+        ("DATETIME2", ("datetime2", 8, 27, 7)),
+    ):
+        assert declared_column("sqlserver", f"a {declared} NULL").type == mssql_live_type(*live)
+    # A type widening is a different spelling, so it compares unequal.
+    assert (
+        mssql_live_type("nvarchar", 1024, 0, 0)
+        != declared_column("sqlserver", "a NVARCHAR(256) NULL").type
+    )
+
+
+def test_a_guarded_add_that_builds_a_column_another_way_raises_until_altered() -> None:
+    """A guarded ADD runs only on a store that lacks the column, so it and the CREATE TABLE each
+    build it on some store. Disagreeing, the store's shape depends on its history."""
+    create = "CREATE TABLE t (id INT NOT NULL, a NVARCHAR(64) NULL)"
+    add = "IF COL_LENGTH('t','a') IS NULL ALTER TABLE t ADD a NVARCHAR(32) NULL"
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema((create, add), "sqlserver")
+    alter = "IF COL_LENGTH('t','a') <> 128 ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
+    shape = declared_schema((create, add, alter), "sqlserver")
+    assert shape.column_shapes["t"]["a"] == ColumnShape("nvarchar(64)", False)
+    pg = declared_schema(
+        (
+            "CREATE TABLE t (a VARCHAR(64))",
+            "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR(128)",
+            "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
+            "ALTER TABLE t ADD PRIMARY KEY (a)",
+        ),
+        "postgres",
+    )
+    assert pg.column_shapes["t"]["a"] == ColumnShape("character varying(128)", False)
+
+
+def test_a_table_level_primary_key_makes_its_columns_not_null() -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (a NVARCHAR(64), b INT NOT NULL, PRIMARY KEY (a, b))",), "sqlserver"
+    )
+    assert shape.column_shapes["t"]["a"] == ColumnShape("nvarchar(64)", False)
+
+
+@pytest.mark.parametrize(
+    ("live", "clause"),
+    [
+        (ColumnShape("bigint", True), "is bigint NULL, expected integer NOT NULL"),
+        (ColumnShape("integer", True), "is integer NULL, expected integer NOT NULL"),
+        (
+            ColumnShape("integer", False, True),
+            "is integer IDENTITY NOT NULL, expected integer NOT NULL",
+        ),
+    ],
+)
+def test_a_column_of_another_type_nullability_or_numbering_refuses(
+    live: ColumnShape, clause: str
+) -> None:
+    expected = live_shape({"t": {"a"}}, {}, {"t": {"a": ColumnShape("integer", False)}})
+    got = live_shape({"t": {"a"}}, {}, {"t": {"a": live}})
+    assert server_schema_differences(expected, got, {}) == [f"table 't' column 'a' {clause}"]
+    assert server_schema_differences(expected, expected, {}) == []
+
+
+def test_a_collation_is_compared_only_where_the_batch_declares_one() -> None:
+    bin2 = ColumnShape("nvarchar(64)", False, False, "latin1_general_100_bin2")
+    expected = live_shape({"t": {"a", "b"}}, {}, {"t": {"a": bin2, "b": ColumnShape("int", True)}})
+    ci = ColumnShape("nvarchar(64)", False, False, "SQL_Latin1_General_CP1_CI_AS")
+    live = live_shape(
+        {"t": {"a", "b"}}, {}, {"t": {"a": ci, "b": ColumnShape("int", True, False, "any")}}
+    )
+    assert server_schema_differences(expected, live, {}) == [
+        "table 't' column 'a' is nvarchar(64) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,"
+        " expected nvarchar(64) COLLATE latin1_general_100_bin2 NOT NULL"
+    ]
+    upper = ColumnShape("nvarchar(64)", False, False, "Latin1_General_100_BIN2")
+    same = live_shape({"t": {"a", "b"}}, {}, {"t": {"a": upper}})
+    assert server_schema_differences(expected, same, {}) == []
+
+
+def test_refuse_short_schema_reads_each_columns_shape_and_an_empty_table() -> None:
+    """A table with no columns is not missing: each column it lacks is named (BACKLOG #5062)."""
+    expected = live_shape(
+        {"t": {"a"}, "u": {"x", "y"}}, {}, {"t": {"a": ColumnShape("integer", False)}}
+    )
+    rows = [
+        ("t", "table", "a", ColumnShape("bigint", False)),
+        ("u", "table", None, None),
+    ]
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        refuse_short_schema("postgres", "mf", expected, rows, {}, {})
+    assert caught.value.differences == (
+        "table 'u' is missing column 'x'",
+        "table 'u' is missing column 'y'",
+        "table 't' column 'a' is bigint NOT NULL, expected integer NOT NULL",
+    )
+
+
+def test_the_refusal_is_logged_once_without_a_doubled_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    expected = live_shape({"t": {"a"}}, {})
+    with caplog.at_level("ERROR"), pytest.raises(ServerSchemaMismatchError):
+        refuse_short_schema("postgres", "mf", expected, [("t", None, None, None)], {}, {})
+    [record] = [r for r in caplog.records if r.name.endswith("server_schema_verify")]
+    assert record.getMessage().startswith("postgres schema differs: table 't' is missing")
+
+
+async def test_postgres_refuses_a_column_of_another_type() -> None:
+    """The row's case: a type widening on an existing table, which the guarded CREATE skips."""
+    wider = ColumnShape("text", True)
+    conn = _PgConn(_with_column(pg_declared(), "webauthn_credentials", "credential_id_hash", wider))
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        await _pg_store(conn)._ensure_schema()
+    assert caught.value.differences == (
+        "table 'webauthn_credentials' column 'credential_id_hash' is text NULL,"
+        " expected character varying(128) NOT NULL",
+    )
+    assert not conn.marker_written()
+
+
+async def test_sqlserver_refuses_a_not_null_change() -> None:
+    nullable = ColumnShape("nvarchar(max)", True)
+    conn = _MsConn(_with_column(mssql_declared(), "secret_rotation_meta", "fingerprint", nullable))
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        await _ms_store(conn)._ensure_schema()
+    assert caught.value.differences == (
+        "table 'secret_rotation_meta' column 'fingerprint' is nvarchar(max) NULL,"
+        " expected nvarchar(max) NOT NULL",
+    )
+    assert not conn.marker_written()
+
+
+async def test_sqlserver_reads_nothing_for_a_batch_that_declares_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``VALUES ()`` is a syntax error, so neither read runs for zero names (BACKLOG #5062)."""
+    from messagefoundry.store import sqlserver
+
+    monkeypatch.setattr(sqlserver, "_declared_schema", lambda: live_shape({}, {}))
+    conn = _MsConn()
+    await _ms_store(conn)._verify_live_schema(await conn.cursor())
+    assert conn.executed == []
+
+
+def test_both_backends_hash_the_one_check_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.store import postgres, server_schema_verify, sqlserver
+
+    before = (postgres._schema_hash(), sqlserver._schema_hash())
+    monkeypatch.setattr(server_schema_verify, "SCHEMA_CHECK_REV", 99)
+    after = (postgres._schema_hash(), sqlserver._schema_hash())
+    assert before[0] != after[0] and before[1] != after[1]
+    assert not hasattr(sqlserver, "_SCHEMA_CHECK_REV")
+
+
+# --- BACKLOG #5062: DDL the reader used to misread -------------------------------------------------
+
+
+def test_a_multi_target_drop_drops_each_name() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE a (x INT)",
+            "CREATE TABLE b (x INT)",
+            "CREATE TABLE c (x INT)",
+            "CREATE INDEX ix_1 ON c(x)",
+            "CREATE INDEX ix_2 ON c(x)",
+            "DROP TABLE IF EXISTS a, b",
+            "DROP INDEX ix_1 ON c, ix_2 ON c",
+        )
+    )
+    assert set(shape.columns) == {"c"} and not shape.named_indexes
+
+
+@pytest.mark.parametrize(
+    ("statement", "match"),
+    [
+        ("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT", "more than one clause"),
+        ("ALTER TABLE t ADD a INT NULL, b INT NULL", "more than one clause"),
+        ("ALTER TABLE t RENAME TO u", "rename"),
+        ("ALTER INDEX ix_t RENAME TO ix_u", "rename"),
+        ("EXEC sp_rename 't', 'u'", "cannot read"),
+        ("ALTER TABLE t ENABLE ROW LEVEL SECURITY", "cannot read"),
+        ("ALTER TABLE t OWNER TO someone", "cannot read"),
+        ("ALTER TABLE ONLY t* ADD COLUMN a INT", "cannot read"),
+        ("CREATE TABLE t (a TEXT DEFAULT '-- not a comment')", "comment marker inside a string"),
+        ("DROP TABLE public . t", "cannot read"),
+        ("DROP INDEX ix_t ON t WITH (ONLINE = ON)", "cannot read"),
+    ],
+)
+def test_the_parser_refuses_alter_and_drop_forms_it_would_misread(
+    statement: str, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        declared_schema(("CREATE TABLE t (a INT)", statement))
+
+
+def test_a_column_rename_moves_the_column() -> None:
+    shape = declared_schema(
+        (
+            "CREATE TABLE t (old TEXT)",
+            "ALTER TABLE t RENAME COLUMN old TO new",
+            "CREATE TABLE u (a INT NULL)",
+            "EXEC(N'EXEC sp_rename ''u.a'', ''b'', ''COLUMN'';')",
+        )
+    )
+    assert dict(shape.columns) == {"t": frozenset({"new"}), "u": frozenset({"b"})}
+
+
+def test_a_parenthesised_column_key_is_the_column() -> None:
+    shape = declared_schema(("CREATE INDEX ix_p ON t ((a), ((b)) DESC, (a + b))",))
+    assert shape.named_indexes["ix_p"].columns == ("a", "b DESC", "<expr>")
+
+
+def test_a_comment_with_a_quote_in_it_hides_nothing() -> None:
+    shape = declared_schema(
+        ("CREATE TABLE t (\n  a INT, -- this file's note\n  b INT /* it's */\n)",)
+    )
+    assert dict(shape.columns) == {"t": frozenset({"a", "b"})}
+
+
+def test_a_live_key_keeps_the_options_the_ddl_reader_refuses() -> None:
+    """The PostgreSQL index read now prints a key's collation, operator class and NULLS order, so a
+    live index built with one compares unequal to the declared bare key."""
+    assert key_column('name COLLATE "C"') == 'name COLLATE "C"'
+    assert (
+        key_column("body text_pattern_ops DESC NULLS LAST")
+        == "body text_pattern_ops DESC NULLS LAST"
+    )
+    assert key_column("seq NULLS FIRST") == "seq NULLS FIRST"
+    assert key_column("lower(name) DESC NULLS LAST") == "<expr> DESC NULLS LAST"
+    assert (
+        key_column("seq NULLS FIRST")
+        != declared_schema(("CREATE INDEX ix ON t (seq)",)).named_indexes["ix"].columns[0]
+    )
+    from messagefoundry.store import postgres
+
+    for fragment in ("indcollation[k - 1]", "indclass[k - 1]", "NULLS FIRST", "NULLS LAST"):
+        assert fragment in postgres._LIVE_INDEXES_SQL, fragment
