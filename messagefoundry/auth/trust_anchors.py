@@ -1711,12 +1711,18 @@ def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> boo
 
 def _names_lane_sslca(settings: Mapping[str, Any]) -> bool:
     """Whether a DATABASE connection names a non-empty ``odbc_params`` ``sslca`` its lane check may
-    read. A value of spaces counts: the driver may load it as sent, so the build checks that
-    spelling too (:func:`~messagefoundry.transports.database.driver_file_spellings`). A
-    ``dialect`` that is not yet text may resolve to ``generic``, so it is read as one."""
+    read. A value of spaces counts, and :func:`database_ca_anchor_spec` refuses it, as the build
+    does. So does a value that is not text, such as ``0``, judged by the ``str()`` the build sends,
+    not by its truthiness (vault BACKLOG #5197 item 15). A ``dialect`` that is not yet text may
+    resolve to ``generic``, so it is read as one."""
     if not isinstance(settings.get("dialect", "sqlserver"), str):
         settings = {**settings, "dialect": "generic"}  # only for an unresolved dialect
-    return bool(_generic_odbc_param(settings, "sslca"))
+    value = _generic_odbc_param(settings, "sslca")
+    if value is None:
+        return False
+    from messagefoundry.transports.database import _sent_text
+
+    return bool(_sent_text(value))
 
 
 def lane_ca_setting(settings: Mapping[str, Any]) -> str:
@@ -1749,15 +1755,36 @@ def database_ca_anchor_spec(
     ``sslmode``. The value is judged here again, not taken from the build's judgement, and the
     spellings checked come from this one judgement. The lane check turns the ``ValueError`` into a
     refused setting, as it does a bad pin. ``docs/CONNECTIONS.md``, Generic ODBC, states that
-    check's limits."""
+    check's limits.
+
+    A value the build refuses as a boolean or as text (``_odbc_literal``), a padded one included,
+    raises ``ValueError`` too, in every ``sslmode``, before either spelling is walked or statted:
+    no spelling of it is a file a driver is handed, and checking the trimmed one would clear a
+    value the build never sends (vault BACKLOG #5197 item 8). An empty value names no file and
+    answers ``None``, left to the build's refusal, which names the keyword."""
     value = _generic_odbc_param(settings, "sslca")
     if value is None:
         return None
     from messagefoundry.transports.database import (
+        _odbc_literal,
+        _sent_text,
         driver_file_spellings,
         file_keyword_verdicts,
         names_another_host,
     )
+
+    if not _sent_text(value):
+        # An empty value names no file. The build refuses it naming the keyword, where a refusal
+        # here would be reported against tls_ca_file (lane_ca_setting reads it as unset).
+        return None
+    if isinstance(value, bool):
+        # The build refuses a boolean before it reads the text, so ``True`` is never a file a
+        # driver is handed, and the lane check must not walk or stat the relative path "True".
+        raise ValueError(
+            f"{kind} '{name}' odbc_params value for 'sslca' must not be a boolean; write the "
+            "driver's own spelling as a string"
+        )
+    _odbc_literal(value, what="odbc_params value for 'sslca'", connection=name)
 
     verdicts = file_keyword_verdicts(value)
     if names_another_host(value, verdicts):
