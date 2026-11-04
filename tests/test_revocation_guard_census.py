@@ -595,7 +595,7 @@ class _Unit:
     to it), a class body outside its methods, or a module's top-level statements."""
 
     key: str
-    #: The name a caller reaches it by: the class for ``__init__`` or a class body, else the def's.
+    #: The name a caller reaches it by: the class for a dunder method or a class body, else the def's.
     alias: str | None
     node: ast.AST
     #: The bases its class names, by bare name; empty outside a class.
@@ -616,7 +616,11 @@ def _units(rel: str, tree: ast.Module) -> list[_Unit]:
             if isinstance(stmt, ast.ClassDef):
                 walk(stmt.body, f"{prefix}{stmt.name}.", stmt)
             elif isinstance(stmt, _Def):
-                alias = cls.name if cls is not None and stmt.name == "__init__" else stmt.name
+                # A dunder method (__init__, __post_init__, __call__, __enter__) runs through its
+                # class or an instance of it, never through its own name, so its class is the name
+                # a caller reaches it by.
+                dunder = stmt.name.startswith("__") and stmt.name.endswith("__")
+                alias = cls.name if cls is not None and dunder else stmt.name
                 units.append(_Unit(f"{rel}::{prefix}{stmt.name}", alias, stmt, bases))
             else:
                 rest.append(stmt)
@@ -659,8 +663,9 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
     #: Per parsed file, each ``from ... import name as other`` pair, re-read on every pass so an
     #: alias of a name that is reached only later, or in a file visited earlier, is still followed.
     imports: dict[str, list[tuple[str, str]]] = {}
-    #: Each unit's loaded names, read once when its file is parsed rather than on every pass.
-    loads: dict[str, set[str]] = {}
+    #: Each unit's loaded names, read once when its file is parsed. Keyed by the unit, not its key:
+    #: a property's getter and setter, or a redefined def, share one key.
+    loads: dict[int, set[str]] = {}
     reached: dict[str, _Unit] = {}
     grew = True
     while grew:
@@ -671,7 +676,7 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
                     continue
                 tree = parse_source(source)
                 units[rel] = _units(rel, tree)
-                loads.update((unit.key, _loads(unit.node)) for unit in units[rel])
+                loads.update((id(unit), _loads(unit.node)) for unit in units[rel])
                 imports[rel] = [
                     (alias.name, alias.asname)
                     for imp in ast.walk(tree)
@@ -684,7 +689,7 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
                     names.add(asname)
                     grew = True
             for unit in units[rel]:
-                if unit.key in reached or not loads[unit.key] & names:
+                if unit.key in reached or not loads[id(unit)] & names:
                     continue
                 reached[unit.key] = unit
                 grew = True
@@ -693,49 +698,93 @@ def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> _Reach:
     return _Reach(reached, frozenset(names))
 
 
-def _condition_parts(expr: ast.expr, assigned: dict[str, list[ast.expr]]) -> list[ast.expr]:
-    """``expr`` split on ``and``/``or``, a local name replaced by what the function assigns it, so
-    ``relaxed = skips_validity_period(ctx)`` is read where ``None if relaxed else ...`` uses it."""
-    if isinstance(expr, ast.BoolOp):
-        return [part for value in expr.values for part in _condition_parts(value, assigned)]
-    if isinstance(expr, ast.Name) and expr.id in assigned:
-        values = assigned.pop(expr.id)  # popped, so a name assigned from itself cannot loop
-        return [part for value in values for part in _condition_parts(value, assigned)]
-    return [expr]
+#: Stands for a binding the census does not read as a value: a ``for`` or ``with`` target, a walrus,
+#: an augmented assignment, a deletion, or an unpacking target.
+_UNREAD: ast.expr = ast.Constant(value=Ellipsis)
 
 
-def _reads_relaxation(test: ast.expr, fn: ast.AST) -> bool:
-    """Whether ``test`` holds on a relaxed hop, read off its shape: some part asks
-    ``skips_validity_period`` or reads ``tls_allow_expired``, and no part uses ``not``. The shape,
-    not the value, so at least these pass and review still reads the condition: a part inverted by
-    a comparison (``skips_validity_period(ctx) is False``, ``!= True``), and an ``and`` whose other
-    part is false on a relaxed hop (``False and skips_validity_period(ctx)``)."""
-    assigned: dict[str, list[ast.expr]] = {}
+def _rebinds(node: ast.AST, target: str) -> bool:
+    """Whether the binding target ``node`` rebinds ``target``: it is that spelling, or an unpacking
+    that holds it. Setting an attribute or item of ``target`` does not rebind it."""
+    if isinstance(node, ast.Tuple | ast.List):
+        return any(_rebinds(elt, target) for elt in node.elts)
+    if isinstance(node, ast.Starred):
+        return _rebinds(node.value, target)
+    return ast.unparse(node) == target
+
+
+def _bindings(fn: ast.AST, target: str) -> list[ast.expr]:
+    """Every value code under ``fn`` binds to ``target``, an ``ast.unparse`` spelling such as
+    ``self._ssl``. A binding it does not read as a value is :data:`_UNREAD`."""
+    values: list[ast.expr] = []
     for sub in ast.walk(fn):
         if isinstance(sub, ast.Assign):
-            for target in sub.targets:
-                if isinstance(target, ast.Name):
-                    assigned.setdefault(target.id, []).append(sub.value)
-        elif isinstance(sub, ast.AnnAssign) and sub.value and isinstance(sub.target, ast.Name):
-            assigned.setdefault(sub.target.id, []).append(sub.value)
-    nodes = [sub for part in _condition_parts(test, assigned) for sub in ast.walk(part)]
-    if any(isinstance(sub, ast.UnaryOp) and isinstance(sub.op, ast.Not) for sub in nodes):
-        return False
-    return any(
-        (isinstance(sub, ast.Call) and callee_name(sub) == "skips_validity_period")
-        or (isinstance(sub, ast.Constant) and sub.value == "tls_allow_expired")
-        for sub in nodes
-    )
+            for t in sub.targets:
+                if ast.unparse(t) == target:
+                    values.append(sub.value)
+                elif _rebinds(t, target):
+                    values.append(_UNREAD)
+        elif isinstance(sub, ast.AnnAssign) and sub.value and ast.unparse(sub.target) == target:
+            values.append(sub.value)
+        elif isinstance(sub, ast.AugAssign | ast.For | ast.AsyncFor | ast.NamedExpr):
+            if _rebinds(sub.target, target):
+                values.append(_UNREAD)
+        elif isinstance(sub, ast.withitem):
+            if sub.optional_vars is not None and _rebinds(sub.optional_vars, target):
+                values.append(_UNREAD)
+        elif isinstance(sub, ast.comprehension):
+            if _rebinds(sub.target, target):
+                values.append(_UNREAD)
+        elif isinstance(sub, ast.Delete) and any(_rebinds(t, target) for t in sub.targets):
+            values.append(_UNREAD)
+    return values
+
+
+def _holds_when_relaxed(
+    expr: ast.expr, fn: ast.AST, builders: frozenset[str], seen: frozenset[str] = frozenset()
+) -> bool:
+    """Whether ``expr``, read in ``fn``, is true on a relaxed hop, read off its shape. It is when it
+    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)``; asks
+    ``skips_validity_period`` of the context a relaxing builder returned
+    (:func:`_from_relaxing_builder`), never of some other context; is ``bool(...)`` of one of
+    those; is an ``or`` with one of them as a part, or an ``and`` of them; or is a local name every
+    binding of which is one. Anything else does not hold, ``not`` and a comparison included. It
+    reads shape, not value, so at least ``<x>.get("tls_allow_expired")`` holds whatever ``<x>`` is."""
+    if isinstance(expr, ast.Constant):
+        return expr.value is True
+    if isinstance(expr, ast.BoolOp):
+        parts = [_holds_when_relaxed(v, fn, builders, seen) for v in expr.values]
+        return any(parts) if isinstance(expr.op, ast.Or) else all(parts)
+    if isinstance(expr, ast.Name):
+        if expr.id in seen:
+            return False
+        values = _bindings(fn, expr.id)
+        return bool(values) and all(
+            v is not _UNREAD and _holds_when_relaxed(v, fn, builders, seen | {expr.id})
+            for v in values
+        )
+    if isinstance(expr, ast.Call) and not expr.keywords and expr.args:
+        name, first = callee_name(expr), expr.args[0]
+        if name == "bool" and len(expr.args) == 1:
+            return _holds_when_relaxed(first, fn, builders, seen)
+        if name == "skips_validity_period" and len(expr.args) == 1:
+            return _from_relaxing_builder(first, fn, builders)
+    if isinstance(expr, ast.Call) and callee_name(expr) == "get" and expr.args:
+        first = expr.args[0]
+        return isinstance(first, ast.Constant) and first.value == "tls_allow_expired"
+    return False
 
 
 def _is_none(value: ast.expr) -> bool:
     return isinstance(value, ast.Constant) and value.value is None
 
 
-def _none_when_relaxed(value: ast.expr, fn: ast.AST) -> bool:
+def _none_when_relaxed(value: ast.expr, fn: ast.AST, builders: frozenset[str]) -> bool:
     """``None``, or ``None if <relaxed> else ...``."""
     return _is_none(value) or (
-        isinstance(value, ast.IfExp) and _is_none(value.body) and _reads_relaxation(value.test, fn)
+        isinstance(value, ast.IfExp)
+        and _is_none(value.body)
+        and _holds_when_relaxed(value.test, fn, builders)
     )
 
 
@@ -763,29 +812,14 @@ def _is_capture(call: ast.Call) -> bool:
     return callee_name(call) == "capture" and _is_guard(call)
 
 
-def _is_relaxed_flag(value: ast.expr, fn: ast.AST) -> bool:
-    """Whether ``value``, passed as ``expiry_relaxed``, holds on a relaxed hop: ``True``, or a
-    condition :func:`_reads_relaxation` accepts."""
-    if isinstance(value, ast.Constant):
-        return value.value is True
-    return _reads_relaxation(value, fn)
-
-
 def _from_relaxing_builder(value: ast.expr, fn: ast.AST, builders: frozenset[str]) -> bool:
     """Whether ``value`` is the context or opener a relaxing builder handed ``fn``: a name or
-    attribute that ``fn`` assigns, every time, from a call to one of ``builders``. Read as written,
+    attribute that ``fn`` binds, every time, to a call to one of ``builders``. Read as written,
     so at least a value reassigned through another name, read off such an object's attribute, or
-    assigned on another branch from something else, does not count. Such a hop is faulted although
-    ``capture`` would read the relaxed context it hands over: a false fault, which fails closed."""
-    target = ast.unparse(value)
-    values = [
-        sub.value
-        for sub in ast.walk(fn)
-        if isinstance(sub, ast.Assign | ast.AnnAssign)
-        and sub.value is not None
-        and target
-        in [ast.unparse(t) for t in (sub.targets if isinstance(sub, ast.Assign) else [sub.target])]
-    ]
+    bound on another branch, or by a ``for``, ``with`` or walrus, to something else, does not
+    count. Such a hop may be faulted although ``capture`` would read the relaxed context it hands
+    over: a false fault, which fails closed."""
+    values = _bindings(fn, ast.unparse(value))
     return bool(values) and all(
         isinstance(v, ast.Call) and callee_name(v) in builders - {_RELAX} for v in values
     )
@@ -802,21 +836,25 @@ def _capture_cannot_credit(
     no credit on a relaxed hop. One of three holds (vault BACKLOG #5086): it hands ``capture`` no
     context there, it passes ``expiry_relaxed`` as true there, or the context it hands is the one
     a relaxing builder returned, whose own time-validity flag ``capture`` reads. In a wrapper,
-    ``bound`` maps its parameters to the hop's arguments, read in ``fn``, the hop's code."""
+    ``bound`` maps the parameters it never rebinds to the hop's arguments, read in ``fn``, the
+    hop's code. A ``**`` argument is not read, so a call holding one is a fault."""
+    if any(kw.arg is None for kw in capture.keywords):
+        return False
     context = _keyword(capture, "context")
     flag = _keyword(capture, "expiry_relaxed")
-    if context is None or _none_when_relaxed(context, where):
+    if context is None or _none_when_relaxed(context, where, builders):
         return True
-    if flag is not None and _is_relaxed_flag(flag, where):
+    if flag is not None and _holds_when_relaxed(flag, where, builders):
         return True
     if bound is None or fn is None:
         return _from_relaxing_builder(context, where, builders)
-    if isinstance(flag, ast.Name) and flag.id in bound and _is_relaxed_flag(bound[flag.id], fn):
+    flag_arg = bound.get(flag.id) if isinstance(flag, ast.Name) else None
+    if flag_arg is not None and _holds_when_relaxed(flag_arg, fn, builders):
         return True
     param = context.id if isinstance(context, ast.Name) else _none_param(context)
     arg = bound.get(param) if param is not None else None
     return arg is not None and (
-        _none_when_relaxed(arg, fn) or _from_relaxing_builder(arg, fn, builders)
+        _none_when_relaxed(arg, fn, builders) or _from_relaxing_builder(arg, fn, builders)
     )
 
 
@@ -826,17 +864,19 @@ def _guard_call_cannot_credit(
     """Whether the guard call ``call``, made in ``fn``, can give a CRL no credit on a relaxed hop.
     A ``capture`` call is read where it is (:func:`_capture_cannot_credit`). A wrapper is read one
     level down, in its one def, and each ``capture`` there must pass that read with the wrapper's
-    parameters bound to ``call``'s arguments. Any other shape is not read, so it counts as a
-    fault: so does a wrapper that makes a guard call other than ``capture``."""
+    parameters bound to ``call``'s arguments; a parameter the wrapper rebinds is left unbound. Any
+    other shape is not read, so it counts as a fault: so does a wrapper that makes a guard call
+    other than ``capture``, and a call to it that passes a ``**`` argument."""
     if _is_capture(call):
         return _capture_cannot_credit(call, fn, builders)
     found = defs.get(str(callee_name(call)), [])
-    if len(found) != 1:
+    if len(found) != 1 or any(kw.arg is None for kw in call.keywords):
         return False
     wrapper = found[0]
     params = [arg.arg for arg in (*wrapper.args.posonlyargs, *wrapper.args.args)]
     bound: dict[str, ast.expr] = dict(zip(params, call.args, strict=False))
     bound.update({kw.arg: kw.value for kw in call.keywords if kw.arg})
+    bound = {name: arg for name, arg in bound.items() if not _bindings(wrapper, name)}
     inner = _guard_calls(wrapper)
     captures = [sub for sub in inner if _is_capture(sub)]
     if not captures or len(captures) != len(inner):
@@ -952,7 +992,7 @@ def test_every_relaxed_hop_is_a_connection_whose_guard_call_cannot_credit_a_crl(
     ``RevocationHopGuard.capture`` its relaxed context, passes ``expiry_relaxed`` as true on a
     relaxed hop, or hands no context there. ``capture`` gives no CRL credit in any of the three
     (vault BACKLOG #5086); what it cannot see is a different, unrelaxed context handed over without
-    the flag, which is what this fails on. It reads shapes, as :func:`_reads_relaxation` and
+    the flag, which is what this fails on. It reads shapes, as :func:`_holds_when_relaxed` and
     :func:`_from_relaxing_builder` say."""
     reach = _package_reach()
     hops = [reach.units[key] for key in sorted(_RELAXED_HOPS)]
@@ -991,10 +1031,16 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
         ("self._other", "False", "pass", True),
         ("self._other", "relaxed", "pass", False),
         ("self._other", "not relaxed", "pass", True),
+        # A flag asked of the context it hands over says nothing capture does not already read.
+        ("self._other", "skips_validity_period(self._other)", "pass", True),
+        ("self._other", "relaxed", "relaxed = False", True),
         ("self._ssl", "False", "pass", False),
         ("self._ssl", "False", "self._ssl = ssl.create_default_context()", True),
+        ("self._ssl", "False", "for self._ssl in [ssl.create_default_context()]: pass", True),
+        ("self._ssl", "False", "with open_ctx() as self._ssl: pass", True),
         ("None if relaxed else self._other", "False", "pass", False),
         ("None if not relaxed else self._other", "False", "pass", True),
+        ("None if skips_validity_period(self._other) else self._other", "False", "pass", True),
     ):
         text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
         sources = {"fake.py": text.replace("EXTRA", extra)}
@@ -1007,6 +1053,16 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
                 "fake.py::Dest.__init__: RevocationHopGuard.capture at line 7 may credit a CRL on "
                 "the relaxed hop"
             ], faults
+    # A context passed through ** is not read, so it is a fault even beside the relaxed one.
+    text = _SYNTHETIC_HOP.replace("HANDOFF", "self._ssl").replace("FLAG", "False")
+    text = text.replace("expiry_relaxed=False,", '**{"context": self._other},')
+    sources = {"fake.py": text.replace("EXTRA", "pass")}
+    reach = _relaxed_reach(sources, frozenset())
+    faults = _handoff_faults(sources, [reach.units["fake.py::Dest.__init__"]], reach.names)
+    assert faults == [
+        "fake.py::Dest.__init__: RevocationHopGuard.capture at line 7 may credit a CRL on the "
+        "relaxed hop"
+    ], faults
 
 
 _SYNTHETIC_WRAPPED = """
@@ -1068,6 +1124,8 @@ def test_the_wrapper_alias_constructor_and_exemption_reads_each_fail_on_a_synthe
         ("self._opener", "False", "pass", False),
         (f"None if {relaxed} else self._other", "False", "pass", False),
         (f"None if {relaxed} else self._other", "False", "_guard_ftps_revocation(o)", True),
+        # The wrapper rebinds the parameter, so the relaxed opener it was handed is not what it hands.
+        ("self._opener", "False", "opener = build_strict_opener()", True),
     ):
         text = _SYNTHETIC_WRAPPED.replace("OPENER", opener).replace("FLAG", flag)
         sources = {"fake.py": text.replace("EXTRA", extra).replace("SECOND", "pass")}
@@ -1102,6 +1160,34 @@ def test_the_wrapper_alias_constructor_and_exemption_reads_each_fail_on_a_synthe
     assert _not_relaxed_faults(reach, stop) == [
         "fake.py::Src.__init__: reads ['relax_verify_expiry'] beside _relaxed"
     ]
+    # Two units sharing a key (a property's getter and setter) are each read: the getter is reached.
+    prop = """
+class Box:
+    @property
+    def ctx(self):
+        c = ssl.create_default_context()
+        relax_verify_expiry(c, host="h")
+        return c
+
+    @ctx.setter
+    def ctx(self, value):
+        self._c = value
+"""
+    reach = _relaxed_reach({"p.py": prop}, frozenset())
+    assert sorted(reach.units) == ["p.py::Box.ctx"], sorted(reach.units)
+    # A dunder method is followed through its class, the name a caller loads.
+    post = """
+class Box:
+    def __post_init__(self):
+        relax_verify_expiry(self.c, host="h")
+
+
+def build(s):
+    return Box(s)
+"""
+    reach = _relaxed_reach({"p.py": post}, frozenset())
+    assert reach.units["p.py::Box.__post_init__"].alias == "Box"
+    assert "p.py::build" in reach.units, sorted(reach.units)
     # A read-only exemption: reading the builder's name is clean, calling it is faulted.
     read_only: dict[str, tuple[str, str | None]] = {"fake.py::Src.__init__": ("_relaxed", None)}
     call = "self._ssl = _relaxed(config.settings, server=True)"

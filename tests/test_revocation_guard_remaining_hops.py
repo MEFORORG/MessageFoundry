@@ -609,9 +609,11 @@ def test_an_unattested_time_skipping_crl_is_refused_without_the_flag() -> None:
     assert "Configure [tls].crl_file" not in str(exc.value)
     own = _guard(_crl_context(skip_validity=True), ways_across="")
     assert own.ways_across == ""
-    # A hop that is not a connection is refused the same way.
+    # A hop that is not a connection is refused the same way, but not given that remedy, which
+    # names a connection's flags.
     not_a_connection = _guard(_crl_context(skip_validity=True), connection=None)
     assert not_a_connection.disposition() is HopDisposition.REFUSE
+    assert not_a_connection.ways_across is None
     kept = _guard(_crl_context(skip_validity=False))
     assert kept.ways_across is None
     assert kept.disposition() is HopDisposition.ALLOW

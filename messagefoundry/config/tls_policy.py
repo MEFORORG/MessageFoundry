@@ -2701,9 +2701,9 @@ class RevocationHopGuard:
     crl_checked: bool = False
     #: Whether this hop skips the validity-period check: the caller passed ``expiry_relaxed=True``
     #: (``tls_allow_expired``), or the context handed to :meth:`capture` skips it. Descriptive only.
-    #: Its readers are the wording of the records :meth:`_detail` builds (the refusal, the WARNING
-    #: and the attested crossing's line); no disposition reads it, since :attr:`crl_checked` is
-    #: already False wherever it is True.
+    #: At least the record's wording reads it: :meth:`_detail` (the refusal and the WARNING) and
+    #: :meth:`enforce_construction`'s choice of the attested crossing's lead. No disposition reads
+    #: it, since :attr:`crl_checked` is already False wherever it is True.
     expiry_relaxed: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
@@ -2720,9 +2720,9 @@ class RevocationHopGuard:
     #: ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence naming both
     #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
     #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
-    #: The field is not always what the caller passed: :meth:`capture` fills a ``None`` with
-    #: :data:`EXPIRY_RELAXED_WAYS_ACROSS` on a hop that :attr:`expiry_relaxed` marks (vault BACKLOG
-    #: #5089 and #5086).
+    #: The field is not always what the caller passed: :meth:`capture` fills a connection's
+    #: ``None`` with :data:`EXPIRY_RELAXED_WAYS_ACROSS` on a hop that :attr:`expiry_relaxed` marks
+    #: (vault BACKLOG #5089 and #5086).
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
@@ -2783,11 +2783,13 @@ class RevocationHopGuard:
         (:func:`skips_validity_period`). Either one settles both halves of that rule unless the
         caller also passes a remedy. The hop earns no CRL credit: ``crl_checked`` is False whatever
         CRL the context loads, because the relaxation also skips the CRL's own validity window.
-        And an omitted ``ways_across`` becomes :data:`EXPIRY_RELAXED_WAYS_ACROSS`, so the record
+        And on a connection an omitted ``ways_across`` becomes :data:`EXPIRY_RELAXED_WAYS_ACROSS`, so the record
         does not offer the CRL it has just refused to credit. A ``ways_across`` the caller passes is
         used as given, so it can still name a CRL whose credit was dropped; nothing here refuses
-        that. That text names a connection's flags, so a hop that is not a connection and hands over
-        such a context must pass its own sentence (BACKLOG #1498).
+        that. That text names a connection's flags, so a hop that is not a connection
+        (``connection=None``) is not given it. Such a hop falls back to the default, which offers
+        ``[tls].crl_file`` and names a connection's flag too, so one that is relaxed must pass its
+        own sentence (BACKLOG #1498).
 
         The flag can only take credit away, never grant it: on a context that skips the check, the
         CRL earns nothing with or without the flag (vault BACKLOG #5086, which closes the no-flag
@@ -2808,7 +2810,7 @@ class RevocationHopGuard:
             expiry_relaxed=expiry_relaxed,
             ways_across=(
                 EXPIRY_RELAXED_WAYS_ACROSS
-                if expiry_relaxed and ways_across is None
+                if expiry_relaxed and ways_across is None and connection is not None
                 else ways_across
             ),
             attested_reason=attested_reason,
