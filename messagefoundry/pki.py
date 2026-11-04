@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import logging
 import os
 import string
 from collections.abc import Iterable, Iterator
@@ -84,6 +85,8 @@ __all__ = [
     "canonical_dn",
     "IssuerIndex",
 ]
+
+_log = logging.getLogger(__name__)
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
 _SECONDS_PER_DAY = 86_400
@@ -567,12 +570,16 @@ def peer_othernames_intact(ssl_object: Any) -> bool:
 
     Never raises. Deliberately broad, as each caller's verified-issuer read beside it is: this runs
     on an unauthenticated path, where an escaping exception would skip the caller's audited
-    refusal. A fault yields ``False``, which can only drop the peer's otherNames."""
+    refusal. A fault yields ``False``, which can only drop the peer's otherNames, and is logged by
+    its type alone, since a certificate field can name a person."""
     try:
-        leaf_der = ssl_object.getpeercert(binary_form=True)
-    except Exception:
+        return san_othernames_intact(ssl_object.getpeercert(binary_form=True))
+    except Exception as exc:
+        _log.warning(
+            "could not read a peer certificate's otherNames; none of them is matched: %s",
+            type(exc).__name__,
+        )
         return False
-    return san_othernames_intact(leaf_der)
 
 
 #: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate

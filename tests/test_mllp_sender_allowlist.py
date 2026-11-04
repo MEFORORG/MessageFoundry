@@ -484,6 +484,29 @@ def test_the_der_read_refuses_an_othername_ssl_cannot_report_whole(
     assert san_othernames_intact(leaf_der) is intact
 
 
+def test_the_der_read_never_raises_into_a_caller(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Any fault reading the DER drops the otherNames and is logged by its type alone, rather than
+    escaping into a listener's admission or the API shim's ``connection_made``."""
+
+    class _Ssl:
+        def getpeercert(self, binary_form: bool = False) -> bytes:
+            return _leaf_der(_upn(b"feed@partner.example"))
+
+    def _boom(leaf_der: bytes | None) -> bool:
+        raise RuntimeError("feed@partner.example")
+
+    from messagefoundry import pki
+
+    assert pki.peer_othernames_intact(_Ssl()) is True  # control: the same certificate, read
+    monkeypatch.setattr(pki, "san_othernames_intact", _boom)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pki"):
+        assert pki.peer_othernames_intact(_Ssl()) is False
+    assert "RuntimeError" in caplog.text
+    assert "feed@partner.example" not in caplog.text
+
+
 async def test_an_othername_holding_a_nul_on_a_certificate_matches_no_entry(
     tmp_path: Path, store: MessageStore
 ) -> None:
