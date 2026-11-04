@@ -238,6 +238,8 @@ from messagefoundry.store.store import (
     DbStatus,
     DestinationMetrics,
     DiskFreeStatus,
+    EpochBump,
+    EpochRaise,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
@@ -309,6 +311,7 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     global_epoch_or_refuse,
+    global_epoch_raise,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -339,6 +342,7 @@ from messagefoundry.store.store import (
     report_user_reseal,
     require_notify_email,
     require_totp_rule,
+    restamp_kept_session,
     role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
@@ -13952,14 +13956,17 @@ class SqlServerStore:
         rows = await cur.fetchall()
         return global_epoch_or_refuse(rows[0][0] if rows else None)
 
-    async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
+    async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
-        transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
-        record that fails its seal does not stop the revoke that called this."""
+        transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
+        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
+        the revoke that called this, and reports no raise."""
+        bump = EpochBump()
         try:
-            await self._write_user(cur, user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(cur, user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -15465,7 +15472,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
-                await self._bump_session_epoch(cur, user_id)
+                raised = await self._bump_session_epoch(cur, user_id)
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                 else:
@@ -15475,13 +15482,8 @@ class SqlServerStore:
                     )
                 revoked = len(await cur.fetchall())
                 if except_token_hash is not None:
-                    await cur.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
-                    epoch_rows = await cur.fetchall()
-                    epoch = int(epoch_rows[0][0]) if epoch_rows else 0
                     await self._write_session(
-                        cur,
-                        except_token_hash,
-                        lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                        cur, except_token_hash, restamp_kept_session(user_id, raised)
                     )
                 await self._commit(conn)
             except Exception:
@@ -15512,7 +15514,8 @@ class SqlServerStore:
         Raises the epoch of each account its read of the account list returns, ends the sessions
         it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
         session minted before it whatever account it belongs to, and re-seals the kept session
-        under both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that
+        under both new epochs, when it carried both epochs those raises replaced
+        (:func:`restamp_kept_session`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session sweep*, says what that
         leaves.
 
         LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
@@ -15533,8 +15536,10 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
-                for (user_id,) in await cur.fetchall():
-                    await self._bump_session_epoch(cur, str(user_id))
+                raised = {
+                    str(user_id): await self._bump_session_epoch(cur, str(user_id))
+                    for (user_id,) in await cur.fetchall()
+                }
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_ALL_SESSIONS_SQL, (now,))
                 else:
@@ -15547,21 +15552,21 @@ class SqlServerStore:
                     "UPDATE global_session_epoch SET epoch = epoch + 1"
                     " OUTPUT inserted.epoch WHERE id = 1"
                 )
-                raised = await cur.fetchall()
-                current = global_epoch_or_refuse(raised[0][0] if raised else None)
+                global_rows = await cur.fetchall()
+                global_raised = global_epoch_raise(
+                    global_epoch_or_refuse(global_rows[0][0] if global_rows else None)
+                )
                 if except_token_hash is not None:
                     await cur.execute(
-                        "SELECT s.user_id, u.session_epoch FROM sessions s"
-                        " JOIN users u ON u.id = s.user_id WHERE s.token_hash=?",
-                        (except_token_hash,),
+                        "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
                     )
                     kept = await cur.fetchall()
                     if kept:
-                        epoch = int(kept[0][1])
+                        owner = str(kept[0][0])
                         await self._write_session(
                             cur,
                             except_token_hash,
-                            lambda s: replace(s, user_epoch=epoch, global_epoch=current),
+                            restamp_kept_session(owner, raised.get(owner), global_raised),
                         )
                 await self._commit(conn)
             except Exception:

@@ -2814,6 +2814,71 @@ def new_user_record(
 UserChange = Callable[[UserAuthzRecord], UserAuthzRecord | None]
 
 
+class EpochRaise(NamedTuple):
+    """One raise of a session epoch: the value it replaced and the value it wrote (BACKLOG #4975).
+    A revoke re-stamps the session it keeps only when that session carried :attr:`before`."""
+
+    before: int
+    after: int
+
+
+class EpochBump:
+    """A :data:`UserChange` that raises the account's session epoch and keeps the epoch it raised
+    from (BACKLOG #4975). ``_write_user`` calls it with the record it read under the account's lock,
+    so :attr:`before` is the value that write replaced, not a separate read. A backend's
+    ``_bump_session_epoch`` passes it to ``_write_user`` and reports :meth:`raised`."""
+
+    def __init__(self) -> None:
+        self.before: int | None = None
+
+    def __call__(self, record: UserAuthzRecord) -> UserAuthzRecord:
+        self.before = record.row.session_epoch
+        return record.bump_epoch()
+
+    def raised(self, updated: UserAuthzRecord | None) -> EpochRaise | None:
+        """The raise ``_write_user`` reported, or ``None`` when it wrote nothing: no row, or a
+        compare lost to a concurrent write. A record that fails its seal raises instead."""
+        if updated is None or self.before is None:
+            return None
+        return EpochRaise(self.before, updated.row.session_epoch)
+
+
+def global_epoch_raise(after: int) -> EpochRaise:
+    """The raise of the store's global session epoch that wrote ``after`` (BACKLOG #4975, #5091).
+
+    Exact, where the per-account raise must read the value it replaced: the global raise is one
+    ``UPDATE`` that adds one to the row it holds locked, and one that matches no row refuses the
+    whole revoke. So no revoke goes on with that epoch unmoved, the case Lander decision
+    d20261101T013132231-ef9540 rules out ``after - 1`` for on the per-account raise, whose seal
+    failure leaves the epoch where it was and lets the revoke go on."""
+    return EpochRaise(after - 1, after)
+
+
+def restamp_kept_session(
+    user_id: str, raised: EpochRaise | None, global_raised: EpochRaise | None = None
+) -> Callable[[SessionRecord], SessionRecord]:
+    """The change a revoke applies to the session it keeps (BACKLOG #2592, #4975, #5091).
+
+    The new epochs go onto the kept session only when it is ``user_id``'s and carried the epochs
+    the revoke raised from: its account's (``raised``), and, where the revoke raised the store's
+    global epoch too (``global_raised``), that one as well. A kept session an earlier sweep missed
+    is behind on one of them; stamping it would make it valid again, so it is left as it is and
+    the gate refuses it the next time it is presented. With no account raise, as where the
+    account's record fails its seal, nothing is stamped. A revoke that raises no global epoch
+    leaves the session's global stamp as it is, so a session behind on it stays refused."""
+
+    def change(s: SessionRecord) -> SessionRecord:
+        if raised is None or s.user_id != user_id or s.user_epoch != raised.before:
+            return s
+        if global_raised is None:
+            return replace(s, user_epoch=raised.after)
+        if s.global_epoch != global_raised.before:
+            return s
+        return replace(s, user_epoch=raised.after, global_epoch=global_raised.after)
+
+    return change
+
+
 def full_authentication_clear(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
     """What a FULL AUTHENTICATION writes (ADR 0197 AC-8): the sign-in stamp and all six lockout
     columns back to "no history". Zeroing the sign-in cycle count is the ADR's recommendation,
@@ -17970,12 +18035,14 @@ class MessageStore:
         caller's current session — "sign out everywhere else"). Returns the number revoked.
 
         Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy
-        of any of those rows resolves to nothing. The kept session is re-sealed under the new epoch
-        through :meth:`_write_session`; if its own seal does not verify, that raises
-        :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
+        of any of those rows resolves to nothing. The kept session is re-sealed through
+        :meth:`_write_session`, under the new epoch only when it carried the epoch the raise
+        replaced (:func:`restamp_kept_session`, BACKLOG #4975); if its own seal does not verify,
+        that raises :class:`RowSealError` and the whole transaction, revokes included, rolls
+        back."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._bump_session_epoch(user_id)
+            raised = await self._bump_session_epoch(user_id)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
@@ -17985,11 +18052,7 @@ class MessageStore:
                 )
             revoked = int(cur.rowcount)
             if except_token_hash is not None:
-                epoch = await self._session_epoch(user_id)
-                await self._write_session(
-                    except_token_hash,
-                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
-                )
+                await self._write_session(except_token_hash, restamp_kept_session(user_id, raised))
             await self._commit()
         return revoked
 
@@ -18024,7 +18087,8 @@ class MessageStore:
 
         The store's global session epoch is raised first (BACKLOG #5091), then every account's
         epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
-        row is re-sealed under its own account's new epoch and the new global one.
+        row is re-sealed under its own account's new epoch and the new global one, when it carried
+        both epochs those raises replaced (:func:`restamp_kept_session`, BACKLOG #4975).
 
         The first statement is a write, which takes SQLite's write lock, so the reads below run
         under it: another process (an engine shard, or the engine beside
@@ -18036,8 +18100,9 @@ class MessageStore:
         if cur.rowcount != 1:
             raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
-        for row in await cur.fetchall():
-            await self._bump_session_epoch(str(row[0]))
+        raised = {
+            str(row[0]): await self._bump_session_epoch(str(row[0])) for row in await cur.fetchall()
+        }
         # Spelled at the call, not built from a constant, so the BEGIN guard in
         # `tests/test_writer_txn_is_the_only_begin.py` can read it.
         cur = await self._db.execute(
@@ -18053,11 +18118,11 @@ class MessageStore:
         )
         owner = await kept.fetchone()
         if owner is not None:
-            epoch = await self._session_epoch(str(owner[0]))
-            current = await self._global_session_epoch()
+            user_id = str(owner[0])
+            global_raised = global_epoch_raise(await self._global_session_epoch())
             await self._write_session(
                 except_token_hash,
-                lambda s: replace(s, user_epoch=epoch, global_epoch=current),
+                restamp_kept_session(user_id, raised.get(user_id), global_raised),
             )
         return revoked
 
@@ -18119,13 +18184,6 @@ class MessageStore:
         tee_audits((audit,), appended, ts=now)
         return record
 
-    async def _session_epoch(self, user_id: str) -> int:
-        """The account's session epoch, read on the writer connection inside the caller's
-        transaction (BACKLOG #2592). 0 for an account that is not there."""
-        cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
-        row = await cur.fetchone()
-        return 0 if row is None else int(row["session_epoch"])
-
     async def _global_session_epoch(self) -> int:
         """The store's global session epoch (BACKLOG #5091), read on the writer connection inside
         the caller's transaction."""
@@ -18133,15 +18191,19 @@ class MessageStore:
         row = await cur.fetchone()
         return global_epoch_or_refuse(None if row is None else row[0])
 
-    async def _bump_session_epoch(self, user_id: str) -> None:
+    async def _bump_session_epoch(self, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
-        transaction (BACKLOG #2592). An account whose record fails its seal is refused on every
-        read already, so the revoke that called this goes ahead without the raise: ending sessions
-        needs no key, and refusing it would keep them live."""
+        transaction (BACKLOG #2592), and report the raise, or ``None`` where none was written
+        (:meth:`EpochBump.raised`, BACKLOG #4975). An account whose record fails its seal is
+        refused on every read already, so the revoke that called this goes ahead without the
+        raise, and reports none: ending sessions needs no key, and refusing it would keep them
+        live."""
+        bump = EpochBump()
         try:
-            await self._write_user(user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def enforce_session_cap(
         self,
