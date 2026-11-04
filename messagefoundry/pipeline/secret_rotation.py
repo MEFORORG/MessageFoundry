@@ -282,15 +282,15 @@ async def open_rotation_record(
     for a changed key the keyed audit chain has not rolled to (BACKLOG #4942), with ``keep_another``:
     it then writes nothing over a record open for another key. That record holds its own key, which a
     run may have rolled the chain to with an upload still under the prior key, so replacing it would
-    let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates: a run that
-    completes re-seals what the record stood for, and one that stops short leaves that key unheld,
-    which a start back on it can stamp.
+    let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates. A start on
+    a keyed chain still holds the replaced key, because it holds any changed key while a record
+    stands open for another, so a run that stops short does not unhold it.
 
     Skipped when the stored stamp already names ``key_id``, so there is nothing for
     :func:`reconcile_rotation_meta` to withhold. That is a run with the key already in use, or one a
-    ``serve`` start stamped first, which it does only where it had no keyed audit chain to ask, and
-    that start's stamp stands. A stamp under a scheme this release
-    does not know cannot say so, and opens the record.
+    ``serve`` start stamped first, which on a keyed audit chain it does only for a key the chain is
+    rolled to, such as the key its genesis row names, and that start's stamp stands. A stamp under a
+    scheme this release does not know cannot say so, and opens the record.
 
     An open record keeps its dates, whatever key it names and even when it cannot be read, because
     a store with no stamp reads the key's age from them, and a run that only starts must not make
@@ -298,17 +298,18 @@ async def open_rotation_record(
     :func:`_kept_dates` reads it as an undetermined age. Only a closed or absent record takes
     ``day``.
 
-    Returns whether the record stands open naming ``key_id`` after the call: ``True`` where it
-    opened it or found it so, ``False`` where the stamp already names ``key_id`` and no record
-    does, or it kept a record open for another key. ``rotate-key`` reads it before it names a way
-    out of the record (BACKLOG #4934, #4935)."""
+    Returns whether the record holds ``key_id`` after the call: it names that key and the stamp
+    does not, so no start stamps it. ``False`` where the stamp already names ``key_id``, a record
+    naming it too included, as a run killed between its stamp and its close leaves them, and where
+    it kept a record open for another key. ``rotate-key`` reads it before it names a way out of the
+    record (BACKLOG #4934, #4935)."""
     fingerprint = dek_fingerprint(key_id)
     rows = await meta_store.get_secret_rotation_meta()
     record = rows.get(ROTATION_RECORD_ID)
-    if record is not None and record.fingerprint == fingerprint:
-        return True
     if dek_changed(rows.get(_DEK_CLASS_ID), fingerprint) is False:
         return False
+    if record is not None and record.fingerprint == fingerprint:
+        return True
     held = record if _record_open(record) else None
     if keep_another and held is not None:
         return False
@@ -348,9 +349,9 @@ _OPENED_AT_START = (
 #: The WARNING a start logs when it held a key and kept a record open for another key (BACKLOG
 #: #4942): see :func:`open_rotation_record`'s ``keep_another``.
 _HELD_FOR_ANOTHER_RECORD = (
-    "secret rotation: the store key in use differs from its stamp, or has none, and the audit "
-    "chain has not been rolled to it, while the rotation record stands open for another store key "
-    "that no `messagefoundry rotate-key` run has completed on. That record was kept, this key's "
+    "secret rotation: the store key in use differs from its stamp, or has none, while the "
+    "rotation record stands open for another store key that no `messagefoundry rotate-key` run has "
+    "completed on. That record was kept, this key's "
     "rotation date was not stamped and its age was not reset. Stop the engine and run "
     "`messagefoundry rotate-key`, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, "
     "until it exits 0."
@@ -591,10 +592,12 @@ async def reconcile_rotation_meta(
     before it opened the record, inside the store open, and a key changed by hand. The start opens
     the record for the key, as ``rotate-key`` would, and is held by it. Where the record stands open
     for another key the start keeps it and is held all the same, so that key stays held when it
-    comes back. A DEK changed with no record stamps only where ``audit_rolled`` is not ``False``:
-    ``None``, a store with no keyed chain to ask, such as one whose rows open with no genesis row,
-    or ``True``, a chain already rolled to the key. So on a store with a keyed chain a stamp says a
-    run rolled the chain to the key, and elsewhere it proves only a changed key.
+    comes back, and on a keyed chain it does so even where ``audit_rolled`` is ``True``: a run on
+    another key replaced this key's record and stopped short. A DEK changed with no open record
+    stamps only where ``audit_rolled`` is not ``False``: ``None``, a store with no keyed chain to
+    ask, such as one whose rows open with no genesis row, or ``True``, a chain already rolled to
+    the key. So on a store with a keyed chain a stamp says the chain was rolled to the key, by a
+    run or by its genesis row, and elsewhere it proves only a changed key.
 
     It then arms the **ENFORCE escalation**: under ``[security].enforcement=ENFORCE``, a DEK older than
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with
@@ -644,19 +647,28 @@ async def reconcile_rotation_meta(
         hold = None if changed_fp is False else _rotation_hold(record, fingerprint)
         # Not only a key that changed: one whose stamp names an unknown scheme (`None`) cannot say,
         # and re-stamping it with the new fingerprint would hide the change from the run.
-        if changed_fp is not False and hold is None and audit_rolled is False:
-            # BACKLOG #4942, #4936: no rotate-key run has rolled the chain to this key, so data may
-            # still be under the prior one. Opened as the command opens it, dates kept, so the run
-            # that completes finds it and closes it, and a later start reads the same dates.
-            # Re-read for those dates, which `dated` below takes when there is no stamp, and to see
-            # that it wrote: a writer between the two reads can have stamped the key first.
-            # A record open for another key is kept, and this key is held all the same.
-            await open_rotation_record(meta_store, dek_key_id, today.isoformat(), keep_another=True)
+        # On a keyed chain a record open for another key holds this key too, even one the chain
+        # is rolled to: a run on that other key replaced this key's record and stopped short.
+        if (
+            changed_fp is not False
+            and hold is None
+            and (audit_rolled is False or (audit_rolled and _record_open(record)))
+        ):
+            # BACKLOG #4942, #4936: no rotate-key run has completed on this key, so data may still
+            # be under the prior one. Opened as the command opens it, dates kept, so the run that
+            # completes finds it and closes it, and a later start reads the same dates. A record
+            # open for another key is kept, and this key is held all the same. Re-read for those
+            # dates, which `dated` below takes when there is no stamp, and to see that it wrote: a
+            # writer between the two reads can have stamped the key first.
+            opened = await open_rotation_record(
+                meta_store, dek_key_id, today.isoformat(), keep_another=True
+            )
             record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-            if _rotation_hold(record, fingerprint):
-                hold = _OPENED_AT_START
-            elif _record_open(record):
+            hold = _rotation_hold(record, fingerprint)
+            if hold is None and _record_open(record):
                 hold = _HELD_FOR_ANOTHER_RECORD
+            elif hold is not None and opened:
+                hold = _OPENED_AT_START
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.

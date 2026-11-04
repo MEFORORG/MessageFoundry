@@ -644,8 +644,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    rolled to it opens the rotation record for that key itself, writes no stamp, and logs a WARNING.
    A record already open for another key is kept rather than replaced, and still holds that key
    when it comes back, since a run may have rolled the chain to it with an upload still under the
-   prior key. A `rotate-key` run on a third key does replace it, so if that run stops short, a start
-   back on the rolled key stamps it. That covers at least a start between setting the new key and
+   prior key. A `rotate-key` run on a third key replaces it, and a start on a keyed chain then still
+   holds the rolled key, because it holds a changed key whenever a record stands open for another
+   key. That covers at least a start between setting the new key and
    the first run, a run killed inside the store open before it opened the record, and a key changed
    by hand; each is held until a run completes. A key changed with no record still stamps on a
    store with no keyed chain to ask, such as one whose audit rows open with no genesis row naming

@@ -700,10 +700,11 @@ def test_closing_writes_nothing_where_no_run_opened_a_record(tmp_path: Path) -> 
     assert asyncio.run(run()) == {}
 
 
-def test_opening_says_whether_the_record_names_the_key(tmp_path: Path) -> None:
-    """What ``rotate-key`` reads before it names a way out (BACKLOG #4934, #4935). A record left
-    open naming the key counts even where the stamp names it too, as a run killed between its stamp
-    and its close leaves them. A stamp alone, and a record kept for another key, do not count."""
+def test_opening_says_whether_the_record_holds_the_key(tmp_path: Path) -> None:
+    """What ``rotate-key`` reads before it names a way out (BACKLOG #4934, #4935): whether the
+    record holds the key, so no start stamps it. A record naming a key the stamp names too, as a
+    run killed between its stamp and its close leaves them, holds nothing, and neither does a stamp
+    alone or a record kept for another key."""
     db, key_a, key_b = tmp_path / "named.db", generate_key(), generate_key()
     asyncio.run(_seed(db, tmp_path / "uploads", key_a))
 
@@ -726,7 +727,7 @@ def test_opening_says_whether_the_record_names_the_key(tmp_path: Path) -> None:
         finally:
             await store.close()
 
-    assert asyncio.run(run()) == (False, True, False, True)
+    assert asyncio.run(run()) == (False, True, False, False)
 
 
 _WAY_OUT = (
@@ -788,6 +789,33 @@ def test_a_start_on_a_third_key_keeps_the_record_that_holds_a_rolled_key(
     assert back_on_b[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
     assert back_on_b[_DEK].last_rotated == _OLD_DATE
     assert back_on_b[ROTATION_RECORD_ID] == record_b
+
+
+def test_a_third_key_run_that_stops_short_does_not_unhold_the_rolled_key(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #4942. A run to B rolls the chain to B and skips an upload, so its record holds B. A
+    run to C then replaces that record and stops before its roll, so the chain stays rolled to B.
+    A start back on B must not stamp it: the upload skipped in the B run may still be under A."""
+    db, uploads, key_a, key_b = rig
+    key_c = generate_key()
+    _plant_unopenable_upload(uploads)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    with monkeypatch.context() as patch:
+        patch.setattr(MessageStore, "reencrypt_to_active", _refuse_reencrypt)
+        _env(monkeypatch, key_c, f"{key_b},{key_a}", uploads)
+        assert main(["rotate-key", "--db", str(db)]) == 1
+    capsys.readouterr()
+    record_c = asyncio.run(_rows(db, key_c, key_b, key_a))[ROTATION_RECORD_ID]
+    assert record_c.fingerprint == dek_fingerprint(_key_id(key_c))
+
+    back_on_b = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert back_on_b[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert back_on_b[_DEK].last_rotated == _OLD_DATE
+    assert back_on_b[ROTATION_RECORD_ID] == record_c
 
 
 def test_a_stamp_under_an_unknown_scheme_is_held_on_a_keyed_chain(tmp_path: Path) -> None:
