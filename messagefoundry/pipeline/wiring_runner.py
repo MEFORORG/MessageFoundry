@@ -932,10 +932,11 @@ class _AttachmentWriteFailed(Exception):
     source re-reading the same body for as long as a deterministic write fault lasted."""
 
 
-#: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
-#: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. Not every raise: a body the separator read refuses (a registered fuzz known finding,
-#: ``fuzz/targets.py``) still escapes as a bare ``ValueError``.
+#: The refusals ``_detach_documents`` raises for a body it does not detach, a failed attachment write
+#: among them (BACKLOG #1619). Both listeners catch exactly these and record ``ERROR`` before the
+#: ACK, so a type added here is refused by both, never by one alone. Not every raise: a body the
+#: separator read refuses (a registered fuzz known finding, ``fuzz/targets.py``) still escapes as a
+#: bare ``ValueError``.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _AttachmentWriteFailed,
     _StreamBudgetExceeded,
@@ -8122,14 +8123,14 @@ class RegistryRunner:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except _DETACH_REFUSALS as exc:
-                # Only the in-flight budget is the engine's own and clears as concurrent detaches
+                # Of the body's refusals, only the in-flight budget clears, as concurrent detaches
                 # finish, so only it invites a re-send, and only when the body would fit the budget
                 # once they have: one larger than the whole budget is over-size. An unsupported
                 # backend, a malformed handle and an escaped document refuse the same body every time.
                 if isinstance(exc, _StreamBudgetExceeded):
                     kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
                 elif isinstance(exc, _AttachmentWriteFailed):
-                    # The one other re-send: a store fault, not the body, may clear (#1619).
+                    # Not a refusal of the body: a store fault that may clear (#1619).
                     kind = RefusalKind.TEMPORARY
                 else:
                     kind = RefusalKind.PERMANENT
@@ -8270,21 +8271,28 @@ class RegistryRunner:
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 try:
                     ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
-                except StreamingAttachmentsUnsupported:
-                    raise  # a refusal the caller already classifies
+                except _DETACH_REFUSALS:
+                    raise  # a refusal keeps its own classification
+                except (TypeError, AttributeError, NameError, AssertionError):
+                    raise  # a bug in the store code is not a store fault; it propagates as before
                 except Exception as exc:  # noqa: BLE001 - see below
                     # Broad on purpose: the three backends' drivers and the store cipher share no
                     # base class, and this scope holds the store call alone. Only the type is kept,
                     # because a driver's text can quote the value it refused (BACKLOG #1661).
-                    # A document stored before this one stays at refcount 0 for the orphan sweep.
-                    fault = f"{type(exc).__module__}.{type(exc).__qualname__}"
+                    fault: str | None = f"{type(exc).__module__}.{type(exc).__qualname__}"
+                else:
+                    fault = None
+                if fault is not None:
+                    # Raised outside the except block, so the driver's exception, its text and its
+                    # frames are neither chained nor kept alive. A document stored before this one
+                    # stays at refcount 0 for the startup orphan sweep.
                     log.warning(
                         "inbound %r: attachment write failed in the streaming detach (%s); the "
                         "message is not accepted",
                         ic.name,
                         fault,
                     )
-                    raise _AttachmentWriteFailed(f"attachment write failed ({fault})") from exc
+                    raise _AttachmentWriteFailed(f"attachment write failed ({fault})")
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
                 )

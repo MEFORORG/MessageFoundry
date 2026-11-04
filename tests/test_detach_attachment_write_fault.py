@@ -197,6 +197,55 @@ async def test_an_unsupported_backend_is_still_a_permanent_refusal(store: Messag
     assert "attachment write failed" not in error
 
 
+async def test_a_fault_on_a_later_document_refuses_the_whole_body(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first document stores, the second faults: the body is refused, nothing increfs the first
+    # document, and the budget is released. That stored document waits at refcount 0 for the
+    # startup orphan sweep, as after a crash between the detach and the ingress commit.
+    runner, ic = _runner(store, ConnectorType.MLLP)
+    real = store.put_attachment
+    calls: list[str] = []
+
+    async def second_faults(chunks: Iterable[str], content_type: str) -> str:
+        calls.append(content_type)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError(_DRIVER_TEXT)
+        return await real(chunks, content_type)
+
+    monkeypatch.setattr(store, "put_attachment", second_faults)
+    other = base64.b64encode(b"Q" * 2000).decode("ascii")
+    body = _doc_hl7() + f"OBX|2|ED|PDF^Report||^Application^PDF^Base64^{other}||||||F\r"
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+
+    assert len(calls) == 2, "the second document was never written"
+    assert _msa_code(ack) == "AE"
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
+    cur = await store._db.execute("SELECT refcount FROM attachment")
+    assert [r[0] for r in await cur.fetchall()] == [0]
+    assert runner._stream_inflight_bytes == 0
+
+
+@pytest.mark.parametrize("bug", [TypeError, AttributeError])
+async def test_a_bug_in_the_store_code_still_propagates(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, bug: type[Exception]
+) -> None:
+    # A programming error is not a store fault, so it is not answered as one a resend may clear.
+    runner, ic = _runner(store, ConnectorType.MLLP)
+
+    async def broken(*args: Any, **kwargs: Any) -> NoReturn:
+        raise bug("a bug in put_attachment")
+
+    monkeypatch.setattr(store, "put_attachment", broken)
+
+    with pytest.raises(bug):
+        await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
+
+    assert await _rows(store) == []
+    assert runner._stream_inflight_bytes == 0
+
+
 # --- the store is down: the ERROR write fails too, and that propagates ----------------------------
 
 
@@ -213,9 +262,18 @@ async def test_a_failed_error_write_after_the_fault_propagates(
 
     # No frame or receipt comes back from the runner: the transport answers the propagated fault
     # (BACKLOG #1608).
-    with pytest.raises(_ErrorWriteFailed):
+    with pytest.raises(_ErrorWriteFailed) as raised:
         await getattr(runner, entry)(ic, _doc_hl7().encode("utf-8"))
 
+    # The driver's error, whose text can quote a value, is not chained onto what the transport
+    # renders: only the content-free _AttachmentWriteFailed is.
+    chain: list[BaseException] = []
+    link: BaseException | None = raised.value
+    while link is not None:
+        chain.append(link)
+        link = link.__cause__ or link.__context__
+    assert not any(isinstance(e, sqlite3.Error) for e in chain), chain
+    assert any(isinstance(e, wiring_runner._AttachmentWriteFailed) for e in chain), chain
     assert await _rows(store) == []
     assert runner._stream_inflight_bytes == 0
 
