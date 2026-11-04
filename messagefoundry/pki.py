@@ -1812,10 +1812,15 @@ def _refuse_unless_openssl_loads(
                 "read from this file. Remove or re-issue them"
             )
     elif not len(others) <= loaded_others <= other_copies:
+        remedy = (
+            "Remove any empty or non-certificate PEM block, which can stop the TLS library "
+            "reading the file"
+            if loaded_others < len(others)
+            else "Write each certificate as a plain PEM block"
+        )
         problem = (
             f"loads {loaded_others} certificate(s) that are not CAs from this file, where the "
-            f"mTLS issuer map read {len(others)} ({other_copies} with copies). Remove any empty "
-            "or non-certificate PEM block"
+            f"mTLS issuer map read {len(others)} ({other_copies} with copies). {remedy}"
         )
     else:
         return cas

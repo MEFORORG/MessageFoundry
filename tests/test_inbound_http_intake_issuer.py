@@ -853,7 +853,9 @@ def test_a_pinned_certificate_listed_twice_beside_one_with_its_subject_builds(ot
     )
     mid = _ca(_dn((NameOID.COMMON_NAME, "Mid CA")))[0]
     cadata = (_pem(twin) + _pem(mid) + _pem(pinned) + _pem(pinned)).decode("ascii")
-    assert _openssl_loads(cadata) == 4  # the premise: OpenSSL keeps the second copy
+    # The premise, measured on OpenSSL 3.5.7: it keeps the second copy (4). Another build may drop
+    # it (3); the file must build either way, so only an unexpected count fails here.
+    assert _openssl_loads(cadata) in (3, 4)
     index = IssuerIndex(cadata)
     assert index.unmatched_keys(["CN=Mid CA"]) == {}
     assert index.issuer_of(_der(pinned)) == ""  # the two stay ambiguous
@@ -880,10 +882,10 @@ def test_the_count_of_certificates_that_are_no_ca_is_still_bounded() -> None:
     }
     # The index read one certificate that is no CA, and OpenSSL holds none: below the bound.
     alone = ssl.DER_cert_to_PEM_cert(root)
-    with pytest.raises(ValueError, match=r"loads 0 certificate\(s\) that are not CAs"):
+    with pytest.raises(ValueError, match=r"loads 0 certificate\(s\) that are not CAs.*empty or"):
         pki._refuse_unless_openssl_loads(alone, Counter([root, pinned, pinned]), label="x")
     # OpenSSL holds one certificate that is no CA, and the index read none: above the bound.
-    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) that are not CAs"):
+    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) that are not CAs.*plain PEM"):
         pki._refuse_unless_openssl_loads(cadata, Counter([root]), label="x")
 
 
@@ -891,7 +893,8 @@ def test_an_issuer_key_naming_only_a_certificate_that_is_no_ca_is_warned_about(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A key naming only a loaded certificate OpenSSL reads as no CA, which does not sign itself,
-    can never match: such a certificate issues nothing, and is named only as itself. The key would
+    can never match: such a certificate issues nothing, and is named as itself only when it signs
+    itself, which this one does not. The key would
     deny every certificate under it with nothing in the log, so it is warned about at start
     (BACKLOG #4948). A self-signed pinned certificate names itself, so its key is not."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
