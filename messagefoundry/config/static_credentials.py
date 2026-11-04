@@ -59,11 +59,12 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   reported here. The HTTP listener's intake-authentication gate (``check_http_intake_auth``) asks
   only whether an off-loopback listener has an effective peer control, which a narrow
   ``source_ip_allowlist`` with no credential satisfies, and never whether a credential is static.
-* What a builder that config code registers with ``register_source``/``register_destination``
-  presents, whether the builder is new or replaces a shipped one. The connection is judged by the
-  rules for its :class:`~messagefoundry.config.models.ConnectorType` member, as the paragraph above
-  says, and a member or inbound type with no rule is not listed; ``_connection_hop`` and the
-  ``_DIALLED_INBOUND`` comment say which have one.
+* What a builder presents when code outside the shipped transports registers it with
+  ``register_source``/``register_destination``, new or replacing a shipped one. As the
+  *Classification* paragraph says, the builder is never read: a connection is judged by its
+  :class:`~messagefoundry.config.models.ConnectorType` member, its direction and its settings keys.
+  A connection with no rule for its member and direction is not listed, so the gate does not
+  refuse it; ``_connection_hop`` and ``_DIALLED_INBOUND`` say which have one.
 * A generic-ODBC database hop that sets no top-level ``username``/``password``. The database arm
   does not read ``odbc_params``; ``static_credential_db_hops`` says what those keywords can carry.
 * A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
@@ -418,8 +419,9 @@ def _connection_hop(
     return None
 
 
-#: Inbound connection types that DIAL their peer. Every other inbound type is a listener or has no
-#: peer at all. DATABASE (``DatabasePoll``) dials too, and the database arm covers it.
+#: Inbound connection types that DIAL their peer. Every other inbound type the shipped transports
+#: build is a listener or has no peer at all. DATABASE (``DatabasePoll``) dials too, and the database
+#: arm covers it.
 _DIALLED_INBOUND = frozenset({ConnectorType.REMOTEFILE, ConnectorType.FILE})
 
 
