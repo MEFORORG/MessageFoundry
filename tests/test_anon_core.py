@@ -639,9 +639,9 @@ def test_a_malformed_segment_line_is_refused_and_its_text_is_never_named(
     module = leak if checked is anonymize_checked else tee_leak
     report = module.leak_report(msg, rules=DEFAULT_RULES)
     assert report.hits == [
-        "line no rule can reach (a malformed segment id, a header line with no separator "
-        "after its encoding characters, or a line with no fields under a header whose MSH-12 "
-        "holds no readable HL7 version)"
+        "line no rule can reach (kinds include at least a malformed segment id, a header line "
+        "with no separator after its encoding characters, and a line with no fields under a "
+        "header whose MSH-12 holds no readable HL7 version)"
     ]
     assert "(malformed segment)-0" in report.unmapped_fields
     assert all(needle not in a for a in report.unmapped_fields)
