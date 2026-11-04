@@ -906,7 +906,7 @@ _strict_validate_timeout = strict_validate_timeout
 
 
 class _StrictValidateTimedOut(Exception):
-    """A listener's strict validate did not finish inside its timeout (#89).
+    """A listener's strict validate timed out with no result in hand when the timeout was handled (#89).
 
     ``started`` says whether ``hl7apy`` had begun on the body when the timeout fired (BACKLOG #5078,
     the ADR 0154 amendment of 2026-11-03). The timeout counts the wait for a worker thread as well
@@ -941,9 +941,11 @@ class _StrictValidateRun:
     began first and :meth:`abandon` reports it started, or the listener gave up first and the worker
     returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind.
 
-    The result is kept under the same lock, because a validate can finish inside the timeout and its
-    result still reach the event loop after the timeout fired (a loop stalled by other work). Such a
-    run is not a timeout at all, and :meth:`abandon` hands its result back."""
+    The result is kept under the same lock, and :meth:`abandon` hands back any result present when
+    the listener handles the timeout, wherever the validate finished: inside the timeout with its
+    delivery to a stalled event loop late, or after the deadline but before the timeout was handled.
+    Either way the listener uses that result rather than refuse a body it has a verdict for; only a
+    run with no result at that point is a timeout."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -970,7 +972,9 @@ class _StrictValidateRun:
 
 async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResult:
     """The listener's strict validate, off the event loop under the inbound's timeout (#89, review
-    M-11). Raises :class:`_StrictValidateTimedOut` on expiry, saying whether the validate had begun.
+    M-11). On expiry it uses the run's result if one is present when the timeout is handled, even
+    one that finished after the deadline; otherwise it raises :class:`_StrictValidateTimedOut`,
+    saying whether the validate had begun.
 
     ``wait_for`` frees the listener but cannot kill a worker that has begun (no thread cancellation
     in CPython): that orphaned ``hl7apy`` validate holds its thread until it returns, accepted by
@@ -985,7 +989,7 @@ async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResu
     except TimeoutError:
         started, finished = run.abandon()
         if finished is not None:
-            return finished  # it finished in time; only its delivery to the loop was late
+            return finished  # a verdict is in hand, before the deadline or after it
     except BaseException:
         # Cancelled (engine stop, connection teardown): nobody will await the result, so a run not
         # yet begun must not begin.

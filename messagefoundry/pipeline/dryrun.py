@@ -956,7 +956,8 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     :func:`~messagefoundry.pipeline.ingress_guards.strict_validate_timeout` resolves passes. This
     function is synchronous, so it validates **inline and measures**: when the validate took longer
     than that timeout, the result is the listener's text word for word (the parity test compares the
-    two), whatever the validate returned or raised, since the listener had given up on it by then. A
+    two), whatever the validate returned or raised, since the listener had usually given up on it by
+    then (the exception is below). A
     validate inside the timeout reports as before: its own refusal, or its raise. With the backstop
     disabled (``strict_timeout_s <= 0``) nothing times out.
 
@@ -965,7 +966,10 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     the size and segment caps checked before the parse. And the listener's validates share the
     default executor's workers with concurrent traffic, so a saturated executor can push a fast
     validate past its timeout there; the preview validates one message at a time and does not model
-    that. The verdict matches; the wall clock and the concurrency do not."""
+    that. Nor does it model the listener's late-result recovery: a validate that finished after the
+    deadline, but before the listener handled the timeout, is used there as if it had not timed out,
+    while a dry run reports any validate past the timeout as timed out. Below the timeout the
+    verdict matches; the wall clock, the concurrency and that boundary case do not."""
     timeout = strict_validate_timeout(ic)
     started = time.monotonic()
     fault: Exception | None = None

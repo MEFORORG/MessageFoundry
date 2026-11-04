@@ -433,7 +433,7 @@ The table lists the main failures. It is not a full list.
 | The body cannot be decoded or parsed, or it holds a NUL character | NAK `AR` | `ERROR`, recorded with no ingress row |
 | Strict validation fails | NAK `AR` | `ERROR`, recorded with no ingress row |
 | Strict validation times out | NAK `AR` once the validate began, `AE` if it never began | `ERROR`, recorded with no ingress row |
-| A streaming inbound cannot store a large document | NAK `AE` | `ERROR`, recorded with no ingress row |
+| A streaming inbound cannot store a large document | NAK `AE` when only concurrent detaches hold the streaming budget, `AR` for every other detach refusal | `ERROR`, recorded with no ingress row |
 | The store cannot commit the message | NAK `AE` from the MLLP listener, then the connection closes | Nothing was ACKed, so the sender sends it again |
 | A Router or a Handler raises | The `AA` it already holds | `ERROR`, with the row dead-lettered at its own stage |
 | The engine stops before a handoff commits | The `AA` it already holds | The stage runs again after the restart |
