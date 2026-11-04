@@ -512,7 +512,7 @@ async def test_dead_letter_purge_releases_attachment_after_body_purge(store: Mes
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     assert await _refcount(store, ref) == 1  # kept: the dead row is still replayable
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _row_payload(store, oid) == ""  # dead row no longer replayable
     assert await _refcount(store, ref) is None  # last replayable holder gone → decref'd → GC
     assert await _chunk_count(store, ref) == 0
@@ -526,7 +526,7 @@ async def test_dead_letter_purge_releases_attachment_when_run_first(store: Messa
     ref = await store.put_attachment(CHUNKS, "application/pdf")
     mid, oid = await _dead_deliver(store, now=0.0, ref=ref)
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _row_payload(store, oid) == ""
     assert await _refcount(store, ref) is None  # released here — the dead row was the last holder
     assert await _join_count(store, mid) == 0
@@ -568,7 +568,7 @@ async def test_fanout_done_plus_dead_keeps_attachment_until_dead_purged(
     assert await _refcount(store, ref) == 1  # the dead sibling keeps the attachment
     assert await _join_count(store, mid) == 1
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _refcount(store, ref) is None  # last holder purged → GC
     assert await _join_count(store, mid) == 0
 
@@ -582,9 +582,11 @@ async def test_dead_letter_purge_idempotent_no_attachment_underflow(store: Messa
     assert await _refcount(store, ref) == 2
 
     assert (
-        await store.purge_dead_letters(older_than=10 * DAY) == 1
-    )  # only m1's dead row is past cutoff
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # re-run: nothing left to blank
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 1  # only m1's dead row is past cutoff
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 0  # re-run: nothing left to blank
 
     # m1 released exactly once; m2's document SURVIVES byte-for-byte at refcount 1 (no underflow / GC).
     assert await _refcount(store, ref) == 1

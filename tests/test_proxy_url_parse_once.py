@@ -34,7 +34,11 @@ from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.bounded_read import build_strict_opener
 from messagefoundry.transports.egress import check_egress_allowed, check_fhir_lookup_allowed
 from messagefoundry.transports.proxy_address import parse_proxy_url, read_like_urllib
-from messagefoundry.transports.rest import proxy_config_from_settings
+from messagefoundry.transports.rest import (
+    PROXY_DEFAULT,
+    proxy_config_from_settings,
+    proxy_url_holds_credential,
+)
 
 LISTED = "proxy.listed.invalid"
 UNLISTED = "other.unlisted.invalid"
@@ -88,17 +92,22 @@ def _rest(proxy_url: str, **extra: str) -> Destination:
 def _open_through(settings: Mapping[str, Any]) -> bool:
     """Build the connection's proxy opener as the transport does and send one request.
 
-    Returns ``False`` when the build refuses the settings for the split, so nothing could be
-    dialled. Any other refusal is raised, so a credential refused for its cleartext leg cannot
-    pass for this one. The leg is attested, so the proxy login is admitted as a deployment's
-    would be."""
+    Returns ``False`` when the build refuses the settings for the split, or for a user and
+    password written in the URL (vault BACKLOG #3007), so nothing could be dialled. Any other
+    refusal is raised, so a credential refused for its cleartext leg cannot pass for this one.
+    The leg declares the cleartext acceptance with a reason, the one declaration that admits a
+    proxy login off this machine (B462-R1), so the login is admitted as a deployment's would be."""
     with active_hop_posture(HopPosture(enforcing=False)):
         try:
             config = proxy_config_from_settings(
-                settings, dest_scheme="http", attested=True, connection="OB"
+                settings,
+                dest_scheme="http",
+                cleartext_accepted=True,
+                cleartext_reason="test proxy leg on a lab segment",
+                connection="OB",
             )
         except ValueError as exc:
-            if "2965" not in str(exc):
+            if "2965" not in str(exc) and "holds a user or a password" not in str(exc):
                 raise
             return False
     assert config is not None
@@ -128,6 +137,43 @@ def test_the_gate_refuses_a_split_value_at_load(proxy_url: str) -> None:
         )
     _assert_names_no_part(str(lookup.value))
     assert "2965" in str(lookup.value)
+
+
+@pytest.mark.parametrize(
+    "proxy_url", [*SPLIT_SHAPES, f"socks5://{LISTED}:1080", f"http://{LISTED}:0"]
+)
+def test_the_site_proxy_url_is_refused_at_load_for_its_shape(proxy_url: str) -> None:
+    """``[egress].proxy_url`` takes the same parse, at settings load, so the fault names the
+    setting and is caught even when no connection inherits the value. The refusal names no part
+    of it, and pydantic does not echo the input. A value urllib would read a user and a password
+    out of is refused for that first, as the connector's build refuses it (vault BACKLOG #3007)."""
+    with pytest.raises(ValueError) as refused:
+        EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED])
+    if proxy_url_holds_credential(proxy_url):
+        assert "[egress].proxy_url holds a user or a password" in str(refused.value)
+    else:
+        assert "2965" in str(refused.value) and "proxy_url" in str(refused.value)
+    _assert_names_no_part(str(refused.value))
+    assert LISTED not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [PLAIN, PLAIN + "/", "default", "DEFAULT", f"http://@{LISTED}:3128", f"http://:@{LISTED}:3128"],
+)
+def test_control_a_site_proxy_url_the_parse_accepts_loads(proxy_url: str) -> None:
+    """An empty userinfo holds no credential, so it loads; one that holds a user or a password is
+    refused at load (vault BACKLOG #3007, tests/test_proxy_url_credentials_refused.py). The
+    validator writes the sentinel out, so this pins that it is the transport's."""
+    assert EgressSettings(proxy_url=proxy_url, allowed_proxy=[LISTED]).proxy_url == proxy_url
+    assert PROXY_DEFAULT == "default"
+
+
+@pytest.mark.parametrize("proxy_url", ["", "   "])
+def test_a_blank_site_proxy_url_reads_as_unset(proxy_url: str) -> None:
+    """Kept as written, a blank value is truthy, so every connection would inherit it and fail its
+    build for a missing scheme."""
+    assert EgressSettings(proxy_url=proxy_url).proxy_url is None
 
 
 @pytest.mark.parametrize("proxy_url", SPLIT_SHAPES)
@@ -188,16 +234,30 @@ def test_a_trailing_slash_is_accepted_and_dropped(dials: list[tuple[str, int]]) 
 
 
 def test_userinfo_is_kept_in_the_rebuilt_url() -> None:
-    """Userinfo stays supported, escapes and all, so urllib builds the same header from it."""
+    """The parse keeps a userinfo, escapes and all, so urllib reads the same user and password
+    from the rebuilt URL. A user and password there then fail the connector build for their own
+    reason (vault BACKLOG #3007), so the build is asserted to refuse, not to dial."""
     proxy = f"https://us%40er:p%2Fw@{LISTED}:3128/"
-    with active_hop_posture(HopPosture(enforcing=False)):
-        config = proxy_config_from_settings(
-            {"proxy_url": proxy}, dest_scheme="http", connection="OB"
-        )
-    assert config is not None
-    rebuilt = dict(config.proxies)["http"]
+    rebuilt = parse_proxy_url(proxy).url
     assert rebuilt == proxy.rstrip("/")
     assert read_like_urllib(rebuilt)[1:] == read_like_urllib(proxy)[1:]
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        pytest.raises(ValueError, match="holds a user or a password"),
+    ):
+        proxy_config_from_settings({"proxy_url": proxy}, dest_scheme="http", connection="OB")
+
+
+def test_a_user_with_no_password_is_parsed_as_written_and_fails_the_build() -> None:
+    """The parse keeps a userinfo as written. A user alone sends no header, but it may be a token,
+    and it would stay in the URL dialled, so the build refuses it (vault BACKLOG #3007)."""
+    proxy = f"http://us%40er@{LISTED}:3128"
+    assert parse_proxy_url(proxy).url == proxy
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        pytest.raises(ValueError, match="holds a user or a password"),
+    ):
+        proxy_config_from_settings({"proxy_url": proxy}, dest_scheme="http", connection="OB")
 
 
 @pytest.mark.parametrize(
@@ -321,8 +381,13 @@ def test_the_static_hop_label_names_the_dialled_host() -> None:
     assert plain is not None and f"{LISTED}:3128" in plain.detail
     for proxy_url in SPLIT_SHAPES:
         hop = _proxy_hop("OB", {"proxy_url": proxy_url, **keyed}, None)
+        if proxy_url_holds_credential(proxy_url):
+            # A credential in the URL fails the build, so it is no hop to accept (vault BACKLOG #3007).
+            assert hop is None, proxy_url
+            continue
         assert hop is not None and _WITHHELD_PEER in hop.detail, proxy_url
         _assert_names_no_part(hop.detail)
+    assert any(proxy_url_holds_credential(proxy_url) for proxy_url in SPLIT_SHAPES)
 
 
 @pytest.mark.parametrize(

@@ -193,7 +193,7 @@ async def test_dead_letter_override_keys_off_outbound(store: MessageStore) -> No
         connection_cutoffs={"OB_FAST": now - 1 * DAY},
     )
 
-    assert purged == 1
+    assert purged.bodies == 1
     assert await _payload(store, fast) == ""  # OB_FAST's dead body purged on its own window
     assert await _payload(store, slow) == "OUT|dead"  # OB_SLOW still under the global window
 
@@ -280,7 +280,7 @@ async def test_three_backend_parity(store: MessageStore) -> None:
         older_than=now - 30 * DAY, now=now, connection_cutoffs={"OB_FAST": now - 1 * DAY}
     )
 
-    assert (mp, dp) == (1, 1)
+    assert (mp, dp.bodies) == (1, 1)
     assert await _raw(store, fast) == "" and await _raw(store, slow) == RAW
     assert await _payload(store, df) == "" and await _payload(store, ds) == "OUT|dead"
 

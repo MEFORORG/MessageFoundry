@@ -303,28 +303,29 @@ def test_harden_verify_flags_preserves_existing_flags() -> None:
 
 # --- certificate-revocation posture (ASVS 12.1.4, ADR 0078) -----------------------------------
 @pytest.mark.parametrize(
-    "tls_enabled,is_loopback,proxy_terminated,attested,expected_refuse",
+    "tls_enabled,is_loopback,attested,expected_refuse",
     [
         # loopback default (no TLS) — never trips; byte-identical start
-        (False, True, False, False, False),
+        (False, True, False, False),
         # loopback WITH in-process TLS — still never trips (not network-reachable)
-        (True, True, False, False, False),
-        # off-loopback PLAINTEXT (no in-process cert) — the gate keys on tls_enabled, so it passes
-        (False, False, False, False, False),
-        # off-loopback in-process TLS, no proxy, no attestation — THE fail-closed refusal
-        (True, False, False, False, True),
-        # off-loopback in-process TLS behind a declared proxy — revocation proven in front
-        (True, False, True, False, False),
+        (True, True, False, False),
+        # loopback with the attestation set — nothing to refuse either way
+        (True, True, True, False),
+        # off-loopback PLAINTEXT (no in-process cert) — the gate keys on tls_enabled, so it passes.
+        # A plaintext upstream terminator lands here too; after BACKLOG #4636 serve refuses it off
+        # loopback before this gate, so the exemption it still gets covers the loopback one only.
+        (False, False, False, False),
+        # off-loopback in-process TLS with no attestation — THE fail-closed refusal. A declared
+        # upstream terminator in front makes no difference: the predicate no longer reads one
+        # (BACKLOG #4636), because the engine still terminates the proxy hop's TLS itself.
+        (True, False, False, True),
         # off-loopback in-process TLS with the operator attestation opt-out
-        (True, False, False, True, False),
-        # both proofs present — still starts
-        (True, False, True, True, False),
+        (True, False, True, False),
     ],
 )
 def test_in_process_tls_revocation_refused_matrix(
     tls_enabled: bool,
     is_loopback: bool,
-    proxy_terminated: bool,
     attested: bool,
     expected_refuse: bool,
 ) -> None:
@@ -332,7 +333,6 @@ def test_in_process_tls_revocation_refused_matrix(
         in_process_tls_revocation_refused(
             tls_enabled=tls_enabled,
             is_loopback=is_loopback,
-            proxy_terminated=proxy_terminated,
             attested=attested,
         )
         is expected_refuse

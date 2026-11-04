@@ -53,7 +53,7 @@ from messagefoundry.auth.service import AuthService, _directory_login_refusal
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import ApiSettings, AuthSettings
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.config.wiring import Http, WiringError
+from messagefoundry.config.wiring import MLLP, Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
 from tests._ast_sites import call_sites
@@ -72,7 +72,10 @@ _LOGIN_ENTRY_POINTS = frozenset(
 #: Row token -> the setting whose existence proves the pathway still ships: a settings-model field, or
 #: a parameter of a connector factory. ``None`` = always available (Local needs no switch). ``mTLS`` is
 #: the fifth pathway and the first non-interactive one; HTTP intake authentication is the sixth, on the
-#: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway).
+#: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway). MLLP intake
+#: authentication, ``tls_client_subjects``, is the seventh, counted by the record's criterion rather
+#: than by that ruling, which named ``intake_auth`` only: a connector-factory parameter that
+#: authenticates a submitting peer by a subject list is a pathway (BACKLOG #4907).
 _PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**Local**": None,
     "**AD**": (AuthSettings, "ad_enabled"),
@@ -80,14 +83,20 @@ _PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**OIDC federation**": (AuthSettings, "oidc_enabled"),
     "**mTLS service identity**": (ApiSettings, "tls_client_cert_identities"),
     "**HTTP intake authentication**": (Http, "intake_auth"),
+    "**MLLP intake authentication**": (MLLP, "tls_client_subjects"),
 }
 
 #: Pathways that live on the INGEST plane rather than the engine API. Neither the ``AuthService``
 #: derivation nor the ``api.security`` factory derivation can see them, so the set is checked against
-#: the ``config.wiring`` factories that take an ``intake_auth`` parameter instead (see
+#: the ``config.wiring`` factories that take one of :data:`_INGEST_AUTH_PARAMETERS` instead (see
 #: ``test_ingest_plane_pathways_are_derived_from_the_connector_factories``).
-_INGEST_PLANE_PATHWAYS = frozenset({"**HTTP intake authentication**"})
-_INGEST_PLANE_FACTORIES = frozenset({"Http"})
+_INGEST_PLANE_PATHWAYS = frozenset(
+    {"**HTTP intake authentication**", "**MLLP intake authentication**"}
+)
+_INGEST_PLANE_FACTORIES = frozenset({"Http", "MLLP"})
+#: The connector-factory parameters that authenticate a submitting peer: ``Http``'s ``intake_auth``
+#: and ``MLLP``'s ``tls_client_subjects`` (BACKLOG #4907).
+_INGEST_AUTH_PARAMETERS = frozenset({"intake_auth", "tls_client_subjects"})
 
 #: Companion-table row labels, in the primary table's order. The two tables label rows differently,
 #: so the order check needs the mapping rather than a string compare.
@@ -98,10 +107,19 @@ _COMPANION_LABELS = (
     "**OIDC**",
     "**mTLS**",
     "**HTTP intake**",
+    "**MLLP intake**",
 )
 
 #: Tokens the numbered-6.1.3 paragraph must enumerate — it is the artefact that cites the requirement.
-_PARAGRAPH_TOKENS = ("Local", "AD", "Kerberos", "OIDC", "mTLS", "intake_auth")
+_PARAGRAPH_TOKENS = (
+    "Local",
+    "AD",
+    "Kerberos",
+    "OIDC",
+    "mTLS",
+    "intake_auth",
+    "tls_client_subjects",
+)
 
 #: Every public dependency factory in ``messagefoundry.api.security``. The interactive derivation
 #: above covers ``AuthService``; this covers the NON-interactive plane, which is where a new
@@ -204,8 +222,8 @@ def test_row_count_tracks_the_login_entry_points_in_code() -> None:
     )
     # complete_oidc_login + authenticate_oidc are two legs of ONE pathway, so 4 entry points collapse
     # to 3 interactive pathways beyond Local; +Local +mTLS = 5 API-plane rows, +HTTP intake on the
-    # ingest plane = 6 (owner ruling 2026-09-23).
-    assert len(_PATHWAY_ANCHORS) == 6
+    # ingest plane = 6 (owner ruling 2026-09-23), +MLLP intake on the ingest plane = 7 (#4907).
+    assert len(_PATHWAY_ANCHORS) == 7
     # BLIND SPOT CLOSED. The public-coroutine derivation above cannot see a new pathway added
     # through the EXISTING public entry point: ``login()`` dispatches on ``AuthProvider`` into a
     # PRIVATE ``_login_<provider>`` coroutine, so a new enum member + ``_login_saml`` would change
@@ -276,17 +294,19 @@ def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
 
 def test_ingest_plane_pathways_are_derived_from_the_connector_factories() -> None:
     """RULE: a connector factory that takes ``intake_auth`` authenticates a submitting peer, which
-    the owner ruled (2026-09-23) is an authentication pathway. A second one needs its own row."""
+    the owner ruled (2026-09-23) is an authentication pathway. A second one needs its own row.
+    ``MLLP``'s ``tls_client_subjects`` is the second (BACKLOG #4907)."""
     import messagefoundry.config.wiring as wiring
 
     factories = {
         name
         for name, member in inspect.getmembers(wiring, inspect.isfunction)
         if member.__module__ == wiring.__name__
-        and "intake_auth" in inspect.signature(member).parameters
+        and _INGEST_AUTH_PARAMETERS & set(inspect.signature(member).parameters)
     }
     assert factories == _INGEST_PLANE_FACTORIES, (
-        f"the connector factories taking intake_auth changed: {sorted(factories)}. Each is an "
+        f"the connector factories taking {sorted(_INGEST_AUTH_PARAMETERS)} changed: "
+        f"{sorted(factories)}. Each is an "
         "ingest-plane authentication pathway -- give it a comparative-strength row in "
         "docs/SECURITY.md and update _INGEST_PLANE_PATHWAYS in the same change (ASVS 6.1.3)."
     )
@@ -514,7 +534,7 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     block = _section()
     paragraph = block[block.index("ASVS 6.1.3") :]
     assert token in paragraph, (
-        "the ASVS 6.1.3 paragraph must name the switch that strips three of the six pathways of "
+        "the ASVS 6.1.3 paragraph must name the switch that strips three of the seven pathways of "
         "their engine-side throttles — that is the comparative-strength answer the requirement wants."
     )
 
@@ -3424,21 +3444,113 @@ _SIGN_IN_OFF = re.compile(
     re.IGNORECASE,
 )
 
-#: Sign-in REQUIRED only by default, in either word order: "requires authentication by default",
-#: "authentication is required by default", "by default the API requires sign-in". Calling it a
-#: default says a setting can change it, which no setting can (vault BACKLOG #3477). A denial makes
-#: it worse, not true ("does not require auth by default"), so no denial clears this pattern.
-_SIGN_IN_DEFAULT = re.compile(
-    rf"\b(?:an? )?{_SIGN_IN}\b(?: (?:is|are|be))? required,? by default\b"
-    rf"|\brequire[sd]? (?:an? )?{_SIGN_IN}\b,? by default\b"
-    # One subject between: "binds 127.0.0.1 by default and requires auth" ties the default to the bind.
-    rf"|\bby default,? (?:the |an? )?(?!(?:and|or|but)\b)\w+ requires? (?:an? )?{_SIGN_IN}\b",
-    re.IGNORECASE,
+#: The words a doc gives a default, a requirement and a verb "to be", for ``_SIGN_IN_DEFAULT``.
+_DEFAULTED = r"(?:by default|out of the box|as shipped)"
+_REQUIRED = r"(?:required|mandatory|enforced|needed)"
+_BE = r"(?:is|are|be|stays|remains)"
+#: A word, a backticked name such as `serve`, or a path such as /ui.
+_WORD = r"[\w'.`/-]+"
+#: A word that opens a second clause. A subject never runs across one, so "binds 127.0.0.1 by
+#: default and requires auth" ties the default to the bind.
+_JOIN = r"(?:and|or|but|then|which|that|while|when|if|unless|so)"
+_NOT_JOIN = rf"(?!{_JOIN}\b)"
+_NOUN = rf"(?P<noun>{_SIGN_IN}s?)\b"
+_UP_TO_TWO = rf"(?:{_NOT_JOIN}{_WORD} ){{0,2}}?"
+
+#: Sign-in REQUIRED only by default, in any of these word orders. Calling it a default says a
+#: setting can change it, which no setting can (vault BACKLOG #3477, #4179). A denial makes it
+#: worse, not true ("does not require auth by default"), so no denial clears these patterns.
+_SIGN_IN_DEFAULT = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        # "authentication is required by default", "Authentication: required (by default)"
+        rf"\b{_NOUN}:?(?: {_BE})? {_REQUIRED},? \(?{_DEFAULTED}\b",
+        # "authentication is, by default, required"
+        rf"\b{_NOUN} {_BE},? {_DEFAULTED},? {_REQUIRED}\b",
+        # "by default, authentication is required", "by default sign-in required"
+        rf"\b{_DEFAULTED},? (?:(?:the|an?|every|all|any) )?{_NOUN}(?: {_BE})? {_REQUIRED}\b",
+        # "requires a sign-in by default", "requires authentication and TLS (by default)",
+        # "requires authentication for every route by default"
+        rf"\brequire[sd]? {_UP_TO_TWO}{_NOUN}(?: (?:and|or) {_WORD})?"
+        rf"(?: {_NOT_JOIN}{_WORD}){{0,3}}?,? \(?{_DEFAULTED}\b",
+        # "requires users to sign in by default"
+        rf"\brequire[sd]? (?:{_NOT_JOIN}{_WORD} ){{1,2}}to (?P<noun>sign|log) ?in\b,? \(?{_DEFAULTED}\b",
+        # "by default the engine's API requires sign-in", "the API by default requires sign-in"
+        rf"\b{_DEFAULTED},? (?P<subject>(?:{_NOT_JOIN}{_WORD} ){{0,4}}?)"
+        rf"(?:(?:may|must|will|does|also) )?requires? {_UP_TO_TWO}{_NOUN}",
+        # "authentication defaults to on", "the default is to require sign-in"
+        rf"\b{_NOUN} defaults? to (?:on|required|enabled|mandatory|true)\b",
+        rf"\bthe default is to require {_UP_TO_TWO}{_NOUN}",
+        # "every request is authenticated by default", "requests are, by default, authenticated"
+        rf"\b{_BE} (?P<noun>authenticated),? \(?{_DEFAULTED}\b",
+        rf"\b{_BE},? {_DEFAULTED},? (?P<noun>authenticated)\b",
+    )
 )
 
-#: A leg's or another system's name, anywhere in the stretch that holds a default match: "the SMTP
-#: relay requires authentication by default" is about the relay, not the engine's sign-in.
-_ONE_LEG = re.compile(r"\b(?:" + "|".join(_SIGN_IN_LEGS) + r")\b", re.IGNORECASE)
+#: Another system that may require its own sign-in by default: "the SMTP relay requires
+#: authentication by default" is about the relay, and "Vault requires a token login by default" is
+#: about Vault. A list, so a system it does not name still reds.
+_OTHER_SYSTEMS = (
+    "Vault",
+    "prox(?:y|ies)",
+    "Postgres(?:QL)?",
+    "SQL Server",
+    "SMTP",
+    "LDAP",
+    "AD",
+    "Kerberos",
+    "OIDC",
+    "SSO",
+)
+#: Another system as a whole word of the subject, or a possessive: "the SMTP relay", "Vault's
+#: server". Not a part of a compound: "the SSO-enabled API" is the engine's API.
+_OTHER_SYSTEM = re.compile(
+    r"(?<!\S)(?:" + "|".join(_OTHER_SYSTEMS) + r")(?:'s)?(?!\S)", re.IGNORECASE
+)
+#: A leg or another system named as the word right before the sign-in noun: "two-factor
+#: authentication", "LDAP authentication", "SQL Server authentication". A count of failures is
+#: not a sign-in requirement: "the lockout requires five failed logins by default".
+_ONE_LEG = re.compile(
+    r"\b(?:" + "|".join((*_SIGN_IN_LEGS, *_OTHER_SYSTEMS, "failed")) + r")(?:'s)?$", re.IGNORECASE
+)
+
+
+def _stretch(c: str, end: int) -> str:
+    """``c`` up to ``end``, back to the last comma, colon, dash or bracket."""
+    return re.split(r"[,:(—–]", c[:end])[-1]
+
+
+def _subject_ahead(c: str, end: int) -> str:
+    """The last three words of ``c`` before ``end``, in its stretch and after its last join word,
+    with any closed bracket left out: the subject a verb at ``end`` reads as. In "the engine reads
+    Vault and requires sign-in" the subject of "requires" is the engine, so this is empty there,
+    and in "the API (unlike Vault) requires sign-in" it is "the API"."""
+    unbracketed = re.sub(r"\([^()]*\)", " ", c[:end])
+    words = _stretch(unbracketed, len(unbracketed)).split()
+    start = max((i + 1 for i, w in enumerate(words) if re.fullmatch(_JOIN, w, re.I)), default=0)
+    return " ".join(words[start:][-3:])
+
+
+def _about_another_leg_or_system(c: str, m: re.Match[str]) -> bool:
+    """Whether a ``_SIGN_IN_DEFAULT`` match is about a leg's or another system's sign-in, or a
+    second factor's.
+
+    Yes when the words right before the noun end in a leg or system ("LDAP authentication is
+    required by default"), or when the subject names another system or a second factor: the last
+    words ahead of the match ("the proxy requires authentication by default", "MFA is required
+    for sign-in by default"; "Vault, by default, requires a token login") or the subject the
+    pattern read ("by default PostgreSQL requires a login"). A leg that is not also a listed
+    system is never a subject: "the local API requires sign-in by default" is about the engine's
+    API."""
+    before_noun = " ".join(c[: m.start("noun")].split()[-2:])
+    if _ONE_LEG.search(before_noun):
+        return True
+    ahead = c[: m.start()]
+    if re.match(_DEFAULTED, m.group(0), re.IGNORECASE):
+        ahead = ahead.rstrip(", ")
+    subject = _subject_ahead(ahead, len(ahead)) + " " + m.groupdict("").get("subject", "")
+    return bool(_OTHER_SYSTEM.search(subject) or _SECOND_FACTOR.search(subject))
+
 
 #: A denial just ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
 _DENIED_BEFORE = re.compile(r"\b(?:no|not|never|cannot|nothing)\b|n't\b", re.IGNORECASE)
@@ -3458,20 +3570,25 @@ def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
     account's sign-in is disabled" and "a request without authentication is answered 401": that is
     loud, and rewording clears it.
 
-    ``_SIGN_IN_DEFAULT`` is read apart: no denial clears it, and a leg or system named in its
-    stretch does. So a true sentence about the engine that also names one ("the local API requires
-    sign-in by default") passes, and so would the claim written that way."""
-
-    def stretch(c: str, m: re.Match[str]) -> str:
-        return re.split(r"[,:(—–]", c[: m.start()])[-1]
-
+    ``_SIGN_IN_DEFAULT`` is read apart: no denial clears it, and ``_about_another_leg_or_system``
+    does. It flags every match of its patterns that does not name a listed leg or system in the
+    places that function reads. So it reds a true sentence about a system
+    ``_OTHER_SYSTEMS`` does not list ("the Redis cache requires authentication by default"), and
+    one whose system sits ahead of a relative clause ("a proxy that the engine trusts requires
+    authentication by default"). What
+    it misses is at least a claim in other words ("sign-in is the default"), one whose subject
+    runs across a join word ("by default the web console and the API require sign-in"), and one
+    that names a leg as the noun's modifier or a system in its subject ("the API requires a
+    password login by default", "the API behind the proxy requires sign-in by default")."""
     return [
         c
         for c in clauses
         if _AUTH_DISABLED.search(c)
-        or any(not _DENIED_BEFORE.search(stretch(c, m)) for m in _SIGN_IN_OFF.finditer(c))
+        or any(not _DENIED_BEFORE.search(_stretch(c, m.start())) for m in _SIGN_IN_OFF.finditer(c))
         or any(
-            not _ONE_LEG.search(stretch(c, m) + m.group(0)) for m in _SIGN_IN_DEFAULT.finditer(c)
+            not _about_another_leg_or_system(c, m)
+            for pattern in _SIGN_IN_DEFAULT
+            for m in pattern.finditer(c)
         )
     ]
 
@@ -3534,6 +3651,37 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "The API does not require authentication by default.",
         "The engine no longer requires sign-in by default.",
         "The API doesn't require auth by default.",
+        # docs/CONFIGURATION.md's `[auth]` lead, as engine PR 2526 left it (vault BACKLOG #4177).
+        "Authentication is required by default;",
+        # The rewordings the first patterns missed (vault BACKLOG #4179), one for each pattern.
+        "By default, authentication is required.",
+        "authentication is, by default, required",
+        "Sign-in is mandatory by default.",
+        "Logins are required out of the box.",
+        "The API requires authentication (by default).",
+        "The API requires authentication and TLS by default.",
+        "The engine requires users to sign in by default.",
+        "By default the engine's API requires authentication.",
+        "By default, every route requires authentication.",
+        "The API by default requires sign-in.",
+        "Sign-in defaults to on.",
+        "The default is to require authentication.",
+        "Every request is authenticated by default.",
+        # A leg named ahead of the subject, not as the noun's modifier, no longer exempts it.
+        "The local API requires sign-in by default.",
+        "On Windows the API requires sign-in by default.",
+        # A system named before a join word is not the subject of the verb after it.
+        "The engine reads its key from Vault and requires sign-in by default.",
+        # Code review round 1: a backticked subject, a system in brackets or in a compound, more
+        # words between the noun and the default, and a colon or no verb.
+        "By default `serve` requires sign-in.",
+        "By default the `/ui` console requires sign-in.",
+        "The API (unlike Vault) requires sign-in by default.",
+        "The SSO-enabled API requires sign-in by default.",
+        "The API requires authentication for every route by default.",
+        "Authentication: required by default.",
+        "By default sign-in required.",
+        "Requests are, by default, authenticated.",
         # A denial in an earlier stretch of the clause is about something else.
         "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
         "TLS is not needed on loopback, where sign-in is optional.",
@@ -3542,6 +3690,11 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "TLS is not needed where auth is disabled.",
     ]
     assert _says_sign_in_can_be_off(off) == off
+    # Every default pattern reads at least one of those, so none is dead. The floor is the count of
+    # patterns on 2026-11-04, so a tuple that lost its patterns cannot pass this on nothing.
+    assert len(_SIGN_IN_DEFAULT) >= 10, f"_SIGN_IN_DEFAULT holds {len(_SIGN_IN_DEFAULT)} pattern(s)"
+    idle = [p.pattern for p in _SIGN_IN_DEFAULT if not any(p.search(c) for c in off)]
+    assert not idle, f"these _SIGN_IN_DEFAULT patterns match no control: {idle}"
     denied = [
         "(`serve` always requires sign-in;",
         "there is no switch that turns it off.)",
@@ -3562,6 +3715,21 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "The LDAP server requires authentication by default.",
         "By default LDAP requires authentication.",
         "Two-factor authentication is required by default.",
+        # True sentences about Vault, a proxy and PostgreSQL that the first patterns flagged
+        # (vault BACKLOG #4179): the system is the subject, or the noun's modifier.
+        "Vault requires a token login by default.",
+        "By default Vault requires authentication.",
+        "A forward proxy may require authentication by default.",
+        "Proxy authentication is required by default on that host.",
+        "PostgreSQL requires password authentication by default.",
+        "By default PostgreSQL requires a login.",
+        "By default the engine binds loopback and requires sign-in.",
+        # Code review round 1: a system set off by commas or as a two-word modifier, and a second
+        # factor or a failure count, which are real defaults.
+        "Vault, by default, requires a token login.",
+        "The store requires SQL Server authentication by default.",
+        "MFA is required for sign-in by default.",
+        "The account lockout requires five failed logins by default.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
     assert _says_sign_in_can_be_off(denied) == []
@@ -3612,6 +3780,7 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
         ("docs/CLOUD-DEPLOYMENT.md", 250),
         ("docs/CLOUD-PHI-HIPAA.md", 110),
         ("docs/CONFIGURATION.md", 5000),
+        ("docker/README.md", 150),
     ],
 )
 def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, floor: int) -> None:
@@ -3619,9 +3788,10 @@ def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, f
     keyless refusal, and engine PR 2015 retired that. docs/CONTAINER-EXPOSURE-EVALUATION.md said
     the same in three places, and no guard read that file for it (vault BACKLOG #2993, items 5 and
     6). docs/CLOUD-DEPLOYMENT.md, docs/CLOUD-PHI-HIPAA.md and docs/CONFIGURATION.md said it too, and
-    no guard read them either (vault BACKLOG #3477). A keyless start is refused by default. The key
-    keeps the refusal past the audited opt-out. Each floor sits below the file's count on
-    2026-10-26."""
+    no guard read them either (vault BACKLOG #3477). docker/README.md said it too (vault BACKLOG
+    #4178). A keyless start is refused by default. The key keeps the refusal past the audited
+    opt-out. Each floor sits below the file's count on 2026-10-26, docker/README.md's on
+    2026-11-03."""
     units = _clauses_and_rows(_doc(name))
     assert len(units) >= floor, (
         f"{name} cut into {len(units)} clause(s) and row(s), floor {floor}: the require_encryption "
@@ -3636,30 +3806,80 @@ def test_no_doc_credits_require_encryption_with_the_keyless_refusal(name: str, f
     )
 
 
+def test_the_docker_manifests_say_what_require_encryption_does() -> None:
+    """docker/compose.yaml said `MEFOR_STORE_REQUIRE_ENCRYPTION` makes the engine fail closed with
+    no store key, and three more manifest lines set it with no word on what it does (vault BACKLOG
+    #4178). A keyless store is refused by default; the key keeps that refusal past the audited
+    opt-out. A manifest is not prose, so each line that sets it is read alone, and must name the
+    opt-out. The floor is the count of such lines on 2026-11-03."""
+    lines = [
+        f"{path.relative_to(_ROOT).as_posix()}: {line.strip()}"
+        for path in sorted((_ROOT / "docker").rglob("*.y*ml"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "MEFOR_STORE_REQUIRE_ENCRYPTION" in line
+    ]
+    assert len(lines) >= 4, f"docker/ sets MEFOR_STORE_REQUIRE_ENCRYPTION on {len(lines)} line(s)"
+    # The control: compose.yaml's retired comment reds both reads below.
+    retired = 'MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # fail closed if no store key'
+    assert not _KEYLESS_OPT_OUT.search(retired)
+    assert _credits_require_encryption_with_the_refusal([retired]) == [retired]
+    bare = [line for line in lines if not _KEYLESS_OPT_OUT.search(line)]
+    assert not bare, (
+        f"these manifest lines set MEFOR_STORE_REQUIRE_ENCRYPTION without naming the audited opt-out "
+        f"it keeps the refusal past: {bare}"
+    )
+    assert _credits_require_encryption_with_the_refusal(lines) == []
+
+
+#: True sentences in docs/CONFIGURATION.md that the sign-in scan reds: a federated account, an SMTP
+#: relay and an alert hop "with no login" or "with no sign-in", none about the engine's own
+#: sign-in. Each is cut out of its unit before the scan, so the rest of that unit is still read.
+_CONFIGURATION_TRUE_SIGN_IN_PHRASES = (
+    "turning this off leaves a bound account with no sign-in until it is unbound",
+    "A relay with no login takes no revocation guard",
+    "It covers a hop with no login only",
+)
+
+
 @pytest.mark.parametrize(
-    ("name", "floor"),
+    ("name", "floor", "true_phrases"),
     [
-        ("docs/USER-GUIDE.md", 600),
-        ("docs/CLOUD-DEPLOYMENT.md", 250),
-        ("docs/CLOUD-PHI-HIPAA.md", 110),
+        ("docs/USER-GUIDE.md", 600, ()),
+        ("docs/CLOUD-DEPLOYMENT.md", 250, ()),
+        ("docs/CLOUD-PHI-HIPAA.md", 110, ()),
+        ("docker/README.md", 150, ()),
+        ("docs/CONFIGURATION.md", 6400, _CONFIGURATION_TRUE_SIGN_IN_PHRASES),
     ],
 )
-def test_these_docs_do_not_say_sign_in_can_be_off(name: str, floor: int) -> None:
+def test_these_docs_do_not_say_sign_in_can_be_off(
+    name: str, floor: int, true_phrases: tuple[str, ...]
+) -> None:
     """docs/USER-GUIDE.md said the API requires authentication "by default" and that it is "on by
-    default", and no guard read that file for it (vault BACKLOG #3477). `serve` always requires
-    sign-in: the load refuses both keys that once turned it off (the second-round probe above).
+    default", and no guard read that file for it (vault BACKLOG #3477). docs/CONFIGURATION.md's
+    `[auth]` lead said it too (vault BACKLOG #4177). `serve` always requires sign-in: the load
+    refuses both keys that once turned it off (the second-round probe above).
 
     docs/CLOUD-PHI-HIPAA.md section 6 states the posture; docs/CLOUD-DEPLOYMENT.md states none, so
     for it this is a floor against a claim arriving. A table row is read whole, but the patterns
     need their words side by side, so a claim split across cells ("| Sign-in | optional |") still
-    passes. docs/CONFIGURATION.md is left out: it holds at least one true sentence the scan
-    reds, and a stale "required by default" in its `[auth]` section, both outside what vault BACKLOG
-    #3477 was briefed to edit. Each floor sits below the file's count on 2026-10-26."""
+    passes. ``true_phrases`` are cut out of the units before the scan. Each must sit in a unit of
+    the file that the scan reds, and must red the scan by itself, so the list cannot go stale or
+    carry a phrase the scan no longer flags there. Each floor sits below the file's count on
+    2026-10-26, docs/CONFIGURATION.md's and docker/README.md's on 2026-11-03."""
     clauses = _clauses_and_rows(_doc(name))
     assert len(clauses) >= floor, (
         f"{name} cut into {len(clauses)} clause(s) and row(s), floor {floor}: the sign-in scan reads "
         "too little to clear it."
     )
+    flagged = _says_sign_in_can_be_off(clauses)
+    for phrase in true_phrases:
+        assert any(phrase in c for c in flagged), (
+            f"no unit of {name} holding {phrase!r} reds the sign-in scan now; drop it here"
+        )
+        assert _says_sign_in_can_be_off([phrase]) == [phrase], (
+            f"the sign-in scan no longer reds {phrase!r} by itself; drop it here"
+        )
+        clauses = [c.replace(phrase, " ") for c in clauses]
     disabled = _says_sign_in_can_be_off(clauses)
     assert not disabled, (
         f"{name} says sign-in can be off, or is only a default, again: {disabled}. `serve` always "

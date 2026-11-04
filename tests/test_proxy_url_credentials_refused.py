@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A proxy URL credential never reaches a proxy in cleartext (vault BACKLOG #2572, #3410).
+"""A proxy URL credential is refused before it reaches a proxy, in cleartext (vault BACKLOG #2572,
+#3410) and over a verified TLS leg (vault BACKLOG #4909), on the engine's urllib openers.
 
 urllib turns a user and a password in a proxy URL into a ``Proxy-Authorization: Basic`` header. To a
 proxy reached over plain TCP that header crosses the network in cleartext. The Vault hop has refused
 that since BACKLOG #2547. The urllib egress did not: REST, SOAP, FHIR, DICOMweb, the token
 endpoints, the alert webhook, the OIDC legs and the AI broker all read a proxy from the environment,
 from the system settings or from ``proxy_url``. ``LoopbackDirectProxyHandler`` now refuses per
-request, on every opener ``build_strict_opener`` makes.
+request, on every opener ``build_strict_opener`` makes, and a credential in a connection's own
+``proxy_url`` now fails its build first (vault BACKLOG #3007).
 
 **The first section is a measurement, not a rule.** It runs a PLAIN urllib opener, with no engine
 code in the path, against a loopback socket that records what arrives before any TLS. The target
@@ -46,17 +48,30 @@ import urllib.request
 from collections.abc import Callable, Iterator
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.wiring import Rest
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused, active_hop_posture
+from messagefoundry.config.wiring import (
+    FHIR,
+    ConnectionSpec,
+    DICOMweb,
+    OutboundConnection,
+    Rest,
+    Soap,
+)
 from messagefoundry.pipeline import alert_sinks
+from messagefoundry.pipeline.wiring_runner import _dest_config
 from messagefoundry.transports import bounded_read, build_destination, rest
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
     ProxyCredentialsRefusedError,
     build_strict_opener,
 )
+from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.proxy_address import parse_proxy_url
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
 from tests._wire_proxy import _WireProxy
@@ -90,15 +105,24 @@ def no_ambient_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def _assert_fixed_refusal(exc: BaseException) -> None:
-    """The refusal's text is fixed: no user, no password, no encoded pair, no proxy host."""
+def _assert_names_no_credential(exc: BaseException) -> None:
+    """No user, no password, no encoded pair, no proxy host."""
     text = f"{exc!s} {exc!r} {getattr(exc, 'reason', '')}"
-    assert "vault BACKLOG #2572" in text
-    for part in (_USER, _PASSWORD, _BASIC.decode(), "proxy-marker", "127.0.0.1"):
+    for part in (_USER, _PASSWORD, _BASIC.decode(), "proxy-marker", "127.0.0.1", "s3cr/et"):
         assert part not in text, part
     # No parser error that quotes the URL rides along on the chain.
     assert exc.__cause__ is None
     assert exc.__context__ is None
+
+
+def _assert_fixed_refusal(exc: BaseException, item: str = "#2572") -> None:
+    """The refusal's text is fixed, and it says which rule refused. The verified TLS leg's own
+    text (vault BACKLOG #4909) names TLS, so it never says cleartext."""
+    text = f"{exc!s} {getattr(exc, 'reason', '')}"
+    assert f"vault BACKLOG {item}" in text
+    if item == "#4909":
+        assert "cleartext" not in text
+    _assert_names_no_credential(exc)
 
 
 # --- the measurement: what urllib sends before any TLS -------------------------------------------
@@ -158,22 +182,54 @@ def test_measured_urllib_sends_these_proxy_credentials_in_cleartext(
 
 def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy() -> None:
     """A proxy written ``https://`` gets a TLS session before anything else on this leg.
-    Measured on plain urllib and on the engine's opener, where it is also not refused."""
-    for build in (urllib.request.build_opener, build_strict_opener):
+    Measured on plain urllib, with no engine code in the path."""
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        plain = urllib.request.build_opener(urllib.request.ProxyHandler({"http": value}))
+        _open_and_discard(plain, _HTTP_TARGET)
+    assert proxy.cleartext == []
+    assert proxy.tls_first == 1
+
+
+def _engine_refuses_over_tls(opener: urllib.request.OpenerDirector) -> None:
+    """The engine's opener refuses before it dials, in the verified TLS leg's own text."""
+    with pytest.raises(ProxyCredentialsRefusedError) as raised:
+        opener.open(_HTTP_TARGET, timeout=5)
+    _assert_fixed_refusal(raised.value, "#4909")
+
+
+def _reached_tls_first(proxy: _WireProxy) -> None:
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
+
+
+def test_the_engine_opener_refuses_an_http_target_with_no_https_proxy_over_tls() -> None:
+    """Leg 2 of vault BACKLOG #4909, on the engine's opener: refused before anything is dialled.
+    The control is a credential-free proxy, which gets one connection, TLS first."""
+    for cred, refused in ((f"{_CRED}@", True), ("", False)):
         with _WireProxy() as proxy:
-            value = f"https://{_CRED}@{proxy.address}"
-            _open_and_discard(build(urllib.request.ProxyHandler({"http": value})), _HTTP_TARGET)
-        assert proxy.cleartext == []
-        assert proxy.tls_first == 1
+            value = f"https://{cred}{proxy.address}"
+            opener = build_strict_opener(urllib.request.ProxyHandler({"http": value}))
+            if refused:
+                _engine_refuses_over_tls(opener)
+            else:
+                _open_and_discard(opener, _HTTP_TARGET)
+        if refused:
+            assert proxy.connections == 0
+        else:
+            _reached_tls_first(proxy)
 
 
-def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
+def test_an_http_target_to_a_bypassed_https_proxy_is_refused_before_the_tls_leg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One proxy written ``https://`` for both schemes, and ``NO_PROXY`` names the proxy's own
-    host. Plain urllib and the engine's opener both send the ``http`` request to the proxy over
-    TLS: one connection, TLS first, no cleartext request head (vault BACKLOG #3410). The control is
-    the engine's opener with no bypass list, which is refused before it dials."""
+    host: leg 1 of vault BACKLOG #4909. Plain urllib sends the ``http`` request to the proxy over
+    TLS, one connection, TLS first, and that half stays a measurement. The engine's opener let it
+    through too until #4909, and now refuses it before it dials. Two controls: with no bypass list
+    the leg is a cleartext ``CONNECT``, refused in that leg's own text; and a credential-free
+    proxy on the bypassed leg still gets one connection, TLS first."""
     with _WireProxy() as proxy:
         value = f"https://{_CRED}@{proxy.address}"
         opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
@@ -182,17 +238,26 @@ def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
     assert proxy.connections == 0
     _assert_fixed_refusal(raised.value)
 
-    for build in (urllib.request.build_opener, build_strict_opener):
+    cases = (
+        (urllib.request.build_opener, f"{_CRED}@", False),  # the measurement
+        (build_strict_opener, f"{_CRED}@", True),
+        (build_strict_opener, "", False),  # the credential-free control
+    )
+    for build, cred, refused in cases:
+        monkeypatch.delenv("NO_PROXY", raising=False)  # the previous pass set it
         with _WireProxy() as proxy:
-            monkeypatch.delenv("NO_PROXY", raising=False)  # the previous pass set it
-            value = f"https://{_CRED}@{proxy.address}"
+            value = f"https://{cred}{proxy.address}"
             opener = build(urllib.request.ProxyHandler({"http": value, "https": value}))
             # Set after the build, so the pass shows the bypass list is read at send time.
             monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
-            _open_and_discard(opener, _HTTP_TARGET)
-        assert proxy.connections == 1
-        assert proxy.tls_first == 1
-        assert proxy.cleartext == []
+            if refused:
+                _engine_refuses_over_tls(opener)
+            else:
+                _open_and_discard(opener, _HTTP_TARGET)
+        if refused:
+            assert proxy.connections == 0
+        else:
+            _reached_tls_first(proxy)
 
 
 # --- the refusal, on the wire --------------------------------------------------------------------
@@ -406,6 +471,29 @@ def test_an_environment_proxy_with_credentials_is_refused_on_every_opener_family
 
 
 @pytest.mark.parametrize("family", list(_FAMILIES))
+def test_an_environment_proxy_credential_is_refused_on_the_tls_leg_of_every_opener_family(
+    recorded: None, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    """Leg 2 of vault BACKLOG #4909 on each family: ``HTTP_PROXY`` names a credentialed
+    ``https://`` proxy, with no ``HTTPS_PROXY``. Nothing is dialled. A family whose context does
+    not verify the proxy keeps that refusal's own text (vault BACKLOG #3418). The control is the
+    same family behind a credential-free proxy, which is dialled with no header."""
+    monkeypatch.setenv("HTTP_PROXY", f"https://{_CRED}@{_PROXY_HOST}")
+    with pytest.raises(ProxyCredentialsRefusedError) as raised:
+        _FAMILIES[family]().open(_HTTP_TARGET, timeout=1)
+    item = (
+        "#3418" if family in ("http-family-verify-off", "http-family-expiry-relaxed") else "#4909"
+    )
+    assert f"vault BACKLOG {item}" in str(raised.value)
+    _assert_names_no_credential(raised.value)
+
+    monkeypatch.setenv("HTTP_PROXY", f"https://{_PROXY_HOST}")
+    dialled = _dial(_FAMILIES[family](), _HTTP_TARGET)
+    assert dialled.host == _PROXY_HOST
+    assert dialled.proxy_header is None
+
+
+@pytest.mark.parametrize("family", list(_FAMILIES))
 def test_control_an_environment_proxy_with_no_credentials_is_used_on_every_opener_family(
     recorded: None, monkeypatch: pytest.MonkeyPatch, family: str
 ) -> None:
@@ -549,13 +637,30 @@ def test_the_refusal_is_a_urlerror_that_copies_and_pickles(recorded: None) -> No
 # --- a REST connection: an explicit proxy_url, and proxy_url = "default" -------------------------
 
 
-def _rest(**extra: object) -> RestDestination:
+def _rest(
+    *,
+    posture: HopPosture | None = None,
+    accepted: bool = False,
+    attested: bool = False,
+    **extra: object,
+) -> RestDestination:
     settings = Rest(url="https://partner.example.test/ingest").settings
     settings.update(extra)
-    dest = build_destination(
-        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings),
-        egress=permitting(settings),
-    )
+    with active_hop_posture(posture or HopPosture(enforcing=True)):
+        dest = build_destination(
+            Destination(
+                name="OB_REST",
+                type=ConnectorType.REST,
+                settings=settings,
+                cleartext_accepted=accepted,
+                cleartext_reason="legacy partner listener has no TLS" if accepted else None,
+                tls_hop_attested=attested,
+                tls_hop_attested_reason="IPsec tunnel to the partner" if attested else None,
+                tls_revocation_attested=True,  # isolate the proxy behaviour from the #201 gate
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
+            ),
+            egress=permitting(settings),
+        )
     assert isinstance(dest, RestDestination)
     return dest
 
@@ -584,12 +689,6 @@ def _assert_send_is_refused(dest: RestDestination) -> None:
         assert part not in text, part
 
 
-def test_a_rest_send_through_an_explicit_credentialed_proxy_url_is_refused(recorded: None) -> None:
-    """No ``proxy_user`` is set, so the posture-keyed ``proxy_user`` guard never ran. The
-    connection builds, and each send is refused."""
-    _assert_send_is_refused(_rest(proxy_url=_CREDENTIALED))
-
-
 def test_a_rest_send_through_a_default_proxy_with_credentials_is_refused(
     recorded: None, default_proxy: Callable[[str], None]
 ) -> None:
@@ -607,3 +706,282 @@ def test_control_a_rest_send_through_a_credential_free_proxy_reaches_it(
             asyncio.run(dest.send('{"a": 1}'))
         assert dialled.value.host == _PROXY_HOST
         assert dialled.value.proxy_header is None
+
+
+# --- a credential in a connection's own proxy_url fails its build (vault BACKLOG #3007) -----------
+#
+# The send-time rule above would meet it on each message, as a retryable error, until the message
+# dead-letters. It is a known fault, so the build reports it, and a declaration does not lift it.
+# Which rule governs which credential is stated once, in docs/CONNECTIONS.md.
+
+
+def _refused_at_build(build: Callable[[], object]) -> None:
+    with pytest.raises(InsecureHopRefused) as raised:
+        build()
+    text = str(raised.value)
+    assert "holds a user or a password" in text
+    # An attested connection reads this too, and the pair rule refuses the acceptance beside it.
+    assert "in place of any tls_hop_attested, never beside it" in text
+    assert "connection 'OB_REST'" in text or "connection 'OB'" in text
+    _assert_names_no_credential(raised.value)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        pytest.param(_CREDENTIALED, id="http"),
+        pytest.param(f"https://{_CRED}@{_PROXY_HOST}", id="https"),
+        pytest.param(f"  HTTP://{_CRED}@{_PROXY_HOST}  ", id="padded-and-upper-case"),
+        pytest.param(f"http://{_CRED}@127.0.0.1:3128", id="a-proxy-on-this-machine"),
+    ],
+)
+def test_a_credential_in_proxy_url_fails_the_build(proxy_url: str) -> None:
+    """Every spelling the transport would send, and a loopback proxy, which a ``proxy_user``
+    credential may reach with no declaration and a URL credential may not."""
+    _refused_at_build(lambda: _rest(proxy_url=proxy_url))
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize(
+    "userinfo",
+    [
+        pytest.param(f":{_PASSWORD}", id="a-password-with-no-user"),
+        pytest.param(_USER, id="a-token-written-as-the-user"),
+        pytest.param(f"{_USER}:", id="a-user-with-an-empty-password"),
+    ],
+)
+def test_half_a_credential_in_proxy_url_fails_the_build(scheme: str, userinfo: str) -> None:
+    """urllib sends no header for these, so the send-time rule never sees them, and the secret would
+    stay in the URL the connector dials. A credential in the URL is refused whatever urllib makes
+    of it."""
+    _refused_at_build(lambda: _rest(proxy_url=f"{scheme}://{userinfo}@{_PROXY_HOST}"))
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        pytest.param(f"http://@{_PROXY_HOST}", id="an-empty-userinfo"),
+        pytest.param(f"http://:@{_PROXY_HOST}", id="an-empty-user-and-password"),
+    ],
+)
+def test_control_a_userinfo_with_nothing_in_it_still_builds(written: str) -> None:
+    """The control for the test above: this refusal is about a credential, so a userinfo that holds
+    none stays as it was."""
+    _rest(proxy_url=written)
+
+
+def test_a_password_that_ends_the_authority_for_urlsplit_is_read_as_urllib_reads_it() -> None:
+    """Called directly, because the ``allowed_proxy`` gate withholds this host name and so refuses
+    this shape first. ``_parse_proxy`` still reads the password urllib would send."""
+    _refused_at_build(
+        lambda: rest.proxy_config_from_settings(
+            {"proxy_url": f"http://{_USER}:s3cr/et@{_PROXY_HOST}"},
+            dest_scheme="https",
+            connection="OB",
+        )
+    )
+
+
+@pytest.mark.parametrize("enforcing", [True, False], ids=["enforce", "warn"])
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        pytest.param({}, id="none"),
+        pytest.param({"accepted": True}, id="cleartext_accepted"),
+        pytest.param({"attested": True}, id="tls_hop_attested"),
+    ],
+)
+def test_no_declaration_and_no_enforcement_level_lifts_it(
+    enforcing: bool, declaration: dict[str, bool]
+) -> None:
+    """B462-R2 of the 2026-10-30 rulings, stricter than R1 of ASVS-OWNER-RULINGS-2026-10-05.md."""
+    posture = HopPosture(enforcing=enforcing)
+    _refused_at_build(lambda: _rest(proxy_url=_CREDENTIALED, posture=posture, **declaration))
+
+
+def test_it_is_refused_beside_a_proxy_user_as_well() -> None:
+    """``proxy_user`` is the declared route, and it does not excuse a credential left in the URL."""
+    _refused_at_build(
+        lambda: _rest(
+            proxy_url=f"http://{_CRED}@127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pp",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(lambda: Soap(url=_HTTPS_TARGET), id="SOAP"),
+        pytest.param(lambda: FHIR(url=_HTTPS_TARGET), id="FHIR"),
+        pytest.param(lambda: DICOMweb(url=_HTTPS_TARGET), id="DICOMweb"),
+    ],
+)
+def test_the_other_http_connectors_refuse_it_too(factory: Callable[[], ConnectionSpec]) -> None:
+    spec = factory()
+    settings = {**spec.settings, "proxy_url": _CREDENTIALED}
+    config = Destination(name="OB", type=spec.type, settings=settings)
+    _refused_at_build(lambda: build_destination(config, egress=permitting(settings)))
+
+
+def test_a_fhir_lookup_refuses_it_too() -> None:
+    with pytest.raises(InsecureHopRefused, match="holds a user or a password"):
+        FhirLookupExecutor(
+            {"epic": {"url": _HTTPS_TARGET, "proxy_url": _CREDENTIALED}},
+            egress=permitting({"proxy_url": _CREDENTIALED}),
+        )
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [_CREDENTIALED, f"http://{_USER}@{_PROXY_HOST}", f"http://:{_PASSWORD}@{_PROXY_HOST}"],
+    ids=["user-and-password", "user-only", "password-only"],
+)
+def test_a_credential_in_egress_proxy_url_is_refused_at_load(proxy_url: str) -> None:
+    """Refused once, naming the setting, rather than on each inheriting build or not at all when
+    nothing inherits it. Neither the value nor its parts reach the error, however it is rendered."""
+    with pytest.raises(ValueError) as refused:
+        EgressSettings(
+            deny_by_default=False, proxy_url=proxy_url, allowed_proxy=["proxy-marker.invalid"]
+        )
+    rendered = [str(refused.value), repr(refused.value)]
+    if isinstance(refused.value, ValidationError):
+        rendered += [str(refused.value.errors()), refused.value.json()]
+    assert "[egress].proxy_url holds a user or a password" in rendered[0]
+    for text in rendered:
+        assert _USER not in text and _PASSWORD not in text, text
+
+
+#: A user or a password beside a shape fault. The parse refuses the shape, and the early credential
+#: read misses it, so the validator refuses it after the parse's handler. The host has no port.
+_SHAPE_FAULT_HOST = "proxy-marker.invalid"
+_CREDENTIAL_BESIDE_A_SHAPE_FAULT = [
+    f"http://{_USER}@{_SHAPE_FAULT_HOST}:99999",
+    f"http://:{_PASSWORD}@{_SHAPE_FAULT_HOST}/path",
+    f"http://{_USER}@{_SHAPE_FAULT_HOST}?x",
+]
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    _CREDENTIAL_BESIDE_A_SHAPE_FAULT,
+    ids=["user-port-out-of-range", "password-with-path", "user-with-query"],
+)
+def test_a_credential_beside_a_shape_fault_is_refused_with_no_chain(proxy_url: str) -> None:
+    """Refused naming the setting, with neither chain holding the parse's error (the safe shape in
+    ``tests/test_from_none_is_not_redaction.py``). Read through the load, where pydantic keeps the
+    validator's error in each error's ``ctx``."""
+    # Positive control: each value reaches the raise after the parse's handler, not the early one.
+    assert not rest.proxy_url_holds_credential(proxy_url)
+    with pytest.raises(ValueError):
+        parse_proxy_url(proxy_url)
+    with pytest.raises(ValidationError) as refused:
+        EgressSettings(
+            deny_by_default=False, proxy_url=proxy_url, allowed_proxy=[_SHAPE_FAULT_HOST]
+        )
+    errors = refused.value.errors()
+    assert len(errors) == 1
+    cause = (errors[0].get("ctx") or {}).get("error")
+    assert isinstance(cause, ValueError)
+    assert "[egress].proxy_url holds a user or a password" in str(cause)
+    _assert_names_no_credential(cause)
+    for text in (str(refused.value), repr(refused.value), refused.value.json()):
+        assert _USER not in text and _PASSWORD not in text, text
+
+
+def test_a_split_fault_beside_a_credential_keeps_the_parse_refusal_with_no_chain() -> None:
+    """urlsplit itself refuses this value inside the parse's handler, and its own error can quote
+    the netloc. The validator drops that error and re-raises the parse's fixed refusal."""
+    proxy_url = f"http://{_USER}@[::1:3128"
+    with pytest.raises(ValueError, match="Invalid IPv6"):
+        urllib.parse.urlsplit(proxy_url)
+    with pytest.raises(ValidationError) as refused:
+        EgressSettings(
+            deny_by_default=False, proxy_url=proxy_url, allowed_proxy=[_SHAPE_FAULT_HOST]
+        )
+    cause = (refused.value.errors()[0].get("ctx") or {}).get("error")
+    assert isinstance(cause, ValueError)
+    assert "2965" in str(cause)
+    _assert_names_no_credential(cause)
+
+
+def test_a_credential_inherited_from_egress_proxy_url_fails_the_build() -> None:
+    """``_dest_config`` copies ``[egress].proxy_url`` in before the connector is built, so the same
+    check reads it. The load refuses that value first, so it is put past the load here, to pin that
+    the build still refuses it. A connection whose own value wins inherits nothing and builds."""
+    egress = EgressSettings(deny_by_default=False, allowed_proxy=["proxy-marker.invalid"])
+    egress = egress.model_copy(update={"proxy_url": _CREDENTIALED})
+    inherited = _dest_config(OutboundConnection("OB", Rest(url=_HTTPS_TARGET)), {}, None, egress)
+    _refused_at_build(lambda: build_destination(inherited, egress=egress))
+
+    own = _dest_config(
+        OutboundConnection("OB", Rest(url=_HTTPS_TARGET, proxy=f"http://{_PROXY_HOST}")),
+        {},
+        None,
+        egress,
+    )
+    assert isinstance(build_destination(own, egress=egress), RestDestination)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        pytest.param("http://127.0.0.1/@proxy-marker.invalid:9", id="at-after-a-slash"),
+        pytest.param("http://127.0.0.1?@proxy-marker.invalid:9", id="at-after-a-question-mark"),
+        pytest.param("http://127.0.0.1#@proxy-marker.invalid:9", id="at-after-a-hash"),
+        pytest.param(f"http:/{_CRED}@{_PROXY_HOST}", id="one-slash-urllib-cannot-read"),
+    ],
+)
+@pytest.mark.parametrize(
+    "login",
+    [pytest.param({}, id="no-login"), pytest.param({"proxy_user": "a", "proxy_password": "b"})],
+)
+def test_a_proxy_url_the_checks_would_misread_fails_the_build(
+    proxy_url: str, login: dict[str, str]
+) -> None:
+    """urlsplit reads the first three as loopback and urllib would dial the host after the ``@``,
+    so the ``proxy_user`` guard's loopback admission and ``[egress].allowed_proxy`` would both judge
+    a host the request never reaches. The transport's one proxy parse refuses each before the guard
+    reads the host (vault BACKLOG #2965), so no loopback admission is granted on a misread. Called
+    directly, because the egress gate refuses these first on the wired path."""
+    with pytest.raises(ValueError, match="#2965") as raised:
+        rest.proxy_config_from_settings(
+            {"proxy_url": proxy_url, **login}, dest_scheme="https", connection="OB"
+        )
+    _assert_names_no_credential(raised.value)
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "http://proxy.example.test:3128",
+        "http://proxy.example.test:3128/",
+        "https://PROXY.example.test",
+        "http://[2001:db8::1]:3128",
+        "http://127.0.0.1:3128",
+    ],
+)
+def test_control_a_proxy_url_both_readers_agree_on_builds(proxy_url: str) -> None:
+    config = rest.proxy_config_from_settings(
+        {"proxy_url": proxy_url}, dest_scheme="https", connection="OB"
+    )
+    assert config is not None
+
+
+def test_a_well_formed_credentialed_proxy_url_passes_the_parse_and_still_fails_the_build() -> None:
+    """The credential refusal is this row's, not #2965's: the one proxy parse accepts a userinfo,
+    so the refusal is still what stops a well-formed credentialed URL (vault BACKLOG #3007)."""
+    assert parse_proxy_url(_CREDENTIALED).userinfo == _CRED
+    _refused_at_build(lambda: _rest(proxy_url=_CREDENTIALED))
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        pytest.param(f"http://{_PROXY_HOST}", id="no-userinfo"),
+        pytest.param("default", id="default"),
+    ],
+)
+def test_control_a_proxy_url_that_sends_no_credential_builds(proxy_url: str) -> None:
+    assert isinstance(_rest(proxy_url=proxy_url), RestDestination)

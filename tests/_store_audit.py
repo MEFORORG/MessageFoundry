@@ -14,15 +14,15 @@ from __future__ import annotations
 from messagefoundry.store.store import AuditAppend
 
 
-def no_purge_audit(_cancelled: int) -> None:
-    """A purge audit that records nothing, for a test about the cancel alone."""
-    return None
-
-
 def no_operator_audit(_result: object) -> None:
-    """An operator audit that records nothing, for a test about the replay, resend or re-ingress
-    alone. It writes what the old ``audit=None`` default wrote: no row (BACKLOG #2624)."""
+    """An operator audit that records nothing, for a test about the replay, resend, re-ingress or
+    cancel alone. It writes what the old ``audit=None`` default wrote: no row (BACKLOG #2624). The
+    store now refuses ``None`` itself (BACKLOG #5069), so a test that wants no row passes this."""
     return None
+
+
+#: The same audit under the name the purge tests use; one function, not two copies (BACKLOG #5071).
+no_purge_audit = no_operator_audit
 
 
 #: The alert row a test about the alert mutation alone passes.

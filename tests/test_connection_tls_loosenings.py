@@ -171,6 +171,30 @@ def handle(msg):
 """
 
 
+#: ADR 0139: the code-first form samples/ech-sidecar/README.md documents, once with an http sidecar
+#: and once with an https one beside it, which is the control the check must not name.
+_ECH_MODULE = """
+from messagefoundry import MLLP, Rest, Send, handler, inbound, outbound, router
+
+inbound("IB", MLLP(port=15098), router="r")
+for _name, _sidecar in (("OB_ECH_HTTP", "http"), ("OB_ECH_HTTPS", "https")):
+    _s = Rest(url="https://partner.example.invalid/ingest")
+    _s.settings["ech_egress"] = True
+    _s.settings["ech_sidecar"] = _sidecar + "://127.0.0.1:8123"
+    outbound(_name, _s)
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def handle(msg):
+    return Send("OB_ECH_HTTP", msg)
+"""
+
+
 def _write_config(tmp_path: Path, *, clean: bool = False, module: str | None = None) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
@@ -194,8 +218,10 @@ def test_check_surfaces_the_expiry_bridge(tmp_path: Path) -> None:
     r = _result(report, "tls-allow-expired")
     assert r.ok and not r.required and not r.skipped
     assert "OB_BRIDGE" in r.detail and "partner.example.invalid:6100" in r.detail
-    # Advisory, and honest in both directions: it must not imply verify-off.
-    assert "chain, hostname and key usage are still verified" in r.detail
+    # Advisory, and honest in both directions: it must not imply verify-off, and it must not claim the
+    # whole chain is verified (vault BACKLOG #5089).
+    assert "the chain's signatures, the hostname and key usage are still verified" in r.detail
+    assert "validity periods of the intermediates and the trust anchor" in r.detail
 
 
 def test_check_surfaces_the_hostname_unchecked_set(tmp_path: Path) -> None:
@@ -219,6 +245,7 @@ def test_check_expiry_line_stops_claiming_the_hostname_where_it_is_off(tmp_path:
     report = run_checks(_write_config(tmp_path, module=_HOSTNAME_MODULE), run_lint=False)
     detail = _result(report, "tls-allow-expired").detail
     assert "chain, hostname and key usage are still verified" not in detail
+    assert "the chain's signatures, the hostname and key usage" not in detail
     assert "the hostname is NOT on OB_BOTH" in detail
     assert "and is on the others" in detail  # OB_EXPIRED is the other, and it checks the name
 
@@ -249,6 +276,19 @@ def test_check_surfaces_the_revocation_attested_set_in_both_directions(tmp_path:
     assert "PLAIN" not in r.detail
 
 
+def test_check_names_an_http_ech_sidecar(tmp_path: Path) -> None:
+    """ADR 0139. The sidecar is loopback, so no hop gate refuses it, and the check is where review
+    sees that its hop is cleartext. The https sidecar beside it is not named."""
+    from messagefoundry.checks import run_checks
+
+    report = run_checks(_write_config(tmp_path, module=_ECH_MODULE), run_lint=False)
+    r = _result(report, "ech-sidecar-cleartext")
+    assert r.ok and not r.required and not r.skipped
+    assert "1 REST connection(s)" in r.detail
+    assert "OB_ECH_HTTP (an http:// sidecar)" in r.detail
+    assert "OB_ECH_HTTPS" not in r.detail
+
+
 def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Path) -> None:
     """The negative control, and it must SAY "none" rather than go quiet: an absent line is
     indistinguishable from a check that did not run, which is how a green gate stops being evidence."""
@@ -272,6 +312,10 @@ def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Pa
         "no outbound or FhirLookup url carries a credential-like query parameter"
         in _result(report, "url-query-credential").detail
     )
+    assert (
+        "no REST connection sends through an http:// ECH sidecar"
+        in _result(report, "ech-sidecar-cleartext").detail
+    )
 
 
 def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_path: Path) -> None:
@@ -287,10 +331,12 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     for name in (
         "tls-allow-expired",
         "generic-db-tls",
+        "generic-db-server",
         "tls-revocation-attested",
         "fhir-update-path-form",
         "tls-check-hostname",
         "url-query-credential",
+        "ech-sidecar-cleartext",
     ):
         r = _result(report, name)
         assert r.skipped and r.ok and "config did not load" in r.detail

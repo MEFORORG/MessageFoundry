@@ -96,6 +96,8 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    INTAKE_AUTH_RATE_LIMIT_DEFAULT,
+    INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
@@ -128,6 +130,7 @@ from messagefoundry.netaddr import (
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
+    ValidationResult,
     encode_batch,
     summarize,
     validate,
@@ -168,6 +171,7 @@ from messagefoundry.pipeline.ingress_guards import (
     check_decoded,
     decode_body,
     doc_ref_marker_refusal,
+    ingress_encoding,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -234,6 +238,7 @@ from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
+from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -246,6 +251,7 @@ from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
+    InboundHandler,
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
@@ -258,7 +264,7 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
-from messagefoundry.transports.egress import warn_url_query_credentials
+from messagefoundry.transports.egress import warn_url_query_credentials_before_build
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
@@ -353,6 +359,9 @@ class _IntakeRateLimiter:
         if self._global is None or self._authenticated_recently(peer):
             return True
         return self._global.would_allow(peer)
+
+    def check_peer(self, peer: str) -> bool:
+        return self._per_peer.would_allow(peer)
 
     def charge_failure(self, peer: str) -> None:
         self._per_peer.allow(peer)
@@ -625,6 +634,31 @@ _REFUSAL_LOG_MAX_PAIRS = 4096
 
 # Most message ids one STOP dead-letter line names; past this it names the first ones and a count.
 _STOP_LINE_MAX_MESSAGES = 10
+
+
+async def _forget_dead_payload(
+    connector: DestinationConnector, sent: str | None, failed: FailOutcome
+) -> None:
+    """Tell ``connector`` to forget ``sent`` once a transient failure dead-lettered its row at the
+    retry cap (vault BACKLOG #4908). The row has left the lane, so a connector's memory of its sends
+    would only shorten a replay of it. ``sent`` is ``None`` when no live send was attempted. By
+    ``getattr``, as ``consumes_metadata`` is read, so a stand-in connector without the hook is still
+    a connector. Best effort: it runs after the DEAD write, inside the arm that still has the alert
+    checks to run, so a failure is logged by type and goes no further."""
+    if not failed.dead or sent is None:
+        return
+    forget = getattr(connector, "forget_payload", None)
+    if forget is None:
+        return
+    try:
+        await forget(sent)
+    except Exception as exc:  # noqa: BLE001 - a connector's cache hook must not skip the alert checks
+        log.warning(
+            "delivery worker: %s.forget_payload failed after a dead-letter (%s); its memory of that "
+            "row's sends is kept",
+            type(connector).__name__,
+            type(exc).__name__,
+        )
 
 
 def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: str) -> None:
@@ -909,6 +943,125 @@ _STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
 _strict_validate_timeout = strict_validate_timeout
 
 
+class _StrictValidateTimedOut(Exception):
+    """A listener's strict validate timed out with no result in hand when the timeout was handled (#89).
+
+    ``started`` says whether ``hl7apy`` had begun on the body when the timeout fired (BACKLOG #5078,
+    the ADR 0154 amendment of 2026-11-03). The timeout counts the wait for a worker thread as well
+    as the validate, so under load a body can time out before it is ever looked at. That body says
+    nothing about itself, and it left no thread behind, so it is answered as temporary (``503``, or
+    ``AE`` on MLLP). One that had started is final (``422``, or ``AR``; owner ruling of 2026-11-03,
+    decision log d20261104T032854299-7235a9, stamped in UTC): it
+    may be the slow body the timeout exists for, and its thread is still running. "Began" means a
+    worker ran the run's first line before the deadline (:class:`_StrictValidateRun`); a free thread
+    that the GIL or the OS did not schedule in time reads as not begun too, so the reason says only
+    that.
+
+    ``reason`` is value-free, only the numeric timeout, and goes to the stored ``ERROR`` row.
+    ``ack_text`` goes in an MLLP NAK's MSA-3 and is the same for both causes. The answer's class
+    (``503`` or ``AE`` versus ``422`` or ``AR``) still tells a sender which one it was, by design: a
+    sender cannot be told to re-send without being told the engine was busy."""
+
+    def __init__(self, timeout: float, *, started: bool) -> None:
+        self.started = started
+        #: The receipt path's class and the MLLP NAK's MSA-1, kept together so the two listeners
+        #: cannot split the timeout differently.
+        self.refusal_kind = RefusalKind.PERMANENT if started else RefusalKind.TEMPORARY
+        self.nak_code = "AR" if started else "AE"
+        self.ack_text = f"strict-validation timed out after {timeout}s"
+        self.reason = self.ack_text if started else f"{self.ack_text} before the validate began"
+        super().__init__(self.reason)
+
+
+class _StrictValidateRun:
+    """One strict validate on a worker thread, which records whether it began (BACKLOG #5078).
+
+    "Began" is decided when the timeout fires, not when the listener handles it. The run carries the
+    timeout's deadline, read from the event loop's clock just before the timeout's own timer is set
+    (:func:`_validate_strictly` says why that clock), and the worker compares ``time.monotonic()``
+    with it. A worker that reaches the run at or past it does not begin: it records
+    "not begun" and returns without validating. Without that, a worker that came free after the
+    deadline but before a busy event loop handled the timeout would begin, and the listener would
+    answer a body nobody had looked at inside the timeout as final.
+
+    The start and the listener's abandonment take one lock, so they cannot cross: either the worker
+    began first and :meth:`abandon` reports it started, or the listener gave up first and the worker
+    returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind.
+
+    The result is kept under the same lock, and :meth:`abandon` hands back any result present when
+    the listener handles the timeout, for a run that began before the deadline: its result may have
+    reached a stalled event loop late, or it may have finished after the deadline but before the
+    timeout was handled. Either way the listener uses that result rather than refuse a body it has a
+    verdict for; only a run with no result at that point is a timeout."""
+
+    def __init__(self, deadline: float | None) -> None:
+        self._deadline = deadline
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._started = False
+        self._result: ValidationResult | None = None
+
+    def __call__(self, text: str, expected_version: str | None) -> ValidationResult | None:
+        with self._lock:
+            if self._abandoned or (
+                self._deadline is not None and time.monotonic() >= self._deadline
+            ):
+                return None
+            self._started = True
+        result = validate(text, expected_version=expected_version)
+        with self._lock:
+            self._result = result
+        return result
+
+    def abandon(self) -> tuple[bool, ValidationResult | None]:
+        """Stop a run that has not begun. Report whether it had, and its result if it finished."""
+        with self._lock:
+            self._abandoned = True
+            return self._started, self._result
+
+
+async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResult:
+    """The listener's strict validate, off the event loop under the inbound's timeout (#89, review
+    M-11). On expiry it uses the run's result if one is present when the timeout is handled, even
+    one that finished after the deadline, from a run that began before it; otherwise it raises
+    :class:`_StrictValidateTimedOut`, saying whether the validate began before the timeout fired.
+
+    ``wait_for`` frees the listener but cannot kill a worker that has begun (no thread cancellation
+    in CPython): that orphaned ``hl7apy`` validate holds its thread until it returns, accepted by
+    design (mirrors ``_run_lookup``), bounded by ``enforce_size_limits``' 16 MiB and segment caps
+    that fire before the slow parse."""
+    timeout = _strict_validate_timeout(ic)
+    # The same expression wait_for's own timer is set from, read just before it, so the run's deadline
+    # is the timer's or earlier. On asyncio's own loops loop.time() IS time.monotonic(), the clock the
+    # worker reads. On uvloop (CPython outside Windows) it is libuv's loop time, in milliseconds and
+    # updated by the loop rather than read fresh, so it can read behind time.monotonic(), and the
+    # timer is set from it; time.monotonic() + timeout there could be later than the timer. That the
+    # two share a base on uvloop, and libuv's sub-millisecond timer rounding, are read from the
+    # libraries' design, not measured: no uvloop runs on the Windows machine this was built on.
+    deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+    run = _StrictValidateRun(deadline)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(run, text, ic.validation.hl7_version), timeout
+        )
+    except TimeoutError:
+        started, result = run.abandon()
+    except BaseException:
+        # Cancelled (engine stop, connection teardown): nobody will await the result, so a run not
+        # yet begun must not begin.
+        run.abandon()
+        raise
+    else:
+        # None here is a run its worker reached past the deadline, delivered before the loop got to
+        # the timeout: it never began.
+        started = False
+    if result is not None:
+        return result  # a verdict is in hand, before the deadline or after it
+    # Raised outside the handler, so the TimeoutError is not on the chain and needs no suppressing.
+    assert timeout is not None  # only a run with a deadline returns None unabandoned
+    raise _StrictValidateTimedOut(timeout, started=started)
+
+
 # The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
 # OBX-5.2 label contradicts the document's magic bytes (ASVS 1.3.4/5.2.2). Matches the download route's
 # _DEFAULT_ATTACHMENT_MIME so a mislabelled active-content payload is served as inert bytes either way.
@@ -931,6 +1084,28 @@ class _StreamBudgetExceeded(Exception):
         self.alone = alone
 
 
+#: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
+#: SQL Server's ``NVARCHAR(256)`` (SQLite and PostgreSQL use unbounded ``TEXT``). OBX-5.2 is
+#: sender-controlled, so a longer label would fail the write with error 2628 on every resend.
+_ATTACHMENT_CONTENT_TYPE_MAX = 256
+
+
+def _label_fits_every_backend(label: str) -> bool:
+    """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
+    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), and no wider than
+    :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing either would fail the write on every
+    resend. The length test comes first, so a long sender-controlled label is never copied to be
+    measured.
+
+    A lone surrogate is deliberately not tested. A label can hold one only when the decoded body
+    does, and the same character then stays in the skeleton, whose ingress write fails on it
+    whatever the label is. Downgrading it would only store an unreferenced attachment first, so
+    ``put_attachment``'s own encode fault propagates instead, writing nothing."""
+    if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
+        return False
+    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
+
+
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
 #: by one alone. A body with an OBX and an MSH-2 shorter than four characters is one,
@@ -945,6 +1120,49 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     NonVerbatimDocumentError,
     UnreadableDelimitersError,
 )
+
+#: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
+#: certificate is not on its inbound's allowlist. Fixed strings, because a certificate subject can
+#: name a person and neither the row nor the reply may carry one.
+_UNLISTED_SENDER_ERROR = (
+    "sender refused: its verified certificate is not on this inbound's certificate-subject "
+    "allowlist under its issuing CA"
+)
+_UNLISTED_SENDER_NAK_TEXT = "sender not permitted"
+#: How far into a refused body the AR's header echo looks for the end of MSH, so a large refused
+#: body is never parsed whole to echo it. The MLLP listener's handler-fault NAK bounds its own scan
+#: separately, at a larger figure; an MSH longer than this is echoed from its first part only.
+_UNLISTED_SENDER_HEADER_SCAN_BYTES = 4096
+
+
+def _header_segment(raw: bytes, encoding: str) -> str:
+    """The first segment of a refused body, decoded in the inbound's charset, for the AR's echo.
+
+    Bounded and lenient: nothing past the first segment break is read, and a segment that does not
+    decode strictly gives ``""``, so ``build_ack`` falls back to its own header defaults. Strict, not
+    ``errors="replace"``: a U+FFFD echoed into the AR would not re-encode under a charset such as
+    ``ascii``, and the reply would then fail to frame after the row was written."""
+    prefix = raw[:_UNLISTED_SENDER_HEADER_SCAN_BYTES].lstrip()
+    breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
+    try:
+        return prefix[: min(breaks, default=len(prefix))].decode(encoding)
+    except (LookupError, UnicodeDecodeError):
+        return ""
+
+
+def _detach_refusal_kind(exc: Exception) -> RefusalKind:
+    """The class of one of :data:`_DETACH_REFUSALS`, which both listeners answer by (BACKLOG #5078).
+
+    Only the in-flight budget is the engine's own and clears as concurrent detaches finish, so only
+    it invites a re-send, and only when the body would fit the budget once they have: one larger
+    than the whole budget is over-size. Every other refusal, at least an unsupported backend, a
+    malformed or received handle, an escaped document and one the splice would alter, refuses the
+    same body every time. The receipt path answers the class as is; MLLP answers
+    ``AE`` for TEMPORARY and ``AR`` for every final class (owner ruling of 2026-11-03, decision log
+    d20261104T032854299-7235a9, stamped in UTC)."""
+    if isinstance(exc, _StreamBudgetExceeded):
+        return RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+    return RefusalKind.PERMANENT
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -2166,6 +2384,13 @@ class RegistryRunner:
             and str(ic.spec.settings.get("intake_auth") or "none") != "none"
         )
 
+    def _sender_allowlist_enabled(self, ic: InboundConnection) -> bool:
+        # BACKLOG #4907: the MLLP listener's tls_client_subjects refuses a peer at intake on the
+        # same decision as HTTP's mtls_subject, so it gets the same audit sink and budget.
+        return ic.spec.type is ConnectorType.MLLP and bool(
+            ic.spec.settings.get("tls_client_subjects")
+        )
+
     def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
         """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
 
@@ -2177,7 +2402,7 @@ class RegistryRunner:
         This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
         column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
         """
-        if not self._intake_auth_enabled(ic):
+        if not (self._intake_auth_enabled(ic) or self._sender_allowlist_enabled(ic)):
             return None
         # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
         # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
@@ -2247,7 +2472,14 @@ class RegistryRunner:
         return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
-        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
+
+        An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
+        own and gets the ``Http()`` factory's defaults."""
+        if self._sender_allowlist_enabled(ic):
+            return _IntakeRateLimiter(
+                per_peer=INTAKE_AUTH_RATE_LIMIT_DEFAULT, glob=INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
+            )
         if not self._intake_auth_enabled(ic):
             return None
         per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
@@ -2592,13 +2824,12 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
-        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
-        recorded while its lookup is down, whether its build or another setting failed (ASVS
-        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
-        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
-        and logs none. A caller
-        whose build check has already warned passes False (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` runs
+        :func:`~messagefoundry.transports.egress.warn_url_query_credentials_before_build` once per
+        lookup, before any build, so an ``env()`` URL carrying a query credential is recorded while
+        its lookup is down (ASVS 14.2.1). A lookup whose warning step itself raises is degraded,
+        with an ERROR line and no WARNING. A caller whose build check has already warned passes
+        False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
@@ -2606,28 +2837,6 @@ class RegistryRunner:
         def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
             return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-
-        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
-            # ``resolved`` is None when a setting failed to resolve. The url alone is then
-            # resolved, so an env() URL is still named while the lookup is down.
-            if resolved is None:
-                try:
-                    resolved = resolve_env_settings(
-                        {"url": specs[name].settings.get("url")},
-                        self._env_values,
-                        connection=fhir_lookup_record_name(name),
-                    )
-                except WiringError:  # names the key, never a value
-                    # The lookup's own failure may name another setting, so say this one too.
-                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
-                    # as a secret, and a lookup name may end in a credential word.
-                    log.info(
-                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
-                        "check could not read it",
-                        name,
-                    )
-                    return
-            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
 
         def build(
             resolved: Mapping[str, Mapping[str, Any]],
@@ -2673,7 +2882,14 @@ class RegistryRunner:
             if not warn_query_credentials:
                 continue
             try:
-                warn(name, settled.get(name))
+                # The one pre-build step an outbound's start takes too (BACKLOG #4997). It reads
+                # the url alone, so an env() URL is still named while the lookup is down.
+                warn_url_query_credentials_before_build(
+                    f"FhirLookup {name!r}",
+                    specs[name].settings,
+                    self._env_values,
+                    connection=fhir_lookup_record_name(name),
+                )
             except Exception as exc:
                 log.error(
                     "FhirLookup %r URL query-credential check failed, so it is not started",
@@ -4311,6 +4527,11 @@ class RegistryRunner:
             return None
         connector: DestinationConnector | None = None
         try:
+            if warn_query_credentials:
+                # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371: the operator start of a lane the boot gates left unbuilt checks
             # its CA too, isolated with the build below.
@@ -4319,8 +4540,9 @@ class RegistryRunner:
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
             # (fail-closed/no-op default) posture.
             with active_hop_posture(self._hop_posture):
+                # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                    dest, egress=self._egress, warn_query_credentials=False
                 )
             # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
@@ -4912,7 +5134,8 @@ class RegistryRunner:
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
         # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
-        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # inbound actually authenticates, or is an MLLP inbound with tls_client_subjects (BACKLOG
+        # #4907), so every other connection stays byte-identical. The audit
         # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
@@ -4934,6 +5157,13 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # BACKLOG #4907: the refusal a listener hands a message from a sender whose verified
+        # certificate is not on its allowlist, injected the same runtime way. None unless this
+        # inbound keeps one, like the intake-auth seams above, so every other inbound is
+        # byte-identical.
+        source.refuse_unlisted_sender = (
+            self._make_unlisted_sender_refusal(ic) if self._sender_allowlist_enabled(ic) else None
+        )
         # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
         # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
         # contract, not on a connector type (CLAUDE.md section 4).
@@ -5514,6 +5744,14 @@ class RegistryRunner:
         )  # at/above threshold this run — clear any prior parked marker
         connector: DestinationConnector | None = None
         try:
+            if warn_query_credentials:
+                # The one pre-build step a FhirLookup's start takes too (BACKLOG #4997). Before
+                # env() resolves the rest and before any check, so a lane that is down for an
+                # unresolved setting, a refused CA or any other build failure keeps its ASVS 14.2.1
+                # record. Inside this try, so a step that raises fails this lane only.
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.
             await self._check_lane_anchor("outbound", name, dest.settings)
@@ -5526,8 +5764,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
+                # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                    dest, egress=self._egress, warn_query_credentials=False
                 )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
@@ -6044,8 +6283,10 @@ class RegistryRunner:
 
         Abandonment is safe for those four. It is NOT safe for DICOM, which releases its port inside
         ``await to_thread(server.shutdown)`` — an abandoned DICOM stop can still hold the port at
-        re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and
-        parks on that Event, so an abandoned one finishes at most its single in-flight scan.
+        re-promotion. File/RemoteFile/Database/Timer set an Event, and each is leader-gated and
+        parks on that Event, so an abandoned one finishes at most its single in-flight scan. File,
+        RemoteFile and Database then cancel a poll task still outside a store call after their own
+        grace (BACKLOG #1620, #4685), so that scan's blocked external call is cut, not waited on.
 
         The bound is applied HERE, at the call site — never by editing a transport constant, which would
         make ``transports/`` know about clustering (the one-way dependency rule).
@@ -6154,11 +6395,11 @@ class RegistryRunner:
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge engine shutdown, and the reload, re-promotion and connection API calls
         queued behind its lock, for as long as a wedged
-        File/Database ``stop()`` runs. (Database waits on its poll task with no timeout of its own;
-        once cancelled, it lets a row's hand-off and mark run for a bounded grace, which a
-        non-leader skips, then cuts the task and bounds both the join and the pool close. File now
-        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
-        without a bound while that task is inside a store call.)
+        File/Database/RemoteFile ``stop()`` runs. (File, BACKLOG #1620, and Database and
+        RemoteFile, BACKLOG #4685, cut a poll task blocked on an external call after a grace, but still wait without a bound while
+        that task is inside a store call. Once cancelled, Database lets a row's hand-off and mark
+        run for a bounded grace, which a non-leader skips, then cuts the task and bounds both the
+        join and the pool close.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and
@@ -7902,6 +8143,59 @@ class RegistryRunner:
 
         return on_message
 
+    def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
+        # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
+        async def refuse(raw: bytes) -> str | None:
+            return await self._refuse_unlisted_sender(ic, raw)
+
+        return refuse
+
+    async def _refuse_unlisted_sender(self, ic: InboundConnection, raw: bytes) -> str | None:
+        """Record a message from a sender outside the inbound's certificate-subject allowlist as
+        ``ERROR``, then return the ``AR`` reply, or ``None`` where the inbound sends none (BACKLOG
+        #4907).
+
+        The order is the one #2607's closing step 5 set: the row is committed before the reply is
+        built, so the message is counted and logged, never accepted and dropped. ``AR``, not ``AE``,
+        because the same sender is refused the same way on every resend; the engine's own MLLP
+        destination dead-letters an ``AR`` at once. Nothing from the certificate reaches the row, the
+        reply or the log: the reason and the MSA-3 text are fixed, because a subject can name a
+        person. The body is kept under the refused-body allowance, as every other refusal's is.
+
+        On an inbound that is not HL7 v2, or whose acknowledgements are off, there is no HL7 reply
+        to give, so this returns ``None`` and the listener closes the connection with no reply; the
+        close, with nothing written, is that feed's refusal. The body is stored as received, before
+        any decode, and the message is never routed. On an HL7 v2 inbound that replies, only its
+        first segment is then decoded, in the inbound's charset and bounded to the first
+        ``_UNLISTED_SENDER_HEADER_SCAN_BYTES``, and parsed by ``build_ack`` for the ``AR``'s header
+        echo; nothing past that segment is decoded or parsed."""
+        hl7v2 = ic.content_type is ContentType.HL7V2
+        mid = await self._record_refused(
+            ic,
+            raw,
+            None,
+            error=_UNLISTED_SENDER_ERROR,
+            message_type=None if hl7v2 else ic.content_type.value,
+        )
+        if not hl7v2 or ic.ack_mode is AckMode.NONE:
+            return None
+        ack = build_ack(
+            _header_segment(raw, ingress_encoding(ic)),
+            code="AR",
+            text=_UNLISTED_SENDER_NAK_TEXT,
+            ack_mode=ic.ack_mode,
+        )
+        if self._capture_ack_enabled(ic):
+            await self._capture_ack(
+                mid,
+                ic.name,
+                ack_code="AR",
+                ack_phase="ingest",
+                ack_body=None,
+                detail=_UNLISTED_SENDER_ERROR,
+            )
+        return ack
+
     def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
         # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
         # receipt can carry it (AC-2) — distinct from the MLLP/TCP handler, whose str return is a wire
@@ -8095,29 +8389,19 @@ class RegistryRunner:
                 ic.stream_threshold_bytes,
             )
         elif ic.validation.strict:
-            timeout = _strict_validate_timeout(ic)
             try:
-                # wait_for frees THIS listener path but cannot kill the to_thread worker (no thread
-                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
-                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
-                # 16 MiB / segment caps that fire before the slow parse (#89).
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
-                    timeout,
-                )
-            except TimeoutError:
-                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
-                # it instead of pinning intake. The message string is PHI-safe/value-free (only the
-                # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
+                result = await _validate_strictly(ic, text)
+            except _StrictValidateTimedOut as exc:
+                # DoS backstop (#89): dead-letter instead of pinning intake. HTTP owns its own
+                # 202/4xx response — no HL7 ACK here.
                 #
-                # PERMANENT, not temporary (BACKLOG #2105): a body that times out for its own content
-                # times out on every re-send, and each attempt orphans another hl7apy thread this path
-                # cannot kill, so inviting a retry would multiply the very load this timeout bounds. A
-                # timeout caused by load instead cannot be told apart from it here. ADR 0154's
-                # 2026-10-30 amendment records the cost and when it may be reclassified.
-                timed_out = f"strict-validation timed out after {timeout}s"
+                # A validate that had begun is PERMANENT (BACKLOG #2105; owner ruling of 2026-11-03): a
+                # body that times out for its own content times out on every re-send, and each
+                # attempt orphans another hl7apy thread this path cannot kill. One that never began
+                # (no worker thread ran it inside the timeout) tells nothing of the body and left no
+                # thread, so it is TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
                 return await self._refuse(
-                    ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
+                    ic, raw, text, exc.refusal_kind, error=exc.reason, peek=peek
                 )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
@@ -8127,28 +8411,19 @@ class RegistryRunner:
                 kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns a refusal — never accepted-and-dropped.
+        # refusal records ERROR + returns a refusal — never accepted-and-dropped. Any other fault, a
+        # put_attachment fault among them (#1619), propagates with no row.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except _DETACH_REFUSALS as exc:
-                # Only the in-flight budget is the engine's own and clears as concurrent detaches
-                # finish, so only it invites a re-send, and only when the body would fit the budget
-                # once they have: one larger than the whole budget is over-size. Every other
-                # refusal in _DETACH_REFUSALS, at least an unsupported backend, a malformed or
-                # received handle, an escaped document and one the splice would alter, refuses the
-                # same body every time.
-                if isinstance(exc, _StreamBudgetExceeded):
-                    kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
-                else:
-                    kind = RefusalKind.PERMANENT
                 return await self._refuse(
                     ic,
                     raw,
                     text,
-                    kind,
+                    _detach_refusal_kind(exc),
                     error=f"streaming detach failed: {safe_exc(exc)}",
                     peek=peek,
                 )
@@ -8285,8 +8560,12 @@ class RegistryRunner:
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
+                # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
+                # tested first so an over-long label is never copied by the MIME check.
                 safe_ct = content_type
-                if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
+                if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
+                    content_type, b64_head(verbatim_b64)
+                ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
                 # Dropped once stored, before the splice below copies OBX-5 and before the scan
@@ -8528,33 +8807,28 @@ class RegistryRunner:
         elif ic.validation.strict:
             # hl7apy validation is CPU-bound (full structure/cardinality parse) — run it off the event
             # loop so a strict feed can't stall every other listener, worker, and API call (review M-11).
-            timeout = _strict_validate_timeout(ic)
             try:
-                # wait_for frees THIS listener but cannot kill the to_thread worker (no thread
-                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
-                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
-                # 16 MiB / segment caps that fire before the slow parse (#89).
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
-                    timeout,
-                )
-            except TimeoutError:
-                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
-                # + NAK AE instead of pinning the listener. The stored/ACK string is PHI-safe/value-free
-                # (only the numeric timeout) — unlike the validation-error path below it quotes no field.
-                timed_out = f"strict-validation timed out after {timeout}s"
-                mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
+                result = await _validate_strictly(ic, text)
+            except _StrictValidateTimedOut as exc:
+                # DoS backstop (#89): dead-letter + NAK instead of pinning the listener. The stored/ACK
+                # string is PHI-safe/value-free (only the numeric timeout) — unlike the validation-error
+                # path below it quotes no field. The same split as the receipt path (owner ruling of
+                # 2026-11-03, BACKLOG #5078): a validate that had begun is final, AR, and one that
+                # never began is temporary, AE.
+                mid = await self._record_refused(ic, raw, text, error=exc.reason, peek=peek)
                 ack = (
-                    build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
+                    build_ack(peek, code=exc.nak_code, text=exc.ack_text, ack_mode=ack_mode)
+                    if reply
+                    else None
                 )
                 if ack is not None and self._capture_ack_enabled(ic):
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code=exc.nak_code,
                         ack_phase="strict",
                         ack_body=None,
-                        detail=timed_out,
+                        detail=exc.reason,
                     )
                 return ack
             if not result.ok:
@@ -8566,10 +8840,13 @@ class RegistryRunner:
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
                 mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                # The AE ACK goes back to the partner that SENT this message (their own data) and is
-                # transient (never persisted), so it may carry the fuller, bounded validation text.
+                # AR, not AE (BACKLOG #5078; owner ruling of 2026-11-03): every strict failure is final,
+                # as the receipt path answers it (422, or 413 for validate()'s own size cap), and an
+                # AE invited a sender, the engine's own MLLP outbound included, to retry it. The NAK
+                # goes back to the partner that SENT this message (their own data) and is transient
+                # (never persisted), so it may carry the fuller, bounded validation text.
                 ack = (
-                    build_ack(peek, code="AE", text=joined[:200], ack_mode=ack_mode)
+                    build_ack(peek, code="AR", text=joined[:200], ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8579,7 +8856,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code="AR",
                         ack_phase="strict",
                         ack_body=None,
                         detail=persisted,
@@ -8590,9 +8867,9 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure or an unsupported
-        # backend, AR for an escaped document (below) — the message is NEVER accepted-and-dropped, and
-        # no ACK is sent for a body we couldn't store.
+        # detach refusal is a synchronous ERROR + NAK, in the receipt path's class (below) — the
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. Any
+        # other fault, a put_attachment fault among them (#1619), propagates to the transport.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8601,28 +8878,31 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
-                # A budget or backend refusal may clear on a resend, so AE. A refusal of the message
-                # itself, at least an escaped document (vault BACKLOG #2809) and the BACKLOG #5099
-                # shapes below, fails the same way every time, so AR.
+                # The receipt path's class decides MSA-1 (BACKLOG #5078): AE only for a budget held by
+                # concurrent detaches, which a re-send may clear, and AR for every refusal the
+                # receipt path answers as final, a body alone over the whole budget, an unsupported
+                # backend, a malformed handle, an escaped document (vault BACKLOG #2809) and the
+                # BACKLOG #5099 shapes below alike. MSA-3 names the shape where it is the message's own.
+                nak_code = "AE" if _detach_refusal_kind(exc) is RefusalKind.TEMPORARY else "AR"
                 if isinstance(exc, EscapedDocumentError):
-                    nak_code, nak_text = "AR", "escaped document in OBX-5.5"
+                    nak_text = "escaped document in OBX-5.5"
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
-                    nak_code, nak_text = "AR", "OBX-5.5 document holds a delimiter or control"
+                    nak_text = "OBX-5.5 document holds a delimiter or control"
                 elif isinstance(exc, UnreadableDelimitersError):
                     # The header, not a document: no OBX-5.5 of this body can be read. Only a
                     # short MSH-2 reaches here, since the listener's parse refuses a body with no
                     # MSH.
-                    nak_code, nak_text = "AR", "MSH-2 shorter than four characters"
+                    nak_text = "MSH-2 shorter than four characters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
-                    nak_code, nak_text = "AR", "document under base64 delimiters"
+                    nak_text = "document under base64 delimiters"
                 elif isinstance(exc, InboundDocRefError):
                     # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
                     # with a document to detach.
-                    nak_code, nak_text = "AR", "document handle marker in the body"
+                    nak_text = "document handle marker in the body"
                 else:
-                    nak_code, nak_text = "AE", "streaming detach failed"
+                    nak_text = "streaming detach failed"
                 ack = (
                     build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply
@@ -9291,6 +9571,9 @@ class RegistryRunner:
                 1,
             )
             return _ItemOutcome.STOPPED, None
+        # The payload handed to connector.send, for forget_payload once a transient failure
+        # dead-letters the row at the retry cap. None until a live send is attempted.
+        sent: str | None = None
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -9335,7 +9618,7 @@ class RegistryRunner:
                 # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
                 # payload with no handle is returned byte-identical; a missing attachment raises a
                 # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
-                payload = await self._hydrate_payload(item.payload, item.message_id)
+                payload = sent = await self._hydrate_payload(item.payload, item.message_id)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
                     # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
@@ -9386,6 +9669,7 @@ class RegistryRunner:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
+                await _forget_dead_payload(connector, sent, failed)
                 await self._delivery_failure_alert_checks(name)
         except CellTagError as exc:
             # BACKLOG #2593: the dynamic_headers metadata read met a cell that fails its channel
@@ -9414,6 +9698,7 @@ class RegistryRunner:
             failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
             retry_until = failed.retry_at
             self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
+            await _forget_dead_payload(connector, sent, failed)
             await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)
@@ -10431,7 +10716,24 @@ class RegistryRunner:
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
-        body = await self.store.response_body_for_work_row(item.id) or ""
+        try:
+            body = await self.store.response_body_for_work_row(item.id) or ""
+        except CipherError as exc:
+            # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
+            # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
+            # does an unopenable payload; the token keeps its reference for a replay. The handoff
+            # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
+            # any CipherError the handoff raises still takes the fault arm.
+            log.warning(
+                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                name,
+                item.id,
+                type(exc).__name__,
+            )
+            await self.store.dead_letter_now(
+                item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
+            )
+            return _ItemOutcome.PROCESSED, None
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
         # HL7 body meets the same ceiling inside Peek.parse.

@@ -385,7 +385,9 @@ async def test_the_console_refuses_a_profile_email_creation_would_refuse(engine:
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u1")
-        await service.store.update_user_profile(uid, display_name=None, email="dir@example.test")
+        await service.store.update_user_profile(
+            uid, display_name=None, email="dir@example.test", audits=()
+        )
         r = await _save_profile(c, uid, {"display_name": "Renamed", "email": "a@b"})
         assert r.status_code == 400
         assert "profile email" in r.text
@@ -409,7 +411,9 @@ async def test_the_console_saves_over_a_stored_profile_email_the_rule_refuses(
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u1")
-        await service.store.update_user_profile(uid, display_name=None, email="not-an-address")
+        await service.store.update_user_profile(
+            uid, display_name=None, email="not-an-address", audits=()
+        )
         page = (await c.get(f"/ui/users/{uid}")).text
         assert 'value="not-an-address"' in page  # what the form will post back
         r = await _save_profile(
@@ -435,7 +439,7 @@ async def test_an_unrelated_console_save_leaves_the_notification_address(engine:
         # The directory-sync write: profile email only.
         for uid in (set_uid, blank_uid):
             await service.store.update_user_profile(
-                uid, display_name=None, email="dir@example.test"
+                uid, display_name=None, email="dir@example.test", audits=()
             )
 
         # The page shows both addresses, each in its own field, plus the shown copy.
@@ -803,7 +807,7 @@ async def test_resaving_a_directory_scope_needs_a_confirmation(engine: Engine) -
     service = await _service(engine)
     ada = uuid.uuid4().hex  # the shape a real account id has
     await service.store.create_user(
-        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     resave = {"scope_mode": "list", "channels": "IB_A"}
@@ -859,7 +863,7 @@ async def test_a_refused_scope_save_shows_the_submitted_edits(engine: Engine) ->
     service = await _service(engine)
     ada = uuid.uuid4().hex
     await service.store.create_user(
-        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     same_origin = {"Sec-Fetch-Site": "same-origin"}
@@ -934,7 +938,7 @@ async def test_the_other_scope_refusals_keep_the_edits_where_they_can(engine: En
     service = await _service(engine)
     ada = uuid.uuid4().hex
     await service.store.create_user(
-        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     same_origin = {"Sec-Fetch-Site": "same-origin"}
@@ -1030,7 +1034,7 @@ async def test_the_console_and_the_engine_agree_on_who_owns_a_scope(engine: Engi
     service = await _service(engine)
     uid = uuid.uuid4().hex
     await service.store.create_user(
-        user_id=uid, username="ada", auth_provider="ad", password_generated=False
+        user_id=uid, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     base = await service.store.get_user(uid)
     assert base is not None
@@ -1074,7 +1078,7 @@ async def test_a_ticked_save_on_a_legacy_directory_scope_saves(engine: Engine) -
     service = await _service(engine)
     ada = uuid.uuid4().hex
     await service.store.create_user(
-        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     await service.store.set_user_channel_scope(
         ada,
@@ -1120,7 +1124,7 @@ async def test_a_sign_in_landing_during_a_console_scope_save_is_refused(
     service = await _service(engine)
     len_ = uuid.uuid4().hex
     await service.store.create_user(
-        user_id=len_, username="len", auth_provider="ad", password_generated=False
+        user_id=len_, username="len", auth_provider="ad", password_generated=False, audits=()
     )
     await service.store.set_user_channel_scope(
         len_, json.dumps(["IB_M"]), source=SCOPE_SOURCE_MANUAL
@@ -1697,6 +1701,7 @@ async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
         auth_provider="ad",
         display_name="AD User",
         password_generated=False,
+        audits=(),
     )
     async with _boss_client(engine, service) as c:
         detail = await c.get("/ui/users/ad-user-1")

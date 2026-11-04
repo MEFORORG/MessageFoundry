@@ -2895,7 +2895,10 @@ def _win_open_confined(root_real: Path, parts: tuple[str, ...], access: int) -> 
 def _win_hold_dirs(root: Path, dirs: tuple[str, ...]) -> list[int]:
     """Windows: open each directory ``root/dirs...`` as itself, refuse one that is not a plain
     directory, and return their handles, held so that none can be renamed (BACKLOG #2535). The caller
-    passes them to :func:`_win_release`."""
+    passes them to :func:`_win_release`.
+
+    The DR staging truncate fail-safe holds its directories with this too (BACKLOG #4992), so one
+    Windows walk serves both modules rather than two that drift apart."""
     held: list[int] = []
     try:
         where = root
@@ -2922,31 +2925,65 @@ def _win_release(held: list[int]) -> None:
         _kernel32().CloseHandle(handle)
 
 
-def _win_open_file(path: Path, access: int) -> int:
+def _win_open_file(
+    path: Path,
+    access: int,
+    *,
+    vet: Callable[[int], None] | None = None,
+    fd_flags: int = os.O_RDONLY,
+) -> int:
     """Windows: open the file at ``path`` as itself, and refuse it if it names another path (a symbolic
-    link, a junction). Returns a descriptor the caller closes.
+    link, a junction). Returns a descriptor the caller closes, opened with ``fd_flags``.
 
     A reparse point that names no path (a deduplicated, cloud or tiered file) serves its data only to
     an open that lets its filter act, so it is opened again that way and must still be the same file.
     That second open is the one open here that would follow a link swapped in between the two; the
-    identity compare then refuses what it reached."""
-    fd = _fd_for(_win_create(path, access, _SHARE_ALL, _FLAG_OPEN_REPARSE_POINT))
+    identity compare then refuses what it reached.
+
+    ``vet``, where given, is called with the descriptor of the file opened as itself, after the tag
+    check and before that second open, and raises to refuse the file, so a file it refuses is never
+    served by its filter (BACKLOG #4992). The second open still goes by name, so a file renamed into
+    that name between the two opens is served by its own filter before the identity compare."""
+    fd = _fd_for(_win_create(path, access, _SHARE_ALL, _FLAG_OPEN_REPARSE_POINT), fd_flags)
     try:
         attributes, tag = _attribute_tag(_os_handle(fd))
+        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _NAME_SURROGATE:
+            raise _Unconfined("a symbolic link or a junction")
+        if vet is not None:
+            vet(fd)
         if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-            if tag & _NAME_SURROGATE:
-                raise _Unconfined("a symbolic link or a junction")
             first = _file_id(os.fstat(fd))
             os.close(fd)
             fd = -1
-            fd = _fd_for(_win_create(path, access, _SHARE_ALL, 0))
+            fd = _fd_for(_win_create(path, access, _SHARE_ALL, 0), fd_flags)
             if _file_id(os.fstat(fd)) != first:
                 raise _Replaced("not the file first opened")
-    except OSError:
+    except BaseException:  # a caller's `vet` may raise anything; never leak the handle
         if fd >= 0:
             os.close(fd)
         raise
     return fd
+
+
+def _win_lstat(path: Path) -> tuple[os.stat_result, int]:
+    """Windows: ``os.fstat`` of the object at ``path`` opened as itself, for attributes only, and its
+    reparse tag, which ``os.fstat`` does not report (a file symlink reads as a regular file there).
+
+    ``os.lstat`` opens a reparse point that names no path (a cloud, deduplicated or tiered file)
+    through its filter, as ``os.stat`` does. This never does (BACKLOG #4992)."""
+    fd = _fd_for(
+        _win_create(
+            path,
+            _FILE_READ_ATTRIBUTES,
+            _SHARE_ALL,
+            _FLAG_OPEN_REPARSE_POINT | _FLAG_BACKUP_SEMANTICS,
+        )
+    )
+    try:
+        attributes, tag = _attribute_tag(_os_handle(fd))
+        return os.fstat(fd), tag if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT else 0
+    finally:
+        os.close(fd)
 
 
 def _win_error(code: int | None = None) -> OSError:
@@ -2966,14 +3003,14 @@ def _win_create(path: Path, access: int, share: int, flags: int) -> int:
     return int(handle)
 
 
-def _fd_for(handle: int) -> int:
+def _fd_for(handle: int, flags: int = os.O_RDONLY) -> int:
     """Windows: a descriptor that owns ``handle``, so closing the descriptor closes the handle."""
     if sys.platform != "win32":  # pragma: no cover - narrows mypy
         raise _Unconfined("no OS handles on this platform")
     import msvcrt
 
     try:
-        return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        return msvcrt.open_osfhandle(handle, flags)
     except OSError:
         _kernel32().CloseHandle(handle)
         raise
@@ -3101,7 +3138,12 @@ def _open_no_link(name: str, flags: int, dir_fd: int) -> int:
 
 def _final_path(fd: int) -> str:
     """Windows: the final path of the file open on ``fd``, every link and junction resolved."""
-    handle = _os_handle(fd)
+    return _handle_final_path(_os_handle(fd))
+
+
+def _handle_final_path(handle: int) -> str:
+    """Windows: the final path of the object open on the OS ``handle``, every link and junction
+    resolved. The DR staging fail-safe reads its held directories' paths with this (BACKLOG #4992)."""
     query = _kernel32().GetFinalPathNameByHandleW
     size = 512
     while True:

@@ -124,10 +124,9 @@ def test_unknown_level_raises() -> None:
 def test_the_filtered_last_resort_redacts_what_no_handler_takes(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #3768: ``serve``'s ``lastResort`` for the window before its handlers. It redacts at
+    """BACKLOG #3768: the CLI's ``lastResort`` for the window before its handlers. It redacts at
     WARNING on whatever ``sys.stderr`` is at the emit, from a logger that does not propagate too,
     and a record a handler takes never reaches it, so nothing is written twice."""
-    monkeypatch.setattr(logging, "lastResort", logging.lastResort)  # process-wide: put it back
     root = logging.getLogger()
     root.handlers.clear()  # a real CLI process's shape; the autouse fixture puts pytest's back
     resort = logging_setup.install_filtered_last_resort()
@@ -165,18 +164,110 @@ def test_the_filtered_last_resort_redacts_what_no_handler_takes(
     assert late.out.count("late") == 1 and "DOE^JANE" not in late.out, late.out
 
 
-def test_the_filtered_last_resort_leaves_a_configured_root_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_the_filtered_last_resort_leaves_a_configured_root_alone() -> None:
     """A host that configured logging first keeps the stdlib's ``lastResort``, as it keeps its
     handlers under ``run_cli``'s sink: the choice is process-wide, so it is the host's."""
-    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
     before = logging.lastResort
     root = logging.getLogger()
     hosts = logging.NullHandler()
     root.handlers[:] = [hosts]
     assert logging_setup.install_filtered_last_resort() is None
     assert logging.lastResort is before and root.handlers == [hosts]
+
+
+@pytest.mark.parametrize("hosts", [None, logging.NullHandler()], ids=["none", "own-handler"])
+def test_the_filtered_last_resort_leaves_a_host_set_last_resort_alone(
+    hosts: logging.Handler | None,
+) -> None:
+    """A host that set ``lastResort`` itself, to None or to its own handler, keeps it, on an empty
+    root too. The conftest's restore puts the stdlib's back after this test."""
+    root = logging.getLogger()
+    root.handlers.clear()
+    logging.lastResort = hosts
+    assert logging_setup.install_filtered_last_resort() is None
+    assert logging.lastResort is hosts
+    logging.lastResort = logging_setup._STDLIB_LAST_RESORT  # the control: the stdlib's is replaced
+    assert isinstance(
+        logging_setup.install_filtered_last_resort(), logging_setup._FilteredLastResort
+    )
+
+
+def test_a_last_resort_a_host_set_before_the_import_is_kept_too(tmp_path: Path) -> None:
+    """The stdlib's own is read from ``logging``, not from ``lastResort`` at import, so a host
+    that set it to None before importing the engine keeps None. Run in a child, because this
+    process imported the module long ago."""
+    import subprocess
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import logging; logging.lastResort = None\n"
+            "from messagefoundry import logging_setup\n"
+            "print(logging_setup.install_filtered_last_resort(), logging.lastResort)\n",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["None", "None"], proc.stdout
+
+
+def test_the_filtered_last_resort_refuses_a_stream_assignment() -> None:
+    """BACKLOG #4716: assigning the stream raises, as it does on the stdlib's own ``lastResort``,
+    rather than being dropped with the caller told nothing. ``setStream`` to the stream it already
+    writes to is a no-op on both, so that path does not raise."""
+    resort = logging_setup._FilteredLastResort()
+    stdlib = logging._StderrHandler()  # type: ignore[attr-defined]  # the stdlib's own, the control
+    for handler in (stdlib, resort):
+        with pytest.raises(AttributeError):
+            handler.setStream(io.StringIO())
+        assert handler.setStream(sys.stderr) is None
+    assert resort.stream is sys.stderr
+
+
+def _run_cli_callers(source: str) -> dict[str, bool]:
+    """Each function in ``source`` that calls ``run_cli``, mapped to whether it calls
+    ``install_filtered_last_resort`` on an earlier line."""
+    found: dict[str, bool] = {}
+    for fn in ast.walk(ast.parse(source)):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        lines: dict[str, list[int]] = {"run_cli": [], "install_filtered_last_resort": []}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name in lines:
+                    lines[name].append(node.lineno)
+        if lines["run_cli"]:
+            installs = lines["install_filtered_last_resort"]
+            found[fn.name] = bool(installs) and min(installs) < min(lines["run_cli"])
+    return found
+
+
+def test_every_run_cli_caller_installs_the_filtered_last_resort_first() -> None:
+    """BACKLOG #3768: the install lives in each command's ``main()``, not in ``run_cli``, so a new
+    caller of ``run_cli`` could leave it out and reopen the parse window with nothing failing.
+    This finds every call in the shipped packages, pins the set, and checks each one installs
+    first. The pin makes a new caller a visible edit here."""
+    repo = Path(__file__).resolve().parents[1]
+    callers: dict[str, bool] = {}
+    for package in ("messagefoundry", "messagefoundry_toolkit", "messagefoundry_webconsole"):
+        for path in sorted((repo / package).rglob("*.py")):
+            for name, ok in _run_cli_callers(path.read_text(encoding="utf-8")).items():
+                callers[f"{path.relative_to(repo).as_posix()}:{name}"] = ok
+    assert callers == {
+        "messagefoundry/__main__.py:main": True,
+        "messagefoundry_toolkit/__main__.py:main": True,
+    }
+    # The control: the checker flags a caller that installs late or not at all.
+    assert _run_cli_callers(
+        "def a():\n    run_cli()\n    install_filtered_last_resort()\n"
+        "def b():\n    run_cli()\n"
+        "def c():\n    install_filtered_last_resort()\n    run_cli()\n"
+    ) == {"a": False, "b": False, "c": True}
 
 
 def test_routes_uvicorn_loggers_to_root() -> None:

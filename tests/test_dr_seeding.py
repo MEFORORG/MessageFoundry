@@ -310,16 +310,22 @@ async def test_config_only_seed_on_sqlite_aborts(tmp_path: Path) -> None:
     # server-DB gate returns early too, because the backend is SQLite. Both gates no-op, and a
     # deploying site would record a dr_seed marker and a dr.activate row against a store nothing was
     # ever restored into -- the exact silent success ADR 0048's amendment says is refused
-    # unconditionally. It cannot be a false refusal: `run_restore` refuses a config-only archive
-    # outright (tests/test_cli_restore_dispatch.py), so no SQLite box could have been seeded from one.
+    # unconditionally. It cannot be a false refusal: `run_restore` refuses to restore a store from a
+    # config-only archive, and with `--config-to` alone restores only its config bundle (vault
+    # BACKLOG #5233; tests/test_cli_restore_dispatch.py), so no SQLite box could have been seeded
+    # from one.
     key = generate_key()
     primary, _full_archive, ss = await _make_seed(tmp_path, key)
+    # A config-only pass must carry a config file to be written at all (vault BACKLOG #5220).
+    cfg = tmp_path / "cfgonly_config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# synthetic router\n")
     try:
         runner = BackupRunner(
             primary,
             BackupSettings(enabled=True, destination=str(tmp_path / "cfgonly")),
             store_settings=ss,
-            config_dir=None,
+            config_dir=cfg,
         )
         config_only = await runner.run_once(now=2.0, force_config_only=True)
         assert config_only is not None and config_only.config_only

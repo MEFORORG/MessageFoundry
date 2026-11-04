@@ -35,7 +35,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.credential import VERIFIED_ISSUER_KEY
+from messagefoundry.credential import OTHERNAMES_INTACT_KEY, VERIFIED_ISSUER_KEY
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +91,22 @@ def peercert_from_ssl_object(ssl_object: Any) -> Mapping[str, Any] | None:
     # stashed and the resolver denies rather than matching an empty subject.
     if not cert:
         return None
-    return {**cert, VERIFIED_ISSUER_KEY: _verified_issuer(ssl_object)}
+    return {
+        **cert,
+        VERIFIED_ISSUER_KEY: _verified_issuer(ssl_object),
+        OTHERNAMES_INTACT_KEY: _othernames_intact(ssl_object),
+    }
+
+
+def _othernames_intact(ssl_object: Any) -> bool:
+    """Whether the peer's otherNames may be matched (BACKLOG #4907), or ``False`` with no cert map
+    on this context, since then nothing is matched and the leaf need not be read."""
+    if getattr(getattr(ssl_object, "context", None), ISSUER_INDEX_ATTR, None) is None:
+        return False
+    # Lazy: pki pulls in cryptography, which a context with no cert map never needs.
+    from messagefoundry.pki import peer_othernames_intact
+
+    return peer_othernames_intact(ssl_object)
 
 
 def _verified_issuer(ssl_object: Any) -> str:

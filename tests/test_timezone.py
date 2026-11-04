@@ -166,18 +166,22 @@ def test_date_precision_on_a_transition_day_is_not_refused() -> None:
 
 def test_date_precision_still_honours_an_explicit_policy_in_a_midnight_transition_zone() -> None:
     # A few zones transition AT midnight, so even the "00" filler can be ambiguous — and there it
-    # moves the emitted calendar DATE, not just the offset. America/Havana falls back at 01:00 on
-    # 2026-11-01, making local 00:00 occur twice. The default must never refuse a date, but a caller
-    # who passed a policy asked for it, so it is applied rather than silently dropped.
-    havana, cancun = "America/Havana", "America/Cancun"
-    assert convert_hl7_timestamp("20261101", cancun, from_tz=havana) == "20261031-0500"
+    # moves the emitted calendar DATE, not just the offset. Atlantic/Azores falls back at 01:00 local
+    # (+00 to -01) on 2026-10-25, the last Sunday of October under the long-standing EU rule, making
+    # local 00:00 occur twice; Atlantic/Cape_Verde is a fixed -01 with no DST. The default must never
+    # refuse a date, but a caller who passed a policy asked for it, so it is applied rather than
+    # silently dropped. (This used America/Havana's 2026-11-01 midnight fall-back until tzdata 2026.6
+    # dropped it; a zone must keep its transition in BOTH the tzdata package the Windows legs read
+    # and the runner's older system zoneinfo the Linux legs read.)
+    azores, cape_verde = "Atlantic/Azores", "Atlantic/Cape_Verde"
+    assert convert_hl7_timestamp("20261025", cape_verde, from_tz=azores) == "20261024-0100"
     assert (
-        convert_hl7_timestamp("20261101", cancun, from_tz=havana, on_dst_edge="earlier")
-        == "20261031-0500"
+        convert_hl7_timestamp("20261025", cape_verde, from_tz=azores, on_dst_edge="earlier")
+        == "20261024-0100"
     )
     assert (
-        convert_hl7_timestamp("20261101", cancun, from_tz=havana, on_dst_edge="later")
-        == "20261101-0500"
+        convert_hl7_timestamp("20261025", cape_verde, from_tz=azores, on_dst_edge="later")
+        == "20261025-0100"
     )
 
 

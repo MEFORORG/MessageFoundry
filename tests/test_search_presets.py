@@ -154,6 +154,7 @@ async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
                 auth_provider="local",
                 now=1.0,
                 password_generated=False,
+                audits=(),
             )
         for pid, owner, name, now in (
             ("pa", "alice", "ACME ADT", None),

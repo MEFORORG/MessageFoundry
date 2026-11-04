@@ -412,7 +412,6 @@ PROBE_SECRETS = ("S3CRET", "sk_live_ABC123", "sk_live_KEY9", "CAPSECRET", "servi
 #: What each probe's detail must still name, so a label that emitted nothing would not pass.
 PROBE_PEERS = {
     "proxy:OB_PROBE_PROXY": "(proxy.corp.invalid:3128)",
-    "proxy:OB_PROBE_KEY": "(http://proxy2.example.invalid:3128)",
     "OB_PROBE_KEY_HOST": "(mllp.example.invalid:2575)",
     "OB_PROBE_PATH": "(https://hooks.example.invalid)",
 }
@@ -433,6 +432,9 @@ def probe_hops(tmp_path_factory: pytest.TempPathFactory) -> dict[str, StaticCred
 
 def test_no_probe_secret_reaches_a_detail(probe_hops: dict[str, StaticCredentialHop]) -> None:
     assert set(PROBE_PEERS) | {"OB_PROBE_QUERY_AT"} <= set(probe_hops)
+    # Probe 2's key-only userinfo fails the connector's build (vault BACKLOG #3007), so its proxy
+    # hop is not listed at all, which keeps the key out of every detail too.
+    assert "proxy:OB_PROBE_KEY" not in probe_hops
     for hop in probe_hops.values():
         for secret in PROBE_SECRETS:
             assert secret not in hop.detail, hop
@@ -527,10 +529,11 @@ def test_http_digest_is_read_from_the_mode_the_connector_reads() -> None:
 _PROXY_PW = "PROXY-userinfo-SECRET"
 
 
-def test_a_proxy_url_carrying_userinfo_is_a_static_credential_hop(tmp_path: Path) -> None:
-    """urllib's ``ProxyHandler`` turns ``user:password@`` in the proxy URL into a pre-emptive
-    ``Proxy-authorization: Basic`` header, so the hop presents a static credential with no
-    ``proxy_user`` set. The label still carries scheme, host and port only."""
+def test_a_proxy_url_carrying_userinfo_is_not_a_static_credential_hop(tmp_path: Path) -> None:
+    """urllib's ``ProxyHandler`` would turn ``user:password@`` in the proxy URL into a pre-emptive
+    ``Proxy-authorization: Basic`` header, but the connector's build refuses such a URL (vault
+    BACKLOG #3007), so the hop never runs and is not offered for ``static_credential_accepted``.
+    The control is the same proxy with a ``proxy_user`` pair, which is listed."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text(
@@ -545,15 +548,28 @@ def test_a_proxy_url_carrying_userinfo_is_a_static_credential_hop(tmp_path: Path
             registry=load_config(cfg, allow_empty=True), settings=ServiceSettings()
         )
     }
+    assert "proxy:OB_P" not in hops
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import Rest, env, outbound\n"
+        "outbound('OB_P', Rest(url='https://a.example.invalid/x',\n"
+        "    proxy='https://proxy.example.invalid:3128', proxy_user='pu', proxy_password=env('pp')))\n",
+        encoding="utf-8",
+    )
+    hops = {
+        h.name: h
+        for h in static_credential_hops(
+            registry=load_config(cfg, allow_empty=True), settings=ServiceSettings()
+        )
+    }
     hop = hops["proxy:OB_P"]
     assert hop.credential == "static" and hop.compliant_kind is False
     assert "(https://proxy.example.invalid:3128)" in hop.detail
-    assert _PROXY_PW not in hop.detail and "puser" not in hop.detail
 
 
-def test_a_site_proxy_carrying_userinfo_is_a_hop_for_every_http_connection(tmp_path: Path) -> None:
-    """The inherited ``[egress].proxy_url`` is sent by every HTTP-family connection with no proxy of
-    its own, so its userinfo is presented on each of those hops."""
+def test_a_site_proxy_carrying_userinfo_is_refused_at_load(tmp_path: Path) -> None:
+    """The inherited ``[egress].proxy_url`` would be sent by every HTTP-family connection with no
+    proxy of its own, so a user and a password in it are refused once, at load, naming the setting
+    (vault BACKLOG #3007), and no hop is reported for it."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text(
@@ -562,18 +578,15 @@ def test_a_site_proxy_carrying_userinfo_is_a_hop_for_every_http_connection(tmp_p
         encoding="utf-8",
     )
     registry = load_config(cfg, allow_empty=True)
-    site = _settings(
-        egress={
-            "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
-            "allowed_proxy": ["site.example.invalid"],
-        }
-    )
-    hops = {h.name: h for h in static_credential_hops(registry=registry, settings=site)}
-    hop = hops["proxy:OB_S"]
-    assert hop.credential == "static"
-    assert "(http://site.example.invalid:3128)" in hop.detail
-    assert _PROXY_PW not in hop.detail and "suser" not in hop.detail
-    # The control: the same site proxy without userinfo presents nothing to the proxy.
+    with pytest.raises(ValueError, match=r"\[egress\]\.proxy_url holds a user or a password") as e:
+        _settings(
+            egress={
+                "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
+                "allowed_proxy": ["site.example.invalid"],
+            }
+        )
+    assert _PROXY_PW not in str(e.value) and "suser" not in str(e.value)
+    # The control: the same site proxy without userinfo loads, and presents nothing to the proxy.
     bare = _settings(
         egress={
             "proxy_url": "http://site.example.invalid:3128",
@@ -647,7 +660,7 @@ def test_the_userinfo_reader_answers_what_the_engine_sends(url: str, sent: bool)
     """``ProxyHandler`` sends a header exactly when ``_parse_proxy`` yields a user and a password,
     and the transport reaches the handler only for an http(s) URL it can parse. The reader calls a
     private stdlib function, so the shapes where it matters are pinned here."""
-    from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
+    from messagefoundry.transports.rest import proxy_url_sends_userinfo as _proxy_url_sends_userinfo
 
     assert _proxy_url_sends_userinfo(url) is sent
 
@@ -658,7 +671,7 @@ def test_the_reader_pairs_with_urllibs_own_parser() -> None:
     import urllib.parse
     import urllib.request
 
-    from messagefoundry.config.static_credentials import _proxy_url_sends_userinfo
+    from messagefoundry.transports.rest import proxy_url_sends_userinfo as _proxy_url_sends_userinfo
 
     for url, _ in _PROXY_SHAPES:
         proxy = url.strip()
@@ -687,9 +700,10 @@ def test_a_malformed_proxy_url_never_crashes_the_reader() -> None:
     assert hop is not None and _PROXY_PW not in hop.detail
 
 
-def test_a_site_proxy_carrying_userinfo_reaches_a_fhir_lookup(tmp_path: Path) -> None:
-    """A lookup takes no proxy of its own, so the inherited ``[egress].proxy_url`` is its only one.
-    The hop is named ``proxy:fhir_lookup:<name>``, which is the name an opt-out must use."""
+def test_a_fhir_lookup_on_the_site_proxy_presents_no_proxy_credential(tmp_path: Path) -> None:
+    """A lookup takes no proxy of its own, so the inherited ``[egress].proxy_url`` is its only one,
+    and a credential in that URL is refused at load (vault BACKLOG #3007). So a lookup on a site
+    proxy with no userinfo reports no ``proxy:fhir_lookup:<name>`` hop, while its own hop stays."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text(
@@ -699,22 +713,21 @@ def test_a_site_proxy_carrying_userinfo_reaches_a_fhir_lookup(tmp_path: Path) ->
     )
     site = _settings(
         egress={
-            "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
+            "proxy_url": "http://site.example.invalid:3128",
             "allowed_proxy": ["site.example.invalid"],
         }
     )
-    hops = {
-        h.name: h
+    names = {
+        h.name
         for h in static_credential_hops(registry=load_config(cfg, allow_empty=True), settings=site)
     }
-    assert hops["proxy:fhir_lookup:lk"].credential == "static"
-    assert _PROXY_PW not in hops["proxy:fhir_lookup:lk"].detail
+    assert "proxy:fhir_lookup:lk" not in names
 
 
-def test_url_userinfo_is_basic_whatever_proxy_auth_type_says() -> None:
-    """The handler sends URL userinfo as pre-emptive Basic and it replaces the engine's own header,
-    so the detail names Basic even beside a Digest pair. Without userinfo the type is read the way
-    the transport reads it, trimmed and lowercased."""
+def test_url_userinfo_is_no_hop_whatever_proxy_auth_type_says() -> None:
+    """URL userinfo fails the connector's build, so it is no hop even beside a Digest pair (vault
+    BACKLOG #3007). Without userinfo the type is read the way the transport reads it, trimmed and
+    lowercased."""
     from messagefoundry.config.static_credentials import _proxy_hop
 
     both = {
@@ -723,9 +736,7 @@ def test_url_userinfo_is_basic_whatever_proxy_auth_type_says() -> None:
         "proxy_password": "pp",
         "proxy_auth_type": "digest",
     }
-    hop = _proxy_hop("OB", both, "")
-    assert hop is not None and "forward-proxy basic credential" in hop.detail
-    assert _PROXY_PW not in hop.detail
+    assert _proxy_hop("OB", both, "") is None
     keyed = {
         "proxy_url": "http://proxy.example.invalid:3128",
         "proxy_user": "pu",
@@ -869,10 +880,15 @@ outbound("OB_DICOMWEB_BYPASSED", DICOMweb(url="https://i.example.invalid/dw",
                                           proxy_no_proxy=["i.example.invalid"], **_PROXY))
 outbound("OB_DICOMWEB_PROXIED", DICOMweb(url="https://j.example.invalid/dw", **_PROXY))
 # A lookup takes no proxy of its own: the inherited [egress] proxy and bypass list are its only ones.
-FhirLookup("lk_bypassed", url="https://k.site.invalid/fhir")
-with_smart_backend(FhirLookup("lk_smart_proxied", url="https://l.site.invalid/fhir"),
-                   token_url="https://idp5.example.invalid/token", client_id="c",
+# FhirLookup() takes no proxy credential either, and a credential in [egress].proxy_url is refused
+# at load, so the pair is written into each lookup's settings past the factory, which the executor
+# reads, to keep the lookup bypass decision under test.
+_LK_LOGIN = dict(proxy_user="pu", proxy_password="pp")
+FhirLookup("lk_bypassed", url="https://k.site.invalid/fhir").settings.update(_LK_LOGIN)
+_lk = FhirLookup("lk_smart_proxied", url="https://l.site.invalid/fhir")
+with_smart_backend(_lk, token_url="https://idp5.example.invalid/token", client_id="c",
                    private_key=env("key"))
+_lk.settings.update(_LK_LOGIN)
 """
 
 
@@ -887,8 +903,8 @@ def bypass_registry(tmp_path_factory: pytest.TempPathFactory) -> Registry:
 def test_a_proxy_every_address_bypasses_is_not_a_hop(bypass_registry: Registry) -> None:
     site = _settings(
         egress={
-            # Userinfo, so every lookup on the site proxy carries a credential of its own.
-            "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
+            # No userinfo: a credential in it is refused at load (vault BACKLOG #3007).
+            "proxy_url": "http://site.example.invalid:3128",
             "allowed_proxy": ["site.example.invalid", "proxy.example.invalid"],
             "proxy_no_proxy": [".site.invalid"],
         }

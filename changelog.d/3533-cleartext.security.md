@@ -17,8 +17,8 @@
   whitespace or is shaped like a credential is not shown as written in the refusal text. Owner ruling
   2026-10-26, recorded as a dated amendment to
   [ADR 0153](../docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
-  The forward-proxy login stays under the declarations, by the owner's 2026-10-05 ruling on that
-  credential. (`BACKLOG #3533`)
+  The forward-proxy login stays under one declaration, `cleartext_accepted` with a reason, by the
+  owner's rulings on that credential; `docs/CONNECTIONS.md` states them. (`BACKLOG #3533`)
 - **A Handler's per-message headers meet the hop's header rule at send.** On a
   `verify_tls = false` hop, a header stamped under `dynamic_headers` must be `Accept`,
   `Content-Type`, `User-Agent` or `X-Request-ID` with no credential in it. Over plain `http` off
