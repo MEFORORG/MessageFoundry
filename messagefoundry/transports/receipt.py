@@ -29,12 +29,18 @@ class RefusalKind(StrEnum):
     """Why the runner refused a body it read, as the sender needs to know it."""
 
     #: Engine-side, not about the body: the same body may be accepted on a re-send once the cause
-    #: clears. At least three are classed here: the streaming detach's in-flight budget while other
-    #: detaches hold it, which clears on its own; a strict-validation timeout that fired before any
-    #: worker thread began the validate (BACKLOG #5078); and an inbound codec name that sets up no
-    #: decode (BACKLOG #2431), which clears only when the operator fixes it. A strict-validation
-    #: timeout whose validate began is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
+    #: clears on its own. At least two are classed here: the streaming detach's in-flight budget
+    #: while other detaches hold it, and a strict-validation timeout that fired before any worker
+    #: thread began the validate (BACKLOG #5078). A strict-validation timeout whose validate began
+    #: is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
     TEMPORARY = "temporary"
+    #: The inbound's own configuration refuses every body until an operator changes it, so the body
+    #: is not at fault, yet no re-send clears it on its own (BACKLOG #5102). At least an inbound codec
+    #: name that sets up no decode (BACKLOG #2431). Told apart from TEMPORARY so that no source
+    #: answers an operator-only fault as retry-soon, and from the final kinds so that no sender drops
+    #: a body the engine takes once the fault is fixed. ADR 0154's amendment of 2026-11-04 says what
+    #: each source answers.
+    CONFIGURATION = "configuration"
     #: About the body itself: a re-send of the same bytes is refused the same way.
     PERMANENT = "permanent"
     #: Over a size ceiling. Permanent too, but told apart so every over-size path answers one code.

@@ -425,7 +425,8 @@ def poll_interval(settings: Mapping[str, Any], *, default: float, transport: str
 
 # A source hands each inbound message (raw bytes, MLLP framing already stripped) to this
 # callback and sends whatever it returns back to the sender (unless the source declares
-# ``SourceConnector.wants_receipt``, when the return is a receipt instead). Return ``None`` for
+# ``SourceConnector.wants_receipt``, when it is started with a ``ReceiptHandler`` returning an
+# ``IngressReceipt`` instead, both in ``transports/receipt.py``). Return ``None`` for
 # fire-and-forget transports (e.g. file) that have no reply channel.
 InboundHandler = Callable[[bytes], Awaitable[str | None]]
 

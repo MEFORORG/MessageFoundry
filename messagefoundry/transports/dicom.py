@@ -2174,7 +2174,9 @@ class DicomScpSource(SourceConnector):
                 receipt.message_id,
                 receipt.refusal.value,
             )
-            if receipt.refusal is RefusalKind.TEMPORARY:
+            # DIMSE has no "retry once the operator acts" status, so a configuration refusal takes
+            # the re-send class, never the final one a sender drops the object on (BACKLOG #5102).
+            if receipt.refusal in (RefusalKind.TEMPORARY, RefusalKind.CONFIGURATION):
                 return _STATUS_OUT_OF_RESOURCES
             return _STATUS_CANNOT_UNDERSTAND
         logger.info(

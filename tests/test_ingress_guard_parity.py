@@ -574,7 +574,7 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
     assert rows == [
         {
             "status": MessageStatus.ERROR.value,
-            "error": _as_stored(listener, preview.error, kind="temporary"),
+            "error": _as_stored(listener, preview.error, kind="configuration"),
         }
     ]
 
@@ -601,7 +601,7 @@ async def test_an_env_encoding_is_not_resolved_by_the_decode_even_with_a_value(
     assert rows == [
         {
             "status": MessageStatus.ERROR.value,
-            "error": _as_stored(listener, preview.error, kind="temporary"),
+            "error": _as_stored(listener, preview.error, kind="configuration"),
         }
     ]
 

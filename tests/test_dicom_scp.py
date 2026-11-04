@@ -317,6 +317,9 @@ def test_scp_commit_on_a_loop_that_is_not_running_answers_out_of_resources(close
         (RefusalKind.PERMANENT, 0xC000),
         (RefusalKind.OVERSIZE, 0xC000),
         (RefusalKind.TEMPORARY, 0xA700),
+        # BACKLOG #5102: DIMSE has no "after an operator acts" status, so an operator-only fault
+        # takes the re-send class rather than one a sender drops the object on.
+        (RefusalKind.CONFIGURATION, 0xA700),
     ],
 )
 async def test_scp_handler_refusal_returns_dimse_failure_not_success(
