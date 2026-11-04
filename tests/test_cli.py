@@ -1285,7 +1285,7 @@ def _expose_toml(
     relax: str | None = None,
     public_origin: str | None = None,
 ) -> None:
-    """A non-loopback bind (exposed via a declared TLS-terminating proxy) with egress locked down.
+    """An exposed instance (a loopback bind behind a declared TLS-terminating proxy) with egress locked down.
 
     Exposed via Posture-B (``tls_terminated_upstream`` + ``trusted_proxies``) rather than a cleartext
     ``--allow-insecure-bind``: #200 (ADR 0092) clamped that flag so it can no longer wave a
@@ -1309,9 +1309,9 @@ def _expose_toml(
     # Pass every non-MFA exposure gate (Posture-B declarations + egress deny-by-default + the #186/#188
     # secure retention + SMTP-alert channels) so require_mfa is the ONLY posture under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        enforce_line + relax_line + "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
-        f"security.require_mfa = {auth}\n"
+        # A LOOPBACK bind behind the declared terminator. It is still an exposed instance, and
+        # BACKLOG #4636 refuses the plaintext proxy-to-engine hop off loopback.
+        enforce_line + relax_line + f"security.require_mfa = {auth}\n"
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
         # The at-rest gate, acked here with the rest of the non-MFA plumbing. These callers run
@@ -1523,8 +1523,7 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # Loopback behind the declared terminator, as in _expose_toml (BACKLOG #4636).
         "security.require_mfa = false\n"
         "security.allow_single_factor_admin_when_exposed = true\n"
         "security.block_unlisted_outbound = true\n"
@@ -1668,9 +1667,8 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     (tmp_path / "messagefoundry.toml").write_text(
         # Exposed via a declared TLS-terminating proxy (Posture-B) — #200 clamped --allow-insecure-bind
         # so it can no longer wave a prod-PHI cleartext bind past the exposed-gate; the MFA gate is
-        # reached through a real TLS-terminated bind instead.
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # reached through a real TLS-terminated bind instead. Loopback behind it, as in
+        # _expose_toml (BACKLOG #4636).
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'

@@ -107,8 +107,8 @@ def exposed_prod_phi(*security_lines: str) -> str:
     TOML a trailing ``security.x = true`` after ``[alerts]`` lands in ``[alerts]``, loads clean, and
     silently does nothing — which would make a declared-start test pass for the wrong reason."""
     return (
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # A loopback bind behind the declared proxy, which is exposed all the same: BACKLOG #4636
+        # refuses the plaintext proxy-to-engine hop off loopback.
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
         # BACKLOG #1026: a PHI instance behind a declared terminator under `enforce` now REFUSES

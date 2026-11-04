@@ -3532,9 +3532,10 @@ def _serve(args: argparse.Namespace) -> int:
     # itself, and refusing would hard-stop working deployments on upgrade. The off-loopback arm keeps
     # refusing exactly as before, so this change is additive — it can only add a warning, never a new
     # refusal.
-    # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
-    # top of the block refuses in EVERY mode. Do not move it under `enforcing` to match the paragraphs
-    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says.
+    # TWO EXCEPTIONS, and neither is dial-governed: the BACKLOG #4636 off-loopback refusal and the
+    # BACKLOG #1179 plaintext-hop acknowledgement at the top of the block refuse in EVERY mode. Do not
+    # move them under `enforcing` to match the paragraphs above; the owner ruled that hop the deploying
+    # site's to secure, and accepted it on a loopback bind only, whatever the dial says.
     if settings.api.tls_terminated_upstream:
         # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
         # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
@@ -3542,18 +3543,37 @@ def _serve(args: argparse.Namespace) -> int:
         # it on. Keyed on api_tls_source, the same branch order that decides what the listener serves:
         # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
-        # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
+        # enforcing or warn: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
+        from messagefoundry.api.tls import (
+            plaintext_upstream_hop_off_loopback,
+            plaintext_upstream_hop_unacknowledged,
+        )
 
+        # BACKLOG #4636: the acknowledgement covers a same-machine proxy only, so a plaintext hop off
+        # loopback is refused first, acknowledged or not, in every mode like the arm below.
+        if plaintext_upstream_hop_off_loopback(settings.api):
+            print(
+                "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
+                f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
+                "[api].tls_cert_file the engine serves that hop in plaintext, and "
+                "[api].plaintext_upstream_hop_acknowledged accepts it only from a proxy on the same "
+                "machine, with the engine bound to loopback (127.0.0.0/8, ::1 or localhost). Bind "
+                "the engine to loopback ([security].local_access_only, [security].listen_address or "
+                "serve --host), or set [api].tls_cert_file so the engine serves that hop over TLS, "
+                "and point the proxy at https and have it trust that certificate. See "
+                "docs/SECURITY.md (BACKLOG #4636).",
+                file=sys.stderr,
+            )
+            return 2
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
                 "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
                 "The reverse proxy terminates TLS and no [api].tls_cert_file is set, so the engine "
                 "serves the proxy-to-engine hop in PLAINTEXT by design and does nothing to protect "
-                "it. Securing that hop (for example a same-host loopback hop, an isolated network "
-                "segment, or a host firewall) is the deploying site's job. Set "
+                "it. Securing that hop, which is accepted only from a proxy on this same machine, is "
+                "the deploying site's job. Set "
                 "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
                 "it on. Or set [api].tls_cert_file so the engine serves that hop over TLS, and then "
                 "point the proxy at https and have it trust that certificate: a proxy still speaking "

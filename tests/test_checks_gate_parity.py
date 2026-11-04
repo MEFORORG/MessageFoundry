@@ -158,7 +158,6 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
     ),
     (
         "mfa-off-exposed-prod-phi-single-factor-ack-allows",
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\nsecurity.allow_single_factor_admin_when_exposed = true\n"
         + PHI_GATE_PROVISIONS_NO_ALERTS_TOML
         + "security.delete_message_bodies_after_days = 30\n"
@@ -222,10 +221,11 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         True,
         2,
     ),
-    # MFA-at-exposure: production PHI behind a declared proxy with require_mfa off refuses.
+    # MFA-at-exposure: production PHI behind a declared proxy with require_mfa off refuses. These
+    # rows bound 0.0.0.0 until BACKLOG #4636 refused the plaintext proxy-to-engine hop off loopback,
+    # which would have refused them first. A declared terminator is exposed on a loopback bind too.
     (
         "mfa-off-exposed-prod-phi-refuses",
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\nsecurity.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n" + _PROXY + _RETENTION_DL + _ALERTS,
         "prod",
@@ -235,7 +235,6 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
     (
         "mfa-off-exposed-staging-phi-warns-and-starts",
         'security.enforcement = "warn"\n'
-        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\nsecurity.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n" + _PROXY + _RETENTION_DL + _ALERTS,
         "staging",
@@ -375,11 +374,12 @@ def test_checks_mirror_posture_parity_through_security_keys(tmp_path: Path) -> N
 # Posture-B fixture from tests/test_api_tls.py, which pre-satisfies every other exposure gate, so
 # serve's exit code is this gate's decision and not some neighbour's.
 
-#: (arm, ack, cert, expected serve exit). The refuse arm is the only one that exits 2.
+#: (arm, ack, cert, expected serve exit on a loopback bind, off loopback). Off loopback a plaintext
+#: hop is refused whether or not it is acknowledged (BACKLOG #4636).
 _HOP_ACK_ARMS = [
-    ("refuses-without-ack", False, False, 2),
-    ("acknowledged-starts", True, False, 0),
-    ("operator-cert-needs-no-ack", False, True, 0),
+    ("refuses-without-ack", False, False, 2, 2),
+    ("acknowledged-starts-on-loopback", True, False, 0, 2),
+    ("operator-cert-needs-no-ack", False, True, 0, 0),
 ]
 
 
@@ -389,7 +389,9 @@ def _hop_ack_check(toml: Path) -> CheckResult:
 
 
 @_ACK_MODES
-@pytest.mark.parametrize("arm,ack,cert,expected", _HOP_ACK_ARMS, ids=[a[0] for a in _HOP_ACK_ARMS])
+@pytest.mark.parametrize(
+    "arm,ack,cert,on_loopback,off_loopback", _HOP_ACK_ARMS, ids=[a[0] for a in _HOP_ACK_ARMS]
+)
 def test_checks_mirror_hop_ack_parity_with_serve(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -399,7 +401,8 @@ def test_checks_mirror_hop_ack_parity_with_serve(
     arm: str,
     ack: bool,
     cert: bool,
-    expected: int,
+    on_loopback: int,
+    off_loopback: int,
 ) -> None:
     # intra="mtls" with the certificate, as the serve-side tests do: it is the attestation that
     # goes with an engine serving the hop over TLS.
@@ -411,11 +414,16 @@ def test_checks_mirror_hop_ack_parity_with_serve(
         loopback=loopback,
         ack=ack,
         cert=_self_signed(tmp_path) if cert else None,
+        auto_cert=False,
     )
+    expected = on_loopback if loopback else off_loopback
+    off_loopback_plaintext = not loopback and not cert
     rc = _run_posture_b(tmp_path, monkeypatch, env="prod")
     err = capsys.readouterr().err
     assert rc == expected, f"{arm}: serve exit {rc}, expected {expected}"
-    if expected == 2:
+    if off_loopback_plaintext:
+        assert "refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback" in err
+    elif expected == 2:
         # Other gates also exit 2; the message pins that THIS one refused.
         assert "without [api].plaintext_upstream_hop_acknowledged" in err
 
@@ -425,6 +433,7 @@ def test_checks_mirror_hop_ack_parity_with_serve(
     assert result.ok == (rc == 0), f"{arm}: serve exit {rc} but check ok={result.ok}"
     if not result.ok:
         assert "plaintext_upstream_hop_acknowledged" in result.detail
+        assert ("non-loopback API bind host" in result.detail) == off_loopback_plaintext
 
 
 def test_hop_ack_check_passes_without_a_terminator(tmp_path: Path) -> None:

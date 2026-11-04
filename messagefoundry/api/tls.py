@@ -33,6 +33,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
+    is_loopback_hop_host,
     narrow_to_approved_suites,
 )
 from messagefoundry.keywrap import load_checked_cert_chain
@@ -55,6 +56,7 @@ __all__ = [
     "ensure_api_tls_material",
     "generated_state_dir",
     "plan_api_tls_material",
+    "plaintext_upstream_hop_off_loopback",
     "plaintext_upstream_hop_unacknowledged",
     "record_generated_pair_replacements",
 ]
@@ -300,6 +302,26 @@ def plaintext_upstream_hop_unacknowledged(api: ApiSettings) -> bool:
     ``messagefoundry check``, so the refusal and the gate agree by construction.
     """
     return api.serves_plaintext_upstream_hop and not api.plaintext_upstream_hop_acknowledged
+
+
+def plaintext_upstream_hop_off_loopback(api: ApiSettings) -> bool:
+    """True when ``serve`` refuses to start on BACKLOG #4636: the engine serves the proxy-to-engine
+    hop in plaintext and binds a host that is not loopback, so that hop would cross a network.
+
+    The acknowledgement accepts the plaintext hop only from a proxy on the same machine, with the
+    engine bound to loopback (owner ruling R1 of 2026-10-27 on BACKLOG #1179). Off loopback no
+    acknowledgement covers it, so this is decided without reading one, and ``serve`` checks it
+    before :func:`plaintext_upstream_hop_unacknowledged`: an operator is never told to set an
+    acknowledgement that would then be refused. An operator ``tls_cert_file`` makes the hop TLS,
+    so it is not refused here.
+
+    Loopback is :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host`: ``localhost``, all
+    of ``127.0.0.0/8`` and ``::1``, with no DNS. That predicate also reads an empty host as
+    loopback, but an empty bind host listens on every interface, so it is refused here.
+
+    Shared by ``serve`` and the ``upstream-hop-ack`` leg of ``messagefoundry check``.
+    """
+    return api.serves_plaintext_upstream_hop and not (api.host and is_loopback_hop_host(api.host))
 
 
 @dataclass(frozen=True)

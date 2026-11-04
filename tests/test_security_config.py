@@ -616,12 +616,12 @@ def test_loosening_warns_and_prod_phi_refuses(
     assert "posture loosened" in out and "require_mfa" in out
 
     # A production-PHI weakening still REFUSES where the pre-refactor gate refused: require_mfa off on an
-    # exposed production PHI bind (Posture-B) fails closed — the ADR 0092 clamp is unchanged.
+    # exposed production PHI bind (Posture-B) fails closed — the ADR 0092 clamp is unchanged. A
+    # loopback bind behind the declared proxy, which is exposed: BACKLOG #4636 refuses the plaintext
+    # proxy-to-engine hop off loopback.
     rc = _serve(
         tmp_path,
         monkeypatch,
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"

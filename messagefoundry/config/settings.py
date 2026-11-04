@@ -1761,8 +1761,9 @@ class ApiSettings(_Section):
     # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
     # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
     # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
-    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
-    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # refuses to start that topology without it, in every mode -- enforcing or warn -- because only
+    # the operator can take on a hop the engine does not protect. It covers a loopback bind only:
+    # off loopback serve refuses the plaintext hop even with it (BACKLOG #4636). With an
     # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
     # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
     # tls_terminated_upstream, so setting it without that is refused at load (a stray

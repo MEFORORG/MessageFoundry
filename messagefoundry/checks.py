@@ -3523,11 +3523,13 @@ def _check_upstream_hop_ack(
 ) -> CheckResult:
     """Refuse a declared upstream TLS terminator with no ``[api].tls_cert_file`` and no
     ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
-    brought forward to commit/CI time.
+    brought forward to commit/CI time. Also refuse that plaintext hop on a non-loopback bind host,
+    acknowledged or not, which ``serve`` refuses too (BACKLOG #4636).
 
-    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decision is
-    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicate ``serve``
-    calls, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
+    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decisions are
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_off_loopback` and
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicates ``serve``
+    calls in the same order, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
     enforcement mode, so this check reads no dial either.
 
     Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
@@ -3538,7 +3540,11 @@ def _check_upstream_hop_ack(
     The file lookup differs from ``serve``'s in the ways :func:`_check_posture` documents."""
     from pydantic import ValidationError
 
-    from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+    from messagefoundry.api.tls import (
+        api_tls_source,
+        plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_unacknowledged,
+    )
     from messagefoundry.config.settings import settings_error_detail
 
     toml, env_only = _settings_source(
@@ -3564,6 +3570,21 @@ def _check_upstream_hop_ack(
             detail=f"settings did not load: {settings_error_detail(exc)}",
         )
     api = settings.api
+    # Checked first, in serve's order: off loopback no acknowledgement covers the plaintext hop.
+    if plaintext_upstream_hop_off_loopback(api):
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=False,
+            required=True,
+            detail=(
+                "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
+                f"proxy-to-engine hop in plaintext on the non-loopback API bind host {api.host!r}, "
+                "and [api].plaintext_upstream_hop_acknowledged accepts that hop only with the "
+                "engine bound to loopback -- serve would refuse to start (exit 2, in every "
+                "enforcement mode). Bind the engine to loopback, or set [api].tls_cert_file "
+                "(see docs/SECURITY.md)"
+            ),
+        )
     if plaintext_upstream_hop_unacknowledged(api):
         return CheckResult(
             "upstream-hop-ack",
