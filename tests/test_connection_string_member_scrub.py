@@ -210,10 +210,45 @@ _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
     "&<redacted>19800505;xpass=xnonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
 )
 
+#: Lines a review or a seeded run found printing a value ``origin/main`` hid, while each word was
+#: masked to ``redacted`` (BACKLOG #5030). In order: a "#" after a scheme word and a space refused
+#: the word before the scheme-word rule ran, so the bearer pass of a later redaction lost its
+#: scheme word; ``Jane Doe`` in lower case was no name run for the bundle's PHI pass, which on
+#: ``origin/main`` replaced it and so joined the tokens either side into a field run it hid whole;
+#: ``05`` grown to ``redacted`` made a run the bundle's long-base64 sweep took with the ``5E`` of a
+#: ``%5E`` the PHI pass counts; and a word shrunk to a shorter mask let a run that the
+#: control-character filter later joined fall under the sweep's 24 characters; and a digit masked
+#: to a letter, which under a JSON ``name`` the PHI pass no longer read as an operator's value.
+_SHAPES_THE_WORD_MASK_PRINTED = (
+    ";xpass=Patient%7CBearer #=\nc3qd4qBasic ",
+    "MRN: %26PID\x0ba1qkey=;KeyStorePwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
+    "Digest {~\x0cb2qe5q;xpass=%41%41MEFOR_X=[%5E05/05/1980/",
+    "mfb64:v1:==mfb64:v1:;sslpassword=givenmfb64:v1:mfb64:v1:auth=;AccessToken=-birthDate\x0c"
+    "Zm9vYmFy+/Zm9vd4qstate=",
+    '"name":;sslpassword=%3B\r\n/\x85tokene5qmfb64:v1:QUJD:v1:',
+)
+
 _NEVER = re.compile(r"(?!)")
 _UNIT = secretscrub._MEMBER_VALUE_UNIT.pattern
 #: The word alternative, which stops where the bundle marker or the userinfo opener starts.
 _WORD = r"(?:(?!mfb64:v1:|nonnumeric port: )[\w.\-])++"
+
+
+#: The shipped mask, held here so a control can wrap it after the module's name is swapped.
+_MASKED_WORD = secretscrub._masked_word
+
+
+def _kept_word_refusing_any_hash(text: str, word: str, end: int) -> bool:
+    """``secretscrub._kept_word`` as it was before the "#" fix: a "#" after spaces refused the word
+    before the scheme-word rule could keep it."""
+    if secretscrub._MEMBER_KEEP.search(word) is None:
+        return False
+    tail = secretscrub._MEMBER_LABEL_TAIL.match(text, end)
+    if tail is not None:
+        return tail.group(1) != "#" or secretscrub._MEMBER_MRN_WORD.search(word) is not None
+    return (
+        text[end : end + 1].isspace() and secretscrub._MEMBER_SPACED_WORD.search(word) is not None
+    )
 
 
 def _keep_without(*words: str) -> re.Pattern[str]:
@@ -223,7 +258,8 @@ def _keep_without(*words: str) -> re.Pattern[str]:
 
 #: Each rule of the word mask, switched off, with a shape that then prints a value the baseline hid
 #: on some later redaction. So every rule is there for a measured reason, and a test that passes
-#: with the rule on is evidence.
+#: with the rule on is evidence. A rule is a pattern, or for the "#" fix and the mask itself a
+#: function, swapped for its earlier form.
 _RULE_CONTROLS = (
     ("kept credential and query words", "_MEMBER_KEEP", _NEVER, ";xpass=:?code=;xpass=;f6q"),
     (
@@ -242,22 +278,58 @@ _RULE_CONTROLS = (
         ';sslpassword=postgres://svc:id_token="\r\n~e5q',
     ),
     (
+        "scheme word before a space and a #",
+        "_kept_word",
+        _kept_word_refusing_any_hash,
+        _SHAPES_THE_WORD_MASK_PRINTED[0],
+    ),
+    (
+        "name-token case",
+        "_MEMBER_NAME_TOKEN",
+        _NEVER,
+        _SHAPES_THE_WORD_MASK_PRINTED[1],
+    ),
+    (
+        "mask no longer than the word",
+        "_masked_word",
+        lambda _word, _after=False: "redacted",
+        _SHAPES_THE_WORD_MASK_PRINTED[2],
+    ),
+    (
+        "mask no shorter than the word",
+        "_masked_word",
+        lambda _word, _after=False: "x",
+        _SHAPES_THE_WORD_MASK_PRINTED[3],
+    ),
+    (
+        "mask keeps a digit a digit",
+        "_masked_word",
+        lambda word, after=False: re.sub(r"[0-9]", "x", _MASKED_WORD(word, after)),
+        _SHAPES_THE_WORD_MASK_PRINTED[4],
+    ),
+    (
+        "mask keeps a long base64 run long",
+        "_masked_word",
+        lambda _word, _after=False: "x",
+        "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
+    ),
+    (
+        "mask keeps where the marker's base64 run ended",
+        "_masked_word",
+        lambda _word, _after=False: "redacted",
+        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[3],
+    ),
+    (
         "scheme word before a space",
         "_MEMBER_SPACED_WORD",
         _NEVER,
         ";AccessToken=Bearer <redacted>\na1qencryption_key={ x%26session=DOE^JOHN",
     ),
     (
-        "long base64 run",
-        "_MEMBER_LONG_B64",
-        _NEVER,
-        "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
-    ),
-    (
         "segment ID",
         "_MEMBER_SEGMENT_ID",
         _NEVER,
-        "a1q;xpass=PID|1||\n&state=' d4q%7C{b2qpassword=19800505",
+        "a1q;xpass=PV1|1||\n&state=' d4q%7C{b2qpassword=19800505",
     ),
     (
         "DICOM tag",
@@ -294,12 +366,6 @@ _RULE_CONTROLS = (
         "_MEMBER_VALUE_UNIT",
         re.compile(_UNIT.replace(_WORD, r"(?:(?!mfb64:v1:)[\w.\-])++")),
         _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[5],
-    ),
-    (
-        "end of the marker's base64 run",
-        "_MEMBER_B64_STOP",
-        _NEVER,
-        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[3],
     ),
     (
         "kept PHI JSON key words",
@@ -431,6 +497,7 @@ def test_a_second_or_third_redaction_prints_nothing_the_baseline_hid(
         *_SHAPES_THE_FIRST_DRAFT_PRINTED,
         *_SHAPES_A_SECOND_PASS_PRINTED,
         *_SHAPES_A_MARKER_OR_JSON_KEY_PRINTED,
+        *_SHAPES_THE_WORD_MASK_PRINTED,
         *(shape for *_, shape in _RULE_CONTROLS),
         *(
             "".join(rng.choice(_DIFFERENTIAL_PIECES) for _ in range(rng.randint(3, 14)))
@@ -466,6 +533,24 @@ def test_a_bundle_marker_in_a_member_value_is_still_read_by_the_bundle(
     assert [p for p in through_the_bundle if "QUJDkey" in paths[p]] == [], paths
 
 
+@pytest.mark.parametrize("line", _SHAPES_THE_WORD_MASK_PRINTED)
+def test_a_shape_the_word_mask_printed_prints_nothing_the_baseline_hid_on_any_path(
+    monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    """Each line, on each of the nine paths: a planted value prints only where the baseline prints
+    it too. Each printed on at least one later path while words were masked to ``redacted``."""
+    paths = _every_redaction_path(line)
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = _every_redaction_path(line)
+    assert len(paths) == 9
+    printed = {
+        path: [f for f in _planted(line) if f in out and f not in baseline[path]]
+        for path, out in paths.items()
+    }
+    assert not {path: found for path, found in printed.items() if found}, paths
+
+
 def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.MonkeyPatch) -> None:
     """The control for the differential above: with each value replaced whole by the placeholder, as
     the draft did, it finds the second-pass shapes, so a pass of the test is evidence."""
@@ -487,11 +572,15 @@ def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.Mon
     ids=[control[0] for control in _RULE_CONTROLS],
 )
 def test_each_mask_rule_is_needed(
-    monkeypatch: pytest.MonkeyPatch, attr: str, off: re.Pattern[str], shape: str
+    monkeypatch: pytest.MonkeyPatch, attr: str, off: object, shape: str
 ) -> None:
     """With one rule of the word mask off, its shape prints a value the baseline hid on a later
     redaction; with every rule on, it does not."""
-    assert getattr(secretscrub, attr).pattern != off.pattern  # the switch is not a no-op
+    on = getattr(secretscrub, attr)
+    if isinstance(off, re.Pattern):
+        assert on.pattern != off.pattern  # the switch is not a no-op
+    else:
+        assert on is not off
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
         baseline = [_every_redaction_path(shape)]
@@ -556,7 +645,9 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
     # Shapes kept whole, each spelled as its pass spells it.
     assert redaction._USERINFO_OPENER == "nonnumeric port: '"
     assert "nonnumeric port: " in secretscrub._MEMBER_VALUE_UNIT.pattern
-    assert secretscrub._MEMBER_LONG_B64.pattern == bundle_redact._LONG_B64.pattern
+    # The mask keeps each character's class in the two base64 alphabets the bundle reads.
+    assert bundle_redact._LONG_B64.pattern == r"\b[A-Za-z0-9+/]{24,}={0,2}\b"
+    assert bundle_redact._MFB64.pattern == r"mfb64:v1:[A-Za-z0-9+/=]+"
     assert redaction._HL7_SEGMENT.pattern.startswith(r"\b([A-Z][A-Z0-9]{2})")
     assert redaction._ENCODED_SEPARATOR.pattern == r"%(?:7[CcEe]|5[Ee]|26)"
     assert redaction._ENCODED_SEPARATOR.pattern in secretscrub._MEMBER_VALUE_UNIT.pattern
@@ -565,35 +656,43 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
 @pytest.mark.parametrize(
     ("line", "masked"),
     [
-        # A word for a word: the separators a later pass counts stay where they were.
-        (";PWD=Qv7m kX4r,Pw9z&mT3y=Yb8n;", ";PWD=<redacted> redacted,redacted&redacted=redacted;"),
-        (";xpass=a1q%5E", ";xpass=redacted%5E"),
+        # A character for a character: the separators a later pass counts stay where they were.
+        (";PWD=Qv7m kX4r,Pw9z&mT3y=Yb8n;", ";PWD=<redacted> xx0x,xx0x&xx0x=xx0x;"),
+        (";xpass=a1q%5E", ";xpass=x0x%5E"),
         # A later pass's label, segment ID, DICOM tag and userinfo opener stay whole.
-        (";xpass=&state=b2q;", ";xpass=&state=redacted;"),
-        (";xpass=x.PID|1||", ";xpass=redacted.PID|redacted||"),
-        (";xpass=(0010,1000)c3q", ";xpass=(0010,1000)redacted"),
+        (";xpass=&state=b2q;", ";xpass=&state=x0x;"),
+        (";xpass=x.PID|1||", ";xpass=x.PID|0||"),
+        (";xpass=(0010,1000)c3q", ";xpass=(0010,1000)x0x"),
         (";xpass=nonnumeric port: 'd4q@h'", ";xpass=nonnumeric port: 'd4q@h'"),
         # The bundle marker stays, glued or not, and the "_" that ended its base64 run stays.
-        (";xpass=mfb64:v1:a1q b2q", ";xpass=mfb64:v1:redacted redacted"),
-        (";xpass=amfb64:v1:a1q", ";xpass=redactedmfb64:v1:redacted"),
-        (";xpass=mfb64:v1:a1q_b2q.c3q", ";xpass=mfb64:v1:redacted_redacted"),
-        (";xpass=a1q_b2q", ";xpass=redacted"),
+        (";xpass=mfb64:v1:a1q b2q", ";xpass=mfb64:v1:x0x x0x"),
+        (";xpass=amfb64:v1:a1q", ";xpass=xmfb64:v1:x0x"),
+        (";xpass=mfb64:v1:a1q_b2q.c3q", ";xpass=mfb64:v1:x0x_x0x.x0x"),
+        (";xpass=a1q_b2q", ";xpass=x0x_x0x"),
         # A "#" keeps only a word ending in MRN, and a space only a word ending in a scheme word.
-        (";sslpassword=Passw0rd#2024;", ";sslpassword=redacted#redacted;"),
-        (";xpass=x_MRN#5;", ";xpass=x_MRN#redacted;"),
-        (";sslpassword=Basic123 zz;", ";sslpassword=redacted redacted;"),
-        (";sslpassword=xnonnumeric port: ", ";sslpassword=redactednonnumeric port: "),
-        # A base64 run stays long enough for the bundle's sweep.
-        (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=redacted " + "redacted" * 4),
+        (";sslpassword=Passw0rd#2024;", ";sslpassword=xxxxx0xx#0000;"),
+        (";xpass=x_MRN#5;", ";xpass=x_MRN#0;"),
+        (";sslpassword=Basic123 zz;", ";sslpassword=xxxxx000 xx;"),
+        (";sslpassword=xnonnumeric port: ", ";sslpassword=xnonnumeric port: "),
+        # A base64 run stays as long as it was, for the bundle's sweep.
+        (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=x0x " + "X" * 32),
         # A kept word only stays where a later pass reads it: here it is a password or a token.
-        (";sslpassword=Passw0rd!2024;", ";sslpassword=redacted!redacted;"),
-        (";AccessToken=aaa.sig-key_jwt.aaa;", ";AccessToken=redacted;"),
-        (";xpass=Monkey123 Codename9;", ";xpass=redacted redacted;"),
-        # A segment ID stays only before a "|", and never with a prefix.
-        (";sslpassword=Hunter.AB1,xyz;", ";sslpassword=redacted,redacted;"),
-        (";sslpassword=XY9&Qz7;", ";sslpassword=redacted&redacted;"),
+        (";sslpassword=Passw0rd!2024;", ";sslpassword=xxxxx0xx!0000;"),
+        (";AccessToken=aaa.sig-key_jwt.aaa;", ";AccessToken=xxx.xxx-xxx_xxx.xxx;"),
+        (";xpass=Monkey123 Codename9;", ";xpass=xxxxxx000 xxxxxxxx0;"),
+        # A segment ID stays only before a "|", and never with a prefix. A name-token piece keeps
+        # its capitals, for the PHI pass's name run.
+        (";sslpassword=Hunter.AB1,xyz;", ";sslpassword=Xxxxxx.xx0,xxx;"),
+        (";sslpassword=XY9&Qz7;", ";sslpassword=xx0&xx0;"),
+        (";xpass=Jane Doe;", ";xpass=Xxxx Xxx;"),
+        # A digit stays a digit, and a hex escape after a "%" stays one.
+        (";xpass=%3Bb2q%zz;", ";xpass=%0Ax0x%xx;"),
+        (";xpass=x.DOE-Smith_x;", ";xpass=x.XXX-xxxxx_x;"),
+        (";xpass=caf\u00e9;", ";xpass=xxx_;"),
+        # A "#" after a scheme word and a space keeps the scheme word.
+        (";xpass=Bearer #x;", ";xpass=Bearer #x;"),
         # Spaces before the quote that opens a value.
-        (";sslpassword= 'Zq7 kx';PORT=1", ";sslpassword= 'redacted redacted';PORT=1"),
+        (";sslpassword= 'Zq7 kx';PORT=1", ";sslpassword= 'xx0 xx';PORT=1"),
     ],
 )
 def test_the_mask_replaces_words_and_keeps_what_a_later_pass_reads(line: str, masked: str) -> None:
@@ -640,8 +739,8 @@ def test_a_long_semicolon_dense_line_scrubs_in_linear_time(unit: str) -> None:
 
 
 def test_one_long_member_value_masks_in_linear_time() -> None:
-    """One value of about 400 KB, words and base64 runs alternating: the mask walks it once and
-    finds the run under each word by bisection, where a scan of every run per word was quadratic."""
+    """One value of about 400 KB, words and base64 runs alternating: the mask walks it once, where
+    an earlier draft that scanned every base64 run per word was quadratic."""
     line = "DRIVER={X};pwd=" + "QUFBQUFBQUFBQUFBQUFBQUFBQUFB a b " * 12_000
     started = time.perf_counter()
     scrub_credentials(line)
