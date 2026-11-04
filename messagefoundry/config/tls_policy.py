@@ -2817,8 +2817,10 @@ class RevocationHopGuard:
         )
 
     def __post_init__(self) -> None:
-        # The one-field rule (vault BACKLOG #5086) holds for a guard built or replaced directly,
-        # not only through capture(): a hop that skips time validity credits no CRL.
+        # A guard built or replaced directly, not through capture(), has no context to read, so
+        # skips_validity_period is not asked here. This refuses only the contradiction the fields
+        # themselves show, crl_checked and expiry_relaxed both True (vault BACKLOG #5086). A direct
+        # build with crl_checked=True and expiry_relaxed False is accepted whatever its caller dials.
         if self.crl_checked and self.expiry_relaxed:
             raise ValueError("a guard on a hop that skips time validity cannot credit a CRL")
 
