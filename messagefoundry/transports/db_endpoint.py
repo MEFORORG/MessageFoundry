@@ -223,7 +223,9 @@ def _preset_driver(name: object) -> bool:
 def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
     """Why the SQL Server preset refuses to send ``SERVER={server},{port}`` for ``settings``, or
     ``None`` (BACKLOG #4873). The connection-string build and the ``[egress].allowed_db`` check
-    both call it, so the egress check refuses what the build would.
+    both call it, so the egress check refuses the driver and ``server`` the build refuses here. It
+    does not make the build's other refusals, at least of ``auth`` and of the delimiters in
+    ``server``: those the build alone refuses.
 
     It refuses an ``odbc_driver`` that fails :func:`_preset_driver`, and a ``server`` holding a
     comma or a ``\\``. Why each is refused, and what a name cannot tell, is stated once in

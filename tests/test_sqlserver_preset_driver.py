@@ -271,6 +271,15 @@ def test_a_server_holding_a_comma_is_refused(check: Check, server: str) -> None:
         check(_preset(server=server), EgressSettings(allowed_db=[server]))
 
 
+@pytest.mark.parametrize("character", ["\x00", "\t", "\r", "\n", "\x1f", "\x7f", ";", "="])
+def test_a_server_holding_a_control_character_or_delimiter_is_refused_at_build(
+    character: str,
+) -> None:
+    # Unbraced, so a NUL could end the string for a driver manager before the TLS tail.
+    with pytest.raises(ValueError, match="ODBC injection risk"):
+        _build_dsn(_preset(server=f"{HOST}{character}"))
+
+
 @pytest.mark.parametrize(
     "driver", ["ODBC Driver 18 for SQL Server", "SQL Server Native Client 11.0"]
 )

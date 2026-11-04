@@ -264,10 +264,12 @@ def _build_dsn(
     # *validated* for connection-string metacharacters instead of brace-quoted (the guard used for every
     # other free-text value), exactly like the store backend's connection_string.
     server = str(s["server"])
-    if any(ch in server for ch in ";{}=\r\n"):
+    # Not printable covers a newline, a tab and a NUL, which a driver manager may read as the end
+    # of the string, dropping the port and the TLS tail after it.
+    if any(ch in server for ch in ";{}=") or not server.isprintable():
         raise ValueError(
-            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', or newlines "
-            "(ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', or a control "
+            "character (ODBC injection risk)"
         )
     port = port_setting(
         s.get("port", SQLSERVER_DEFAULT_PORT), transport=f"{where}DATABASE connection"
