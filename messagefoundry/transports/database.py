@@ -530,8 +530,10 @@ def generic_odbc_tls_unenforced_unread(params: Mapping[str, Any]) -> str | None:
 
 
 def _family_tls_verdict(params: Mapping[str, Any], family: str | None) -> str | None:
-    """:func:`generic_odbc_tls_unenforced` for the family key ``family``, or ``None`` for a name
-    the engine cannot place."""
+    """:func:`generic_odbc_tls_unenforced` for the family key ``family``. ``family`` is ``None``
+    for a name the engine cannot place, and that never returns ``None``: it returns the no-TLS
+    reason when a TLS keyword holds a no-TLS word, and :data:`UNPLACED_DRIVER_REASON` otherwise,
+    so an unplaced name can never clear the guard (BACKLOG #5053)."""
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
@@ -775,13 +777,14 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     cannot place, take only :data:`_LIBPQ_SSL_MODES`, as before. Microsoft's driver reads no
     ``sslmode``, so on that name any value is refused and the refusal says to set ``Encrypt``.
 
-    For a name it cannot place, the refusal says so, and never offers a libpq value alone: a value
-    spelled exactly as MySQL documents it is pointed at MySQL's registered name, and any other is
-    given libpq's list beside that pointer. A near miss in another case, such as ``required``, gets
-    libpq's list too, since it is as likely a psqlODBC typo under a library path. So it never steers a MySQL driver under another name to
-    a libpq value it would ignore. :func:`generic_odbc_tls_unenforced` counts no mode on such a name
-    either. Each refusal leads with what an operator needs, as a stored failure keeps about its
-    first 200 characters, and none quotes the value given.
+    For a name it cannot place, the refusal advises no value at all, whatever was given: it says
+    the family could not be placed and names the registered names that place psqlODBC and MySQL.
+    Offering libpq's list there would steer a MySQL driver under another name, such as RHEL's bare
+    ``MySQL``, to a value that builds and that MySQL ignores (BACKLOG #5029). A libpq value on such
+    a name still builds, for psqlODBC under a library path, but
+    :func:`generic_odbc_tls_unenforced` counts no mode on it, so the hop stays gated. Each refusal
+    leads with what an operator needs, as a stored failure keeps about its first 200 characters,
+    and none quotes the value given.
 
     The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
     name run to the log redaction, which would blank them."""
@@ -808,17 +811,13 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     if family == "mysql":
         mysql = " or ".join(_MYSQL_SSL_MODES)
         raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
-    libpq = ", ".join(_LIBPQ_SSL_MODES)
     if family is not None:
+        libpq = ", ".join(_LIBPQ_SSL_MODES)
         raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
-    if text in _MYSQL_SSL_MODES:
-        raise ValueError(
-            f"{database} 'sslmode' is a MySQL spelling; the engine cannot place this odbc_driver "
-            f"as MySQL. Name it MySQL ODBC <version> Unicode or ANSI Driver {see}"
-        )
     raise ValueError(
-        f"{database} 'sslmode' for an odbc_driver the engine cannot place must be exactly one of "
-        f"{libpq}; MySQL needs its registered name {see}"
+        f"{database} cannot place the odbc_driver family; name it PostgreSQL Unicode or ANSI, "
+        f"or MySQL ODBC <version> Unicode or ANSI Driver, as registered, and no 'sslmode' counts "
+        f"until then {see}"
     )
 
 
@@ -1422,10 +1421,13 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     one to a no-TLS value, DEBUG otherwise.
 
     Delegating TLS is not the same as declining to gate the hop. A connection whose ``odbc_params`` say
-    TLS is **not required**, or set no mode at all, is refused off-loopback on an enforcing instance by
-    :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors call beside this builder.
-    What stays delegated is the case this path genuinely cannot judge: a mode keyword IS set, and the
-    engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
+    TLS is **not required**, or set no mode its driver family reads, is refused off-loopback on an
+    enforcing instance by :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors
+    call beside this builder. A mode counts only on the keyword the family :func:`_driver_family`
+    places reads, and for psqlODBC and MySQL only at that family's own spellings; a name the engine
+    cannot place has no mode that counts (BACKLOG #5053, :func:`generic_odbc_tls_unenforced`). What
+    stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
+    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
     if not driver:

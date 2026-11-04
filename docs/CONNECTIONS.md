@@ -1989,10 +1989,10 @@ the driver reads another case was not measured, so only the documented upper cas
 **A name the engine cannot place**, at least a library path, an odbcinst alias such as RHEL's
 bare `MySQL` section, another vendor's driver for the same database, or a registered name with a
 doubled space, takes the libpq spellings at build, as before. The engine cannot tell which
-spelling such a driver reads, so the refusal says so, and never offers libpq's list alone: a
-MySQL spelling is pointed at MySQL's registered name, and any other value gets libpq's list
-beside that pointer (BACKLOG #5029). A value in MySQL's words but another case, such as
-`required`, gets libpq's list, as it may be a psqlODBC typo. **No `SSLmode` on such a name counts as a TLS mode**, so its
+spelling such a driver reads, so a refusal there advises no value at all: whatever value was
+given, it says the engine cannot place the driver family and names the psqlODBC and MySQL
+registered names above (BACKLOG #5029). Offering libpq's list there would steer a MySQL driver
+under such a name to a value that builds and that MySQL ignores. **No `SSLmode` on such a name counts as a TLS mode**, so its
 hop is gated as one with no mode (see the TLS note below). To have a driver's TLS mode counted,
 name it by one of the registered names above. Otherwise declare the hop with `tls_hop_attested`
 if it is secured by other means, or, on an outbound, accept it with `cleartext_accepted`. The

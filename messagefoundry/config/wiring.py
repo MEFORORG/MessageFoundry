@@ -6868,10 +6868,14 @@ def unverified_generic_db_hops(
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
-    authority. This lists what that classifier flags, not every delegated hop: one whose usable mode
-    value (see ``transports.database._sets_tls_mode``) is outside the no-TLS deny-list is absent. A
-    blank, padded or non-string mode value is flagged and listed. A hop can appear here and still be crossed legitimately, on-box or under a declared
-    attestation or acceptance, so never read it as "who is crossing in the clear".
+    authority. This lists what that classifier flags, not every delegated hop: one whose mode value
+    counts for its driver family (see ``transports.database._sets_tls_mode``) and is outside the
+    no-TLS deny-list is absent. A mode counts only on the keyword the family placed from
+    ``odbc_driver`` reads, and for psqlODBC and MySQL only at that family's own spellings, so a mode
+    keyword the named driver does not read, and any hop whose ``odbc_driver`` the engine cannot
+    place, is flagged and listed (BACKLOG #5053). A blank, padded or non-string mode value is
+    flagged and listed too. A hop can appear here and still be crossed legitimately, on-box or
+    under a declared attestation or acceptance, so never read it as "who is crossing in the clear".
 
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so

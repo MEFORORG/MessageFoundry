@@ -616,9 +616,13 @@ REST obey the authority does not settle these:
 
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
   it reports the hop as **non-weakened by construction**, and only what `odbc_params` say can reach the
-  authority. A hop that sets no TLS mode, or pins one to a no-TLS value, goes there and is refused
-  off-loopback on an enforcing instance, unless a per-connection declaration relaxes it (BACKLOG #1178). A hop with **any other mode value never reaches it**: if the
-  driver ignored or misread that value, plaintext PHI to a Postgres / Oracle / MySQL ODBC target would
+  authority. A mode counts only on the keyword the named driver's family reads, and for psqlODBC and
+  MySQL only at that family's own spellings; a driver name the engine cannot place has no counted
+  mode (BACKLOG #5053; the families are in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)).
+  A hop with no counted mode, or with a TLS keyword pinned to a no-TLS value, goes there and is
+  refused off-loopback on an enforcing instance, unless a per-connection declaration relaxes it
+  (BACKLOG #1178). A hop whose counted mode holds **any other value never reaches it**: if the
+  driver ignored or misread that value, plaintext PHI to a Postgres / MySQL / SQL Server ODBC target would
   cross with no refusal, on any posture. **The TLS readers do not name that hop either**: construction logs it at
   DEBUG only, and neither the `generic_odbc_tls_unenforced` entry nor the `generic-db-tls` line lists it. The hops the authority does see are also
   reported: a construction WARNING naming the connection, plus an entry in
@@ -710,14 +714,17 @@ there is for MLLP:
 engine will not always refuse them for you:
 
 - **`dialect='generic'` DATABASE** (source *or* destination) — TLS is the ODBC driver's own keyword in
-  `odbc_params`, which MessageFoundry cannot introspect. With no TLS mode, or with one set to a no-TLS
-  value, the connection logs a construction WARNING naming
+  `odbc_params`, which MessageFoundry cannot introspect. With no mode the named driver's family reads
+  (a driver name the engine cannot place has none; the rule is under
+  [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)), or with a TLS
+  keyword set to a no-TLS value, the connection logs a construction WARNING naming
   itself, and an enforcing instance refuses it off-loopback unless the connection declares
-  `tls_hop_attested` with its reason, or, outbound only, `cleartext_accepted`. With any other mode value
-  the engine neither enforces nor verifies it, and the `generic-db-tls` line does not list the hop. A hop the engine can judge
+  `tls_hop_attested` with its reason, or, outbound only, `cleartext_accepted`. With a counted mode at
+  any other value the engine neither enforces nor verifies it, and the `generic-db-tls` line does not list the hop. A hop the engine can judge
   **is** reported (`security_loosenings()` /
   `GET /security/posture` / `messagefoundry check`'s `generic-db-tls`), for **both** directions. Set
-  `SSLmode=verify-full` (psqlODBC) / `SSLMODE=VERIFY_IDENTITY` (MySQL) / the equivalent, and treat it as
+  `SSLmode=verify-full` (psqlODBC) / `SSLMODE=VERIFY_IDENTITY` (MySQL) / `Encrypt=yes` (Microsoft's
+  ODBC Driver for SQL Server), under the driver's registered name, and treat it as
   a deployment requirement rather than a default.
 - **Direct (S/MIME) with `use_tls = false`** — the message body is S/MIME signed and encrypted, but the
   SMTP session (envelope metadata, recipients) is cleartext. This path is gated by the raw

@@ -128,10 +128,15 @@ connector (asyncpg-as-connector, scoped out of #66) that *can* introspect TLS sh
 authority rather than delegate.
 
 **Amended 2026-10-30 (BACKLOG #2483).** The keyword test above no longer decides the level, and the
-hop has been gated as well as logged since BACKLOG #1178. Only `sslmode` or `encrypt` with a value
-outside the no-TLS deny-list counts as the operator owning TLS. A lone key or certificate keyword,
+hop has been gated as well as logged since BACKLOG #1178. Only a mode keyword with a value outside
+the no-TLS deny-list counts as the operator owning TLS, and since BACKLOG #5053 and #5035 only the
+keyword the named driver's family reads: `sslmode` on psqlODBC and MySQL, at that family's own
+spellings, and `encrypt` on Microsoft's driver. A driver name the engine cannot place has no
+counted mode. [CONNECTIONS.md, *The `SSLmode` spelling*](../CONNECTIONS.md#the-sslmode-spelling)
+holds the families. A lone key or certificate keyword,
 or a blank mode, now reads as no mode, because a driver's own default need not require TLS. This only
-adds refusals, so the No-loosen rule (§5) holds. `encrypt` stays one of the two mode keywords, unproven;
+adds refusals, so the No-loosen rule (§5) holds. `encrypt`'s value on Microsoft's driver is judged by
+the deny-list alone, unproven;
 [CONNECTIONS.md](../CONNECTIONS.md#generic-odbc-postgresql--mysql) records the limits. A hop with a mode
 outside the deny-list logs at `DEBUG` only and is not on the `generic-db-tls` line, so the delegation
 above is not visible for that hop at normal log levels.
