@@ -471,7 +471,11 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
 
 
 def _capture_guard(
-    context: ssl.SSLContext | None, *, attested: bool = True, **over: Any
+    context: ssl.SSLContext | None,
+    *,
+    attested: bool = True,
+    posture: HopPosture = ENFORCING,
+    **over: Any,
 ) -> RevocationHopGuard:
     return RevocationHopGuard.capture(
         host=REMOTE,
@@ -480,7 +484,7 @@ def _capture_guard(
         attested=attested,
         attested_reason=REASON if attested else None,
         context=context,
-        posture=ENFORCING,
+        posture=posture,
         connection="OB_TEST",
         **over,
     )
@@ -548,6 +552,20 @@ def test_an_unattested_crl_on_a_context_that_skips_time_validity_is_refused() ->
     assert kept.ways_across is None
     assert kept.disposition() is HopDisposition.ALLOW
     kept.enforce_construction()
+
+
+def test_an_unattested_crl_on_a_context_that_skips_time_validity_warns_when_not_enforcing() -> None:
+    """The same CRL earns no credit on a non-enforcing instance either, so the hop takes the WARN
+    any unchecked off-box hop takes there, where the bare CRL flag used to ALLOW it with no line
+    (vault BACKLOG #5086). The posture-blind read is what ``docs/SECURITY-LOOSENING.md`` states
+    for ``tls_allow_expired`` ("in either posture"). The keep-time CRL is the control."""
+    relaxed = _capture_guard(
+        _crl_context(skip_validity=True), attested=False, posture=NOT_ENFORCING
+    )
+    assert relaxed.crl_checked is False
+    assert relaxed.disposition() is HopDisposition.WARN
+    kept = _capture_guard(_crl_context(skip_validity=False), attested=False, posture=NOT_ENFORCING)
+    assert kept.disposition() is HopDisposition.ALLOW
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:

@@ -1799,10 +1799,9 @@ count is above `0` (vault BACKLOG #2613).
   *(Note 2026-11-03: `capture` changed since. It gives a CRL on a context that skips time validity
   no credit itself (vault BACKLOG #5086), so a hop handed such a context is decided as above
   in either posture. A connection that hands `capture` its relaxed context and passes no remedy
-  of its own gets a refusal naming the `tls_allow_expired` remedy. MLLP, the DICOM C-STORE SCU
-  and FTPS hand the guard no context and pass that remedy themselves; the REST, SOAP and FHIR
-  refusals pass no context and still name the `[tls].crl_file` default (ADR 0173 §13, *Left
-  open*).)*
+  of its own gets a refusal naming the `tls_allow_expired` remedy. The REST, SOAP and FHIR
+  refusals hand the guard no context and still name the `[tls].crl_file` default (ADR 0173 §13,
+  *Left open*); which hops pass which remedy is in ADR 0173 §4.3's note of 2026-11-03.)*
   The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —

@@ -774,14 +774,18 @@ that context's CRL, with no attestation, so the rule rests on each caller passin
 its meaning, so the disposition and the line read one field: a CRL on a context that skips time
 validity earns no credit, and such a hop is refused under an enforcing posture unless attested
 (vault BACKLOG #5086, owner ruling 2026-11-03). The remedy a refusal names comes from the
-`ways_across` a call site passes: MLLP, the DICOM SCU and FTPS pass `EXPIRY_RELAXED_WAYS_ACROSS`,
-REST, SOAP and FHIR still name the default (§13, *Left open*), and a connection that hands
-`capture()` the relaxed context with no `ways_across` gets `EXPIRY_RELAXED_WAYS_ACROSS` from it.
-Unlike the 2026-10-30 correction, which the paragraph's closing sentence says changed no
-disposition, this one changes the guard's: a hop handed such a context is refused where the guard
-used to admit it. No shipped call site's disposition moves, because every shipped caller that
-builds a context skipping time validity (each caller of `relax_verify_expiry`) hands the guard no
-context there: the call sites below, MLLP and the DICOM SCU since vault BACKLOG #2978.)* The
+`ways_across` a call site passes. On 2026-11-03, MLLP, the DICOM SCU and FTPS passed
+`EXPIRY_RELAXED_WAYS_ACROSS`, and REST, SOAP and FHIR still named the default (§13, *Left open*). A
+connection that hands `capture()` the relaxed context with no `ways_across` gets
+`EXPIRY_RELAXED_WAYS_ACROSS` from it. Unlike the 2026-10-30 correction, which the paragraph's
+closing sentence says changed no disposition, this one changes the guard's: an off-box, unattested
+hop handed such a context is refused under an enforcing posture, and warned on an instance that does
+not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set, where the guard used to admit it on that
+CRL. No shipped call site's disposition moved,
+because on 2026-11-03 every caller of `relax_verify_expiry` handed the guard no context for the
+relaxed hop: the call sites the next sentence names, MLLP and the DICOM SCU since vault BACKLOG
+#2978. A new caller of `relax_verify_expiry` reopens that claim. The rest of this paragraph is as of
+2026-10-30.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.

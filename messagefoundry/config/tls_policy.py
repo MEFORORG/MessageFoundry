@@ -2730,7 +2730,10 @@ class RevocationHopGuard:
         handing one over with no ``ways_across`` of its own names
         :data:`EXPIRY_RELAXED_WAYS_ACROSS`, since the default offers ``[tls].crl_file``, a lever
         that cannot cross it (SDS-3.7). That text names a connection's flags, so a hop that is not
-        a connection keeps the default and passes its own sentence instead (BACKLOG #1498)."""
+        a connection is not given it. Such a hop falls back to the default, which offers
+        ``[tls].crl_file`` too and names a connection's flag, so one that hands over such a context
+        must pass its own sentence (BACKLOG #1498). On 2026-11-03 no caller of
+        :func:`relax_verify_expiry` was a hop that is not a connection."""
         expiry_relaxed = context is not None and skips_validity_period(context)
         return cls(
             host=host,
