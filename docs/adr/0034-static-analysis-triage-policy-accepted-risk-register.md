@@ -863,17 +863,15 @@ read from. This is a third: what the source is called. Three notes in
 |---|---|---|
 | `mfa` as a separate word, such as `mfa_verify_min_elapsed_seconds` or `OIDC_MFA_CLAIM_EXCEPTION` | A number, or a fixed sentence | Two on PR 1842; 241, 242 and 248 to 251 on PR 1959 |
 | `trusted_proxies` | A list of proxy addresses | 122, dismissed under *Misclassified value*; 209 on `main` |
-| `trusted`, a local in `config/wiring.py`'s `_enforce_posix_paths` | The fixed words naming the owners a config path may have | 265, on `main` and on PR 2760; fixed under rule 1 by renaming it `owner_rule` (vault BACKLOG #5248) |
-
-Rule 1 covers a local variable too, since the engine chooses its name.
+| `trusted`, a local in `config/wiring.py`'s `_enforce_posix_paths` | The word root, or root and the engine's uid, naming the owners a config path may have | 265, classed `secret`, open at least on `main` and on PR 2760's merge ref. Renamed `owner_rule` under rule 1 (vault BACKLOG #5248); whether that closes it waits on the next scan |
 
 PR 1959's repair comment read the `mfa` pattern at CodeQL 2.27.1 as `([_-]|\b)mfa([_-]|\b)`. That
 reading is attributed to that pull request and was not re-measured here.
 
 ### The rule
 
-1. Where the engine chooses the name, a module constant or a helper, choose one the heuristic does
-   not read. PR 1959 renamed `OIDC_MFA_CLAIM_EXCEPTION` and `oidc_mfa_claim_exception()` to
+1. Where the engine chooses the name, a module constant, a helper or a local variable, choose one
+   the heuristic does not read. PR 1959 renamed `OIDC_MFA_CLAIM_EXCEPTION` and `oidc_mfa_claim_exception()` to
    `OIDC_SECOND_FACTOR_CLAIM_EXCEPTION` and `oidc_second_factor_claim_exception()`, with the text and
    behaviour unchanged.
 2. Where an operator writes the name, a config field, the name stays. Where the value adds nothing
@@ -888,7 +886,8 @@ reading is attributed to that pull request and was not re-measured here.
 `tests/test_security_config.py::test_no_logged_settings_text_is_named_like_a_password` guards part
 of rule 1, because CodeQL is not a required check. It reads one word, `mfa`, and only the module-level
 `str` constants and `-> str` helpers in `config.settings`. It does not see another word the heuristic
-reads, such as `secret`, a helper returning another type, another module, or a config field. Rule 2
+reads, such as `secret` or `trusted`, a helper returning another type, a local variable, another
+module, or a config field. Rule 2
 and rule 3 have no guard but a reader.
 
 The guard stops at one module on purpose. Measured 2026-10-03, the same scan over every module in

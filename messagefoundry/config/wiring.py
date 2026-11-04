@@ -9907,9 +9907,9 @@ def _enforce_posix_paths(
     # Neither binding below is named "trusted". CodeQL's clear-text-logging query read the local
     # this rule's text was once bound to, `trusted`, as a secret, and followed it through the
     # refusal into the escape-hatch WARNING in _refuse_unsafe_config_source (alert 265). The set
-    # only feeds a membership test today; it is renamed too, so rendering it in a refusal does not
-    # raise the alert again. ADR 0034's 2026-10-03 amendment, rule 1.
-    owner_uids = frozenset({0, euid})
+    # only feeds a membership test today; it is renamed too, so that rendering it in a refusal
+    # later does not hand the query the same word. ADR 0034's 2026-10-03 amendment, rule 1.
+    allowed_owners = frozenset({0, euid})
     owner_rule = "root" if euid == 0 else f"root or uid {euid}"
     for path in paths:
         try:
@@ -9924,11 +9924,13 @@ def _enforce_posix_paths(
             continue
         # Code here runs as the engine's account, so a file owned by any other non-root user is an
         # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
-        if st.st_uid not in owner_uids:
+        if st.st_uid not in allowed_owners:
+            # "what the engine loads", not "the executed code": a start's settings and env files
+            # come through here too, and neither is code.
             refuse(
                 f"{lead} {path} owned by uid {st.st_uid} -- the engine runs as "
                 f"uid {euid} and trusts only an owner that is {owner_rule}; uid {st.st_uid} "
-                "could rewrite the executed code (see docs/SERVICE.md)"
+                "could rewrite what the engine loads (see docs/SERVICE.md)"
             )
 
 
