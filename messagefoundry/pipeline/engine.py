@@ -325,7 +325,7 @@ def _require_approved(
         material = value_file_material(snapshot)
     except ValueError as exc:
         log.warning("the environment value file could not be checked: %s", safe_exc(exc))
-        raise ConfigDigestUnavailable(approval.fingerprint) from None
+        raise ConfigDigestUnavailable(approval.fingerprint) from exc
     held = approval.value_file
     if material is None and held is None:
         return
@@ -2842,7 +2842,7 @@ class Engine:
             material = value_file_material(snapshot)
         except ValueError as exc:
             log.warning("the environment value file could not be bound: %s", safe_exc(exc))
-            raise ConfigDigestUnavailable(None) from None
+            raise ConfigDigestUnavailable(None) from exc
         binding = None if material is None else config_value_file_mac(self.store.cipher(), material)
         if material is not None and binding is None:
             # At the hold too, not only at its release, so the log says so before an approver
