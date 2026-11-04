@@ -1659,9 +1659,24 @@ _ACCEPT_FATAL_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 #: EINVAL, so a peer reset during AcceptEx (ERROR_NETNAME_DELETED, 64) arrives as EINVAL too.
 _ACCEPT_FATAL_WINERRORS = frozenset({10009, 10022, 10038})
 
-#: How many failed accepts in a row `_AcceptingServer` skips at once before it waits
-#: `_ACCEPT_RETRY_DELAY` and logs a WARNING, so a lasting fault it does not know cannot hold a core.
+#: How many failed accepts in a row `_AcceptingServer` skips at once before the next one makes it
+#: wait `_ACCEPT_RETRY_DELAY` and log a WARNING, so a lasting fault it does not know cannot hold a
+#: core. A peer's own dropped connection (`_peer_dropped`) is not counted, so a peer resetting its
+#: sockets cannot make the listener wait.
 _ACCEPT_SKIP_RUN = 100
+
+#: The Windows codes for a connection the peer dropped before or during AcceptEx:
+#: ERROR_NETNAME_DELETED and ERROR_CONNECTION_ABORTED. CPython maps both to EINVAL.
+_PEER_DROPPED_WINERRORS = frozenset({64, 1236})
+
+
+def _peer_dropped(exc: OSError) -> bool:
+    """Whether a failed accept is the peer's dropped connection, which asyncio's selector server
+    skips too: at least ``ConnectionAbortedError`` and ``ConnectionResetError``, and their Windows
+    codes."""
+    if isinstance(exc, ConnectionError):
+        return True
+    return getattr(exc, "winerror", None) in _PEER_DROPPED_WINERRORS
 
 
 def _accept_fault_is_fatal(exc: OSError, sock: socket.socket) -> bool:
@@ -1795,8 +1810,9 @@ class _AcceptingServer:
             except OSError as exc:
                 if _accept_fault_is_fatal(exc, sock):
                     raise  # the listening socket is gone; `_closer` closes and logs it
-                skipped += 1
-                if exc.errno not in _ACCEPT_SHORTAGE and skipped < _ACCEPT_SKIP_RUN:
+                if not _peer_dropped(exc):
+                    skipped += 1
+                if exc.errno not in _ACCEPT_SHORTAGE and skipped <= _ACCEPT_SKIP_RUN:
                     # This connection's own failure, the peer gone before the accept among them:
                     # skip it and keep accepting. A selector loop's sock_accept fails at once,
                     # without yielding, so this yields a turn first, or a run of such failures
@@ -1819,7 +1835,15 @@ class _AcceptingServer:
                 await asyncio.sleep(_ACCEPT_RETRY_DELAY)
                 continue
             skipped = 0
-            on_socket(conn)
+            try:
+                on_socket(conn)
+            except Exception as exc:  # noqa: BLE001 - one connection's fault must not end the listener
+                conn.close()
+                logger.error(
+                    "MLLP listener %s could not take an accepted connection: %s",
+                    self._name,
+                    safe_exc(exc),
+                )
             # A selector loop's accept completes at once while connections are queued, and an
             # await on a finished future does not yield; one turn per accept keeps a flood from
             # starving the loop, the admission tasks above included.
@@ -2245,7 +2269,7 @@ class MLLPSource(SourceConnector):
         it, a cancellation by stop() included. A handshake failure is logged and counted as
         `_start_tls` does it, with the peer. A failure before the transport holds the socket is no
         handshake failure and is not counted: the task's done callback closes the socket, and an
-        ``OSError`` is logged here at WARNING, any other exception there at ERROR.
+        ``OSError`` is logged here at DEBUG, any other exception there at ERROR.
 
         A connection closed CLEANLY during the handshake completes the wait with a result rather
         than an error, as `_start_tls` describes, so the transport comes back closed and never
@@ -2298,9 +2322,11 @@ class MLLPSource(SourceConnector):
                 self._handshakes.discard(task)
                 if unwrapped:
                     # Not a handshake failure, so not counted; the done callback closes the socket.
-                    logger.warning(
-                        "MLLP listener %s could not hand a connection to TLS: %s",
-                        self._pacing_name,
+                    # DEBUG, as `_start_tls` logs a failure a peer may cause, such as a socket
+                    # option refused on a socket the peer already reset.
+                    logger.debug(
+                        "MLLP connection from %s could not be handed to TLS: %s",
+                        peer.get_extra_info("peername"),
                         safe_exc(exc),
                     )
                     return

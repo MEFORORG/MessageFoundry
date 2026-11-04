@@ -1183,7 +1183,7 @@ async def test_a_socket_the_tls_layer_never_took_is_closed_and_not_counted(
     through the real call, on the same listener, which is counted."""
     monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
     monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
-    caplog.set_level(logging.WARNING, logger="messagefoundry.transports.mllp")
+    caplog.set_level(logging.DEBUG, logger="messagefoundry.transports.mllp")
     loop_class = type(asyncio.get_running_loop())
     real_connect_accepted = loop_class.connect_accepted_socket
     refused: list[socket.socket] = []
@@ -1209,7 +1209,7 @@ async def test_a_socket_the_tls_layer_never_took_is_closed_and_not_counted(
         assert len(refused) == 1 and refused[0].fileno() == -1
         assert source.tls_handshake_failures == 0
         assert events.kinds() == []
-        assert "could not hand a connection to TLS" in caplog.text
+        assert "could not be handed to TLS" in caplog.text
         # CONTROL: the same listener, through the real call, still counts a real failure.
         monkeypatch.setattr(loop_class, "connect_accepted_socket", real_connect_accepted)
         _r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
@@ -1313,27 +1313,73 @@ def test_a_long_run_of_skipped_accepts_waits_and_warns(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A lasting fault the accept loop does not know would otherwise retry once per turn for as long
-    as it lasts, logged only at DEBUG. After a run of skips it waits the retry delay and warns."""
+    as it lasts, logged only at DEBUG. After a run of skips it waits the retry delay and warns. The
+    control: a peer's own dropped connections are never counted, so a peer resetting its sockets
+    cannot make the listener wait."""
     monkeypatch.setattr(mllp_module, "_ACCEPT_SKIP_RUN", 3)
     monkeypatch.setattr(mllp_module, "_ACCEPT_RETRY_DELAY", 60.0)
 
-    async def scenario() -> None:
-        fake = _FailingAccept(errno.ECONNABORTED)
+    async def run(fake: _FailingAccept) -> None:
         asyncio.get_running_loop().sock_accept = fake  # type: ignore[method-assign]
         listening = socket.socket()
         server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
         try:
             for _ in range(20):
                 await asyncio.sleep(0)
-            assert fake.calls == 3, "the accept loop did not wait after its run of skips"
             assert listening.fileno() != -1
         finally:
             server.close()
             await server.wait_closed()
 
+    unknown = _FailingAccept(errno.EPROTO)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
-        asyncio.run(scenario())
+        asyncio.run(run(unknown))
+    assert unknown.calls == 4, "the accept loop did not wait after skipping its run of three"
     assert "IB_TEST accept failed, retrying in 60s" in caplog.text
+    caplog.clear()
+    dropped = _FailingAccept(errno.ECONNABORTED)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        asyncio.run(run(dropped))
+    assert dropped.calls > 4, "a peer's dropped connections made the listener wait"
+    assert "retrying in" not in caplog.text
+
+
+def test_a_connection_the_listener_cannot_take_is_closed_and_accepting_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fault taking one accepted connection closes that socket and keeps the listener accepting,
+    rather than ending the accept loop and leaving the socket open."""
+
+    async def scenario() -> None:
+        accepted = socket.socket()
+        fails_after = _FailingAccept(errno.ECONNABORTED)
+        handed: list[socket.socket] = []
+
+        async def accept(sock: socket.socket) -> tuple[socket.socket, object]:
+            if not handed:
+                handed.append(accepted)
+                return accepted, ("127.0.0.1", 1)
+            return await fails_after(sock)
+
+        def on_socket(conn: socket.socket) -> None:
+            raise RuntimeError("synthetic: could not take the connection")
+
+        asyncio.get_running_loop().sock_accept = accept  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], on_socket, name="IB_TEST")
+        try:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert accepted.fileno() == -1, "the connection it could not take was left open"
+            assert fails_after.calls >= 1, "the accept loop stopped after the fault"
+            assert listening.fileno() != -1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.mllp"):
+        asyncio.run(scenario())
+    assert "IB_TEST could not take an accepted connection" in caplog.text
 
 
 def test_the_accept_loop_stops_on_a_fault_of_its_listening_socket(
