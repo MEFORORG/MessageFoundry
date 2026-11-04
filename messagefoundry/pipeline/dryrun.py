@@ -965,9 +965,10 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     instead of being abandoned at the timeout, so a preview can take as long as hl7apy does, up to
     the size and segment caps checked before the parse. And the listener's validates share the
     default executor's workers with concurrent traffic, so a saturated executor can push a fast
-    validate past its timeout there; the preview validates one message at a time and does not model
-    that. Nor does it model the listener's late-result recovery: a validate that finished after the
-    deadline, but before the listener handled the timeout, is used there as if it had not timed out,
+    validate past its timeout there, answered as temporary when no worker began it before the timeout
+    fired; the preview validates one message at a time and does not model that. Nor does it model
+    the listener's late-result recovery: a validate that began before the deadline and finished
+    after it, but before the listener handled the timeout, is used there as if it had not timed out,
     while a dry run reports any validate past the timeout as timed out. Below the timeout the
     verdict matches; the wall clock, the concurrency and that boundary case do not."""
     timeout = strict_validate_timeout(ic)

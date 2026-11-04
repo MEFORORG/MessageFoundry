@@ -2333,8 +2333,8 @@ class MLLPSource(SourceConnector):
 
         **Why AE.** It is this engine's code for "not accepted, and not because of what the message
         says". The runner answers ``AR`` for every refusal it treats as final and ``AE`` only for a
-        temporary one, at least a strict-validation timeout whose validate had not begun when the
-        listener handled the timeout and a streaming-detach budget held by concurrent detaches
+        temporary one, at least a strict-validation timeout that fired before any worker thread
+        began the validate and a streaming-detach budget held by concurrent detaches
         (BACKLOG #5078, owner ruling of 2026-11-03, decision log d20261104T032854299-7235a9,
         stamped in UTC). The strict outcomes are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*;
         the detach classes are

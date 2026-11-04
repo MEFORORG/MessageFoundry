@@ -1546,17 +1546,24 @@ is queued, not when a worker picks it up. So a timeout has two parts: time waiti
 time validating. When every worker is busy for the whole timeout, the validate never begins.
 
 **The discriminator.** Each strict validate now runs through `_StrictValidateRun` in
-`pipeline/wiring_runner.py`. The worker marks the run started as its first act, and the listener,
-when the timeout fires, marks it abandoned. Both take one lock, so they cannot cross: either the
-worker began first and the listener reads that it began, or the listener gave up first and the worker
-returns without calling `hl7apy` at all. Nothing is inferred from timings. "Began" means the worker
-ran the run's first line, so a free thread that the GIL or the OS did not schedule in time also reads
-as not begun. The stored reason therefore says only "before the validate began", not why. The run
-keeps its result under the same lock, and the listener reads it when it handles the timeout: a result
-present then is used, and the message is not a timeout, wherever the validate finished. That covers
-a validate that finished inside the timeout but whose result reached a stalled event loop late, and
-also one that finished after the deadline but before the listener got to handle the timeout. Only a
-run with no result when the timeout is handled is refused as a timeout.
+`pipeline/wiring_runner.py`. "Began" is decided when the timeout fires, not when the listener gets
+round to handling it. The run carries the timeout's deadline on `time.monotonic()`, the clock
+asyncio's event loop times with, taken just before the timeout's own, so it is never the later of the
+two. The worker, as its first act and under the run's lock, checks the deadline and whether the
+listener abandoned the run: if either holds, it records the run as not begun and returns without
+calling `hl7apy` at all; otherwise it marks the run started. The listener, when it handles the
+timeout, marks the run abandoned under the same lock, so the two cannot cross. Without the deadline
+check, a worker that came free after the deadline but before a busy event loop handled the timeout
+would begin, and the listener would answer that body as a final timeout though nothing had looked at
+it inside the timeout. No timing is inferred beyond the deadline itself. "Began" means a worker ran
+the run's first line before the deadline, so a free thread that the GIL or the OS did not schedule in
+time also reads as not begun. The stored reason therefore says only "before the validate began", not
+why. The run keeps its result under the same lock, and the listener reads it when it handles the
+timeout: a result present then, from a run that began before the deadline, is used, and the message
+is not a timeout, wherever the validate finished. That covers a validate that finished inside the
+timeout but whose result reached a stalled event loop late, and also one that began in time and
+finished after the deadline but before the listener got to handle the timeout. Only a run with no
+result when the timeout is handled is refused as a timeout.
 
 | Timeout | What is known | Receipt path | MLLP / TCP | Stored reason |
 | --- | --- | --- | --- | --- |
@@ -1578,8 +1585,11 @@ refusal, and the same pool free gives a PERMANENT one. The MLLP arms are driven 
 engine's own MLLP outbound, which reads the began timeout's `AR` as permanent and the never-began
 timeout's `AE` as retryable. The kind-to-status mapping (`503`, `422`) is
 `_refusal_status` in `transports/http_listener.py`, pinned by `tests/test_ingress_refusal_kinds.py`.
-The lock protocol itself is pinned by a direct test of `_StrictValidateRun`; the receipt-path arms
-cannot see it, because cancelling the executor future already skips a queued job.
+The lock protocol and the deadline check are pinned by a direct test of `_StrictValidateRun`; the
+receipt-path arms cannot see the lock, because cancelling the executor future already skips a queued
+job. A further test holds the one worker past the deadline while the event loop is stalled, releases
+it before the loop handles the timeout, and reads that `hl7apy` was not started and the timeout is
+temporary.
 
 **What the discriminator does not see, which the owner ruling of 2026-11-03 accepts as final.** The
 cost the 2026-10-30 amendment recorded is narrowed, not removed: a valid body in either case below is

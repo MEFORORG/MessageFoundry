@@ -914,9 +914,10 @@ class _StrictValidateTimedOut(Exception):
     nothing about itself, and it left no thread behind, so it is answered as temporary (``503``, or
     ``AE`` on MLLP). One that had started is final (``422``, or ``AR``; owner ruling of 2026-11-03,
     decision log d20261104T032854299-7235a9, stamped in UTC): it
-    may be the slow body the timeout exists for, and its thread is still running. "Began" means the
-    worker ran the run's first line; a free thread that the GIL or the OS did not schedule in time
-    reads as not begun too, so the reason says only that.
+    may be the slow body the timeout exists for, and its thread is still running. "Began" means a
+    worker ran the run's first line before the deadline (:class:`_StrictValidateRun`); a free thread
+    that the GIL or the OS did not schedule in time reads as not begun too, so the reason says only
+    that.
 
     ``reason`` is value-free, only the numeric timeout, and goes to the stored ``ERROR`` row.
     ``ack_text`` goes in an MLLP NAK's MSA-3 and is the same for both causes. The answer's class
@@ -937,17 +938,25 @@ class _StrictValidateTimedOut(Exception):
 class _StrictValidateRun:
     """One strict validate on a worker thread, which records whether it began (BACKLOG #5078).
 
+    "Began" is decided when the timeout fires, not when the listener handles it. The run carries the
+    timeout's deadline on ``time.monotonic()``, the clock asyncio's event loop times with, taken
+    before the timeout's own. A worker that reaches the run at or past it does not begin: it records
+    "not begun" and returns without validating. Without that, a worker that came free after the
+    deadline but before a busy event loop handled the timeout would begin, and the listener would
+    answer a body nobody had looked at inside the timeout as final.
+
     The start and the listener's abandonment take one lock, so they cannot cross: either the worker
     began first and :meth:`abandon` reports it started, or the listener gave up first and the worker
     returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind.
 
     The result is kept under the same lock, and :meth:`abandon` hands back any result present when
-    the listener handles the timeout, wherever the validate finished: inside the timeout with its
-    delivery to a stalled event loop late, or after the deadline but before the timeout was handled.
-    Either way the listener uses that result rather than refuse a body it has a verdict for; only a
-    run with no result at that point is a timeout."""
+    the listener handles the timeout, for a run that began before the deadline: its result may have
+    reached a stalled event loop late, or it may have finished after the deadline but before the
+    timeout was handled. Either way the listener uses that result rather than refuse a body it has a
+    verdict for; only a run with no result at that point is a timeout."""
 
-    def __init__(self) -> None:
+    def __init__(self, deadline: float | None) -> None:
+        self._deadline = deadline
         self._lock = threading.Lock()
         self._abandoned = False
         self._started = False
@@ -955,7 +964,9 @@ class _StrictValidateRun:
 
     def __call__(self, text: str, expected_version: str | None) -> ValidationResult | None:
         with self._lock:
-            if self._abandoned:
+            if self._abandoned or (
+                self._deadline is not None and time.monotonic() >= self._deadline
+            ):
                 return None
             self._started = True
         result = validate(text, expected_version=expected_version)
@@ -973,33 +984,36 @@ class _StrictValidateRun:
 async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResult:
     """The listener's strict validate, off the event loop under the inbound's timeout (#89, review
     M-11). On expiry it uses the run's result if one is present when the timeout is handled, even
-    one that finished after the deadline; otherwise it raises :class:`_StrictValidateTimedOut`,
-    saying whether the validate had begun.
+    one that finished after the deadline, from a run that began before it; otherwise it raises
+    :class:`_StrictValidateTimedOut`, saying whether the validate began before the timeout fired.
 
     ``wait_for`` frees the listener but cannot kill a worker that has begun (no thread cancellation
     in CPython): that orphaned ``hl7apy`` validate holds its thread until it returns, accepted by
     design (mirrors ``_run_lookup``), bounded by ``enforce_size_limits``' 16 MiB and segment caps
     that fire before the slow parse."""
     timeout = _strict_validate_timeout(ic)
-    run = _StrictValidateRun()
+    # Taken before wait_for starts its own timer on the same clock, so the run's deadline is never
+    # later than the timeout's.
+    run = _StrictValidateRun(None if timeout is None else time.monotonic() + timeout)
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(run, text, ic.validation.hl7_version), timeout
         )
     except TimeoutError:
-        started, finished = run.abandon()
-        if finished is not None:
-            return finished  # a verdict is in hand, before the deadline or after it
+        started, result = run.abandon()
     except BaseException:
         # Cancelled (engine stop, connection teardown): nobody will await the result, so a run not
         # yet begun must not begin.
         run.abandon()
         raise
     else:
-        assert result is not None  # only an abandoned run returns None, and nothing awaits that one
-        return result
+        # None here is a run its worker reached past the deadline, delivered before the loop got to
+        # the timeout: it never began.
+        started = False
+    if result is not None:
+        return result  # a verdict is in hand, before the deadline or after it
     # Raised outside the handler, so the TimeoutError is not on the chain and needs no suppressing.
-    assert timeout is not None  # wait_for(None) never times out
+    assert timeout is not None  # only a run with a deadline returns None unabandoned
     raise _StrictValidateTimedOut(timeout, started=started)
 
 

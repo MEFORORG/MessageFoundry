@@ -532,8 +532,9 @@ async def test_upload_resend_into_a_tolerant_inbound_still_admits_a_strictly_inv
 async def test_upload_resend_past_the_strict_timeout_is_refused(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The listener AE-NAKs a validate that outruns validation.strict_timeout_s, so the resend refuses
-    # it as well, and the request does not wait on it.
+    # The listener refuses a validate that outruns validation.strict_timeout_s (AR on MLLP once the
+    # validate began, AE if the timeout fired before it began; docs/HL7-VALIDATION.md tables it), so
+    # the resend refuses it as well, and the request does not wait on it.
     import time
 
     from messagefoundry.parsing.validate import ValidationResult
