@@ -10610,7 +10610,8 @@ class RegistryRunner:
             return _ItemOutcome.STOPPED, None
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
-        # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
+        # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree. A
+        # refused (peek_failed) child is the exception: it stores this read's bounded view instead.
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
         except CipherError as exc:
@@ -10640,9 +10641,10 @@ class RegistryRunner:
         refused = None
         if peek_failed:
             # Vault BACKLOG #4796: the refused reply is charged to the loopback's refused-body
-            # allowance, as a listener's refusal is. A handoff that then stores no child (a consumed
-            # or depth-capped token), or that raises and is retried, leaves the charge spent: that
-            # errs toward storing less, never more.
+            # allowance, as a listener's refusal is. A handoff that then stores no child (at least a
+            # consumed, depth-capped, missing, erased or corrupt token, or an origin that fails its
+            # row tag), or that raises and is retried, leaves the charge spent, and a replay of that
+            # token charges it again: that errs toward storing less, never more.
             refused = self._refused_body.bound_held(
                 name,
                 body,

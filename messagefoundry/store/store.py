@@ -971,12 +971,11 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 #: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
 #: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
-
-
 #: The ``error`` of a re-ingress child whose body failed its HL7 peek, when the worker passes no reason
 #: of its own. The server backends import it, and so does the re-ingress worker, which leads it with
 #: the refused-body allowance note when it stores only the head (vault BACKLOG #4796).
 REINGRESS_PEEK_FAILED: Final = "re-ingress body failed HL7 peek"
+
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
