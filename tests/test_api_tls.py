@@ -2765,7 +2765,9 @@ def test_serve_context_refuses_a_client_ca_file_the_issuer_index_cannot_match(
         tls_client_ca_file=str(ca_file),
         tls_client_cert_identities={"CN=Inter CA": {"CN:svc.internal": "0" * 32}},
     )
-    with pytest.raises(ValueError, match=r"\[api\]\.tls_client_ca_file: .*loads 1 certificate"):
+    with pytest.raises(
+        ValueError, match=r"\[api\]\.tls_client_ca_file: .*does not load 1 CA certificate"
+    ):
         build_api_ssl_context(api, enforcing=False)
 
 

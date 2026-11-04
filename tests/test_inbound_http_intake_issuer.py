@@ -29,6 +29,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from messagefoundry import pki
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pki import IssuerIndex
@@ -365,7 +366,9 @@ def test_an_unparsable_certificate_in_the_trust_store_refuses_the_build(
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     cadata = (_pem(good[0]) + _wrapped(_der(odd[0]) + b"\x30\x00", label)).decode("ascii")
     assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads the odd block
-    with pytest.raises(ValueError, match=r"IB_PARTNER: tls_ca_file: .*cannot be parsed"):
+    with pytest.raises(
+        ValueError, match=r"IB_PARTNER: tls_ca_file: .*certificate block 2 .*cannot be parsed"
+    ):
         _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
     # Control: the same store without the junk block builds and warns about nothing.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
@@ -660,7 +663,9 @@ def test_a_body_line_with_a_nul_where_openssl_stops_refuses_the_build(
     lines[1] = head + lines[1] + tail
     cadata = (_pem(root[0]) + b"\n".join(lines)).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Root CA"}  # the premise: OpenSSL stops after the root
-    with pytest.raises(ValueError, match="the client CA file: "):
+    with pytest.raises(
+        ValueError, match="the client CA file: certificate block 2 .*cannot be parsed"
+    ):
         IssuerIndex(cadata)
     IssuerIndex(_pem(root[0]).decode("ascii"))  # control: the root alone builds
 
@@ -717,7 +722,7 @@ def test_a_block_where_openssl_silently_stops_refuses_the_build(stop: str) -> No
     inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
     cadata = (_pem(root[0]) + _SILENT_STOPS[stop] + _pem(inter[0])).decode("ascii")
     assert _loaded_subjects(cadata) == {"CN=Root CA"}  # the premise: OpenSSL stops after the root
-    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) from this file"):
+    with pytest.raises(ValueError, match=r"does not load 1 CA certificate\(s\) the mTLS issuer"):
         IssuerIndex(cadata)
     # Control: with that block after the intermediate, OpenSSL loads both and the index names both.
     tail = (_pem(root[0]) + _pem(inter[0]) + _SILENT_STOPS[stop]).decode("ascii")
@@ -730,7 +735,9 @@ def test_a_silent_stop_in_tls_ca_file_refuses_the_listener(tmp_path: Path) -> No
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
     cadata = _pem(root[0]) + _SILENT_STOPS["empty-foo"] + _pem(inter[0])
-    with pytest.raises(ValueError, match=r"HTTP source .*: tls_ca_file: .*loads 1 certificate"):
+    with pytest.raises(
+        ValueError, match=r"HTTP source .*: tls_ca_file: .*does not load 1 CA certificate"
+    ):
         _source(tmp_path, [], {"CN=Inter CA": [SUBJECT]}, cadata=cadata)
 
 
@@ -749,6 +756,65 @@ def test_the_check_reads_what_openssl_lists_and_counts() -> None:
     index = IssuerIndex((_pem(twin1[0]) + _pem(mid) + _pem(twin2[0])).decode("ascii"))
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), twin2)[0])
     assert index.issuer_of(leaf) == ""  # the twins stay ambiguous
+
+
+def test_a_rollover_file_listing_a_ca_twice_builds() -> None:
+    """Two CAs share a DN, another CA sits between them, and the new one is listed twice. OpenSSL
+    3.5.7 keeps both copies of it, so a check counting OpenSSL's CA list rather than comparing it
+    as a set would refuse a file every handshake reads correctly (BACKLOG #4948)."""
+    old, new = (_ca(_dn((NameOID.COMMON_NAME, "Acme CA"))) for _ in range(2))
+    root = _ca(_dn((NameOID.COMMON_NAME, "Partner Root")))[0]
+    cadata = (_pem(old[0]) + _pem(root) + _pem(new[0]) + _pem(new[0])).decode("ascii")
+    index = IssuerIndex(cadata)
+    assert index.unmatched_keys(["CN=Partner Root"]) == {}
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), new)[0])
+    assert index.issuer_of(leaf) == ""  # the twins stay ambiguous
+
+
+def test_the_check_refuses_a_ca_openssl_did_not_load_when_the_count_balances() -> None:
+    """Driven at the check itself, with an index no scan produces: OpenSSL loaded a CA and a
+    pinned certificate it reads as no CA, while the index holds that CA and another CA. Both hold
+    two certificates, so only the per-certificate CA test catches the CA OpenSSL never loaded. And
+    a CA OpenSSL loaded that the index missed refuses too (BACKLOG #4948)."""
+    root = _der(_ca(_dn((NameOID.COMMON_NAME, "Root CA")))[0])
+    phantom = _der(_ca(_dn((NameOID.COMMON_NAME, "Phantom CA")))[0])
+    pinned = _pinned("Pinned")
+    cadata = ssl.DER_cert_to_PEM_cert(root) + _pem(pinned).decode("ascii")
+    assert _openssl_context(cadata).cert_store_stats() == {"x509": 2, "crl": 0, "x509_ca": 1}
+    with pytest.raises(ValueError, match=r"does not load 1 CA certificate\(s\)"):
+        pki._refuse_unless_openssl_loads(cadata, {root, phantom}, label="x")
+    with pytest.raises(ValueError, match=r"loads 1 CA certificate\(s\) .* did not read"):
+        pki._refuse_unless_openssl_loads(cadata, {_der(pinned)}, label="x")
+    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) that are not CAs"):
+        pki._refuse_unless_openssl_loads(cadata, {root}, label="x")
+    assert pki._refuse_unless_openssl_loads(cadata, {root, _der(pinned)}, label="x") == {root}
+
+
+def test_a_certificate_openssl_reads_as_no_ca_names_only_itself() -> None:
+    """A pinned certificate OpenSSL reads as no CA is named for a leaf that is that certificate.
+    OpenSSL never accepts it as the issuer of another leaf, so neither does the index: one that
+    names a leaf its key signed would name a leaf whose chain ran through a client-sent CA with
+    the same name and key (BACKLOG #4948)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = _dn((NameOID.COMMON_NAME, "Pinned"))
+    now = datetime.datetime.now(datetime.UTC)
+
+    def _cert(subject: x509.Name) -> x509.Certificate:
+        return (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256())
+        )
+
+    pinned, other = _cert(name), _cert(_dn((NameOID.COMMON_NAME, "leaf")))
+    index = IssuerIndex(_pem(pinned).decode("ascii"))
+    assert index.issuer_of(_der(pinned)) == "CN=Pinned"  # control: it names itself
+    assert index.issuer_of(_der(other)) == ""
 
 
 @pytest.mark.parametrize(

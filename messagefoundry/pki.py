@@ -1637,6 +1637,10 @@ def canonical_dn(text: str) -> str | None:
 class _Anchor:
     cert: x509.Certificate
     subject: str
+    der: bytes
+    #: Whether OpenSSL reads it as a CA. One it does not can sign nothing in a chain OpenSSL
+    #: verifies, so it names only itself, as a pinned client certificate (BACKLOG #4948).
+    ca: bool
 
 
 class IssuerIndex:
@@ -1655,8 +1659,8 @@ class IssuerIndex:
     never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
     itself, whether or not it is marked as a CA.
 
-    The index holds exactly the certificates OpenSSL loads from ``cadata``, or the build raises
-    ``ValueError`` naming ``label`` (BACKLOG #4948). :func:`_pem_certificate_blocks` finds them, but
+    The index holds exactly the CA certificates OpenSSL loads from ``cadata``, and as many others,
+    or the build raises ``ValueError`` naming ``label`` (BACKLOG #4948). :func:`_pem_certificate_blocks` finds them, but
     it models OpenSSL's PEM reader and is not that reader, so the result is then checked against
     OpenSSL itself (:func:`_refuse_unless_openssl_loads`). A CA the index named but OpenSSL never
     loaded could be named for a leaf whose chain ran through a client-sent copy of it; a CA OpenSSL
@@ -1671,7 +1675,9 @@ class IssuerIndex:
         # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
         # are, because the map names only the name.
         self._subject_keys: dict[str, set[bytes]] = {}
-        for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
+        read: list[tuple[x509.Certificate, str, bytes]] = []
+        blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
+        for position, block in enumerate(blocks, start=1):
             try:
                 cert = x509.load_pem_x509_certificate(block)
                 subject = cert.subject.rfc4514_string()
@@ -1681,29 +1687,33 @@ class IssuerIndex:
                 )
             except (*_UNREADABLE_CA, UnsupportedAlgorithm) as exc:
                 raise ValueError(
-                    f"{label}: a certificate in this file cannot be parsed for the mTLS issuer "
-                    "map, though the TLS library may load it, so the map could not hold what the "
-                    "handshake trusts. Remove or re-issue that certificate"
+                    f"{label}: certificate block {position} in this file cannot be parsed for the "
+                    "mTLS issuer map, though the TLS library may load it, so the map could not "
+                    "hold what the handshake trusts. Remove or re-issue that certificate"
                 ) from exc
             if der in seen:
                 continue  # the same certificate twice is one anchor
             seen.add(der)
-            self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
+            read.append((cert, subject, der))
             self._subject_keys.setdefault(subject, set()).add(key)
-        _refuse_unless_openssl_loads(cadata, seen, label=label)
+        cas = _refuse_unless_openssl_loads(cadata, seen, label=label)
+        for cert, subject, der in read:
+            anchor = _Anchor(cert, subject, der, ca=der in cas)
+            self._by_subject_name.setdefault(cert.subject, []).append(anchor)
 
     def issuer_of(self, leaf_der: bytes) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
 
         ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA with a
         DIFFERENT key shares the issuing CA's subject: the map is keyed by name, so it could not tell
-        the two apart. Never raises."""
+        the two apart. A loaded certificate OpenSSL reads as no CA names only a leaf that is that
+        certificate. Never raises."""
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
             issuers = [
                 anchor
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
-                if _directly_issued(leaf, anchor.cert)
+                if (anchor.ca or anchor.der == leaf_der) and _directly_issued(leaf, anchor.cert)
             ]
         except _UNREADABLE_CA:
             return ""
@@ -1736,48 +1746,52 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
-def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str) -> None:
-    """Raise ``ValueError`` unless ``indexed``, certificate DERs, holds exactly the CA
-    certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``, and as many
-    other certificates as it loads (BACKLOG #4948). This is the authority; the PEM scan only
-    proposes.
+def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str) -> set[bytes]:
+    """The CA certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``, as
+    DER, or ``ValueError`` unless ``indexed`` holds exactly those, and as many other certificates as
+    it loads (BACKLOG #4948). This is the authority; the PEM scan only proposes.
 
     Asked of a scratch context, as ``config.tls_policy.crl_scratch_context`` asks one about a CRL
     file, so the live context is never written to. ``get_ca_certs`` lists every CA certificate the
-    store holds, as DER, so the CA sets are compared directly, both ways. A certificate the index
-    holds that is not in that list must be one OpenSSL reads as no CA, asked of a context holding
-    it alone, or it would be a CA the index read and OpenSSL never loaded. OpenSSL lists no other
-    certificate, so those are compared by count. An uncounted difference there names nothing: in a
-    chain OpenSSL verifies, a certificate it reads as no CA can sign nothing, and so is never the
-    issuer the index names for a leaf it did not itself load as an anchor.
-
-    The comparison never rests on OpenSSL dropping a certificate it was given twice: it does not
-    always (measured on OpenSSL 3.5.7, two CAs sharing a DN with another CA between them), and a
-    copy it keeps twice makes this refuse rather than accept."""
+    store holds, as DER, so the CA sets are compared directly, both ways, as sets: OpenSSL does not
+    always drop a certificate it is given twice (measured on OpenSSL 3.5.7, a CA listed twice after
+    another CA with its DN and a third between them), and a second copy signs nothing a first does
+    not. A certificate the index holds that is not in that list must be one OpenSSL reads as no CA,
+    asked of a context holding it alone, or it would be a CA the index read and OpenSSL never
+    loaded. OpenSSL lists no other certificate, so those are compared only by count, and a copy of
+    one kept twice refuses. A count that balances over two different such certificates is not
+    caught here, so :meth:`IssuerIndex.issuer_of` lets one name only a leaf that is itself."""
     scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots
     try:
         scratch.load_verify_locations(cadata=cadata)
-    except (ssl.SSLError, ValueError):
+    except (ssl.SSLError, ValueError) as exc:
         # The live context loaded these bytes first, so it refused them too.
         raise ValueError(
             f"{label}: the TLS library refuses this file, so the mTLS issuer map could not hold "
             "what the handshake trusts"
-        ) from None
+        ) from exc
     listed = scratch.get_ca_certs(binary_form=True)
-    loaded = scratch.cert_store_stats()["x509"]
     cas = set(listed)
-    if (
-        len(cas) != len(listed)
-        or not cas <= indexed
-        or loaded != len(indexed)
-        or not all(_loads_as_no_ca(der) for der in indexed - cas)
-    ):
-        raise ValueError(
-            f"{label}: the TLS library loads {loaded} certificate(s) from this file, which are not "
-            f"the {len(indexed)} the mTLS issuer map read, so the map could name a CA the handshake "
-            "never trusts or miss one it does. Write each certificate as a plain PEM block, with "
-            "nothing else between the blocks"
+    others = indexed - cas
+    loaded_others = scratch.cert_store_stats()["x509"] - len(listed)
+    if missed := len(cas - indexed):
+        problem = (
+            f"loads {missed} CA certificate(s) from this file that the mTLS issuer map did not read"
         )
+    elif extra := sum(not _loads_as_no_ca(der) for der in others):
+        problem = f"does not load {extra} CA certificate(s) the mTLS issuer map read from this file"
+    elif loaded_others != len(others):
+        problem = (
+            f"loads {loaded_others} certificate(s) that are not CAs from this file, where the "
+            f"mTLS issuer map read {len(others)}"
+        )
+    else:
+        return cas
+    raise ValueError(
+        f"{label}: the TLS library {problem}, so the map could name a CA the handshake never "
+        "trusts or miss one it does. Remove any empty or non-certificate PEM block, and any line "
+        "that is not part of a block, and list each certificate once"
+    )
 
 
 def _loads_as_no_ca(der: bytes) -> bool:
