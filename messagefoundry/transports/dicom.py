@@ -206,8 +206,9 @@ _MAX_UNANSWERED_SENDS_OVER_CEILING = 3
 #: unordered lane rotates every failing object it holds, so the bound has to exceed how many objects
 #: over the ceiling one lane could hold pending at once. Defeating it takes more than 65,536 of them
 #: pending, over 2 TiB of payload in the store. Each entry is a key of about 90 bits and a small
-#: count, about 76 bytes (the dict's 40 measured with ``tracemalloc``, plus the key's int), so a full
-#: map holds under 5 MiB.
+#: count, about 76 bytes (the dict's 40, plus the key's int), so a map just filled holds about 5 MiB.
+#: Evicting and re-inserting at the bound grows the dict's table: measured with ``tracemalloc`` on
+#: Python 3.14, about 7.3 MiB held, and a peak near 12.3 MiB while the table resizes.
 _UNANSWERED_REMEMBERED = 65_536
 
 
