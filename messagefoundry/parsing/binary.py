@@ -613,11 +613,12 @@ def iter_obx_documents(
         # Every OBX-5.5 read below would raise a plain ValueError, which no listener records;
         # named here, it is a refusal both of them answer (BACKLOG #5099). The text names the one
         # cause the body has, since the listeners store it: only a short MSH-2 reaches them.
-        cause = (
-            "its first MSH's MSH-2 is shorter than four characters"
-            if message.count_segments("MSH")
-            else "the body has no MSH"
-        )
+        if not message.count_segments("MSH"):
+            cause = "the body has no MSH"
+        elif len(message._raw_field("MSH", 2)) < 4:
+            cause = "its first MSH's MSH-2 is shorter than four characters"
+        else:
+            cause = "its first MSH's MSH-1 is not one character"
         raise UnreadableDelimitersError(f"{cause}, so no OBX-5.5 can be read; refusing the detach")
     occurrences: list[int] = []
     documents: list[int] = []
@@ -865,14 +866,19 @@ def _strip_obx_ed(
         return raw, 0, 0
     try:
         message._encoding_chars()
+        readable = True
     except ValueError:
         # No MSH, or an MSH-2 shorter than four characters: every OBX read would raise, and the
         # retention pass calls this with no try, so one such stored row would abort the pass on
         # every run. Its document stays, as any body this strip cannot read does (BACKLOG #5099).
         # Any ValueError, not only the bare one _delimiters_readable answers for: the detach lets
         # another fault out, but a retention pass must contain it as it contains a parse failure.
+        readable = False
+    if not readable:
         # Reported, not silent, because a document it holds now outlives its window; the caller
-        # holds the row id and logs it, so this pure codec has no logging side effect.
+        # holds the row id and logs it, so this pure codec has no logging side effect. Called
+        # outside the handler, so nothing the caller raises chains the refusal, which quotes
+        # MSH-1 and MSH-2.
         if on_unreadable is not None:
             on_unreadable()
         return raw, 0, 0

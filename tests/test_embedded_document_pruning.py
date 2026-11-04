@@ -298,18 +298,19 @@ async def test_below_threshold_not_stripped(store: MessageStore) -> None:
     assert (await _get(store, mid))["raw"] == small
 
 
-async def test_unreadable_delimiters_skip_is_logged_once_per_pass(
+async def test_unreadable_delimiters_skip_is_logged_once_per_strip_call(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A row whose HL7 delimiters cannot be read (an MSH-2 shorter than four characters) is left
     as stored, so its document outlives the window; the pass logs that at WARNING, once, naming
-    the count and a message id and no byte of a body (BACKLOG #5099). A readable row stripped in
-    the same pass is the control: it is stripped, and adds nothing to the record."""
+    the count and an unreadable row's message id and no byte of a body (BACKLOG #5099). A
+    readable row stripped in the same pass is the control: it is stripped, and adds nothing to
+    the record."""
     short = HL7_ED_BODY.replace("MSH|^~\\&|", "MSH|^~\\|", 1)
     assert short != HL7_ED_BODY
     first = await _delivered(store, channel_id="IB", raw=short, now=0.0, control="C-UNR1")
-    await _delivered(store, channel_id="IB", raw=short, now=0.0, control="C-UNR2")
-    await _delivered(store, channel_id="IB", raw=HL7_ED_BODY, now=0.0, control="C-READ")
+    second = await _delivered(store, channel_id="IB", raw=short, now=0.0, control="C-UNR2")
+    readable = await _delivered(store, channel_id="IB", raw=HL7_ED_BODY, now=0.0, control="C-READ")
 
     now = 5 * DAY
     with caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"):
@@ -326,7 +327,9 @@ async def test_unreadable_delimiters_skip_is_logged_once_per_pass(
     assert records[0].levelno == logging.WARNING and records[0].exc_info is None
     text = records[0].getMessage()
     assert "skipped 2 stored HL7 bodies" in text
-    assert "message " in text
+    # The id it names is an unreadable row's, never the readable one stripped beside them.
+    assert f"message {first}" in text or f"message {second}" in text
+    assert str(readable) not in text
     for piece in ("SEND", "RECV", "MSG0001", "ORU", "^~", DOC.decode()[:20], "C-UNR"):
         assert piece not in text, piece
 

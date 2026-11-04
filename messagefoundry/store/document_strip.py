@@ -55,12 +55,13 @@ def cutoff_for(
 
 
 def log_unreadable_skips(message_ids: Sequence[object]) -> None:
-    """Log, once per pass and at WARNING, the rows a strip pass skipped because their HL7
-    delimiters could not be read (``strip_documents``' ``on_unreadable``, BACKLOG #5099): a
-    document such a row holds stays past its strip window, so the skip must not be silent
-    (CLAUDE.md section 6). One record per pass rather than one per row, since the same rows are
-    selected again on every pass until their bodies are purged. It names the count and the first
-    message id, never a byte of a body. Nothing is logged for an empty pass."""
+    """Log, once per ``strip_embedded_documents`` call and at WARNING, the rows it skipped because
+    their HL7 delimiters could not be read (``strip_documents``' ``on_unreadable``, BACKLOG
+    #5099): a document such a row holds stays past its strip window, so the skip must not be
+    silent (CLAUDE.md section 6). One record per call rather than one per row, since the same rows
+    are selected again on every pass until their bodies are purged; the retention runner makes one
+    call per distinct ``min_bytes`` threshold, so a pass may log more than one. It names the count
+    and the first message id, never a byte of a body. Nothing is logged when none was skipped."""
     if not message_ids:
         return
     log.warning(

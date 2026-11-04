@@ -1768,8 +1768,14 @@ def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> No
     with pytest.raises(UnreadableDelimitersError) as caught:
         next(scan)
     assert "^~" not in str(caught.value)
+    # The stored reason names the one cause this body has, not "no MSH" beside it.
+    assert str(caught.value).startswith("its first MSH's MSH-2 is shorter than four characters")
     # The separator read's refusal quotes MSH-1 and MSH-2; none of it rides on the chain.
     assert caught.value.__cause__ is None and caught.value.__context__ is None
+    # With no MSH at all, the reason says so instead.
+    batch = "FHS|MSH|A\r" + _SHORT_MSH2_DOCUMENT[_SHORT_MSH2_DOCUMENT.index("OBX|") :]
+    with pytest.raises(UnreadableDelimitersError, match="^the body has no MSH,"):
+        next(iter_obx_documents(Message.parse(batch), received=batch))
 
 
 def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> None:

@@ -9453,6 +9453,8 @@ class SqlServerStore:
             msgs += 1
             docs += n_docs
             reclaimed += n_bytes
+        # Before the write, so a failed write does not lose the record of the skips.
+        log_unreadable_skips(unreadable)
         if updates:
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
@@ -9464,7 +9466,6 @@ class SqlServerStore:
                 except Exception:
                     await conn.rollback()
                     raise
-        log_unreadable_skips(unreadable)
         await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed

@@ -18567,13 +18567,14 @@ class MessageStore:
             msgs += 1
             docs += n_docs
             reclaimed += n_bytes
+        # Before the write, so a failed write does not lose the record of the skips.
+        log_unreadable_skips(unreadable)
         if updates:
             async with _writer_txn(self._db, self._lock):
                 await self._db.executemany(
                     "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
                 )
                 await self._commit()
-        log_unreadable_skips(unreadable)
         await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
