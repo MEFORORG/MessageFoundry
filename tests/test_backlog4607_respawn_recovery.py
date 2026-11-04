@@ -329,6 +329,11 @@ async def test_a_replacement_takes_over_where_its_dead_serializer_stopped(tmp_pa
 # --- the round-3 review repairs -------------------------------------------------------------------
 
 
+def _leading() -> RependFence:
+    """A fence this node leads under throughout."""
+    return RependFence.capture(lambda: True, lambda: 1)
+
+
 class _Flap:
     """A lease this node holds under one epoch throughout, whose ``is_leader`` reads False for the
     first ``lost`` reads and True after (a flap), or False forever with ``lost=None``."""
@@ -419,7 +424,7 @@ async def test_a_per_lane_replacement_sleeps_out_its_re_pend_before_its_first_cl
     _shorten_backoffs(monkeypatch)
     store, runner, _ = await _start_runner(tmp_path, "per_lane")
     try:
-        leading = RependFence(lambda: True, lambda: 1, True, 1)
+        leading = _leading()
         sent, ran, sleeps = await _recover_per_lane(runner, monkeypatch, leading)
         assert (sent, ran) == ([["r1"]], [[]])
         assert sleeps == [wiring_runner._WORKER_ERROR_BACKOFF_SECONDS]
@@ -487,7 +492,7 @@ async def test_a_stop_during_a_pooled_respawn_backoff_is_counted_against_quiesce
     so its row stays INFLIGHT; quiesce must not then report zero rows INFLIGHT."""
     dispatcher, _ = _processing_dispatcher(db)
     row = await _claimed_ingress_row(db)
-    fence = RependFence(lambda: True, lambda: 1, True, 1)
+    fence = _leading()
     task = asyncio.ensure_future(
         dispatcher._run_lane("IB", [], fence=fence, recover_ids=[row], delay=30.0)
     )
@@ -514,7 +519,7 @@ async def test_the_death_page_does_not_duplicate_the_recoverys_own_bound(
     monkeypatch.setattr(
         dispatcher, "_start_serializer", lambda lane, body, ids, fence: body.close()
     )
-    fence = RependFence(lambda: True, lambda: 1, True, 1)
+    fence = _leading()
 
     async def die() -> None:
         raise _Kill("injected kill")
@@ -550,7 +555,7 @@ async def test_a_replacement_for_a_serializer_that_died_in_its_transition_counts
             raise _Kill("injected kill inside the terminal transition")
 
     monkeypatch.setattr(dispatcher, "_park", park)
-    fence = RependFence(lambda: True, lambda: 1, True, 1)
+    fence = _leading()
     with pytest.raises(_Kill):
         await dispatcher._run_lane("IB", [], fence=fence, recover_ids=[row])
     assert st.infra_error_streak == 1

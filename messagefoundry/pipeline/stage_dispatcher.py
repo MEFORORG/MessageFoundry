@@ -37,9 +37,9 @@ synchronous except a claimer's single ``await claim_fifo_heads`` (plus, only on 
 its opening backoff sleep and ``await release_claimed`` in ``_adopt_abandoned``) and a serializer's
 ``await process_item`` / ``await release_claimed``. A state read must never be separated from its mutation by an
 ``await`` — the conservation law (``slots_free + processing_lanes + reserved == max_processing_lanes``)
-and the ``busy_violations`` counter assert this holds. One serializer holds no slot: a dead
-serializer's replacement, which returns it on entry because it holds no payload (BACKLOG #4607), so
-the law counts ``processing_lanes`` less those.
+and the ``busy_violations`` counter assert this holds. A dead serializer's replacement returns its
+slot on entry, since it holds no payload (BACKLOG #4607), and ``processing_lanes`` counts only
+serializers that hold one.
 """
 
 from __future__ import annotations
@@ -96,6 +96,12 @@ def _capped_backoff(base: float, exp: int, cap: float) -> float:
     streak cannot blow up ``2**exp``; ``float(...)`` pins the type, because ``int ** (variable int)``
     is typed Any by mypy (the negative-exponent overload)."""
     return min(float(base * (2 ** min(max(exp, 0), 20))), cap)
+
+
+def _found_streak(st: _LaneState) -> int:
+    """The lane's ``infra_error_streak`` as its last terminal transition found it, before any
+    count that transition made and did not finish (BACKLOG #4607, ``_LaneState.transition_streak``)."""
+    return st.infra_error_streak if st.transition_streak is None else st.transition_streak
 
 
 class HoldResult(Enum):
@@ -1501,7 +1507,7 @@ class StageDispatcher:
         if (
             deaths == self._infra_fault_stop_after
             and not st.lane_stuck_alerted
-            and not self._recovery_meets_bound(st)
+            and not self._recovery_meets_bound(lane, st, ids)
         ):
             st.lane_stuck_alerted = True
             try:
@@ -1530,19 +1536,18 @@ class StageDispatcher:
             lane, self._run_lane(lane, [], fence=fence, recover_ids=ids, delay=delay), ids, fence
         )
 
-    def _recovery_meets_bound(self, st: _LaneState) -> bool:
+    def _recovery_meets_bound(self, lane: str, st: _LaneState, ids: list[str]) -> bool:
         """Whether the recovery a dead serializer's replacement is about to apply
         (:meth:`_dead_serializer_outcome`) is a zero-progress infra fault that brings the lane's
         ``infra_error_streak`` to ``infra_fault_stop_after``, so :meth:`_apply_retry` STOPs or pages
         the lane itself (BACKLOG #4607)."""
-        if st.drained is not None:
-            outcome, _, head = st.drained
-            if head is None or outcome.made_progress or not outcome.is_infra_fault:
-                return False
-        elif st.drain_index > 0:
-            return False
-        streak = st.infra_error_streak if st.transition_streak is None else st.transition_streak
-        return streak + 1 >= self._infra_fault_stop_after
+        outcome, _, _ = self._dead_serializer_outcome(lane, ids)
+        return (
+            outcome.kind is LaneResultKind.RETRY
+            and outcome.is_infra_fault
+            and not outcome.made_progress
+            and _found_streak(st) + 1 >= self._infra_fault_stop_after
+        )
 
     def _close_serializer_deaths(self, lane: str, st: _LaneState) -> None:
         """End the lane's run of serializer deaths (BACKLOG #4607), with one line if it was open."""
@@ -1576,22 +1581,19 @@ class StageDispatcher:
         lane at its cadence whenever the row that killed it was not the first, the spin fix A
         collapses.
 
-        A serializer that died INSIDE its terminal transition may already have counted its fault
-        on the streak, so the streak is first put back to what that transition found
-        (``_LaneState.transition_streak``); the replayed transition then counts it once."""
+        Pure: a serializer that died INSIDE its terminal transition may already have counted its
+        fault on the streak, so the streak read is the one that transition found
+        (:func:`_found_streak`); :meth:`_run_lane` puts it back before the replay counts it once."""
         st = self._states[lane]  # the caller respawns only a lane whose state it read
-        if st.transition_streak is not None:
-            st.infra_error_streak = st.transition_streak
-            st.transition_streak = None
         if st.drained is not None:
             outcome, tail, head = st.drained
             if head is None:
                 return outcome, [], list(tail)
-            streak = 0 if outcome.made_progress else st.infra_error_streak
+            streak = 0 if outcome.made_progress else _found_streak(st)
             park_until = self._clock() + self._infra_backoff(streak)
             return replace(outcome, park_until=park_until), [head[0]], list(tail)
         i = min(st.drain_index, max(len(ids) - 1, 0))
-        streak = st.infra_error_streak if i == 0 else 0
+        streak = _found_streak(st) if i == 0 else 0
         park_until = self._clock() + self._infra_backoff(streak)
         outcome = _LaneOutcome(
             LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)
@@ -1620,7 +1622,7 @@ class StageDispatcher:
         do (:func:`wait_to_retry`), and treats the whole prefix as a T17 head
         (:meth:`_dead_serializer_outcome`)."""
         recover = recover_ids is not None
-        claimed = len(items) if recover_ids is None else len(recover_ids)
+        claimed = len(recover_ids if recover_ids is not None else items)
         # BACKLOG #1611: the lease these rows were claimed under, read before the body runs, so a
         # lease change during the body or the first re-pend still fences the retries. Every
         # dispatched serializer is handed the one read at its spawn (which its replacement reuses);
@@ -1665,6 +1667,9 @@ class StageDispatcher:
                     ),
                 )
             outcome, head_ids, tail_ids = self._dead_serializer_outcome(lane, recover_ids)
+            if st_r is not None and st_r.transition_streak is not None:
+                # A death inside the terminal transition: the replay below counts the fault once.
+                st_r.infra_error_streak, st_r.transition_streak = st_r.transition_streak, None
             when = outcome.park_until or 0.0
             if held is not None:
                 head = tail = held
@@ -2495,7 +2500,11 @@ class StageDispatcher:
 
     @property
     def processing_lanes(self) -> int:
-        return len(self._lane_tasks)
+        """Serializers holding a processing slot: a dead serializer's replacement holds none
+        (BACKLOG #4607), so the conservation law holds while one runs."""
+        return sum(
+            1 for lane in self._lane_tasks if (st := self._states.get(lane)) and st.slot_held
+        )
 
     @property
     def paused_count(self) -> int:
