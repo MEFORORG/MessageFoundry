@@ -421,7 +421,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   (a non-loopback host, a declared TLS-terminating proxy, a set `[api].trusted_proxies`, or a set
   `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
-  (`serve_web_console = true` with an operator certificate + `web_console_public_address`). The `/ui` surface stays *stricter*
+  (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback is refused without an operator
   `[api].tls_cert_file`, and that refusal holds even under
   `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared

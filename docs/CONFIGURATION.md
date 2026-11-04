@@ -334,9 +334,9 @@ The one row that *does* vary:
 > ASVS 12.1.1 startup probe dials that origin to measure the terminator's TLS floor, so leaving it
 > unset *silently disabled the check* rather than failing it — and a control that degrades to a
 > no-op reports success forever afterwards. So on a PHI instance, read this as a property of the
-> **deployment posture**, not of whether you serve the console. It is only in the **off-loopback operator-certificate** case, with
-> no proxy in `trusted_proxies`, that an unset origin only warns — and *there* the ceremonies do
-> fail closed (no passkeys) until you set it.
+> **deployment posture**, not of whether you serve the console. In the **off-loopback operator-certificate** case, with
+> no proxy in `trusted_proxies`, an unset origin only warns, and the ceremonies fail closed (no
+> passkeys) until you set it.
 > Either way, **changing its host later invalidates every enrolled passkey** (they pin their
 > mint-time RP; the account page marks them "unusable (origin changed)").
 >
