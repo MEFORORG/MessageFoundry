@@ -2122,9 +2122,10 @@ def _guard_ftps_revocation(
     RevocationHopGuard.capture(
         host=str(s["host"]),
         cell=f"REMOTEFILE ftps {direction}",
+        # The relaxed record says itself what the hop lacks; see the MLLP destination.
         description=(
-            f"verified FTPS {'upload' if direction == 'destination' else 'poll'} "
-            "(no revocation check)"
+            f"verified FTPS {'upload' if direction == 'destination' else 'poll'}"
+            + ("" if s.get("tls_allow_expired") else " (no revocation check)")
         ),
         attested=attested,
         attested_reason=attested_reason,

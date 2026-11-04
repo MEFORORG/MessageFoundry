@@ -913,7 +913,10 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
     verified by reading ``ctx.check_hostname``, so call this AFTER the caller has set it: on a hop with
     ``tls_check_hostname=false`` the hostname is NOT verified, and the line says so rather than
     claiming it is. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): it used to say "the chain, hostname,
-    and key-usage are still verified" unconditionally, which was false on exactly that hop. The
+    and key-usage are still verified" unconditionally, which was false on exactly that hop.
+    CORRECTED 2026-11-03 (vault BACKLOG #5089): "the chain ... still verified" also over-stated, since
+    the relaxation skips the validity periods of the intermediates and the trust anchor and a CRL's
+    own window, as above; the line now names those and claims only the chain's signatures. The
     warning fires when the relaxation is
     ENABLED (once per connector build); whether an expired cert is then actually presented is an
     OpenSSL-internal handshake detail this context-level flag does not surface. It NEVER weakens the
@@ -926,15 +929,16 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
         return
     ctx.verify_flags |= _X509_V_FLAG_NO_CHECK_TIME
     still_verified = (
-        "the chain, hostname, and key-usage are still verified"
+        "the chain's signatures, the hostname and key usage are still verified"
         if ctx.check_hostname
-        else "the chain and key-usage are still verified, but the hostname is NOT "
+        else "the chain's signatures and key usage are still verified, but the hostname is NOT "
         "(tls_check_hostname=false)"
     )
     logger.warning(
         "TLS certificate expiry validation is RELAXED for the hop to %s (tls_allow_expired=true): an "
-        "EXPIRED server certificate will be accepted; %s. Restore a valid certificate as soon as "
-        "possible.",
+        "EXPIRED server certificate will be accepted, and at least the validity periods of the "
+        "intermediates and the trust anchor, and a CRL's own validity window, go unchecked too; %s. "
+        "Restore a valid certificate as soon as possible.",
         host or "(unspecified host)",
         still_verified,
     )

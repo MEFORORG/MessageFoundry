@@ -498,6 +498,11 @@ _RELAXED_CROSSING = (
     "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
 )
 
+#: The suffix the MLLP, DICOM SCU and FTPS call sites put on their description only on a hop that
+#: keeps the validity-period check: on a relaxed hop it would lead the record with "no revocation
+#: check" before the record says a CRL there still refuses a leaf it lists (BACKLOG #5089).
+_UNRELAXED_DESCRIPTION = "(no revocation check)"
+
 
 def _crl_context(*, skip_validity: bool) -> ssl.SSLContext:
     ctx = ssl.create_default_context()
@@ -928,11 +933,15 @@ def test_an_expiry_relaxed_ftps_hop_with_a_crl_is_worded_as_relaxed(
     assert _RELAXED_CROSSING in shipped, crossed.state()
     assert _RELAXED_DETAIL in shipped, crossed.state()
     assert "NO certificate revocation checking" not in shipped, crossed.state()
+    verb = "upload" if direction == "destination" else "poll"
+    assert f"verified FTPS {verb} to {REMOTE}: the peer" in shipped, crossed.state()
+    assert _UNRELAXED_DESCRIPTION not in shipped, crossed.state()
     with active_hop_posture(NOT_ENFORCING), _guard_log() as warned:
         build(attested=False)
     revocation = [m for m in warned.messages if f"REMOTEFILE ftps {direction}" in m]
     assert revocation, warned.state()
     assert all(_RELAXED_DETAIL in m for m in revocation), warned.state()
+    assert not any(_UNRELAXED_DESCRIPTION in m for m in revocation), warned.state()
 
 
 @pytest.mark.parametrize("shape", ["missing", "not a crl"])
@@ -1224,6 +1233,8 @@ def _assert_refused_for_the_relaxation(
     assert "Configure [tls].crl_file" not in text
     assert f"connection '{connection}';" in text
     assert _RELAXED_DETAIL in text
+    # The call site's description does not lead the relaxed record with less than it then says.
+    assert _UNRELAXED_DESCRIPTION not in text
 
 
 def test_a_crl_does_not_admit_an_mllp_destination_that_ignores_certificate_expiry(
@@ -1261,6 +1272,8 @@ def test_an_expiry_relaxed_mllp_destination_crosses_on_its_attestation_and_is_au
     assert _RELAXED_CROSSING in shipped, log.state()
     assert _RELAXED_DETAIL in shipped, log.state()
     assert "NO certificate revocation checking" not in shipped, log.state()
+    assert f"verified MLLP-over-TLS egress to {REMOTE}: the peer" in shipped, log.state()
+    assert _UNRELAXED_DESCRIPTION not in shipped, log.state()
 
 
 def test_a_crl_still_admits_an_mllp_destination_that_checks_expiry(bare_crl: str) -> None:
@@ -1313,6 +1326,8 @@ def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
     assert "DICOM C-STORE client (SCU) over TLS" in shipped
     assert _RELAXED_CROSSING in shipped, log.state()
     assert _RELAXED_DETAIL in shipped, log.state()
+    assert f"verified DICOM-over-TLS association to {REMOTE}: the peer" in shipped, log.state()
+    assert _UNRELAXED_DESCRIPTION not in shipped, log.state()
 
 
 def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str) -> None:
@@ -1332,6 +1347,28 @@ def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str
         # Each WARNING words the hop as relaxed (BACKLOG #5089), not as one with no check at all.
         assert all(_RELAXED_DETAIL in m for m in lines), log.state()
         assert not any("NO certificate revocation checking" in m for m in lines), log.state()
+        assert not any(_UNRELAXED_DESCRIPTION in m for m in lines), log.state()
+
+
+def test_an_unrelaxed_hop_keeps_its_no_revocation_check_description() -> None:
+    """The control for the relaxed arms' ``_UNRELAXED_DESCRIPTION`` checks: without
+    ``tls_allow_expired`` and with no CRL, each call site still leads its record with it, so an
+    assertion that it is absent can fail (BACKLOG #5089)."""
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+        MLLPDestination(_mllp(REMOTE))
+        DicomScuDestination(_scu(REMOTE))
+        RemoteFileDestination(_ftps(REMOTE))
+        RemoteFileSource(_poll(REMOTE))
+    for hop in (
+        "verified MLLP-over-TLS egress",
+        "verified DICOM-over-TLS association",
+        "verified FTPS upload",
+        "verified FTPS poll",
+    ):
+        lines = [m for m in log.messages if hop in m and "revocation" in m]
+        assert lines, log.state()
+        assert all(f"{hop} {_UNRELAXED_DESCRIPTION} to {REMOTE}:" in m for m in lines), log.state()
+        assert not any(_RELAXED_DETAIL in m for m in lines), log.state()
 
 
 def test_a_crl_still_admits_a_dicom_scu_that_checks_expiry(bare_crl: str) -> None:

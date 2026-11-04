@@ -2371,7 +2371,9 @@ class DicomScuDestination(DestinationConnector):
             RevocationHopGuard.capture(
                 host=self._host,
                 cell="DICOM C-STORE client (SCU) over TLS",
-                description="verified DICOM-over-TLS association (no revocation check)",
+                # The relaxed record says itself what the hop lacks; see the MLLP destination.
+                description="verified DICOM-over-TLS association"
+                + ("" if skips_validity_period(self._ssl) else " (no revocation check)"),
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,

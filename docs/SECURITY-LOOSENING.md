@@ -1796,8 +1796,13 @@ count is above `0` (vault BACKLOG #2613).
   which a CRL used to admit without the revocation WARNING, now logs that WARNING at each build, except at
   least when `MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own
   `tls_revocation_attested`, or on a loopback hop. CORRECTED 2026-10-30:
-  this said "No posture gate keys on it", which was false once the call sites handed the guard no
-  context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged. The engine will tell you *which* connections have it set,
+  this said "No posture gate keys on it", which was false once the call sites stopped giving such a
+  hop CRL credit. At least MLLP, the DICOM C-STORE SCU and both FTPS directions pass
+  `RevocationHopGuard.capture` the context they dial with and `expiry_relaxed=True`, which drops
+  the credit whatever CRL the context loads (vault BACKLOG #5089); at least REST, SOAP and FHIR
+  hand the guard no context or opener (ADR 0173 §4.3 and §13). CORRECTED 2026-11-03: this said
+  `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
+  which stopped being true when `capture` gained that flag. The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.

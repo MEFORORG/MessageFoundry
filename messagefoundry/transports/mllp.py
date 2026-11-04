@@ -925,7 +925,10 @@ class MLLPDestination(DestinationConnector):
             RevocationHopGuard.capture(
                 host=self.host,
                 cell="MLLP outbound",
-                description="verified MLLP-over-TLS egress (no revocation check)",
+                # The relaxed record says itself what the hop lacks, and a CRL there still refuses
+                # a leaf it lists, so "(no revocation check)" would lead it with less than is true.
+                description="verified MLLP-over-TLS egress"
+                + ("" if skips_validity_period(self._ssl) else " (no revocation check)"),
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
