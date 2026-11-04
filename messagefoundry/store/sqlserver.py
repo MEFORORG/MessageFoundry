@@ -432,10 +432,10 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
 
     A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open
     transaction and its locks on the server, and an operator whose writes are timing out needs a
-    line that points at it (BACKLOG #1940). That is the failed work's transaction after a rollback
-    that failed or ran past its bound (:meth:`SqlServerStore._rollback_or_discard`: an audit
-    append, a lease claim or another write), or the abandoned statement's after a quarantined
-    cancellation (:meth:`SqlServerStore._release_dirty`)."""
+    line that points at it (BACKLOG #1940). Whose transaction depends on the discard, which is any
+    :func:`_detach_connection` names: for example the failed work's after a rollback that failed or
+    ran past its bound (:meth:`SqlServerStore._rollback_or_discard`), or a failed schema batch's,
+    which may hold the schema applock."""
     if not fut.cancelled() and fut.exception() is not None:
         log.warning(
             "sqlserver: detached close of a discarded connection failed; the server may hold its"
@@ -447,11 +447,11 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
 
-    The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
-    quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
+    The one detach sequence every discard uses (BACKLOG #1940, engine PR 1722 defect 5), at least:
+    the quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
     discard after a rollback that failed or ran past its bound
     (:meth:`SqlServerStore._rollback_or_discard`), whether of an audit append, a lease claim or
-    another write.
+    another write, and the discards after a failed schema batch and a failed LOCK_TIMEOUT reset.
 
     **The first write is the guarantee, and nothing here awaits.** aioodbc derives
     ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
@@ -5447,6 +5447,9 @@ class SqlServerStore:
             async with nullcontext() if within is None else asyncio.timeout(within):
                 await conn.rollback()
         except Exception as exc:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
+            # Detach before logging, so nothing the log line computes can skip the discard.
+            # Its future is deliberately not awaited; see the docstring.
+            _detach_connection(conn)
             log.warning(
                 "sqlserver: rollback after a failed transaction failed or ran past its bound"
                 " (%s, SQLSTATE %s); discarding the connection",
@@ -5454,8 +5457,6 @@ class SqlServerStore:
                 driver_sqlstate(exc),
             )
             log.debug("sqlserver: the failed rollback's traceback", exc_info=True)
-            # Its future is deliberately not awaited; see the docstring.
-            _detach_connection(conn)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.

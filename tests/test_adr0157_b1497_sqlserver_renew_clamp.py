@@ -23,6 +23,7 @@ import contextlib
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -403,56 +404,68 @@ class _DriverError(Exception):
 
 
 # Synthetic driver texts in the shape SQL Server writes for 2627 and 2628, each quoting a made-up
-# stored value. Neither value may reach a WARNING record.
+# stored value. Neither value may reach a WARNING record. Factories, so each case raises fresh
+# instances and no traceback or context carries over from an earlier case.
 _DUPLICATED_ID = "SYNTHETIC-ROW-1111"
 _TRUNCATED_VALUE = "SYNTHETIC-ROW-2222"
-_DUPLICATE_KEY = _DriverError(
-    "23000",
-    "[23000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Violation of PRIMARY KEY"
-    " constraint 'PK_t'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key value"
-    f" is ({_DUPLICATED_ID}). (2627) (SQLExecDirectW)",
-)
-_TRUNCATION = _DriverError(
-    "22001",
-    "[22001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]String or binary data would"
-    f" be truncated in table 'dbo.t', column 'c'. Truncated value: '{_TRUNCATED_VALUE}'."
-    " (2628) (SQLEndTran)",
-)
 
 
+def _duplicate_key() -> _DriverError:
+    return _DriverError(
+        "23000",
+        "[23000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Violation of PRIMARY KEY"
+        " constraint 'PK_t'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key"
+        f" value is ({_DUPLICATED_ID}). (2627) (SQLExecDirectW)",
+    )
+
+
+def _truncation() -> _DriverError:
+    return _DriverError(
+        "22001",
+        "[22001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]String or binary data would"
+        f" be truncated in table 'dbo.t', column 'c'. Truncated value: '{_TRUNCATED_VALUE}'."
+        " (2628) (SQLEndTran)",
+    )
+
+
+def _other_error() -> Exception:
+    return RuntimeError(f"rollback refused near ({_DUPLICATED_ID})")
+
+
+@pytest.fixture
+def _fake_is_a_driver_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pyodbc is an optional extra; stand the fake in for its error class."""
+    import messagefoundry.store.base as store_base
+
+    monkeypatch.setattr(
+        store_base, "_is_server_driver_error", lambda exc: isinstance(exc, _DriverError)
+    )
+
+
+@pytest.mark.usefixtures("_fake_is_a_driver_error")
 @pytest.mark.parametrize(
     ("rollback_fail", "named"),
     [
-        (_TRUNCATION, "(_DriverError, SQLSTATE 22001)"),
+        (_truncation, "(_DriverError, SQLSTATE 22001)"),
         # Not a driver error, so its first argument is never read as a SQLSTATE.
-        (
-            RuntimeError(f"rollback refused near ({_DUPLICATED_ID})"),
-            "(RuntimeError, SQLSTATE None)",
-        ),
+        (_other_error, "(RuntimeError, SQLSTATE None)"),
     ],
     ids=["driver-error", "other-error"],
 )
 @pytest.mark.parametrize("method", ["_execute", "_execute_output", "_fetchone"])
 async def test_a_failed_rollback_logs_no_stored_value_or_traceback_at_warning(
     method: str,
-    rollback_fail: Exception,
+    rollback_fail: Callable[[], Exception],
     named: str,
     caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The discard's WARNING names the rollback's class and SQLSTATE only. A traceback there would
     print the rollback's own text and, as its context, the write's: both can quote stored values,
     and section 9 of CLAUDE.md keeps message content out of the general log at INFO and above.
     Before this repair the WARNING carried ``exc_info``, so both values reached it."""
-    import messagefoundry.store.base as store_base
-
-    # pyodbc is an optional extra; stand the fake in for its error class.
-    monkeypatch.setattr(
-        store_base, "_is_server_driver_error", lambda exc: isinstance(exc, _DriverError)
-    )
     conn = _Conn()
-    conn.fail = _DUPLICATE_KEY
-    conn.rollback_fail = rollback_fail
+    conn.fail = _duplicate_key()
+    conn.rollback_fail = rollback_fail()
     store = _store(conn)
     with (
         caplog.at_level(logging.DEBUG, logger="messagefoundry.store.sqlserver"),
@@ -469,6 +482,25 @@ async def test_a_failed_rollback_logs_no_stored_value_or_traceback_at_warning(
     assert named in discard.getMessage()
     # The traceback is still there for diagnosis, at DEBUG only.
     assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
+
+
+async def test_the_discard_runs_before_the_warning_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing the WARNING computes can skip the discard: with the SQLSTATE read raising, the
+    connection whose rollback failed is still out of the pool."""
+    import messagefoundry.store.sqlserver as sqlserver
+
+    def _refuse(_exc: BaseException) -> str | None:
+        raise LookupError("synthetic: the SQLSTATE read failed")
+
+    monkeypatch.setattr(sqlserver, "driver_sqlstate", _refuse)
+    conn = _Conn()
+    conn.fail = _duplicate_key()
+    conn.rollback_fail = _truncation()
+    with pytest.raises(LookupError):
+        await _store(conn)._execute("INSERT INTO t VALUES (?)", ("x",))
+    assert conn.closed is True
 
 
 async def test_a_rollback_that_succeeds_still_recycles_the_connection() -> None:
