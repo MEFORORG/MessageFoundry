@@ -197,14 +197,14 @@ The PySide6 **desktop console was retired** and `messagefoundry/console/` delete
 
 | Feature | Status | Notes |
 |---------|:--:|-------|
-| HL7 autocomplete (bundled hl7apy 2.5.1 schema) + validate-on-save | ✅ | `media/hl7schema.json` is generated ahead of time from `messagefoundry hl7schema`, so there is no per-keystroke Python; a Python save coalesces into one validate + graph + code-set refresh |
+| HL7 autocomplete (bundled hl7apy 2.5.1 schema) + validate-on-save | ✅ | `media/hl7schema.json` is generated ahead of time from `messagefoundry-toolkit hl7schema`, so there is no per-keystroke Python; a Python save coalesces into one validate + graph + code-set refresh |
 | Components sidebar — element / flow perspectives, filter + group | ✅ | The wired graph from `messagefoundry graph`; **Toggle Element / Flow View**, **Filter / Group Components**, Refresh |
 | Translation Tables sidebar + CSV grid editor | ✅ | The code sets under `codesets/` (via `messagefoundry codeset`); New / Edit / Rename / Delete / Refresh, a CSV grid form editor (TOML-authored sets stay read-only) |
 | Home authoring page (webview launchpad) | ✅ | Wizards / test & data / operate / setup actions in one panel |
 | Wizards — Route, Connection, Router, Handler, Alert | ✅ | Route = IB→Router→Handler→OB in one flow; Connection also has a keyboard-only variant; Alert edits the service TOML's `[[alerts.rules]]` (ADR 0014) |
 | Test Bench (dry-run + before/after diff + debug step-through) | ✅ | |
 | Live Debug — annotate the code on save from a synthetic dry-run | ✅ | Disposition summary + per-line values; message-derived values **redacted by default**; *Reveal Values for One Run* shows real values for that one run and the next run is masked again, synthetic samples only, never a real engine; debounced (`liveDebug.debounceMs`) |
-| Steps view over a Handler `.py` | ✅ | ADR 0076 — a custom editor over the *real* Python via `messagefoundry lens parse` / `lens rewrite`; plain `.py` stays the only artifact and the only execution path |
+| Steps view over a Handler `.py` | ✅ | ADR 0076 — a custom editor over the *real* Python via `messagefoundry-toolkit lens parse` / `lens rewrite`; plain `.py` stays the only artifact and the only execution path |
 | Wiring Map (read-only graph panel) | ✅ | Open from the Components title bar or *Show in Wiring Map*; no drag-drop and no editing of any kind |
 | Insert Element + scaffold snippets + Cookbook | ✅ | `Ctrl+Alt+I` / `Cmd+Alt+I`, the bundled Python snippet set, and a searchable gallery of solved problems — each drops real, editable Python |
 | Stage → Promote to a running engine | ✅ | `engineUrl` / `environments` (and an environment's engine instances) are **machine-scoped**, so a checked-in `.vscode/settings.json` cannot retarget a promote — and the credentials it carries — at another host |
@@ -212,7 +212,7 @@ The PySide6 **desktop console was retired** and `messagefoundry/console/` delete
 | Start / Stop / Restart a **local** engine + Python-env / engine setup | ✅ | ADR 0112 — offered for a local, loopback target in a trusted workspace |
 | Opt-in live status + count decorations on connection rows | ✅ | `liveStatus.enabled` / `intervalSeconds` (≥5s) — polls `GET /connections` for status words and counts only, never message content |
 | `connections.toml` GUI editor | ✅ | ADR 0007 (#193) — a custom editor over `**/connections.toml` |
-| Security-settings editor, Generate Samples, version-control setup | ✅ | `[security]` posture switches via `messagefoundry security`; a synthetic corpus via `messagefoundry generate`; a guided git + commit-time `messagefoundry check` setup (`sourceControl.autoPrompt`) |
+| Security-settings editor, Generate Samples, version-control setup | ✅ | `[security]` posture switches via `messagefoundry security`; a synthetic corpus via `messagefoundry-toolkit generate`; a guided git + commit-time `messagefoundry check` setup (`sourceControl.autoPrompt`) |
 | `@messagefoundry` chat participant (provider-agnostic, PHI-safe) | ✅ | code + schema + graph only — `/explain`, `/transform`, `/router`, `/review`, `/migrate`, `/test`; `ai.contextCharLimit` bounds the editor code attached (`0` = graph names only), and *Show AI Policy* prints the governing policy |
 | Getting-started walkthrough (9 cards) | ✅ | Engine target → config dir → Connection → Route → Insert Element → Test Bench → Live Debug → Cookbook → Stage → Promote |
 | Untrusted-workspace limited mode | ✅ | `untrustedWorkspaces: limited` — the workspace Python CLI is not auto-run (validate / graph / codeset / promote disabled) until the workspace is trusted |
@@ -228,8 +228,8 @@ The PySide6 **desktop console was retired** and `messagefoundry/console/` delete
 | Environments + deferred `env()` values (`environments/<env>.toml`) | ✅ | |
 | Env-aware promote (dry-run pre-flight) | ✅ | |
 | Config reload (`POST /config/reload`, allow-list-confined + audited) | ✅ | #85/#101 |
-| CLI subcommands | ✅ | Run/author (`serve`, `supervise`, `init`, `import`, `validate`, `graph`, `dryrun`, `check`, `impact`, `connection`, `codeset`, `alert`, `security`, `generate`, `lens`, `hl7schema`, `hl7structures`, `ai-policy`, `cluster-vip`) + operate (`backup`, `restore-verify`, `rotate-key`, `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-reset-totp`, `provision-admin`, `gen-key`, `protect-key`, `cert`, `verify`, `support-bundle`, `service`) — `_DISPATCH` in `__main__.py` is the registry. `messagefoundry/cli_surface.py` (`CLI_TIERS`) gives every subcommand its tier, production or toolkit; a pinned count here went stale. ADR 0201 moves the toolkit rows to a separate `messagefoundry-toolkit` command, and `adr-analyze` has moved (`python -m messagefoundry_toolkit` in a checkout) |
-| Synthetic HL7 generators (ADT, …) | ✅ | `messagefoundry generate`; corpus git-ignored |
+| CLI subcommands | ✅ | Run/check (`serve`, `supervise`, `validate`, `graph`, `dryrun`, `check`, `connection`, `codeset`, `alert`, `security`, `ai-policy`, `cluster-vip`) + operate (`backup`, `restore-verify`, `rotate-key`, `audit-verify`, `audit-anchor`, `admin-unlock`, `admin-reset-totp`, `provision-admin`, `gen-key`, `protect-key`, `cert`, `verify`, `support-bundle`, `service`) on the engine's `messagefoundry` command, whose registry is `_DISPATCH` in `messagefoundry/__main__.py`. The authoring commands (`init`, `import`, `impact`, `generate`, `lens`, `hl7schema`, `hl7structures`, `adr-analyze`) are on the separate `messagefoundry-toolkit` command (ADR 0201; `python -m messagefoundry_toolkit` in a checkout), whose registry is `_DISPATCH` in `messagefoundry_toolkit/__main__.py`. `messagefoundry/cli_surface.py` (`CLI_TIERS`) gives every subcommand its tier, and each command registers exactly its own tier's rows; a pinned count here went stale |
+| Synthetic HL7 generators (ADT, …) | ✅ | `messagefoundry-toolkit generate`; corpus git-ignored |
 | Windows service via NSSM | ✅ | docs/SERVICE.md |
 
 ## 13. Release & Distribution

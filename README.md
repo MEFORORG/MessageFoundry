@@ -97,7 +97,8 @@ dependency**, then scaffold your own config repo ([ADR 0017](https://github.com/
 
 ```bash
 pip install "messagefoundry==<version>"   # pin the exact engine version (core runtime, SQLite store)
-messagefoundry init ./my-config-repo      # scaffold a standalone config repo
+pip install "messagefoundry-toolkit==<version>"   # the authoring commands, same version; not for a production host
+messagefoundry-toolkit init ./my-config-repo   # scaffold a standalone config repo
 cd ./my-config-repo
 messagefoundry provision-admin --username <name> --email <address>   # the first administrator
 python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev
