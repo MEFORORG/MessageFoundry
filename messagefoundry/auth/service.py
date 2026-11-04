@@ -11766,8 +11766,8 @@ class AuthService:
     ) -> tuple[int, bool]:
         """Admin: end every account's sessions at once (BACKLOG #2614), for a suspected
         compromise where walking the accounts one by one would leave the rest live meanwhile.
-        ``keep_token_hash`` keeps the caller's own session, so the administrator who ran it is not
-        signed out mid-response. Returns the count and whether that session was kept. Audited
+        ``keep_token_hash`` names the caller's own session for the revoke to keep, so the
+        administrator who ran it is not signed out mid-response where the revoke re-stamps it. Returns the count and whether that session was kept. Audited
         even when the count is zero, because the act itself is the record an investigator looks
         for. The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 

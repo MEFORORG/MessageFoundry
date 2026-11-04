@@ -2901,7 +2901,11 @@ def global_epoch_unmoved(current: int | None) -> EpochRaise | None:
     and ended, and the revoke still ends the rest rather than roll back and keep them live. The
     missing row is logged, since every other read of it refuses loudly."""
     if current is None:
-        log.warning("%s; the kept session is ended with the rest", GLOBAL_SESSION_EPOCH_MISSING)
+        log.warning(
+            "%s; the session this revoke was asked to keep is not re-stamped, and if it is a live"
+            " session of this account it will be ended with the rest",
+            GLOBAL_SESSION_EPOCH_MISSING,
+        )
         return None
     return EpochRaise(current, current)
 
@@ -18282,7 +18286,8 @@ class MessageStore:
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> RevokeResult:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
-        caller's current session — "sign out everywhere else"). Returns the number revoked and
+        caller's current session — "sign out everywhere else"), which is kept only when it is
+        re-stamped below and is otherwise ended too. Returns the number revoked and
         whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy

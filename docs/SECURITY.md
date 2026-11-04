@@ -5427,9 +5427,11 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
   passwordless or smartcard-only account cannot end its other sessions this way;
-- end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session, or from
-  the host with `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What
-  these and the per-account revokes above may miss: *Limits of the session sweep* under
+- end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session only when
+  the revoke re-stamps it and otherwise ends it too, or from the host with
+  `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What these and the
+  per-account revokes above may miss, and when a revoke ends the session it was asked to keep:
+  *Limits of the session sweep* under
   [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142).
 
 [CONFIGURATION.md](CONFIGURATION.md) documents each setting.
@@ -5445,8 +5447,11 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
   to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
   already hold does not unlock a terminate, and the grant is single-use.
-- **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your sessions except the current.
-  Same `session_terminate` re-proof gate.
+- **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your other sessions. The
+  current one is kept only when the revoke re-stamps it. Otherwise it is ended too, in the
+  revoke's own transaction, or by a fallback sweep where its own seal fails; *Limits of the
+  session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says
+  when. Same `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 

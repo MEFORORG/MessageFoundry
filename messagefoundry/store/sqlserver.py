@@ -15736,8 +15736,23 @@ class SqlServerStore:
         account row first, and this transaction already holds it. Every reader of the global row
         takes no hint, so under READ_COMMITTED_SNAPSHOT it never waits, and without it holds its
         shared lock only for the read. A session minted between the sweep and the commit read the
-        old value, so it ends when this commits. Read from the code and not run against a server
-        that has READ_COMMITTED_SNAPSHOT off."""
+        old value, so it ends when this commits.
+
+        The per-account :meth:`revoke_user_sessions` reads the global row too (follow-up to
+        BACKLOG #4975), with no hint, while it holds its account row (``UPDLOCK`` from the epoch
+        raise's read, then the raise's own write) and the X locks of the session rows its sweep
+        ended. That closes no cycle with this method. Each takes the account row before any
+        session row or the global row, and this method takes the row of every account its list
+        read returned before it raises the global epoch. On such an account, whichever takes the
+        account row first goes on, and the other waits on that row while holding nothing the
+        first needs: this method before it holds the global row, the per-account revoke before it
+        holds any session row. A per-account revoke of an account the list read did not return
+        takes no row this method waits on once it holds the global row, since the only row left
+        then is the kept session's. On ``DELETE /sessions`` that is the caller's own, signed in
+        before this transaction began, so its account is one that read returned; a direct store
+        call that names a session of an account created after that read is outside this
+        reasoning. Read from the code and not run against a server that has
+        READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
