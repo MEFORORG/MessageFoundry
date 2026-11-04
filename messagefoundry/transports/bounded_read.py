@@ -109,9 +109,11 @@ refused before anything enters the tunnel.
 is about the request, not the reply. It lives here because :func:`build_strict_opener` is the one
 place every engine urllib opener is built. See :class:`LoopbackDirectProxyHandler`.
 
-**A credential from a proxy URL never reaches a proxy**, in cleartext or over TLS (vault BACKLOG
-#2572, #3410, #4909, ASVS 12.2.1). The same handler makes that check, for the same reason. See
-:class:`ProxyCredentialsRefusedError`, which states the rule and what it does not cover.
+**On an engine urllib opener, a credential from a proxy URL is refused before the dial**, on the
+cleartext legs and the TLS legs :class:`ProxyCredentialsRefusedError` names (vault BACKLOG #2572,
+#3410, #4909, ASVS 12.2.1). The requests-based Vault hop is not one of these openers. The same
+handler makes that check, for the same reason. That class states the rule and what it does not
+cover.
 """
 
 from __future__ import annotations
@@ -833,9 +835,8 @@ _UNSENDABLE_PROXY_VALUE = (
 )
 _TLS_PROXY_CREDENTIALS = (
     "a web proxy credential for this request would reach a proxy over TLS, and it comes from a "
-    "proxy URL or no connection admitted it. Such a credential is not sent on any leg. Take the "
-    "credentials out of the proxy URL, or remove the Proxy-Authorization header; refusing to "
-    "send (vault BACKLOG #4909)"
+    "proxy URL or no connection admitted it. Take the credentials out of the proxy URL, or "
+    "remove the Proxy-Authorization header; refusing to send (vault BACKLOG #4909)"
 )
 #: The attribute that marks a request for that refusal, from the proxy handler to the https handler.
 _TLS_LEG_REFUSAL_ATTR = "_mefor_proxy_tls_leg_refusal"
@@ -847,7 +848,8 @@ _UNVERIFIED_PROXY_TLS = (
 
 
 class ProxyCredentialsRefusedError(urllib.error.URLError):
-    """A request would send a web-proxy credential where it could be read on the way.
+    """A request would send a web-proxy credential where it could be read on the way, or over a
+    TLS leg that fully verifies the proxy, which is refused on another ground.
 
     A web-proxy credential is a ``Proxy-Authorization`` header on a request. urllib makes one from
     a user and a password in a proxy URL, and a caller may set one, as a connection's
@@ -869,25 +871,28 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     A credential that rides a ``CONNECT`` is judged as cleartext, whatever TLS follows it.
 
     **On a TLS leg that fully verifies the proxy, a credential from a proxy URL is refused too,
-    and so is a plainly spelled header no connection admitted** (vault BACKLOG #4909). So a
-    credential from a proxy URL, the environment or the system proxy settings crosses no leg, and
-    neither does a caller-set header no connection admitted. The proxy handler judges the leg,
-    and the strict https handler raises the refusal before it dials, once the request is still
-    bound for the proxy over TLS. That way a request urllib hands back for a ``CONNECT`` is
-    refused in the cleartext text instead, and a context that does not verify the proxy keeps its
-    own text. The environment half rests on decision d20261031T213402506-5d928c. The caller-set
-    half is the proposed scope that row records, not yet ruled.
+    and so is a plainly spelled header no connection admitted** (vault BACKLOG #4909). The ground
+    on that leg is not that the credential could be read on the way. The environment half rests
+    on decision d20261031T213402506-5d928c; the caller-set half is the proposed scope that row
+    records, not yet ruled. So on an opener :func:`build_strict_opener` makes, a credential from
+    a proxy URL, the environment or the system proxy settings is refused on every leg its proxy
+    handler judges, and so is a caller-set header no connection admitted. The requests-based
+    Vault hop is not such an opener: it still sends an ``HTTPS_PROXY`` credential to an
+    ``https://`` proxy over TLS. The proxy handler judges the leg, and the strict https handler
+    raises the refusal before it dials, once the request is still bound for the proxy over TLS.
+    That way a request urllib hands back for a ``CONNECT`` is refused in the cleartext text
+    instead, and a context that does not verify the proxy keeps its own text.
 
     **The one exception.** A caller-set header that its connection admitted when it was built is
     sent on the leg to the proxy that connection's ``transports.rest.ProxyConfig`` names: a
     cleartext leg, or a TLS leg that fully verifies. The admitting check is the connection's
     posture-keyed guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a
     ``proxy_user`` credential when the connection declares ``cleartext_accepted``, or the proxy is
-    on this machine. The connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
-    header in its plain spelling only, under a name that is a ``str`` and no subclass of one.
-    Every other spelling :func:`is_proxy_credential_header_name` reads is never admitted, and
-    none is sent: a name with other characters at either end, and a name of the plain one, a
-    character no name can hold, and any text after it (vault BACKLOG #3457).
+    on this machine. The connection's proxy handler then carries ``caller_header_admitted``. The
+    exception covers that header in its plain spelling only, under a name that is a ``str`` and no
+    subclass of one. Every other spelling :func:`is_proxy_credential_header_name` reads is never
+    admitted, and none is sent: a name with other characters at either end, and a name of the
+    plain one, a character no name can hold, and any text after it (vault BACKLOG #3457).
     Each is judged once in a request, and the answer is kept on the request:
     :func:`_proxy_header_verdicts` says how. One that could be sent is refused on every leg, a
     verified TLS leg included. Its text is a fixed one about the spelling, except where a

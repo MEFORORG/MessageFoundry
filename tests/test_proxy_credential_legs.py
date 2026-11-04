@@ -952,7 +952,8 @@ def test_a_caller_set_header_is_refused_over_unverified_tls(family: str) -> None
 
 @pytest.mark.parametrize("family", list(_UNVERIFIED))
 def test_an_admitted_caller_set_header_is_still_refused_over_unverified_tls(family: str) -> None:
-    """The exception covers cleartext legs only. The guard that admits a caller-set header never
+    """The exception covers a cleartext leg and a TLS leg that fully verifies the proxy (vault
+    BACKLOG #4909), never an unverified one. The guard that admits a caller-set header never
     reads the TLS context, so on a leg whose context does not fully verify the proxy the admitted
     header is refused like any other, and the proxy is never dialled (vault BACKLOG #3418)."""
     with _WireProxy() as proxy:

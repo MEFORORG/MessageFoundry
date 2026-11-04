@@ -2069,8 +2069,9 @@ class ProxyConfig:
             return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
         # A credential is here only because it passed the posture-keyed guard in
         # proxy_auth_handler_from_settings, so the handler may let that caller-set header across a
-        # cleartext proxy leg: the one exception bounded_read.ProxyCredentialsRefusedError states
-        # (vault BACKLOG #3416). An unverified TLS leg is refused regardless.
+        # cleartext proxy leg or a TLS leg that fully verifies the proxy: the one exception
+        # bounded_read.ProxyCredentialsRefusedError states (vault BACKLOG #3416, #4909). An
+        # unverified TLS leg is refused regardless.
         return LoopbackDirectProxyHandler(
             dict(self.proxies),
             caller_header_admitted=admitted and bool(self.auth_header or self.digest),
@@ -2218,8 +2219,9 @@ def proxy_auth_handler_from_settings(
     CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
     So the credential is judged as crossing in cleartext whatever the proxy's scheme, by the ONE
     posture-keyed authority (:func:`_enforce_shipped_hop`), REGARDLESS of destination
-    scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
-    send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
+    scheme (vault BACKLOG #3416). A credential that passes it may cross the proxy leg at send, a
+    cleartext one or a TLS one that fully verifies the proxy: the one exception
+    ``bounded_read.ProxyCredentialsRefusedError`` states (vault BACKLOG #4909). Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
     item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
     ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""

@@ -1724,6 +1724,8 @@ BACKLOG #4909). Every leg the rule refuses, and what it does not check, are stat
 `proxy_url` fails its build with a credential in it ([CONNECTIONS.md](CONNECTIONS.md)), and an
 `[egress].proxy_url` with one is refused at config load. The Vault clients
 refuse a credentialed proxy not written `https://`, when they are built and again on each send.
+They are not urllib hops, so vault BACKLOG #4909 does not reach them: a Vault client would still
+send an `HTTPS_PROXY` credential to an `https://` proxy over TLS.
 
 **The leg to the proxy is not always TLS, even for a proxy written `https://`.** The other
 documents link here rather than restate it.

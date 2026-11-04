@@ -1618,15 +1618,21 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**Engine openers refuse a web-proxy credential on the legs where it could be read on the way,
-with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418, #4909).** That covers a user and password in a proxy URL
-and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
-`HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
-FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. The error names no part of the proxy URL. Which legs are refused, and the one exception for a `proxy_user` credential
-its connection admitted when it was built, are stated once, on
+**The engine's urllib openers refuse a web-proxy credential on the legs where it could be read on
+the way, and on a TLS leg that fully verifies the proxy, with one exception (vault BACKLOG #2572,
+#3410, #3416, #3417, #3418, #4909).** On that verified TLS leg the ground is not that the
+credential could be read on the way: for an environment credential it is decision
+d20261031T213402506-5d928c, and for a caller-set header it is a proposed scope, not yet ruled,
+that the same row records. That covers a user and password in a proxy URL and a `proxy_user` and
+`proxy_password` pair. The proxy may come from `proxy_url`, from `HTTP_PROXY` or `HTTPS_PROXY`, or
+from the system proxy settings. That covers at least REST, SOAP, FHIR, DICOMweb, `FhirLookup`, the
+token endpoints, the alert webhook, the OIDC legs and the AI broker. The error names no part of
+the proxy URL. Which legs are refused, and the one exception for a `proxy_user` credential its
+connection admitted when it was built, are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with what it does
-not check.
+not check. **The requests-based Vault/OpenBao hop is not one of these openers**, and it would
+still send an `HTTPS_PROXY` credential to an `https://` proxy over TLS; its own rule is under
+`[secrets]` in [CONFIGURATION.md](CONFIGURATION.md).
 
 **No declaration lifts a credential written in a proxy URL, and `proxy_user` has one declared way
 (owner rulings of 2026-10-05 and 2026-10-30, vault BACKLOG #3007).** R1 of the vault's
