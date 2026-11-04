@@ -1810,9 +1810,9 @@ count is above `0` (vault BACKLOG #2613).
   flag. `capture` reads only the context it is handed, so a call site that handed it some other,
   unrelaxed context with a CRL would still earn credit. `tests/test_revocation_guard_census.py`
   fails on such a call site among the ones that reach `relax_verify_expiry` by name, in at least
-  the shapes it reads. It reads call shapes by name, not what the code evaluates to, so some shapes
-  can get past it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that file's relaxed-hop
-  census say what it reads. REST, SOAP
+  the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
+  some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
+  file's relaxed-hop census say what it reads. REST, SOAP
   and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
   (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
