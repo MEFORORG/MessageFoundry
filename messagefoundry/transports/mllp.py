@@ -2276,10 +2276,14 @@ class MLLPSource(SourceConnector):
         The injected failed-attempt budget follows ADR 0154 D6. The address's own arm is consulted
         read-only BEFORE the certificate is compared, so an address that has spent it is closed
         unread, whatever certificate it now presents. The global arm is consulted only once the
-        compare has refused: it bounds the volume of refusals and the audit writes they drive, and
-        a listed sender drives none. That leaves no way for refusals from other addresses to close
-        a listed sender unread, which matters because MLLP has no setting that turns the global arm
-        off. A refused sender is charged one failed attempt. A listed one is not noted as
+        compare has refused, and a listed sender is never refused. That leaves no way for refusals
+        from other addresses to close a listed sender unread, which matters because MLLP has no
+        setting that turns the global arm off. What each arm bounds is refusals: the address's arm
+        those from one address, the global arm those from every address, and with each refusal its
+        ``ERROR`` rows, its audit row and its event. Neither bounds the closes on a spent budget:
+        each one still writes an audit row and an event, and only its log line is throttled, so a
+        peer that keeps reconnecting on a spent budget drives one audit write per completed
+        handshake. A refused sender is charged one failed attempt. A listed one is not noted as
         authenticated, as HTTP notes its partners: here the note would gate nothing for the listed
         sender and would only exempt an unlisted certificate from the same address from the global
         arm. Each refusal writes the connection event and the audit row the HTTP listener

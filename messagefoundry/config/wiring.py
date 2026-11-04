@@ -114,7 +114,7 @@ from messagefoundry.connection_names import (
     is_connection_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
-from messagefoundry.credential import QUALIFIED_CERT_NAME
+from messagefoundry.credential import QUALIFIED_CERT_NAME, unmatchable_san_reason
 from messagefoundry.exception_origin import (
     exception_chain,
     raise_statement_file,
@@ -2736,9 +2736,16 @@ def _mllp_client_subjects(value: Any, *, tls: Any, tls_ca_file: Any) -> dict[str
     """``MLLP``'s ``tls_client_subjects`` checked at factory time, or ``None`` when unset (#4907).
 
     The table's shape is ``Http``'s ``intake_client_subjects``, checked by the same function. Then
-    each rule refuses a setting that would be inert or refuse everyone with no start-time error:
-    an empty table, a listener with no client CA (no certificate is requested, so none is listed),
-    and a name ``cert_name_candidates`` can never yield."""
+    each rule refuses a setting that would be inert, refuse everyone with no start-time error, or
+    admit a class of certificates: an empty table, a listener with no client CA (no certificate is
+    requested, so none is listed), a name that is not ``CN:<value>`` / ``SAN:<type>:<value>``, and
+    a ``SAN:`` name :func:`~messagefoundry.credential.unmatchable_san_reason` says
+    ``cert_name_candidates`` can never yield: at least a type ``ssl`` never reports or spells
+    otherwise (``SAN:IP:...`` for ``SAN:IP Address:...``, ``SAN:dns:`` for ``SAN:DNS:``), a
+    placeholder ``ssl`` reports for a name it cannot render (``SAN:othername:<unsupported>``, the
+    X400Name and EdiPartyName forms), and an IP address in a spelling ``ssl`` never writes. A
+    placeholder is refused because it stands for every certificate carrying such a name, not one
+    sender. ``Http``'s ``intake_client_subjects`` checks shape only."""
     if value is None:
         return None
     setting = "MLLP tls_client_subjects"
@@ -2763,6 +2770,17 @@ def _mllp_client_subjects(value: Any, *, tls: Any, tls_ca_file: Any) -> dict[str
             "'SAN:<type>:<value>' / 'CN:<value>', each part non-empty. A certificate's names are "
             "matched as 'SAN:DNS:<value>' and 'CN:<value>', so any other name matches nothing and "
             "would refuse the sender it names"
+        )
+    reasons = [
+        reason
+        for names in subjects.values()
+        for n in names
+        if (reason := unmatchable_san_reason(n)) is not None
+    ]
+    if reasons:
+        raise WiringError(
+            f"{setting} has {len(reasons)} SAN entr{'y' if len(reasons) == 1 else 'ies'} a "
+            f"certificate's names can never match as written; the first is {reasons[0]}"
         )
     return subjects
 

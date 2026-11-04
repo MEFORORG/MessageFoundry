@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
     "QUALIFIED_CERT_NAME",
+    "SAN_TYPES",
     "VERIFIED_ISSUER_KEY",
     "constant_time_equal",
     "constant_time_match",
@@ -42,6 +44,7 @@ __all__ = [
     "cert_name_candidates",
     "client_cert_principal",
     "client_cert_principal_under_issuer",
+    "unmatchable_san_reason",
 ]
 
 # Compared in place of an unconfigured credential slot so the number of digest comparisons does not
@@ -128,7 +131,94 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
 #: A configured name :func:`cert_name_candidates` can actually yield: ``CN:<value>`` or
 #: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
 #: Shared by ``[api].tls_client_cert_identities`` and ``Http``'s ``intake_client_subjects`` (#2287).
+#: It checks shape only; ``MLLP``'s ``tls_client_subjects`` also applies :func:`unmatchable_san_reason`.
 QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
+
+#: The ``subjectAltName`` types ``ssl.getpeercert()`` reports a real value for, spelled as it spells
+#: them (CPython ``_ssl.c``, ``_get_peer_alt_names``). A ``SAN:<type>:`` with any other type, or the
+#: same type in another case, is never yielded by :func:`cert_name_candidates` (BACKLOG #4907).
+SAN_TYPES = ("DNS", "email", "URI", "IP Address", "Registered ID", "DirName", "othername")
+
+#: The types ``ssl`` reports only as a placeholder: it hands x400Address and ediPartyName to OpenSSL's
+#: ``GENERAL_NAME_print``, which writes ``X400Name:<unsupported>`` and ``EdiPartyName:<unsupported>``
+#: whatever the name holds.
+_PLACEHOLDER_ONLY_SAN_TYPES = frozenset({"X400Name", "EdiPartyName"})
+
+#: The text ``ssl`` reports in place of a SAN it cannot render: ``<unsupported>`` for an otherName of a
+#: type OpenSSL does not print, or whose value has the wrong ASN.1 type, and ``<invalid>`` for an
+#: iPAddress of neither 4 nor 16 bytes. Measured on CPython 3.14.7 with OpenSSL 3.5.7 by decoding
+#: certificates carrying each form. One such text stands for a whole class of names, so a listed
+#: placeholder would admit every certificate carrying any name of that class (BACKLOG #4907).
+_SAN_PLACEHOLDERS = ("<unsupported>", "<invalid>")
+
+#: Other spellings of a ``SAN_TYPES`` entry, folded, mapped to the one ``ssl`` writes, so a refusal
+#: can name the right spelling: RFC 5280's names, and the short forms an operator might reach for.
+_SAN_TYPE_SPELLINGS = {
+    **{t.lower().replace(" ", ""): t for t in SAN_TYPES},
+    "ip": "IP Address",
+    "rid": "Registered ID",
+    "dnsname": "DNS",
+    "rfc822name": "email",
+    "uniformresourceidentifier": "URI",
+    "directoryname": "DirName",
+}
+
+
+def _is_placeholder_san(san_type: str, value: str) -> bool:
+    """Whether ``SAN:<san_type>:<value>`` is text ``ssl`` reports in place of a name it cannot
+    render. Fail-closed: a real name carrying the marker text is dropped too, and can only be
+    refused, never admitted, by that."""
+    return san_type in _PLACEHOLDER_ONLY_SAN_TYPES or any(p in value for p in _SAN_PLACEHOLDERS)
+
+
+def _ssl_ip_text(value: str) -> str | None:
+    """``value`` as ``ssl`` writes an iPAddress SAN, or ``None`` when it is not an address.
+
+    ``_ssl.c`` formats the raw bytes itself: IPv4 dotted, IPv6 as eight upper-case hex groups with
+    no leading zeros and no ``::`` compression, so ``2001:db8::1`` is reported ``2001:DB8:0:0:0:0:0:1``."""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if address.version == 4:
+        return str(address)
+    packed = address.packed
+    return ":".join(f"{(packed[i] << 8) | packed[i + 1]:X}" for i in range(0, 16, 2))
+
+
+def unmatchable_san_reason(name: str) -> str | None:
+    """Why :func:`cert_name_candidates` can never yield the ``SAN:`` name ``name``, or ``None``.
+
+    ``None`` for any name that is not ``SAN:<type>:<value>``: :data:`QUALIFIED_CERT_NAME` checks
+    shape. This refuses, at least, a type ``ssl`` never reports, including one of
+    :data:`SAN_TYPES` in another case; a placeholder ``ssl`` reports for a name it cannot render;
+    and an IP address in a spelling ``ssl`` never writes. It does not check any other value against
+    what a certificate can hold. The reason quotes nothing the operator wrote, only ``ssl``'s own
+    spellings, so it can go into an error message as it is."""
+    if not name.startswith("SAN:") or name.count(":") < 2:
+        return None
+    _, san_type, value = name.split(":", 2)
+    folded = san_type.lower().replace(" ", "")
+    if _is_placeholder_san(san_type, value) or folded in {
+        t.lower() for t in _PLACEHOLDER_ONLY_SAN_TYPES
+    }:
+        return (
+            "a placeholder, such as 'SAN:othername:<unsupported>', that ssl reports in place of a "
+            "name it cannot render. X400Name and EdiPartyName are only ever reported that way. "
+            "Every certificate carrying such a name presents the same text, so it names no one "
+            "sender, and a placeholder is never matched"
+        )
+    if san_type not in SAN_TYPES:
+        spelling = _SAN_TYPE_SPELLINGS.get(folded)
+        if spelling is not None:
+            return f"a SAN type ssl never reports in that spelling; ssl writes it {spelling!r}"
+        return "a SAN type ssl never reports; it reports " + ", ".join(repr(t) for t in SAN_TYPES)
+    if san_type == "IP Address" and _ssl_ip_text(value) != value:
+        return (
+            "an IP address in a spelling ssl never writes: IPv4 dotted, and IPv6 as eight "
+            "upper-case hex groups with no leading zeros and no '::'"
+        )
+    return None
 
 
 def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
@@ -137,7 +227,12 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
     Yields ``"CN:<commonName>"`` for each subject commonName RDN and ``"SAN:<type>:<value>"`` for each
     subjectAltName entry (e.g. ``"SAN:DNS:svc.internal"``). These are the exact keys an operator lists
     under an issuer in ``[api].tls_client_cert_identities`` — qualifying the name space (CN vs SAN,
-    SAN type) means a spoofed commonName can never collide with a pinned DNS SAN."""
+    SAN type) means a spoofed commonName can never collide with a pinned DNS SAN.
+
+    A SAN ``ssl`` reports only as a placeholder (:data:`_SAN_PLACEHOLDERS`, such as
+    ``othername:<unsupported>``) is left out, so no listed entry can match it (BACKLOG #4907). That
+    text stands for a whole class of names, so matching it would admit every certificate carrying
+    any of them. Every caller shares this, the operator API and the HTTP listener included."""
     candidates: list[str] = []
     for rdn in peercert.get(
         "subject", ()
@@ -147,7 +242,9 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
                 candidates.append(f"CN:{pair[1]}")
     for pair in peercert.get("subjectAltName", ()):
         if len(pair) == 2:
-            candidates.append(f"SAN:{pair[0]}:{pair[1]}")
+            san_type, value = f"{pair[0]}", f"{pair[1]}"
+            if not _is_placeholder_san(san_type, value):
+                candidates.append(f"SAN:{san_type}:{value}")
     return candidates
 
 

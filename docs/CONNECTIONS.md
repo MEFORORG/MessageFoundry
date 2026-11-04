@@ -442,7 +442,21 @@ matches a commonName in the subject. Prefer a SAN entry where the partner's cert
 `CN:` is the defined fallback for a certificate that carries none. The two never stand in for each
 other: a `CN:` entry does not match a SAN with the same text, so a commonName cannot pass as a pinned
 SAN. The rest of the subject DN is not read, so an entry cannot name an `O=` or `OU=`. A name in any
-other form is refused at build, since it could never match.
+other form is refused at build, since it could never match. So is a SAN type spelled other than as
+Python's `ssl` spells it: `DNS`, `email`, `URI`, `IP Address`, `Registered ID`, `DirName` and
+`othername`, so `SAN:IP:...` and `SAN:dns:...` are refused with the right spelling named. An
+`IP Address` value is written as `ssl` writes it: IPv4 dotted, and IPv6 as eight upper-case hex
+groups with no leading zeros and no `::`, such as `2001:DB8:0:0:0:0:0:1`.
+
+**A placeholder is not a name.** For a SAN it cannot render, `ssl` reports fixed text instead:
+at least `othername:<unsupported>` for an otherName of a type OpenSSL does not print,
+`X400Name:<unsupported>` and `EdiPartyName:<unsupported>` whatever those names hold, and
+`IP Address:<invalid>` for a malformed address. Every certificate carrying such a name presents the
+same text, so one such entry would admit all of them under that CA. An entry holding that text is
+refused at build, and the matcher never reads a placeholder from a certificate, so a placeholder
+matches nothing even on a listener built some other way. That matcher is shared, so the operator
+API's `tls_client_cert_identities` and the HTTP listener's `intake_client_subjects` skip a
+placeholder too; neither of those settings refuses one at build.
 
 **How it matches.** Exactly, character for character, as Python's `ssl` module reports the name: no
 case folding, no wildcards, no prefix or suffix match. A DNS name in a different case does not match,
@@ -498,6 +512,12 @@ certificate after the check; anything the sender has not yet had read stays with
   on either arm is written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited`
   connection event, and leaves no message row, since nothing was read. The count is in process,
   so each engine shard keeps its own.
+- What each arm bounds is refusals: the per-address arm those from one address, the global arm
+  those from every address, and with each refusal its `ERROR` rows, its
+  `intake.auth_subject_denied` row and its event. Neither arm bounds the closes on a spent budget.
+  Each such close still writes its `intake.auth_rate_limited` row and its event, and only its
+  WARNING line is throttled, so a peer that keeps reconnecting on a spent budget would drive one
+  audit write per completed handshake.
 
 The stored reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate
 field, since a subject can name a person; the log line gives the connection name and peer address,

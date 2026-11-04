@@ -48,6 +48,7 @@ from messagefoundry.config.wiring import (
     env,
     load_config,
 )
+from messagefoundry.credential import cert_name_candidates
 from messagefoundry.mllpcodec import AckMode
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _IntakeRateLimiter
@@ -82,8 +83,15 @@ def _bundle(tmp_path: Path, signer: _CaPair, cn: str = _PERSON) -> Path:
     return _client_bundle(tmp_path, signer, cn=cn)
 
 
-def _san_bundle(tmp_path: Path, signer: _CaPair, *, cn: str, dns: str) -> Path:
-    """A client leaf carrying a DNS subjectAltName, signed by ``signer``."""
+def _san_bundle(
+    tmp_path: Path,
+    signer: _CaPair,
+    *,
+    cn: str,
+    dns: str,
+    other: tuple[x509.GeneralName, ...] = (),
+) -> Path:
+    """A client leaf carrying a DNS subjectAltName, and any ``other`` names, signed by ``signer``."""
     key = ec.generate_private_key(ec.SECP256R1())
     leaf = (
         x509.CertificateBuilder()
@@ -93,7 +101,7 @@ def _san_bundle(tmp_path: Path, signer: _CaPair, *, cn: str, dns: str) -> Path:
         .serial_number(x509.random_serial_number())
         .not_valid_before(_NOW - datetime.timedelta(minutes=5))
         .not_valid_after(_NOW + datetime.timedelta(days=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(dns)]), critical=False)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(dns), *other]), critical=False)
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer[1].public_key()),
             critical=False,
@@ -317,6 +325,58 @@ async def test_a_san_entry_matches_and_a_cn_entry_does_not_match_a_san(
     assert b"MSA|AR|" in refused
 
 
+#: An otherName of a type OpenSSL does not print: ``ssl`` reports it as ``othername:<unsupported>``,
+#: the same text for every such name, whatever it holds.
+_UNPRINTED_OTHERNAME = x509.OtherName(x509.ObjectIdentifier("1.3.6.1.4.1.55555.1"), b"\x0c\x03abc")
+
+
+async def test_a_placeholder_san_on_a_certificate_matches_no_entry(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """``ssl`` reports a SAN it cannot render as placeholder text shared by a whole class of names,
+    so a placeholder entry would admit every certificate carrying one. The factory refuses that
+    entry; this listener is built past the factory, as a ``Source`` built some other way would be,
+    to show the matcher itself never reads the placeholder from a certificate."""
+    named = _ca("Partner CA")
+    settings = _settings(tmp_path, [named[0]], {_issuer(named): ["SAN:DNS:feed.partner.example"]})
+    settings["tls_client_subjects"] = {
+        _issuer(named): ["SAN:othername:<unsupported>", "SAN:DNS:feed.partner.example"]
+    }
+    unprinted = _san_bundle(
+        tmp_path, named, cn="unrelated.example", dns="other.example", other=(_UNPRINTED_OTHERNAME,)
+    )
+    listed = _san_bundle(tmp_path, named, cn="unrelated.example", dns="feed.partner.example")
+    source = await _wired(settings, store)
+    try:
+        refused, rest = await _exchange(source, unprinted)
+        # Control on the same listener: a certificate carrying the listed DNS name is admitted.
+        accepted, _ = await _exchange(source, listed)
+    finally:
+        await source.stop()
+    assert b"MSA|AR|" in refused and rest == b""
+    assert b"MSA|AA|" in accepted
+
+
+def test_the_shared_matcher_drops_every_placeholder_ssl_reports() -> None:
+    """The forms measured from ``ssl.getpeercert()``; the real names beside them stay."""
+    peercert = {
+        "subject": ((("commonName", "partner.example"),),),
+        "subjectAltName": (
+            ("othername", "<unsupported>"),
+            ("X400Name", "<unsupported>"),
+            ("EdiPartyName", "<unsupported>"),
+            ("IP Address", "<invalid>"),
+            ("othername", "UPN:feed@partner.example"),
+            ("DNS", "feed.partner.example"),
+        ),
+    }
+    assert cert_name_candidates(peercert) == [
+        "CN:partner.example",
+        "SAN:othername:UPN:feed@partner.example",
+        "SAN:DNS:feed.partner.example",
+    ]
+
+
 async def test_matching_is_exact_and_case_sensitive(tmp_path: Path, store: MessageStore) -> None:
     named = _ca("Partner CA")
     source = await _wired(
@@ -520,6 +580,42 @@ def _mllp(subjects: Any, **overrides: Any) -> Any:
             {"CN=Partner CA": [SUBJECT]}, {"tls_ca_file": None}, "needs tls=True", id="no-ca"
         ),
         pytest.param({"CN=Partner CA": [SUBJECT]}, {"tls": False}, "needs tls=True", id="no-tls"),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:othername:<unsupported>"]},
+            {},
+            "a placeholder",
+            id="othername-placeholder",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:X400Name:<unsupported>"]}, {}, "a placeholder", id="x400"
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:EdiPartyName:<unsupported>"]}, {}, "a placeholder", id="edi"
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:IP Address:<invalid>"]}, {}, "a placeholder", id="ip-invalid"
+        ),
+        pytest.param(
+            {"CN=Partner CA": [SUBJECT, "SAN:IP:192.0.2.10"]},
+            {},
+            "ssl writes it 'IP Address'",
+            id="ip-short",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:dns:feed.partner.example"]},
+            {},
+            "ssl writes it 'DNS'",
+            id="dns-lower",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:Fingerprint:ab12"]}, {}, "a SAN type ssl never", id="no-type"
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:IP Address:2001:db8::1"]},
+            {},
+            "an IP address in a spelling ssl never writes",
+            id="ipv6-compressed",
+        ),
     ],
 )
 def test_the_factory_refuses_what_cannot_work(
@@ -528,6 +624,21 @@ def test_the_factory_refuses_what_cannot_work(
     with pytest.raises(WiringError, match=message) as excinfo:
         _mllp(subjects, **overrides)
     assert "MLLP tls_client_subjects" in str(excinfo.value)
+
+
+def test_the_factory_accepts_each_san_type_in_the_spelling_ssl_reports() -> None:
+    """The control for the spelling refusals: the same entries, written as ``ssl`` writes them."""
+    names = [
+        "SAN:DNS:feed.partner.example",
+        "SAN:IP Address:192.0.2.10",
+        "SAN:IP Address:2001:DB8:0:0:0:0:0:1",
+        "SAN:URI:https://feed.partner.example/",
+        "SAN:email:feed@partner.example",
+        "SAN:othername:UPN:feed@partner.example",
+    ]
+    assert _mllp({"CN=Partner CA": names}).settings["tls_client_subjects"] == {
+        "CN=Partner CA": names
+    }
 
 
 def test_the_factory_carries_a_valid_table_and_leaves_it_off_by_default() -> None:
