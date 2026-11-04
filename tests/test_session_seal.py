@@ -416,6 +416,25 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
             {"scope": "all", "count": 3} if bent else {"scope": "all_but_caller", "count": 2}
         )
         await store.revoke_user_sessions("u")
+    # The same for signing out everywhere else: the caller's own row is in the count when the
+    # fallback ended it, as it is above.
+    for bent in (False, True):
+        caller, *_ = [await mint() for _ in range(3)]
+        identity = await service.identity_for_token(caller)
+        assert identity is not None
+        if bent:
+            await _raw_for(path)(
+                "UPDATE sessions SET reauth_at=? WHERE token_hash=?", (1.0, hash_token(caller))
+            )
+        assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == (
+            3 if bent else 2
+        )
+        assert await last() == (
+            {"scope": "self_all", "count": 3} if bent else {"scope": "self_others", "count": 2}
+        )
+        caller_row = await store.get_session(hash_token(caller))
+        assert caller_row is not None and (caller_row.revoked_at is not None) is bent
+        await store.revoke_user_sessions("u")
 
 
 async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(

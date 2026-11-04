@@ -11698,9 +11698,14 @@ class AuthService:
         except RowSealError:
             # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
             # The caller asked to end every other session and its own is suspect: end them all,
-            # and audit that scope, since the caller's own session is ended too.
-            await self._session_seal_failed(current_token_hash)
-            result = await self._store.revoke_user_sessions(identity.user_id)
+            # and audit that scope, since the caller's own session is ended too. The sweep runs
+            # first so the suspect row is in its count, as revoke_every_session does (BACKLOG
+            # #4975); the handler still runs if the sweep raises, and its own revoke then matches
+            # nothing.
+            try:
+                result = await self._store.revoke_user_sessions(identity.user_id)
+            finally:
+                await self._session_seal_failed(current_token_hash)
         scope = "self_others" if result.kept else "self_all"
         if result.count or not result.kept:
             await self._audit(

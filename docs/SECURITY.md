@@ -4740,8 +4740,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   revoke that keeps a session an earlier sweep missed. A revoke that keeps a session, the per-account one or the every-account one, stamps
   the new epochs onto it only when it carried the epochs that revoke's own raises replaced: its
   account's epoch, taken from the record the raise read under the account's lock, and for the
-  every-account revoke the global epoch too. A kept session behind on an epoch that revoke checks
-  is left as it is and refused when next presented. Where the account's record fails its seal,
+  every-account revoke the global epoch too. A kept session that does not carry an epoch that
+  revoke checks is left as it is, unrevoked; one behind on it, as a missed session is, is refused
+  when next presented. Where the account's record fails its seal,
   its epoch cannot be raised and nothing is stamped. The per-account revoke checks and raises the
   account's epoch alone, and leaves the kept session's global stamp as it is. So a session behind
   on the global epoch only, for example one an every-account revoke missed on an account its read

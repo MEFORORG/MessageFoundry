@@ -150,7 +150,7 @@ class _MssqlCursor:
     async def fetchall(self) -> list[Any]:
         if _reads_session_row(self._last):
             return [_LIVE_SESSION]
-        if self._last.startswith(("SELECT session_epoch", _GLOBAL_EPOCH_READ)):
+        if self._last.startswith(_GLOBAL_EPOCH_READ):
             return [(0,)]
         return self._other_rows()
 
@@ -357,8 +357,6 @@ class _PgConn:
         self._seen.append((sql, args))
         if _reads_session_row(sql):
             return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
-        if sql.startswith("SELECT session_epoch"):
-            return {"session_epoch": 0}
         return None
 
     async def fetchval(self, sql: str, *args: Any) -> Any:

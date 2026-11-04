@@ -150,6 +150,7 @@ __all__ = [
     "ResendSourceEmpty",
     "ResendSourceNotFound",
     "RestoreRecord",
+    "RevokeResult",
     "Row",
     "SearchSpec",
     "SearchTarget",
