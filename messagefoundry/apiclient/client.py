@@ -1828,7 +1828,10 @@ class EngineClient:
         self._request("DELETE", f"/me/sessions/{_seg(session_id)}")
 
     def revoke_other_sessions(self) -> str:
-        """Revoke every session except this one ("sign out everywhere else"); returns the summary."""
+        """Revoke the user's other sessions ("sign out everywhere else"); returns the summary.
+
+        The server keeps this session only when its revoke re-stamps it, and otherwise ends it too;
+        docs/SECURITY.md, *Limits of the session sweep*, says when."""
         return _decode(self._request("DELETE", "/me/sessions"), SimpleMessage).detail
 
     def revoke_user_sessions(self, user_id: str) -> str:

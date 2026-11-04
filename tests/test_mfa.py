@@ -732,7 +732,7 @@ async def test_spending_a_recovery_code_is_audited_distinguishably_and_notified(
         )
         identity, token, password = await login_admin(service)
         await store.update_user_profile(
-            identity.user_id, display_name=None, email="admin@example.org"
+            identity.user_id, display_name=None, email="admin@example.org", audits=()
         )
         # THE TWO ADDRESSES MUST DIFFER OR THIS TEST CANNOT SEE THE DEFECT IT EXISTS FOR. ADR 0182
         # splits the directory mirror from the engine-owned notification target; with both set to
@@ -2293,6 +2293,7 @@ async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_on
             auth_provider="local",
             password_hash=user.password_hash,
             password_generated=False,
+            audits=(),
         )
         bare = await store.get_user("u-noaddr")
         assert bare is not None and not bare.notify_email
@@ -2326,6 +2327,7 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
             auth_provider="ad",
             now=clock.now,
             password_generated=False,
+            audits=(),
         )
         await store.set_user_notify_email("u-ad", email="ad@example.org")
         ad = await store.get_user("u-ad")
@@ -3278,7 +3280,11 @@ async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_
         # Named although disabled: it is lockable the moment it is re-enabled (review round 2).
         await store.set_user_disabled(disabled_id, disabled=True)
         await store.create_user(
-            user_id="dir-1", username="directory", auth_provider="ad", password_generated=False
+            user_id="dir-1",
+            username="directory",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
         )
         census = await service.lockable_account_census()
         assert census.no_way_past == ("disabled", ADMIN_USERNAME)
@@ -3450,7 +3456,11 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
     store = await _store()
     try:
         await store.create_user(
-            user_id="dir-totp", username="directory", auth_provider="ad", password_generated=False
+            user_id="dir-totp",
+            username="directory",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
         )
         staged_cell = await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
         assert await store.enable_totp(
@@ -3461,6 +3471,7 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
             username="half-built",
             auth_provider="local",
             password_generated=False,
+            audits=(),
         )
         real = store.get_totp_secret
 

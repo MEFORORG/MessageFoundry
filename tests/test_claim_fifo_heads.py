@@ -30,6 +30,7 @@ from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import ClaimedHeads, MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.store import MessageStatus
+from tests._claim_lock_helpers import claim_past_empty_yield
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
@@ -176,20 +177,6 @@ async def _make_not_due(store: Any, stage: str, message_id: str, until: float) -
     )
 
 
-# ADR 0066 §9: claim_fifo_heads' SQL Server path opens with SET LOCK_TIMEOUT 0, so a transient
-# server-internal lock surfaces as error 1222 and the WHOLE batch fail-closes to EMPTY-all — by_lane
-# AND rearm both empty, the claim rolled back, nothing consumed/incremented. That never-block YIELD is
-# contract-legal (the pooled caller re-arms and re-claims next tick — it "self-heals on retry", see the
-# drainer in test_batch_claim_locking.py) but makes a single-shot assertion flaky: it was observed as a
-# 1-in-40-CI KeyError on `res.by_lane["IB_HT"]` in test_interior_not_due_… on the SQL Server leg. These
-# tests assert a claim OUTCOME, not the yield, so re-issue past a transient EMPTY-all. This masks nothing:
-# EMPTY-all is a full roll-back (a retry cannot double-claim), and a GENUINELY unclaimable head stays
-# EMPTY-all every pass and still fails after the cap. SQLite serializes and Postgres SKIP-LOCKs, so
-# neither yields here — the first call already returns and the loop is a no-op on those backends.
-_CLAIM_YIELD_RETRIES = 16
-_CLAIM_YIELD_BACKOFF = 0.01
-
-
 async def _claim_heads(
     store: Any,
     stage: str,
@@ -198,19 +185,13 @@ async def _claim_heads(
     now: float | None = None,
     per_lane_limit: int = 1,
 ) -> ClaimedHeads:
-    """``claim_fifo_heads`` re-issued past a transient SQL Server never-block EMPTY-all yield (ADR 0066
-    §9; see the note above). Returns as soon as the claim did ANYTHING — a non-empty ``by_lane`` (rows
-    claimed) or ``rearm`` (a head consumed in-txn). A 1222 rolls the entire batch back to both-empty, so
-    this never observes a partial claim. Use it wherever a test asserts a NON-empty outcome; call
-    ``store.claim_fifo_heads`` directly where EMPTY-all is itself the assertion (a not-due head, an
-    unknown/empty lane) — that answer is already EMPTY-all and so is immune to the yield."""
-    res = await store.claim_fifo_heads(stage, lanes, now=now, per_lane_limit=per_lane_limit)
-    for _ in range(_CLAIM_YIELD_RETRIES):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
-        res = await store.claim_fifo_heads(stage, lanes, now=now, per_lane_limit=per_lane_limit)
-    return res
+    """``claim_fifo_heads`` re-issued past a transient SQL Server never-block EMPTY-all yield, for a
+    test asserting a NON-empty outcome; :func:`claim_past_empty_yield` says why that masks nothing.
+    Call ``store.claim_fifo_heads`` directly where EMPTY-all is itself the assertion (a not-due head,
+    an unknown/empty lane) — that answer is already EMPTY-all and so is immune to the yield."""
+    return await claim_past_empty_yield(
+        lambda: store.claim_fifo_heads(stage, lanes, now=now, per_lane_limit=per_lane_limit)
+    )
 
 
 # --- basic multi-lane contract ------------------------------------------------

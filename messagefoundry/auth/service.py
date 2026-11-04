@@ -200,6 +200,7 @@ from messagefoundry.store.store import (
     require_notify_email,
     role_seal_ok,
     seed_notify_email,
+    session_epochs_current,
     session_seal_ok,
     session_sealed_by_retired_key,
     user_seal_ok,
@@ -965,30 +966,34 @@ DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 #: #2434). The directory is never asked and nothing is charged; the caller sees a refused password.
 EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a credential
 
-#: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
-#: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
-#: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes. The federated
-#: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154), and so does the
-#: password re-bind, as the ``auth.reauth`` row's ``reason`` (BACKLOG #3081).
+#: The outcome :meth:`AuthService._directory_roles_lost` gives an account that lost a role in the
+#: directory since sign-in (BACKLOG #2240); that method's docstring states the rule, and its
+#: callers are the legs that refuse with it. Among them, at least: the legs that reach it through
+#: :meth:`AuthService._directory_step_up_refusal`, for a present, enabled account, audit it beside
+#: :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes; the federated step-up leg refuses
+#: with it as its own closed-set reason (BACKLOG #2154); and the password re-bind gives it as the
+#: ``auth.reauth`` row's ``reason`` (BACKLOG #3081).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 
-#: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
-#: account when the AD group-to-role map fails its seal (BACKLOG #2592), so no role can be judged.
-#: Not :data:`DIRECTORY_ROLES_DEMOTED`: nothing changed in the directory, a new sign-in takes its
-#: roles from the same failing map, and the fix is an administrator re-saving the map (BACKLOG
-#: #3082). Audited beside :data:`DIRECTORY_UNCONFIRMED`.
+#: The outcome :meth:`AuthService._directory_roles_lost` gives, on every leg that calls it, an
+#: account that holds a role when the AD group-to-role map fails its seal (BACKLOG #2592), so no
+#: role can be judged. Not :data:`DIRECTORY_ROLES_DEMOTED`: nothing changed in the directory, a
+#: new sign-in takes its roles from the same failing map, and the fix is an administrator
+#: re-saving the map (BACKLOG #3082). Audited as :data:`DIRECTORY_ROLES_DEMOTED` is.
 DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
 
 class DirectoryRefusal(Enum):
-    """Why a step-up leg refused a directory account it never checked the proof of, carried on
-    ``Elevation.directory_refusal`` so a caller can name the fix that clears it (BACKLOG #3082).
+    """Which fix clears a second-factor, enrolment or password re-bind leg's directory refusal,
+    carried on ``Elevation.directory_refusal`` so a caller can name it (BACKLOG #3082). The federated step-up leg does not set
+    it; it refuses with its own closed-set reason. Whether the proof was checked is the
+    ``Elevation.directory_refusal`` field's to say.
 
-    ``UNCONFIRMED``: the directory did not confirm the account is present and enabled, or could not
-    be asked. A later try, or an administrator, clears it; a new sign-in would fail the same way.
-    ``DEMOTED``: the account is present and enabled, but a role it holds is no longer among those
-    its directory groups grant (BACKLOG #2240). A new sign-in clears it, because it takes the roles
-    the groups grant now. The precise cause stays on the audit row; a caller says only which fix."""
+    ``UNCONFIRMED``: every other directory refusal. A later try, or an administrator, clears it.
+    ``DEMOTED``: the account is present and enabled, but lost a role in the directory (BACKLOG
+    #2240; the rule is in ``AuthService._directory_roles_lost``). A new sign-in clears it, because
+    it takes the roles the groups grant now. The precise cause stays on the audit row; a caller
+    says only which fix."""
 
     UNCONFIRMED = DIRECTORY_UNCONFIRMED
     DEMOTED = DIRECTORY_ROLES_DEMOTED
@@ -1252,9 +1257,8 @@ class Elevation:
     #: and :meth:`AuthService.finish_webauthn_registration` on them too (BACKLOG #3061). Each of
     #: those also sets it on an account that lost a role in the directory since sign-in
     #: (``directory_roles_demoted``). In every case nothing was charged, and the proof was never
-    #: checked, except on a demoted account's re-bind (BACKLOG #3081): the bind proved the password
-    #: right, and the account was refused for its roles, so a retry is refused again until a new
-    #: sign-in re-syncs them. It qualifies the wrong-proof state: the token still authenticates, and
+    #: checked, except where the re-bind's bind succeeded (BACKLOG #3081): the bind proved the
+    #: password right, and the account was refused after it. It qualifies the wrong-proof state: the token still authenticates, and
     #: the caller must name the directory's refusal, by the fix below, rather than call the code,
     #: the password or the passkey wrong. The precise cause goes to the audit row (``reason`` on
     #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``). The caller
@@ -1506,9 +1510,9 @@ def _is_single_mailbox(address: str) -> bool:
         bool(at)
         and bool(local)
         and "@" not in domain
+        # A dot inside the domain, which the send rule does not ask for. A dot at either end is the
+        # send rule's to refuse, below, as an empty label (BACKLOG #3075 item 8).
         and "." in domain.strip(".")
-        and not domain.startswith(".")
-        and not domain.endswith(".")
         and all(ch.isprintable() and not ch.isspace() for ch in address)
         and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
         # The rule send_plain_email applies to every notice's RCPT TO (vault BACKLOG #2870). Without
@@ -4250,6 +4254,9 @@ class AuthService:
                     password_hash=None,
                     must_change_password=True,
                     password_generated=False,
+                    # No audit row with the INSERT (BACKLOG #5070): the run's record is the
+                    # `auth.first_administrator_provisioned` row written once the grant has landed.
+                    audits=(),
                 )
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
@@ -6594,9 +6601,11 @@ class AuthService:
         still an OIDC session; the account is enabled and still a directory account; the token's
         verified ``(issuer, sub)`` is byte-for-byte the pair bound to the account; ``auth_time`` is
         fresh by our clock (see the inline note); the session holds an IdP ``auth_time``, and the
-        new one is later; the directory still has the account; and every role stored on the
-        account is among the roles its current groups map to (BACKLOG #2154). Then it elevates through :meth:`_elevated_hash`, so
-        rotation, the MFA carry and the single-use grant follow the password leg's rules exactly.
+        new one is later; the directory still has the account, and its answer names the row's own
+        directory object (BACKLOG #3174); the account still exists on a re-read; and
+        :meth:`_directory_roles_lost` refuses nothing (BACKLOG #2154, #3082). Then it elevates
+        through :meth:`_elevated_hash`, so rotation, the MFA carry and the single-use grant follow
+        the password leg's rules exactly.
 
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
@@ -6757,13 +6766,11 @@ class AuthService:
         mismatch = _directory_answer_mismatch(principal, object_id)
         if mismatch is not None:
             return await refuse(mismatch)
-        # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
-        # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
-        # (#2240), through the one shared comparison. Not through that helper, because its probe
-        # would change this leg's not_in_directory reason. Only a LOST role refuses, or a role map
-        # that fails its seal, as DIRECTORY_ROLE_MAP_UNSEALED rather than a demotion (BACKLOG
-        # #3082). Refusing writes nothing; for a lost role the reconciler or the next sign-in
-        # re-syncs the roles. Read after the directory round trip, as before, through the loader
+        # BACKLOG #2154: the role test, by calling _directory_roles_lost directly, whose docstring
+        # states the rule. This leg does not go through
+        # _directory_step_up_refusal, the wrapper the second-factor legs reach it through, because
+        # that wrapper's own directory probe would replace this leg's not_in_directory reason with
+        # the probe's outcome. The row is read after the directory round trip, through the loader
         # (BACKLOG #2592).
         fresh = await self._load_user(user.id)
         if fresh is None:
@@ -9918,7 +9925,7 @@ class AuthService:
             self._report_directory_admin_grant(
                 user, before=user.role_ids, after=revocation.role_ids
             )
-        revoked = await self._store.revoke_user_sessions(revocation.user_id)
+        revoked = (await self._store.revoke_user_sessions(revocation.user_id)).count
         # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
         # revocation ended nothing still reports, unless a verified row shows another pass revoked
         # it. Read BEFORE this revocation's own row is written, or the row would find itself.
@@ -11493,8 +11500,9 @@ class AuthService:
         - ``"credential"``: the owner's admin-issued temporary credential is past its deadline
           (:meth:`_credential_lapsed`, BACKLOG #2298). A disabled account is not judged here: the
           gate refuses it for that reason, and does not audit it as a lapse.
-        - ``"epoch"``: a whole-account revoke raised the account's epoch after this session was
-          sealed, so the session belongs to sessions that were ended (BACKLOG #2592). That revoke
+        - ``"epoch"``: a whole-account revoke raised the account's epoch, or an every-account
+          revoke raised the store's global epoch, after this session was sealed, so the session
+          belongs to sessions that were ended (BACKLOG #2592, #5091). That revoke
           blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
           a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
           epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal;
@@ -11506,7 +11514,9 @@ class AuthService:
         record what they record for a live session."""
         if not user.disabled and self._credential_lapsed(user, now):
             return "credential"
-        if session.user_epoch != user.session_epoch:
+        if not session_epochs_current(
+            session, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
+        ):
             return "epoch"
         return None
 
@@ -11602,20 +11612,25 @@ class AuthService:
         hidden too, since the validator refuses them on presentation (BACKLOG #2096). So is a row
         that fails its integrity seal (BACKLOG #2592): it resolves to nothing, so it is not one of
         the user's sessions, and it is handled as :meth:`_load_session` handles one. So is a row
-        minted under an older session epoch than the account's, which the validator refuses."""
+        minted under an older session epoch than the account's, or an older global one than the
+        store's (BACKLOG #5091), which the validator refuses."""
         rows = await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
         if not rows:
             return []
         user = await self._load_user(user_id)
-        epoch = None if user is None else user.session_epoch
         sealer = self._store.row_sealer()
         kept: list[SessionRecord] = []
         for row in rows:
+            # The seal check first, even with no account: it ends a row that fails it.
             if not await self._session_row_holds(row, sealer):
                 continue
-            if row.user_epoch == epoch:
+            if user is None:
+                continue
+            if session_epochs_current(
+                row, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
+            ):
                 kept.append(row)
-            elif epoch is not None:
+            else:
                 await self._session_seal_failed(row.token_hash)  # see identity_for_token
         return kept
 
@@ -11673,26 +11688,39 @@ class AuthService:
         self, identity: Identity, current_token_hash: str, *, actor: str
     ) -> int:
         """Revoke all of ``identity``'s sessions **except** the caller's current one ("sign out
-        everywhere else"). Returns the count revoked. Audited when any were revoked."""
-        scope = "self_others"
+        everywhere else"). Returns the count revoked. Audited when any were revoked, and whenever
+        the revoke did not keep the caller's own session: then the scope is ``self_all``.
+
+        Whether it kept that session is the store's answer from the revoke's own transaction
+        (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
+        after it. The store keeps the session only when it re-stamped it with the new epoch, and
+        otherwise ends it in that transaction (follow-up to BACKLOG #4975), so a session an earlier
+        sweep missed, or one behind on the global epoch, is ended and not reported kept. The count
+        is the caller's other sessions this call revoked, never the caller's own: the store counts
+        the caller's own when it ends it, and that one is taken off (``ended_kept``), and on the
+        seal-failure path the handler ends it before the counted sweep.
+        :meth:`revoke_every_session` counts it in both cases instead."""
         try:
-            revoked = await self._store.revoke_user_sessions(
+            result = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
             )
         except RowSealError:
             # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
             # The caller asked to end every other session and its own is suspect: end them all,
-            # and audit that scope, since the caller's own session is ended too.
+            # and audit that scope, since the caller's own session is ended too. The handler ends
+            # it before the sweep, so the count and the reply ("signed out N other sessions") stay
+            # the other sessions only.
             await self._session_seal_failed(current_token_hash)
-            revoked = await self._store.revoke_user_sessions(identity.user_id)
-            scope = "self_all"
-        if revoked:
+            result = await self._store.revoke_user_sessions(identity.user_id)
+        others = result.others
+        scope = "self_others" if result.kept else "self_all"
+        if others or not result.kept:
             await self._audit(
                 "auth.session_revoked",
                 actor=actor,
-                detail=_json({"scope": scope, "count": revoked}),
+                detail=_json({"scope": scope, "count": others}),
             )
-        return revoked
+        return others
 
     async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int | None:
         """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
@@ -11725,7 +11753,7 @@ class AuthService:
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.
         Audited."""
-        revoked = await self._store.revoke_user_sessions(user_id)
+        revoked = (await self._store.revoke_user_sessions(user_id)).count
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -11738,35 +11766,44 @@ class AuthService:
     ) -> tuple[int, bool]:
         """Admin: end every account's sessions at once (BACKLOG #2614), for a suspected
         compromise where walking the accounts one by one would leave the rest live meanwhile.
-        ``keep_token_hash`` keeps the caller's own session, so the administrator who ran it is not
-        signed out mid-response. Returns the count and whether that session was kept. Audited
-        even when the count is zero, because the act itself is the record an investigator looks
-        for. The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
+        ``keep_token_hash`` names the caller's own session for the revoke to keep, so the
+        administrator who ran it is not signed out mid-response where the revoke re-stamps it.
+        Returns the count and whether that session was kept. Audited even when the count is zero,
+        because the act itself is the record an investigator looks for. The host command
+        ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as
-        :meth:`revoke_other_sessions` does."""
+        :meth:`revoke_other_sessions` does.
+
+        Whether the session was kept is the store's answer from the revoke's own transaction
+        (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
+        after it: kept only when the store re-stamped it with the new epochs. Not kept covers at
+        least a session another request ended first, one an earlier sweep missed, which the store
+        ends in the revoke's own transaction (follow-up to BACKLOG #4975), and the seal-failure
+        path. The count is the rows this call revoked: where the store or the seal-failure path
+        ended the caller's own, that one is in it, which :meth:`revoke_other_sessions` leaves out
+        of its count."""
         try:
-            revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
+            result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:
             # The sweep runs first, so the suspect row is counted with the rest: ended first by
             # the seal-failure handler, the sweep would find it gone and the reply and the audit
             # row would be one short. The handler still runs if the sweep raises, so the suspect
             # row is ended either way; its own revoke then matches nothing, and it reports.
             try:
-                revoked = await self._store.revoke_all_sessions()
+                result = await self._store.revoke_all_sessions()
             finally:
                 await self._session_seal_failed(keep_token_hash)
-        # Read back rather than inferred: a revoke of the caller's own session that landed before
-        # the sweep leaves nothing kept, and the reply and the audit row must say so.
-        kept = await self._load_session(keep_token_hash) is not None
         await self._audit(
             "auth.session_revoked",
             actor=actor,
-            detail=_json({"scope": "all_but_caller" if kept else "all", "count": revoked}),
+            detail=_json(
+                {"scope": "all_but_caller" if result.kept else "all", "count": result.count}
+            ),
             client=client,
         )
-        return revoked, kept
+        return result.count, result.kept
 
     async def _custom_permissions_for_ids(self, role_ids: Iterable[str]) -> frozenset[Permission]:
         """Resolve the permission overlay for any custom (``custom:``-prefixed) role ids the user holds
@@ -12047,9 +12084,9 @@ class AuthService:
         nothing here writes to the directory. A directory that cannot be asked, or that cannot find
         the principal, is a refusal but NOT a failure, on the account or the session: counting an
         outage would lock every operator who tried to step up while a domain controller was down.
-        A right password on an account that lost a role in the directory since sign-in is refused
-        as ``directory_roles_demoted`` and is not a failure either (BACKLOG #3081); nor does it
-        reset the budget or the counter, because nothing was granted.
+        A right password the role test in :meth:`_directory_roles_lost` refuses is not a failure
+        either (BACKLOG #3081); nor does it reset the budget or the counter, because nothing was
+        granted.
 
         ``clear`` marks the re-auth leg, whose success rotates the session: only there does a success
         reset the session's budget and the account counter. The account counter resets only at FULL
@@ -12193,15 +12230,13 @@ class AuthService:
         if current is None:
             return _Reproof(ok=False, user=user)
         if directory:
-            # BACKLOG #3081: the test the code, passkey and IdP legs apply (#2240, #2154), on the
-            # groups the bind just resolved and the roles of the row read AFTER it, as those legs
-            # read theirs. The groups vouch only for the object the bind was keyed on, so a row
-            # whose id or provider moved during the round trip is refused rather than judged on
-            # another object's groups, as identity_for_cert_user_id refuses it. The password was
-            # right, so nothing is charged or registered, and the session's budget and the account
-            # counter are left as they were. It refuses and writes nothing: the reconciler or the
-            # next sign-in re-syncs the roles. A role map that fails its seal is refused as
-            # DIRECTORY_ROLE_MAP_UNSEALED rather than as a demotion (BACKLOG #3082).
+            # BACKLOG #3081: the role test stated in _directory_roles_lost's docstring, on the
+            # groups the bind just resolved and the roles of the row read AFTER it, as the other
+            # legs read theirs. The groups vouch only for the object the bind was keyed on, so a
+            # row whose id or provider moved during the round trip is refused rather than judged
+            # on another object's groups, as identity_for_cert_user_id refuses it. The password
+            # was right, so nothing is charged or registered, and the session's budget and the
+            # account counter are left as they were. No refusal in this block writes roles, the moved-row one included.
             refusal: str | None
             if (
                 current.directory_object_id != user.directory_object_id
@@ -12258,9 +12293,8 @@ class AuthService:
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
         re-bind** against the directory so AD operators aren't locked out, and a good re-bind on an
-        account that lost a role in the directory since sign-in is refused as
-        :data:`DIRECTORY_ROLES_DEMOTED`, uncharged, as the code and passkey legs refuse it
-        (BACKLOG #3081). A session the federated
+        account that lost a role in the directory since sign-in is refused, uncharged, by the test
+        :meth:`_directory_roles_lost` states (BACKLOG #3081). A session the federated
         login minted is refused before either (see the first branch): it steps up at the IdP through
         :meth:`complete_oidc_step_up`. Always audited.
 
@@ -14426,12 +14460,8 @@ class AuthService:
         row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
         This leg used to ask an id-less row with no binding by its name.
 
-        **A present account that lost a role in the directory is refused too (BACKLOG #2240).** Its
-        stored roles must all be among the roles its current groups map to, the same pair the
-        reconciler diffs, by :meth:`_directory_roles_lost`, whose docstring gives the rule.
-        Otherwise a demoted operator would renew its window, or clear the MFA gate, with roles it
-        no longer holds until the reconciler's role pass. This refuses and writes nothing; the
-        reconciler or the next sign-in re-syncs the roles.
+        **A present account that lost a role in the directory is refused too (BACKLOG #2240),** by
+        :meth:`_directory_roles_lost`, whose docstring states the rule.
         """
         answer = await self._directory_presence(user)
         if not isinstance(answer, reconcile.Probe):
@@ -14448,9 +14478,18 @@ class AuthService:
         self, role_ids: Iterable[str], groups: Iterable[str]
     ) -> str | None:
         """Why a stored role in ``role_ids`` is not among the roles ``groups`` map to, or ``None``
-        when every one is: the demotion test every directory step-up leg refuses on (BACKLOG #2240,
-        #2154, #3081), shared by every leg that refuses on it (BACKLOG #3081 item 6). This
-        docstring is where the rule's reasons live. An account with no roles has none to lose.
+        when every one is: the demotion test the directory step-up and enrolment legs refuse on
+        (BACKLOG #2240, #2154, #3061, #3081), shared by every leg that refuses on it (BACKLOG #3081
+        item 6). This docstring is where the rule and its reasons live; a caller cites it rather
+        than restating it. An account with no roles has none to lose.
+
+        Every stored role must be among the roles the account's current groups map to, the same
+        pair the reconciler diffs. Without the test, an operator demoted in the directory since
+        sign-in would renew its window, clear the MFA gate, or be minted an action-bound grant,
+        with roles it no longer holds, until the reconciler's role pass. A leg that refuses on
+        either outcome writes no roles; it still audits the refusal. For a lost role the
+        reconciler or the next sign-in re-syncs the roles. A failing map is not cleared that way;
+        :data:`DIRECTORY_ROLE_MAP_UNSEALED` says what its fix is.
 
         :data:`DIRECTORY_ROLES_DEMOTED` for a lost role, and :data:`DIRECTORY_ROLE_MAP_UNSEALED`
         when the role map fails its seal, since every stored role would then read as lost and
@@ -15728,6 +15767,9 @@ class AuthService:
                 # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
                 must_change_password=True,
                 password_generated=True,
+                # No audit row with the INSERT (BACKLOG #5070): `user.created` names the
+                # roles, so it is written below, after `set_user_roles`.
+                audits=(),
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -15837,7 +15879,11 @@ class AuthService:
             new_notify = _require_single_mailbox(notify_email)
         if disabled and await self.is_last_enabled_admin(user_id):
             raise LastAdministratorRefused("cannot disable the last administrator")
-        await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+        # No audit row with the UPDATE (BACKLOG #5070): this save's `user.updated` row also
+        # records the disable outcome, so it is written below, once that is known.
+        await self._store.update_user_profile(
+            user_id, display_name=display_name, email=email, audits=()
+        )
         # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
         # makes, and on a directory account `email` is the directory's.
         if before is not None and new_notify is not None:
@@ -16956,7 +17002,7 @@ class AuthService:
             # absolute lifetime it found none, and those rows would come back on the old mapping
             # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
             # whatever the clock says, and costs one statement where the read cost one too.
-            revoked += await self._store.revoke_user_sessions(user_id)
+            revoked += (await self._store.revoke_user_sessions(user_id)).count
         return revoked
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:

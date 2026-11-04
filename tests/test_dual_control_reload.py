@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -32,7 +33,6 @@ from fastapi import HTTPException
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import (
-    _REFUSAL_LOG_LIMIT,
     _audit_refused_reload,
     _audit_reload_attempt,
     _compare_start_config,
@@ -63,6 +63,12 @@ from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests._share_fault import _share_fault
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
+from tests.test_config_source_trust import (
+    _CLEAN_READ,
+    _EVERYONE_WRITE_READ,
+    _SELF,
+    _never_admin,
+)
 from tests.test_trust_anchors import _block, _FaultyAuditStore, _judged_clean
 
 PW = "a-strong-test-passphrase"
@@ -1134,8 +1140,10 @@ async def test_an_invalid_config_refusal_cannot_forge_a_log_line_and_keeps_its_f
 
 
 async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixture) -> None:
-    """The lifted cut is a larger bound, not none: an error past _REFUSAL_LOG_LIMIT is cut, so one
+    """The lifted cut is a larger bound, not none: an error past REFUSAL_LOG_LIMIT is cut, so one
     refusal cannot write a 64 KiB line for every handler to re-scan on the event loop."""
+    from messagefoundry.redaction import REFUSAL_LOG_LIMIT
+
     error = WiringError(" ".join(f"word-{i:05d}" for i in range(2000)))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         await _audit_refused_reload(
@@ -1144,7 +1152,7 @@ async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixtu
     [warning] = _refusal_warnings(caplog)
     assert "word-00300" in warning  # well past the old 200-character cut
     assert "word-01999" not in warning
-    assert len(warning) < _REFUSAL_LOG_LIMIT + 200
+    assert len(warning) < REFUSAL_LOG_LIMIT + 200
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
@@ -1766,10 +1774,18 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
 
 
-def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
+def _lose_after_one_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: Path,
+    fails: Callable[[int], bool] = lambda listing: listing > 1,
+    *,
+    answers_is_dir: bool = False,
+) -> None:
     """Fail every listing of ``cfg`` past the next one, which is the reload's target check, as a
     share Windows cannot reach fails, and answer ``Path.is_dir`` of it ``False``, as both do for a
-    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory."""
+    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory.
+    ``fails`` picks the listings that fail by their number, from 1, in place of all past the
+    first, and ``answers_is_dir`` leaves ``is_dir`` alone, for a share that comes and goes."""
     real_scandir, real_is_dir = os.scandir, Path.is_dir
     listings = 0
 
@@ -1777,7 +1793,7 @@ def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
         nonlocal listings
         if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
             listings += 1
-            if listings > 1:
+            if fails(listings):
                 raise _share_fault()
         return real_scandir(path)
 
@@ -1785,13 +1801,16 @@ def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
         return self.resolve() != cfg and real_is_dir(self, **kwargs)
 
     monkeypatch.setattr(os, "scandir", _scandir)
-    monkeypatch.setattr(Path, "is_dir", _is_dir)
+    if not answers_is_dir:
+        monkeypatch.setattr(Path, "is_dir", _is_dir)
 
 
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_inline(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An ungated reload's strict read fails, so the load reads the directory itself and refuses."""
+    """An ungated reload's strict read fails, so the load reads the directory itself and refuses.
+    Audited ``unreadable``, as the target check audits the same fault, not ``invalid_config``,
+    which would send an operator looking for a config to fix (vault BACKLOG #5248 item 4)."""
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
@@ -1800,7 +1819,241 @@ async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
     assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "the engine could not read the config directory; see the engine log"
+    )
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+async def test_a_directory_unlistable_only_at_the_trust_walk_is_audited_unreadable(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lax load's first check lists the directory, and the trust walk's listing then fails:
+    judged again, so it is ``unreadable`` too, not a source the walk could not vet (vault BACKLOG
+    #5248 item 4)."""
+    from messagefoundry.config import wiring
+
+    cfg = (tmp_path / "cfg").resolve()
+    walked = wiring.config_source_trust_paths
+    lost = False
+
+    def _walk(directory: Path) -> list[Path]:
+        nonlocal lost
+        lost = True  # the share drops as the walk starts, after the load's own check listed it
+        return walked(directory)
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        # The strict read already failed, as the test above has it, so the load reads lax.
+        monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
+        _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost, answers_is_dir=True)
+        monkeypatch.setattr(wiring, "config_source_trust_paths", _walk)
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert lost, "the trust walk never ran, so this measured the first check"
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+async def test_a_directory_moved_away_during_the_trust_walk_listing_is_not_found(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's listing meets a directory moved away after the reload's checks: 404
+    ``not_found`` end to end, the reason a missing directory always had (vault BACKLOG #5248 item
+    1). PR 2715's head audited this ``invalid_config``; the read seam alone was pinned before."""
+    from messagefoundry.config import wiring
+
+    cfg = tmp_path / "cfg"
+    walked = wiring.config_source_trust_paths
+
+    def _moved_then_walked(directory: Path) -> list[Path]:
+        if cfg.exists():
+            cfg.rename(tmp_path / "moved")
+        return walked(directory)
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(wiring, "config_source_trust_paths", _moved_then_walked)
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
+    assert r.status_code == 404, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["not_found"]
+
+
+async def test_a_directory_moved_away_before_its_windows_access_read_is_not_found(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk listed the directory, and it moved away before the Windows check read its owner
+    and access list. That read fails not-found, which refused it as a source that could not be
+    vetted, audited ``invalid_config`` (vault BACKLOG #5248 item 1). It is missing, as the
+    listing would have said. The pure Windows enforcer runs here on every platform, over a fake
+    reader at its ctypes boundary, as tests/test_config_source_trust.py drives it."""
+    from messagefoundry.config import wiring
+
+    gone = wiring._WinPathSecurity(status=2)
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(
+            wiring, "_check_trusted_paths", _windows_check_moving_away(tmp_path, gone)
+        )
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
+    assert r.status_code == 404, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["not_found"]
+
+
+def _windows_check_moving_away(tmp_path: Path, answer: Any) -> Any:
+    """The pure Windows enforcer over a fake reader that answers ``cfg``'s own read with
+    ``answer`` and moves ``cfg`` away as it reads it; every other path reads clean."""
+    from messagefoundry.config import wiring
+
+    cfg = tmp_path / "cfg"
+
+    def _read_path(path: Path) -> Any:
+        if path.name == "cfg" and cfg.exists():
+            cfg.rename(tmp_path / "moved")
+            return answer
+        return _CLEAN_READ
+
+    probes = wiring._WinConfigSourceProbes(
+        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    return functools.partial(wiring._enforce_windows_paths, probes=probes)
+
+
+async def test_a_policy_refusal_then_a_directory_moved_away_is_invalid_config_inline(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trust check refused the directory on its policy, and the directory then moved away:
+    the refusal stands, audited ``invalid_config``, not ``not_found``. Only a refusal that came
+    from the directory being gone is answered as missing (vault BACKLOG #5248)."""
+    from messagefoundry.config import wiring
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(
+            wiring,
+            "_check_trusted_paths",
+            _windows_check_moving_away(tmp_path, _EVERYONE_WRITE_READ),
+        )
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
+    assert r.status_code == 422, r.text
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+
+
+async def test_a_policy_refusal_then_a_directory_moved_away_says_not_reached_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The release's trust check refused the directory on its policy, and it then moved away. The
+    row keeps ``invalid_config`` with ``approval_digest_check`` ``not_reached`` and the approved
+    digest, as any refusal before the digest check does (vault BACKLOG #5248, #2596)."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    approved = config_fingerprint(tmp_path / "cfg")
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr(
+            wiring,
+            "_check_trusted_paths",
+            _windows_check_moving_away(tmp_path, _EVERYONE_WRITE_READ),
+        ),
+    )
+    monkeypatch.undo()
+    assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
+    assert r.status_code == 422, r.text
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "approved_fingerprint": approved,
+            "approval_digest_check": "not_reached",
+            "reason": "invalid_config",
+        }
+    ]
+
+
+def _lose_the_share_at_the_access_read(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> list[bool]:
+    """Answer ``cfg``'s own Windows owner and DACL read with Win32 53, a share Windows cannot reach,
+    and fail every listing of ``cfg`` from then on. Returns a flag list, true once that read ran."""
+    from messagefoundry.config import wiring
+
+    lost = [False]
+
+    def _read_path(path: Path) -> Any:
+        if path.name == cfg.name:
+            lost[0] = True
+            return wiring._WinPathSecurity(status=53)
+        return _CLEAN_READ
+
+    probes = wiring._WinConfigSourceProbes(
+        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    monkeypatch.setattr(
+        wiring,
+        "_check_trusted_paths",
+        functools.partial(wiring._enforce_windows_paths, probes=probes),
+    )
+    _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost[0], answers_is_dir=True)
+    return lost
+
+
+async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own owner and DACL read failed because its share could not be reached
+    (Win32 53), and the directory then stopped listing: ``unreadable``, as a share lost at the
+    walk's listing is, not a source the check could not vet (#3535, vault BACKLOG #5248)."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        # The strict read already failed, as test_a_directory_lost_after_the_target_check_is_not_
+        # audited_as_missing_inline has it, so the load reads lax.
+        monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
+        lost = _lose_the_share_at_the_access_read(monkeypatch, (tmp_path / "cfg").resolve())
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert lost[0], "the directory's own read never ran, so nothing was measured"
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+async def test_a_share_lost_at_the_windows_access_read_is_digest_unavailable_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same fault on a release: its strict read raises the listing fault, so the release is
+    refused as ``digest_unavailable``, as a share lost at the walk's listing is, not
+    ``invalid_config`` with the digest check ``not_reached`` (#3535, vault BACKLOG #5248)."""
+    installed: list[list[bool]] = []
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: installed.append(
+            _lose_the_share_at_the_access_read(monkeypatch, (tmp_path / "cfg").resolve())
+        ),
+    )
+    monkeypatch.undo()
+    assert installed and installed[0][0], "the directory's own read never ran"
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
 
 
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(

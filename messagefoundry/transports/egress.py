@@ -137,7 +137,8 @@ def check_lookup_allowed(
         )
     if egress.allowed_db:
         # Both callers build the SQL Server preset whatever `settings` say (neither DatabaseLookup
-        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting.
+        # nor DatabaseRef takes a dialect), so the port sent is the `port` setting, and a driver the
+        # preset refuses is refused here too (BACKLOG #4873).
         refusal = _database_refusal(settings, egress.allowed_db, dialect="sqlserver")
         if refusal is not None:
             log.warning("connect denied: %s %r %s", label, name, refusal)
@@ -764,9 +765,10 @@ def _database_refusal(
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
     dialect's connection string sends. A host no entry names is refused as unlisted, before its
     port is read. Once the host is listed, a port the reading cannot settle is refused, whatever
-    the entries for that host say. An entry that pins a port admits only that port, compared as a
-    number on both sides. A connection whose port the engine cannot read matches an entry that
-    names no port, and never one that pins one."""
+    the entries for that host say, and so is a driver or ``server`` the SQL Server preset refuses
+    (BACKLOG #4873); both arrive as the reading's ``conflict``. An entry that pins a port admits
+    only that port, compared as a number on both sides. A connection whose port the engine cannot
+    read matches an entry that names no port, and never one that pins one."""
     if dialect is None:
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)

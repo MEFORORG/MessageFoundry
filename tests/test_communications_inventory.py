@@ -388,6 +388,12 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
             mllp.DEFAULT_MAX_CONNECTIONS_PER_HOST,
             "transports.mllp",
         ),
+        # vault BACKLOG #4888: the HTTP listener's per-address handshake budget, which ships on.
+        (
+            "max_handshakes_per_host",
+            http_listener.DEFAULT_MAX_HANDSHAKES_PER_HOST,
+            "transports.http_listener",
+        ),
         ("receive_timeout", mllp.DEFAULT_RECEIVE_TIMEOUT, "transports.mllp"),
         ("max_frame_seconds", mllp.DEFAULT_MAX_FRAME_SECONDS, "transports.mllp"),
         ("acquire_timeout", database._DEFAULT_DB_ACQUIRE_TIMEOUT, "transports.database"),

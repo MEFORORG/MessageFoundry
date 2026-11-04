@@ -22,7 +22,7 @@ Why 404 and not 403: a 403 would tell a scoped caller that a message exists in a
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import HTTPException, Request
 
@@ -35,8 +35,19 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline import Engine
 
 
+#: The detail of the one 403 a channel-scoped caller gets for a connection it may not reach
+#: (BACKLOG #2551). Held here, beside the audit it follows, so the API's per-name routes and the web
+#: console's flag route answer with one text (BACKLOG #3378).
+CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
+
+
 async def audit_channel_denied(
-    engine: Engine, identity: Identity, channel: str | None, client: str | None = None
+    engine: Engine,
+    identity: Identity,
+    channel: str | None,
+    client: str | None = None,
+    *,
+    flag_direction_not_inbound: bool = False,
 ) -> None:
     """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
 
@@ -51,11 +62,19 @@ async def audit_channel_denied(
     never holds caller text of unbounded length. The loader registers no connection under such a
     name, so it is never in a scope, and the actor and host still identify the attempt. The detail
     then carries ``"malformed_name": true``, so such a probe is told apart from a refusal that names
-    no channel by design."""
+    no channel by design.
+
+    ``flag_direction_not_inbound`` marks a flag request refused because its direction was not
+    ``inbound``, which a scoped caller may flag only (BACKLOG #3378). The detail then carries
+    ``"flag_direction_not_inbound": true``. Such a row can name an inbound inside the actor's own
+    scope, and without the marker it would read like a request asked of the wrong engine shard. The
+    direction itself is not recorded, since the console's form carries it as caller text."""
     detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
         detail = {"channel": None, "malformed_name": True}
+    if flag_direction_not_inbound:
+        detail["flag_direction_not_inbound"] = True
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,

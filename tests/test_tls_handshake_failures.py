@@ -554,7 +554,7 @@ async def test_the_http_listener_records_a_failed_handshake(
 ) -> None:
     """On the stdlib loop the listener runs its own handshakes since BACKLOG #2479, and counts a
     failure with its peer. ``loop`` forces the path uvloop takes, where the context's hook counts
-    it and knows no peer."""
+    it and does not read the peer."""
     if runner == "loop":
         monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, cert = _http_tls_source(tmp_path)
@@ -574,7 +574,7 @@ async def test_the_http_listener_records_a_failed_handshake(
         failed = [e for e in events.seen if e[0] == "tls_handshake_failed"]
         assert len(failed) == 1
         (_kind, peer, reason) = failed[0]
-        # The listener's own handshake knows its peer; the loop's TLS object knows none.
+        # The listener's own handshake knows its peer; the loop's hook does not read it.
         assert peer == ("127.0.0.1" if runner == "listener" else None)
         assert reason is not None and reason.startswith("1 failed handshake(s)")
         assert "GET" not in reason  # a cause, never the peer's bytes
@@ -654,7 +654,7 @@ async def _mllp_loop_run_scenario(tmp_path: Path) -> None:
         await _until(lambda: "tls_handshake_failed" in events.kinds(), "no failure event")
         assert source.tls_handshake_failures == 1
         (_kind, peer, reason) = next(e for e in events.seen if e[0] == "tls_handshake_failed")
-        assert peer is None  # the loop's TLS object knows no peer
+        assert peer is None  # the loop's hook does not read the peer
         assert reason is not None and reason.startswith("1 failed handshake(s)")
         assert "MSH" not in reason and "GET" not in reason
     finally:

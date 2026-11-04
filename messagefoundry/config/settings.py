@@ -5752,7 +5752,8 @@ class AlertRule(BaseModel):
     # suppress instead).
     recipients: list[str] | None = None
     # #138 (ADR 0127): optional operator label for this rule, surfaced as the {rule_id} alert-email
-    # template variable and in the read-only /alerts/rules view. Non-PHI free text; NEVER interpolated as
+    # template variable and in the read-only /alerts/rules view, which may withhold it (see
+    # docs/SECURITY.md, GET /alerts/rules; BACKLOG #3378). Non-PHI free text; NEVER interpolated as
     # code (it is a value substituted into an allowlisted template placeholder). None = "" in a template.
     id: str | None = None
     # #144 (ADR 0128): OPTIONAL auto-remediation control action fired when this rule matches — one of
@@ -6686,9 +6687,10 @@ class SecretRotationSettings(_Section):
     keeps its alert-only behaviour. Opting in tightens the posture; leaving it empty is not reported
     as a loosening.
 
-    The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
-    engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
-    watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
+    The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): a keyed start persists a
+    non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK
+    off it, except for a key the rotation record holds, which ``reconcile_rotation_meta`` states
+    (BACKLOG #3737, #4942), so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
     **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC credentials the engine holds are
     tracked too — each is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG #3472)
     and its clock reset when the secret no longer matches it (rotation auto-detected). The broader
@@ -6703,8 +6705,9 @@ class SecretRotationSettings(_Section):
     )
     # Store DEK tracking: the operator MAY record when the store encryption key was last rotated (ISO
     # YYYY-MM-DD) + how long it may live. When unset, the DEK is tracked LIVE-BY-DEFAULT off a persisted
-    # tracked-since stamp (ASVS 13.3.4, BACKLOG #282): the engine records the DEK key-id + first-seen date
-    # in store meta at first keyed start, so the operator date is an OVERRIDE, not a prerequisite. These
+    # tracked-since stamp (ASVS 13.3.4, BACKLOG #282): a keyed start records the DEK key-id + first-seen
+    # date in store meta, unless the rotation record holds that key (BACKLOG #3737, #4942), so the
+    # operator date is an OVERRIDE, not a prerequisite. These
     # are DATES, not the key — never a secret value.
     store_key_last_rotated: str | None = None
     store_key_max_age_days: int = 365  # rotate the store DEK within this many days of last_rotated
@@ -7845,6 +7848,29 @@ class ServiceSettings(_InputHidingModel):
             " clamp, and its COMMIT is not bounded by it, so a renew issued just before this node"
             f" self-fences can still land and re-extend the lease. {remedy}"
         )
+
+    @model_validator(mode="after")
+    def _config_only_backup_bundles_config(self) -> ServiceSettings:
+        """A backup on a server-DB store is config-only, so with ``include_config = false`` every
+        archive it writes carries nothing to restore, yet each would take a keep-N slot. The run
+        refuses such a pass (vault BACKLOG #5220); this refuses the configuration that makes every
+        pass one, at load, where ``serve`` and ``check`` read it. Spans two sections, so it lives
+        here. A pass forced config-only on SQLite, or whose walk adds nothing, is judged at run time
+        only, because only the run knows it."""
+        if (
+            self.backup.enabled
+            and self.backup.config_only_on_server_db
+            and not self.backup.include_config
+            and self.store.backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
+        ):
+            raise ValueError(
+                "[backup].include_config = false cannot be combined with [store].backend = "
+                f"{self.store.backend.value!r}: the store backup there is DBA-delegated, so every "
+                "DR backup is config-only and would archive nothing. Set [backup].include_config = "
+                "true. Setting [backup].enabled = false stops the scheduled backup, but the "
+                "`messagefoundry backup` command turns enabled on, so it still refuses"
+            )
+        return self
 
     @model_validator(mode="after")
     def _dr_activate_not_clustered(self) -> ServiceSettings:
@@ -10183,8 +10209,10 @@ def security_loosenings(
     ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
-    connection whose ``odbc_params`` set no usable TLS mode, or set one to a no-TLS value, as
-    ``transports.database.generic_odbc_tls_unenforced`` judges it (#66 / ADR 0092's amendment).
+    connection whose ``odbc_params`` set no usable TLS mode its driver family reads, or set one to
+    a no-TLS value, or whose ``odbc_driver`` names no family the engine places, as
+    ``transports.database.generic_odbc_tls_unenforced`` judges it (#66 / ADR 0092's amendment,
+    BACKLOG #5053).
     Since BACKLOG #1178 an enforcing instance refuses such a hop off-loopback unless it declares
     ``tls_hop_attested`` or, outbound only, ``cleartext_accepted``; a non-enforcing instance builds
     it with a WARNING. And
@@ -10754,9 +10782,11 @@ def security_loosenings(
                 "tls_allow_expired",
                 f"{len(expiry_relaxed_hops)} connection(s) accept an EXPIRED server "
                 f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
-                "re-checks it; the chain signature and key usage are still fully verified, and so is "
-                "the hostname match unless the same connection also sets tls_check_hostname=false "
-                "(listed under its own entry), so this is narrower than verify-off",
+                "re-checks it, and at least the validity periods of the intermediates and the "
+                "trust anchor, and a CRL's own validity window, go unchecked too; the chain's "
+                "signatures and key usage are still verified, and so is the hostname match unless "
+                "the same connection also sets tls_check_hostname=false (listed under its own "
+                "entry), so this is narrower than verify-off",
             )
         )
     if hostname_unchecked_hops:
@@ -10792,7 +10822,8 @@ def security_loosenings(
             (
                 "generic_odbc_tls_unenforced",
                 f"{len(unverified_db_hops)} generic-ODBC database connection(s) set no usable TLS "
-                f"mode in odbc_params, or set one to a no-TLS value ({named}) — MessageFoundry cannot "
+                "mode their driver family reads in odbc_params, set one to a no-TLS value, or name "
+                f"an odbc_driver the engine cannot place ({named}) — MessageFoundry cannot "
                 "introspect an arbitrary driver's TLS, so these hops are judged by the cleartext-hop "
                 "gate, not the SQL Server weakened-TLS refusal. An enforcing instance refuses each "
                 "one at construction unless it is on-box, declares tls_hop_attested, or (outbound "
@@ -10801,7 +10832,9 @@ def security_loosenings(
                 "posture, and no declaration lifts that. A hop that is built may carry the rows, "
                 "and the DSN credential, in plaintext. A name marked possibly generic has an env() "
                 "dialect this reading could not resolve, and the above holds of it only if it "
-                "resolves to generic",
+                "resolves to generic. A name marked possibly delegated has an env() odbc_driver "
+                "this reading could not resolve, and the above holds of it only if that driver's "
+                "family does not count its mode",
             )
         )
     # Owner ruling 2026-09-24: the one per-hop declaration that ALLOWs rather than WARNs, so it is the

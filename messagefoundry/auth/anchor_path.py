@@ -409,6 +409,66 @@ def _strip_win_prefix(path: str) -> str | None:
 WinProbe = Callable[[str], tuple[str, str | None]]
 
 
+class WalkCause(str):
+    """A cause :func:`windows_chain` answers. The text can name a path from the operator's config,
+    so it belongs at DEBUG; ``kind`` never names one, so a line above DEBUG may carry it
+    (``docs/PHI.md``, vault BACKLOG #5197 item 22). ``kind`` is required, with no fallback to the
+    text: a cause written without one would otherwise carry its path above DEBUG unnoticed."""
+
+    kind: str
+
+    def __new__(cls, text: str, kind: str) -> WalkCause:
+        cause = super().__new__(cls, text)
+        cause.kind = kind
+        return cause
+
+    def __getnewargs__(self) -> tuple[str, str]:  # type: ignore[override]
+        # copy, deepcopy, pickle and dataclasses.asdict rebuild a str subclass from these; str's
+        # own answer omits the required kind, and a ChainFinding's reason holds one of these.
+        return str(self), self.kind
+
+    @classmethod
+    def plain(cls, text: str) -> WalkCause:
+        """A cause whose ``text`` is a fixed sentence that names no path, so it is its own kind."""
+        return cls(text, text)
+
+
+def subst_target(answer: str) -> str | None:
+    """What a ``QueryDosDeviceW`` ``answer`` for a drive letter says a ``subst`` drive stands for,
+    whole (``\\??\\C:\\certs`` or ``\\??\\UNC\\host\\share``), or ``None`` for a real volume or a
+    network redirector (``\\Device\\...``). Kept whole so :func:`_strip_win_prefix` maps a share to
+    ``\\\\host\\share``: stripping four characters by hand left ``UNC\\host\\share``, which the walk
+    read as a path with no drive (vault BACKLOG #5197 item 14)."""
+    return answer if answer.startswith("\\??\\") else None
+
+
+def _drive_relative(path: str) -> bool:
+    """Whether ``path`` names a drive letter with no separator after it (``C:ca.pem``, ``C:``).
+    Windows reads such a path from that drive's own working directory, which a service does not
+    share with the process's, so the walk cannot know where it leads (vault BACKLOG #5197 item 12).
+    """
+    drive, rest = ntpath.splitdrive(path)
+    return len(drive) == 2 and drive[1] == ":" and rest[:1] not in ("\\", "/")
+
+
+_TOO_MANY_HOPS = f"the path passes through more than {MAX_LINK_HOPS} links"
+_DEVICE_PATH = "the path is a device path this check does not read"
+_STREAM = "the path names an alternate data stream"
+_DRIVE_RELATIVE = (
+    "the path names a drive with no separator after it, so Windows reads it from that drive's own "
+    "working directory"
+)
+#: The cause :func:`windows_chain` answers, as text and as ``kind``, when the path it reached is on
+#: a share. A caller that judges where a path leads, not who can write it, may read this ``kind``
+#: as "leads off the host".
+SHARE_CAUSE = "the path is on a network share, whose permissions this host cannot read"
+#: The ``kind`` of the cause for a link whose target is rooted with no drive (``\RPC Control\x``,
+#: ``/Device/Mup/...``). Such a target may name the NT object namespace, where an unprivileged
+#: account can add links onto a share, and a list of object roots always trails that namespace,
+#: so the walk does not read it as a folder on the link's drive (vault BACKLOG #5197 item 9).
+_ROOTED_LINK = "a link points at a rooted path with no drive"
+
+
 def _no_volume_cause(_root: str) -> str | None:
     return None
 
@@ -424,26 +484,40 @@ def windows_chain(
     *,
     volume_cause: Callable[[str], str | None] = _no_volume_cause,
     drive_target: Callable[[str], str | None] = _no_drive_target,
-) -> tuple[list[tuple[str, str]], str | None]:
+) -> tuple[list[tuple[str, str]], WalkCause | None]:
     """The chain of ``(object path, kind)`` from the volume root to the anchor, and a cause when the
-    walk could not finish.
+    walk could not finish. The cause is a :class:`WalkCause`, whose ``kind`` names no path.
 
     Win32 collapses ``.`` and ``..`` in the text before any link is followed, so each pass
     normalizes first. A link's target is spliced in: a relative one against the directory holding
     the link, an absolute one from its own root. Every pass then restarts from the root of the new
     path, which re-reads a shared prefix but keeps the walk simple. The hop limit ends a cycle.
 
-    ``drive_target`` answers the folder a ``subst`` drive letter stands for, or ``None`` for a real
-    volume. Such a letter is spliced in like a link, because its ``X:\\`` is not a volume root:
-    the folders above the substituted one can still be renamed. ``volume_cause`` answers why a
-    volume cannot be judged, and is asked before anything on that volume is read. So a mapped
-    network drive costs no round trip per folder, and a FAT volume's missing DACL is never read as
-    everyone-full-control. ``cwd`` is called only for a relative path."""
+    ``drive_target`` answers the folder a ``subst`` drive letter stands for, in any form
+    :func:`_strip_win_prefix` reads (:func:`subst_target`), or ``None`` for a real volume, and
+    raises ``OSError`` when it cannot tell, which ends the walk with a cause. Such a
+    letter is spliced in like a link, because its ``X:\\`` is not a volume root: the folders above
+    the substituted one can still be renamed. ``volume_cause`` answers why a volume cannot be
+    judged, and is asked before anything on that volume is read. So a mapped network drive costs no
+    round trip per folder, and a FAT volume's missing DACL is never read as everyone-full-control.
+    ``cwd`` is called only for a relative path with no drive.
+
+    At least these end the walk with a cause, since Windows would open another object than the text
+    names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
+    link target or a ``subst`` target; a name ending in a space or a dot, which Win32 strips; and a
+    link target rooted with no drive (:data:`_ROOTED_LINK`); a device prefix written with forward
+    slashes (``//?/S:/x``); and a stream name after a link. A path that reaches a share ends with
+    :data:`SHARE_CAUSE`."""
     full = _strip_win_prefix(path)
     if full is None:
-        return [], "the path is a device path this check does not read"
+        return [], WalkCause.plain(_DEVICE_PATH)
+    if _drive_relative(full):
+        return [], WalkCause.plain(_DRIVE_RELATIVE)
     if not ntpath.isabs(full) and not full.startswith("\\\\"):
-        full = ntpath.join(cwd() if callable(cwd) else cwd, full)
+        # A working directory may itself carry a \\?\ prefix, which the loop below would refuse.
+        full = _strip_win_prefix(ntpath.join(cwd() if callable(cwd) else cwd, full))
+        if full is None:
+            return [], WalkCause.plain(_DEVICE_PATH)
     chain: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -456,56 +530,97 @@ def windows_chain(
     pending = full
     while True:
         norm = ntpath.normpath(pending)
+        if norm.startswith("\\\\.\\") or (
+            norm.startswith("\\\\?\\") and norm[4:11].lower() != "volume{"
+        ):
+            # A device prefix written with forward slashes (``//?/S:/x``, ``//./C:/x``), which
+            # normpath turns into backslashes after _strip_win_prefix has looked. Read as a share
+            # or a drive, it skipped the subst lookup or answered "share" for a local device path,
+            # so it is a cause instead, a ``//./Volume{`` spelling too (vault BACKLOG #5197 review).
+            return chain, WalkCause.plain(_DEVICE_PATH)
         if norm.startswith("\\\\") and not norm.startswith("\\\\?\\"):
-            return chain, "the path is on a network share, whose permissions this host cannot read"
+            return chain, WalkCause.plain(SHARE_CAUSE)
         drive, rest = ntpath.splitdrive(norm)
         if not drive:
-            return chain, "the path has no drive or volume"
-        substituted = drive_target(drive) if len(drive) == 2 else None
+            return chain, WalkCause.plain("the path has no drive or volume")
+        try:
+            substituted = drive_target(drive) if len(drive) == 2 else None
+        except OSError as exc:
+            # A subst drive that could not be read would hide the folders above its target.
+            return chain, WalkCause(
+                f"the drive {drive} could not be read: {exc.strerror or exc}",
+                f"a drive could not be read: {exc.strerror or type(exc).__name__}",
+            )
         if substituted is not None:
             hops += 1
             if hops > MAX_LINK_HOPS:
-                return chain, f"the path passes through more than {MAX_LINK_HOPS} links"
+                return chain, WalkCause.plain(_TOO_MANY_HOPS)
             target = _strip_win_prefix(substituted)
             if not target:
-                return chain, f"the drive {drive} stands for a path this check does not read"
+                return chain, WalkCause(
+                    f"the drive {drive} stands for a path this check does not read",
+                    "a drive stands for a path this check does not read",
+                )
+            if _drive_relative(target):
+                return chain, WalkCause.plain(_DRIVE_RELATIVE)
             pending = target + rest
             continue
         root = drive + "\\"
         why = volume_cause(root)
         if why is not None:
-            return chain, f"{root!r}: {why}"
+            return chain, WalkCause(f"{root!r}: {why}", f"a volume cannot be judged: {why}")
         add(root, DIRECTORY)
         parts = [c for c in rest.split("\\") if c]
         cur = root
         spliced = False
         for i, name in enumerate(parts):
             if ":" in name:
-                return chain, "the path names an alternate data stream"
+                return chain, WalkCause.plain(_STREAM)
             child = ntpath.join(cur, name)
+            if name.endswith((" ", ".")) and name not in (".", ".."):
+                return chain, WalkCause(
+                    f"{child!r} ends in a space or a dot, which Windows strips",
+                    "a name in the path ends in a space or a dot, which Windows strips",
+                )
             try:
                 kind, target = probe(child)
             except OSError as exc:
-                return chain, f"{child!r} could not be read: {exc.strerror or exc}"
+                # strerror, never str(exc): an OSError's own text carries its filename.
+                reason = exc.strerror or type(exc).__name__
+                return chain, WalkCause(
+                    f"{child!r} could not be read: {exc.strerror or exc}",
+                    f"a name in the path could not be read: {reason}",
+                )
             if kind == LINK:
                 add(child, LINK)
                 hops += 1
                 if hops > MAX_LINK_HOPS:
-                    return chain, f"the path passes through more than {MAX_LINK_HOPS} links"
+                    return chain, WalkCause.plain(_TOO_MANY_HOPS)
                 spliced_target = _strip_win_prefix(target or "")
                 if not spliced_target:
-                    return chain, f"the link {child!r} points at a path this check does not read"
-                if spliced_target.startswith("\\") and not spliced_target.startswith("\\\\"):
-                    spliced_target = drive + spliced_target  # rooted, no drive: the link's drive
+                    return chain, WalkCause(
+                        f"the link {child!r} points at a path this check does not read",
+                        "a link points at a path this check does not read",
+                    )
+                if _drive_relative(spliced_target):
+                    return chain, WalkCause.plain(_DRIVE_RELATIVE)
+                if spliced_target[:1] in ("\\", "/") and spliced_target[1:2] not in ("\\", "/"):
+                    return chain, WalkCause(f"the link {child!r}: {_ROOTED_LINK}", _ROOTED_LINK)
                 if not (ntpath.isabs(spliced_target) or spliced_target.startswith("\\\\")):
                     spliced_target = ntpath.join(cur, spliced_target)
                 remaining = parts[i + 1 :]
+                if any(":" in rest_name for rest_name in remaining):
+                    # ntpath.join would restart at a remaining ``D:ca.pem`` and drop the folders
+                    # before it, where Windows opens a stream of the name before the colon.
+                    return chain, WalkCause.plain(_STREAM)
                 pending = ntpath.join(spliced_target, *remaining) if remaining else spliced_target
                 spliced = True
                 break
             add(child, kind)
             if kind != DIRECTORY and i != len(parts) - 1:
-                return chain, f"{child!r} is not a directory"
+                return chain, WalkCause(
+                    f"{child!r} is not a directory", "a folder in the path is not a directory"
+                )
             cur = child
         if not spliced:
             return chain, None
@@ -1107,13 +1222,16 @@ def windows_host_readers() -> WinHost:
         return unresolved(members, "the enumeration did not finish in 64 pages")
 
     def drive_target(drive: str) -> str | None:
-        """The folder a ``subst`` drive stands for, or ``None``. QueryDosDeviceW answers
-        ``\\??\\C:\\...`` for a substituted drive and ``\\Device\\...`` for a real volume or a
-        network redirector."""
+        """The folder a ``subst`` drive stands for, whole, or ``None`` (:func:`subst_target`). A
+        failed query other than "no such device" raises ``OSError``: read as a real volume, a subst
+        drive it could not read would hide the folders above its target from the walk."""
         buf = ctypes.create_unicode_buffer(1024)
         if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
-            return None
-        return buf.value[4:] if buf.value.startswith("\\??\\") else None
+            error = ctypes.get_last_error()
+            if error == 2:  # ERROR_FILE_NOT_FOUND: no device at that letter
+                return None
+            raise OSError(f"the drive {drive} could not be read: {win_error(error)}")
+        return subst_target(buf.value)
 
     cache: list[tuple[frozenset[str], bool]] = []
 

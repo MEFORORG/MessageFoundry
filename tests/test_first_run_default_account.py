@@ -203,7 +203,7 @@ async def test_every_backend_binds_disabled_false_in_its_user_insert() -> None:
     sqlite = await MessageStore.open(":memory:")
     try:
         for shape in _ACCOUNT_SHAPES:
-            await sqlite.create_user(**shape)
+            await sqlite.create_user(**shape, audits=())
             user = await sqlite.get_user(str(shape["user_id"]))
             assert user is not None and user.username == shape["username"]
             assert user.disabled is False, f"SQLite created {shape['username']} disabled"
@@ -232,7 +232,7 @@ async def test_every_backend_binds_disabled_false_in_its_user_insert() -> None:
 
         store._execute_with_audits = _capture
         for shape in _ACCOUNT_SHAPES:
-            await store.create_user(**shape)
+            await store.create_user(**shape, audits=())
         assert len(captured) == len(_ACCOUNT_SHAPES), f"{name} wrote {len(captured)} statements"
         for (sql, params), shape in zip(captured, _ACCOUNT_SHAPES, strict=True):
             match = re.search(r"INSERT INTO users \((.*?)\) VALUES", " ".join(sql.split()))

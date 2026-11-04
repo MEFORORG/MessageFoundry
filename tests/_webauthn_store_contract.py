@@ -88,6 +88,7 @@ async def _assert_webauthn_rehash_contract(store: Any) -> None:
         password_hash="h",
         now=100.0,
         password_generated=False,
+        audits=(),
     )
     bare, tagged = "ab" * 32, "wc1:" + "ab" * 32
     await store.add_webauthn_credential(_cred("wa-r1", "key", id_hash=bare))
@@ -115,6 +116,7 @@ async def _assert_webauthn_conditional_bind_contract(store: Any) -> None:
             password_hash="h",
             now=100.0,
             password_generated=False,
+            audits=(),
         )
     for token_hash, uid in (("cb-a", "wa-c1"), ("cb-b", "wa-c1"), ("cb-d", "wa-c2")):
         assert await store.create_session(
@@ -213,6 +215,7 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
         password_hash="h",
         now=100.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_user(
         user_id="wa-u2",
@@ -221,6 +224,7 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
         password_hash="h",
         now=100.0,
         password_generated=False,
+        audits=(),
     )
 
     # Multi-row round-trip: fields survive intact (transports JSON, backed_up bool, aaguid, rp_id).
@@ -333,6 +337,7 @@ async def _assert_totp_contract(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
 
     # Secret staging round-trip (cipher-covered column) + clear.
@@ -591,6 +596,7 @@ async def _assert_totp_binding_contract(store: Any) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     verified = await store.set_totp_secret("totp-u2", secret="JBSWY3DPEHPK3PXP", now=2.0)
     assert verified is not None

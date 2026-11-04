@@ -1545,8 +1545,11 @@ count is above `0` (vault BACKLOG #2613).
 - **What the engine refuses without it:** each hop verifies the peer's certificate, and its
   handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
   off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
-  Both hold on a host the `smtp_allowed_hosts` or `webhook_allowed_hosts` allowlist admits; a host
-  off it is left to the per-send refusal.
+  Each holds on a host its own hop's allowlist admits: `[alerts].smtp_allowed_hosts` for the
+  relay, `[alerts].webhook_allowed_hosts` for the webhook. Which hosts a list admits, an unset or
+  empty one included, is stated once, in [PHI.md](PHI.md) rows 10 and 11. A host off a non-empty
+  list is refused at the build, at every posture and before this guard, so no attestation is
+  asked for it.
   A relay with no login takes no guard at all, so the `email` pair does nothing there.
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
@@ -1794,8 +1797,13 @@ count is above `0` (vault BACKLOG #2613).
   which a CRL used to admit without the revocation WARNING, now logs that WARNING at each build, except at
   least when `MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own
   `tls_revocation_attested`, or on a loopback hop. CORRECTED 2026-10-30:
-  this said "No posture gate keys on it", which was false once the call sites handed the guard no
-  context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged. The engine will tell you *which* connections have it set,
+  this said "No posture gate keys on it", which was false once the call sites stopped giving such a
+  hop CRL credit. At least MLLP, the DICOM C-STORE SCU and both FTPS directions pass
+  `RevocationHopGuard.capture` the context they dial with and `expiry_relaxed=True`, which drops
+  the credit whatever CRL the context loads (vault BACKLOG #5089); at least REST, SOAP and FHIR
+  hand the guard no context or opener (ADR 0173 §4.3 and §13). CORRECTED 2026-11-03: this said
+  `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
+  which stopped being true when `capture` gained that flag. The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -1987,20 +1995,22 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying TLS mode —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
-- **How it is detected, precisely:** the hop counts as owned only when `sslmode` or `encrypt`, in any
-  case, has a non-blank string value with no blank at either end, and no TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known
-  no-TLS spellings. The value check matters: matching the key alone read `SSLmode=disable` as TLS
+- **How it is detected, precisely:** the engine places the `odbc_driver` name in a driver family
+  (BACKLOG #5053). The hop counts as owned only when the one mode keyword that family reads, at a
+  spelling it reads, has a non-blank string value with no blank at either end, and no TLS-shaped
+  `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known no-TLS spellings. On a name the
+  engine cannot place, no keyword counts at all. The families, their keywords and their spellings
+  are tabled once, in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling).
+  The value check matters: matching the key alone read `SSLmode=disable` as TLS
   ownership. So did a lone key or certificate path, or a blank mode, none of which the engine counts
   as a mode (BACKLOG #2483). A passphrase-shaped key such as `sslpassword` is not
   TLS-shaped for this check, and its value is never classified or reported (BACKLOG #1352).
   **Known residuals:** an *encrypted-but-unverified* value
   (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
-  for "verified" are not consistent enough to grade without guessing. A mode value outside the deny-list
-  clears the check however it is spelled. The build refuses an `sslmode` outside libpq's six
-  lower-case spellings on every driver but MySQL Connector/ODBC (BACKLOG #2705), so a typo still
-  clears an `encrypt` value, or an `sslmode` on MySQL Connector/ODBC, and on some drivers it would
-  select no TLS. `encrypt` is unproven, and absent from psqlODBC's keyword parser.
-  [CONNECTIONS.md](CONNECTIONS.md#generic-odbc-postgresql--mysql) records both.
+  for "verified" are not consistent enough to grade without guessing. An `encrypt` value outside
+  the deny-list clears the check on Microsoft's driver however it is spelled. The family is read
+  from the driver NAME, never the library it loads, so a name registered for another library is
+  taken at its word. No MySQL driver was run for the MySQL spellings.
 - **What reports it:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
   `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`. A

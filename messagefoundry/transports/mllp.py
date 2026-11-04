@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import socket
 import ssl
 import time
@@ -36,7 +37,6 @@ from typing import Any, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import (
     ConnectorType,
-    ContentType,
     Destination,
     Source,
     bool_setting,
@@ -46,7 +46,6 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
-    EXPIRY_RELAXED_WAYS_ACROSS,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
@@ -70,6 +69,11 @@ from messagefoundry.config.tls_policy import (
     skips_validity_period,
     warn_hostname_check_off,
 )
+from messagefoundry.credential import (
+    OTHERNAMES_INTACT_KEY,
+    VERIFIED_ISSUER_KEY,
+    client_cert_principal_under_issuer,
+)
 from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.mllpcodec import (
     _CODES,
@@ -85,15 +89,22 @@ from messagefoundry.mllpcodec import (
 )
 from messagefoundry.parsing._builtin_hl7 import DelimiterRewriteRefused
 from messagefoundry.parsing.message import emit_raw_separators, reencode_with_separators
-from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
+from messagefoundry.parsing.peek import (
+    PEEK_READ_FAULTS,
+    HL7PeekError,
+    Peek,
+    normalize,
+    starts_with_msh,
+)
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.tls_handshake_failures import (
     HUNG_UP,
     HandshakeFailures,
     handshake_cause,
 )
-from messagefoundry.transports.admission import FrameClock, ListenerAdmission
+from messagefoundry.transports.admission import FrameClock, ListenerAdmission, RefusalLog
 from messagefoundry.transports.base import (
+    INTAKE_AUDIT_ACTIONS,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -102,6 +113,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     float_setting,
     intake_open,
+    owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
@@ -349,6 +361,31 @@ def _bounded_ack_field(value: str | None) -> str:
     ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
     redactor's thresholds and walks the identifier into the log downstream."""
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
+
+
+#: A segment break in a payload not yet normalized (``normalize`` maps both to ``\r``).
+_LINE_BREAK = re.compile(r"[\r\n]")
+
+
+def _outgoing_control_id(payload: str) -> str | None:
+    """MSH-10 of an outgoing payload, read from its MSH segment alone (BACKLOG #4905).
+
+    MSH-10 lives in the header, so parsing the whole body to read it was both waste and a hole: a
+    body over a :meth:`Peek.parse` cap (16 MiB, 10,000 segments, the escape budget) raised
+    ``HL7PeekError`` although its MSH-10 was readable, and correlation switched off. The slice runs
+    up to the first line break after the leading ``MSH``, keeping anything before it, so the parser
+    sees the same header the whole-body parse would have, and nothing past the header is copied.
+
+    ``None`` for a payload that does not lead with ``MSH``: it is not HL7 and has no MSH-10, which
+    the whole-body parse refused too. Raises ``HL7PeekError`` only where an MSH-led header cannot be
+    read, so a caller may treat every such raise as a delivery check switched off."""
+    if not starts_with_msh(payload):
+        return None
+    # Leading whitespace holds no "MSH", so the first one is the header's own.
+    brk = _LINE_BREAK.search(payload, payload.find("MSH") + 3)
+    if brk is not None:
+        payload = payload[: brk.start()]
+    return Peek.parse(payload).control_id
 
 
 # --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
@@ -638,9 +675,10 @@ def _mllp_ssl_context(
 
     ``on_client_ca`` (inbound mTLS only) is called once with the exact ``cadata`` text the context
     loaded as its client trust store. The inbound HTTP listener passes it to index which loaded CA
-    issued each client certificate (vault BACKLOG #2287). Handing over the loaded bytes, rather than
-    the path, is the point: a second read of ``tls_ca_file`` could see a swapped file. ``None``, the
-    default and every MLLP caller, changes nothing."""
+    issued each client certificate (vault BACKLOG #2287), and so does the MLLP listener when it sets
+    ``tls_client_subjects`` (BACKLOG #4907). Handing over the loaded bytes, rather than the path, is
+    the point: a second read of ``tls_ca_file`` could see a swapped file. ``None``, the default,
+    changes nothing."""
     refuse_an_unread_ca_pin(
         s,
         inbound=server,
@@ -744,8 +782,10 @@ def _mllp_ssl_context(
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has
-        # passed while STILL validating the chain, and the hostname unless tls_check_hostname=false
-        # (relax_verify_expiry's WARNING says which). Opt-in per connection (default False = byte-
+        # passed while STILL validating the chain's signatures and key usage, and the hostname
+        # unless tls_check_hostname=false (relax_verify_expiry's WARNING says which). At least the
+        # intermediates' and the trust anchor's validity periods, and a CRL's own window, go
+        # unchecked too (vault BACKLOG #5089). Opt-in per connection (default False = byte-
         # identical); applied on the verify path only, so it composes with (never bypasses) the
         # tls_verify=false refusal above and the #200 cleartext/verify-off hop refusals.
         if s.get("tls_allow_expired"):
@@ -918,25 +958,27 @@ class MLLPDestination(DestinationConnector):
         # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
         # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
         #
-        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
-        # is handed to the guard as no context: see skips_validity_period (owner ruling 2026-10-05;
-        # vault BACKLOG #2978, ADR 0173 §13).
-        expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so
+        # the guard is told with expiry_relaxed, which drops that credit and names the relaxed
+        # remedy: see skips_validity_period (owner ruling 2026-10-05; vault BACKLOG #2978 and #5089,
+        # ADR 0173 §13).
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
                 host=self.host,
                 cell="MLLP outbound",
-                description="verified MLLP-over-TLS egress (no revocation check)",
+                # The relaxed record says itself what the hop lacks, and a CRL there still refuses
+                # a leaf it lists, so "(no revocation check)" would lead it with less than is true.
+                description="verified MLLP-over-TLS egress"
+                + ("" if skips_validity_period(self._ssl) else " (no revocation check)"),
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                # BACKLOG #299: the context this hop will actually hand to wrap_socket, unless it
-                # skips validity-period checks (above, #2978), when it is deliberately None and
-                # must stay so. A CRL that reached it (via [tls].crl_file through the resolved
-                # anchor) sets VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the
-                # setting -- so a sibling hop the same CRL never reached keeps its refusal.
-                context=None if expiry_relaxed else self._ssl,
-                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+                # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
+                # reached it (via [tls].crl_file through the resolved anchor) sets
+                # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting --
+                # so a sibling hop the same CRL never reached keeps its refusal.
+                context=self._ssl,
+                expiry_relaxed=skips_validity_period(self._ssl),
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None
@@ -1057,13 +1099,24 @@ class MLLPDestination(DestinationConnector):
                 return await self._send_persistent_no_ack(wire)
             # BACKLOG #82: read the OUTGOING control id (MSH-10) once, off the final on-wire payload
             # (after any delimiter/raw-separator rewrite), so _check_ack can correlate it to the reply's
-            # MSA-2. Off → None → no correlation (byte-identical). Defensive: a non-HL7 / unparseable
-            # payload has no MSH-10 to correlate, so we skip (deliver as before) rather than fail.
+            # MSA-2. Off → None → no correlation (byte-identical). Defensive: a non-HL7 payload has no
+            # MSH-10 to correlate, so we skip (deliver as before) rather than fail.
             sent_control_id: str | None = None
             if self.verify_ack_control_id:
                 try:
-                    sent_control_id = Peek.parse(payload).control_id
-                except HL7PeekError:
+                    sent_control_id = _outgoing_control_id(payload)
+                except HL7PeekError as exc:
+                    # BACKLOG #4905: only the header is parsed, so a whole-message cap (size,
+                    # segments, escape budget) can no longer reach here, and a payload that is not
+                    # HL7 returns None quietly. What does reach here is a header that leads with MSH
+                    # and still cannot be read; that switches off a delivery check, so say so, by
+                    # type name only.
+                    logger.warning(
+                        "MLLP send to %s:%s: MSH-10 read refused (%s); ACK correlation skipped",
+                        self.host,
+                        self.port,
+                        type(exc).__name__,
+                    )
                     sent_control_id = None
                 except PEEK_READ_FAULTS as exc:
                     # A faulting MSH-10 read is unreadable too (BACKLOG #1594), so correlation is
@@ -1811,6 +1864,69 @@ def _pacing_settings(
     return rate, float(burst or rate or 0.0)
 
 
+# --- the expected-sender allowlist (BACKLOG #4907) -------------------------------------------------
+
+#: The connection-event reasons for a ``tls_client_subjects`` refusal: the inbound HTTP listener's
+#: own reasons for the same two kinds, fixed strings, never anything from the certificate.
+_SENDER_DENIED = "client certificate subject is not permitted"
+_SENDER_RATE_LIMITED = "too many failed authentication attempts"
+
+
+def _client_subjects_by_issuer(subjects: Any) -> dict[str, dict[str, str]] | None:
+    """``tls_client_subjects`` as the matcher reads it, or ``None`` when the allowlist is off.
+
+    Issuer DN -> each qualified name mapped to itself, the shape
+    :func:`~messagefoundry.credential.client_cert_principal_under_issuer` reads, so this listener
+    and the inbound HTTP listener's ``intake_client_subjects`` share one matcher. The ``MLLP()``
+    factory has already checked the shape. This refuses anything that is not a non-empty table of
+    non-empty lists, so a ``Source`` built some other way fails at construction rather than
+    refusing every sender with no cause in the log. The message quotes no value."""
+    if subjects is None:
+        return None
+    if (
+        not isinstance(subjects, Mapping)
+        or not subjects
+        or any(not isinstance(names, list | tuple) or not names for names in subjects.values())
+    ):
+        raise ValueError(
+            "MLLP tls_client_subjects must be a non-empty table keyed by the issuing CA's DN, each "
+            "naming a non-empty list of qualified subjects such as 'SAN:DNS:partner.example' "
+            "(BACKLOG #4907)"
+        )
+    return {str(issuer): {str(n): str(n) for n in names} for issuer, names in subjects.items()}
+
+
+def _sender_issuer_lookup(
+    name: str, cadata: str, subjects: Mapping[str, object]
+) -> Callable[[bytes], str]:
+    """Index the client CAs this listener loaded, and warn about an issuer key that cannot match.
+
+    Returns the lookup from a leaf's DER to the subject of the loaded CA whose key signed it, or
+    ``""``. A key naming no loaded CA, or two loaded CAs with one subject and different keys, would
+    refuse every sender under it with nothing in the log, so each is warned about here, as the
+    inbound HTTP listener does for ``intake_client_subjects``."""
+    # Lazy: pki pulls in cryptography, which a listener without the allowlist never needs.
+    from messagefoundry.pki import IssuerIndex
+
+    index = IssuerIndex(cadata)
+    if index.unreadable:
+        logger.warning(
+            "MLLP listener %s: %d certificate(s) in tls_ca_file could not be parsed for "
+            "tls_client_subjects; no sender certificate is admitted under them",
+            name,
+            index.unreadable,
+        )
+    for issuer in index.unmatched_keys(subjects):
+        logger.warning(
+            "MLLP listener %s: tls_client_subjects issuer %r names no CA certificate loaded from "
+            "tls_ca_file, or names several with one subject and different keys; no sender "
+            "certificate is admitted under it",
+            name,
+            issuer,
+        )
+    return index.issuer_of
+
+
 class MLLPSource(SourceConnector):
     """Listen for inbound MLLP connections, hand each message to the pipeline handler,
     and frame whatever the handler returns back to the sender as the ACK.
@@ -1923,7 +2039,40 @@ class MLLPSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
         # once here so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
+        # BACKLOG #4907: with tls_client_subjects set, the builder hands back the client trust store's
+        # exact text, so the issuer index reads the bytes the context loaded, never a second read.
+        self._client_subjects = _client_subjects_by_issuer(s.get("tls_client_subjects"))
+        loaded_client_ca: list[str] = []
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(
+            s,
+            server=True,
+            name=config.name or "",
+            on_client_ca=loaded_client_ca.append if self._client_subjects else None,
+        )
+        #: The loaded CA that signed a sender's leaf, by its DER; ``None`` while the allowlist is off.
+        self._issuer_of: Callable[[bytes], str] | None = None
+        if self._client_subjects is not None:
+            if not loaded_client_ca:
+                # No client CA means no client certificate is requested, so every sender would be
+                # refused with no start-time error to say why. The factory refuses this too.
+                raise ValueError(
+                    "MLLP tls_client_subjects needs tls=true and tls_ca_file: without a client CA "
+                    "no sender certificate is requested, so no sender could be listed"
+                )
+            self._issuer_of = _sender_issuer_lookup(
+                config.name or "", loaded_client_ca[0], self._client_subjects
+            )
+            # The certificate is checked once, after the handshake. A TLS 1.2 renegotiation could
+            # present a different certificate after that check, so this listener refuses one. TLS
+            # 1.3 has no renegotiation, and a listener without the allowlist is left as it was.
+            assert self._ssl is not None  # a client CA was loaded, so a context was built
+            self._ssl.options |= ssl.OP_NO_RENEGOTIATION
+        #: Throttles the refused-sender WARNING as the admission throttles its refusals, so a sender
+        #: that reconnects in a loop cannot write a line per connection (BACKLOG #4907).
+        self._unlisted_log = RefusalLog()
+        #: The same throttle for the spent-budget line, kept apart so neither line hides the other
+        #: for an address inside one window.
+        self._budget_log = RefusalLog()
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         #: The pre-read admission shared with the raw-TCP, X12 and HTTP listeners (vault BACKLOG
@@ -2117,7 +2266,158 @@ class MLLPSource(SourceConnector):
     async def _emit_tls_failure(self, peer_host: str | None, reason: str) -> None:
         await self._emit_event("tls_handshake_failed", peer_host=peer_host, reason=reason)
 
-    async def _handle_bounded(self, message: bytes) -> str | None:
+    def _sender_listed(self, writer: asyncio.StreamWriter) -> bool:
+        """Whether this connection's verified certificate is on ``tls_client_subjects`` (BACKLOG
+        #4907), or ``True`` while the allowlist is off.
+
+        Read after the handshake, so the chain is already verified against ``tls_ca_file``; what
+        is left is the binding the CA does not give: ``tls_ca_file`` alone admits any certificate
+        that CA ever signed. A listed name counts only under the loaded CA whose key signed the
+        leaf, through the matcher the inbound HTTP listener and the operator API share, so a
+        second CA in ``tls_ca_file`` cannot issue a listed name (the flaw BACKLOG #2287 closed on
+        the HTTP listener). Deny by default: anything that cannot be established is unlisted."""
+        if self._client_subjects is None:
+            return True
+        ssl_object = writer.get_extra_info("ssl_object")
+        try:
+            peercert = ssl_object.getpeercert() if ssl_object is not None else None
+        except ValueError:  # ssl's "handshake not done": nothing verified, so refuse
+            return False
+        if not peercert:
+            return False
+        # Lazy, as _sender_issuer_lookup's: pki pulls in cryptography.
+        from messagefoundry.pki import peer_othernames_intact
+
+        verified = {
+            **peercert,
+            VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object),
+            OTHERNAMES_INTACT_KEY: peer_othernames_intact(ssl_object),
+        }
+        return client_cert_principal_under_issuer(verified, self._client_subjects) is not None
+
+    def _verified_issuer(self, ssl_object: Any) -> str:
+        """The subject of the loaded CA that directly signed the sender's leaf, or ``""``.
+
+        Read from the leaf's DER and the index alone. Never from ``getpeercert()["issuer"]``, which
+        the issuing CA writes and OpenSSL matches to a CA loosely, folding case and whitespace; and
+        never from ``get_verified_chain()``, which is empty on a resumed session. ``""`` matches no
+        issuer, so a sender whose issuer cannot be established is refused."""
+        issuer_of = self._issuer_of
+        if issuer_of is None:
+            return ""
+        try:
+            leaf_der = ssl_object.getpeercert(binary_form=True)
+            return issuer_of(leaf_der) if leaf_der else ""
+        except Exception as exc:
+            # Deliberately broad, as the HTTP listener's twin is: anything that stops the issuer
+            # being established must REFUSE the sender, never escape into the per-connection
+            # last-resort handler. Scrubbed, with no traceback, since a subject can name a person.
+            logger.warning(
+                "MLLP listener %s: could not establish a sender certificate's issuer; refusing: %s",
+                self._pacing_name,
+                safe_exc(exc),
+            )
+            return ""
+
+    async def _admit_sender(
+        self, writer: asyncio.StreamWriter, peer_host: str | None
+    ) -> tuple[InboundHandler, bool] | None:
+        """The handler for this connection's frames and whether its sender is refused, or ``None``
+        to close the connection unread (BACKLOG #4907). The allowlist off, the inbound handler.
+
+        A sender outside ``tls_client_subjects`` gets the runner's ``refuse_unlisted_sender``,
+        which records each frame its first read completes as ``ERROR`` before answering ``AR``, so
+        none is accepted and dropped. With no refusal wired (a source built outside the runner)
+        nothing could record its messages, so none is read.
+
+        The injected failed-attempt budget follows ADR 0154 D6. The address's own arm is consulted
+        read-only BEFORE the certificate is compared, so an address that has spent it is closed
+        unread, whatever certificate it now presents. The global arm is consulted only once the
+        compare has refused, and a listed sender is never refused. That leaves no way for refusals
+        from other addresses to close a listed sender unread, which matters because MLLP has no
+        setting that turns the global arm off. What each arm bounds is refusals: the address's arm
+        those from one address, the global arm those from every address, and with each refusal its
+        ``ERROR`` rows, its audit row and its event. Neither bounds the closes on a spent budget:
+        each one still writes an audit row and an event, and only its log line is throttled, so a
+        peer that keeps reconnecting on a spent budget drives one audit write per completed
+        handshake. A refused sender is charged one failed attempt. A listed one is not noted as
+        authenticated, as HTTP notes its partners: here the note would gate nothing for the listed
+        sender and would only exempt an unlisted certificate from the same address from the global
+        arm. Each refusal writes the connection event and the audit row the HTTP listener
+        writes for the same decision. The log line, the event and the audit row name the peer
+        address only, never the certificate: a subject can name a person."""
+        assert self._handler is not None
+        if self._client_subjects is None:
+            return self._handler, False
+        peer = peer_host or "unknown"
+        limiter = self.intake_rate_limiter
+        if limiter is not None and not limiter.check_peer(peer):
+            await self._refuse_spent_budget(peer, peer_host, which="its failed-attempt budget")
+            return None
+        if self._sender_listed(writer):
+            return self._handler, False
+        if limiter is not None and not limiter.check(peer):
+            await self._refuse_spent_budget(
+                peer,
+                peer_host,
+                which="the listener's global failed-attempt budget, as an unlisted sender",
+            )
+            return None
+        if limiter is not None:
+            limiter.charge_failure(peer)
+        handle = self.refuse_unlisted_sender
+        if count := self._unlisted_log.note(peer):
+            logger.warning(
+                "MLLP listener %s: the verified certificate of the sender at %s is not on "
+                "tls_client_subjects under its issuing CA; %s (%d refused so far)",
+                self._pacing_name,
+                peer,
+                "messages completed by its first read are recorded as ERROR, then the "
+                "connection closes"
+                if handle is not None
+                else "nothing can record its messages here, so none is read and the "
+                "connection closes",
+                count,
+            )
+        await self._emit_event("auth_subject_denied", peer_host=peer_host, reason=_SENDER_DENIED)
+        await self._audit_sender_refusal("auth_subject_denied", peer_host)
+        return None if handle is None else (handle, True)
+
+    async def _refuse_spent_budget(self, peer: str, peer_host: str | None, *, which: str) -> None:
+        """Log, emit and audit a ``tls_client_subjects`` sender closed unread on a spent
+        failed-attempt budget, its own address's or, for an unlisted sender, the global one.
+        ``which`` names the arm in the log line, so a close on the global arm does not read as
+        the address's own failures."""
+        if count := self._budget_log.note(peer):
+            logger.warning(
+                "MLLP listener %s: the sender at %s has spent %s for tls_client_subjects; "
+                "closing the connection unread (%d refused so far)",
+                self._pacing_name,
+                peer,
+                which,
+                count,
+            )
+        await self._emit_event(
+            "auth_rate_limited", peer_host=peer_host, reason=_SENDER_RATE_LIMITED
+        )
+        await self._audit_sender_refusal("auth_rate_limited", peer_host)
+
+    async def _audit_sender_refusal(self, kind: str, peer_host: str | None) -> None:
+        """Write the tamper-evident ``audit_log`` row for a ``tls_client_subjects`` refusal, under
+        the action the HTTP listener writes for the same ``kind`` (BACKLOG #4907).
+
+        The detail names the setting and nothing from the certificate. Fail-soft, as HTTP's is: an
+        audit fault must not drop the connection, so it is logged, scrubbed, and the refusal goes
+        on. No sink (a source built outside the runner) writes nothing."""
+        sink = self.on_intake_audit
+        if sink is None:
+            return
+        try:
+            await sink(INTAKE_AUDIT_ACTIONS[kind], peer_host, "mode=tls_client_subjects")
+        except Exception as exc:  # fail-soft; an audit bug cannot drop an MLLP client
+            logger.warning("MLLP intake audit emit failed: %s", safe_exc(exc))
+
+    async def _handle_bounded(self, message: bytes, handler: InboundHandler) -> str | None:
         """Run the inbound handler inside one of this listener's in-flight slots, if the bound is on
         (BACKLOG #1725 act 3).
 
@@ -2128,13 +2428,16 @@ class MLLPSource(SourceConnector):
         raises, before the ACK is written, so a slow reader of ACKs cannot hold one: the bound is
         on the HANDLING path only. The semaphore released is the one acquired, even if a restart
         has replaced ``_inflight`` meanwhile.
+
+        ``handler`` is the inbound handler, or for a refused sender the runner's
+        ``refuse_unlisted_sender``, which records the frame as ``ERROR`` and returns the ``AR``
+        reply, if any (BACKLOG #4907). That takes a slot too, as it writes to the store.
         """
-        assert self._handler is not None
         slots = self._inflight
         if slots is None:
-            return await self._handler(message)
+            return await handler(message)
         async with slots:
-            return await self._handler(message)
+            return await handler(message)
 
     @property
     def sockport(self) -> int:
@@ -2279,20 +2582,23 @@ class MLLPSource(SourceConnector):
         ``content_type`` is injected by the runner; ``None`` (a direct build, as in tests) reads as
         HL7, the MLLP default.
         """
-        return self.ack_mode is not AckMode.NONE and self.content_type in (
-            None,
-            ContentType.HL7V2,
-        )
+        return owes_hl7_reply(self.ack_mode, self.content_type)
 
     def _handler_failure_nak(self, message: bytes) -> bytes | None:
         """The framed ``AE`` NAK (``CE`` in enhanced mode) for a frame the inbound handler faulted
         on, or ``None`` if none can be framed. Call it only when a reply is owed.
 
         **Why AE.** It is this engine's code for "not accepted, and not because of what the message
-        says". The runner answers ``AE`` for its own transient conditions (a strict-validation
-        timeout, a streaming-detach budget) and ``AR`` only for a body it could not read. The
-        engine's own MLLP destination reads the same split: it retries ``AE`` and dead-letters
-        ``AR`` at once. An ``AR`` here would dead-letter an engine-to-engine hop on a store blip.
+        says". The runner answers ``AR`` for every refusal it treats as final and ``AE`` only for a
+        temporary one, at least a strict-validation timeout that fired before any worker thread
+        began the validate and a streaming-detach budget held by concurrent detaches
+        (BACKLOG #5078, owner ruling of 2026-11-03, decision log d20261104T032854299-7235a9,
+        stamped in UTC). The strict outcomes are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*;
+        the detach classes are
+        ``_detach_refusal_kind`` in ``pipeline/wiring_runner.py``. A handler fault is the engine's
+        own and says nothing about the body, so it takes the temporary code. The engine's own MLLP
+        destination reads the same split: it retries ``AE`` and dead-letters ``AR`` at once. An
+        ``AR`` here would dead-letter an engine-to-engine hop on a store blip.
 
         Built defensively, because the fault may have come from reading this very message. Only a
         bounded prefix up to the first segment break is decoded and parsed, so a large frame costs
@@ -2321,7 +2627,13 @@ class MLLPSource(SourceConnector):
         return None
 
     async def _answer_handler_failure(
-        self, message: bytes, exc: Exception, peer: object, peer_host: str | None
+        self,
+        message: bytes,
+        exc: Exception,
+        peer: object,
+        peer_host: str | None,
+        *,
+        closing: bool = False,
     ) -> tuple[bool, bytes | None]:
         """Log and record a handler fault. Returns whether a reply is owed, and the framed NAK.
 
@@ -2347,6 +2659,11 @@ class MLLPSource(SourceConnector):
             outcome = f"answering MSA-1 {_CODES[self.ack_mode]['AE']}, then closing the connection"
         elif owed:
             outcome = "no reply could be framed; closing the connection"
+        elif closing:
+            # BACKLOG #4907: a refused sender's connection closes after this read either way.
+            outcome = (
+                "this inbound sends no reply; the sender is refused, so closing the connection"
+            )
         else:
             outcome = "this inbound sends no reply; keeping the connection"
         logger.error(
@@ -2415,8 +2732,14 @@ class MLLPSource(SourceConnector):
                     handshaking = False
                     if self._stopping:
                         return  # the handshake finished after stop() began: refuse it unread
-                established = True
-                await self._emit_event("established", peer_host=peer_host)
+                # BACKLOG #4907: the expected-sender allowlist. See the method.
+                admitted = await self._admit_sender(writer, peer_host)
+                if admitted is None:
+                    return  # closed unread: the sender keeps whatever it had not had read
+                handle, unlisted = admitted
+                if not unlisted:
+                    established = True
+                    await self._emit_event("established", peer_host=peer_host)
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
@@ -2461,13 +2784,17 @@ class MLLPSource(SourceConnector):
                             decoded += 1
                             try:
                                 # BACKLOG #1725 act 3: bounded per listener; see the method.
-                                reply = await self._handle_bounded(message)
+                                reply = await self._handle_bounded(message, handle)
                             except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
                                 # BACKLOG #1619: the handler faulted on a frame the decoder read
                                 # cleanly, which is not a framing fault. A store outage at the
                                 # ingress commit is one reachable case. NAK it, then close.
                                 owed, nak = await self._answer_handler_failure(
-                                    message, exc, writer.get_extra_info("peername"), peer_host
+                                    message,
+                                    exc,
+                                    writer.get_extra_info("peername"),
+                                    peer_host,
+                                    closing=unlisted,
                                 )
                                 if not owed:
                                     continue  # no reply on this inbound: handle what follows
@@ -2487,8 +2814,17 @@ class MLLPSource(SourceConnector):
                                     )
                                 )
                                 await self._drain_ack(writer)
+                        if unlisted and decoded:
+                            # BACKLOG #4907: every frame this read completed was recorded above,
+                            # then the connection closes. The certificate cannot change within
+                            # the session, so every later frame would be refused too. Closing
+                            # bounds what a refused sender has recorded per connection to the
+                            # frames of the first read that completes one, which can include a
+                            # frame begun in earlier reads (up to max_frame_bytes), and leaves
+                            # anything it has not yet had read with the sender.
+                            handler_dropped = True
                         if handler_dropped:
-                            failed = True  # handler_error already names why this closes
+                            failed = True  # handler_error or the sender refusal says why
                             break
                         # Charge AFTER the messages in this chunk are fully handled and ACKed.
                         if pacer is not None:

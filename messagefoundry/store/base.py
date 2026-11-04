@@ -84,6 +84,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
@@ -108,6 +109,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -129,6 +131,8 @@ __all__ = [
     "AdminStore",
     "AuditStore",
     "AuthStore",
+    "CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS",
+    "ConnectionFlagLockTimeout",
     "ContentSearchError",
     "DbaDelegatedError",
     "DEFAULT_SCAN_LIMIT",
@@ -147,6 +151,7 @@ __all__ = [
     "ResendSourceEmpty",
     "ResendSourceNotFound",
     "RestoreRecord",
+    "RevokeResult",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -184,6 +189,14 @@ class DbaDelegatedError(RuntimeError):
     reimplemented in the engine, so the snapshot raises this rather than producing a half-baked copy. The
     BackupRunner / ``backup`` CLI catch it and fall back to a config-only backup (or skip) per
     ``[backup].config_only_on_server_db``."""
+
+
+class ReferenceKeyCollision(ValueError):
+    """Two keys of one reference snapshot differ only by trailing spaces, which SQL Server compares
+    as equal (BACKLOG #4917), so its ``write_reference_snapshot`` refuses before the transaction.
+
+    The message holds the set name and the two keys' ordinals, never a key or a hash of one, so
+    ``reference_sync`` logs it whole where it logs any other source error by class name only."""
 
 
 class Row(Protocol):
@@ -377,7 +390,14 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is True ever receives a non-empty value.
 
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
-        message id, commits in the same transaction. A live receipt passes none.
+        message id, commits in the same transaction. A live receipt passes none. It stays optional
+        in the type because this one method is both paths, so nothing at the type level holds a
+        direct caller here. At runtime an operator ``origin`` (``operator_edit``,
+        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written;
+        an operator inject whose audit builds no row raises inside the transaction, which rolls
+        the inject back (BACKLOG #5071,
+        ``store.require_ingress_audit``, where the limit is stated: it keys on ``origin``). The
+        engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires one.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
         A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""
@@ -852,8 +872,9 @@ class QueueStore(StoreLifecycle, Protocol):
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
-        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed, ``""``
-        if the artifact is gone."""
+        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed. ``""``
+        if the artifact row is missing, its body was erased, or the reply was empty: the peek needs
+        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996)."""
         ...
 
     async def mark_failed(
@@ -1078,9 +1099,12 @@ class QueueStore(StoreLifecycle, Protocol):
 
     # The operator mutations. Each takes a REQUIRED ``audit`` that builds the operator's audit row
     # from the result, and the row commits in the mutation's own transaction (BACKLOG #2624,
-    # OperatorAudit). Required with no default, so a caller cannot run one and record nothing by
-    # leaving the argument out; ``enqueue_ingress`` stays optional because a live receipt has no
-    # operator. An ``OperatorAudit`` may still return ``None``, which records nothing.
+    # OperatorAudit). Required with no default, so a typed caller cannot run one and record nothing
+    # by leaving the argument out, and each backend raises TypeError, before any write, on an
+    # explicit ``None`` or anything not callable (BACKLOG #5069). ``enqueue_ingress`` keeps an
+    # optional ``audit`` because it is also the live receipt path; see its docstring for what holds
+    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result,
+    # which records nothing: that is decided, and the reason is on ``store.OperatorAudit``.
     async def replay(
         self,
         message_id: str,
@@ -1424,10 +1448,13 @@ class QueueStore(StoreLifecycle, Protocol):
         writer. So the flag matches the newest row a call appended, unless something outside the
         store writes the table (ADR 0007, amendment of 2026-10-31).
 
-        On a server backend the flag statement waits at most
-        :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` for a lock on the table, since the audit lock is
-        held while it waits. Past that it raises :class:`ConnectionFlagLockTimeout`, having rolled
-        back and released the audit lock, with nothing written."""
+        On a server backend each lock wait the flag statement makes on the table is bounded at
+        :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, since the audit lock is held while it waits.
+        Past it the call raises :class:`ConnectionFlagLockTimeout`, with nothing written, once the
+        transaction has rolled back and released the audit lock. Where that rollback fails, the
+        connection is discarded instead, and the audit lock is held until the server ends that
+        session. The constant's comment says what the bound covers, and ADR 0007, amendment of
+        2026-10-31, at least what it does not."""
         ...
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -1657,13 +1684,14 @@ class QueueStore(StoreLifecycle, Protocol):
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null dead-lettered bodies updated before ``older_than`` (their own window), at **every
         stage** — a dead ``ingress``/``routed`` row carries the full raw body and is reached here
         (#1188, ASVS 14.2.7), not only a dead ``outbound`` row. ``connection_cutoffs`` (#34, ADR 0027)
         optionally overrides the cutoff per ``destination_name`` (``float('-inf')`` = keep forever);
         default empty ⇒ a single global cutoff. A row with a NULL ``destination_name`` (ingress, routed,
-        response) always takes the global window. Returns the number purged."""
+        response) always takes the global window. Returns a :class:`DeadLetterPurge` (BACKLOG
+        #4996)."""
         ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
@@ -2032,7 +2060,7 @@ class AuditStore(Protocol):
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request whose row FAILS its integrity seal to ``rejected`` (BACKLOG
         #3638; owner ruling 2026-10-26). ``True`` iff this call moved it.
@@ -2160,7 +2188,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Insert one account row.
 
@@ -2222,7 +2250,7 @@ class AuthStore(Protocol):
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Refresh the **cached** username on a directory-backed row (BACKLOG #1532).
 
@@ -2352,7 +2380,7 @@ class AuthStore(Protocol):
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields, never ``notify_email`` (BACKLOG #1139).
 
@@ -3125,14 +3153,26 @@ class AuthStore(Protocol):
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int: ...
+    ) -> RevokeResult:
+        """Revoke the account's unrevoked sessions, but ``except_token_hash`` when it is given,
+        raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
+        many it revoked and whether it re-stamped the kept session with the new epoch in that
+        transaction (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975): only when
+        that session is the account's and carried the epoch the raise replaced and the store's
+        current global epoch, read in that transaction (store.py's ``KeptSessionRestamp``). A
+        session of the account it declines to re-stamp it ends in the same transaction and counts,
+        and reports ``ended_kept`` (follow-up to BACKLOG #4975). ``kept`` is False with no
+        ``except_token_hash``."""
+        ...
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
     ) -> int:
         """How many sessions :meth:`revoke_user_sessions` would end, given the same ``user_id`` and
         ``except_token_hash``: every unrevoked row of the account, idle or expired ones included,
-        but for the excepted one (BACKLOG #3393).
+        but for the excepted one (BACKLOG #3393). Where the revoke declines to re-stamp the
+        excepted session it ends that one too and counts it (``RevokeResult.ended_kept``), so its
+        ``count`` is then one more than this; its ``others`` is this number.
 
         Deliberately the revoke's predicate and not :meth:`list_sessions`'s, so the number an offer
         to sign out the other sessions shows is the number the revoke then ends. Each backend
@@ -3143,14 +3183,24 @@ class AuthStore(Protocol):
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
-        return how many it revoked (BACKLOG #2614).
+        return how many it revoked and whether it re-stamped the kept session
+        (:class:`~messagefoundry.store.store.RevokeResult`; BACKLOG #2614, #4975).
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss. A kept session whose seal does not verify raises
-        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
+        In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
+        every session minted before it whatever account it belongs to, raises the epoch of each
+        account its read of the account list returns, ends the sessions it finds, and re-seals the
+        kept session under its account's new epoch and the new global one, only when it carried
+        both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
+        kept session an earlier sweep missed, or one whose account's record failed its seal, is
+        ended in the same transaction and counted instead, ``kept`` is False and ``ended_kept``
+        True (follow-up to BACKLOG #4975). The order of the first three is each backend's, and its
+        own docstring states it. store.py's
+        ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
+        *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal
+        does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError`, a store with
+        no global epoch row raises ``RuntimeError``, and either way the transaction rolls back."""
         ...
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -3573,22 +3623,31 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
         )
 
 
-#: How long a server backend's connection flag toggle waits for a lock on ``connection_flag``
-#: (BACKLOG #2623). The toggle holds the store's audit lock while it waits, so this also bounds how
-#: long a foreign lock on that table can hold every audit append. Under the engine's
-#: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so the toggle's own
-#: refusal arrives before the engine stops waiting for it.
+#: How long each lock wait of a server backend's connection flag statement may last, on
+#: ``connection_flag`` (BACKLOG #2623). The toggle holds the store's audit lock while it waits, so
+#: this also bounds how long a foreign lock on that table can hold every audit append, per lock
+#: wait and per attempt, not per statement or per toggle. It sits under the engine's
+#: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so a toggle that
+#: gets the audit lock at once and meets one lock hears this refusal before the engine stops
+#: waiting. A statement that meets two locks, or a toggle that first queued for the audit lock, can
+#: still be cut off by the engine instead, though each lock wait on ``connection_flag`` still ends
+#: at this bound; the wait for the audit lock is not bounded by it. Where a non-zero
+#: ``[store].command_timeout`` is at or under it, the driver's timeout ends the wait first, and SQL
+#: Server's retry waits again. ADR 0007, amendment of 2026-10-31, records at least what it does not
+#: cover.
 CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 class ConnectionFlagLockTimeout(RuntimeError):
-    """A server backend's flag statement did not get its lock on ``connection_flag`` within
-    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` (BACKLOG #2623). Only toggles write the table, and
-    they run one at a time under the audit lock, so the holder is something outside the store.
+    """A lock wait of a server backend's flag statement on ``connection_flag`` did not end within
+    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, or within a stricter ``lock_timeout`` a Postgres
+    role or database sets (BACKLOG #2623). Toggles run one at a time under
+    the audit lock, so the holder is something other than a toggle: at least a writer outside the
+    store, or a schema change holding a lock on the table.
 
-    Raised inside the toggle's transaction, which then rolls back with nothing written and releases
-    the audit lock. It is never retried there, since a retry would hold the audit lock again behind
-    the same holder."""
+    Raised inside the toggle's transaction, which then rolls back with nothing written; the store
+    method's docstring says what happens where that rollback fails. It is never retried there,
+    since a retry would hold the audit lock again behind the same holder."""
 
     def __init__(self, backend: StoreBackend, timeout: float) -> None:
         self.backend = backend
@@ -3599,8 +3658,9 @@ class ConnectionFlagLockTimeout(RuntimeError):
             else ""
         )
         super().__init__(
-            f"{backend.value}: a connection flag statement did not get its row lock within "
-            f"{timeout:.15g} s{stricter}; another session holds one. Nothing was written"
+            f"{backend.value}: a connection flag statement did not get its lock on the flag table "
+            f"within {timeout:.15g} s{stricter}; another session, or a schema change, holds one. "
+            "Nothing was written"
         )
 
 

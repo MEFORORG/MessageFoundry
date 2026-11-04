@@ -831,7 +831,8 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
     **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
     non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
     filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
-    that and survives on ``serve``'s filtered ``lastResort`` (:func:`install_filtered_last_resort`).
+    that and survives on the filtered ``lastResort`` ``main()`` installs
+    (:func:`install_filtered_last_resort`).
     The REFUSE arm is unaffected (it raises).
     Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
 
@@ -2053,7 +2054,7 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
     **Which processes still reach that shape.** When #1199 landed, every CLI subcommand but ``serve``
     and ``supervise`` did. Since BACKLOG #1441, ``__main__.main`` gives most subcommands a filtered
     stderr root handler before dispatch (``__main__._CONFIGURES_OWN_LOGGING`` names the exceptions
-    and how ``serve`` covers its window), so they normally find a handler and do not build one
+    and points at what covers their windows), so they normally find a handler and do not build one
     here. Any process that logs without going through ``main()`` still can. This used to say "only
     two call sites in the package install a root handler", which was an enumeration over a search
     that could not see a bare ``root.addHandler`` (the tray entrypoint has one). Read the install
@@ -2139,13 +2140,22 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     return handler
 
 
+#: The standard library's own ``logging.lastResort``, so :func:`install_filtered_last_resort` can
+#: tell it from one a host set (BACKLOG #3768). ``logging`` keeps it as ``_defaultLastResort``;
+#: reading ``lastResort`` at import instead would take a host's choice made before that import.
+_STDLIB_LAST_RESORT: logging.Handler | None = getattr(
+    logging, "_defaultLastResort", logging.lastResort
+)
+
+
 class _FilteredLastResort(logging.StreamHandler[TextIO]):
     """The standard library's ``logging.lastResort`` with the PHI filter chain added.
 
     Like the stdlib's own: level ``WARNING``, and ``sys.stderr`` looked up at every emit rather
     than bound when built, so a later swap of ``sys.stderr`` is followed. ``StreamHandler.__init__``
-    is skipped for that reason, as the stdlib's ``_StderrHandler`` skips it, and the setter
-    ignores the assignment ``setStream`` would make."""
+    is skipped for that reason, as the stdlib's ``_StderrHandler`` skips it. Assigning the stream,
+    as ``setStream`` does, raises ``AttributeError`` as it does on the stdlib's, rather than being
+    dropped while the caller is told nothing (BACKLOG #4716)."""
 
     def __init__(self) -> None:
         logging.Handler.__init__(self, logging.WARNING)
@@ -2158,29 +2168,38 @@ class _FilteredLastResort(logging.StreamHandler[TextIO]):
 
     @stream.setter
     def stream(self, value: TextIO) -> None:
-        pass
+        raise AttributeError("the filtered lastResort always writes to the current sys.stderr")
 
 
 def install_filtered_last_resort() -> logging.Handler | None:
-    """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it; return
-    None, and change nothing, where the root logger already has a handler (BACKLOG #3768).
+    """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it (BACKLOG
+    #3768). Checked in this order: where the root logger already has a handler, return None and
+    change nothing, even when ``lastResort`` is already the filtered one; where ``lastResort`` is
+    already the filtered one, return it and build nothing; where it is neither that nor the
+    standard library's own, return None and change nothing.
 
     The standard library hands a record to ``logging.lastResort`` when no handler took it: no
     handler on the logger or any ancestor it propagates to. That handler prints ``WARNING`` and
-    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``. ``serve``
-    calls this first, because it calls :func:`configure_logging` only after its settings, key and
-    egress gates run (``__main__._serve``), and until then its root has no handler. Records keep
-    the level gate, the stream and the rule for when they arrive; each is now redacted and
-    scrubbed, and carries the text formatter's prefix. A record a handler took never reaches it,
-    so nothing is written twice. Left in place for the life of the process, it also covers a
-    logger that does not propagate after :func:`configure_logging` has run.
+    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``. The
+    ``main()`` of every command that runs :func:`messagefoundry.cli_common.run_cli` calls this
+    right after hardening its console streams, before it parses the arguments, and
+    ``tests/test_logging.py`` pins that for every such caller. For every command it covers
+    argument parsing; ``serve`` and ``supervise`` also call :func:`configure_logging` only
+    part-way through (``__main__._serve``, ``__main__._supervise``), so it covers their start
+    too. Records keep the level gate and the rule for when they arrive, and each is now redacted
+    and scrubbed. A record a handler took never reaches it, so nothing is written twice. It is
+    left in place for the life of the process, and a second call builds nothing.
 
-    **Only on an empty root**, as ``run_cli``'s sink: ``lastResort`` is process-wide, and a host
-    that configured logging first, such as an embedding host or pytest's capture, owns that
-    choice. Records logged before the call, such as at module import, meet the stdlib's own."""
+    **Only on an empty root and the stdlib's own** ``lastResort``, as ``run_cli``'s sink: the
+    choice is process-wide, and a host that configured logging first, such as an embedding host
+    or pytest's capture, or that set ``lastResort`` itself, even to None, owns it. What this
+    leaves unfiltered, and where and how what it takes is written, is stated once, in
+    ``docs/PHI.md`` section 7 row 1."""
     if logging.getLogger().handlers:
         return None
     if not isinstance(logging.lastResort, _FilteredLastResort):
+        if logging.lastResort is not _STDLIB_LAST_RESORT:
+            return None
         logging.lastResort = _FilteredLastResort()
     return logging.lastResort
 

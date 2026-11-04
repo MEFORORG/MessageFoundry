@@ -38,13 +38,16 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    HandlerFaultUnrecovered,
     InboundHandler,
     SourceConnector,
     count_setting,
     float_setting,
+    owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
+    recover_handler_fault,
     register_destination,
     register_source,
     wait_for_intake,
@@ -488,6 +491,9 @@ class TcpSource(SourceConnector):
         # rule is the backstop that hands one that got past it to frame_reply's fallback, rather than
         # raising a TypeError that leaves the reply unsent.
         self.encoding: str = declared_encoding(s.get("encoding"))
+        # Read only to tell whether a handler fault owes the sender a reply (BACKLOG #5022): the
+        # runner, not this listener, builds the reply.
+        self.ack_mode = config.ack_mode
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
         self.max_connections: int | None = positive_cap(
@@ -668,6 +674,7 @@ class TcpSource(SourceConnector):
                     max_frame_seconds=self.max_frame_seconds,
                     receive_timeout=self.receive_timeout,
                 )
+                peer = writer.get_extra_info("peername")  # fixed for the connection
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
@@ -692,7 +699,34 @@ class TcpSource(SourceConnector):
                         decoded = 0
                         for message in decoder.feed(chunk):
                             decoded += 1
-                            reply = await self._handler(message)
+                            fault: str | None = None
+                            try:
+                                reply = await self._handler(message)
+                            except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
+                                # BACKLOG #5022: the decoder read this frame cleanly, so this is a
+                                # handler fault, not a framing fault. Only the scrubbed text leaves
+                                # this clause; recover_handler_fault says why.
+                                fault = safe_exc(exc)
+                            if fault is not None:
+                                # Set until recovered, so a cancel inside it is no clean close.
+                                failed = True
+                                try:
+                                    reply = await recover_handler_fault(
+                                        self._handler,
+                                        message,
+                                        fault,
+                                        owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
+                                        transport="TCP",
+                                        peer=peer,
+                                        log=logger,
+                                        stopped=lambda: self._admission.stopping,
+                                        report=lambda reason: self._emit_event(
+                                            "handler_error", peer_host=peer_host, reason=reason
+                                        ),
+                                    )
+                                except HandlerFaultUnrecovered:
+                                    break  # handler_error is recorded; close
+                                failed = False
                             if reply is not None:
                                 writer.write(
                                     frame_reply(
@@ -703,11 +737,12 @@ class TcpSource(SourceConnector):
                                     )
                                 )
                                 await self._drain_reply(writer)
+                        if failed:
+                            break
                         # Charge AFTER the messages in this chunk are fully handled.
                         if pacer is not None:
                             pacer.settle(decoded)
                     except FrameError as exc:
-                        peer = writer.get_extra_info("peername")
                         logger.warning(
                             "TCP frame from %s over cap; closing connection: %s", peer, exc
                         )
@@ -719,9 +754,9 @@ class TcpSource(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
-                        # per-connection task die silently or leak detail. Log redacted; drop the conn.
-                        peer = writer.get_extra_info("peername")
+                        # Last-resort (ASVS 16.5.4): an unexpected codec or reply-framing error must
+                        # not let the per-connection task die silently or leak detail. Log redacted;
+                        # drop the conn. A handler fault is caught above and is `handler_error`.
                         logger.error(
                             "TCP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )

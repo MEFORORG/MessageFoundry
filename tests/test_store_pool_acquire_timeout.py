@@ -44,6 +44,7 @@ from messagefoundry.store.base import (
     acquire_pooled,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.store import RevokeResult
 
 FAST = 0.05  # a timeout short enough to keep the suite quick, long enough not to be flaky
 
@@ -339,6 +340,7 @@ class _SessionConn(_Conn):
             "revoked_at": None,
             "client": None,
             "user_epoch": 0,
+            "global_epoch": 0,
             "seal": "",
         }
 
@@ -354,7 +356,10 @@ class _BusyPool(_GatedPool):
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("revoke_user_sessions", 2), ("rotate_session", True)],
+    [
+        ("revoke_user_sessions", RevokeResult(2, kept=False, ended_kept=False)),
+        ("rotate_session", True),
+    ],
 )
 async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
     name: str, expected: object
@@ -410,15 +415,14 @@ class _MssqlSessionCursor:
                     "revoked_at",
                     "client",
                     "user_epoch",
+                    "global_epoch",
                     "seal",
                 )
             ]
 
     async def fetchall(self) -> list[Any]:
         if self._last.startswith("SELECT * FROM sessions"):
-            return [("a" * 64, "u", 1.0, 9e9, 1.0, None, None, 0, "")]
-        if self._last.startswith("SELECT session_epoch"):
-            return [(0,)]
+            return [("a" * 64, "u", 1.0, 9e9, 1.0, None, None, 0, 0, "")]
         return [("b" * 64,), ("c" * 64,)]
 
     async def close(self) -> None:
@@ -442,7 +446,10 @@ class _MssqlSessionConn(_Conn):
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("revoke_user_sessions", 2), ("rotate_session", True)],
+    [
+        ("revoke_user_sessions", RevokeResult(2, kept=False, ended_kept=False)),
+        ("rotate_session", True),
+    ],
 )
 async def test_sqlserver_post_commit_session_writes_wait_out_a_busy_pool(
     name: str, expected: object, monkeypatch: pytest.MonkeyPatch

@@ -121,6 +121,7 @@ from messagefoundry.store.store import (
     ReingressOutcome,
     ResendKeyRecord,
     ResendOutcome,
+    audit_chain_rolled,
     parse_audit_anchor,
     read_audit_anchor_file,
 )
@@ -2085,6 +2086,9 @@ class Engine:
                         # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
                         # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
                         extra_values=self._connector_secret_env_values(),
+                        # BACKLOG #4942: a changed key the keyed audit chain has not rolled to is
+                        # held, not stamped. The open already settled the chain; no I/O here.
+                        audit_rolled=audit_chain_rolled(self.store),
                     )
                 except SecretsDirectoryError:
                     # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the

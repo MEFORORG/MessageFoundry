@@ -292,7 +292,10 @@ first-ever reference-row key-rotation tests on all three backends.
   per-interval sync failure. **CORRECTED 2026-10-30 (BACKLOG #1588):** this read that BIN2 also
   stops keys differing only by a trailing space from colliding. It does not: SQL Server pads
   trailing spaces in `=` and in index keys under every collation, BIN2 included, so such keys still
-  collide here, and nothing refuses them yet.
+  collide here, and nothing refuses them yet. **AMENDED 2026-11-03 (BACKLOG #4917):** the SQL
+  Server `write_reference_snapshot` now refuses such a snapshot before its transaction with
+  `ReferenceKeyCollision`, naming the two keys by ordinal only. The sync still fails and alerts
+  every interval, and the last-good snapshot stays active, as it did when the INSERT failed.
 - **Encryption at rest.** Values are `cipher.encrypt(json.dumps(v))` (`mfenc`), covered by **both**
   `reencrypt_to_active` (key rotation) **and** `_encrypt_existing_rows` (the no-key→key migration
   pass). The migration pass is required because "born encrypted" is false: under a no-key deployment
