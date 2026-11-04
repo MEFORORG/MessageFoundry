@@ -786,17 +786,25 @@ async def test_a_pooled_serializer_that_died_after_writing_its_head_recovers_as_
     assert await _ingress_inflight(db) == 0  # the in-flight head was re-pended either way
 
 
-@pytest.mark.parametrize("written", [False, True], ids=["rows-in-flight", "a-row-written"])
-async def test_a_per_lane_worker_that_died_after_writing_a_row_closes_its_run_of_deaths(
-    written: bool, db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "case", ["row-in-flight", "one-written-one-in-flight", "every-row-written"]
+)
+async def test_a_per_lane_worker_that_died_after_writing_its_rows_closes_its_run_of_deaths(
+    case: str, db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R4-3, per-lane half. A per-lane run of deaths closed only on a settled pass, so a worker
-    that died after delivering a row, every time, read as stuck on it: backed off, and paged at
-    the bound. The replacement now reads whether a row it inherited is no longer in flight; one
-    was written, so the run closes and the replacement does not wait out a repeat death's
-    backoff."""
+    that died after delivering its row, every time, read as stuck on it: backed off, and paged at
+    the bound. The replacement now reads whether any row it inherited is still in flight; with
+    none, the row it died on was written too, so the run closes. R5-1 (round 2): a batch with one
+    row written and one still in flight is not progress, since on an UNORDERED lane fresh rows
+    sort ahead of a poison row and are written before it kills the worker every time."""
     runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
-    row = await _claimed_ingress_row(db)
+    # A written row is no longer in flight; an id the store never claimed reads the same.
+    ids = ["written-row"]
+    if case != "every-row-written":
+        ids.insert(0, await _claimed_ingress_row(db))
+    if case == "row-in-flight":
+        ids.pop()
     sleeps: list[float] = []
 
     async def sleep(delay: float) -> bool:
@@ -811,12 +819,11 @@ async def test_a_per_lane_worker_that_died_after_writing_a_row_closes_its_run_of
 
     monkeypatch.setattr(runner, "_stop_or_sleep", sleep)
     monkeypatch.setattr(runner, "_repend_claimed_on_fault", repend)
-    ids = [row, "written-row"] if written else [row]
     claims = _LaneClaims(ids, _leading(), deaths=_dead_run(3))
     await asyncio.wait_for(runner._recover_then_run("router", "IB", claims, run), timeout=5.0)
-    assert claims.deaths.count == (0 if written else 3)
+    assert claims.deaths.count == (0 if case == "every-row-written" else 3)
     backoff = wiring_runner._WORKER_ERROR_BACKOFF_SECONDS
-    assert sleeps == ([backoff] if written else [backoff, backoff, backoff])
+    assert sleeps == [backoff, backoff, backoff]  # the repeat-death backoff runs before the read
 
 
 # --- the round-5 review repairs (this branch's own round-4 changes) -------------------------------
@@ -838,15 +845,33 @@ async def test_a_written_extra_does_not_drop_a_head_still_in_flight_from_the_re_
     """R5-2a. The in-flight count says a row was written, never which: a batching outbound writes
     its kept members before it dead-letters a refused head. A replacement that read the head as
     written left it out of the re-pend, INFLIGHT, and the lane claimed past it. Every row is
-    re-pended now; the reading moves only the progress accounting."""
-    dispatcher, _ = _processing_dispatcher(db)
+    re-pended now. Round 2 (R5-4): such a reading is not progress either, or a head that kills
+    every serializer beside a member written on its own would reset its streak at every death
+    and never reach the STOP or the page."""
+    dispatcher, st = _processing_dispatcher(db)
+    st.serializer_deaths = _dead_run(2)
     head = await _claimed_ingress_row(db)
     dispatcher.note_held("IB", ["written-extra"])
     outcomes = _capture_retries(dispatcher, monkeypatch)
     await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=[head])
     assert await _ingress_inflight(db) == 0  # the head was re-pended
     (outcome,) = outcomes
-    assert outcome.made_progress
+    assert not outcome.made_progress
+    assert st.serializer_deaths.count == 2
+
+
+async def test_a_replayed_full_drain_ends_the_run_of_serializer_deaths(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5-5. A serializer that drained its whole batch and died in its terminal transition
+    survived its body, but its replacement replayed an outcome with ``made_progress`` False, so
+    the run stayed open and could page a lane that delivered every row."""
+    dispatcher, st = _processing_dispatcher(db)
+    st.serializer_deaths = _dead_run(2)
+    st.drained = (_LaneOutcome(None), [], None)
+    monkeypatch.setattr(dispatcher, "_lane_done", lambda lane, st, claimed_full: None)
+    await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=["drained-row"])
+    assert st.serializer_deaths.count == 0
 
 
 async def test_a_reading_after_a_recovery_wrote_is_not_taken_as_progress(

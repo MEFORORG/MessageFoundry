@@ -5497,7 +5497,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
         # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever), or is
-        # held retrying a failed re-pend of its claimed rows under it (BACKLOG #1611).
+        # held retrying a failed re-pend of its claimed rows under it (BACKLOG #1611); under either
+        # policy, a run of per-lane worker or pooled serializer deaths on one lane (BACKLOG #4607).
         "lane_stuck",
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.

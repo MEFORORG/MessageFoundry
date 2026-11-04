@@ -6892,8 +6892,6 @@ class RegistryRunner:
             self._log_left_in_flight(kind, name, claims.ids)
             return
         abandon = self._hold_abandon(kind, name)
-        if claims.deaths.count and await self._dead_worker_wrote(kind, name, claims):
-            claims.close_deaths(kind, name)  # it moved the lane on: the next death is another row's
         if claims.deaths.count >= 2:
             delay = _capped_backoff(
                 _WORKER_ERROR_BACKOFF_SECONDS, claims.deaths.count - 2, _REPEND_RETRY_CAP_SECONDS
@@ -6904,6 +6902,9 @@ class RegistryRunner:
                     self._log_left_in_flight(kind, name, claims.ids)
                     return
                 delay -= step
+        # After the backoff, so a read that dies as its worker did is still paced.
+        if claims.deaths.count and await self._dead_worker_wrote(kind, name, claims):
+            claims.close_deaths(kind, name)  # it moved the lane on: the next death is another row's
         fence = claims.fence
         if claims.ids and fence is not None and not fence.may_write():
             # Not the fault-time write but a retry of it, so it is fenced as the hold's retries
@@ -6981,19 +6982,20 @@ class RegistryRunner:
         await run(name, claims=claims)
 
     async def _dead_worker_wrote(self, kind: str, name: str, claims: _LaneClaims) -> bool:
-        """Whether a dead per-lane worker wrote any of the rows it died holding, ``ids`` (BACKLOG
-        #4607). A run of deaths otherwise closes only on a settled pass, so a worker that dies after
-        delivering a row, every time, would read as stuck on it.
+        """Whether a dead per-lane worker wrote EVERY row it died holding, ``claims.ids``, the one
+        it died on included (BACKLOG #4607). A run of deaths otherwise closes only on a settled
+        pass, so a worker that dies after delivering its row, every time, would read as stuck on it.
 
-        Measured as the pooled twin measures it (``StageDispatcher._dead_rows_in_flight``): fewer of
-        the lane's rows in flight at this stage than it held means one was written. A read that
-        fails, another holder of the lane's rows, or a replacement's re-pend of them already sent
-        (``_LaneClaims.repend_sent``), whose landing would read as a write, reads as not written.
-        The except arm's own re-pend is not marked: a worker that dies after that write lands and
-        before it clears ``ids`` reads as having written. That only closes a run of deaths early;
-        every row is still re-pended."""
-        ids = claims.ids
-        if not ids or claims.repend_sent:
+        Measured as the pooled twin measures it (``StageDispatcher._dead_rows_in_flight``): none
+        of the lane's rows in flight at this stage. Not merely fewer than it held: on an UNORDERED
+        lane fresh rows sort ahead of a re-pended poison row, so each batch writes some rows before
+        the poison row kills its worker, and counting that as progress would reset the run at
+        every death, with no backoff and no page. A read that fails, another holder of the lane's
+        rows, or a replacement's re-pend of them already sent (``_LaneClaims.repend_sent``), whose
+        landing would read as a write, reads as not written. The except arm's own re-pend is not
+        marked: a worker that dies after that write lands and before it clears ``ids`` reads as
+        having written. That only closes a run of deaths early; every row is still re-pended."""
+        if not claims.ids or claims.repend_sent:
             return False
         stage = {
             "delivery": Stage.OUTBOUND,
@@ -7012,7 +7014,7 @@ class RegistryRunner:
                 exc_info=True,
             )
             return False
-        return inflight.get(name, (0, 0.0))[0] < len(ids)
+        return inflight.get(name, (0, 0.0))[0] == 0
 
     @staticmethod
     def _log_left_in_flight(kind: str, name: str, ids: Sequence[str]) -> None:
