@@ -8474,7 +8474,10 @@ class RegistryRunner:
             mid = await self._record_refused(ic, raw, text, error=marker_refused, peek=peek)
             ack = (
                 build_ack(
-                    peek, code="AR", text="handle marker under base64 delimiters", ack_mode=ack_mode
+                    peek,
+                    code="AR",
+                    text="handle marker refused by its delimiters",
+                    ack_mode=ack_mode,
                 )
                 if reply
                 else None

@@ -369,12 +369,8 @@ def _delimits_with_base64(separators: Iterable[str]) -> bool:
     value, so a subcomponent separator in the alphabet is escaped inside a document set back into
     ``OBX-5.5``, and any of them may be inside a copied content address, which then may not read
     as one. A field, component or repetition separator in the alphabet instead splits a document
-    across fields, components or repetitions, so the detach would store a fragment of it. So the
-    ingress
-    detach refuses a body it would detach a document from (:class:`Base64DelimiterError`), both
-    listeners refuse a body that holds the marker (:func:`marker_under_base64_delimiters`), and
-    the delivery re-attach refuses a handle it would splice and any marker it finds
-    (:func:`reattach_documents_in_hl7`). Ordinary delimiters, ``|^~\\&`` and the common
+    across fields, components or repetitions, so the detach would store a fragment of it. ADR
+    0105 records where the rule is applied. Ordinary delimiters, ``|^~\\&`` and the common
     variants, hold no base64 character and are untouched."""
     return not _BASE64_ALPHABET.isdisjoint(separators)
 
@@ -389,6 +385,12 @@ def _marker_forms(separators: tuple[str, str, str, str, str]) -> tuple[str, ...]
     return (marker, DOC_REF_MARKER) if marker != DOC_REF_MARKER else (marker,)
 
 
+def _holds_marker(text: str, separators: tuple[str, str, str, str, str]) -> bool:
+    """Whether ``text`` holds the handle marker in any of :func:`_marker_forms`: one substring scan
+    per form, and no copy."""
+    return any(m in text for m in _marker_forms(separators))
+
+
 def marker_under_base64_delimiters(message: Message, text: str) -> bool:
     """Whether a received HL7 body names a base64 character as a delimiter
     (:func:`_delimits_with_base64`) and holds the handle marker, raw or as its delimiters escape
@@ -399,16 +401,14 @@ def marker_under_base64_delimiters(message: Message, text: str) -> bool:
     ``message`` is ``text`` parsed. A body whose MSH-1 and MSH-2 name no delimiters counts when it
     holds the raw marker, as delivery refuses that too. For ordinary delimiters the cost is the
     header read alone; otherwise at most two substring scans of ``text``. A marker hidden behind
-    a hex escape is not looked for: the engine never writes one."""
+    a hex escape is not looked for: the engine never writes one, so it is the sender's text."""
     try:
         separators = message._encoding_chars()
     except ValueError:
         # Delivery refuses a raw marker under such a header (reattach_documents_in_hl7), so it is
         # refused here too, before the ACK.
         return DOC_REF_MARKER in text
-    if not _delimits_with_base64(separators):
-        return False
-    return any(m in text for m in _marker_forms(separators))
+    return _delimits_with_base64(separators) and _holds_marker(text, separators)
 
 
 def may_hold_doc_ref(text: str) -> bool:
@@ -634,8 +634,6 @@ def _received_holds_marker(message: Message, received: str) -> bool:
     """Whether ``received`` holds the handle marker anywhere, raw or escaped by the message's
     delimiters: where a detach would leave it for delivery's after-the-splice guard to find
     (BACKLOG #5099). Reads the text the caller already holds, and copies no document."""
-    if DOC_REF_MARKER in received:
-        return True
     try:
         separators = message._encoding_chars()
     except ValueError:
@@ -643,7 +641,7 @@ def _received_holds_marker(message: Message, received: str) -> bool:
         # form, so it is refused rather than detached unchecked. The OBX reads before this call
         # already raise on such a header, so the branch only guards a reorder.
         return True
-    return any(m in received for m in _marker_forms(separators))
+    return _holds_marker(received, separators)
 
 
 def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:

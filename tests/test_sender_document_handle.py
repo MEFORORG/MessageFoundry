@@ -1469,7 +1469,7 @@ async def test_a_marker_under_a_base64_delimiter_is_refused_at_both_listeners(
 
     assert _ack_code(ack) == "AR"
     if "/" in msh2:  # a lowercase delimiter splits the echoed text; "/" leaves it whole
-        assert ack is not None and "handle marker under base64 delimiters" in ack
+        assert ack is not None and "handle marker refused by its delimiters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
