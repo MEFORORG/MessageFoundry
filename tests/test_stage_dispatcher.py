@@ -421,6 +421,38 @@ class _ClaimShim:
         return cast("ClaimedHeads", result)
 
 
+class _CountingStore:
+    """A stand-in store that records each claim it receives, for the shim's own control below."""
+
+    def __init__(self) -> None:
+        self.claims: list[frozenset[str]] = []
+
+    async def claim_fifo_heads(
+        self, stage: str, lanes: Any, now: float | None = None, *, per_lane_limit: int = 1
+    ) -> ClaimedHeads:
+        self.claims.append(frozenset(lanes))
+        return ClaimedHeads(by_lane={}, rearm=frozenset())
+
+
+async def test_the_claim_shim_counts_every_claim_it_passes_through() -> None:
+    """THE CONTROL for every ``real_claims == 0`` guard in this file (BACKLOG #4915): a zero there
+    means nothing unless the counter moves when a claim does fall through. It must count a claim of
+    a non-target lane, a claim of the target once ``times`` is spent, and, through a nested shim,
+    exactly the claims that reach the store underneath."""
+    real = _CountingStore()
+    inner = _ClaimShim(real, "IB_INNER", mode="empty", times=_EVERY_CLAIM)
+    outer = _ClaimShim(inner, "IB_OUTER", mode="lock_timeout_once", times=1)
+    await outer.claim_fifo_heads("outbound", ["IB_OUTER"])  # intercepted by the outer shim
+    await outer.claim_fifo_heads("outbound", ["IB_INNER"])  # passes outer, intercepted by inner
+    assert (outer.real_claims, inner.real_claims, real.claims) == (1, 0, [])
+    await outer.claim_fifo_heads(
+        "outbound", ["IB_OUTER"]
+    )  # outer spent: falls through to the store
+    await outer.claim_fifo_heads("outbound", ["IB_OTHER"])  # no shim's target
+    assert (outer.real_claims, inner.real_claims) == (3, 2)
+    assert real.claims == [frozenset({"IB_OUTER"}), frozenset({"IB_OTHER"})]
+
+
 # --- async settling helpers -----------------------------------------------------------------------
 
 _HUGE_SWEEP = 3600.0  # disable the periodic (real-time) sweep; drive discovery explicitly
@@ -1613,6 +1645,7 @@ async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
             f"a lane NAME reached the log — a lane is a destination_name (PHI): {lines!r}"
         )
         assert d.busy_violations == 0
+        await _settle()  # a stray claim still in flight must reach the shim before it is counted
         assert quiet.real_claims == 0, "a claim reached the real store"
     finally:
         await d.stop()

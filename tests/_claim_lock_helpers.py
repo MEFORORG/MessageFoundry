@@ -145,8 +145,11 @@ async def _ss_discard(ss_store: Any, conn: Any, cur: Any) -> None:
     Closing the connection ends the session, which rolls its transaction back server-side and frees
     the lock. On a gated connection the cursor and the connection go to the call gate, cursor first,
     and close once no pyodbc call is running on them, so a statement a cancellation left on an
-    executor thread never has its handles freed under it, no cursor outlives its connection, and
-    nothing here waits on the close, so a cancellation arriving now is never swallowed.
+    executor thread never has its handles freed under it, no cursor handed in outlives its
+    connection, and nothing here waits on the close, so a cancellation arriving now is never
+    swallowed. A cursor still being created when a cancellation lands was never handed in (``cur``
+    is ``None``), so the collector frees it, possibly after its connection closed: the limit
+    ``abandon_one_shot`` documents.
 
     Both callers install the gate before they get here, so a connection reaching this ungated is
     either a stand-in with no bound ``_execute`` or a real aioodbc one ``install_call_gate`` could not
@@ -222,7 +225,7 @@ def assert_skip_named(res: Any, lane: str, *, abort_ok: bool, stage: str) -> Non
     in the HEAD phase past its fetch, through the ``delivered_keys`` probe, so only there may the skip
     it read ride out, and the lane is admitted beside nothing."""
     timeout = res.lock_timeout
-    if abort_ok and timeout is not None and timeout.phase is ClaimAbortPhase.HEAD:
+    if abort_ok and timeout is not None and timeout.phase == ClaimAbortPhase.HEAD:
         legal: set[frozenset[str]] = {frozenset()}
         if stage == Stage.OUTBOUND.value:
             legal.add(frozenset({lane}))
