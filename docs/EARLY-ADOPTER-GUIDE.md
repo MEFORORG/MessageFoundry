@@ -680,7 +680,9 @@ becomes the bottleneck.
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
 decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /
 `-shm` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
-`--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
+`--config-to <dir>` to restore the config bundle alongside it. A config-only archive carries no store,
+so restore its config bundle with `messagefoundry restore <archive> --config-to <dir>` and no `--to`;
+an archive that carries a store is refused that way. Check the archive without writing anything
 with `messagefoundry restore-verify <archive>`.
 
 **A restore brings back the archive's whole store, accounts and sessions included (BACKLOG

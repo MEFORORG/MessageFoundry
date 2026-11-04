@@ -1314,18 +1314,24 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
+    # Vault BACKLOG #5233: --to is not argparse-required, because a CONFIG-ONLY archive (a server-DB
+    # store's backup) carries no store for it to name. A run with neither --to nor --config-to is
+    # refused by the restore primitive itself, before the archive is opened.
     restore.add_argument(
         "--to",
-        required=True,
+        default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused",
+        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
+        "except for a CONFIG-ONLY archive, whose bundle --config-to restores alone",
     )
     restore.add_argument(
         "--config-to",
         default=None,
         help="also restore the archive's config bundle into this directory (must be empty or absent). "
-        "Refused when the archive carries no config bundle, or when one of its members would be "
-        "written over the store this restore places at --to",
+        "Without --to, restore ONLY the config bundle of a CONFIG-ONLY archive (a server-DB store's "
+        "backup); an archive that carries a store is then refused. Refused when the archive carries "
+        "no config bundle, or when one of its members would be written over the store this restore "
+        "places at --to",
     )
     restore.add_argument(
         "--service-config",
@@ -11387,7 +11393,9 @@ def _restore(args: argparse.Namespace) -> int:
         "sessions_revoked": result.sessions_revoked,
         # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
         # prints it.
-        "rollback_notice": RESTORE_ROLLBACK_NOTICE,
+        # None on the config-only route (vault BACKLOG #5233): it places no store, so it rolls
+        # nothing back.
+        "rollback_notice": RESTORE_ROLLBACK_NOTICE if result.store_path is not None else None,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,
@@ -11398,6 +11406,14 @@ def _restore(args: argparse.Namespace) -> int:
     }
     if args.json:
         _print_json(payload, compact=True)
+    elif result.store_path is None:
+        print(
+            f"OK: restored the config bundle of the CONFIG-ONLY archive {args.archive}: "
+            f"{result.config_files} file(s) into {result.config_dir}"
+        )
+        print(f"  encrypted={result.encrypted} key_id={result.key_id}")
+        print(f"  archive taken {payload['archive_created_at']}")
+        print("  It carries no store: restore the database from the DBA's own backup.")
     else:
         print(f"OK: restored {result.store_path} ({result.store_bytes} bytes) from {args.archive}")
         print(
