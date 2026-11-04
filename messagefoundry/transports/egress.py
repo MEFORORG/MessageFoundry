@@ -448,8 +448,10 @@ def check_egress_allowed(
     outright (fail-closed); with the list set, the per-list matching below is unchanged.
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
-    refusal. A reload passes it for the builds that follow its build check, which has already
-    logged the warning for this reload (vault BACKLOG #2910)."""
+    refusal. The runner's lane builds pass it: a start, an operator start and a schedule window's
+    opening log the line in :func:`warn_url_query_credentials_before_build` just before the build
+    (BACKLOG #4997), and a reload's builds follow its build check, which has logged it (vault
+    BACKLOG #2910)."""
     # ASVS 14.2.1: a recorded loosening, never a silent one. Before every refusal, so a lane a
     # refusal takes down is still recorded.
     if warn_query_credentials:

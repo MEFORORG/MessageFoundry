@@ -2888,7 +2888,9 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
         "".join(rand.choice(fragments) for _ in range(rand.randint(2, 9))) for _ in range(20_000)
     ]
     shipped = [secretscrub.scrub_credentials(text) != text for text in texts]
-    member = secretscrub._CONNECTION_STRING_MEMBER
+    member_shape = re.compile(
+        r"(?i);[A-Za-z0-9_]*(?:password|passwd|passphrase|pass|pwd|secret|credential|token)="
+    )
     # Which texts the shipped filters change with the escape start kept and only the member pass
     # off, so a text the escape start alone changes cannot be counted as the member's.
     with monkeypatch.context() as patched:
@@ -2912,7 +2914,9 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
                 assert widened.search(text) is not None, repr(text)
             elif shipped_changed:
                 member_only += 1
-                assert member.search(text) is not None, repr(text)
+                # The exception is the member shape and nothing wider: spelled here, not read from
+                # the module, so a member pattern that grew past it would go red.
+                assert member_shape.search(text) is not None, repr(text)
             elif redaction._CREDENTIAL_AHEAD.search(text) is None:
                 unmatched += 1
     assert changed > 500 and unmatched > 2_000 and escape_only > 5 and member_only > 5, (

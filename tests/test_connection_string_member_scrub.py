@@ -211,9 +211,21 @@ _RULE_CONTROLS = (
         "_MEMBER_KEEP",
         _keep_without(
             "mrn", "name", "address", "0010", "patient", "medicalrecordlocator",
-            "responsibleperson", "msh", "bhs", "fhs",
+            "responsibleperson",
         ),
         'e5q;AccessToken="name": %26\na1qcode=d4qe5q123-45-6789[redacted]',
+    ),
+    (
+        "label tail",
+        "_MEMBER_LABEL_TAIL",
+        _NEVER,
+        ';sslpassword=postgres://svc:id_token="\r\n~e5q',
+    ),
+    (
+        "scheme word before a space",
+        "_MEMBER_SPACED_WORD",
+        _NEVER,
+        ";AccessToken=Bearer <redacted>\na1qencryption_key={ x%26session=DOE^JOHN",
     ),
     (
         "long base64 run",
@@ -274,6 +286,7 @@ def _through_three_handlers(line: str) -> list[str]:
     one record in place, so the second handler filters what the first left, and the third what the
     second left: the chain applied once, twice and three times."""
     logger = logging.getLogger(f"{_LOGGER}.three")
+    propagate, level = logger.propagate, logger.level
     logger.propagate = False
     logger.setLevel(logging.INFO)
     captures = [_Capture() for _ in range(3)]
@@ -285,6 +298,7 @@ def _through_three_handlers(line: str) -> list[str]:
     finally:
         for capture in captures:
             logger.removeHandler(capture)
+        logger.propagate, logger.level = propagate, level
     return [capture.out[0] for capture in captures]
 
 
@@ -356,7 +370,7 @@ def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.Mon
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
         baseline = [_every_redaction_path(line) for line in lines]
-    monkeypatch.setattr(secretscrub, "_mask_member_value", lambda _value: "<redacted>")
+    monkeypatch.setattr(secretscrub, "_mask_member_value", lambda _text, _s, _e: "<redacted>")
     whole_value = [_every_redaction_path(line) for line in lines]
     printed = _printed_where_the_baseline_hid(lines, whole_value, baseline)
     # Every shape is in the list because the draft printed it on at least one later path.
@@ -423,7 +437,6 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         "redaction DICOM label words": redaction._DICOM_LABEL_WORDS,
         "redaction widened key words": redaction._WIDENED_KEY_WORDS,
         "redaction MRN": ("mrn",),
-        "redaction MSH headers": ("MSH", "BHS", "FHS"),
         "bundle scheme words": ("bearer", "basic", "digest", "mfb64"),
     }
     missing = {name: [w for w in words if not kept(w)] for name, words in sources.items()}
@@ -432,7 +445,6 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
     alternatives = secretscrub._MEMBER_KEEP.pattern.removeprefix("(?i)").split("|")
     assert set(alternatives) <= {word.lower() for word in secretscrub._MEMBER_KEEP_WORDS}
     assert all(kept(word) for word in secretscrub._MEMBER_KEEP_WORDS)
-    assert redaction._MSH_DELIMITERS.pattern.startswith("(?:MSH|BHS|FHS)")
     # Shapes kept whole, each spelled as its pass spells it.
     assert redaction._USERINFO_OPENER == "nonnumeric port: '"
     assert "nonnumeric port: " in secretscrub._MEMBER_VALUE_UNIT.pattern
@@ -450,11 +462,20 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         (";xpass=a1q%5E", ";xpass=redacted%5E"),
         # A later pass's label, segment ID, DICOM tag and userinfo opener stay whole.
         (";xpass=&state=b2q;", ";xpass=&state=redacted;"),
-        (";xpass=x.PID|1||", ";xpass=x.PID|redacted||"),
+        (";xpass=x.PID|1||", ";xpass=redacted.PID|redacted||"),
         (";xpass=(0010,1000)c3q", ";xpass=(0010,1000)redacted"),
         (";xpass=nonnumeric port: 'd4q@h'", ";xpass=nonnumeric port: 'd4q@h'"),
         # A base64 run stays long enough for the bundle's sweep.
         (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=redacted " + "redacted" * 4),
+        # A kept word only stays where a later pass reads it: here it is a password or a token.
+        (";sslpassword=Passw0rd!2024;", ";sslpassword=redacted!redacted;"),
+        (";AccessToken=aaa.sig-key_jwt.aaa;", ";AccessToken=redacted;"),
+        (";xpass=Monkey123 Codename9;", ";xpass=redacted redacted;"),
+        # A segment ID stays only before a "|", and never with a prefix.
+        (";sslpassword=Hunter.AB1,xyz;", ";sslpassword=redacted,redacted;"),
+        (";sslpassword=XY9&Qz7;", ";sslpassword=redacted&redacted;"),
+        # Spaces before the quote that opens a value.
+        (";sslpassword= 'Zq7 kx';PORT=1", ";sslpassword= 'redacted redacted';PORT=1"),
     ],
 )
 def test_the_mask_replaces_words_and_keeps_what_a_later_pass_reads(line: str, masked: str) -> None:

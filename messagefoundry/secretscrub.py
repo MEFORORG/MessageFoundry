@@ -923,11 +923,12 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # that pass then printed values ``origin/main`` hid. A review measured 11 store-path and 5
 # two-handler lines of a 20,000-line fuzz, and this rewrite's own differential measured 124 to
 # 145 lines of 320,000 on each of the second handler, the third handler, a chain line the bundle
-# reads back, and the store path, against none on 640,000 for the word mask. At least these: the "&", "^" or "%5E" a later PHI pass counts to judge a
-# token an HL7 field run, so a token it hid whole then printed; a later label inside the value, such
-# as ``Token=`` or ``?code=``, whose value a later pass reads past the ";" or across a line break the
-# control-character filter wrote as text; a segment ID such as ``PID`` before its "|"; and a long
-# base64 run whose length let the bundle's sweep take a label behind it.
+# reads back, and the store path, against none on 640,000 for the word mask. What it took, at least
+# these: the "&", "^" or "%5E" a later PHI pass counts to judge a token an HL7 field run, so a token
+# it hid whole then printed; a later label inside the value, such as ``Token=`` or ``?code=``, whose
+# value a later pass reads past the ";" or across a line break the control-character filter wrote as
+# text; a segment ID such as ``PID`` before its "|"; and a long base64 run whose length let the
+# bundle's sweep take a label behind it.
 #
 # So the mask changes only WORDS, a run of letters, digits, "_", "." and "-", and replaces each with
 # the word ``redacted``: a word for a word, so a word boundary, a token and a label prefix sit where
@@ -937,23 +938,29 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # keeps what a later pass reads in a word, at least these:
 #
 # * a word holding one of :data:`_MEMBER_KEEP_WORDS`, the label and anchor words of the credential
-#   passes, the query filter, the support bundle and the PHI pass, stays as it is;
+#   passes, the query filter, the support bundle and the PHI pass, stays as it is where a later pass
+#   reads it: before a ":", "=" or "#" (after an optional quote and spaces), and a scheme word or
+#   "MRN" before a space. Anywhere else it is masked, so a password such as ``Passw0rd!2024`` or a
+#   token holding ``sig`` is masked like any other;
 # * a percent-encoded HL7 separator, a DICOM tag ``(gggg,eeee)``, and the ``nonnumeric port: ``
 #   opener of the PHI pass's userinfo backstop stay whole;
-# * a three-character segment ID right before a separator stays;
+# * a three-character segment ID before a "|" stays, and a prefix glued on by "." or "-" is masked;
 # * a word inside a base64 run of 24 or more characters becomes ``redacted`` four times, so the run
 #   stays as long as the bundle's sweep needs.
 #
 # ``tests/test_connection_string_member_scrub.py`` switches each of those rules off in turn and
 # shows a shape that then prints a value ``origin/main`` hid. A placeholder an earlier pass wrote
-# also stays whole, so a second redaction does not respell ``[REDACTED]``. An XML tag in a value is
-# masked like any other text: a probe of 336 XML shapes and the fuzz found no later pass that reads
-# one across the member's span.
+# also stays whole, so a second redaction does not respell ``[REDACTED]``. An XML tag, and an MSH
+# header before a delimiter other than "|", are masked like any other text: a probe of 336 XML
+# shapes and the fuzz found no later pass that reads either across the member's span.
 #
-# THE COST. The value's spaces and punctuation print, so a reader sees that a password held a space,
-# a "," and an "&", and how many words; never a letter or digit of it. A word that holds a kept word,
-# such as ``MyPassword1`` or ``monkey``, prints, and so does a three-character segment ID before a
-# separator. Each of those printed on ``origin/main`` too, which hid at most the first word.
+# THE COST, at least these. The value's spaces and punctuation print, so a reader sees that a
+# password held a space, a "," and an "&", and how many words. A word that holds a kept word and
+# reads as a label prints, such as the ``pass`` of ``pass=word``, and so does a three-character
+# segment ID before a "|". Each of those printed on ``origin/main`` too, which hid at most the first
+# word. Redacting a record ONCE, so a later handler reads nothing this pass wrote, was measured and
+# not taken: ``origin/main``'s own second handler hides a value its first prints on 313 to 584 lines
+# per 20,000, so a record redacted once would print each of them on every handler after the first.
 # ``tests/test_connection_string_member_scrub.py`` holds the differential: the chain applied once,
 # twice and three times, a chain line the bundle reads back, and the store path print nothing
 # ``origin/main`` hid, and the whole-value draft fails it.
@@ -967,14 +974,14 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # lookbehinds below read that. ``;Bypass=1`` is a member too, and its value is masked.
 #
 # THE VALUE RUNS TO THE NEXT ";", QUOTE OR LINE BREAK, OR THE END OF THE TEXT, over spaces, ",",
-# "&", "=" and "://" alike. One quote may open it. Stopping at a later quote costs nothing the builder
-# sends, since a plain password and every ``odbc_params`` value refuse quotes, and it keeps the rest
-# of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is taken by ``_ODBC_BRACED``
-# with its body kept to one line, and then on to the same stops, so ``;sslpassword={a;b} c`` is
-# masked whole, and a "{" not closed on its line takes the rest of the line, as
-# ``_ODBC_BRACED_OVERRUN`` does for the label pattern. A brace may not cross a line: a traceback keeps
-# its frames, and an unclosed "{" on one line cannot walk the rest of a long record from every later
-# ";<key>={". An empty value is no match.
+# "&", "=" and "://" alike. Spaces and then one quote may open it. Stopping at a later quote costs
+# nothing the builder sends, since a plain password and every ``odbc_params`` value refuse quotes,
+# and it keeps the rest of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is
+# taken by ``_ODBC_BRACED`` with its body kept to one line, and then on to the same stops, so
+# ``;sslpassword={a;b} c`` is masked whole, and a "{" not closed on its line takes the rest of the
+# line, as ``_ODBC_BRACED_OVERRUN`` does for the label pattern. A brace may not cross a line: a
+# traceback keeps its frames, and an unclosed "{" on one line cannot walk the rest of a long record
+# from every later ";<key>={". An empty value, or one of spaces only, is no match.
 #
 # LINEAR. A match starts only AT a ";", which group 1 takes with the key so the replacement keeps it,
 # so the key run cannot be entered mid-word. The key run and the braced and plain walks are
@@ -994,7 +1001,10 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # * a key holding "." or "-", or a space before its "=" (``;PWD =x``), left to ``_CREDENTIAL_KV``;
 # * on the write-time chain, a member glued to a percent-encoded HL7 run in one token
 #   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
-#   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030.
+#   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030;
+# * a quoted value that holds a ";" (``;sslpassword="a;b c"``), which the value stops at, so the text
+#   after the ";" prints, as it did before #5030. The builder refuses a quote and a ";" in such a
+#   value.
 #
 # The key words are :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`: the builder's own
 # secret keywords, ``transports/database.py`` ``_ODBC_SECRET_KEY_RE``, plus a bare ``pass``, which
@@ -1007,19 +1017,18 @@ _MEMBER_EXTRA_WORDS = ("token",)
 _CONNECTION_STRING_MEMBER = re.compile(
     r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
     r"|(?<=secret)|(?<=credential)|(?<=token)))="
-    r"(\{(?:[^}\r\n]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|['\"]?[^;'\"\r\n]++)"
+    r"(\{(?:[^}\r\n]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|[ \t]*+['\"]?[^;'\"\r\n]++)"
 )
 
-#: Words a member value keeps where a word holds one, matched as a substring ignoring case (BACKLOG
-#: #5030). Each is a word some pass after the member pass reads, so masking it would change what
-#: that pass does on a second redaction. At least: this module's credential, token and key-material
+#: Words a member value keeps where a word holds one, matched as a substring ignoring case, and a
+#: later pass reads the word there (:func:`_kept_word`; BACKLOG #5030). Each is a word some pass
+#: after the member pass reads, so masking it would change what that pass does on a second redaction. At least: this module's credential, token and key-material
 #: words and its ``MEFOR_`` prefix; its URL query-credential words (``key``, ``sig``, ``auth``,
 #: ``jwt``; ``signature`` holds ``sig``); the write-time query filter's keys
 #: (``logging_setup._CREDENTIAL_QUERY_KEYS``: ``code`` and ``state``, the rest hold ``token`` or
 #: ``session``); the support bundle's ``mfb64`` marker and ``basic``/``digest`` scheme words; and the
-#: PHI pass's anchors: ``mrn``, the widened JSON key words, the DICOM label words, and the MSH, BHS
-#: and FHS headers whose delimiters it reads. ``tests/test_connection_string_member_scrub.py`` holds
-#: this to those sources.
+#: PHI pass's anchors: ``mrn``, the widened JSON key words and the DICOM label words.
+#: ``tests/test_connection_string_member_scrub.py`` holds this to those sources.
 _MEMBER_KEEP_WORDS = (
     *_CREDENTIAL_WORDS,
     *_TOKEN_WORDS,
@@ -1042,17 +1051,13 @@ _MEMBER_KEEP_WORDS = (
     "patient",
     "medicalrecordlocator",
     "responsibleperson",
-    "msh",
-    "bhs",
-    "fhs",
 )
 #: :data:`_MEMBER_KEEP_WORDS` as one search, reduced by subsumption (``pass`` holds ``password``,
 #: ``key`` holds ``api_key``, ``auth`` holds ``authorization``). Spelled literally, so the regex
 #: scanner in ``tests/test_security_static.py`` reads it; the member test holds it to the tuple.
 _MEMBER_KEEP = re.compile(
     r"(?i)medicalrecordlocator|responsibleperson|credential|address|patient|session|mefor_|bearer"
-    r"|secret|digest|state|token|basic|mfb64|pass|code|name|0010|auth|pwd|key|sig|jwt|mrn|msh|bhs"
-    r"|fhs"
+    r"|secret|digest|state|token|basic|mfb64|pass|code|name|0010|auth|pwd|key|sig|jwt|mrn"
 )
 
 #: One unit of a member value. Group 1 is a WORD, which the mask may replace; every other
@@ -1063,46 +1068,71 @@ _MEMBER_VALUE_UNIT = re.compile(
     r"<redacted>|\[(?:REDACTED|redacted)\]|%(?:7[CcEe]|5[Ee]|26)|nonnumeric port: "
     r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)|([\w.\-]++)"
 )
+#: What follows a kept word where a later pass reads it as a label: an optional quote, spaces, and a
+#: ":", "=" or "#". Read in the whole text, past the value's end, since a value that opens with a
+#: quote ends at the quote that closes a JSON key (``;Token="name": ...``).
+_MEMBER_LABEL_TAIL = re.compile(r"""['"]?[ \t]*+[:=#]""")
+#: Kept words a later pass reads before a space instead: the bearer passes' scheme words and the PHI
+#: pass's MRN label.
+_MEMBER_SPACED_WORD = re.compile(r"(?i)bearer|basic|digest|mrn")
+#: A word that ends in an HL7 segment ID at a word boundary, as ``redaction._HL7_SEGMENT`` reads it
+#: before its "|". Group 1 is the ID.
+_MEMBER_SEGMENT_ID = re.compile(r"(?:\A|[.\-])([A-Z][A-Z0-9]{2})\Z")
 #: The support bundle's long-base64 sweep, ``support/redact.py`` ``_LONG_B64``.
 _MEMBER_LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
-#: A word that ends in an HL7 segment ID at a word boundary, as ``redaction._HL7_SEGMENT`` reads it.
-_MEMBER_SEGMENT_ID = re.compile(r"(?:\A|[.\-])[A-Z][A-Z0-9]{2}\Z")
 #: The word that replaces a masked word, and the one for a word inside a long base64 run: 32
 #: characters, at least the 24 :data:`_MEMBER_LONG_B64` reads.
 _MEMBER_MASK = "redacted"
 _MEMBER_LONG_MASK = _MEMBER_MASK * 4
 
 
-def _mask_member_value(value: str) -> str:
-    """``value`` with each WORD replaced by ``redacted``, except the words a later pass reads, and every
-    other character kept in place. See :data:`_CONNECTION_STRING_MEMBER` for why."""
-    long_runs = [m.span() for m in _MEMBER_LONG_B64.finditer(value)]
-    long_ends = [end for _, end in long_runs]
+def _kept_word(text: str, word: str, end: int) -> bool:
+    """Whether a later pass reads ``word``, which ends at ``end`` in ``text``, as a label or a scheme
+    word, so the mask must leave it."""
+    if _MEMBER_KEEP.search(word) is None:
+        return False
+    if _MEMBER_LABEL_TAIL.match(text, end) is not None:
+        return True
+    return text[end : end + 1].isspace() and _MEMBER_SPACED_WORD.search(word) is not None
 
-    def unit(m: re.Match[str]) -> str:
+
+def _mask_member_value(text: str, start: int, end: int) -> str:
+    """``text[start:end]``, a member's value, with each WORD replaced by ``redacted`` except what a
+    later pass reads, and every other character kept in place. See :data:`_CONNECTION_STRING_MEMBER`
+    for why. The tests for what follows a word read the whole text, past the value's end."""
+    long_runs = [m.span() for m in _MEMBER_LONG_B64.finditer(text, start, end)]
+    long_ends = [run_end for _, run_end in long_runs]
+    out: list[str] = []
+    pos = start
+    for m in _MEMBER_VALUE_UNIT.finditer(text, start, end):
         word = m.group(1)
         if word is None:
-            return m.group(0)
-        start, end = m.span()
-        after = value[end : end + 1]
-        if _MEMBER_KEEP.search(word) is not None or (
-            after and not after.isspace() and _MEMBER_SEGMENT_ID.search(word) is not None
-        ):
-            return word
-        # The first long run ending after this word starts; the runs are disjoint and in order.
-        i = bisect.bisect_right(long_ends, start)
-        if i < len(long_runs) and long_runs[i][0] < end:
-            return _MEMBER_LONG_MASK
-        return _MEMBER_MASK
-
-    return _MEMBER_VALUE_UNIT.sub(unit, value)
+            continue
+        word_start, word_end = m.span()
+        out.append(text[pos:word_start])
+        pos = word_end
+        segment = _MEMBER_SEGMENT_ID.search(word)
+        if _kept_word(text, word, word_end):
+            out.append(word)
+        elif segment is not None and text.startswith("|", word_end):
+            # The ID stays for the segment pattern; a prefix before its "." or "-" is masked.
+            prefix = word[: segment.start(1)]
+            out.append((_MEMBER_MASK + prefix[-1] if prefix else "") + segment.group(1))
+        else:
+            # The first long run ending after this word starts; the runs are disjoint and in order.
+            i = bisect.bisect_right(long_ends, word_start)
+            inside = i < len(long_runs) and long_runs[i][0] < word_end
+            out.append(_MEMBER_LONG_MASK if inside else _MEMBER_MASK)
+    out.append(text[pos:end])
+    return "".join(out)
 
 
 def _mask_member(m: re.Match[str]) -> str:
     """The replacement for a :data:`_CONNECTION_STRING_MEMBER` match: the ``;<key>=`` kept, and the
     value's words masked (BACKLOG #5030). The support bundle runs this one function with this one
     pattern, so the two surfaces cannot drift apart."""
-    return f"{m.group(1)}={_mask_member_value(m.group(2))}"
+    start, end = m.span(2)
+    return f"{m.group(1)}={_mask_member_value(m.string, start, end)}"
 
 
 def _keep_label(m: re.Match[str], placeholder: str) -> str:
