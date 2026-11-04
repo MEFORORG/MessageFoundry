@@ -276,7 +276,7 @@ empty host are not loopback.
 - **On any other bind host**, `serve` refuses to start (exit 2), in every enforcement mode,
   acknowledged or not, and names the host.
 
-There are two ways out. Bind the engine to loopback, with `[security].listen_address` or
+Two ways out keep the proxy in front. Bind the engine to loopback, with `[security].listen_address` or
 `serve --host`, and set the acknowledgement. Or set `[api].tls_cert_file`: the engine then serves the
 hop over TLS and needs no acknowledgement, and the proxy must speak https to it and trust that
 certificate, or every request through it fails. Off loopback that bind is in-process TLS, so the

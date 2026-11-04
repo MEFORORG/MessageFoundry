@@ -1804,6 +1804,38 @@ def test_the_off_loopback_refusal_names_serve_host_alone_when_the_flag_set_the_b
     assert plaintext_upstream_hop_off_loopback_remedy(levers) in err
 
 
+@pytest.mark.parametrize(
+    ("extra", "levers"),
+    [
+        ((), "[security].listen_address or serve --host"),
+        (("--host", "0.0.0.0"), "serve --host, which overrides [security].listen_address"),
+    ],
+    ids=["file", "serve --host"],
+)
+def test_the_revocation_refusal_names_the_loopback_lever_in_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: tuple[str, ...],
+    levers: str,
+) -> None:
+    # The same lever choice as the plaintext-hop refusal, on the ADR 0078 revocation refusal.
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        ack=False,
+        auto_cert=False,
+        listen_address="0.0.0.0" if not extra else "127.0.0.1",
+        cert=_self_signed(tmp_path),
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod", attest=False, extra_args=extra)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "in-process TLS on non-loopback" in err
+    assert f"bind the engine to loopback ({levers})" in err
+
+
 #: The loopback levers serve's off-loopback plaintext-hop refusal names. The remedy sentence itself
 #: comes from plaintext_upstream_hop_off_loopback_remedy, the one source serve and the check share.
 _SERVE_LOOPBACK_LEVERS = "[security].listen_address or serve --host"

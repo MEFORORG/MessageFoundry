@@ -1070,11 +1070,11 @@ The two gates compose with — never duplicate — the cleartext gates: a cleart
 hop is already refused by the [hop authority](#channel--tls-posture-matrix), so revocation only ever
 decides a hop that is *already* verifying.
 
-**The ways across.** This list is the outbound gate's; the listener gate's are in
+**The ways across.** This list is the outbound gate's; the `[api]` listener gate's are in
 [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate). There is no
 `--allow-insecure-bind` for the outbound gate and `MEFOR_ALLOW_INSECURE_TLS` does not reach it. At
 the shipped PHI + `enforce` default an outbound connection crosses only the three ways
-[CONNECTIONS.md](CONNECTIONS.md) lists: attest that one connection (item 1), stay on loopback (item
+[CONNECTIONS.md](CONNECTIONS.md) lists: attest that one connection (item 1's per-connection pair), stay on loopback (item
 2), or load a CRL the hop checks (item 3). Item 5 is what a *changed* posture does, and item 4 is
 what one did until ADR 0186. Item 5 is the realistic failure mode — a mis-set box, not a missing
 attestation. A revocation-checking egress proxy is not on the list: the authority has no input for

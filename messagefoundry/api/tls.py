@@ -329,15 +329,15 @@ def plaintext_upstream_hop_off_loopback(api: ApiSettings) -> bool:
 def plaintext_upstream_hop_off_loopback_remedy(loopback_lever: str) -> str:
     """The two ways out of the :func:`plaintext_upstream_hop_off_loopback` refusal, as one sentence.
 
-    ``serve`` and the ``upstream-hop-ack`` check leg both print it, so the remedies cannot drift
-    apart. ``loopback_lever`` names how to bind loopback: ``serve`` adds ``serve --host``, which the
-    check, reading only the file's bind host, cannot see. The certificate remedy names the revocation
+    ``serve`` and the ``upstream-hop-ack`` check leg both print it. ``loopback_lever`` names how to
+    bind loopback: ``serve`` adds ``serve --host``, which the check cannot see. The certificate remedy names the revocation
     attestation because off loopback that bind is in-process TLS (docs/SECURITY.md, *API revocation
     gate*)."""
     return (
-        f"Either bind the engine to loopback ({loopback_lever}) and set "
-        "[api].plaintext_upstream_hop_acknowledged = true, or set [api].tls_cert_file and "
-        f"{TLS_REVOCATION_ATTESTED_ENV}=1 and point the proxy at https"
+        f"Either bind the engine to loopback ({loopback_lever}) behind a proxy on the same "
+        "machine and set [api].plaintext_upstream_hop_acknowledged = true, or set "
+        f"[api].tls_cert_file, set {TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment, and "
+        "point the proxy at https"
     )
 
 

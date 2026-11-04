@@ -148,10 +148,10 @@ gate and start **byte-identically** — the default `127.0.0.1` posture is compl
   off-loopback TLS bind.
   *(Note 2026-11-04: the predicate no longer takes a proxy-terminated input, BACKLOG #4636, Manager
   decision d20261104T080839080-981796, the way engine PR 2578 removed `proxy_proven` from
-  `revocation_hop_disposition`. It returns `False` for the loopback, plaintext and attested cases,
+  `revocation_hop_disposition`. It returns `False` for the loopback, no-certificate and attested cases,
   and `True` for an unattested in-process off-loopback TLS bind, a declared terminator in front of
-  it included. A loopback plaintext terminator is exempt as a loopback case. The plaintext case is a
-  bind with no `[api].tls_cert_file`; which certificate that bind serves, and whether `serve`
+  it included. A loopback plaintext terminator is exempt as a loopback case. The no-certificate case
+  is a bind with no `[api].tls_cert_file`; which certificate that bind serves, and whether `serve`
   starts it, is the exposed-bind gate's decision. docs/SECURITY.md, *API revocation gate*, states
   the rule.)*
   → `tests/test_tls_policy.py::test_in_process_tls_revocation_refused_matrix`

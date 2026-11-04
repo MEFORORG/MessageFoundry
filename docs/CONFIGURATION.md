@@ -409,10 +409,11 @@ The one row that *does* vary:
 > Posture **B** additionally needs `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service environment, on
 > the rule [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate) states.
 >
-> A terminator bound off loopback also needs **`[api].proxy_intra_service_auth`** *and*
-> **`[api].proxy_tls_min_version`** on a PHI instance under `enforcement = enforce` (the rows
-> above), which block A declares. Both are `exit 2`, both land before the console gates, and
-> `--allow-insecure-bind` covers neither. The worked recipes are
+> A terminator bound off loopback needs that certificate and attestation too
+> ([SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)), and also needs
+> **`[api].proxy_intra_service_auth`** *and* **`[api].proxy_tls_min_version`** on a PHI instance
+> under `enforcement = enforce` (the rows above), which block A declares. Each is an `exit 2`, each
+> lands before the console gates, and `--allow-insecure-bind` covers none of them. The worked recipes are
 > [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md) §1 Options A/B and [DEPLOYMENT.md](DEPLOYMENT.md) § *Before
 > you expose off-loopback*. Full runbook + reverse-proxy-mTLS reference
 > configs: security/OFF-LOOPBACK-DEPLOYMENT.md — a maintainer-internal document; see

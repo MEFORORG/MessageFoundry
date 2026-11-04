@@ -3488,8 +3488,10 @@ def _serve(args: argparse.Namespace) -> int:
                 "so a remote client can authenticate the engine only by pinning that exact "
                 "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
                 "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
-                "Configure [api].tls_cert_file for in-process "
-                "TLS (with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
+                "Configure [api].tls_cert_file for in-process TLS "
+                "(off loopback also MEFOR_TLS_REVOCATION_ATTESTED=1 in serve's environment, "
+                "docs/SECURITY.md, API revocation gate; "
+                "with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
                 "terminates TLS and re-encrypts to the engine, BACKLOG #4636), or set "
                 "[security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
@@ -3503,9 +3505,10 @@ def _serve(args: argparse.Namespace) -> int:
                 "available is the engine's generated self-signed placeholder, which no trust store "
                 "vouches for, so a remote client can authenticate the engine only by pinning that "
                 "exact certificate, handed over out of band. Configure "
-                "[api].tls_cert_file for in-process TLS (with [api].tls_terminated_upstream + "
-                "trusted_proxies beside it if a proxy terminates TLS and re-encrypts to the engine, "
-                "BACKLOG #4636), or, under "
+                "[api].tls_cert_file for in-process TLS (off loopback also "
+                "MEFOR_TLS_REVOCATION_ATTESTED=1 in serve's environment, docs/SECURITY.md, API "
+                "revocation gate; with [api].tls_terminated_upstream + trusted_proxies beside it if "
+                "a proxy terminates TLS and re-encrypts to the engine, BACKLOG #4636), or, under "
                 "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
                 "placeholder on a trusted, firewalled network.",
                 file=sys.stderr,
