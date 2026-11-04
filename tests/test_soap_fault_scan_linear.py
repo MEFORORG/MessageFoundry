@@ -12,8 +12,9 @@ control for the second, and inside the reference for the first.
 
 The new extraction is NOT the old one everywhere. The old patterns read the first faultcode anywhere
 in the reply, else the first Value, the Header included, and an empty ``<faultcode/>`` took the next element's text as its
-code. Both could make a permanent fault read as a Receiver one and retry for ever; the named tests
-below pin each, with a control.
+code. Both could make a permanent fault read as a Receiver one and retry until the attempt limit;
+the named tests below pin each, with a control. The Fault is searched for from the SOAP Body start
+tag, ``_find_fault`` says how, and the Body tests pin that, each with a control.
 
 The third is about which thread runs the scan, not about the loop staying responsive.
 ``SoapDestination._post_and_classify`` says why the two differ, and what bounds the difference.
@@ -50,10 +51,12 @@ def _old_fault_code(body: str, fault: object = None) -> str:
     return m.group(1) if m else ""
 
 
-# The reference reading: the old patterns, run on the text between the first Fault start tag and
-# its close tag, the earlier of the two names taken, with an element that cannot hold a code read
-# as empty. It reuses the production close-tag and nested-tag patterns, so it re-checks the
-# str.find bounds and captures, not those patterns; the named shapes pin what they read.
+# The reference reading: the old patterns, run on the text between the first Fault start tag after
+# the first Body start tag (or anywhere, with no Body start tag) and the Fault's close tag, the
+# earlier of the two names taken, with an element that cannot hold a code read as empty. It reuses
+# the production close-tag and nested-tag patterns, so it re-checks the str.find bounds and
+# captures, not those patterns; the named shapes pin what they read.
+_REF_BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>](.*)", re.IGNORECASE | re.DOTALL)
 _REF_FAULT_RE = re.compile(
     r"<\s*(?:[\w.\-]+:)?Fault[\s/>](.*?)(?:</\s*(?:[\w.\-]+:)?Fault\s*>|\Z)",
     re.IGNORECASE | re.DOTALL,
@@ -62,6 +65,9 @@ _REF_START_TAG_RE = re.compile(r"[^>]*>")
 
 
 def _ref_fault_code(body: str) -> str:
+    in_body = _REF_BODY_RE.search(body)
+    if in_body is not None:
+        body = in_body.group(1)
     fault = _REF_FAULT_RE.search(body)
     if fault is None:
         return ""
@@ -248,22 +254,155 @@ def test_a_receiver_code_in_the_fault_still_retries(body: str) -> None:
     assert isinstance(failure, DeliveryError) and not isinstance(failure, NegativeAckError)
 
 
-#: Fragments a random reply is built from: the delimiters the scan looks for, both names, legal and
+# The Fault is read from the SOAP Body. Each test's control patches the Body anchor out, so the
+# whole reply is searched as it is with no Body start tag, and shows the shape reads otherwise.
+_NO_BODY_ANCHOR = re.compile(r"(?!)")
+
+_SOAP11_RECEIVER_BODY = (
+    "<soap:Body><soap:Fault><faultcode>soap:Server</faultcode></soap:Fault></soap:Body>"
+    "</soap:Envelope>"
+)
+_SOAP12_RECEIVER_BODY = (
+    "<env:Body><env:Fault><env:Code><env:Value>env:Receiver</env:Value></env:Code></env:Fault>"
+    "</env:Body></env:Envelope>"
+)
+#: Each shape, its outcome, and its outcome with the anchor patched out.
+_BEFORE_THE_BODY = {
+    # A Fault-named element, or a WS-Security code, before a Body Receiver fault.
+    "header-self-closing-fault": (
+        "<soap:Envelope><soap:Header><x:Fault/></soap:Header>" + _SOAP11_RECEIVER_BODY,
+        "transient",
+        "soap-fault",
+    ),
+    "header-fault-with-text": (
+        "<env:Envelope><env:Header><x:Fault>none</x:Fault></env:Header>" + _SOAP12_RECEIVER_BODY,
+        "transient",
+        "soap-fault",
+    ),
+    "comment-before-the-envelope": (
+        "<!-- <Fault/> --><soap:Envelope>" + _SOAP11_RECEIVER_BODY,
+        "transient",
+        "soap-fault",
+    ),
+    "comment-before-the-body": (
+        "<env:Envelope><!-- <Fault/> -->" + _SOAP12_RECEIVER_BODY,
+        "transient",
+        "soap-fault",
+    ),
+    "header-wsse-code": (
+        "<env:Envelope><env:Header><x:Note>MessageExpired</x:Note></env:Header>"
+        + _SOAP12_RECEIVER_BODY,
+        "transient",
+        "wssecurity",
+    ),
+    # A Body Sender fault still dead-letters.
+    "header-self-closing-fault-sender-body": (
+        "<soap:Envelope><soap:Header><x:Fault/></soap:Header><soap:Body><soap:Fault>"
+        "<faultcode>soap:Client</faultcode></soap:Fault></soap:Body></soap:Envelope>",
+        "soap-sender",
+        "soap-fault",
+    ),
+    "header-receiver-fault-sender-body": (
+        "<env:Envelope><env:Header><x:Fault><x:Code><x:Value>Receiver</x:Value></x:Code></x:Fault>"
+        "</env:Header><env:Body><env:Fault><env:Code><env:Value>env:Sender</env:Value></env:Code>"
+        "</env:Fault></env:Body></env:Envelope>",
+        "soap-sender",
+        "transient",
+    ),
+    # With no Fault in the Body, a 2xx reply is delivered.
+    "header-fault-only": (
+        "<soap:Envelope><soap:Header><x:Fault/></soap:Header><soap:Body><m:Ack>ok</m:Ack>"
+        "</soap:Body></soap:Envelope>",
+        "delivered",
+        "soap-fault",
+    ),
+}
+
+
+def _outcome(failure: DeliveryError | None) -> str:
+    """``delivered``, ``transient``, or a permanent failure's code."""
+    if failure is None:
+        return "delivered"
+    if isinstance(failure, NegativeAckError):
+        assert failure.permanent
+        return failure.code
+    return "transient"
+
+
+@pytest.mark.parametrize(
+    ("body", "outcome", "unanchored"), list(_BEFORE_THE_BODY.values()), ids=list(_BEFORE_THE_BODY)
+)
+def test_the_fault_is_read_from_the_body(
+    body: str, outcome: str, unanchored: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What comes before the Body does not decide the reply's class. Control: with the anchor
+    patched out the shape reads otherwise, as it did when the first Fault, and any WS-Security
+    code, anywhere was read."""
+    assert _outcome(_classify_soap(200, body)) == outcome
+    monkeypatch.setattr(soap, "_BODY_RE", _NO_BODY_ANCHOR)
+    assert _outcome(_classify_soap(200, body)) == unanchored
+
+
+#: Fragments a random reply is built from: the delimiters the scan looks for, the names, legal and
 #: illegal prefixes, whitespace, and text.
 _FRAGMENTS = (
     "<", ">", "</", "/>", " ", "\n", "faultcode", "FaultCode", "Value", "VALUE", "Fault",
     "soap:", "SOAP-ENV:", "a.b:", ":", "x", "Client", "Receiver", '"', "'", "=", "<!--", "-->",
-    "<![CDATA[", "]]>", "faultcodes", "Values",
+    "<![CDATA[", "]]>", "faultcodes", "Values", "Body",
 )  # fmt: skip
+#: What goes before the Body: the fragments, and Fault-named elements the Body anchor must skip.
+_HEAD_FRAGMENTS = _FRAGMENTS + ("<x:Fault>", "<x:Fault/>", "</x:Fault>", "<!-- <Fault/> -->")
+#: Each envelope's text before its head fragments, and from there to its Fault's first child.
+_ENVELOPES = (
+    ("<soap:Envelope><soap:Header>", "</soap:Header><soap:Body><soap:Fault>"),
+    ("<env:Envelope>", "<env:Body ><env:Fault><env:Code>"),
+    ("<Envelope><Header>", "</Header><Body><Fault><Code>"),
+)
+#: A code element's start tag and its own close tag, around random fragments.
+_CODE_ELEMENTS = (
+    ("<faultcode>", "</faultcode>"),
+    ("<soap:faultcode a='b'>", "</soap:faultcode >"),
+    ("<Value>", "</Value>"),
+    ("<env:Value >", "</env:Value>"),
+)
+
+
+def _random_reply(rng: random.Random) -> str:
+    def fragments(alphabet: tuple[str, ...], most: int) -> str:
+        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, most)))
+
+    envelope, body_to_fault = rng.choice(_ENVELOPES)
+    start, close = rng.choice(_CODE_ELEMENTS)
+    return (
+        envelope
+        + fragments(_HEAD_FRAGMENTS, 6)
+        + body_to_fault
+        + start
+        + fragments(_FRAGMENTS, 2)
+        + close
+        + fragments(_FRAGMENTS, 12)
+    )
 
 
 def test_random_replies_yield_the_reference_reading() -> None:
     """The argument is in ``_fault_code``'s docstring; this samples it against the regex reference.
-    Seeded, so a failure replays."""
+    Seeded, so a failure replays.
+
+    Each reply opens an Envelope, a Body, a Fault and a code element, so the floors below hold: at
+    least a fifth of the replies yield a code, and at least one in twenty reads differently when the
+    Fault is searched for from the reply's start. Without them a sample of bodies that yield no
+    code, or that never reach the anchor, would pass any extraction (the seeded sample read about 60%
+    and 10% on 2026-11-04)."""
     rng = random.Random(2827)
-    for _ in range(5_000):
-        body = "".join(rng.choice(_FRAGMENTS) for _ in range(rng.randint(0, 16)))
-        assert _fault_code(body) == _ref_fault_code(body), repr(body)
+    total, with_a_code, anchored = 5_000, 0, 0
+    for _ in range(total):
+        body = _random_reply(rng)
+        code = _fault_code(body)
+        assert code == _ref_fault_code(body), repr(body)
+        with_a_code += bool(code)
+        anchored += code != _fault_code(body, soap._FAULT_RE.search(body))
+    assert with_a_code >= total // 5, f"only {with_a_code} of {total} replies yield a code"
+    assert anchored >= total // 20, f"the Body anchor decided only {anchored} of {total} replies"
 
 
 # --- linear growth, with a positive control -----------------------------------------------------
@@ -275,7 +414,7 @@ _MAX_LINEAR_RATIO = 8.0
 
 #: Replies shaped to make the old tails rescan: many start tags, none of them closed. ``long-prefixes``,
 #: ``lt-run`` and ``long-close-prefixes`` name neither element, so they never reached the old tails;
-#: the last two reach the checks on a code element that has a close. ``long-prefixes`` is here for the
+#: the two ``long-code-*`` shapes reach the checks on a code element that has a close. ``long-prefixes`` is here for the
 #: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon, and
 #: ``long-close-prefixes`` for the same class in the Fault close-tag scan, ``_FAULT_END_RE``.
 #: ``lt-run`` is the shape measured in ``SoapDestination._post_and_classify``'s docstring.
@@ -292,6 +431,10 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     # for a nested start tag, over a long run of comment openers.
     "long-code-close-prefix": lambda k: "<Fault><faultcode>x</" + "a." * (k // 2),
     "long-code-text": lambda k: "<Fault><faultcode>" + "<!x" * (k // 3) + "</faultcode>",
+    # The Body anchor's scan, ``_BODY_RE``, over the same prefix runs and a run of ``<``, before a
+    # Body that holds the Fault.
+    "long-prefixes-before-the-body": lambda k: ("<" + "a." * 50) * (k // 101) + "<Body><Fault>",
+    "lt-run-before-the-body": lambda k: "<" * k + "<Body><Fault><faultcode>",
 }
 
 

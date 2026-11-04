@@ -136,6 +136,10 @@ logger = logging.getLogger(__name__)
 # faults routinely are) with HTTP 200 reads as SUCCESS. That is a wrong disposition on a real delivery,
 # not a cosmetic miss. Kept identical to _HEADER_EL_RE below, which already had it right.
 _FAULT_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Fault[\s/>]", re.IGNORECASE)
+# The SOAP Body start tag. BACKLOG #2827: a SOAP 1.1 or 1.2 fault is a Body child, so _classify_soap
+# searches for the Fault, and for a WS-Security code, only after it; _find_fault says what happens
+# without one.
+_BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>]", re.IGNORECASE)
 _SENDER_RE = re.compile(r"client|sender", re.IGNORECASE)
 _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
 # WS-Security fault codes that are PERMANENT (a retry won't fix a rejected/expired credential).
@@ -199,11 +203,24 @@ def _code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -
     return body[gt + 1 : close]
 
 
+def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
+    """The first ``_FAULT_RE`` match from where the fault searches start, and that start: the end of
+    the first ``_BODY_RE`` match, or ``0``, the whole reply, when there is none.
+
+    BACKLOG #2827: so a Fault-named element before the Body, in the Header or a comment say, does
+    not decide the class of the Body's fault. The first Body start tag is taken even when it sits in
+    a comment or a CDATA section. With no Body start tag the reply is searched whole, as it was
+    before the anchor."""
+    m = _BODY_RE.search(body)
+    start = 0 if m is None else m.end()
+    return _FAULT_RE.search(body, start), start
+
+
 def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     """The fault code text (e.g. ``soap:Client`` / ``soap:Receiver``), SOAP 1.1 or 1.2, or ``""``.
 
-    BACKLOG #2827: read only inside ``fault``, the ``_FAULT_RE`` match (searched for when not
-    given), from its start tag to its close tag or, with none, the reply's end, so a ``faultcode``
+    BACKLOG #2827: read only inside ``fault``, the ``_FAULT_RE`` match (:func:`_find_fault`'s when
+    not given), from its start tag to its close tag or, with none, the reply's end, so a ``faultcode``
     or ``Value`` outside it, in the Header say, does not decide the fault's class. A self-closing
     Fault holds no code. The first ``faultcode`` or ``Value`` start tag in that range is the code
     element: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may carry an
@@ -212,7 +229,7 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     Where it cannot hold a code, a later tag is still not tried: that is a choice, so the code
     stays the Fault's first code element."""
     if fault is None:
-        fault = _FAULT_RE.search(body)
+        fault, _ = _find_fault(body)
         if fault is None:
             return ""
     start = fault.end()
@@ -234,11 +251,12 @@ def _classify_soap(status: int, body: str) -> DeliveryError | None:
     """``None`` if delivered, else the classified failure. A WS-Security fault (auth/expiry) →
     permanent; a SOAP fault is classified by its code (Sender/Client → permanent; Receiver/Server →
     transient; unrecognized → permanent so a rejected request can't loop the lane); a fault-less
-    response falls back to the HTTP status."""
-    fault = _FAULT_RE.search(body)
+    response falls back to the HTTP status. The Fault and the WS-Security code are searched for from
+    where :func:`_find_fault` starts."""
+    fault, start = _find_fault(body)
     if fault:
         code = _fault_code(body, fault)
-        if _WSSE_FAULT_RE.search(code) or _WSSE_FAULT_RE.search(body):
+        if _WSSE_FAULT_RE.search(code) or _WSSE_FAULT_RE.search(body, start):
             return NegativeAckError(
                 f"WS-Security fault (HTTP {status})", code="wssecurity", permanent=True
             )
@@ -926,7 +944,8 @@ class SoapDestination(DestinationConnector):
         single call, about 0.7 to 1.5 s, was a ``_FAULTCODE_RE`` or ``_CODEVALUE_RE`` name scan over
         a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
         ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
-        not a bound on another."""
+        not a bound on another, and they predate ``_find_fault``'s ``_BODY_RE`` scan, one more
+        linear pass."""
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
