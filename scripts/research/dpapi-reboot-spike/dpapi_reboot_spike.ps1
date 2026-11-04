@@ -45,8 +45,8 @@
   The reboot is proven from the reports themselves, for A4 and for A5 each against A3, and A5 must
   be from A4's boot when A4 reported. Either signal shows a reboot: Windows' boot counter
   (PrefetchParameters BootId) changed, or the tick count went down (it resets only at a boot) while
-  the boot time (clock minus uptime) moved later. With no counter in a report, boot times 60
-  seconds or more apart show one too. The judge prints every report's raw counter, tick count and
+  the boot time (clock minus uptime) moved later. With no counter in a report, a tick count that
+  went down shows one alone, and so does a boot time 60 seconds or more later. The judge prints every report's raw counter, tick count and
   boot time on its boots line.
 
   Each arm reads YES, NO, INVALID or INCONCLUSIVE. INVALID is a report showing a broken instrument:
@@ -323,6 +323,7 @@ public static class Spike
             }
         }
         catch (UnauthorizedAccessException e) { lines.Add("masterkey=UNREADABLE " + e.Message); }
+        catch (IOException e) { lines.Add("masterkey=UNREADABLE " + e.Message); }
 
         string plainPath = Path.Combine(dir, "plain.bin");
         string userPath = Path.Combine(dir, "user.blob");
@@ -668,14 +669,15 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra, [string]$Plain) {
         if ($Report['protect_machine'] -eq 'OK') { return @('NO', "protect_user $($Report['protect_user']); protect_machine OK") }
         return @('INCONCLUSIVE', "protect_user $($Report['protect_user']), protect_machine $($Report['protect_machine'])")
     }
-    if ($Extra) { return @('INCONCLUSIVE', $Extra) }
-    if ($Action -eq 'unprotect') {
-        if (-not $Plain) { return @('INCONCLUSIVE', 'report-A1 gives no plain_sha256 to compare') }
-        if ($Report['plain_sha256'] -ne $Plain) { return @('INVALID', "plain_sha256 $($Report['plain_sha256']) is not report-A1's $Plain") }
+    # The INVALID readings come before $Extra: a broken instrument shows whatever else failed.
+    if ($Action -eq 'unprotect' -and $Plain -and $Report['plain_sha256'] -ne $Plain) {
+        return @('INVALID', "plain_sha256 $($Report['plain_sha256']) is not report-A1's $Plain")
     }
     $user = [string]$Report['user_unprotect']
     # ERROR_INVALID_DATA is what the tampered control gets: a damaged blob, not a lost key.
     if ($user -eq 'FAIL win32=13' -or $user -eq 'OK mismatch') { return @('INVALID', "user_unprotect $user, a damaged blob or value") }
+    if ($Extra) { return @('INCONCLUSIVE', $Extra) }
+    if ($Action -eq 'unprotect' -and -not $Plain) { return @('INCONCLUSIVE', 'report-A1 gives no plain_sha256 to compare') }
     $controls = "foreign $($Report['control_foreign']), tampered $($Report['control_tampered']), machine $($Report['machine_unprotect'])"
     $held = $Report['control_foreign'] -eq $NteBadKeyState -and ([string]$Report['control_tampered']).StartsWith('FAIL') -and
         $Report['machine_unprotect'] -eq 'OK match'
@@ -702,9 +704,11 @@ function Get-BootRelation($Earlier, $Later) {
     # 'rebooted', 'same' or 'unknown', for two reports in time order. Either of two signals shows a
     # reboot: Windows' boot counter changed, or the tick count went down while the boot time (clock
     # minus uptime) moved later. A counter that did not move cannot overrule the second, since
-    # nothing here shows every build moves it at every boot. With no counter, boot times 60 s or
-    # more apart show a reboot, and a tick count that went up with boot times within 60 s shows the
-    # same boot; those rest on the guest clock. Signals that disagree read 'unknown'.
+    # nothing here shows every build moves it at every boot. With no counter, a tick count that went
+    # down shows a reboot whatever the clock says (a clock read early at boot can put the boot time
+    # back); else a boot time 60 s or more LATER shows one, and boot times within 60 s show the same
+    # boot. Those last rest on the guest clock. Signals that disagree read 'unknown', a boot time
+    # that moved back beside a tick count that went up included.
     $e = Get-BootReading $Earlier
     $l = Get-BootReading $Later
     $idKnown = [bool]($e[0] -and $l[0])
@@ -715,8 +719,10 @@ function Get-BootRelation($Earlier, $Later) {
     if ($tickDown -and $bootKnown -and $l[2] -gt $e[2]) { return 'rebooted' }
     if ($idKnown) { if ($tickDown) { return 'unknown' } else { return 'same' } }
     if (-not $tickKnown -or -not $bootKnown) { return 'unknown' }
-    if ([Math]::Abs(($l[2] - $e[2]).TotalSeconds) -ge 60) { return 'rebooted' }
-    if ($tickDown) { return 'unknown' }
+    if ($tickDown) { return 'rebooted' }
+    $gap = ($l[2] - $e[2]).TotalSeconds
+    if ($gap -ge 60) { return 'rebooted' }
+    if ($gap -le -60) { return 'unknown' }
     'same'
 }
 
@@ -826,12 +832,14 @@ function Invoke-Payload {
     $exit = 1
     try {
         foreach ($s in $PreRebootSteps) { Invoke-PayloadStep $log $s[0] $s[1] }
-        Copy-Item -Path (Join-Path $Work '*.txt') -Destination $OutDir
         $judged = Invoke-Judge $Work $false
         $judged.Lines | Add-Content -LiteralPath $log -Encoding ASCII
         $judged.Lines | Write-Host
         if ($judged.PrePass) { $exit = 0 }
     } finally {
+        # Out before the uninstall deletes them, on a failed step too, so the judge can be re-run.
+        # Continue: a failed copy is reported, and must not skip the uninstall.
+        if (Test-Path -LiteralPath $Work) { Copy-Item -Path (Join-Path $Work '*.txt') -Destination $OutDir -ErrorAction Continue }
         Invoke-PayloadStep $log 'Uninstall' ''
     }
     $exit
@@ -851,11 +859,21 @@ function Invoke-Guest($Session, [string]$GuestStep, [string]$ArmName = '') {
         ForEach-Object { Write-Log ([string]$_) }
 }
 
-function Get-GuestBoot($Session) {
-    Invoke-Command -Session $Session -ScriptBlock { (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime() }
+function Get-GuestUptimeMs($Session) {
+    # The guest's tick count, which only a boot resets. The guest side is Windows PowerShell 5.1,
+    # whose .NET has no Environment.TickCount64.
+    Invoke-Command -Session $Session -ScriptBlock {
+        if (-not ('MeforSpike.Tick' -as [type])) {
+            Add-Type -Namespace MeforSpike -Name Tick -MemberDefinition '[DllImport("kernel32.dll")] public static extern ulong GetTickCount64();'
+        }
+        [MeforSpike.Tick]::GetTickCount64()
+    }
 }
 
-function Wait-GuestSession($Credential, [Nullable[DateTime]]$BootAfter, [int]$Seconds) {
+function Wait-GuestSession($Credential, $AskedAt, [int]$Seconds) {
+    # $AskedAt is the host's time just before the reboot was asked, or $null for no reboot. The
+    # guest is back from that reboot once its uptime is less than the time since: a guest that never
+    # rebooted has been up longer than that. It reads no guest clock, which a reboot may set wrong.
     # Each failed attempt is logged with its type. While a guest boots the failure types vary (the
     # VM bus not up, the credential service not up, a session that drops), so no one type is caught;
     # a refused credential is the exception, and stops the wait at once.
@@ -866,9 +884,11 @@ function Wait-GuestSession($Credential, [Nullable[DateTime]]$BootAfter, [int]$Se
         if ($beat -notlike 'Ok*') { Write-Log "waiting for the guest: heartbeat $beat"; Start-Sleep -Seconds 10; continue }
         try {
             $s = New-PSSession -VMName $VMName -Credential $Credential -ErrorAction Stop
-            if ($null -eq $BootAfter) { return $s }
-            $boot = Get-GuestBoot $s
-            if ($boot -gt $BootAfter.Value.AddSeconds(30)) { Write-Log "guest back, last boot $($boot.ToString('o'))"; return $s }
+            if ($null -eq $AskedAt) { return $s }
+            $up = [double](Get-GuestUptimeMs $s)
+            $since = ((Get-Date) - $AskedAt).TotalMilliseconds
+            if ($up -lt $since) { Write-Log "guest back: uptime_ms=$up, $([long]$since) ms since the reboot was asked"; return $s }
+            Write-Log "waiting for the guest: still the boot before, uptime_ms=$up, $([long]$since) ms since the reboot was asked"
             Remove-PSSession $s
         } catch {
             if ($s) { Remove-PSSession $s -ErrorAction SilentlyContinue }
@@ -920,6 +940,8 @@ function Invoke-HostRun {
         $null = New-Item -ItemType Directory -Force -Path $OutDir
         $script:HostLog = Join-Path $OutDir 'dpapi-reboot-spike-host.txt'
         $reports = Join-Path $OutDir 'reports'
+        # The judge reads whatever is in it, so an earlier run's reports would pass for this run's.
+        if ((Test-Path -LiteralPath $reports) -and @(Get-ChildItem -LiteralPath $reports -Force).Count) { throw "STOP     $reports already holds files from another run; pass a new -OutDir; nothing ran" }
         $null = New-Item -ItemType Directory -Force -Path $reports
         Invoke-Rig $cred $snap $reports
     } finally {
@@ -944,6 +966,9 @@ function Stop-AndRevert($Snap) {
     if ($state -ne 'Off') { $problems += "after Stop-VM it was $state, not Off" }
     try { Restore-VMSnapshot -VMSnapshot $Snap -Confirm:$false -ErrorAction Stop }
     catch { $problems += "Restore-VMSnapshot failed: $($_.Exception.Message)" }
+    # The next run refuses a VM that is not Off, so a revert that leaves it Saved needs a hand too.
+    $state = Get-VMStateText
+    if ($state -ne 'Off') { $problems += "after the revert it was $state, not Off" }
     if (-not $problems.Count) { return '' }
     "STOP     $VMName was not turned off and reverted ($($problems -join '; ')); it is $(Get-VMStateText) now; turn it off and revert it to $Checkpoint by hand before anything else uses it"
 }
@@ -962,12 +987,12 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         $session = Wait-GuestSession $Credential $null 600
         foreach ($s in $PreRebootSteps) { Invoke-Guest $session $s[0] $s[1] }
         # Out before the reboot, so a guest that never comes back still leaves A1 to A3 to judge.
-        Copy-Item -FromSession $session -Path 'C:\mefor-dpapi-reboot\work\*.txt' -Destination $Reports
-        $bootBefore = Get-GuestBoot $session
+        Copy-Item -FromSession $session -Path (Join-Path $Work '*.txt') -Destination $Reports
+        $askedAt = Get-Date
         Invoke-Guest $session 'Reboot' 'A4'
         Remove-PSSession $session
         $session = $null
-        $session = Wait-GuestSession $Credential $bootBefore 900
+        $session = Wait-GuestSession $Credential $askedAt 900
         Invoke-Guest $session 'BootReport'
         Invoke-Guest $session 'Start' 'A5'
     } catch {
@@ -978,14 +1003,14 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         # The readings come out before the revert destroys them, on success and failure alike.
         if ($session) {
             try {
-                Copy-Item -FromSession $session -Path 'C:\mefor-dpapi-reboot\work\*.txt' -Destination $Reports -ErrorAction Stop
+                Copy-Item -FromSession $session -Path (Join-Path $Work '*.txt') -Destination $Reports -ErrorAction Stop
                 Invoke-Guest $session 'Uninstall'
             } catch {
                 Write-Log "could not copy the reports or uninstall: $($_.Exception.Message)"
             }
             Remove-PSSession $session -ErrorAction SilentlyContinue
         } else {
-            Write-Log 'no guest session at the end, so no reports were copied'
+            Write-Log 'no guest session at the end, so the judge reads only the reports copied before the reboot, if any'
         }
         $endStop = Stop-AndRevert $Snap
         if ($endStop) { Write-Log $endStop } else { Write-Log "$VMName turned off and reverted to $Checkpoint; output in $OutDir" }

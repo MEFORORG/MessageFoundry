@@ -208,6 +208,15 @@ SCENARIOS: dict[str, Scenario] = {
         )
     ),
     "two_boots": Scenario(_all(A5=_report("A5", boot_id="9"))),
+    # No counter, a tick count that went up and a boot time two minutes back: a clock correction
+    # inside one boot, not a reboot.
+    "no_id_clock_back": Scenario(
+        _all(
+            A3=_report("A3", **NO_ID),
+            A4=_report("A4", uptime_ms="500000", boot_utc="2026-11-04T06:01:20.0000000Z", **NO_ID),
+            A5=_report("A5", uptime_ms="510000", boot_utc="2026-11-04T06:01:20.0000000Z", **NO_ID),
+        )
+    ),
     # No counter and a tick count past A3's, but boot times 15 minutes apart: the clock shows it.
     "no_id_clock_rebooted": Scenario(
         _all(
@@ -280,6 +289,11 @@ SCENARIOS: dict[str, Scenario] = {
     "a3_no_report": Scenario(_all(A3=None), rebooted=False),
     # A3's control failed: A4 and A5 open the blob, but nothing before the reboot shows A3 working.
     "a3_control_failed": Scenario(_all(A3=_report("A3", control_tampered="OPENED"))),
+    # A failed precondition does not hide a damaged blob.
+    "cross_failed_a2_damaged": Scenario(
+        _all(A2=_report("A2", user_unprotect="FAIL win32=13")),
+        crosscheck="admin_open=OPENED by REVTEST01\\Administrator exit=0",
+    ),
     "a5_damaged": Scenario(_all(A5=_report("A5", user_unprotect="FAIL win32=13"))),
     "a4_mismatch": Scenario(_all(A4=_report("A4", user_unprotect="OK mismatch"))),
     "a5_other_value": Scenario(_all(A5=_report("A5", plain_sha256="cd" * 32))),
@@ -375,6 +389,8 @@ _OVERALL: list[tuple[str, str]] = [
     ("a1_protect_refused", "INVALID"),
     ("a1_no_sha", "INCONCLUSIVE"),
     ("a3_control_failed", "INCONCLUSIVE"),
+    ("cross_failed_a2_damaged", "INVALID"),
+    ("no_id_clock_back", "INCONCLUSIVE"),
     ("a1_dpapi_down", "INCONCLUSIVE"),
     ("not_rebooted_a2_refused", "INVALID"),
 ]
@@ -536,3 +552,64 @@ def test_only_a_sharing_or_lock_violation_reads_busy(tmp_path: Path) -> None:
     assert other.startswith("dir=STOP     cannot open hvtest's lock file"), other
     assert "HRESULT 0x80070005" in other, other
     assert "busy" not in other
+
+
+# Host mode runs only on MEFORHV01, once. So its reboot wait and its cleanup run here against
+# stand-ins for the Hyper-V and remoting cmdlets: a function shadows a cmdlet of the same name.
+_HOST_DRIVER = (
+    _lift("Wait-GuestSession", "Get-VMStateText", "Stop-AndRevert")
+    + r"""
+$VMName = 'REVTEST01'; $Checkpoint = 'cp'
+$script:states = @(); $script:uptimes = @(); $script:stopFails = $false
+function Write-Log([string]$Line) { }
+function Start-Sleep { }
+function New-PSSession { 'session' }
+function Remove-PSSession { }
+function Get-VM {
+    $s = 'Off'
+    if ($script:states.Count) { $s, $script:states = $script:states }
+    [pscustomobject]@{ Heartbeat = 'OkApplicationsHealthy'; State = $s }
+}
+$script:reads = 0
+# Past the list, a guest that has been up for days.
+function Get-GuestUptimeMs {
+    $script:reads++
+    if ($script:reads -le $script:uptimes.Count) { $script:uptimes[$script:reads - 1] } else { 999999999 }
+}
+function Stop-VM { if ($script:stopFails) { throw 'stop refused' } }
+function Restore-VMSnapshot { }
+
+# No reboot asked: the first session is the one.
+"none=$(Wait-GuestSession $null $null 60)"
+# The first session is still the boot before (up longer than the 120 s since the ask), the second
+# is the new boot.
+$script:uptimes = @(900000, 30000)
+"rebooted=$(Wait-GuestSession $null (Get-Date).AddSeconds(-120) 60) reads=$script:reads"
+# A guest that never reboots never reads as back.
+$script:reads = 0; $script:uptimes = @()
+try { $null = Wait-GuestSession $null (Get-Date).AddSeconds(-120) 1; 'never=RETURNED' } catch { "never=$($_.Exception.Message)" }
+
+$script:states = @('Off', 'Off')
+"clean=[$(Stop-AndRevert $null)]"
+$script:stopFails = $true; $script:states = @('Running', 'Off', 'Off')
+"stopfail=$(Stop-AndRevert $null)"
+$script:stopFails = $false; $script:states = @('Off', 'Saved', 'Saved')
+"saved=$(Stop-AndRevert $null)"
+"""
+)
+
+
+def test_host_reboot_wait_and_cleanup(tmp_path: Path) -> None:
+    driver = tmp_path / "host.ps1"
+    driver.write_text(_HOST_DRIVER, encoding="ascii")
+    lines = _run_pwsh(driver, tmp_path, 120).strip().splitlines()
+    out = dict(line.split("=", 1) for line in lines)
+    assert out["none"] == "session"
+    assert out["rebooted"] == "session reads=2"
+    assert out["never"].startswith("STOP     no PowerShell Direct session"), out["never"]
+    assert out["clean"] == "[]"
+    assert "Stop-VM failed: stop refused" in out["stopfail"]
+    assert "after Stop-VM it was Running, not Off" in out["stopfail"]
+    assert out["stopfail"].startswith("STOP     REVTEST01 was not turned off and reverted")
+    assert "after the revert it was Saved, not Off" in out["saved"]
+    assert "it is Saved now" in out["saved"]
