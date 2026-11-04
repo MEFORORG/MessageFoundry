@@ -48,7 +48,7 @@ JSON-only instance:
 | Posture (off-loopback bind) | Result |
 |---|---|
 | in-process TLS (`[api].tls_cert_file`) | **refused (exit 2) until `MEFOR_TLS_REVOCATION_ATTESTED=1` is also set** — the engine terminates TLS itself and performs no OCSP/CRL check, so revocation has to be attested ([ADR 0078](adr/0078-certificate-revocation-posture.md)). With the attestation: starts |
-| proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | **refused (exit 2) in every mode until `[api].plaintext_upstream_hop_acknowledged = true` is also set**, unless you supply `[api].tls_cert_file`. Without one, the proxy-to-engine hop is plaintext and yours to secure. With the acknowledgement set, it still needs the attestations: on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
+| proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | **refused (exit 2) in every mode unless you supply `[api].tls_cert_file`**, so the proxy re-encrypts to the engine. Without one the proxy-to-engine hop is plaintext, and `[api].plaintext_upstream_hop_acknowledged` accepts that hop on a loopback bind only (BACKLOG #4636). With the certificate set, it still needs the attestations: on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
 | no operator certificate, plus `serve --allow-insecure-bind` **or** `[security].require_encryption_for_remote = false` | **starts**, with a stderr warning — the API serves TLS on the engine's self-signed placeholder, which no trust store vouches for, so a remote client can authenticate the engine only by pinning that exact certificate |
 | …the same, on a **PHI-classified** instance under `[security].enforcement = enforce` (the default) | refused — the escape is clamped shut and cannot relax a bind on the placeholder |
 | no operator certificate, no escape | refused |
@@ -135,15 +135,20 @@ engine warns at startup rather than refusing, so this is easy to miss. An intern
 ### Option B — TLS terminated upstream (reverse proxy / load balancer)
 
 A proxy (nginx, IIS/ARR, HAProxy, a k8s ingress) terminates TLS and forwards plaintext to the engine.
-Tell the engine a terminator is in front so the off-loopback gate is satisfied and the
+Tell the engine a terminator is in front so the exposure gates know a proxy is there and the
 audit/rate-limit source IP is the real client. The engine then terminates no TLS itself, so this
 posture needs **no** `MEFOR_TLS_REVOCATION_ATTESTED` — revocation is delegated to the terminator,
 which is why it is the better option when you cannot attest a revocation-checking PKI:
 
+This block keeps the engine on loopback, with the proxy on the same machine: that is the only bind
+on which `serve` accepts the plaintext proxy-to-engine hop (BACKLOG #4636). For a proxy on another
+machine, set `local_access_only = false` and a `listen_address`, add `[api].tls_cert_file`, drop the
+acknowledgement, and point the proxy at https.
+
 ```toml
 [security]
-local_access_only = false        # or keep the engine on loopback if the proxy is on this same host
-listen_address = "0.0.0.0"
+# local_access_only keeps its default, true: the engine binds 127.0.0.1 and the proxy on this
+# machine faces the network.
 serve_web_console = true         # REQUIRED off-box, and EXPLICITLY — see §3
 # REQUIRED behind a declared proxy: the engine REFUSES TO START serving /ui without it, because the
 # Host header is client-forwardable there and the CSRF check + WebAuthn origin binding need the exact
@@ -154,14 +159,14 @@ web_console_public_address = "https://mefor.example.org"
 tls_terminated_upstream = true
 # REQUIRED in every mode when no [api].tls_cert_file is set: the proxy speaks plaintext to the
 # engine, so securing that hop is your site's job. serve refuses to start (exit 2) until you
-# acknowledge it.
+# acknowledge it, and refuses it on any non-loopback bind even then.
 plaintext_upstream_hop_acknowledged = true
-trusted_proxies = ["10.0.0.5"]   # the proxy's address(es) — REQUIRED; empty trusts nothing
+trusted_proxies = ["127.0.0.1"]  # the proxy's address(es) as the engine sees them — REQUIRED; empty trusts nothing
 # Posture-B attestations — BOTH REQUIRED, not optional. The engine terminates NO browser TLS here,
 # so it can observe neither the proxy->engine hop nor the TLS floor the proxy offers browsers — both
-# are operator DECLARATIONS. On a PHI instance (all three built-in env names) under the default
-# [security].enforcement = enforce, an OFF-LOOPBACK bind REFUSES to start without them (exit 2); if
-# you took the loopback-behind-the-proxy variant above it only WARNS — declare them anyway, they are
+# are operator DECLARATIONS. On this loopback bind a missing one only WARNS; on a PHI instance (all
+# three built-in env names) under the default [security].enforcement = enforce, the OFF-LOOPBACK
+# variant with a certificate REFUSES to start without them (exit 2). Declare them anyway, they are
 # the only record that the internal hop and the browser-facing floor were considered.
 proxy_intra_service_auth = "network"   # "mtls" | "network" | "shared_secret"
 # ASVS 12.1.1 — the browser-facing TLS floor. This line is an ATTESTATION worth exactly what your
@@ -372,6 +377,7 @@ mTLS here is **transport authentication only** unless you also populate
 | Hostname mismatch in the browser | The engine cert's SAN doesn't cover the host in `[security].web_console_public_address`. Reissue the cert with the right SAN, or point the origin at a name the cert covers. |
 | `https://…/ui` returns 404, engine started fine | The console auto-degraded to JSON-only: `[security].serve_web_console` was left at its default on an exposed instance, or the `messagefoundry-webconsole` wheel is missing. Both print a stderr warning at startup — check the service log. |
 | Engine won't start: `refusing to serve behind an upstream TLS terminator … without [api].plaintext_upstream_hop_acknowledged` | Option B with no `tls_cert_file`: the proxy-to-engine hop is plaintext and yours to secure. Set `plaintext_upstream_hop_acknowledged = true` under `[api]` once it is. |
+| Engine won't start: `refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API bind host …` | Option B with no `tls_cert_file` on a bind that is not loopback. The acknowledgement covers a proxy on the same machine only. Keep the engine on loopback, or set `tls_cert_file` and point the proxy at https. |
 | Engine won't start: `refusing to serve the browser ops dashboard … without an operator certificate or a declared TLS-terminating proxy` | An off-loopback `/ui` bind with neither of those. The engine would still encrypt the hop on its generated self-signed placeholder, but no trust store vouches for that certificate, so the browser surface refuses it. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` + `plaintext_upstream_hop_acknowledged` (Option B). `--allow-insecure-bind` does **not** cover `/ui`. |
 | Engine won't start: `…serve_web_console=true needs the web console package` | Install `messagefoundry-webconsole` (or set `serve_web_console = false` for a JSON-only engine). |
 | Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without an operator certificate on the JSON API. The engine would serve the placeholder there too, and refuses it for the same reason. Same fix as above. |

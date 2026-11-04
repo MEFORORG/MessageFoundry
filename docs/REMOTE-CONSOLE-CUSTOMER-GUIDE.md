@@ -96,7 +96,10 @@ Open the firewall on the chosen port (default **8765/TCP**) so remote PCs can re
 > `trusted_proxies = ["..."]` under `[api]`, and have the proxy forward to the engine. Also set
 > `plaintext_upstream_hop_acknowledged = true` under `[api]`: the link from the proxy to the engine
 > is not encrypted, so keeping it private is your job, and the engine will not start until you
-> confirm that. See the
+> confirm that. That unencrypted link is allowed only with the proxy on this same server and the
+> engine kept on loopback: leave out `local_access_only = false` and `listen_address`. For a proxy
+> on another machine, keep the certificate settings above, leave out
+> `plaintext_upstream_hop_acknowledged`, and have the proxy connect to the engine over https. See the
 > technical reference (`REMOTE-CONSOLE.md`) for details.
 
 ---

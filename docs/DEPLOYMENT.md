@@ -472,9 +472,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
 
 1. **API** — set `[security].local_access_only = false` + `[security].listen_address`, then either
    `[api].tls_cert_file` + `[api].tls_key_file` (in-process TLS) *or* `[api].tls_terminated_upstream = true`
-   + `[api].trusted_proxies` + `[api].plaintext_upstream_hop_acknowledged = true` (front it with a TLS
-   terminator; unless you also set `[api].tls_cert_file`, the acknowledgement is required because the
-   proxy-to-engine hop is plaintext and yours to secure). Sign-in is always on: `serve` refuses to
+   + `[api].trusted_proxies` + `[api].tls_cert_file` (front it with a TLS terminator that
+   re-encrypts to the engine; off loopback `serve` refuses a plaintext proxy-to-engine hop even with
+   `[api].plaintext_upstream_hop_acknowledged`, BACKLOG #4636, see [SECURITY.md](SECURITY.md)). Sign-in is always on: `serve` refuses to
    start without it, and no flag covers that (vault BACKLOG #2719). The legacy `[api].host` key is
    **rejected at load**, since it moved to `[security]` (ADR 0118). `[auth].enabled` and
    `[security].require_sign_in` are rejected at load too, as removed.

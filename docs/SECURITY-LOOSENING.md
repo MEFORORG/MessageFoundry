@@ -1408,9 +1408,10 @@ count is above `0` (vault BACKLOG #2613).
   ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
   decision 3). So the hop from the proxy to the engine is **plaintext**, and the engine does nothing to
   protect it. At least sign-in credentials, session tokens and PHI reads cross that hop unencrypted.
-- **When acceptable:** the site keeps the hop private by means the engine cannot see: a same-host
-  loopback hop, an isolated network segment, or a host firewall. Without the acknowledgement, `serve`
-  refuses this topology in every mode (BACKLOG #1179).
+- **When acceptable:** only on a same-host loopback hop, with the proxy on the engine's machine and
+  the engine bound to loopback. Without the acknowledgement, `serve` refuses this topology in every
+  mode (BACKLOG #1179). Off loopback it refuses the plaintext hop even with it (BACKLOG #4636;
+  [SECURITY.md](SECURITY.md) states the rule).
 - **Compensating controls:** set `[api].tls_cert_file` so the engine serves that hop over TLS, and point
   the proxy at https with that certificate trusted. Short of that, keep the proxy on the same host.
   Isolation limits who can read the hop; it does not encrypt it.
