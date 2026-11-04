@@ -3486,13 +3486,13 @@ def _extract_member(
 ) -> Path | None:
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
-    ``secure`` locks the output file to its owner with the store's own primitive the moment it exists,
-    BEFORE the first byte is streamed into it. The restore path passes it: its staging directory sits
-    on the destination volume, and the file is the whole decrypted store. What it leaves is not always
-    owner-only on Windows (ADR 0163). Securing it after the stream, the way
+    ``secure`` hands the output file to the store's own best-effort ``_secure_file`` the moment it
+    exists, BEFORE the first byte is streamed into it; what that leaves is not always owner-only on
+    Windows (ADR 0163). The restore path passes it: its staging directory sits on the destination
+    volume, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
-    under the inherited ACL for as long as the write takes. The verify path passes it everywhere but
-    ``.mefor-staging`` (BACKLOG #1174).
+    under the inherited ACL for as long as the write takes. The verify path passes it on each staging
+    root it uses, ``.mefor-staging`` included (BACKLOG #1174).
 
     Path-traversal-safe by construction, NOT by an after-the-fact check: the member's *stored name* is
     never used as a filesystem path — we look the member up by name, then stream its CONTENT to a fixed
@@ -3887,10 +3887,11 @@ def _restore_blocking(
         # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
         # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
         # 3.14.6) rather than inheriting the parent's. The files staged inside it are the whole
-        # decrypted archive and, on the store route, the whole store: full-body PHI at rest there
-        # (docs/PHI.md section 3), and on either route a config bundle that can carry secrets.
-        # So each is locked to its owner with the store's own primitive the moment it exists and
-        # before its first byte is written. Best-effort and non-fatal, per that primitive's contract.
+        # decrypted archive and, on the store route, the whole extracted store. On the store route
+        # both are full-body PHI at rest (docs/PHI.md section 3), and an archive can also carry a
+        # config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
+        # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
+        # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
         # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
         # a file carries the temp directory's entries explicitly (it removes inherited entries only;
