@@ -397,6 +397,9 @@ from messagefoundry.config.tls_policy import (
     phi_read_hop_disposition,
 )
 from messagefoundry.config.wiring import (
+    _REFUSAL_LOG_LIMIT as _CONFIG_REFUSAL_LOG_LIMIT,
+)
+from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
     ConfigDirUnlistable,
     EnvRef,
@@ -2538,15 +2541,10 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 )
 
 #: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for at least its 404, 422
-#: and 503 refusal WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer
-#: withholds. ``safe_exc``'s default 200-character cut dropped the directory from a long config
-#: path and the fix from a long WiringError. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
-#: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
-#: bounds how much redaction-missed text one line carries and what each handler's filters re-scan on
-#: the event loop. ``safe_exc`` redacts before the cut. The bound is on the text BEFORE
-#: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
-#: times over. The cut keeps the head, so an error longer than this still loses its tail.
-_REFUSAL_LOG_LIMIT: Final = 8192
+#: and 503 refusal WARNINGs and its reload_fault ERROR, which carry the real reload error that the
+#: answer withholds. Defined once, in the config package, whose own refusal WARNING uses it too;
+#: why it is 8192 is written there.
+_REFUSAL_LOG_LIMIT: Final = _CONFIG_REFUSAL_LOG_LIMIT
 
 #: The answer to a reload whose config directory the engine could not resolve or list: at the
 #: target check, or in the load after it (vault BACKLOG #5248).

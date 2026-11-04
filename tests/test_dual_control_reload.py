@@ -64,7 +64,12 @@ from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests._share_fault import _share_fault
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
-from tests.test_config_source_trust import _CLEAN_READ, _SELF, _never_admin
+from tests.test_config_source_trust import (
+    _CLEAN_READ,
+    _EVERYONE_WRITE_READ,
+    _SELF,
+    _never_admin,
+)
 from tests.test_trust_anchors import _block, _FaultyAuditStore, _judged_clean
 
 PW = "a-strong-test-passphrase"
@@ -1923,10 +1928,6 @@ def _windows_check_moving_away(tmp_path: Path, answer: Any) -> Any:
     return functools.partial(wiring._enforce_windows_paths, probes=probes)
 
 
-#: A write grant to Everyone (S-1-1-0) on the directory: a policy refusal, not a failed read.
-_EVERYONE_MAY_WRITE = (0x00, 0x00000002 | 0x00000004 | 0x00000010 | 0x00010000, "S-1-1-0")
-
-
 async def test_a_policy_refusal_then_a_directory_moved_away_is_invalid_config_inline(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1935,13 +1936,14 @@ async def test_a_policy_refusal_then_a_directory_moved_away_is_invalid_config_in
     from the directory being gone is answered as missing (vault BACKLOG #5248)."""
     from messagefoundry.config import wiring
 
-    refused = wiring._WinPathSecurity(owner_sid=_SELF, aces=(_EVERYONE_MAY_WRITE,))
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         op = await _token(c, "op")
         monkeypatch.setattr(
-            wiring, "_check_trusted_paths", _windows_check_moving_away(tmp_path, refused)
+            wiring,
+            "_check_trusted_paths",
+            _windows_check_moving_away(tmp_path, _EVERYONE_WRITE_READ),
         )
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
@@ -1960,14 +1962,15 @@ async def test_a_policy_refusal_then_a_directory_moved_away_says_not_reached_rel
     from messagefoundry.config.fingerprint import config_fingerprint
 
     approved = config_fingerprint(tmp_path / "cfg")
-    refused = wiring._WinPathSecurity(owner_sid=_SELF, aces=(_EVERYONE_MAY_WRITE,))
     service = await _service(engine)
     _, r = await _hold_then_release(
         engine,
         service,
         {},
         between=lambda: monkeypatch.setattr(
-            wiring, "_check_trusted_paths", _windows_check_moving_away(tmp_path, refused)
+            wiring,
+            "_check_trusted_paths",
+            _windows_check_moving_away(tmp_path, _EVERYONE_WRITE_READ),
         ),
     )
     monkeypatch.undo()
@@ -1994,7 +1997,6 @@ async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
 
     cfg = (tmp_path / "cfg").resolve()
     lost = False
-    real_scandir = os.scandir
 
     def _read_path(path: Path) -> Any:
         nonlocal lost
@@ -2002,11 +2004,6 @@ async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
             lost = True
             return wiring._WinPathSecurity(status=53)
         return _CLEAN_READ
-
-    def _scandir(path: Any) -> Any:
-        if lost and isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
-            raise _share_fault()
-        return real_scandir(path)
 
     probes = wiring._WinConfigSourceProbes(
         self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
@@ -2023,7 +2020,7 @@ async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
             "_check_trusted_paths",
             functools.partial(wiring._enforce_windows_paths, probes=probes),
         )
-        monkeypatch.setattr(os, "scandir", _scandir)
+        _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost, answers_is_dir=True)
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
     assert lost, "the directory's own read never ran, so nothing was measured"

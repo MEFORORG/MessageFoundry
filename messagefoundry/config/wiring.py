@@ -8217,9 +8217,15 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
 #: How every config-source refusal of a load begins.
 _CONFIG_SOURCE_LEAD = "refusing to load config from"
 
-#: The log bound on a config-source refusal the load answers some other way. The clamped escape's
-#: text alone runs past ``safe_exc``'s default 200 characters. The API's own ``_REFUSAL_LOG_LIMIT``
-#: is the same number, for the same reason; this package cannot import it.
+#: The ``safe_exc`` bound on a logged refusal: a config-source refusal the load answers some other
+#: way, and the API's reload refusals, which import it. ``safe_exc``'s default 200-character cut
+#: dropped the directory from a long config path, the fix from a long WiringError, and the clamped
+#: escape's text. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
+#: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
+#: bounds how much redaction-missed text one line carries and what each handler's filters re-scan on
+#: the event loop. ``safe_exc`` redacts before the cut. The bound is on the text BEFORE
+#: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
+#: times over. The cut keeps the head, so an error longer than this still loses its tail.
 _REFUSAL_LOG_LIMIT: Final = 8192
 
 #: The folder Python's source loader reads compiled modules from. A matching cache file there runs
@@ -9208,11 +9214,8 @@ def _enforce_windows_paths(
         )
     for index, path in enumerate(paths):
         sec = probes.read_path(path)
-        if (
-            sec.status in _WIN_PATH_GONE_ERRORS
-            and not (first_is_required and index == 0)
-            and not os.path.lexists(path)
-        ):
+        is_config_dir = first_is_required and index == 0
+        if sec.status in _WIN_PATH_GONE_ERRORS and not is_config_dir and not os.path.lexists(path):
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
@@ -9221,7 +9224,7 @@ def _enforce_windows_paths(
                 f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
                 f"docs/SERVICE.md for required permissions"
             )
-            if first_is_required and index == 0 and sec.status in _WIN_CONFIG_DIR_UNREACHED_ERRORS:
+            if is_config_dir and sec.status in _WIN_CONFIG_DIR_UNREACHED_ERRORS:
                 _refuse_unreached_config_dir(refuse, message)
             else:
                 refuse(message)
