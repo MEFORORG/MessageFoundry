@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 21 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 20 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -459,7 +459,7 @@ reach one:
 
 ## 5. Native library calls
 
-21 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+20 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -488,14 +488,11 @@ pure-Python equivalent:
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
   act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory
-- Backup staging fail-safe: `pipeline/dr_backup.py`, which empties the files a failed backup left in
-  its staging directory. On Windows it opens each directory and file with `kernel32`'s `CreateFileW`
-  and `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or junction is opened as itself,
-  `GetFileInformationByHandleEx` to refuse one, and `GetFinalPathNameByHandleW` to confirm the
-  object lies under the staging directory before it is truncated through that handle (BACKLOG
-  #2420). POSIX needs no `ctypes` for this; it opens each directory and file with `O_NOFOLLOW`
-  relative to its directory's descriptor
+  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  staging fail-safe, which empties the files a failed backup left in its staging directory, calls
+  these same helpers on Windows rather than `ctypes` of its own: it holds each directory and opens
+  each file as itself, refuses a link or junction, and confirms the object lies under the staging
+  directory before it is truncated through that handle (BACKLOG #2420, #4992)
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
