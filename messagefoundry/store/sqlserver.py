@@ -74,7 +74,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
 from messagefoundry.odbc_call_gate import call_gate as _call_gate
@@ -2834,8 +2834,9 @@ def _live_indexes_sql(count: int) -> str:
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
-    """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
-    the setting. A no-op when the store sends no pin.
+    """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises
+    :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, a ``ValueError``, naming the
+    setting (BACKLOG #5000). A no-op when the store sends no pin.
 
     Vault BACKLOG #2223: the pinned file is the connection's only trust anchor, because of what a
     pin match does under ``Encrypt=strict``. The ``ssl_root_cert`` row of ``docs/CONFIGURATION.md``
@@ -2878,7 +2879,7 @@ def check_pinned_certificate(
     path = spec.path
     # The anchor checks read the whole file, so a file too large for a pin is refused first.
     if (too_large := oversized_pin_reason(path)) is not None:
-        raise ValueError(f"[store].ssl_root_cert {path!r} {too_large}")
+        raise StoreTlsRefused(f"[store].ssl_root_cert {path!r} {too_large}")
     checked: bytes | str  # the bytes the anchor checks read, or the refusal
     try:
         enforcing = posture is None or posture.enforcing
@@ -2894,20 +2895,20 @@ def check_pinned_certificate(
         # The store open does not guard a FIFO or an endless device: such a read can block or never end.
         checked = f"[store].ssl_root_cert {path!r} could not be read: the engine ran out of memory"
     if isinstance(checked, str):  # raised outside the handler, so no chained parser text
-        raise ValueError(checked)
+        raise StoreTlsRefused(checked)
     cert = pinned_server_certificate(checked)
     if isinstance(cert, str):
-        raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
+        raise StoreTlsRefused(f"[store].ssl_root_cert {path!r} {cert}")
     moment = time.time() if now is None else now
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
-        raise ValueError(
+        raise StoreTlsRefused(
             f"[store].ssl_root_cert {path!r}: the pinned certificate expired at "
             f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
             "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
         )
     if moment < not_before.timestamp():
-        raise ValueError(
+        raise StoreTlsRefused(
             f"[store].ssl_root_cert {path!r}: the pinned certificate is not valid until "
             f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
             "refuses a pin outside its validity period."
@@ -2938,7 +2939,7 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # STRICT verify-off cell (no gradient warn-and-cross) and keeps NO second escape.
     weakened = settings.trust_server_certificate or not settings.encrypt
     if weakened and not weakened_tls_escape_permitted(posture):
-        raise ValueError(
+        raise StoreTlsRefused(
             "SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
             "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
