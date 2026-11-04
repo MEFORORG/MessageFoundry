@@ -984,11 +984,11 @@ DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
 
 class DirectoryRefusal(Enum):
-    """Why a step-up or enrolment leg refused a directory account on the directory's answer rather
-    than on its proof, carried on ``Elevation.directory_refusal`` so a caller can name the fix that
-    clears it (BACKLOG #3082). The legs that ask the directory before the proof never checked it;
-    the password re-bind proved the password with its bind, then refused the account for what the
-    bind returned (BACKLOG #3081).
+    """Why a second-factor, enrolment or password re-bind leg refused a directory account on the
+    directory's answer rather than on its proof, carried on ``Elevation.directory_refusal`` so a
+    caller can name the fix that clears it (BACKLOG #3082). The federated step-up leg does not set
+    it; it refuses with its own closed-set reason. Whether the proof was checked is the
+    ``Elevation.directory_refusal`` field's to say.
 
     ``UNCONFIRMED``: the directory did not confirm the account is present and enabled, or could not
     be asked. A later try, or an administrator, clears it; a new sign-in would fail the same way.
@@ -1259,9 +1259,10 @@ class Elevation:
     #: and :meth:`AuthService.finish_webauthn_registration` on them too (BACKLOG #3061). Each of
     #: those also sets it on an account that lost a role in the directory since sign-in
     #: (``directory_roles_demoted``). In every case nothing was charged, and the proof was never
-    #: checked, except on a demoted account's re-bind (BACKLOG #3081): the bind proved the password
-    #: right, and the account was refused for its roles, so a retry is refused again until a new
-    #: sign-in re-syncs them. It qualifies the wrong-proof state: the token still authenticates, and
+    #: checked, except where the re-bind's bind succeeded (BACKLOG #3081): the bind proved the
+    #: password right, and the account was refused for what the bind returned, a lost role, a role
+    #: map that fails its seal, or a row that moved during the bind, so a retry is refused again
+    #: until that clears. It qualifies the wrong-proof state: the token still authenticates, and
     #: the caller must name the directory's refusal, by the fix below, rather than call the code,
     #: the password or the passkey wrong. The precise cause goes to the audit row (``reason`` on
     #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``). The caller
@@ -6603,10 +6604,9 @@ class AuthService:
         fresh by our clock (see the inline note); the session holds an IdP ``auth_time``, and the
         new one is later; the directory still has the account, and its answer names the row's own
         directory object (BACKLOG #3174); the account still exists on a re-read; and
-        :meth:`_directory_roles_lost` refuses nothing, which for an account holding a role needs
-        no role lost and a sealed role map (BACKLOG #2154, #3082). Then it elevates through
-        :meth:`_elevated_hash`, so rotation, the MFA carry and the single-use grant follow the
-        password leg's rules exactly.
+        :meth:`_directory_roles_lost` refuses nothing (BACKLOG #2154, #3082). Then it elevates
+        through :meth:`_elevated_hash`, so rotation, the MFA carry and the single-use grant follow
+        the password leg's rules exactly.
 
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
@@ -12064,8 +12064,8 @@ class AuthService:
         the principal, is a refusal but NOT a failure, on the account or the session: counting an
         outage would lock every operator who tried to step up while a domain controller was down.
         A right password the role test in :meth:`_directory_roles_lost` refuses is not a failure
-        either (BACKLOG #3081); nor does it
-        reset the budget or the counter, because nothing was granted.
+        either (BACKLOG #3081); nor does it reset the budget or the counter, because nothing was
+        granted.
 
         ``clear`` marks the re-auth leg, whose success rotates the session: only there does a success
         reset the session's budget and the account counter. The account counter resets only at FULL
@@ -12211,12 +12211,11 @@ class AuthService:
         if directory:
             # BACKLOG #3081: the role test stated in _directory_roles_lost's docstring, on the
             # groups the bind just resolved and the roles of the row read AFTER it, as the other
-            # legs read theirs. The groups vouch only
-            # for the object the bind was keyed on, so a row whose id or provider moved during the
-            # round trip is refused rather than judged on another object's groups, as
-            # identity_for_cert_user_id refuses it. The password was right, so nothing is charged
-            # or registered, and the session's budget and the account counter are left as they
-            # were. No refusal in this block writes roles, the moved-row one included.
+            # legs read theirs. The groups vouch only for the object the bind was keyed on, so a
+            # row whose id or provider moved during the round trip is refused rather than judged
+            # on another object's groups, as identity_for_cert_user_id refuses it. The password
+            # was right, so nothing is charged or registered, and the session's budget and the
+            # account counter are left as they were. No refusal in this block writes roles, the moved-row one included.
             refusal: str | None
             if (
                 current.directory_object_id != user.directory_object_id
