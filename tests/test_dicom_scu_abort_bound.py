@@ -275,31 +275,216 @@ async def test_an_error_raised_mid_store_counts_toward_the_same_bound(
     assert isinstance(final.__cause__, ConnectionResetError)
 
 
+def _key(n: int) -> int:
+    """A stand-in for _unanswered_key's hash: the count only needs keys that differ."""
+    return n
+
+
+def _scu_off() -> DicomScuDestination:
+    return _scu_from({"ae_title": "MEFOR_SCU", "host": "127.0.0.1", "max_object_bytes": None})
+
+
 def test_each_object_keeps_its_own_count_and_one_at_the_ceiling_is_never_counted() -> None:
-    scu = _scu_from({"ae_title": "MEFOR_SCU", "host": "127.0.0.1", "max_object_bytes": None})
+    scu = _scu_off()
     size = dicom_module._ENGINE_SCP_ABORT_PAST_BYTES + 1
     limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
     for _ in range(limit - 1):
-        assert scu._count_unanswered("1.2.3", size) is None
-        assert scu._count_unanswered("1.2.4", size) is None
-    for uid in ("1.2.3", "1.2.4"):
-        final = scu._count_unanswered(uid, size)
+        assert scu._count_unanswered(_key(1), size) is None
+        assert scu._count_unanswered(_key(2), size) is None
+    for n in (1, 2):
+        final = scu._count_unanswered(_key(n), size)
         assert final is not None and final.permanent is True
+    # The key is None for an object at the ceiling: never counted, however often it ends.
+    at = b"x" * dicom_module._ENGINE_SCP_ABORT_PAST_BYTES
+    assert dicom_module._unanswered_key(at) is None
     for _ in range(limit + 1):
-        assert scu._count_unanswered("1.2.5", size - 1) is None
+        assert scu._count_unanswered(None, len(at)) is None
     assert scu._unanswered == {}
 
 
-def test_the_oldest_count_is_dropped_past_the_ones_remembered() -> None:
-    scu = _scu_from({"ae_title": "MEFOR_SCU", "host": "127.0.0.1", "max_object_bytes": None})
+def test_the_key_is_the_whole_object_so_two_objects_of_one_size_never_share_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # B8r: the key was (SOP instance UID, size), so every object with no UID shared one count per
+    # size, and a second such object could end the first's sends early.
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", 3)
+    first, second = dicom_module._unanswered_key(b"abcd"), dicom_module._unanswered_key(b"abce")
+    assert first is not None and second is not None and first != second
+    assert dicom_module._unanswered_key(b"abcd") == first, "a re-send meets its own count"
+
+
+def _without_uid(patient_name: str) -> bytes:
+    """A synthetic SR with no SOP Instance UID in its data set."""
+    _needs_dicom()
+    from io import BytesIO
+
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    ds = dcmread(BytesIO(make_sr_part10(patient_name=patient_name)))
+    del ds.SOPInstanceUID
+    out = BytesIO()
+    ds.save_as(out)
+    return out.getvalue()
+
+
+async def test_two_objects_with_no_uid_keep_their_own_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, second = _without_uid("Doe^Jane^A"), _without_uid("Doe^Jane^B")
+    assert len(first) == len(second) and first != second, "CONTROL: one size, two objects"
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(first) - 1)
+    scu = _uncapped_scu(1, "PACS_SCP")
+    monkeypatch.setattr(scu, "_associate", lambda ae: _ResetMidStore())
+    limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
+    outcomes: list[str] = []
+    for data in [first, second] * (limit - 1) + [first]:
+        try:
+            await scu.send(_carry(data))
+        except NegativeAckError:
+            outcomes.append("final")
+        except DeliveryError:
+            outcomes.append("re-send")
+    # Interleaved, each object still gets its own limit - 1 re-sends before its own final.
+    assert outcomes == ["re-send"] * (2 * (limit - 1)) + ["final"]
+
+
+def test_an_unordered_lane_rotating_past_the_old_bound_still_goes_final() -> None:
+    # B8r: the map held 64 counts, and a lane rotating 65 failing objects evicted each before its
+    # third end, so none ever went final. 1,000 is far past that and well inside the bound.
+    scu = _scu_off()
+    size = dicom_module._ENGINE_SCP_ABORT_PAST_BYTES + 1
+    limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
+    rotating = 1000
+    assert rotating < dicom_module._UNANSWERED_REMEMBERED
+    for _ in range(limit - 1):
+        for n in range(rotating):
+            assert scu._count_unanswered(_key(n), size) is None
+    finals = [scu._count_unanswered(_key(n), size) for n in range(rotating)]
+    assert all(final is not None and final.permanent for final in finals)
+    assert scu._unanswered == {}
+
+
+def test_the_oldest_count_is_dropped_past_the_ones_remembered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The eviction order, at a small bound so the test reads it directly.
+    monkeypatch.setattr(dicom_module, "_UNANSWERED_REMEMBERED", 8)
+    scu = _scu_off()
     size = dicom_module._ENGINE_SCP_ABORT_PAST_BYTES + 1
     remembered = dicom_module._UNANSWERED_REMEMBERED
     for n in range(remembered + 1):
-        assert scu._count_unanswered(f"1.2.{n}", size) is None
+        assert scu._count_unanswered(_key(n), size) is None
     assert len(scu._unanswered) == remembered
-    assert ("1.2.0", size) not in scu._unanswered
-    assert (f"1.2.{remembered}", size) in scu._unanswered
+    assert _key(0) not in scu._unanswered and _key(remembered) in scu._unanswered
     # A count taken again moves to the newest end, so the next one dropped is another object's.
-    assert scu._count_unanswered("1.2.1", size) is None
-    assert scu._count_unanswered(f"1.2.{remembered + 1}", size) is None
-    assert ("1.2.1", size) in scu._unanswered and ("1.2.2", size) not in scu._unanswered
+    assert scu._count_unanswered(_key(1), size) is None
+    assert scu._count_unanswered(_key(remembered + 1), size) is None
+    assert _key(1) in scu._unanswered and _key(2) not in scu._unanswered
+
+
+def test_the_bound_is_sized_past_what_one_lane_could_hold_pending() -> None:
+    # The stated sizing: defeating the bound takes more objects over the ceiling pending at once
+    # than 2 TiB of store holds.
+    pending = dicom_module._UNANSWERED_REMEMBERED * dicom_module._ENGINE_SCP_ABORT_PAST_BYTES
+    assert pending >= 2 * 1024**4
+
+
+async def test_forget_payload_gives_a_replay_every_send_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # B8r: a row the retry policy dead-lettered with two unanswered ends kept its count, so a
+    # replay of it went final after one send. The delivery worker now calls forget_payload there.
+    _needs_dicom()
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
+    scu = _uncapped_scu(1, "PACS_SCP")
+    monkeypatch.setattr(scu, "_associate", lambda ae: _ResetMidStore())
+    limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
+    payload = _carry(data)
+    for _ in range(limit - 1):
+        with pytest.raises(DeliveryError) as caught:
+            await scu.send(payload)
+        assert not isinstance(caught.value, NegativeAckError)
+    other = _carry(make_sr_part10())
+    await scu.forget_payload(other)  # CONTROL: another object's row leaves this count alone
+    assert len(scu._unanswered) == 1
+    await scu.forget_payload(payload)
+    assert scu._unanswered == {}
+    for _ in range(limit - 1):  # the replay
+        with pytest.raises(DeliveryError) as caught:
+            await scu.send(payload)
+        assert not isinstance(caught.value, NegativeAckError)
+    with pytest.raises(NegativeAckError):
+        await scu.send(payload)
+
+
+async def test_the_final_refusal_names_no_cause_it_cannot_know(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # B8r: the message said an engine SCP aborts, but the SCU's own DIMSE timeout on a slow link
+    # to any peer ends a store with no response too.
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", 3)
+    scu = _scu_off()
+    final = None
+    for _ in range(dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING):
+        final = scu._count_unanswered(_key(7), 4)
+    assert final is not None
+    text = str(final)
+    assert "no response (an abort or a timeout)" in text
+    assert "engine SCP" not in text
+
+
+# --- The delivery worker's half: forget_payload once the retry cap dead-letters the row -----------
+
+
+class _FailsAndRemembers:
+    """A connector whose every send fails transiently, recording each forget_payload call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.forgotten: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.calls += 1
+        raise DeliveryError("connection reset")
+
+    async def forget_payload(self, payload: str) -> None:
+        self.forgotten.append(payload)
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("max_attempts", [3, None], ids=["finite-cap", "no-cap"])
+async def test_the_worker_forgets_a_payload_only_when_the_retry_cap_dead_letters_it(
+    tmp_path: Any, max_attempts: int | None
+) -> None:
+    from messagefoundry.config.models import RetryPolicy
+    from messagefoundry.store import MessageStore
+    from tests.test_retry_exhausted_log import FAST, OUT, _enqueue, _stepped_runner
+
+    store = await MessageStore.open(tmp_path / "engine.db")
+    try:
+        dest = _FailsAndRemembers()
+        runner = _stepped_runner(store, dest, RetryPolicy(max_attempts=max_attempts, **FAST))
+        await _enqueue(store, 1)
+        payloads: set[str] = set()
+        for attempt in (1, 2, 3):
+            item = await store.claim_next_fifo(OUT, now=1e12)
+            assert item is not None
+            payloads.add(item.payload)
+            await runner._process_delivery_item(OUT, item)
+            dead = await store.count_dead(allowed_channels=None)
+            # The hook moves with the DEAD write, and never before it.
+            assert len(dest.forgotten) == dead
+            if attempt < 3 or max_attempts is None:
+                assert dead == 0
+        assert dest.calls == 3
+        if max_attempts is not None:
+            assert dead == 1 and len(payloads) == 1 and dest.forgotten == list(payloads)
+    finally:
+        await store.close()

@@ -622,6 +622,21 @@ _REFUSAL_LOG_MAX_PAIRS = 4096
 _STOP_LINE_MAX_MESSAGES = 10
 
 
+async def _forget_dead_payload(
+    connector: DestinationConnector, sent: str | None, failed: FailOutcome
+) -> None:
+    """Tell ``connector`` to forget ``sent`` once a transient failure dead-lettered its row at the
+    retry cap (vault BACKLOG #4908). The row has left the lane, so a connector's memory of its sends
+    would only shorten a replay of it. ``sent`` is ``None`` when no live send was attempted. By
+    ``getattr``, as ``consumes_metadata`` is read, so a stand-in connector without the hook is still
+    a connector."""
+    if not failed.dead or sent is None:
+        return
+    forget = getattr(connector, "forget_payload", None)
+    if forget is not None:
+        await forget(sent)
+
+
 def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: str) -> None:
     """Say so when an internal-error STOP arm's ``mark_failed`` or ``mark_batch_failed``
     dead-lettered rather than re-pending (vault BACKLOG #3211). ``stage`` is the stage of the rows
@@ -9186,6 +9201,9 @@ class RegistryRunner:
                 1,
             )
             return _ItemOutcome.STOPPED, None
+        # The payload handed to connector.send, for forget_payload once a transient failure
+        # dead-letters the row at the retry cap. None until a live send is attempted.
+        sent: str | None = None
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -9228,7 +9246,7 @@ class RegistryRunner:
                 # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
                 # payload with no handle is returned byte-identical; a missing attachment raises a
                 # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
-                payload = await self._hydrate_payload(item.payload)
+                payload = sent = await self._hydrate_payload(item.payload)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
                     # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
@@ -9279,6 +9297,7 @@ class RegistryRunner:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
+                await _forget_dead_payload(connector, sent, failed)
                 await self._delivery_failure_alert_checks(name)
         except CellTagError as exc:
             # BACKLOG #2593: the dynamic_headers metadata read met a cell that fails its channel
@@ -9307,6 +9326,7 @@ class RegistryRunner:
             failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
             retry_until = failed.retry_at
             self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
+            await _forget_dead_payload(connector, sent, failed)
             await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)

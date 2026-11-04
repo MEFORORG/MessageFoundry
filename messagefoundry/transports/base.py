@@ -1398,6 +1398,14 @@ class DestinationConnector(abc.ABC):
         any delimiter rewrite to the whole envelope, not to the member."""
         return None
 
+    async def forget_payload(self, payload: str) -> None:
+        """Drop any state this connector keeps in memory about ``payload`` across sends. The delivery
+        worker calls it once the store has dead-lettered a single row it sent ``payload`` for at the
+        retry policy's ``max_attempts``, so a replay of that row starts clean. The default is a no-op:
+        at least the DICOM C-STORE SCU overrides it, for its count of unanswered stores of a large
+        object (vault BACKLOG #4908)."""
+        return None
+
     async def validate_startup(self) -> None:
         """Optional **opt-in** at-start validity check for the destination's external resource, run by
         the runner in ``_start_outbound`` right after the connector is built (BACKLOG #114) — the
