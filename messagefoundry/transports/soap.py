@@ -137,8 +137,8 @@ logger = logging.getLogger(__name__)
 # not a cosmetic miss. Kept identical to _HEADER_EL_RE below, which already had it right.
 _FAULT_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Fault[\s/>]", re.IGNORECASE)
 # The SOAP Body start tag. BACKLOG #2827: a SOAP 1.1 or 1.2 fault is a Body child, so _classify_soap
-# searches for the Fault, and for a WS-Security code, only after it; _find_fault says what happens
-# without one.
+# searches for the Fault, and for a WS-Security code, from the first one; _find_fault says when it
+# searches the whole reply instead.
 _BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>]", re.IGNORECASE)
 _SENDER_RE = re.compile(r"client|sender", re.IGNORECASE)
 _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
@@ -951,8 +951,8 @@ class SoapDestination(DestinationConnector):
         single call, about 0.7 to 1.5 s, was a ``_FAULTCODE_RE`` or ``_CODEVALUE_RE`` name scan over
         a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
         ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
-        not a bound on another, and they predate ``_find_fault``'s ``_BODY_RE`` scan, one more
-        linear pass."""
+        not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
+        code-element checks in ``_code_text``, so they are not a reading of this code."""
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
