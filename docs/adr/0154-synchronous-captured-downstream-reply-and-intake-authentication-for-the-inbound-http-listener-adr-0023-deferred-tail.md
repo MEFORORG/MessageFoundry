@@ -1723,5 +1723,12 @@ built that (BACKLOG #5078); `_nak_code` now maps the detach arm's classes to MSA
 
 The tests: `tests/test_inbound_http_source.py` pins the `503` with no `Retry-After` behind a real
 listener, and the stored tag; `tests/test_ingress_refusal_kinds.py` pins the classifier, the
-kind-to-MSA-1 mapping, and the `Rest()` outbound retrying the `503`; `tests/test_dicom_scp.py` pins
-`0xA700`; `tests/test_ingress_guard_parity.py` pins the stored tag on both callers.
+kind-to-MSA-1 mapping, and the `Rest()` outbound retrying the `503`. `tests/test_dicom_scp.py` pins
+`0xA700` for a configuration receipt, but the receipt is one the test's own handler builds, so it
+does not show that an unusable codec name reaches the SCP as that kind.
+`tests/test_ingress_guard_parity.py` pins the stored tag on the receipt-path caller only, since the
+MLLP caller stores the reason with no tag, and pins the MLLP listener's `AE`. Its file-source test
+calls `FileSource._emit` and reads the one `ERROR` row; it drives neither `_scan_once` nor
+`RemoteFileSource._hand_off`, so that the file is consumed is not tested, and the remote-file
+source is covered only by calling its batch split, `split_batch_bytes`, on a name that refuses
+every conversion.

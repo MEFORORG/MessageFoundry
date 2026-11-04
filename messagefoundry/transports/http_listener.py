@@ -11,10 +11,11 @@ routing/transform/delivery failure happens *after* the ``202`` and is **not** re
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
 as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
 no ingress row) is never answered ``202``: a temporary refusal is answered ``503`` with
-``Retry-After``, an over-size one ``413``, and any other ``422``, each naming the ``ERROR`` row as
-``refused_message_id`` (ADR 0154 amendments 2026-09-26 and 2026-10-30). A refusal the inbound's own
-configuration caused, at least an unusable codec name, is ``503`` with no ``Retry-After``: it clears
-only once an operator fixes the configuration (BACKLOG #2431, #5102; the 2026-11-04 amendment).
+``Retry-After``, an over-size one ``413``, a permanent one ``422``, and a configuration one ``503``
+with no ``Retry-After``, each naming the ``ERROR`` row as ``refused_message_id`` (ADR 0154
+amendments 2026-09-26, 2026-10-30 and 2026-11-04). A configuration refusal is one the inbound's own
+configuration caused, at least an unusable codec name: it clears only once an operator fixes the
+configuration (BACKLOG #2431, #5102).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;

@@ -927,7 +927,9 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 
 The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
 `422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in
-the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
+the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after),
+and for a configuration refusal in the
+[amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
 The owner ruling of 2026-09-26 answered a refused body `422`. The owner ruling of 2026-09-30 set a
 temporary refusal at `503` with `Retry-After` and kept a permanent one at `422`; which refusals are
 temporary, and the one `413` for over-size, are Manager decision d20261030T155119571-255c98. The
