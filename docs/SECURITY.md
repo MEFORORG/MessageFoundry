@@ -2543,7 +2543,11 @@ during the load is neither run nor recorded. The limits below name at least one 
 from disk instead. The digest covers `serve`'s environment value file wherever
 `[environments].base_dir` puts it: in the config directory's `environments/` folder, or elsewhere,
 where the release reads it into the snapshot after vetting the file, its folder, and the folder of
-each link along a chain of file links from it. Where that value file alone cannot be read, the
+each link along a chain of file links from it. That vet misses at least these: a directory link
+in the path to the value file, or to any link along that chain, is resolved rather than walked,
+so the folder that holds it is not vetted, and on Windows the link objects themselves are not
+vetted (`Engine._value_file_folders` in [`pipeline/engine.py`](../messagefoundry/pipeline/engine.py)).
+Where that value file alone cannot be read, the
 reload is refused, released or not, rather than reading it again from disk. Where the config
 directory cannot be read whole, a value file in its `environments/` folder included, a released
 reload is refused and an ungated one still reads the values from disk. `serve` parses
