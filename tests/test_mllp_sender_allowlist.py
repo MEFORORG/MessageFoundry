@@ -329,31 +329,48 @@ async def test_a_san_entry_matches_and_a_cn_entry_does_not_match_a_san(
 #: the same text for every such name, whatever it holds.
 _UNPRINTED_OTHERNAME = x509.OtherName(x509.ObjectIdentifier("1.3.6.1.4.1.55555.1"), b"\x0c\x03abc")
 
+#: A UPN otherName ``feed@partner.example<LF>x`` as a DER UTF8String. ``ssl`` stops reading the
+#: printed line at the newline, so it reports ``UPN:feed@partner.example<LF>``: the first part of
+#: every UPN that starts that way.
+_CUT_UPN = x509.OtherName(
+    x509.ObjectIdentifier("1.3.6.1.4.1.311.20.2.3"), b"\x0c\x16" + b"feed@partner.example\nx"
+)
+
 
 async def test_a_placeholder_san_on_a_certificate_matches_no_entry(
     tmp_path: Path, store: MessageStore
 ) -> None:
     """``ssl`` reports a SAN it cannot render as placeholder text shared by a whole class of names,
-    so a placeholder entry would admit every certificate carrying one. The factory refuses that
-    entry; this listener is built past the factory, as a ``Source`` built some other way would be,
-    to show the matcher itself never reads the placeholder from a certificate."""
+    and cuts a printed name short at a newline, so either entry would admit every certificate
+    carrying such a name. The factory refuses both; this listener is built past the factory, as a
+    ``Source`` built some other way would be, to show the matcher itself never reads either from a
+    certificate."""
     named = _ca("Partner CA")
     settings = _settings(tmp_path, [named[0]], {_issuer(named): ["SAN:DNS:feed.partner.example"]})
     settings["tls_client_subjects"] = {
-        _issuer(named): ["SAN:othername:<unsupported>", "SAN:DNS:feed.partner.example"]
+        _issuer(named): [
+            "SAN:othername:<unsupported>",
+            "SAN:othername:UPN:feed@partner.example\n",
+            "SAN:DNS:feed.partner.example",
+        ]
     }
     unprinted = _san_bundle(
         tmp_path, named, cn="unrelated.example", dns="other.example", other=(_UNPRINTED_OTHERNAME,)
+    )
+    cut = _san_bundle(
+        tmp_path, named, cn="unrelated.example", dns="other.example", other=(_CUT_UPN,)
     )
     listed = _san_bundle(tmp_path, named, cn="unrelated.example", dns="feed.partner.example")
     source = await _wired(settings, store)
     try:
         refused, rest = await _exchange(source, unprinted)
+        refused_cut, rest_cut = await _exchange(source, cut)
         # Control on the same listener: a certificate carrying the listed DNS name is admitted.
         accepted, _ = await _exchange(source, listed)
     finally:
         await source.stop()
     assert b"MSA|AR|" in refused and rest == b""
+    assert b"MSA|AR|" in refused_cut and rest_cut == b""
     assert b"MSA|AA|" in accepted
 
 
@@ -366,14 +383,21 @@ def test_the_shared_matcher_drops_every_placeholder_ssl_reports() -> None:
             ("X400Name", "<unsupported>"),
             ("EdiPartyName", "<unsupported>"),
             ("IP Address", "<invalid>"),
+            ("othername", "UPN:feed@partner.example\n"),
+            ("othername", "UPN:" + "a" * 2032),
+            ("Registered ID", "1.2." + "3" * 2040),
             ("othername", "UPN:feed@partner.example"),
+            ("othername", "UPN:" + "a" * 2031),
             ("DNS", "feed.partner.example"),
+            ("DNS", "d" * 3000),
         ),
     }
     assert cert_name_candidates(peercert) == [
         "CN:partner.example",
         "SAN:othername:UPN:feed@partner.example",
+        "SAN:othername:UPN:" + "a" * 2031,
         "SAN:DNS:feed.partner.example",
+        "SAN:DNS:" + "d" * 3000,
     ]
 
 
@@ -616,6 +640,30 @@ def _mllp(subjects: Any, **overrides: Any) -> Any:
             "an IP address in a spelling ssl never writes",
             id="ipv6-compressed",
         ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:othername:UPN:feed@partner.example\n"]},
+            {},
+            "a value ssl may have cut short",
+            id="othername-newline",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:othername:UPN:" + "a" * 2032]},
+            {},
+            "a value ssl may have cut short",
+            id="othername-line-full",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:DirName:CN=feed.partner.example"]},
+            {},
+            "a DirName in a form ssl never reports",
+            id="dirname-dn",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:othername:feed@partner.example"]},
+            {},
+            "an othername in a form ssl never reports",
+            id="othername-no-form",
+        ),
     ],
 )
 def test_the_factory_refuses_what_cannot_work(
@@ -635,6 +683,9 @@ def test_the_factory_accepts_each_san_type_in_the_spelling_ssl_reports() -> None
         "SAN:URI:https://feed.partner.example/",
         "SAN:email:feed@partner.example",
         "SAN:othername:UPN:feed@partner.example",
+        "SAN:othername:UPN:" + "a" * 2031,
+        "SAN:DirName:((('commonName', 'feed.partner.example'),),)",
+        "SAN:DNS:" + "d" * 3000,
     ]
     assert _mllp({"CN=Partner CA": names}).settings["tls_client_subjects"] == {
         "CN=Partner CA": names

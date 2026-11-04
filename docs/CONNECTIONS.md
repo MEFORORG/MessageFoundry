@@ -446,14 +446,18 @@ other form is refused at build, since it could never match. So is a SAN type spe
 Python's `ssl` spells it: `DNS`, `email`, `URI`, `IP Address`, `Registered ID`, `DirName` and
 `othername`, so `SAN:IP:...` and `SAN:dns:...` are refused with the right spelling named. An
 `IP Address` value is written as `ssl` writes it: IPv4 dotted, and IPv6 as eight upper-case hex
-groups with no leading zeros and no `::`, such as `2001:DB8:0:0:0:0:0:1`.
+groups with no leading zeros and no `::`, such as `2001:DB8:0:0:0:0:0:1`. A `DirName` value is the
+Python tuple `ssl` reports, such as `((('commonName', 'feed.example'),),)`, and an `othername` value
+carries its form first, such as `UPN:feed@partner.example`; either in another form is refused.
 
 **A placeholder is not a name.** For a SAN it cannot render, `ssl` reports fixed text instead:
 at least `othername:<unsupported>` for an otherName of a type OpenSSL does not print,
 `X400Name:<unsupported>` and `EdiPartyName:<unsupported>` whatever those names hold, and
 `IP Address:<invalid>` for a malformed address. Every certificate carrying such a name presents the
-same text, so one such entry would admit all of them under that CA. An entry holding that text is
-refused at build, and the matcher never reads a placeholder from a certificate, so a placeholder
+same text, so one such entry would admit all of them under that CA. The same holds for a name `ssl`
+may have cut short: it reads an `othername` or `Registered ID` as one printed line of at most 2046
+bytes, stopping after a newline, so such a value can be the first part of many names. An entry
+holding either is refused at build, and the matcher never reads either from a certificate, so it
 matches nothing even on a listener built some other way. That matcher is shared, so the operator
 API's `tls_client_cert_identities` and the HTTP listener's `intake_client_subjects` skip a
 placeholder too; neither of those settings refuses one at build.

@@ -2743,9 +2743,10 @@ def _mllp_client_subjects(value: Any, *, tls: Any, tls_ca_file: Any) -> dict[str
     ``cert_name_candidates`` can never yield: at least a type ``ssl`` never reports or spells
     otherwise (``SAN:IP:...`` for ``SAN:IP Address:...``, ``SAN:dns:`` for ``SAN:DNS:``), a
     placeholder ``ssl`` reports for a name it cannot render (``SAN:othername:<unsupported>``, the
-    X400Name and EdiPartyName forms), and an IP address in a spelling ``ssl`` never writes. A
-    placeholder is refused because it stands for every certificate carrying such a name, not one
-    sender. ``Http``'s ``intake_client_subjects`` checks shape only."""
+    X400Name and EdiPartyName forms), a value ``ssl`` may have cut short, and an IP address,
+    DirName or othername in a form ``ssl`` never writes. A placeholder or a cut-short value is
+    refused because it stands for every certificate carrying such a name, not one sender.
+    ``Http``'s ``intake_client_subjects`` checks shape only."""
     if value is None:
         return None
     setting = "MLLP tls_client_subjects"
