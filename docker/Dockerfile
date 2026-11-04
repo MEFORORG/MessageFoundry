@@ -42,7 +42,7 @@
 # 20250419~deb12u2, pip 26.2.2). The certifi installed into /opt/venv is the locked one in
 # docker/locks/. Nothing re-inspects a later digest or another platform:
 # tests/test_container_build_pins.py refuses only the known-bad digests.
-FROM python:3.14-slim-bookworm@sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1 AS python-base
+FROM python:3.14-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
 FROM python-base AS builder-base
