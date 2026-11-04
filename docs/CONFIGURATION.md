@@ -740,7 +740,8 @@ no sets are declared**, so these defaults are safe on an existing deployment.
 | `max_staleness_seconds` | float (s) | `0` | **reserved / not enforced** — the intended freshness guard (alert/refuse when the active snapshot is older than this). Accepted so a forward-looking file still loads; `0` = off. Must be `>= 0`. |
 
 ### `[auth]` — authentication & RBAC
-Implemented (see [SECURITY.md](SECURITY.md)). Authentication is **required** by default; the AD bind
+Implemented (see [SECURITY.md](SECURITY.md)). Sign-in is always required, and no setting turns it off
+([SECURITY.md](SECURITY.md#enforcement-model) states the rule). The AD bind
 password is a **secret**: supply it via env (`MEFOR_AUTH_AD_BIND_PASSWORD`) or a `[secrets]` reference, not the file.
 A value in the file is still accepted, with a WARNING at load naming the key.
 The full inventory of resource-demanding functionality the `*_rate_limit_*` throttles below defend —
@@ -984,7 +985,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `baa_attested` | bool | `false` | **accepted-but-ignored** — an operator attestation carried for the future `managed_claude_baa` path |
 | `endpoint` | str | — | the customer-managed LLM URL. **Required** for `mode = managed_endpoint`; `http`/`https` only, and a cleartext `http` endpoint is **refused** (it would expose `api_key`) |
 | `api_key` | secret | — | the LLM credential — **env only** (`MEFOR_AI_API_KEY`), never the file. **Required** for `mode = managed_endpoint` |
-| `allowed_endpoints` | list | `[]` | fail-closed SSRF allow-list for `endpoint`'s host; each entry is `host` (any port) or `host:port`. **An empty list permits nothing** — deliberately independent of `[egress].allowed_http`, which is permissive when empty and so can't gate this surface |
+| `allowed_endpoints` | list | `[]` | fail-closed SSRF allow-list for `endpoint`'s host; each entry is `host` (any port) or `host:port`. **An empty list permits nothing** — deliberately independent of `[egress].allowed_http`, which an empty list leaves allow-any under the `[security].block_unlisted_outbound = false` opt-out ([`[egress]`](#egress) states the rule), so it can't gate this surface |
 | `endpoint_revocation_attested` | bool | `false` | attests that revocation of the `endpoint`'s server certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27). The broker verifies that certificate and checks no CRL and no OCSP, so under `[security].enforcement = enforce` an `endpoint` whose host is not loopback is **refused** at `POST /ai/chat` (503) unless this is set; no CRL lever is built, so `[tls].crl_file` does not reach this hop. Adds no check on the wire. A **loosening**: `security_loosenings()` names it with the reason. What it can rest on: [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED` |
 | `endpoint_revocation_attested_reason` | str | — | **required** with `endpoint_revocation_attested = true`: what covers revocation of the endpoint's certificate, for example its short lifetime. Put no secret in it: it is printed in the serve-time warning and `GET /security/posture`. The load rules are the `[store].vault_revocation_attested_reason` row's. Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED_REASON` |
 

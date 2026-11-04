@@ -160,8 +160,9 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
   invariant only holds if the store survives a restart. Mount the writable **directory** holding
   `messagefoundry.db` (WAL writes `-wal`/`-shm` siblings beside it). The image defaults
   `MEFOR_STORE_PATH=/var/lib/mefor/messagefoundry.db`. Set `MEFOR_STORE_ENCRYPTION_KEY` (base64 32 bytes,
-  `messagefoundry gen-key`) and `MEFOR_STORE_REQUIRE_ENCRYPTION=true` so a PHI instance fails closed
-  without a key.
+  `messagefoundry gen-key`): `serve` refuses a keyless store by default. The manifests also set
+  `MEFOR_STORE_REQUIRE_ENCRYPTION=true`, which keeps that refusal in force past the audited opt-out
+  and encrypts nothing itself; [PHI.md](../docs/PHI.md#3-encryption-at-rest) §3 states the rule.
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):
   the engine reads these from **env vars**. On k8s inject via `secretKeyRef` (clean). On Docker use
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for
