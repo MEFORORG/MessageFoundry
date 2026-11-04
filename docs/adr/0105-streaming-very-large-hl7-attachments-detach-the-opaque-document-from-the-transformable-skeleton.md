@@ -320,16 +320,18 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
 
   Each ingress refusal is an `ERROR` row before any ingress row, an `AR` on MLLP and a permanent
   refusal on HTTP. Ordinary delimiters, `|^~\&` and variants such as a `#` or `!`, hold no base64
-  character and are unaffected. A row ingested before this rule under such delimiters, with a
+  character and are unaffected by this rule. A row ingested before this rule under such delimiters, with a
   handle to splice or a marker, now dead-letters at delivery: under a subcomponent separator in
   the alphabet it would have reached the partner with its document escaped, and under a field,
   component or repetition separator it may have been delivered as it came.
-  A document is detached only if splicing it back under the delimiters it arrived with reproduces
-  it exactly, so the detach also refuses an ED Base64 document whose own value
-  `Message._escape_leaf` would change under them, such as a non-base64 value holding `&` under
-  `|^~\&` (`NonVerbatimDocumentError`). The re-attach refuses such a stored value after its read
-  and before the splice, under the delimiters it is delivered with, so a Handler that moved
-  `MSH-2` after the detach dead-letters the row rather than send an altered document.
+  **Beside that rule, under any delimiters, ordinary ones included:** a document is detached only
+  if splicing it back under the delimiters it arrived with reproduces it exactly, so the detach
+  also refuses an ED Base64 document whose own value `Message._escape_leaf` would change under
+  them, such as a non-base64 value holding `&` or a control character under `|^~\&`
+  (`NonVerbatimDocumentError`), the same way. The re-attach refuses a stored value holding a
+  delimiter the payload's `MSH-2` names after its read and before the splice, so a Handler that
+  moved `MSH-2` after the detach dead-letters the row rather than send an altered document; a
+  stored control character is an engine fault for the internal-error policy, as a CR or LF is.
   *Out of scope:* an outbound `encoding_characters` override, which the transport applies after
   hydration, is operator configuration. An uppercased marker `MFDOC:V1:REF:` is not a handle, since
   `is_doc_ref` is case-sensitive. A marker hidden behind `\Xhh\` escapes is not something the

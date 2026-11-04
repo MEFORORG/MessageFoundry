@@ -1610,7 +1610,7 @@ async def test_a_streaming_document_the_splice_would_alter_is_refused_before_the
     receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "document delivery would alter" in ack
+    assert ack is not None and "OBX-5.5 document holds a delimiter or control" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
@@ -1642,17 +1642,33 @@ async def test_a_non_ed_value_holding_the_separator_is_carried_as_before(
     assert [r[0] for r in await cur.fetchall()] == [body]
 
 
-@pytest.mark.parametrize("odd", ["&", "\x01"], ids=["subcomponent-separator", "control"])
-async def test_a_stored_document_the_splice_would_alter_is_refused_at_egress(
-    store: MessageStore, odd: str
-) -> None:
-    """The backstop for a value the detach did not check under these delimiters: the stored
-    value holds a character the splice escapes, so setting it back would alter it. The
-    re-attach refuses it once the read returns it, and the row dead-letters at once with nothing
-    sent (BACKLOG #5099)."""
+async def test_a_stored_control_character_is_an_engine_fault_at_egress() -> None:
+    """The detach refuses a control character under any delimiters, so a stored one is store
+    corruption or an engine bug: a plain ``ValueError`` for the outbound's internal-error policy,
+    as a stored CR or LF is, never the payload's permanent refusal, and nothing is sent."""
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
 
-    stored = "Q" * 400 + odd + "R" * 400
+    stored = "Q" * 400 + "\x01" + "R" * 400
+    sha = hashlib.sha256(stored.encode("ascii")).hexdigest()
+    reader = _Reader({sha: stored})
+    with pytest.raises(ValueError, match="control character") as caught:
+        await reattach_documents_in_hl7(
+            _hl7(make_doc_ref(sha, "Application")), reader, bound=frozenset({sha})
+        )
+    assert not isinstance(caught.value, UnreattachableDocumentError)
+    assert reader.calls == [sha]
+
+
+async def test_a_stored_document_the_splice_would_alter_is_refused_at_egress(
+    store: MessageStore,
+) -> None:
+    """The backstop for a value the detach did not check under these delimiters: the stored
+    value holds a delimiter the splice escapes, so setting it back would alter it. The re-attach
+    refuses it once the read returns it, and the row dead-letters at once with nothing sent
+    (BACKLOG #5099)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    stored = "Q" * 400 + "&" + "R" * 400
     ref = await store.put_attachment(chunk_b64(stored), "application/pdf")
     payload = _hl7(make_doc_ref(ref, "Application"))
     reader = _Reader({ref: stored})

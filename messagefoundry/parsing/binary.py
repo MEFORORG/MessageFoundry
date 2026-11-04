@@ -35,6 +35,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
 from typing import TYPE_CHECKING
 
 from messagefoundry.parsing._builtin_hl7 import (
+    _HEX_ESCAPED_CONTROLS,
     _SEPARATOR_HEAD,
     _extract_separators,
     _whitespace_end,
@@ -187,7 +188,7 @@ class UnreattachableDocumentError(ValueError):
     re-attach does not splice, such as ``NTE-3`` or a second ``OBX-5.5`` repetition; or a
     delimiter is a character of the base64 alphabet while a handle, or the marker, is in the
     payload (:func:`_delimits_with_base64`); or the splice would escape a character of a stored
-    value, so the partner would not get it verbatim. The same
+    value under the payload's delimiters, so the partner would not get it verbatim. The same
     payload fails the same way on every attempt, so the delivery path refuses it permanently.
     Every other
     ``ValueError`` in the re-attach may be an engine fault and stays the outbound's internal-error
@@ -647,16 +648,15 @@ def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool,
             f"OBX occurrence {occ}: OBX-5.5 already holds a document handle, which only the "
             "engine writes; refusing a received value that would name a stored attachment"
         )
+    if not is_ed:
+        return False, False, False, False
     # Not a tombstone: one resolves nothing, so it rides as text.
     detachable = bool(value) and not is_document_tombstone(value) and len(value) >= min_b64_len
     # Kept beside the whole-body check: unlike that one, it does not rest on ``received`` being
     # the text the message was parsed from. It costs one pass over the value.
     holds_marker = detachable and DOC_REF_MARKER in value
-    # Only an ED Base64 value is ever detached, so only one is checked.
-    alters = is_ed and detachable and _splice_alters(value, message._encoding_chars())
+    alters = detachable and _splice_alters(value, message._encoding_chars())
     del value
-    if not is_ed:
-        return False, False, False, False
     return True, detachable, holds_marker, alters
 
 
@@ -895,7 +895,8 @@ async def reattach_documents_in_hl7(
     refused before ``reader`` runs, since the splice would escape that character inside the
     document (:func:`_delimits_with_base64`). A stored value the splice would escape any other
     way, such as a subcomponent separator in a value that is not base64, is refused after its
-    read and before it is set, so no altered document is sent."""
+    read and before it is set, so no altered document is sent; one holding a control character
+    raises a plain ``ValueError``, as a stored CR or LF does."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -982,11 +983,19 @@ async def reattach_documents_in_hl7(
 
     def _splice(occ: int, verbatim: str) -> None:
         # The detach checks a value under the delimiters it arrived with; a Handler that moved
-        # MSH-2 since, or a row the detach stored before it checked, reaches this instead.
-        # Message.set would escape a character the value holds, so the partner would not get the
-        # sender's document. The same row fails the same way on every attempt, so it is the
-        # payload's permanent refusal (BACKLOG #5099).
+        # MSH-2 since reaches this instead. Message.set would escape a character the value holds,
+        # so the partner would not get the sender's document.
         if _splice_alters(verbatim, separators):
+            # Scanned only on this refusal path. The detach refuses a control character under any
+            # delimiters, so a stored one is store corruption or an engine bug, as a stored CR or
+            # LF is below: the outbound's internal-error policy judges it.
+            if any(ch in verbatim for ch in _HEX_ESCAPED_CONTROLS):
+                raise ValueError(
+                    f"the stored document for OBX-5.5 occurrence {occ} holds a control "
+                    "character, so it cannot be set back verbatim"
+                )
+            # A delimiter the value holds: the same row fails the same way on every attempt, so
+            # it is the payload's permanent refusal (BACKLOG #5099).
             raise UnreattachableDocumentError(
                 f"the stored document for OBX-5.5 occurrence {occ} holds a character the splice "
                 "would escape, so it would not be sent verbatim"

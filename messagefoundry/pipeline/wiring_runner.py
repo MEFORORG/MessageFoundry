@@ -8133,8 +8133,9 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 # Only the in-flight budget is the engine's own and clears as concurrent detaches
                 # finish, so only it invites a re-send, and only when the body would fit the budget
-                # once they have: one larger than the whole budget is over-size. An unsupported
-                # backend, a malformed handle, a received handle and an escaped document refuse the
+                # once they have: one larger than the whole budget is over-size. Every other
+                # refusal in _DETACH_REFUSALS, at least an unsupported backend, a malformed or
+                # received handle, an escaped document and one the splice would alter, refuses the
                 # same body every time.
                 if isinstance(exc, _StreamBudgetExceeded):
                     kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
@@ -8594,13 +8595,14 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
-                # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
-                # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
+                # A budget or backend refusal may clear on a resend, so AE. A refusal of the message
+                # itself, at least an escaped document (vault BACKLOG #2809) and the BACKLOG #5099
+                # shapes below, fails the same way every time, so AR.
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
-                    nak_code, nak_text = "AR", "document delivery would alter"
+                    nak_code, nak_text = "AR", "OBX-5.5 document holds a delimiter or control"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_code, nak_text = "AR", "document under base64 delimiters"
