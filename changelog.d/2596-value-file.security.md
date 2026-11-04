@@ -3,7 +3,8 @@
   left the digest unchanged, and a released reload read it from disk after the check. A reload now
   folds the value file into the digest, and `serve` parses the values from the snapshot's bytes. A
   value file outside the config directory's `environments/` folder is read into that snapshot
-  after vetting the file, its folder and the folder of each link it leads through, and where it
+  after vetting the file, its folder and the folder of each link along a chain of file links from
+  it, and where it
   alone cannot be read the reload is refused, released or not, rather than reading it again from
   disk. Where the config directory cannot be read whole, a value file in its `environments/` folder
   included, a released reload is refused and an ungated one still reads the values from disk. A
