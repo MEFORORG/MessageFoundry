@@ -1969,8 +1969,9 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     # A directory here is one the walk took for a file because reading its type raised, so nothing
     # in it was walked or emptied: report it, or the teardown would call the tree clean and raise no
     # cleanup alert while it may still hold plaintext (BACKLOG #4989). A junction, which Windows
-    # reports as a directory, names another path and is never walked, as the walk's filter has it.
-    if stat.S_ISDIR(st.st_mode) and not getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE:
+    # reports as a directory, never reaches here: it names another path, so the Windows screen above
+    # skips it by its reparse tag, which `os.fstat` does not carry.
+    if stat.S_ISDIR(st.st_mode):
         return f"{name}/ (not walked)"
     # A link is never followed: truncating through one would empty a file outside the directory, and
     # the link itself holds no plaintext.
@@ -2061,7 +2062,7 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 #: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
-#: for :func:`_owner_of`, :func:`_names_another_path` and :func:`_truncate_unfollowed`.
+#: for :func:`_owner_of` and :func:`_names_another_path`.
 _WIN_NAME_SURROGATE = _NAME_SURROGATE
 
 # The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
