@@ -146,7 +146,8 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
         behind_before.global_epoch,
     )  # not re-stamped with either new epoch
     assert await service.identity_for_token(behind) is None
-    # Control: a current session kept by the same revoke is stamped with both new epochs.
+    # Control: a current session, kept by a revoke of the same shape run after it, is stamped
+    # with both new epochs.
     current = await _mint(store, frank)
     await store.revoke_all_sessions(except_token_hash=hash_token(current))
     stamped = await store.get_session(hash_token(current))

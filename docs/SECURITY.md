@@ -4740,16 +4740,22 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   another. A revoke that keeps a session, the per-account one or the every-account one, stamps
   the new epochs onto it only when it carried the epochs that revoke's own raises replaced: its
   account's epoch, taken from the record the raise read under the account's lock, and for the
-  every-account revoke the global epoch too. A missed session is behind on at least one of them,
-  so it is left as it is and refused when next presented. Where the account's record fails its
-  seal, its epoch cannot be raised and nothing is stamped. The per-account revoke raises no global
-  epoch, so it leaves the kept session's global stamp as it is. The revoke still ends the user's
-  other sessions, current ones included. All three stores make this check.
+  every-account revoke the global epoch too. A kept session behind on an epoch that revoke checks
+  is left as it is and refused when next presented. Where the account's record fails its seal,
+  its epoch cannot be raised and nothing is stamped. The per-account revoke checks and raises the
+  account's epoch alone, and leaves the kept session's global stamp as it is. So a session behind
+  on the global epoch only, for example one an every-account revoke missed on an account its read
+  did not return, gets the new account epoch there and is still refused on the global one. The
+  revoke still ends the user's other sessions, current ones included. All three stores make this
+  check. The service reads the kept session back against both epochs, so it does not call such a
+  session kept: `DELETE /sessions` then answers that it was not kept and audits scope `all`, and
+  ending the user's other sessions audits scope `self_all`, even with nothing else ended.
   `tests/_session_seal_contract.py` tests the per-account revoke, a seal failure included;
-  `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on both epochs;
-  and `tests/test_b5091_global_session_epoch.py` one behind on the global epoch alone. Each runs
-  on SQLite and on the server legs `.github/workflows/ci.yml` runs from
-  `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`.
+  `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on both epochs and
+  on one behind on its account's epoch alone; and `tests/test_b5091_global_session_epoch.py` one
+  behind on the global epoch alone. Each runs on SQLite and on the server legs
+  `.github/workflows/ci.yml` runs from `tests/test_postgres_store.py` and
+  `tests/test_sqlserver_store.py`.
   **A request that straddles a revoke's commit can still end the session the revoke kept, and
   reports a seal failure either way.** The gate and the session list read a session before its
   account, so such a request can see a session's old stamps beside the account's new epochs. On

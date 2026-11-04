@@ -129,6 +129,27 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     assert (left.user_epoch, left.global_epoch) == (snapshot.user_epoch, snapshot.global_epoch)
     assert await service.identity_for_token(missed) is None
 
+    # --- nor one behind on its account's epoch alone, as a per-account sweep's miss leaves it ---
+    # The per-account revoke raises no global epoch, so the copy is current on that one: the
+    # re-stamp must check the account's epoch too.
+    behind = await _mint(store, alice)
+    snapshot = await store.get_session(hash_token(behind))
+    assert snapshot is not None
+    assert await store.revoke_user_sessions(alice) >= 1
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(behind)),
+    )
+    account = await store.get_user(alice)
+    assert account is not None
+    assert snapshot.global_epoch == account.global_session_epoch  # current on the global epoch
+    assert snapshot.user_epoch == account.session_epoch - 1  # one account epoch behind
+    await store.revoke_all_sessions(except_token_hash=hash_token(behind))
+    left = await store.get_session(hash_token(behind))
+    assert left is not None and left.revoked_at is None
+    assert (left.user_epoch, left.global_epoch) == (snapshot.user_epoch, snapshot.global_epoch)
+    assert await service.identity_for_token(behind) is None
+
 
 @pytest.fixture
 async def keyed(tmp_path: Path) -> AsyncIterator[tuple[MessageStore, Path]]:

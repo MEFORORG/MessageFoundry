@@ -11682,7 +11682,9 @@ class AuthService:
         self, identity: Identity, current_token_hash: str, *, actor: str
     ) -> int:
         """Revoke all of ``identity``'s sessions **except** the caller's current one ("sign out
-        everywhere else"). Returns the count revoked. Audited when any were revoked."""
+        everywhere else"). Returns the count revoked. Audited when any were revoked, and when the
+        caller's own session was not kept current (:meth:`_kept_session_current`, BACKLOG #4975):
+        then the scope is ``self_all``, since the gate ends that session at its next request."""
         scope = "self_others"
         try:
             revoked = await self._store.revoke_user_sessions(
@@ -11695,13 +11697,30 @@ class AuthService:
             await self._session_seal_failed(current_token_hash)
             revoked = await self._store.revoke_user_sessions(identity.user_id)
             scope = "self_all"
-        if revoked:
+        else:
+            if not await self._kept_session_current(current_token_hash):
+                scope = "self_all"
+        if revoked or scope == "self_all":
             await self._audit(
                 "auth.session_revoked",
                 actor=actor,
                 detail=_json({"scope": scope, "count": revoked}),
             )
         return revoked
+
+    async def _kept_session_current(self, token_hash: str) -> bool:
+        """Whether the session a revoke kept still resolves on its epochs: unrevoked, sealed, and
+        carrying its account's epoch and the store's global one (BACKLOG #4975). A revoke leaves
+        a kept session an earlier sweep missed unstamped, so the gate refuses it at its next
+        request, and a reply or audit row that called it kept would be wrong. Read back after the
+        revoke committed; a revoke landing after this read can still end it."""
+        session = await self._load_session(token_hash)
+        if session is None:
+            return False
+        user = await self._load_user(session.user_id)
+        return user is not None and session_epochs_current(
+            session, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
+        )
 
     async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int | None:
         """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
@@ -11767,8 +11786,9 @@ class AuthService:
             finally:
                 await self._session_seal_failed(keep_token_hash)
         # Read back rather than inferred: a revoke of the caller's own session that landed before
-        # the sweep leaves nothing kept, and the reply and the audit row must say so.
-        kept = await self._load_session(keep_token_hash) is not None
+        # the sweep leaves nothing kept, and nor does a kept session an earlier sweep missed, which
+        # the store leaves unstamped (BACKLOG #4975); the reply and the audit row must say so.
+        kept = await self._kept_session_current(keep_token_hash)
         await self._audit(
             "auth.session_revoked",
             actor=actor,
