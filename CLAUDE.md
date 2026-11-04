@@ -521,10 +521,10 @@ Existing machinery is still repaired, and review effort is not touched. The free
 require is carrying them out, not new machinery; that reading is recorded beside the signed text
 and is not part of the signature. The signature covers R1-R9 as they stand in vault
 `docs/LEDGER-INFLOW-RULINGS-DRAFT.md` at commit `22579b25071c`, anchored at the vault ref
-`refs/liaison/owner-ruling-20261104-r1-r9`. The copy on vault `main` is
-`docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (`a03b25550`). It keeps R1-R9 as signed,
-edits the sections around them, and adds, as its last section, the Manager's reading that this
-file calls "recorded beside the signed text".
+`refs/liaison/owner-ruling-20261104-r1-r9`; that commit is not on vault `main`, so fetch the ref.
+The copy on vault `main` is `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (`a03b25550`). At
+`a03b25550` it keeps R1-R9 as signed, edits the sections around them, and adds, as its last
+section, the Manager's reading that this file calls "recorded beside the signed text".
 
 The brief is disposable. The BACKLOG item is the record.
 
