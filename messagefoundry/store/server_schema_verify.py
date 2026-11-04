@@ -128,16 +128,22 @@ _DROP_END = (
     r"(?=\s*(?:[;')]|$)|\s+(?:CASCADE|RESTRICT|BEGIN|END|EXEC|ELSE|DROP|CREATE|ALTER)\b"
     r"|\s+IF\b(?!\s+EXISTS\s*[\w\[\"]))"
 )
+#: A DROP's list of names, read as one run of the characters a name list can hold, up to the first
+#: place the statement ends. A repeated ``{_NAME}`` group here would nest an unbounded quantifier in
+#: another (a ReDoS shape), so each item is checked whole afterwards, by :func:`_dropped`.
+_NAME_LIST = r"[\w\[\]\".,\s]*?[\w\]\"]"
 _DROP_TABLE = re.compile(
-    rf"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<names>{_NAME}(?:\s*,\s*{_NAME})*){_DROP_END}",
-    re.I,
+    rf"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<names>{_NAME_LIST}){_DROP_END}", re.I
 )
-_ON_TABLE = rf"(?:\s+ON\s+{_NAME})?"
 _DROP_INDEX = re.compile(
-    rf"\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?"
-    rf"(?P<names>{_NAME}{_ON_TABLE}(?:\s*,\s*{_NAME}{_ON_TABLE})*){_DROP_END}",
+    rf"\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?P<names>{_NAME_LIST}){_DROP_END}",
     re.I,
 )
+#: One item of a DROP's list: a table's name, or an index's name with SQL Server's ``ON <table>``.
+#: Its quotes and brackets must pair, so a comma split inside ``"a,b"`` leaves no item that passes.
+_PAIRED_NAME = r'(?:(?:\[\w+\]|"\w+"|\w+)\.)?(?:\[\w+\]|"\w+"|\w+)'
+_DROPPED_TABLE = re.compile(_PAIRED_NAME)
+_DROPPED_INDEX = re.compile(rf"{_PAIRED_NAME}(?:\s+ON\s+{_PAIRED_NAME})?", re.I)
 #: ``sp_rename``, as SQL Server runs it directly or inside an ``EXEC`` string, where every quote is
 #: doubled. Only a column rename is read; ``sp_rename`` of a table or an index raises.
 _SP_RENAME = re.compile(
@@ -351,6 +357,16 @@ def _top_level_items(body: str) -> list[str]:
     return [item.strip() for item in items if item.strip()]
 
 
+def _dropped(m: re.Match[str], item: re.Pattern[str]) -> list[str]:
+    """The names a DROP's list holds, each matched whole by ``item``, or ``ValueError``. The list
+    holds no parenthesis or single quote, and no name ``item`` accepts holds a comma, so a plain
+    split finds every item, and an empty one, as in ``a,,b``, is refused rather than skipped."""
+    names = [name.strip() for name in m["names"].split(",")]
+    if not all(item.fullmatch(name) for name in names):
+        raise ValueError(f"DDL the live-schema check cannot read: {m.group(0)[:120]!r}")
+    return names
+
+
 def _clause(segment: str) -> str:
     """The one clause of an ``ALTER TABLE`` that ``segment`` starts with: up to a top-level ``;``,
     an unmatched ``)``, a word that starts the next statement, or the end. A top-level comma means
@@ -372,7 +388,7 @@ def _clause(segment: str) -> str:
         elif depth == 0 and ch == ";":
             break
         elif depth == 0 and ch == ",":
-            raise ValueError(f"an ALTER TABLE with more than one clause: {segment[:120].strip()!r}")
+            raise ValueError(f"an alter table with more than one clause: {segment[:120].strip()!r}")
         elif (
             depth == 0 and (ch.isalpha() or ch == "_") and (i == 0 or not segment[i - 1].isalnum())
         ):
@@ -585,11 +601,11 @@ def _read_column(dialect: Dialect, text: str) -> tuple[str, _Column]:
         w = word(i)
         if w == "not" and word(i + 1) == "null":
             if nullable is True:
-                raise ValueError(f"a column declared both NULL and NOT NULL: {text!r}")
+                raise ValueError(f"a column declared both null and not null: {text!r}")
             nullable, i = False, i + 2
         elif w == "null":
             if nullable is False:
-                raise ValueError(f"a column declared both NULL and NOT NULL: {text!r}")
+                raise ValueError(f"a column declared both null and not null: {text!r}")
             nullable, i = True, i + 1
         elif w == "primary" and word(i + 1) == "key":
             primary_key, i = True, i + 2
@@ -857,25 +873,25 @@ class _Reader:
         elif verb[:1] == ["rename"] and len(words) == 5 and words[1].lower() == "column":
             self._rename(table, _bare(words[2]), _bare(words[4]))
         else:
-            raise ValueError(f"an ALTER TABLE the live-schema check cannot read: {clause[:120]!r}")
+            raise ValueError(f"an alter table the live-schema check cannot read: {clause[:120]!r}")
 
     def _not_null(self, table: str, name: str) -> None:
-        built = self._built(table, name, "a PRIMARY KEY")
+        built = self._built(table, name, "a primary key")
         built.create = built.create and replace(built.create, nullable=False)
         built.later = {replace(s, nullable=False) for s in built.later}
 
     def _alter_column(self, table: str, clause: str, words: list[str]) -> None:
         if len(words) < 3:
-            raise ValueError(f"an ALTER COLUMN with no column: {clause!r}")
+            raise ValueError(f"an alter column with no column: {clause!r}")
         if self.dialect is None:
             return
-        built = self._built(table, _bare(words[2]), "ALTER COLUMN")
+        built = self._built(table, _bare(words[2]), "an alter column")
         rest = " ".join(words[3:])
         if self.dialect == "sqlserver":
             # The whole definition is restated; one without COLLATE takes the database default.
             _name, col = _read_column(self.dialect, f"{words[2]} {rest}")
             if col.identity or col.primary_key:
-                raise ValueError(f"an ALTER COLUMN the live-schema check cannot read: {clause!r}")
+                raise ValueError(f"an alter column the live-schema check cannot read: {clause!r}")
             col.identity = {s.identity for s in built.ways()} == {True}
             new = _finish(self.dialect, col, clause)
             built.altered(lambda _s: new)
@@ -897,7 +913,7 @@ class _Reader:
             new_type, _numbered = _canonical_type(self.dialect, match.group(1))
             built.altered(lambda s: replace(s, type=new_type))
         else:
-            raise ValueError(f"an ALTER COLUMN the live-schema check cannot read: {clause!r}")
+            raise ValueError(f"an alter column the live-schema check cannot read: {clause!r}")
 
     def _rewrite_keys(self, table: str, old: str, new: str | None) -> None:
         """Rename ``old`` in the keys of ``table``'s indexes, or with ``new`` ``None`` drop the
@@ -935,7 +951,7 @@ class _Reader:
         self._rename(_bare(table), _bare(old), _bare(m["new"]))
 
     def drop_tables(self, m: re.Match[str]) -> None:
-        for name in _top_level_items(m["names"]):
+        for name in _dropped(m, _DROPPED_TABLE):
             table = _bare(name)
             self.columns.pop(table, None)
             for index in [n for n, shape in self.indexes.items() if shape.table == table]:
@@ -944,7 +960,7 @@ class _Reader:
     def drop_indexes(self, m: re.Match[str]) -> None:
         """Each index named, but on SQL Server only on the table its ``ON`` names: a name is unique
         only within its table there."""
-        for item in _top_level_items(m["names"]):
+        for item in _dropped(m, _DROPPED_INDEX):
             parts = item.split()
             name = _bare(parts[0])
             on = _bare(parts[-1]) if len(parts) == 3 else None
@@ -962,7 +978,7 @@ class _Reader:
                     listed = " and ".join(sorted(s.describe() for s in ways))
                     raise ValueError(
                         f"column {table}.{name} is built two ways, as {listed}: a guarded ADD,"
-                        " an ALTER COLUMN or a second CREATE TABLE disagrees with the first"
+                        " an alter column or a second create table disagrees with the first"
                     )
                 if ways:
                     one[name] = next(iter(ways))

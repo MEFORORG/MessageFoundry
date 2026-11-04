@@ -948,7 +948,7 @@ def test_a_column_definition_reads_as_its_shape(
     [
         ("postgres", "a GEOMETRY", "does not compare"),
         ("postgres", 'a TEXT COLLATE "C"', "collation is not compared"),
-        ("postgres", "a TEXT NOT NULL NULL", "both NULL and NOT NULL"),
+        ("postgres", "a TEXT NOT NULL NULL", "both null and not null"),
         ("postgres", "a TEXT GENERATED ALWAYS AS (b) STORED", "cannot read"),
         ("sqlserver", "a INT", "leaves NULL to the session"),
         ("sqlserver", "a AS (b + 1)", "does not compare"),
@@ -1152,6 +1152,13 @@ def test_a_multi_target_drop_drops_each_name() -> None:
         ("CREATE TABLE t (a TEXT DEFAULT '-- not a comment')", "comment marker inside a string"),
         ("DROP TABLE public . t", "cannot read"),
         ("DROP INDEX ix_t ON t WITH (ONLINE = ON)", "cannot read"),
+        # The drop's name list is read as one run and each item checked whole afterwards.
+        ("DROP TABLE t,, u", "cannot read"),
+        ("DROP TABLE t u", "cannot read"),
+        ('DROP TABLE "t,u"', "cannot read"),
+        ("DROP TABLE a.b.t", "cannot read"),
+        ("DROP INDEX ix_t ON t ON u", "cannot read"),
+        ("DROP INDEX ix_t ON", "cannot read"),
     ],
 )
 def test_the_parser_refuses_alter_and_drop_forms_it_would_misread(
