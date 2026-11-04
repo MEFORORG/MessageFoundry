@@ -80,7 +80,6 @@ from messagefoundry.transports.mllp import (
     _pacing_settings,
     _peer_host,
     _set_tcp_nodelay,
-    _upgrades_tls_itself,
 )
 from messagefoundry.transports.receipt import ReceiptHandler, RefusalKind, require_receipt
 
@@ -98,6 +97,21 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether this TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so
+    its caps, its allowlist and ``max_handshakes_per_host`` run before the handshake (BACKLOG #2479).
+    True for ``asyncio.BaseEventLoop`` and its subclasses, which the stdlib loops are.
+
+    ``mllp._upgrades_tls_itself`` gives the reading behind the upgrade and why uvloop is kept off it.
+    The MLLP listener matches the stdlib loop classes exactly (vault BACKLOG #4552), because its own
+    accept loop admits before the handshake on any other loop. This listener has no such loop, so on
+    the loop's handshake its caps would apply only after it and ``max_handshakes_per_host`` never.
+    It keeps trusting a subclass rather than lose those controls there.
+    """
+    return isinstance(loop, asyncio.BaseEventLoop)
+
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
 # connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.

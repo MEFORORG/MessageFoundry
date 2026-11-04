@@ -5,7 +5,8 @@
   On a loop other than the stdlib's own, the listener now runs its own accept loop: it refuses or
   admits each socket in plain TCP, then hands an admitted one to the loop's TLS layer before
   anything reads it. stop() closes a socket still in its handshake at once there too, and a failed
-  handshake is reported with its peer. The stdlib path is unchanged. A loop that subclasses a
-  stdlib loop now takes the same path as an unknown loop; for the `Http()` listener that means the
-  loop's own handshake, as under uvloop. See
+  handshake is reported with its peer. The stdlib path is unchanged. For the `MLLP()` listener, a
+  loop that subclasses a stdlib loop now takes the same path as an unknown loop. The `Http()`
+  listener is unchanged: it still upgrades TLS itself on any `asyncio.BaseEventLoop`, so its caps
+  and `max_handshakes_per_host` still apply before the handshake there. See
   [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #1606`, `BACKLOG #4552`)

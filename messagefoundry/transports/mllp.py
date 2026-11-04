@@ -1588,16 +1588,19 @@ _STDLIB_LOOPS: frozenset[type] = frozenset(
 
 
 def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
-    """Whether a TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself with
-    ``StreamWriter.start_tls``, so its caps and allowlist run before the handshake (BACKLOG #1606).
-    True only for the stdlib's own loop classes, ``SelectorEventLoop`` and ``ProactorEventLoop``.
+    """Whether the MLLP TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself
+    with ``StreamWriter.start_tls``, so its caps and allowlist run before the handshake (BACKLOG
+    #1606). True only for the stdlib's own loop classes, ``SelectorEventLoop`` and
+    ``ProactorEventLoop``. The HTTP listener has its own predicate,
+    ``http_listener._upgrades_tls_itself``.
 
     The upgrade is safe only where pausing reading inside ``connection_made`` is known to keep the
     ClientHello out of the plaintext reader. On the stdlib loops it is, read in their source: the
     selector transport arms its reader only if not paused, and the Proactor issues no receive while
     paused. A subclass, even of ``asyncio.BaseEventLoop``, could replace the transports that reading
     rests on, so it is matched exactly and a subclass is treated as an unknown loop (vault BACKLOG
-    #4552). A wrong guess here would stall every TLS connection. A source reading of uvloop's 0.22.1
+    #4552), which the accept loop below still admits before the handshake. A wrong guess here would
+    stall every TLS connection. A source reading of uvloop's 0.22.1
     and 0.23.0 sdists found the upgrade unsafe there, and
     ``test_a_plaintext_upgrade_loses_the_client_hello_on_uvloop`` pins the result. Both versions
     agree on at least these three points:
@@ -1619,11 +1622,11 @@ def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
 
     uvicorn runs the engine on uvloop wherever uvloop is installed, and the engine installs it
     through its own ``uvloop`` dependency in ``pyproject.toml``. That dependency's environment
-    marker is the one statement of where, and every other mention links here. On any loop this
-    returns False for, the MLLP listener runs its own accept loop instead (`_AcceptingServer`):
+    marker is the one statement of where. The docs link to ``pyproject.toml`` for it, and the code
+    here points at this docstring; neither should restate it. On any loop
+    this returns False for, the MLLP listener runs its own accept loop instead (`_AcceptingServer`):
     it admits each socket in plain TCP, then hands it to ``loop.connect_accepted_socket(...,
     ssl=...)`` before anything has read it, so its caps and allowlist still run before the
-    handshake. The HTTP listener has no such loop, so there its caps and allowlist apply after the
     handshake.
     """
     return type(loop) in _STDLIB_LOOPS
@@ -1644,9 +1647,18 @@ _ACCEPT_RETRY_DELAY = 1.0
 
 
 #: The accept failures that mean a resource ran short, after which `_AcceptingServer` waits
-#: `_ACCEPT_RETRY_DELAY` before accepting again; the same set asyncio's own server pauses on. Any
-#: other failure belongs to the one connection, which is skipped.
+#: `_ACCEPT_RETRY_DELAY` before accepting again; the same set asyncio's own server pauses on.
 _ACCEPT_SHORTAGE = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
+
+#: The accept failures that mean the listening socket itself is unusable, closed or never listening,
+#: so every later accept would fail the same way: `_AcceptingServer` stops that socket's accept loop
+#: on one. Windows reports a socket fault under its WinSock number, so those are named too. Any
+#: failure in neither set belongs to the one connection, which is skipped.
+_ACCEPT_FATAL = frozenset(
+    code
+    for name in ("EBADF", "EINVAL", "ENOTSOCK", "WSAEBADF", "WSAEINVAL", "WSAENOTSOCK")
+    if (code := getattr(errno, name, None)) is not None
+)
 
 #: What binding an address reports where its family is not enabled on the host, for example ``::1``
 #: with IPv6 disabled. ``asyncio.start_server`` skips such an address; so does `_bind_tcp`.
@@ -1765,12 +1777,20 @@ class _AcceptingServer:
             try:
                 conn, _address = await loop.sock_accept(sock)
             except OSError as exc:
+                if exc.errno in _ACCEPT_FATAL or sock.fileno() == -1:
+                    raise  # the listening socket is gone; `_closer` closes and logs it
                 if exc.errno not in _ACCEPT_SHORTAGE:
                     # This connection's own failure, the peer gone before the accept among them:
-                    # skip it, as asyncio's own server does, and keep accepting.
+                    # skip it and keep accepting. A selector loop's sock_accept fails at once,
+                    # without yielding, so this yields a turn first: a run of such failures would
+                    # otherwise spin. asyncio's own server cannot spin there either: it tries at
+                    # most backlog + 1 accepts per wakeup of the selector, skipping a
+                    # ConnectionAbortedError, and raises any other failure but a shortage to the
+                    # loop's exception handler, which ends that wakeup.
                     logger.debug(
                         "MLLP listener %s skipped a failed accept: %s", self._name, safe_exc(exc)
                     )
+                    await asyncio.sleep(0)
                     continue
                 logger.warning(
                     "MLLP listener %s accept failed, retrying in %gs: %s",
@@ -2202,8 +2222,10 @@ class MLLPSource(SourceConnector):
         Nothing has read the socket yet, so a refused one never starts a handshake. An admitted one
         holds its slot through the handshake and gives it back however the handshake ends; once it
         completes, `_on_client` takes the slot over. Both TLS bounds go to
-        ``connect_accepted_socket``, which closes the socket on any failure, a cancellation by
-        stop() included. A failure is logged and counted as `_start_tls` does it, with the peer.
+        ``connect_accepted_socket``, which closes the socket on any failure once its transport holds
+        it, a cancellation by stop() included. A handshake failure is logged and counted as
+        `_start_tls` does it, with the peer. A failure before the transport holds the socket is no
+        handshake failure: it is logged, not counted, and the socket is closed here.
 
         A connection closed CLEANLY during the handshake completes the wait with a result rather
         than an error, as `_start_tls` describes, so the transport comes back closed and never
@@ -2233,7 +2255,12 @@ class MLLPSource(SourceConnector):
             task = asyncio.current_task()
             assert task is not None  # always: `_on_tls_socket` runs this as a task
             self._handshakes.add(task)
-            unwrapped.clear()  # the TLS layer's transport owns the socket from this call on
+            # Scheduled before the call, so it runs only once the call suspends. On the stdlib loops
+            # and uvloop alike, the first suspension is the wait on the handshake, by when the TLS
+            # layer's transport holds the socket and closes it however the call ends. A failure
+            # raised before it, such as the transport refusing the socket, leaves the socket in
+            # ``unwrapped``, still this listener's, and no handshake ran.
+            disown = loop.call_soon(unwrapped.clear)
             try:
                 transport, _ = await loop.connect_accepted_socket(
                     lambda: protocol,
@@ -2242,10 +2269,19 @@ class MLLPSource(SourceConnector):
                     ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT,
                     ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT,
                 )
+                unwrapped.clear()  # the transport owns the socket now
             except OSError as exc:
                 # Out of `_handshakes` before the report below awaits, so a stop() that cancels the
                 # tasks still in their handshake cannot cancel a report already in flight.
                 self._handshakes.discard(task)
+                if unwrapped:
+                    # Not a handshake failure, so not counted; the done callback closes the socket.
+                    logger.warning(
+                        "MLLP listener %s could not hand a connection to TLS: %s",
+                        self._pacing_name,
+                        safe_exc(exc),
+                    )
+                    return
                 logger.debug(
                     "TLS handshake on MLLP from %s did not complete: %s",
                     peer.get_extra_info("peername"),
@@ -2256,6 +2292,7 @@ class MLLPSource(SourceConnector):
                 return
             finally:
                 self._handshakes.discard(task)
+                disown.cancel()
             if not protocol.connected:
                 logger.debug(
                     "TLS connection on MLLP from %s closed during its handshake",

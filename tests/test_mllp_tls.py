@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import errno
 import ipaddress
 import logging
+import socket
 import ssl
 import sys
 import time
@@ -27,6 +29,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.wiring import MLLP, WiringError, redacted_settings
 from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.pipeline.wiring_runner import check_mllp_tls_exposure
+from messagefoundry.transports import http_listener as http_module
 from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.mllp import (
@@ -799,7 +802,9 @@ async def test_the_tls_bounds_reach_whichever_side_runs_the_handshake(
 def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     """uvloop's Loop is an AbstractEventLoop and not a BaseEventLoop, so this is what sends it to the
     listener's own accept loop; see `_upgrades_tls_itself` for why. A BaseEventLoop subclass goes
-    there too: its transports are not the ones the upgrade was read against (vault BACKLOG #4552)."""
+    there too: its transports are not the ones the upgrade was read against (vault BACKLOG #4552).
+    The HTTP listener, which has no accept loop of its own, has its own predicate and keeps the
+    upgrade on such a subclass."""
 
     class _OtherLoop(asyncio.AbstractEventLoop):
         pass
@@ -811,15 +816,19 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     selector = asyncio.SelectorEventLoop()
     subclassed = _SubclassedLoop()
     try:
-        assert mllp_module._upgrades_tls_itself(stdlib) is True
-        assert mllp_module._upgrades_tls_itself(selector) is True
+        for predicate in (mllp_module._upgrades_tls_itself, http_module._upgrades_tls_itself):
+            assert predicate(stdlib) is True
+            assert predicate(selector) is True
         assert mllp_module._upgrades_tls_itself(subclassed) is False
+        assert http_module._upgrades_tls_itself(subclassed) is True
     finally:
         stdlib.close()
         selector.close()
         subclassed.close()
     # Never run: the probe only asks which class the loop is, so its abstract methods stay unbound.
-    assert mllp_module._upgrades_tls_itself(_OtherLoop()) is False  # type: ignore[abstract]
+    other = _OtherLoop()  # type: ignore[abstract]
+    assert mllp_module._upgrades_tls_itself(other) is False
+    assert http_module._upgrades_tls_itself(other) is False
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
@@ -1162,6 +1171,131 @@ async def test_a_plaintext_peer_on_a_tls_listener_is_a_failed_handshake(
         assert reason is not None and "MSH" not in reason  # a class name, never the peer's bytes
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_socket_the_tls_layer_never_took_is_closed_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under the listener's own accept loop, ``connect_accepted_socket`` can fail before its
+    transport holds the socket. The socket is still the listener's then, so the listener closes it,
+    and no handshake ran, so nothing is counted. Before the fix it was dropped unclosed and an
+    ``SSLError`` raised there counted as a failed handshake. The control is a real failed handshake
+    through the real call, on the same listener, which is counted."""
+    monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.transports.mllp")
+    loop_class = type(asyncio.get_running_loop())
+    real_connect_accepted = loop_class.connect_accepted_socket
+    refused: list[socket.socket] = []
+
+    async def refuse(
+        self: asyncio.AbstractEventLoop, factory: object, sock: socket.socket, **kwargs: object
+    ) -> tuple[asyncio.Transport, asyncio.BaseProtocol]:
+        refused.append(sock)
+        raise ssl.SSLError("synthetic: refused before the transport took the socket")
+
+    monkeypatch.setattr(loop_class, "connect_accepted_socket", refuse)
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            await _closed_by_listener(reader, within=5.0)
+        finally:
+            await _close_raw(writer)
+        await _until(lambda: source._admission.active == 0, "the slot was not released")
+        assert len(refused) == 1 and refused[0].fileno() == -1
+        assert source.tls_handshake_failures == 0
+        assert events.kinds() == []
+        assert "could not hand a connection to TLS" in caplog.text
+        # CONTROL: the same listener, through the real call, still counts a real failure.
+        monkeypatch.setattr(loop_class, "connect_accepted_socket", real_connect_accepted)
+        _r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            w2.write(b"\x0bMSH|^~\\&|NOT|TLS\r\x1c\r" * 8)
+            await w2.drain()
+            await _until(lambda: "tls_handshake_failed" in events.kinds(), "no failure event")
+        finally:
+            await _close_raw(w2)
+        assert source.tls_handshake_failures == 1
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+class _FailingAccept:
+    """A loop's ``sock_accept`` that fails at once without yielding, as a selector loop's does for a
+    fault ``accept()`` reports synchronously. After ``limit`` calls it raises ``RuntimeError``, which
+    no accept arm catches, so an accept loop that never yields ends rather than hanging the suite."""
+
+    limit = 200
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+        self.calls = 0
+
+    async def __call__(self, sock: socket.socket) -> tuple[socket.socket, object]:
+        self.calls += 1
+        if self.calls >= self.limit:
+            raise RuntimeError("the accept loop never yielded")
+        raise OSError(self.code, "synthetic accept failure")
+
+
+def test_the_accept_loop_yields_after_a_failed_accept_it_skips() -> None:
+    """A run of accept failures that belong to one connection each must not spin the loop: the
+    accept loop yields a turn per failure and keeps its listening socket. The control shows the fake
+    never yields by itself, so a loop without a yield of its own runs it to the limit in one step."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        control = _FailingAccept(errno.ECONNABORTED)
+
+        async def no_yield(sock: socket.socket) -> None:
+            while True:
+                with contextlib.suppress(OSError):
+                    await control(sock)
+
+        with socket.socket() as unused:
+            spinner = loop.create_task(no_yield(unused))
+            await asyncio.sleep(0)
+        assert spinner.done() and control.calls == _FailingAccept.limit
+        assert isinstance(spinner.exception(), RuntimeError)
+        fake = _FailingAccept(errno.ECONNABORTED)
+        loop.sock_accept = fake  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert 1 <= fake.calls <= 4, "the accept loop did not yield per skipped failure"
+            assert listening.fileno() != -1, "a skipped failure stopped the accept loop"
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert listening.fileno() == -1
+
+    asyncio.run(scenario())
+
+
+def test_the_accept_loop_stops_on_a_fault_of_its_listening_socket(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """EBADF means the listening socket is unusable, so every later accept would fail the same way:
+    the accept loop stops at once, closes the socket and logs it, rather than skipping forever."""
+
+    async def scenario() -> None:
+        fake = _FailingAccept(errno.EBADF)
+        asyncio.get_running_loop().sock_accept = fake  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
+        await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+        assert fake.calls == 1
+        assert listening.fileno() == -1
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.mllp"):
+        asyncio.run(scenario())
+    assert "IB_TEST: accept loop failed and stopped" in caplog.text
 
 
 async def test_failed_handshakes_are_counted_and_their_events_throttled(
