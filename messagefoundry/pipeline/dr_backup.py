@@ -1966,7 +1966,8 @@ def _empty_files_in_place(staging: Path) -> list[str]:
       listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
       its final path must lie under ``staging``'s.
 
-    What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
+    What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
+    ``mefor-verify-*`` staging row."""
     unproven: list[str] = []
 
     def _unlisted(exc: OSError) -> None:
@@ -2123,7 +2124,7 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 #: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
-#: for :func:`_owner_of`.
+#: read by :func:`_owner_of` and by :func:`_stat_names_another_path`, which :func:`_is_dir_link` calls.
 _WIN_NAME_SURROGATE = _NAME_SURROGATE
 
 # The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
@@ -2138,7 +2139,7 @@ def _vet_for_truncate(fd: int) -> None:
     On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
     filter serve a reparse point that names no path, and the screen before that open is
     :func:`_win_lstat`, not ``os.lstat`` (BACKLOG #4992). What still reaches a filter first is
-    listed in docs/PHI.md section 2's staging row."""
+    listed in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row."""
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise _Unconfined("not a regular file")
@@ -3487,8 +3488,8 @@ def _extract_member(
 
     ``secure`` locks the output file to its owner with the store's own primitive the moment it exists,
     BEFORE the first byte is streamed into it. The restore path passes it: its staging directory sits
-    on the destination volume, where ``TemporaryDirectory`` inherits whatever the parent grants on
-    Windows, and the file is the whole decrypted store. Securing it after the stream, the way
+    on the destination volume, and the file is the whole decrypted store. What it leaves is not always
+    owner-only on Windows (ADR 0163). Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
     under the inherited ACL for as long as the write takes. The verify path passes it everywhere but
     ``.mefor-staging`` (BACKLOG #1174).
@@ -3885,8 +3886,9 @@ def _restore_blocking(
         # "Less protected than the store's own" is a claim about the VOLUME, and it does not carry to
         # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
         # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
-        # 3.14.6) rather than inheriting the parent's. The two files staged inside it are the whole
-        # decrypted archive and the whole store -- both full-body PHI at rest (docs/PHI.md section 3).
+        # 3.14.6) rather than inheriting the parent's. The files staged inside it are the whole
+        # decrypted archive and, on the store route, the whole store: full-body PHI at rest there
+        # (docs/PHI.md section 3), and on either route a config bundle that can carry secrets.
         # So each is locked to its owner with the store's own primitive the moment it exists and
         # before its first byte is written. Best-effort and non-fatal, per that primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
