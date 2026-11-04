@@ -3508,29 +3508,29 @@ def _serve(args: argparse.Namespace) -> int:
     # documented delegation). WHEN the engine terminates TLS IN-PROCESS (uvicorn, [api].tls_cert_file)
     # on a network-reachable host, a REVOKED-but-unexpired server (or mTLS client) certificate is still
     # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
-    # prem, offline-by-default; CLAUDE.md §2). Revocation must be PROVEN IN FRONT — a declared TLS-
-    # terminating reverse proxy (tls_terminated_upstream + trusted_proxies, WP-15, which does its own
-    # OCSP-must-staple / CRL revocation) OR an explicit operator attestation
-    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that the terminator/PKI enforces revocation. Absent both, refuse
-    # fail-closed. Loopback and proxy-terminated deployments never reach this — they start byte-
-    # identically (the predicate short-circuits). Layered AFTER the §0 exposed-bind ladder above
-    # (extend-never-weaken), like the keyless-store / open-egress / MFA-at-exposure gates.
-    proxy_terminated = settings.api.tls_terminated_upstream and bool(settings.api.trusted_proxies)
+    # prem, offline-by-default; CLAUDE.md §2). So refuse fail-closed unless the operator attests
+    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation. A declared upstream
+    # terminator does not exempt the bind (BACKLOG #4636): off loopback the exposed-bind gate above
+    # refuses a plaintext proxy hop, so the engine terminates that hop's TLS itself, on the operator
+    # certificate. Loopback and plaintext binds start byte-identically (the predicate short-circuits).
+    # Layered AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
+    # open-egress / MFA-at-exposure gates.
     if in_process_tls_revocation_refused(
         tls_enabled=settings.api.tls_enabled,
         is_loopback=settings.api.is_loopback,
-        proxy_terminated=proxy_terminated,
         attested=tls_revocation_attested(),
     ):
         print(
             "error: refusing to serve the API with in-process TLS on non-loopback host "
             f"{settings.api.host!r}: the engine terminates TLS itself but performs NO certificate "
             "revocation check (stdlib ssl has no OCSP/CRL fetch; the engine is offline-by-default), so "
-            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). Terminate TLS "
-            "at a revocation-checking reverse proxy (set [api].tls_terminated_upstream + "
-            "[api].trusted_proxies; e.g. OCSP-must-staple at IIS/nginx/Caddy), or set "
-            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your TLS terminator/PKI enforces "
-            "revocation. See docs/adr/0078-certificate-revocation-posture.md.",
+            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). A declared "
+            "[api].tls_terminated_upstream does not exempt this bind: the engine still terminates "
+            "the proxy-to-engine hop's TLS itself (BACKLOG #4636). Set "
+            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
+            "certificates this engine serves and accepts, or bind [api].host to loopback behind a "
+            "revocation-checking reverse proxy on the same machine. See "
+            "docs/adr/0078-certificate-revocation-posture.md.",
             file=sys.stderr,
         )
         return 2

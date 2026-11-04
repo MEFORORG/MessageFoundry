@@ -34,10 +34,10 @@ validator) without crossing the engine's one-way dependency boundaries. The cont
 * :func:`in_process_tls_revocation_refused` / :func:`tls_revocation_attested` — the **ENFORCED** (not
   merely documented) half of that revocation delegation (ASVS 12.1.4, ADR 0078). Because the engine
   performs no revocation, ``serve`` must **refuse to start** an in-process, off-loopback ``[api]`` TLS
-  bind unless revocation is *proven in front* — a declared TLS-terminating reverse proxy (WP-15) or an
-  explicit operator attestation (``MEFOR_TLS_REVOCATION_ATTESTED``). Secure default = refuse; loopback
-  and proxy-terminated binds never trip it (byte-identical start). This module owns the pure predicate
-  + the env read; the ``_serve`` gate wires them.
+  bind unless the operator attests (``MEFOR_TLS_REVOCATION_ATTESTED``) that a revocation-checking PKI
+  backs its certificates. A declared upstream terminator does not exempt such a bind (BACKLOG #4636).
+  Secure default = refuse; loopback and plaintext binds never trip it (byte-identical start). This
+  module owns the pure predicate + the env read; the ``_serve`` gate wires them.
 """
 
 from __future__ import annotations
@@ -1005,7 +1005,7 @@ def tls_revocation_attested() -> bool:
 
 
 def in_process_tls_revocation_refused(
-    *, tls_enabled: bool, is_loopback: bool, proxy_terminated: bool, attested: bool
+    *, tls_enabled: bool, is_loopback: bool, attested: bool
 ) -> bool:
     """Whether ``serve`` must REFUSE an in-process off-loopback ``[api]`` TLS bind on revocation grounds.
 
@@ -1013,26 +1013,22 @@ def in_process_tls_revocation_refused(
     0078). When the engine terminates TLS itself (uvicorn, ``tls_enabled``) on a network-reachable host
     (``not is_loopback``), a **revoked-but-unexpired** certificate would still be accepted — stdlib
     ``ssl`` performs no OCSP/CRL check and the engine deliberately attempts none (on-prem, offline-by-
-    default; CLAUDE.md §2 / ADR 0002). So refuse to start UNLESS revocation is *proven in front*:
+    default; CLAUDE.md §2 / ADR 0002). So refuse to start UNLESS ``attested``: the operator's explicit
+    :data:`TLS_REVOCATION_ATTESTED_ENV` claim that the certificates this terminator serves and accepts
+    are backed by a revocation-checking PKI (the opt-out).
 
-    * ``proxy_terminated`` — a declared TLS-terminating reverse proxy (WP-15:
-      ``[api].tls_terminated_upstream`` **+** ``[api].trusted_proxies``) that does its own revocation
-      (the engine then runs plaintext behind it and terminates no TLS itself); **or**
-    * ``attested`` — the operator's explicit :data:`TLS_REVOCATION_ATTESTED_ENV` claim that their
-      in-process terminator's certs are backed by a revocation-checking PKI (the opt-out).
+    **A declared upstream terminator does not exempt the bind** (BACKLOG #4636, Manager decision
+    d20261104T080839080-981796). Off loopback, ``serve`` refuses a plaintext proxy-to-engine hop, so a
+    terminator in front of an off-loopback bind means the engine terminates TLS itself on that hop,
+    with an operator certificate and, under mTLS, a client certificate it accepts. The proxy's own
+    revocation checks cover the browser's hop, not this one. The plaintext terminator the predicate
+    still exempts is the loopback one, through ``not tls_enabled``: it terminates no TLS in the engine.
 
     Pure predicate so the ``_serve`` gate stays a one-liner and is unit-testable in isolation. Returns
     ``False`` (start unchanged, **byte-identical**) for the loopback default, a plaintext bind
-    (``not tls_enabled``), a proxy-terminated bind, or an attested bind — ``True`` only for an otherwise
-    unproven in-process off-loopback TLS bind."""
-    if not (tls_enabled and not is_loopback):
-        # loopback default OR no in-process TLS — path unchanged (byte-identical start)
-        return False
-    if proxy_terminated:
-        return False  # revocation delegated to the declared upstream terminator (proven in front)
-    if attested:  # noqa: SIM103
-        return False  # operator attested their terminator/PKI enforces revocation (the opt-out)
-    return True
+    (``not tls_enabled``) or an attested bind — ``True`` only for an otherwise unproven in-process
+    off-loopback TLS bind, a declared upstream terminator included."""
+    return tls_enabled and not is_loopback and not attested
 
 
 def proxy_mtls_declared_but_unverified(*, declared: str, client_ca_configured: bool) -> bool:

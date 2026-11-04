@@ -16,6 +16,7 @@ import subprocess  # nosec B404 -- runs our own interpreter only
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -1245,7 +1246,10 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     # The upstream-TLS exposed gate is the subject here, so everything around it is pre-satisfied
     # per-gate. Since BACKLOG #1279 a dev box cannot declare its way past the Posture-B attestations
-    # either, and an undeclared one would refuse before this gate is reached.
+    # either, and an undeclared one would refuse before this gate is reached. Since BACKLOG #4636 the
+    # declared terminator no longer exempts the operator certificate from the ADR 0078 revocation
+    # gate, so revocation is attested too.
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
     cert, key = _self_signed(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
         "security.block_unlisted_outbound = true\n"
@@ -1543,6 +1547,15 @@ def _run_posture_b(
     # tests/test_tls_floor_probe.py. A test that stubbed it to FAIL would be asserting the probe,
     # not the ladder.
     monkeypatch.setattr("messagefoundry.config.tls_probe.probe_tls_floor", probe)
+    # Revocation is not the subject of any case here either. Since BACKLOG #4636 a declared terminator
+    # no longer exempts an off-loopback operator certificate from the ADR 0078 revocation gate, so a
+    # case whose TOML carries one (`_posture_b_toml`'s cert branch) attests revocation, as a
+    # deployment of that shape must. The gate reads the attestation only for in-process TLS.
+    api_table = tomllib.loads((tmp_path / "messagefoundry.toml").read_text(encoding="utf-8")).get(
+        "api", {}
+    )
+    if api_table.get("tls_cert_file"):
+        monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
 
 
