@@ -407,7 +407,9 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   (`api_key` or `bearer` with an `intake_api_key` read through `env()`, or `mtls_subject` with
   `tls_ca_file` and `intake_client_subjects`, keyed by the CA that issues each partner's
   certificate), DoS caps (`max_connections`, `receive_timeout`,
-  `max_body_bytes`, `max_header_bytes`), the off-loopback exposed-gate (`check_http_tls_exposure`), and
+  `max_body_bytes`, `max_header_bytes`, and the per-address handshake budget
+  `max_handshakes_per_host`, which applies only with `tls = true` on the stdlib loop; see
+  [Per-address listener caps behind the VIP](#per-address-listener-caps-behind-the-vip)), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
   listener with an authenticating reverse proxy.
@@ -465,6 +467,90 @@ none of this.
 and the hybrid edge-relay topology — see [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md); for the cloud PHI /
 HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)
 (both per [ADR 0047](adr/0047-cloud-kubernetes-ha-deployment-packaging.md)).
+
+### Per-address listener caps behind the VIP
+
+An L4 load balancer or a source-NAT hop can make every client reach a listener from one source
+address. A cap keyed on the peer address then applies to all clients together. That is why
+`Http()` ships `max_connections_per_host` **off** (vault BACKLOG #2606): a cap of 32 there would
+become the whole listener's capacity for established requests.
+
+The MLLP, raw-TCP and X12 listeners differ: they ship `max_connections_per_host` **on, at 32**
+(BACKLOG #1725, vault BACKLOG #2606). Behind a balancer or source-NAT hop that collapses
+addresses, those 32 would bound every client's concurrent connections together, and the 33rd
+would be refused with an `at_capacity` event whose reason is `max_connections_per_host`. In that
+topology set `max_connections_per_host` to `None` or `0` on those listeners. The rest of this
+section is about `Http()`.
+
+`Http()` ships `max_handshakes_per_host` **on, at 32** (vault BACKLOG #4888). It counts only the
+sockets one address holds a connection slot with while their TLS handshake is still running. A
+socket leaves the count when its handshake ends, so the cap does not bound how many requests one
+address holds once their handshakes are done. It does bound how many can start at once: `Http()`
+answers every request with `Connection: close`, so each request opens a new connection and runs
+its own handshake, and one address could have at most 32 requests in their handshakes together.
+It applies only on a `tls = true` listener where the engine upgrades the socket itself, which is
+the stdlib event loop. uvloop does not run on Windows, so the Windows service always takes this
+path. On uvloop the loop runs the handshake before the engine sees the socket, so no engine cap
+counts a socket in its handshake, this one included. The loop's 10 s handshake bound is the only
+bound there.
+
+Without it, one address that opens sockets and never finishes a handshake could hold every
+`max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
+port can stall its handshake; on an mTLS listener it needs no client certificate to do so. The
+budget is per address, as `max_connections_per_host` is, so a peer with many source addresses gets
+32 for each of them. The key is the whole address, with no grouping by prefix, so over IPv6 a peer
+that holds a /64, as one site or host commonly does, could use a different address for each socket
+and get 32 on every one of them.
+
+**Without a balancer, one busy partner.** The cap can bite with no balancer and no attacker. One
+partner that keeps many requests in flight at once, from one address, could reach 32 sockets in
+their handshakes by itself, since each request runs its own handshake. Its 33rd concurrent new
+connection would then be closed before any TLS byte, so its client would see the connection close
+during its handshake rather than get an HTTP answer. Each refusal is passed to `notify_refusal`, which feeds the
+security-signal burst detector, so a legitimate burst of refusals could raise a
+`peer_refused_burst` alert for the listener once they reach `[alerts].security_peer_refusals`
+(100 by default) inside the window. If `at_capacity` events with the reason
+`max_handshakes_per_host` name a known partner's address under its ordinary load, raise
+`max_handshakes_per_host` on that `Http()` listener, or set it to `None` or `0` to turn it off.
+
+**What it does not bound.** A peer that completes its handshake leaves the count, and on a listener
+with no `tls_ca_file` a completed handshake proves nothing about who the peer is. Such a peer, or
+any peer on a plaintext listener, can still hold a slot until `receive_timeout` (60 s) by sending
+nothing. Of the admission controls, at least `max_connections`, and `max_connections_per_host`
+where it is set, bound that, with `source_ip_allowlist` limiting who can try, as before this
+budget. The 32 is fixed and does not follow `max_connections`, so on a listener with
+`max_connections` at 32 or fewer it adds no bound: one stalling address could again hold every
+slot.
+
+**The counter-case, behind a balancer that collapses addresses.** There the 32 bound every client's
+handshakes together. A client behind the balancer that stalls 32 handshakes would refuse every
+other client's new connection for as long as it keeps them stalled. The budget does not make that
+lockout meaningfully cheaper, though: without it, the same client would refuse everyone by stalling
+256 sockets instead, which costs it no more. A real client finishes its handshake in one or two
+round trips, but it reaches 32 with no attacker at all on a busy enough listener: at 200 requests
+a second and a 150 ms handshake, about 30 are in flight at once, since `Http()` answers one request
+per connection and so runs a handshake per request. The refusals and the alert they could raise
+are the ones *Without a balancer* above describes. If `at_capacity` events with the reason
+`max_handshakes_per_host` name the balancer's address under ordinary load, raise
+`max_handshakes_per_host`, or set it to `None` or `0` to turn it off.
+
+**`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
+an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer
+with no client certificate passes it. On the stdlib loop each socket it holds in a handshake takes
+a slot, so this budget, `max_connections` and `max_connections_per_host` where it is set all bound
+how many it holds, each for up to the 10 s handshake bound. On uvloop such a socket takes no slot,
+so no engine cap counts it, this budget included, and only the loop's 10 s handshake bound limits
+each one. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
+it cannot tell clients apart either.
+
+Two other shapes were weighed and not built:
+
+- Turning `max_connections_per_host` on for TLS listeners. TLS listeners are the off-loopback ones,
+  which is where a balancer sits, so this would bring back #2606's counter-case for established
+  traffic.
+- A listener-wide total of sockets in their handshake. Every new connection needs a handshake, so a
+  stalling peer that fills such a total would refuse every newcomer, exactly as a full
+  `max_connections` does. It would add no protection.
 
 ---
 
