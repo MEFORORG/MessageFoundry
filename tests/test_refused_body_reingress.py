@@ -72,9 +72,16 @@ def test_a_canonical_carriage_on_a_binary_loopback_is_described_by_the_bytes_it_
     record = _record(bounded.metadata)
     assert record["bytes"] == len(payload) and record["stored"] == "head"
     assert verify_refused_body_digest(make_cipher(key), payload, record["body_hmac"]) is True
-    # The head is the carried bytes' head, in carriage because it holds a NUL: never a cut of the
-    # base64 text, and never the carriage string wrapped a second time.
-    assert is_marked(bounded.raw) and decode_carriage(bounded.raw) == payload[:256]
+    # The head is the carried bytes' head, as carriage that fits the head bound: never a cut of the
+    # base64 text, never the carriage string wrapped a second time, and never a latin-1 view.
+    assert is_marked(bounded.raw) and len(bounded.raw) <= 256
+    assert decode_carriage(bounded.raw) == payload[: 3 * ((256 - len("mfb64:v1:")) // 4)]
+    # A NUL-free binary head stays carriage too.
+    high = RawMessage.from_bytes(b"\xff" * 5000, ContentType.BINARY.value).raw
+    no_nul = _allowance(0).bound_held(
+        "IB_LOOP", high, ContentType.BINARY.value, "e", cipher=_KEYLESS
+    )
+    assert is_marked(no_nul.raw) and set(decode_carriage(no_nul.raw)) == {0xFF}
 
 
 def test_a_carriage_inside_the_allowance_is_stored_exactly_as_held() -> None:
@@ -172,3 +179,12 @@ def test_a_head_only_reingress_child_names_its_origin_as_the_remedy() -> None:
     # A listener's head-only row keeps the sender remedy.
     listener = head_only_resubmit_refusal("row-1", json.dumps(record))
     assert listener is not None and listener.endswith("; have the sender send its own copy again")
+
+
+def test_a_held_text_head_keeps_a_lone_surrogate() -> None:
+    # A held body may carry a lone surrogate; the head is still a prefix of the held text.
+    body = "ab\udc80c" + "d" * 1000
+    bounded = _allowance(0).bound_held(
+        "IB_LOOP", body, ContentType.JSON.value, "e", cipher=_KEYLESS
+    )
+    assert body.startswith(bounded.raw) and len(bounded.raw) == 256 - 2

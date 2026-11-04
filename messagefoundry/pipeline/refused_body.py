@@ -62,6 +62,7 @@ from messagefoundry.content_type import ContentType
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import decode as decode_carriage
+from messagefoundry.parsing.binary import encode as encode_carriage
 from messagefoundry.parsing.binary import is_marked
 from messagefoundry.pipeline.ingress_guards import canonical_carried_size, store_safe_raw
 from messagefoundry.redaction import _DEFAULT_LIMIT as _ERROR_LIMIT
@@ -207,10 +208,8 @@ class RefusedBodyAllowance:
         bound, and the charge is its UTF-8 length. And ``body`` is a stored string, not wire bytes:
         on a binary loopback a canonical ``mfb64:v1:`` carriage stands for the bytes it carries, so
         the length, the digest and the head describe those bytes. Every other body, a padded or
-        corrupt carriage included, is described by its UTF-8.
-
-        The reply also stays in its origin's ``response`` row until retention erases it, so a head
-        here drops no byte the engine does not still hold."""
+        corrupt carriage included, is described by its UTF-8. docs/CONFIGURATION.md, under
+        ``[inbound].refused_body_allowance_bytes``, states what an operator gets of each."""
         head_bytes = self.policy.head_bytes
         wire, text = _held_wire(body, content_type)
         stored_bytes = len(wire) if text is not None else len(body)  # carriage is ASCII
@@ -219,11 +218,12 @@ class RefusedBodyAllowance:
         if whole:
             stored = body
         elif text is None:
-            stored = _head(wire, None, content_type, head_bytes)
+            # Binary stays carriage, never a latin-1 view, and the carriage fits the head bound.
+            stored = encode_carriage(wire[: 3 * (max(head_bytes - len(CARRIAGE_MARKER), 0) // 4)])
         else:
             # Cut the held text first. Its UTF-8 is not received bytes, so a latin-1 view of it, which
             # _head takes for a text holding a NUL, would store mojibake.
-            cut = wire[:head_bytes].decode("utf-8", "ignore")
+            cut = _utf8_prefix(wire, head_bytes)
             stored = _head(cut.encode("utf-8", "surrogatepass"), cut, content_type, head_bytes)
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
 
@@ -320,6 +320,18 @@ def _held_wire(body: str, content_type: str) -> tuple[bytes, str | None]:
     ):
         return decode_carriage(body), None
     return body.encode("utf-8", "surrogatepass"), body
+
+
+def _utf8_prefix(wire: bytes, limit: int) -> str:
+    """The longest whole-character prefix of ``wire``, a ``surrogatepass`` UTF-8 encoding, that fits
+    in ``limit`` bytes. Only the last character can be split, so at most three bytes come off."""
+    start = min(limit, len(wire))
+    for end in range(start, max(start - 4, -1), -1):
+        try:
+            return wire[:end].decode("utf-8", "surrogatepass")
+        except UnicodeDecodeError:
+            continue
+    return ""
 
 
 def with_refusal_note(note: str, error: str) -> str:
