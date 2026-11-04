@@ -366,7 +366,7 @@ class _UnmarkedPolicy:
     downgrade to plaintext has none, so only a refusal can stop it.
 
     **Blank is not refused.** Every purge path writes a literal ``''``, and the sweep seals one only
-    in the one case ``MessageStore._encrypt_existing_rows`` names (BACKLOG #3495), so ``''`` is the
+    in the cases ``MessageStore._encrypt_existing_rows`` names (BACKLOG #3495, #4994), so ``''`` is the
     one unmarked value a keyed store legitimately holds. ``open_queue_cell`` refuses a blank queue
     cell on its own terms. NULL never reaches here.
 

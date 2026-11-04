@@ -11,10 +11,10 @@ Extra-free on the ``_finalize_race_contract`` precedent, so the gated Postgres a
 run the same body on legs that install only their own driver extra.
 
 ``keyless`` is a store opened with no key on a database no keyed open has touched. ``open_keyed`` opens
-a new keyed handle on the same database, and the contract closes it. Its ``on_tag_failure`` is
-installed on the cipher BEFORE the open, so it sees an alarm the open itself raises. ``fetch`` and
-``raw`` run one statement outside the store, with ``?`` placeholders, and each backend's adapter
-respells them.
+a new keyed handle on the same database, and the contract closes it. Its ``allow_unmarked`` builds the
+cipher under ``[store].allow_unmarked_ciphertext``, and its ``on_tag_failure`` is installed on the
+cipher BEFORE the open, so it sees an alarm the open itself raises. ``fetch`` and ``raw`` run one
+statement outside the store, with ``?`` placeholders, and each backend's adapter respells them.
 
 **The refusal is a control, and this contract pins that it did not move.** A blank on a surface that
 is already keyed is what a plant looks like, so the second case keeps refusing it.
@@ -37,17 +37,20 @@ TagFailureHook = Callable[[str, str], None]
 
 
 class OpenKeyed(Protocol):
-    def __call__(self, *, on_tag_failure: TagFailureHook | None = None) -> Awaitable[Any]: ...
+    def __call__(
+        self, *, allow_unmarked: bool = False, on_tag_failure: TagFailureHook | None = None
+    ) -> Awaitable[Any]: ...
 
 
 def keyed_cipher(
     make_cipher: Callable[..., Any],
     key: str,
     *,
+    allow_unmarked: bool = False,
     on_tag_failure: TagFailureHook | None = None,
 ) -> Any:
     """The cipher an ``open_keyed`` adapter opens with, its tag-failure hook already installed."""
-    cipher = make_cipher(key, write_v2=True)
+    cipher = make_cipher(key, write_v2=True, allow_unmarked=allow_unmarked)
     if on_tag_failure is not None:
         cipher.set_tag_failure_hook(on_tag_failure)
     return cipher
@@ -228,6 +231,45 @@ async def assert_a_blank_on_a_keyed_surface_stays_refused(
         await keyed.close()
 
 
+async def assert_the_opt_out_seals_a_keyless_runs_live_blank(
+    keyless: Any, open_keyed: OpenKeyed, fetch: RawFetch, _raw: RawSql
+) -> None:
+    """BACKLOG #4994. A keyless run of a store that was keyed before writes an empty body as a blank
+    on a sealed surface, which reads like a plant. Under ``allow_unmarked_ciphertext`` the operator
+    vouches for such values, so the next keyed open seals the blank with the run's plaintext, and
+    the row is delivered once with no alarm. A terminal blank still stays blank: it may be an
+    erasure, and sealing it would make it replayable. The refusal without the opt-out is the case
+    above."""
+    keyed = await open_keyed()
+    try:
+        witness = await outbound(keyed, "OB_KB_WITNESS", BODY)
+    finally:
+        await keyed.close()
+    assert await marked(fetch)
+    live = await outbound(keyless, "OB_KB_RUN", "")
+    legacy = await outbound(keyless, "OB_KB_RUN_BODY", BODY)
+    done = await terminal(keyless, "OB_KB_RUN_DONE", dead=False)
+    assert (await row_of(fetch, live))["payload"] == ""  # the premise: blank on a sealed surface
+
+    alarms, hook = alarm_log()
+    keyed = await open_keyed(allow_unmarked=True, on_tag_failure=hook)
+    try:
+        assert str((await row_of(fetch, live))["payload"]).startswith(MARKER_PREFIX)
+        assert str((await row_of(fetch, legacy))["payload"]).startswith(MARKER_PREFIX)
+        assert (await row_of(fetch, done))["payload"] == ""
+        assert str((await row_of(fetch, witness))["payload"]).startswith(MARKER_PREFIX)
+
+        item = await keyed.claim_next_fifo("OB_KB_RUN")
+        assert item is not None and item.payload == ""
+        await keyed.mark_done(item.id)
+        assert await status_of(keyed, live) == MessageStatus.PROCESSED.value
+        assert alarms == []
+        item = await keyed.claim_next_fifo("OB_KB_RUN_BODY")  # the control: a real body delivers
+        assert item is not None and item.payload == BODY
+    finally:
+        await keyed.close()
+
+
 async def assert_the_dead_letter_purge_counts_only_the_bodies_it_blanks(
     keyless: Any, _open_keyed: OpenKeyed, fetch: RawFetch, _raw: RawSql
 ) -> None:
@@ -289,6 +331,7 @@ CASES = (
     assert_a_live_empty_ingress_row_is_sealed,
     assert_terminal_blanks_alone_seal_nothing,
     assert_a_blank_on_a_keyed_surface_stays_refused,
+    assert_the_opt_out_seals_a_keyless_runs_live_blank,
     assert_the_dead_letter_purge_counts_only_the_bodies_it_blanks,
     assert_a_blank_reingress_token_is_not_sealed,
     assert_retention_clears_the_error_of_a_blank_delivered_row,

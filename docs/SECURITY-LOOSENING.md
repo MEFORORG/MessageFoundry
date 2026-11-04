@@ -756,19 +756,23 @@ This section is kept rather than deleted, because the claim it used to make is t
   store, a non-blank value with no `mfenc:` marker is a stripped marker or a planted plaintext row, and
   with this off it is refused (`CipherError`) and alerted (`integrity_drift`, subject `store-cipher`).
   With it on, that value is returned as the row's content, and the next keyed open or `rotate-key`
-  seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
+  seals it into genuine ciphertext, after which no evidence of the substitution survives. A blank
+  planted on a live queue row is sealed the same way at the next keyed open and delivered as an
+  empty body (BACKLOG #4994). Cell binding
   (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
   (ASVS 11.3.3, BACKLOG #1169).
 - **When acceptable:** a store that holds legitimate unmarked values in a column that is already
   sealed. One example is rows written by a keyless run of a store that was keyed before. Since
   BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
   even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
-  keyed open to seal them, then turn it back off. It does not seal a blank on a column that is
-  already sealed: an empty body such a run left on a live queue row there stays refused at the
-  claim, as a plant would be (BACKLOG #3495). A blank is sealed only by the open that first seals
-  `queue.payload`, a column with no `keyed_surface` record and no ciphertext, and only on a
-  `pending` or `inflight` inline row outside the `response` stage. That open seals it whether or not
-  this is on. It is a no-op with **no `[store].encryption_key`**.
+  keyed open to seal them, then turn it back off. That open also seals an empty body such a run
+  left on a live queue row, a blank `payload` on a `pending` or `inflight` inline row outside the
+  `response` stage, and the row is delivered as an empty body (BACKLOG #4994). With this off, that
+  blank stays refused at the claim, as a plant would be: the claim dead-letters it with an
+  `integrity_drift` alert, and a dead blank row cannot be replayed, because it reads as an erasure.
+  So turn this on BEFORE the first keyed open that follows a keyless run. Without it, a blank is
+  sealed only by the open that first seals `queue.payload`, a column with no `keyed_surface` record
+  and no ciphertext (BACKLOG #3495). It is a no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything

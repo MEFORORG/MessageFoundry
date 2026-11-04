@@ -3287,7 +3287,7 @@ class PostgresStore:
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
         (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
-        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        are real rows (BACKLOG #3495), sealed as the SQLite twin says (BACKLOG #4994).
         Identifiers are code constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
@@ -3302,7 +3302,8 @@ class PostgresStore:
         keyed = await self._surface_keyed(table, column)
         pending = int(await self._fetchval(count_sql, like) or 0)
         blanks = 0
-        if blank_where is not None and not keyed:
+        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        if blank_where is not None and (not keyed or not strict):
             blanks = int(
                 await self._fetchval(f"SELECT COUNT(*) FROM {table} WHERE {blank_where}") or 0
             )
@@ -3311,9 +3312,8 @@ class PostgresStore:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant. A blank here
-                # stays refused.
-                blanks = 0
+                # so count again rather than report its legitimate seal as a plant. Without the
+                # opt-out the return below leaves a blank here refused.
                 pending = int(await self._fetchval(count_sql, like) or 0)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -3337,12 +3337,15 @@ class PostgresStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
-            # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
-            seal_where = (
-                f"({pending_where}) OR ({blank_where})"
-                if blanks and claimed is not None
-                else pending_where
-            )
+            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed.
+            seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
+            # The UPDATE re-checks `seal_where` (BACKLOG #4994). Under the opt-out this seal runs on
+            # a surface live peer engine shards already write, so a row can leave it after the
+            # SELECT: a blank a peer claimed and dead-lettered would otherwise take encrypt('') and
+            # read as a replayable empty body. A re-check that fails matches no row. The marker
+            # pattern is renumbered past the UPDATE's own parameters.
+            recheck = seal_where.replace("$1", f"${len(keys) + 2}")
+            update_sql = f"UPDATE {table} SET {column}=$1 WHERE {where_keys} AND ({recheck})"
             while True:
                 rows = await conn.fetch(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
@@ -3352,19 +3355,21 @@ class PostgresStore:
                 if not rows:
                     break
                 for r in rows:
-                    await conn.execute(
-                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
-                        self._cipher.encrypt(
-                            r["v"],
-                            aad=(
-                                aad_of(r)
-                                if aad_of is not None
-                                else cell_aad(table, column, *(r[c] for c in aad_cols))
+                    sealed += _rowcount(
+                        await conn.execute(
+                            update_sql,
+                            self._cipher.encrypt(
+                                r["v"],
+                                aad=(
+                                    aad_of(r)
+                                    if aad_of is not None
+                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
+                                ),
                             ),
-                        ),
-                        *(r[c] for c in keys),
+                            *(r[c] for c in keys),
+                            like,
+                        )
                     )
-                sealed += len(rows)
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()
         return sealed

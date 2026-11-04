@@ -9512,8 +9512,8 @@ class MessageStore:
         surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
         it. On a surface that already holds ciphertext the data check refuses it instead. A value
         written into a marked surface by a later KEYLESS run of the same store, or by hand, is
-        refused even if the table had emptied out; the opt-out below seals it for one open, a blank
-        queue row excepted (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
+        refused even if the table had emptied out; the opt-out below seals it for one open, a live
+        blank queue row included (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
         the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
         key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
 
@@ -9522,8 +9522,9 @@ class MessageStore:
         marker while the setting is on. Turning it off again restores the refusal on every marked
         surface.
 
-        NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The one
-        exception is a live empty queue row on a surface that is still unsealed (BACKLOG #3495).** A
+        NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The exception
+        is a live empty queue row on a surface that is still unsealed (BACKLOG #3495), or on any
+        surface under the opt-out (BACKLOG #4994).** A
         keyless store writes an empty body as ``''``, and :func:`open_queue_cell` refuses a blank on
         a keyed store, so that row would dead-letter with a false ``integrity_drift`` alarm the first
         time it was claimed. This open seals it under its own tag instead, in the marker's
@@ -9537,9 +9538,11 @@ class MessageStore:
           :data:`_REPLAYABLE_BODY` and the claim both treat it as erased.
         - Live, on a sealed surface: refused at the claim, dead-lettered and alerted. Nothing a keyed
           writer does leaves one, so it is what a plant looks like, and sealing it here would launder
-          the plant. That is why this exception reads the sealed state and not the row. The limit: an
-          empty body written by a keyless run of a store that was keyed before reads the same way,
-          and it is refused too, under the opt-out as well.
+          the plant. That is why this exception reads the sealed state and not the row. An empty
+          body written by a keyless run of a store that was keyed before reads the same way. The
+          opt-out is the operator's word that such values are legitimate, so under it this open
+          seals that blank as it seals the run's plaintext, and the row is delivered (BACKLOG #4994).
+          A row the claim already dead-lettered stays blank and is not replayable.
 
         **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
         otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
@@ -9643,10 +9646,11 @@ class MessageStore:
         ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
-        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
-        only by the open that writes the marker on a surface holding no ciphertext, under the
-        opt-out too (BACKLOG #4996). There they count as something to seal, so that open never
-        writes the marker over them unsealed. All identifiers
+        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). Without the
+        opt-out they are sealed only by the open that writes the marker on a surface holding no
+        ciphertext; under it, by any keyed open (BACKLOG #4994). On a surface this open finds
+        unsealed they count as something to seal, so it never writes the marker over them unsealed.
+        All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
@@ -9675,15 +9679,16 @@ class MessageStore:
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
         blanks = 0
-        if blank_where is not None and not keyed:
+        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        if blank_where is not None and (not keyed or not strict):
             blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
         if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
-                # its legitimate seal is not reported as a plant. A blank here stays refused.
-                blanks = 0
+                # its legitimate seal is not reported as a plant. Without the opt-out the
+                # return below leaves a blank here refused.
                 pending = await self._count_unmarked(table, pending_where, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -9709,10 +9714,8 @@ class MessageStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
-            # The opt-out reseals plaintext, never a blank on a surface another process keyed.
-            seal_where = (
-                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
-            )
+            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed.
+            seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
                 # matching NOT LIKE and the loop terminates inside the one transaction.

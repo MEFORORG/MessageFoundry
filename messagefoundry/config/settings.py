@@ -773,7 +773,9 @@ class StoreSettings(_Section):
     # value on a sealed surface is a stripped marker or a planted row -- the cipher
     # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
     # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
-    # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
+    # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. On a
+    # sealed surface the sweep then also seals a blank `queue.payload` on a live inline row, which is
+    # then delivered as an empty body rather than refused at the claim (BACKLOG #4994). It is
     # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key. It also
     # restores the passthrough for a plaintext UPLOADED FILE, which a keyed store otherwise refuses
     # until `rotate-key` seals it, alerting under `upload-cipher` (owner ruling 2026-09-23).
@@ -10418,7 +10420,9 @@ def security_loosenings(
                 "an UNMARKED value in an encrypted column reads back as plaintext instead of being "
                 "refused — anyone who can write the store can strip a ciphertext's marker or plant a "
                 "plaintext row and have the engine accept it as that row's content, and the next "
-                "rotate-key seals it as genuine ciphertext. It also serves a plaintext uploaded file: "
+                "rotate-key seals it as genuine ciphertext. A keyed open also seals a blank planted on "
+                "a live queue row, which is then delivered as an empty message instead of being "
+                "dead-lettered with an integrity alarm. It also serves a plaintext uploaded file: "
                 "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
                 "sidecar with a chosen uploader and have it listed, browsed and resent "
                 "(no effect without a store key)",

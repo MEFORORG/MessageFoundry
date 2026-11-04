@@ -4120,7 +4120,7 @@ class SqlServerStore:
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
         (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
-        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        are real rows (BACKLOG #3495), sealed as the SQLite twin says (BACKLOG #4994).
         Every identifier is a code constant and is bracket-quoted (``key`` is a T-SQL reserved word);
         only the marker pattern is a parameter.
 
@@ -4140,7 +4140,8 @@ class SqlServerStore:
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(count_sql, like)
         blanks = 0
-        if blank_where is not None and not keyed:
+        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        if blank_where is not None and (not keyed or not strict):
             blanks = await self._count_unmarked(
                 f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {blank_where}"
             )
@@ -4149,9 +4150,8 @@ class SqlServerStore:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
-                # so count again rather than report its legitimate seal as a plant. A blank here
-                # stays refused.
-                blanks = 0
+                # so count again rather than report its legitimate seal as a plant. Without the
+                # opt-out the return below leaves a blank here refused.
                 pending = await self._count_unmarked(count_sql, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -4192,9 +4192,13 @@ class SqlServerStore:
                     if left:
                         report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
-                # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
-                seal_where = (
-                    f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                # Without the opt-out, `blanks` is non-zero only on a surface this open claimed.
+                seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
+                # The UPDATE re-checks `seal_where`, as on Postgres (BACKLOG #4994): under the
+                # opt-out a peer engine shard can dead-letter a blank after the SELECT, and sealing
+                # encrypt('') into that dead row would make it replayable as an empty body.
+                update_sql = (
+                    f"UPDATE {table} SET [{column}]=? WHERE {where_keys} AND ({seal_where})"
                 )
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
@@ -4210,7 +4214,7 @@ class SqlServerStore:
                         break
                     for r in rows:
                         await cur.execute(
-                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                            update_sql,
                             (
                                 self._cipher.encrypt(
                                     r["v"],
@@ -4221,9 +4225,10 @@ class SqlServerStore:
                                     ),
                                 ),
                                 *(r[c] for c in keys),
+                                like,
                             ),
                         )
-                    sealed += len(rows)
+                        sealed += max(cur.rowcount or 0, 0)
                 await self._commit(conn)
             except BaseException:
                 # Roll the WHOLE surface back: a half-sealed surface reads as sealed on the next open,
