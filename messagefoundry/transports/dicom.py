@@ -70,6 +70,7 @@ import socketserver
 import ssl
 import threading
 import time
+import traceback
 import warnings
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -424,22 +425,41 @@ class _Shape(NamedTuple):
 #: ``Non-conformant '<name>' value '<value>'`` at WARNING, and ``Invalid '<name>' value '<value>' -
 #: <reason>`` at ERROR, whose reasons are fixed strings in ``pynetdicom._validators``.
 #: ``pynetdicom.presentation`` and ``pynetdicom.pdu_primitives`` write ``The <name> '<value>' is
-#: non-conformant``. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>: <repr>.``,
+#: non-conformant``, and ``pynetdicom.presentation`` names a proposed or accepted transfer syntax
+#: again when it is under the DICOM root and no transfer syntax. ``pynetdicom.dul`` logs the
+#: exception a PDU it receives raised as it decoded, which is the refusal ``set_uid`` or ``set_ae``
+#: raises with the value in it, or ``decode_bytes``'s ``Unable to decode '<hex>'`` with the value's
+#: bytes. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>: <repr>.``,
 #: with a pointer to PS3.5 after it when a data element is read, and sometimes after its own length
 #: message in the same line. ``pynetdicom._handlers`` writes ``<label> : <value>`` at DEBUG for each
 #: association request and DIMSE message it receives or sends; a head with a ``label`` group keeps a
 #: value that passes :func:`_kept`, since a real UID or AE title may be logged. At least these
-#: shapes; a line of another shape, or on another logger, passes whole.
+#: shapes, read from pynetdicom 3.0.4 and pydicom 3.0.2; a line of another shape, or on another
+#: logger, passes whole.
 _NON_CONFORMANT_NAME = _Shape(
     re.compile(r"The [A-Za-z ]{1,64} '"), "' is non-conformant", re.compile("' is non-conformant")
 )
+_REFUSED_VALUE = _Shape(re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^']*"))
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
     "pynetdicom.utils": (
         _Shape(re.compile(r"Non-conformant '[^']*' value '"), "'", re.compile("'")),
-        _Shape(re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^']*")),
+        _REFUSED_VALUE,
     ),
-    "pynetdicom.presentation": (_NON_CONFORMANT_NAME,),
+    "pynetdicom.presentation": (
+        _NON_CONFORMANT_NAME,
+        _Shape(
+            re.compile(
+                r"A UID has been added to 'transfer_syntax' that is not a transfer syntax: '"
+            ),
+            "'",
+            re.compile("'"),
+        ),
+    ),
     "pynetdicom.pdu_primitives": (_NON_CONFORMANT_NAME,),
+    "pynetdicom.dul": (
+        _REFUSED_VALUE,
+        _Shape(re.compile(r"Unable to decode '"), "' using the ", re.compile(r"' using the [^']*")),
+    ),
     "pydicom": (
         _Shape(
             re.compile(r"Invalid value for VR [A-Z]{2}: "),
@@ -452,16 +472,25 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
         _Shape(
             re.compile(
                 r" *(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator"
-                r"|Requested SOP Class UID|Their Implementation Class UID|Application Context Name"
-                r"|Abstract Syntax|SOP Class|Service Class) *: *=?"
+                r"|Requested SOP Class UID|Requested SOP Instance UID"
+                r"|Their Implementation Class UID|Their Implementation Version Name"
+                r"|Calling Application Name|Called Application Name|Application Context Name"
+                r"|Abstract Syntax|Accepted Transfer Syntax|SOP Class|Service Class) *: *=?"
             )
         ),
         _Shape(re.compile(r"(?P<label>) +=")),  # a transfer syntax, alone under its context
     ),
 }
 
-#: What pynetdicom's dumps print where a peer sent no value; not a peer's value.
-_DUMP_PLACEHOLDERS = frozenset({"unknown", "none", "None"})
+#: The ``pynetdicom._handlers`` labels whose value ``set_ae`` checks, as :func:`_kept` does.
+_TITLE_LABELS = frozenset(
+    {
+        "Move Originator",
+        "Calling Application Name",
+        "Called Application Name",
+        "Their Implementation Version Name",
+    }
+)
 
 
 def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
@@ -506,16 +535,22 @@ _PRE_READ = threading.local()
 def _kept(label: str, value: str) -> bool:
     """Whether a ``pynetdicom._handlers`` field value passes the check pynetdicom flags it on. A
     check that raises redacts the value, since a filter that raised would raise on the pynetdicom
-    thread that logged the line."""
+    thread that logged the line.
+
+    No word is let through as a placeholder. The only one pynetdicom 3.0.4 prints on these labels
+    is ``unknown``, where a peer sent no implementation class UID or version name. As a version
+    name it passes the title check, as the same word sent by a peer would. As a class UID it is
+    redacted: ``set_uid`` takes any 1 to 64 characters unless ``ENFORCE_UID_CONFORMANCE`` is set,
+    so a peer can send ``unknown`` itself, and the line cannot say which it is."""
     try:
-        if value in _DUMP_PLACEHOLDERS:
-            return True
-        if label == "Move Originator":
+        if label in _TITLE_LABELS:
             from pynetdicom import _config as netdicom_config
 
             # A quote is not in a real title; it is in the repr of one with more than one value,
             # which message_to_primitive flags before it takes the first.
-            return "'" not in value and bool(netdicom_config.VALIDATORS["AE"](value)[0])
+            if label == "Move Originator" and "'" in value:
+                return False
+            return bool(netdicom_config.VALIDATORS["AE"](value)[0])
         # A class or syntax is logged by its name; an instance UID never is.
         named = not label.endswith("Instance UID") and value in _uid_names()
         return named or _loggable_uid(value) == value
@@ -566,7 +601,43 @@ class _PeerValueFilter(logging.Filter):
         redacted = _redacted_line(shapes, text)
         if redacted is not None:
             record.msg, record.args = redacted, ()
+        if record.exc_info and record.exc_info[1] is not None:
+            exc = record.exc_info[1]
+            try:
+                _redact_traceback(record, shapes, exc)
+            except Exception as failed:  # noqa: BLE001 - rendering a third-party exception; never raise here
+                # A filter that raised would raise on the pynetdicom thread that logged the line, and
+                # the traceback could still hold the value, so it is withheld.
+                record.exc_info = None
+                record.exc_text = f"{type(exc).__name__} (traceback withheld: it did not render)"
+                logger.debug("A DICOM traceback was withheld: %s", type(failed).__name__)
         return True
+
+
+def _redact_traceback(
+    record: logging.LogRecord, shapes: tuple[_Shape, ...], exc: BaseException
+) -> None:
+    """Redact the message of ``exc``, and of each exception it was raised from or during, where it
+    is of a shape in ``shapes``. A formatter writes each one again on the traceback's last lines,
+    which redacting the record's own message does not reach. The traceback is rendered into
+    ``exc_text`` and ``exc_info`` cleared, as ``logging_setup``'s own redaction does, so a
+    formatter writes the rendered copy. A traceback with no such message is left as it was."""
+    redactions: list[tuple[str, str]] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current)
+        redacted = _redacted_line(shapes, message)
+        if redacted is not None:
+            redactions.append((message, redacted))
+        current = current.__cause__ or current.__context__
+    if not redactions:
+        return
+    rendered = "".join(traceback.format_exception(exc)).rstrip("\n")
+    for message, redacted in redactions:
+        rendered = rendered.replace(message, redacted)
+    record.exc_info, record.exc_text = None, rendered
 
 
 _PEER_VALUE_FILTER = _PeerValueFilter()
