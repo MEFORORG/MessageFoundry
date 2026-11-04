@@ -3887,9 +3887,10 @@ def _restore_blocking(
         # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
         # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
         # 3.14.6) rather than inheriting the parent's. The files staged inside it are the whole
-        # decrypted archive and, on the store route, the whole extracted store. On the store route
-        # both are full-body PHI at rest (docs/PHI.md section 3), and an archive can also carry a
-        # config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
+        # decrypted archive and, on the store route, the whole extracted store. Both can be full-body
+        # PHI at rest (docs/PHI.md section 3), the archive on the config-only route too when a
+        # store-carrying archive is decrypted whole before it is refused, and an archive can also
+        # carry a config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
