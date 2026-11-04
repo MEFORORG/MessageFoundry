@@ -4386,6 +4386,28 @@ def _is_db_proc_call(statement_lower: str) -> bool:
     return bool(_DB_PROC_CALL_RE.search(statement_lower))
 
 
+def _reject_unlisted_generic_driver(dialect: object, odbc_driver: object) -> None:
+    """Refuse a literal generic ``dialect`` with a literal ``odbc_driver`` off the generic driver
+    allowlist, at declaration (BACKLOG #5041), as ``DatabasePoll`` refuses a writing
+    ``poll_statement``: ``messagefoundry check`` builds connectors only with a messagefoundry.toml,
+    so the build's own refusal alone would leave a bare config directory passing. Both factories are
+    reachable from ``connections.toml``, so this covers that file too. An ``env()`` dialect or driver
+    is left to the build, which resolves it and refuses the same names, and to
+    :func:`refused_generic_db_drivers`. Imported lazily: ``messagefoundry.transports`` imports this
+    module at its top level."""
+    if not (isinstance(dialect, str) and dialect.lower() == "generic"):
+        return
+    if not isinstance(odbc_driver, str):
+        return
+    from messagefoundry.transports.db_endpoint import (
+        GENERIC_DRIVER_REFUSAL,
+        generic_driver_family,
+    )
+
+    if generic_driver_family(odbc_driver) is None:
+        raise WiringError(f"DATABASE {GENERIC_DRIVER_REFUSAL}")
+
+
 def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
     """Refuse an ``env()`` ref inside ``odbc_params`` (#66), in **both** spellings. Nested settings are
     NOT env-resolved (only top-level ones are — see :func:`resolve_env_settings`), so an env ref here
@@ -4488,8 +4510,9 @@ def Database(
 
     ``dialect='sqlserver'`` (default) is the **production / supported** SQL Server preset over ODBC Driver
     18. ``dialect='generic'`` (#66) targets an OS-installed ODBC driver that reads ``SERVER`` as its
-    target (PostgreSQL / MySQL; docs/CONNECTIONS.md, *Accepted odbc_params keywords*, says what is
-    reported for a driver the engine cannot place): name it in ``odbc_driver`` and pass
+    target (PostgreSQL / MySQL): name it in ``odbc_driver`` by a name on the generic driver
+    allowlist (docs/CONNECTIONS.md, *The generic driver allowlist*; any other is refused, here when
+    both it and ``dialect`` are literals, BACKLOG #5041), and pass
     driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``; credentials stay in
     ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` — default
     ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
@@ -4511,6 +4534,7 @@ def Database(
     trailing readback ``SELECT`` in the proc batch. The proc **must be idempotent and must not COMMIT/ROLLBACK
     internally**, or a crash-re-send may capture a divergent value (ADR 0013 amendment atomicity caveat)."""
     _reject_envref_odbc_params(odbc_params)
+    _reject_unlisted_generic_driver(dialect, odbc_driver)
     return ConnectionSpec(
         ConnectorType.DATABASE,
         {
@@ -4616,6 +4640,7 @@ def DatabasePoll(
     refused: at least a ``SELECT`` that calls a function which writes, and a T-SQL second statement
     with no ``;`` whose verb the test does not list, pass."""
     _reject_envref_odbc_params(odbc_params)
+    _reject_unlisted_generic_driver(dialect, odbc_driver)
     # Refused at declaration, as DatabaseRef's statement is (BACKLOG #2617), because
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
     # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
@@ -7011,7 +7036,7 @@ UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env
 
 #: Opens the reason :func:`refused_generic_db_drivers` gives for an ``odbc_driver`` off the
 #: generic dialect's driver allowlist, which the build refuses (BACKLOG #5041).
-REFUSED_DRIVER_REASON = "refused at build: odbc_driver is not on the generic driver allowlist"
+REFUSED_DRIVER_REASON = "refused at build: odbc_driver names no driver the generic dialect accepts"
 
 #: Opens the reason :func:`refused_generic_db_drivers` gives when ``odbc_driver`` is an ``env()``
 #: reference it cannot resolve, so whether the build refuses it is unknown (BACKLOG #5041).
@@ -7081,8 +7106,10 @@ def unverified_generic_db_hops(
     counts for its driver family (see ``transports.database._sets_tls_mode``) and is outside the
     no-TLS deny-list is absent. A mode counts only on the keyword the family placed from
     ``odbc_driver`` reads, and for psqlODBC and MySQL only at that family's own spellings, so a mode
-    keyword the named driver does not read, and any hop whose ``odbc_driver`` the engine cannot
-    place, is flagged and listed (BACKLOG #5053). A blank, padded or non-string mode value is
+    keyword the named driver does not read is flagged and listed (BACKLOG #5053). A hop whose
+    ``odbc_driver`` is off the generic driver allowlist is not: the build refuses it on every
+    posture, so it is no TLS loosening, and :func:`refused_generic_db_drivers` lists it (BACKLOG
+    #5041). An unresolved ``env()`` driver is still listed here. A blank, padded or non-string mode value is
     flagged and listed too. A hop can appear here and still be crossed legitimately, on-box or
     under a declared attestation or acceptance, so never read it as "who is crossing in the clear".
 
@@ -7118,6 +7145,7 @@ def unverified_generic_db_hops(
         generic_odbc_tls_unenforced,
         generic_odbc_tls_unenforced_unread,
     )
+    from messagefoundry.transports.db_endpoint import generic_driver_family
 
     def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
         dialect = _db_dialect(settings, env_values)
@@ -7137,6 +7165,10 @@ def unverified_generic_db_hops(
         reason: str | None
         if driver is _UNRESOLVED:
             reason = generic_odbc_tls_unenforced_unread(params) or UNRESOLVED_DRIVER_REASON
+        elif generic_driver_family(driver) is None:
+            # BACKLOG #5041: the build refuses this driver on every posture and no declaration
+            # lifts that, so it is not a TLS loosening; refused_generic_db_drivers lists it.
+            return None
         else:
             reason = generic_odbc_tls_unenforced(params, driver=driver)
         if reason is None or dialect is not None:
@@ -7174,8 +7206,9 @@ def refused_generic_db_drivers(
     check``'s required ``build-check``, and the ``[egress].allowed_db`` check refuses it too. This
     is the graph's view of the same decision, through the same classifier,
     :func:`~messagefoundry.transports.db_endpoint.generic_driver_family`, imported lazily for the
-    one-way rule. It lists a hop that would be refused even where ``build-check`` cannot run, such
-    as a config directory with no service settings, or a ``deployed=False`` connection.
+    one-way rule. A literal generic dialect with a literal name off the list is refused where it
+    is declared (:func:`_reject_unlisted_generic_driver`), so what this lists is a hop with an
+    ``env()`` dialect or driver, which only the build resolves.
 
     Read as :func:`unverified_generic_db_hops` reads the graph: both connection tables, inbound
     names prefixed ``inbound:``; an ``env()`` dialect resolved against ``env_values`` when given and

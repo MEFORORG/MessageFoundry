@@ -959,7 +959,8 @@ _UNPLACED_DRIVERS = ["MySQL", "/usr/lib64/libmyodbc8w.so", "MariaDB ODBC 3.1 Dri
 # What the refusal for a name off the generic driver allowlist leads with (BACKLOG #5041): the
 # families to name instead. No value is advised.
 _UNPLACED_POINTER = (
-    "DATABASE generic dialect; name psqlODBC or MySQL Connector/ODBC by its registered name"
+    "DATABASE odbc_driver names no driver the generic dialect accepts; name psqlODBC or MySQL "
+    "Connector/ODBC by its registered name"
 )
 
 

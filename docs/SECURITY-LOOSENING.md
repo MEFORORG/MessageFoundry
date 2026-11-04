@@ -1992,8 +1992,10 @@ count is above `0` (vault BACKLOG #2613).
 - **How it is detected, precisely:** the engine places the `odbc_driver` name in a driver family
   (BACKLOG #5053). The hop counts as owned only when the one mode keyword that family reads, at a
   spelling it reads, has a non-blank string value with no blank at either end, and no TLS-shaped
-  `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known no-TLS spellings. On a name the
-  engine cannot place, no keyword counts at all. The families, their keywords and their spellings
+  `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known no-TLS spellings. A name off
+  [the generic driver allowlist](CONNECTIONS.md#the-generic-driver-allowlist) is not a loosening
+  here: the build refuses it on every posture, and no declaration lifts that (BACKLOG #5041). The
+  families, their keywords and their spellings
   are tabled once, in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling).
   The value check matters: matching the key alone read `SSLmode=disable` as TLS
   ownership. So did a lone key or certificate path, or a blank mode, none of which the engine counts

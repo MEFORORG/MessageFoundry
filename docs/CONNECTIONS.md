@@ -1971,17 +1971,18 @@ names, in any case but spelled with single spaces (BACKLOG #5041):
 | MySQL Connector/ODBC | `MySQL ODBC <version> Unicode Driver` or `MySQL ODBC <version> ANSI Driver`, where the version is digits and dots |
 | Microsoft ODBC Driver for SQL Server | `ODBC Driver <n> for SQL Server`, where `<n>` is digits alone |
 
-Any other name is **refused when the connection is built**, inbound `DatabasePoll` and outbound
-`Database` alike, on every posture, and no declaration lifts that: not `tls_hop_attested`, not
-`cleartext_accepted`, and not an on-box `server`. The refusal fails `messagefoundry check`'s
+Any other name is **refused**, inbound `DatabasePoll` and outbound `Database` alike, on every
+posture, and no declaration lifts that: not `tls_hop_attested`, not `cleartext_accepted`, and not
+an on-box `server`. Where both `dialect` and `odbc_driver` are written as literals, it is refused
+where the connection is declared, code-first or in `connections.toml`, so the config does not
+load and `messagefoundry check`'s required `validate` fails, with or without a
+`messagefoundry.toml`. Every other case is refused when the connection is built: that fails the
 required `build-check`, a dry run and a reload, and in the live build at `serve` start it fails
 that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
-the host says. An `odbc_driver` given as `env()` is resolved when the connection is built, and
-refused unless it resolves to a name above, as the SQL Server preset treats its own driver
-(BACKLOG #4873). `messagefoundry check` reads the graph without the values, so its advisory
-`generic-db-driver` line lists such a hop as possibly refused, naming the reference's key and
-never its value. That line also lists a hop with a literal name off the list, a `deployed=False`
-one included, which `build-check` does not build.
+the host says. An `env()` `dialect` or `odbc_driver` is resolved when the connection is built,
+and refused unless the driver resolves to a name above. `messagefoundry check` reads the graph
+without the values, so its advisory `generic-db-driver` line lists such a hop as possibly
+refused, naming the reference's key and never its value.
 
 Refused, at least: a library path, which a driver manager may load as given; an odbcinst alias
 such as RHEL's bare `MySQL`; a file-based driver such as SQLite's or Microsoft Access's, which
@@ -2072,8 +2073,9 @@ host.
   Linux that last name is commonly a FreeTDS alias. FreeTDS reads `,<port>` as the port. But
   nothing shows it reads the preset's TLS keywords, `Encrypt` and `TrustServerCertificate`. A hop
   the engine reports as verifying TLS could then not verify.
-- For another driver, use `dialect="generic"` on `Database` or `DatabasePoll`. `DatabaseLookup`
-  and `DatabaseRef` take only a Microsoft driver.
+- For psqlODBC or MySQL Connector/ODBC, use `dialect="generic"` on `Database` or
+  `DatabasePoll`, which takes only [its allowlist](#the-generic-driver-allowlist).
+  `DatabaseLookup` and `DatabaseRef` take only a Microsoft driver.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
 - `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
   the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
@@ -2242,10 +2244,10 @@ built, and the error names the setting and never the value:
 | Setting | Sent as | Rule |
 |---|---|---|
 | `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
-| `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for every other driver, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
+| `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for psqlODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
 | `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
-| `password` | braced for a listed driver, otherwise plain | printable ASCII. See below |
+| `password` | braced, with the `}}` escape | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
 psqlODBC did not honour `SSLmode={verify-full}` or `SSLmode={require}`: each connected with no TLS

@@ -3025,7 +3025,8 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     arms from the graph — a second, silently different definition of a decision that already has one.
     A hop with a usable mode value outside the no-TLS deny-list, on the keyword and at a spelling its
     driver family reads, is not reported here at all (a blank, padded or non-string mode value is,
-    and so is any mode on a driver name the engine cannot place, BACKLOG #5053): the engine cannot
+    BACKLOG #5053; a driver off the allowlist is refused and is on ``generic-db-driver`` instead,
+    BACKLOG #5041): the engine cannot
     prove that value verifies
     anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
     what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
@@ -3075,12 +3076,11 @@ def _check_generic_db_driver(config_dir: str | Path) -> CheckResult:
     """Surface the generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` is off the generic
     dialect's driver allowlist, which the build refuses (BACKLOG #5041).
 
-    The refusal itself is at construction, so the REQUIRED ``build-check`` fails on such a hop;
-    ``[egress].allowed_db`` refuses it too. This line is the graph's view of the same decision,
-    through the same classifier, so it also names a hop ``build-check`` does not build: a config
-    directory with no service settings, where ``build-check`` skips, or a ``deployed=False``
-    connection. ``required=False`` so the decision has one gate, as ``generic-db-tls`` reasons, and
-    because an ``env()`` driver it cannot resolve is only possibly refused. It replaced BACKLOG
+    A literal generic dialect with a literal name off the list is refused where it is declared,
+    so the REQUIRED ``validate`` fails on it. Any other such hop is refused at construction, so the
+    REQUIRED ``build-check`` fails on it; ``[egress].allowed_db`` refuses it too. This line is the
+    graph's view of the hops whose ``env()`` dialect or driver only the build resolves, through the
+    same classifier. ``required=False`` because without the values each is only possibly refused. It replaced BACKLOG
     #5163's advisory ``generic-db-server`` line, which listed the same names as a warning. SKIPs
     when the graph will not load, as ``generic-db-tls`` does."""
     from messagefoundry.config.wiring import WiringError, load_config, refused_generic_db_drivers

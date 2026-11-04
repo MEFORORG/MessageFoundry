@@ -134,6 +134,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.db_endpoint import (
     COMMA_PORT_FAMILIES,
+    GENERIC_DRIVER_FAMILIES,
     GENERIC_DRIVER_REFUSAL,
     SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
@@ -741,10 +742,10 @@ class _DriverFamily(NamedTuple):
 
 
 # What the engine knows of each family on the generic driver allowlist, keyed as
-# ``GENERIC_DRIVER_FAMILIES`` keys it (BACKLOG #2705, #5029, #5053, #5041). The allowlist, its names
-# and why each family is on it are stated once, in ``transports.db_endpoint``; the build refuses any
-# other name, so every hop that is built places one of these. A change here is a change to the TLS
-# gate and the password rule, and is reviewed as one.
+# ``GENERIC_DRIVER_FAMILIES`` keys it (BACKLOG #2705, #5029, #5053, #5041). The allowlist and its
+# names are in ``transports.db_endpoint``, and why each family is on it is in docs/CONNECTIONS.md;
+# the build refuses any other name, so every hop that is built places one of these. A change here is
+# a change to the TLS gate and the password rule, and is reviewed as one.
 #
 # psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
 # Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
@@ -779,6 +780,10 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
 # only on the family that reads it. A key, certificate or CA file, or a cipher list, does not
 # count. docs/CONNECTIONS.md records what the drivers read so far do with one.
 _ODBC_TLS_MODE_KEYWORDS = frozenset(family.tls_keyword for family in _DRIVER_FAMILIES.values())
+
+# Fail at import, not with a KeyError mid-build, if a family is on one table and not the other.
+if set(_DRIVER_FAMILIES) != set(GENERIC_DRIVER_FAMILIES):
+    raise RuntimeError("_DRIVER_FAMILIES and GENERIC_DRIVER_FAMILIES must name the same families")
 
 #: The one classifier of a generic ``odbc_driver`` name, shared with the ``[egress].allowed_db``
 #: check (BACKLOG #5041): the key in :data:`_DRIVER_FAMILIES` of the family the name places, or
@@ -1422,8 +1427,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
-    refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
-    on the escape list, and otherwise sent plain when it can be and refused when it cannot
+    refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
+    always braced with the ``}}`` escape, as every family on the list reads it
     (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
@@ -1438,8 +1443,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     TLS is **not required**, or set no mode its driver family reads, is refused off-loopback on an
     enforcing instance by :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors
     call beside this builder. A mode counts only on the keyword the family :func:`_driver_family`
-    places reads, and for psqlODBC and MySQL only at that family's own spellings; a name the engine
-    cannot place has no mode that counts (BACKLOG #5053, :func:`generic_odbc_tls_unenforced`). What
+    places reads, and for psqlODBC and MySQL only at that family's own spellings (BACKLOG #5053,
+    :func:`generic_odbc_tls_unenforced`); a name off the allowlist is refused above. What
     stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
     and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
@@ -1462,7 +1467,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     # family on the allowlist.
     family = _driver_family(driver)
     if family is None:
-        raise ValueError(f"{where}DATABASE generic dialect; {GENERIC_DRIVER_REFUSAL}")
+        raise ValueError(f"{where}DATABASE {GENERIC_DRIVER_REFUSAL}")
     parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)

@@ -3441,7 +3441,6 @@ def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
         env,
         unverified_generic_db_hops,
     )
-    from messagefoundry.transports.database import UNPLACED_DRIVER_REASON
 
     cast_ran: list[str] = []
 
@@ -3473,9 +3472,16 @@ def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     # The dark connection's driver is never resolved, so it is listed as unread, not as unplaced.
     assert resolved["OB_DARK"].startswith(UNRESOLVED_DRIVER_REASON)
     assert cast_ran == ["PostgreSQL Unicode"], "only the deployed connection's value is resolved"
-    # The control: the same live hop with a value that names no family is listed.
-    listed = dict(unverified_generic_db_hops(reg, env_values={**values, "ob_live_driver": "MySQL"}))
-    assert listed["OB_LIVE"].startswith(UNPLACED_DRIVER_REASON)
+    # The control: the same live hop under a family that does not read that spelling is listed.
+    mysql = {**values, "ob_live_driver": "MySQL ODBC 8.0 Unicode Driver"}
+    listed = dict(unverified_generic_db_hops(reg, env_values=mysql))
+    assert listed["OB_LIVE"].startswith("a TLS mode is set that this driver does not read")
+    # A value off the generic driver allowlist is refused at build whatever its TLS, so it is not
+    # a TLS loosening and this reader leaves it to refused_generic_db_drivers (BACKLOG #5041).
+    refused = dict(
+        unverified_generic_db_hops(reg, env_values={**values, "ob_live_driver": "MySQL"})
+    )
+    assert "OB_LIVE" not in refused
     # No values: the driver is unresolved, so the hop is listed rather than guessed clear, and the
     # reason says the name was not read rather than that it cannot be placed.
     unread = dict(unverified_generic_db_hops(reg))["OB_LIVE"]

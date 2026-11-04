@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 #: The port the SQL Server preset's connection string uses when ``port`` is not set.
@@ -205,28 +206,21 @@ class DialEndpoint(NamedTuple):
 # ``[egress].allowed_db`` check refuses it as a conflict, and the TLS gate, the password rule and
 # the port reading in :mod:`messagefoundry.transports.database` and here place a family by it.
 #
-# Each family is a network database driver documented to read ``SERVER`` as its target host, read
-# from its own source on 2026-11-03 (BACKLOG #5163): psqlODBC's ``dlg_specific.h`` defines
-# ``SPEC_SERVER`` as the connection-string keyword ``server``; MySQL Connector/ODBC's *Connector/ODBC
-# Connection Parameters* page lists ``server`` as the host name of the server; and Microsoft's *ODBC
-# DSN and Connection String Keywords* page lists ``Server``. That is the documentation's claim, and
-# no run was designed to test it. A family is added here only on the same evidence, and with an
-# entry in ``transports.database._DRIVER_FAMILIES`` saying what the engine knows of its TLS keyword
-# and password escape: adding one admits a driver to a hop the egress check and the cleartext-hop
-# guard judge by ``server``, so it is a change to both controls and is reviewed as one.
-#
-# Whole registered names, in any case but spelled with single spaces. psqlODBC's include the bare
-# ``PostgreSQL``, the section name RHEL registers it under. Not on the list, at least: a library path
-# (which a driver manager may load as given, BACKLOG #2628), an odbcinst alias such as RHEL's bare
-# ``MySQL``, a file-based driver such as SQLite's or Microsoft Access's (which reads no ``SERVER``,
-# BACKLOG #2705), another vendor's driver for the same database such as MariaDB's, and
-# Microsoft's ``ODBC Driver 13.1 for SQL Server``, whose TLS keyword and password escape no table
-# here records. The engine reads the name, never the library it loads.
-GENERIC_DRIVER_FAMILIES: dict[str, re.Pattern[str]] = {
-    "psqlodbc": re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
-    "mysql": re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
-    "msodbc": re.compile(r"odbc driver [0-9]+ for sql server"),
-}
+# Each family is a network database driver documented to read ``SERVER`` as its target host. The
+# evidence for each, and what the list refuses and cannot see, are stated once, in
+# docs/CONNECTIONS.md, *The generic driver allowlist*. A family is added here only on the same
+# evidence, and with an entry in ``transports.database._DRIVER_FAMILIES`` saying what the engine
+# knows of its TLS keyword and password escape (that module refuses to import without one): adding
+# one admits a driver to a hop the egress check and the cleartext-hop guard judge by ``server``, so
+# it is a change to both controls and is reviewed as one. Whole registered names, in any case but
+# spelled with single spaces. Read-only, so code loaded in-process cannot widen it.
+GENERIC_DRIVER_FAMILIES: Mapping[str, re.Pattern[str]] = MappingProxyType(
+    {
+        "psqlodbc": re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
+        "mysql": re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
+        "msodbc": re.compile(r"odbc driver [0-9]+ for sql server"),
+    }
+)
 
 #: The families on the allowlist that read ``SERVER=host,port`` as one host and its port, and
 #: ignore the ``PORT`` keyword: Microsoft's driver alone (BACKLOG #4874). Every other family reads
@@ -234,12 +228,12 @@ GENERIC_DRIVER_FAMILIES: dict[str, re.Pattern[str]] = {
 #: by :func:`generic_hop_endpoint`'s caller, the cleartext-hop guard.
 COMMA_PORT_FAMILIES = frozenset({"msodbc"})
 
-#: Why the generic dialect refuses an ``odbc_driver`` off :data:`GENERIC_DRIVER_FAMILIES`, remedy
-#: first: a stored failure keeps about its first 200 characters. Microsoft's driver is not offered
-#: here, since on this dialect it ignores ``PORT``; it is accepted all the same.
+#: Why the generic dialect refuses an ``odbc_driver`` off :data:`GENERIC_DRIVER_FAMILIES`, cause
+#: then remedy, both inside the about 200 characters a stored failure keeps. Microsoft's driver is
+#: not offered here, since on this dialect it ignores ``PORT``; it is accepted all the same.
 GENERIC_DRIVER_REFUSAL = (
-    "name psqlODBC or MySQL Connector/ODBC by its registered name in odbc_driver, or use dialect "
-    "sqlserver for SQL Server; the generic dialect accepts no other driver (see Generic ODBC in "
+    "odbc_driver names no driver the generic dialect accepts; name psqlODBC or MySQL Connector/ODBC by "
+    "its registered name, or use dialect sqlserver for SQL Server (see Generic ODBC in "
     "docs/CONNECTIONS.md)"
 )
 
@@ -341,8 +335,8 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
         return "odbc_driver must not hold ';', '{', '}' or '=' (ODBC injection risk)"
     if not _preset_driver(driver):
         return (
-            'name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect="generic": '
-            "another driver can misread the server,port the preset sends"
+            'name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect="generic" '
+            "with psqlODBC or MySQL: others misread the server,port it sends"
         )
     server = str(settings.get("server", ""))
     if "," in server:

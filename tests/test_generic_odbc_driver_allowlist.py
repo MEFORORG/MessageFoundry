@@ -116,7 +116,7 @@ def test_the_build_refuses_a_name_off_the_allowlist(driver: str) -> None:
     with pytest.raises(ValueError, match=_REFUSED) as refused:
         _build_odbc_dsn({"odbc_driver": driver, "server": "db.example.invalid"}, connection="OB_X")
     message = str(refused.value)
-    assert message.startswith("connection 'OB_X'; DATABASE generic dialect; name psqlODBC")
+    assert message.startswith("connection 'OB_X'; DATABASE odbc_driver names no driver the generic")
 
 
 @pytest.mark.parametrize("driver", sorted(_ACCEPTED))
@@ -125,26 +125,42 @@ def test_the_build_takes_a_name_on_the_allowlist(driver: str) -> None:
     assert dsn.startswith(f"DRIVER={{{driver.strip()}}};SERVER=db.example.invalid;")
 
 
+# Raw settings, not the factories: Database() and DatabasePoll() refuse a literal off-list name
+# at declaration, so these reach the build the way an env() driver resolved at build does.
 def _destination(driver: str, server: str, **extra: Any) -> Destination:
-    return Destination(
-        name="OB_ELSEWHERE",
-        type=ConnectorType.DATABASE,
-        settings=Database(
-            server=server, dialect="generic", odbc_driver=driver, statement=_INSERT
-        ).settings,
-        **extra,
-    )
+    settings = {"server": server, "dialect": "generic", "odbc_driver": driver, "statement": _INSERT}
+    return Destination(name="OB_ELSEWHERE", type=ConnectorType.DATABASE, settings=settings, **extra)
 
 
 def _source(driver: str, server: str, **extra: Any) -> Source:
-    return Source(
-        name="IB_ELSEWHERE",
-        type=ConnectorType.DATABASE,
-        settings=DatabasePoll(
-            server=server, dialect="generic", odbc_driver=driver, poll_statement="SELECT 1"
-        ).settings,
-        **extra,
-    )
+    settings = {"server": server, "dialect": "generic", "odbc_driver": driver}
+    settings["poll_statement"] = "SELECT 1"
+    return Source(name="IB_ELSEWHERE", type=ConnectorType.DATABASE, settings=settings, **extra)
+
+
+@pytest.mark.parametrize("factory", ["Database", "DatabasePoll"])
+def test_the_factories_refuse_a_literal_name_off_the_allowlist_at_declaration(
+    factory: str,
+) -> None:
+    """``messagefoundry check`` builds connectors only with a messagefoundry.toml, so a literal
+    name is refused where it is declared, as a writing ``poll_statement`` is. An ``env()`` dialect
+    or driver is left to the build, which resolves it, and a placed name is the control."""
+    common: dict[str, Any] = {"server": "db.example.invalid"}
+    if factory == "Database":
+        make: Any = Database
+        common["statement"] = _INSERT
+    else:
+        make = DatabasePoll
+        common["poll_statement"] = "SELECT 1"
+    with pytest.raises(WiringError, match=_REFUSED):
+        make(dialect="generic", odbc_driver=_ORACLE, **common)
+    with pytest.raises(WiringError, match=_REFUSED):
+        make(dialect="GENERIC", odbc_driver="MySQL", **common)
+    make(dialect="generic", odbc_driver="PostgreSQL Unicode", **common)
+    make(dialect=env("db_dialect"), odbc_driver=_ORACLE, **common)
+    make(dialect="generic", odbc_driver=env("db_driver"), **common)
+    # Not the generic arm: the preset keeps its own driver rule, refused at build (BACKLOG #4873).
+    make(odbc_driver=_ORACLE, database="MFDB", **common)
 
 
 def test_both_connection_kinds_refuse_it_at_construction() -> None:
@@ -192,19 +208,22 @@ def test_the_egress_check_refuses_the_name_the_build_refuses(driver: str) -> Non
     placed = {**settings, "odbc_driver": "PostgreSQL Unicode"}
     assert database_dial_endpoint(placed, dialect="generic").conflict is None
     # Not the preset's arm: it keeps its own driver rule (BACKLOG #4873).
-    assert database_dial_endpoint(settings, dialect="sqlserver").conflict != GENERIC_DRIVER_REFUSAL
+    preset = database_dial_endpoint(settings, dialect="sqlserver").conflict
+    assert preset is not None and preset.startswith("name a Microsoft SQL Server driver"), preset
 
 
 def test_the_refusal_names_no_value_and_survives_the_stored_cut() -> None:
-    """A stored failure keeps about the first 200 characters, so the remedy leads. It quotes
-    neither the driver name given nor a TLS spelling, and two upper case words never sit side by
-    side, which the log redaction would blank."""
+    """A stored failure keeps about the first 200 characters, so the cause and the remedy both
+    sit inside them. It does not quote the driver name given."""
     name = "OB_DB_" + "X" * 34
     with pytest.raises(ValueError) as refused:
         _build_odbc_dsn({"odbc_driver": _ORACLE, "server": "db.example.invalid"}, connection=name)
     message = str(refused.value)
     assert _ORACLE not in message
-    lead = "name psqlODBC or MySQL Connector/ODBC by its registered name in odbc_driver"
+    lead = (
+        "odbc_driver names no driver the generic dialect accepts; name psqlODBC or MySQL "
+        "Connector/ODBC by its registered name"
+    )
     assert message.index(lead) + len(lead) < 200, message
 
 
@@ -222,10 +241,11 @@ def _outbound(reg: Registry, name: str, *, deployed: bool = True, **settings: An
 
 
 def test_the_reader_walks_both_tables_and_skips_the_preset() -> None:
+    # A literal generic dialect with a literal off-list name is refused at declaration, so the
+    # reader meets such a name through an env() dialect, resolved here as the build resolves it.
     reg = Registry()
     _outbound(reg, "OB_PG", dialect="generic", odbc_driver="PostgreSQL Unicode")
-    _outbound(reg, "OB_ORACLE", dialect="generic", odbc_driver=_ORACLE)
-    _outbound(reg, "OB_DARK", deployed=False, dialect="generic", odbc_driver="MySQL")
+    _outbound(reg, "OB_ORACLE", dialect=env("db_dialect"), odbc_driver=_ORACLE)
     # Not this reader's arm: the preset refuses a non-Microsoft odbc_driver when its string is
     # built (BACKLOG #4873), which registering the connection here does not do.
     _outbound(reg, "OB_PRESET", database="MFDB", odbc_driver=_ORACLE)
@@ -234,16 +254,15 @@ def test_the_reader_walks_both_tables_and_skips_the_preset() -> None:
             "IB_ORACLE",
             DatabasePoll(
                 server="poll.example.invalid",
-                dialect="generic",
+                dialect=env("db_dialect"),  # type: ignore[arg-type]
                 odbc_driver=_ORACLE,
                 poll_statement="SELECT 1",
             ),
             router="R",
         )
     )
-    hops = dict(refused_generic_db_drivers(reg))
-    # A not-deployed connection is listed too: build-check never builds it.
-    assert set(hops) == {"OB_ORACLE", "OB_DARK", "inbound:IB_ORACLE"}
+    hops = dict(refused_generic_db_drivers(reg, env_values={"db_dialect": "generic"}))
+    assert set(hops) == {"OB_ORACLE", "inbound:IB_ORACLE"}
     assert hops["OB_ORACLE"].startswith(REFUSED_DRIVER_REASON)
     # The peer label names the host the egress check reads, so an operator can find the entry.
     assert "ob_oracle.example.invalid" in hops["OB_ORACLE"]
@@ -299,14 +318,14 @@ def test_the_reader_reads_an_env_dialect_and_an_env_driver_as_possibly() -> None
 
 
 _CHECK_MODULE = """
-from messagefoundry import Database, MLLP, Send, handler, inbound, outbound, router
+from messagefoundry import Database, MLLP, Send, env, handler, inbound, outbound, router
 
 inbound("IB", MLLP(port=15098), router="r")
 outbound(
     "OB_DB",
     Database(
         server="db.example.invalid",
-        dialect="generic",
+        dialect={dialect},
         odbc_driver="{driver}",
         statement="INSERT INTO r (a) VALUES (:a)",
         odbc_params={{"SSLmode": "verify-full"}},
@@ -325,27 +344,42 @@ def handle(msg):
 """
 
 
-def _check(tmp_path: Path, driver: str) -> Any:
+def _check(tmp_path: Path, driver: str, *, dialect: str = '"generic"', toml: bool = True) -> Any:
     from messagefoundry.checks import run_checks
 
-    cfg = _write_config(tmp_path, module=_CHECK_MODULE.format(driver=driver))
-    # Lists the host, so build-check reaches the connector rather than the unlisted-host refusal.
-    toml = tmp_path / "messagefoundry.toml"
-    toml.write_text(_TOML + '\n[egress]\nallowed_db = ["db.example.invalid"]\n', encoding="utf-8")
+    cfg = _write_config(tmp_path, module=_CHECK_MODULE.format(driver=driver, dialect=dialect))
+    settings = tmp_path / "messagefoundry.toml"
+    if toml:
+        # Lists the host, so build-check reaches the connector, not the unlisted-host refusal.
+        allowed = '\n[egress]\nallowed_db = ["db.example.invalid"]\n'
+        settings.write_text(_TOML + allowed, encoding="utf-8")
+    else:
+        settings.unlink()
     return run_checks(cfg, run_lint=False)
 
 
-def test_check_lists_a_refused_driver_and_build_check_refuses_it(tmp_path: Path) -> None:
-    report = _check(tmp_path, _ORACLE)
+def test_check_refuses_a_literal_name_in_a_bare_config_directory(tmp_path: Path) -> None:
+    """PR review: with no messagefoundry.toml ``build-check`` skips, so a refusal at build alone
+    would pass ``check``. The factory refuses at declaration, so the required ``validate`` fails."""
+    report = _check(tmp_path, _ORACLE, toml=False)
+    assert _result(report, "build-check").skipped
+    validate = _result(report, "validate")
+    assert not validate.ok and validate.required, validate.detail
+    assert GENERIC_DRIVER_REFUSAL in validate.detail, validate.detail
+    assert not report.ok
+    # The control: a name on the list loads.
+    control = tmp_path / "ok"
+    control.mkdir()
+    assert _result(_check(control, "PostgreSQL Unicode", toml=False), "validate").ok
+
+
+def test_check_lists_an_env_dialect_hop_the_build_may_refuse(tmp_path: Path) -> None:
+    report = _check(tmp_path, _ORACLE, dialect='env("db_dialect")')
     line = _result(report, "generic-db-driver")
     assert line.ok and not line.required and not line.skipped
     assert "1 generic-ODBC database connection(s)" in line.detail
-    assert "OB_DB" in line.detail and REFUSED_DRIVER_REASON in line.detail
-    assert GENERIC_DRIVER_REFUSAL in line.detail
-    # The required gate is the build itself, which refuses the same name.
-    build = _result(report, "build-check")
-    assert not build.ok and build.required and not build.skipped, build.detail
-    assert "generic dialect accepts no other driver" in build.detail, build.detail
+    assert "OB_DB" in line.detail and POSSIBLY_GENERIC_DB_HOP in line.detail
+    assert REFUSED_DRIVER_REASON in line.detail and GENERIC_DRIVER_REFUSAL in line.detail
 
 
 def test_check_says_none_when_every_driver_is_on_the_list(tmp_path: Path) -> None:
@@ -353,5 +387,4 @@ def test_check_says_none_when_every_driver_is_on_the_list(tmp_path: Path) -> Non
     line = _result(report, "generic-db-driver")
     assert line.ok and not line.required and not line.skipped
     assert line.detail.startswith("no generic-ODBC database connection names a driver")
-    build = _result(report, "build-check")
-    assert "generic dialect accepts no other driver" not in build.detail, build.detail
+    assert _result(report, "validate").ok
