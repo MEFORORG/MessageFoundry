@@ -1545,8 +1545,10 @@ count is above `0` (vault BACKLOG #2613).
 - **What the engine refuses without it:** each hop verifies the peer's certificate, and its
   handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
   off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
-  Both hold on a host the `smtp_allowed_hosts` or `webhook_allowed_hosts` allowlist admits; a host
-  off it is left to the per-send refusal.
+  Each holds on a host its own hop's allowlist admits: `[alerts].smtp_allowed_hosts` for the
+  relay, `[alerts].webhook_allowed_hosts` for the webhook. Which hosts a list admits, an unset or
+  empty one included, is stated once, in [PHI.md](PHI.md) rows 10 and 11. A host off its list
+  takes no guard at build; the allowlist itself then refuses every send to it.
   A relay with no login takes no guard at all, so the `email` pair does nothing there.
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the

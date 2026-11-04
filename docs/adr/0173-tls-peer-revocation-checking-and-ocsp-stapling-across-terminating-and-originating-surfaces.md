@@ -758,9 +758,9 @@ refusal.
 also sets `tls_revocation_attested`, is logged as crossing "without certificate revocation
 checking". The record says more than happened and loses nothing. A one-condition fix was built and
 reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
-and the attestation, where the line was the only record of the attestation. *(Note 2026-10-31: no
-longer over-states on a hop whose CRL is a real check; the CORRECTED 2026-10-30 paragraph below
-says what changed.)*
+and the attestation, where the line was the only record of the attestation. *(Note 2026-10-31: the
+line no longer over-states on a hop whose CRL is a real check; the CORRECTED 2026-10-30 paragraph
+below says what changed.)*
 
 **CORRECTED 2026-10-30 (BACKLOG #2193):** the guard's `crl_is_a_check` reads the context's
 time-check flag as well as its CRL flag, so a hop whose CRL is a real check no longer logs that
@@ -780,6 +780,15 @@ only in part, since a certificate the CRL lists is still refused at the handshak
 changed no disposition. Where the line no longer fires, the
 attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
 `security_loosenings()` names an `[alerts]` pair.
+
+**Note 2026-11-03 (BACKLOG #5089):** on the MLLP destination, the DICOM SCU and both FTPS
+directions, the kept line on a `tls_allow_expired` hop now says what it lacks. Each passes
+`expiry_relaxed` to `RevocationHopGuard.capture`, which it otherwise could not read off the context
+it withholds, and the line then reads *crossed without a revocation check the guard credits*: the
+certificate's validity period is not checked, and a CRL on the hop still refuses a leaf it lists
+but passes once lapsed. A guard handed a context that skips time validity words it the same way.
+The REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
+paragraph describes; their refusal text is left open in §13 too. No disposition reads the flag.
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.
@@ -1517,11 +1526,15 @@ on first deployment, with no attestation.
   §4.3's sentence that the MLLP hop "is not changed here" carries the pointer instead. And the reason §4.3's *One audit line still over-states* gives
   for reverting its one-condition fix, that the fix silenced the line for an MLLP hop with
   `tls_allow_expired`, a CRL and the attestation, no longer holds: that hop now has no CRL credit,
-  so the fix would not silence it. This amendment does not revisit that fix. *(Note 2026-10-31:
-  §4.3's CORRECTED 2026-10-30 paragraph records a different condition, `crl_is_a_check`, which
-  keeps the line for a context that skips time validity. Its effect matches that fix for every
-  shipped caller, because each passes no context when its context skips time validity, so the line
-  is silenced where the CRL is a real check.)*
+  so the fix would not silence it. This amendment does not revisit that fix, and that fix is not in the code. *(Note 2026-10-31,
+  CORRECTED 2026-11-03 under BACKLOG #5089: this note said the effect matched "for every shipped
+  caller", unhedged, and put the cause the wrong way round. §4.3's CORRECTED 2026-10-30 paragraph
+  records the condition the code applies, `crl_is_a_check`. It is what silences the line on a hop
+  whose CRL is a real check, and it keeps the line for a context that skips time validity. At least
+  the callers that paragraph names hand the guard no context when theirs skips time validity, and
+  that handoff is what makes `crl_is_a_check` equal `crl_checked` on each of them, so on those
+  callers the effect matches the reverted fix's. A caller that handed the guard such a context
+  would differ: there `crl_checked` is True and `crl_is_a_check` is False.)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
