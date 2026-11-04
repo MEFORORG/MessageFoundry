@@ -7036,7 +7036,7 @@ UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env
 
 #: Opens the reason :func:`refused_generic_db_drivers` gives for an ``odbc_driver`` off the
 #: generic dialect's driver allowlist, which the build refuses (BACKLOG #5041).
-REFUSED_DRIVER_REASON = "refused at build: odbc_driver names no driver the generic dialect accepts"
+REFUSED_DRIVER_REASON = "refused at build: odbc_driver is not one the generic dialect accepts"
 
 #: Opens the reason :func:`refused_generic_db_drivers` gives when ``odbc_driver`` is an ``env()``
 #: reference it cannot resolve, so whether the build refuses it is unknown (BACKLOG #5041).

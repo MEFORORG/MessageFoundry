@@ -213,7 +213,8 @@ class DialEndpoint(NamedTuple):
 # knows of its TLS keyword and password escape (that module refuses to import without one): adding
 # one admits a driver to a hop the egress check and the cleartext-hop guard judge by ``server``, so
 # it is a change to both controls and is reviewed as one. Whole registered names, in any case but
-# spelled with single spaces. Read-only, so code loaded in-process cannot widen it.
+# spelled with single spaces. Read-only against an edit in place; that is not a boundary
+# against code loaded in-process, which can still rebind this module's name.
 GENERIC_DRIVER_FAMILIES: Mapping[str, re.Pattern[str]] = MappingProxyType(
     {
         "psqlodbc": re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
@@ -227,14 +228,17 @@ GENERIC_DRIVER_FAMILIES: Mapping[str, re.Pattern[str]] = MappingProxyType(
 #: ``PORT``. The one record of how a family takes its port, read by the egress port reading here and
 #: by :func:`generic_hop_endpoint`'s caller, the cleartext-hop guard.
 COMMA_PORT_FAMILIES = frozenset({"msodbc"})
+if not COMMA_PORT_FAMILIES.issubset(GENERIC_DRIVER_FAMILIES):
+    # A renamed family would silently read PORT for a driver that ignores it.
+    raise RuntimeError("COMMA_PORT_FAMILIES names a family GENERIC_DRIVER_FAMILIES does not")
 
-#: Why the generic dialect refuses an ``odbc_driver`` off :data:`GENERIC_DRIVER_FAMILIES`, cause
-#: then remedy, both inside the about 200 characters a stored failure keeps. Microsoft's driver is
-#: not offered here, since on this dialect it ignores ``PORT``; it is accepted all the same.
+#: Why the generic dialect refuses an ``odbc_driver`` off :data:`GENERIC_DRIVER_FAMILIES`: cause,
+#: then the registered-name shapes, kept short since a stored failure keeps about 200 characters
+#: and each raise site adds the connection's name. Microsoft's driver is not offered here, since
+#: on this dialect it ignores ``PORT``; it is accepted all the same.
 GENERIC_DRIVER_REFUSAL = (
-    "odbc_driver names no driver the generic dialect accepts; name psqlODBC or MySQL Connector/ODBC by "
-    "its registered name, or use dialect sqlserver for SQL Server (see Generic ODBC in "
-    "docs/CONNECTIONS.md)"
+    "odbc_driver is not one the generic dialect accepts; name PostgreSQL Unicode or ANSI, or "
+    "MySQL ODBC <n> Unicode or ANSI Driver, or use dialect sqlserver (docs/CONNECTIONS.md)"
 )
 
 

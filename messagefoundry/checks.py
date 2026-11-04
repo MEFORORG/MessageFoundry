@@ -3078,7 +3078,8 @@ def _check_generic_db_driver(config_dir: str | Path) -> CheckResult:
 
     A literal generic dialect with a literal name off the list is refused where it is declared,
     so the REQUIRED ``validate`` fails on it. Any other such hop is refused at construction, so the
-    REQUIRED ``build-check`` fails on it; ``[egress].allowed_db`` refuses it too. This line is the
+    REQUIRED ``build-check`` fails on it where it runs, which needs service settings;
+    ``[egress].allowed_db`` refuses it too. This line is the
     graph's view of the hops whose ``env()`` dialect or driver only the build resolves, through the
     same classifier. ``required=False`` because without the values each is only possibly refused. It replaced BACKLOG
     #5163's advisory ``generic-db-server`` line, which listed the same names as a warning. SKIPs

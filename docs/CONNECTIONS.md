@@ -1976,9 +1976,10 @@ posture, and no declaration lifts that: not `tls_hop_attested`, not `cleartext_a
 an on-box `server`. Where both `dialect` and `odbc_driver` are written as literals, it is refused
 where the connection is declared, code-first or in `connections.toml`, so the config does not
 load and `messagefoundry check`'s required `validate` fails, with or without a
-`messagefoundry.toml`. Every other case is refused when the connection is built: that fails the
-required `build-check`, a dry run and a reload, and in the live build at `serve` start it fails
-that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
+`messagefoundry.toml`. Every other case is refused when the connection is built: that fails a
+dry run, a reload and the required `build-check` where it runs (it skips with no
+`messagefoundry.toml` and no `MEFOR_AI_ENVIRONMENT`), and in the live build at `serve` start it
+fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
 the host says. An `env()` `dialect` or `odbc_driver` is resolved when the connection is built,
 and refused unless the driver resolves to a name above. `messagefoundry check` reads the graph
 without the values, so its advisory `generic-db-driver` line lists such a hop as possibly
@@ -2272,11 +2273,11 @@ families follow the table below.
 The rule depends on the driver family, read from the `odbc_driver` name by
 [the generic driver allowlist](#the-generic-driver-allowlist):
 
-| Family | Registered names | `SSLmode` values accepted | The keyword counted as a TLS mode |
-|---|---|---|---|
-| psqlODBC | `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with `(x64)`, or the bare `PostgreSQL` | libpq's six, in lower case | `SSLmode`, at one of those six |
-| MySQL Connector/ODBC | `MySQL ODBC <version> Unicode Driver` or `... ANSI Driver` | `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case | `SSLMODE`, at one of those five |
-| Microsoft ODBC Driver for SQL Server | `ODBC Driver <n> for SQL Server` | none: the driver reads no `SSLmode`, so any value is refused, with a pointer to `Encrypt` | `Encrypt`, at any value the no-TLS list does not name |
+| Family, by the names [the allowlist](#the-generic-driver-allowlist) gives | `SSLmode` values accepted | The keyword counted as a TLS mode |
+|---|---|---|
+| psqlODBC | libpq's six, in lower case | `SSLmode`, at one of those six |
+| MySQL Connector/ODBC | `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case | `SSLMODE`, at one of those five |
+| Microsoft ODBC Driver for SQL Server | none: the driver reads no `SSLmode`, so any value is refused, with a pointer to `Encrypt` | `Encrypt`, at any value the no-TLS list does not name |
 
 MySQL takes the same keyword with its own upper-case values. Per engine PR 2691, a value it does
 not recognize leaves it at `PREFERRED`, which can fall back to plaintext, so under a MySQL name
@@ -2292,25 +2293,17 @@ name to a libpq spelling that MySQL ignores (BACKLOG #5029). The engine reads th
 library it loads, so registering another library under one of these names would have the engine
 judge it as that family.
 
-**The password.** When `odbc_driver` is, in any case but spelled with single spaces, the whole
-registered name of one of these drivers, the password is **always** sent braced, with the ODBC
-`}}` escape, whatever it holds:
-
-- psqlODBC, measured to read the escape: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with
-  `(x64)`, or the bare `PostgreSQL`, the section name RHEL registers it under;
-- MySQL Connector/ODBC, measured to read it: `MySQL ODBC <version> Unicode Driver` or
-  `... ANSI Driver`;
-- Microsoft's `ODBC Driver <n> for SQL Server`, not probed for this item but relied on for the
-  same escape by the SQL Server preset and the store.
+**The password.** For every family on [the allowlist](#the-generic-driver-allowlist) the
+password is **always** sent braced, with the ODBC `}}` escape, whatever it holds: psqlODBC and
+MySQL Connector/ODBC were measured to read the escape, and Microsoft's driver, not probed for this
+item, is relied on for the same escape by the SQL Server preset and the store.
 
 Braces matter even for a password with no delimiter in it. psqlODBC URL-decodes an unbraced `PWD`,
 so `+` becomes a space and `%41` becomes `A`, and takes a braced one literally (its
 `dlg_specific.c`, where `copyConnAttributes` calls `decode_or_remove_braces`). The braced form is
 the only one that sends such a password as written.
 
-Every name on [the generic driver allowlist](#the-generic-driver-allowlist) is on this list, and
-any other name is refused when the connection is built, before its password is read (BACKLOG
-#5041). Until then a password was sent plain to such a driver when it could be. The Microsoft
+Any other name is refused before its password is read (BACKLOG #5041). Until then a password was sent plain to such a driver when it could be. The Microsoft
 Access driver (ACE) is one reason: it does not read the escape, it refused even a braced password
 with no brace in it, and a `}` let password text set another keyword. The engine reads the
 driver name as written, never the library it loads, so a driver manager alias that reuses a
@@ -2333,9 +2326,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > deny-list. **The engine counts only `SSLmode` and `Encrypt` as a mode** (BACKLOG #2483), and
 > only the one the `odbc_driver` family reads, at that family's own spellings (BACKLOG #5053,
 > #5035; the table under [*The `SSLmode` spelling*](#the-sslmode-spelling)). So `Encrypt=yes`
-> counts on Microsoft's driver alone. A name off the allowlist is refused at build, and the
-> posture readers, which also read connections that are never built, count no keyword on it. The
-> warning's example is the family's own spelling. No other
+> counts on Microsoft's driver alone. A name off the allowlist is refused whatever its TLS, so
+> the posture readers and the `generic-db-tls` line do not list it as a TLS loosening;
+> `generic-db-driver` lists it instead. The warning's example is the family's own spelling. No other
 > TLS keyword counts, at least
 > `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and `SSLCIPHER`, so one of them alone reads as no mode.
 > So does a blank mode, or one with a blank at either end; since BACKLOG #2705 the build refuses

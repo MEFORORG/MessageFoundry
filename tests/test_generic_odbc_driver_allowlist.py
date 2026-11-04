@@ -36,6 +36,7 @@ from messagefoundry.config.wiring import (
     env,
     refused_generic_db_drivers,
 )
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.database import (
     _DRIVER_FAMILIES,
@@ -116,7 +117,7 @@ def test_the_build_refuses_a_name_off_the_allowlist(driver: str) -> None:
     with pytest.raises(ValueError, match=_REFUSED) as refused:
         _build_odbc_dsn({"odbc_driver": driver, "server": "db.example.invalid"}, connection="OB_X")
     message = str(refused.value)
-    assert message.startswith("connection 'OB_X'; DATABASE odbc_driver names no driver the generic")
+    assert message.startswith("connection 'OB_X'; DATABASE odbc_driver is not one the generic")
 
 
 @pytest.mark.parametrize("driver", sorted(_ACCEPTED))
@@ -220,11 +221,11 @@ def test_the_refusal_names_no_value_and_survives_the_stored_cut() -> None:
         _build_odbc_dsn({"odbc_driver": _ORACLE, "server": "db.example.invalid"}, connection=name)
     message = str(refused.value)
     assert _ORACLE not in message
-    lead = (
-        "odbc_driver names no driver the generic dialect accepts; name psqlODBC or MySQL "
-        "Connector/ODBC by its registered name"
-    )
-    assert message.index(lead) + len(lead) < 200, message
+    # The cause and the names to use survive the cut even with a 40-character name.
+    lead = GENERIC_DRIVER_REFUSAL.split(", or use dialect")[0]
+    assert lead.endswith("Unicode or ANSI Driver"), lead
+    assert message.index(lead) + len(lead) <= 200, message
+    assert lead in safe_exc(refused.value), safe_exc(refused.value)
 
 
 # --- the graph reader and the check line ----------------------------------------------------------

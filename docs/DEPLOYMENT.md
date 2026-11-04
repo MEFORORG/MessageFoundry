@@ -703,8 +703,10 @@ REST obey the authority does not settle these:
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
   it reports the hop as **non-weakened by construction**, and only what `odbc_params` say can reach the
   authority. A mode counts only on the keyword the named driver's family reads, and for psqlODBC and
-  MySQL only at that family's own spellings; a driver name the engine cannot place has no counted
-  mode (BACKLOG #5053; the families are in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)).
+  MySQL only at that family's own spellings (BACKLOG #5053; the families are in
+  [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)). A driver name off
+  [the generic driver allowlist](CONNECTIONS.md#the-generic-driver-allowlist) never reaches the
+  authority: it is refused on every posture, and no declaration lifts that (BACKLOG #5041).
   A hop with no counted mode, or with a TLS keyword pinned to a no-TLS value, goes there and is
   refused off-loopback on an enforcing instance, unless a per-connection declaration relaxes it
   (BACKLOG #1178). A hop whose counted mode holds **any other value never reaches it**: if the
