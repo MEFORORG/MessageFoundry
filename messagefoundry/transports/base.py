@@ -1352,9 +1352,12 @@ class DeliveryResponse:
     A capturing ``send`` returns one of these instead of ``None``; a non-capturing ``send`` returns
     ``None`` exactly as before (byte-identical). The transport hands back the **already-derived**
     outcome it computed anyway (the MSA-1 family, the HTTP status, a SOAP fault) so the store never
-    re-parses the encrypted-at-rest body to reconstruct it.
+    re-parses the stored body to reconstruct it.
 
-    * ``body`` — the partner's reply text, already decoded by the transport (PHI; encrypted at rest).
+    * ``body`` — the partner's reply text, already decoded by the transport (PHI). The store cipher
+      covers it at rest only when a store key is configured; a keyless store writes it in
+      plaintext. ``docs/PHI.md`` section 3 says when ``serve`` accepts a keyless store (BACKLOG
+      #5017).
     * ``outcome`` — one of :data:`RESPONSE_OUTCOMES`. ``accepted`` (a positive reply), ``rejected`` (a
       partner ``<Fault>``/negative content on an otherwise-OK transport), ``unparseable`` (a reply
       frame **was received** but its content could not be parsed — **never** "no reply was received",
@@ -1364,11 +1367,14 @@ class DeliveryResponse:
       only when a store key is configured. The store passes it through ``safe_text(detail,
       limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
       knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
-      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. It does not catch
-      every identifier: at least a lone surname such as ``Smith``, an identifier such as
-      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
-      ``response_get(dest).detail``, so a connector author keeps partner free text out of
-      ``detail``.
+      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. A ``detail`` longer
+      than the scan window loses its tail unscanned and gains a ``[redaction bound: dropped N more
+      chars unscanned]`` marker (BACKLOG #5017). ``docs/PHI.md`` section 3, *The store's
+      200-character bound*, is the one statement of the window, both notes, and when a stored value
+      can run past 200 characters. The scrub does not catch every identifier: at least a lone
+      surname such as ``Smith``, an identifier such as ``MRN7731`` and a resource id such as
+      ``Patient/12345`` read back unchanged through ``response_get(dest).detail``, so a connector
+      author keeps partner free text out of ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
@@ -1686,6 +1692,14 @@ class DestinationConnector(abc.ABC):
         :meth:`send` runs: on a simulate (shadow) outbound, and on each MLLP batch member with
         ``rewrite=False``, because a member sits in the envelope as stored and :meth:`send` applies
         any delimiter rewrite to the whole envelope, not to the member."""
+        return None
+
+    async def forget_payload(self, payload: str) -> None:
+        """Drop any state this connector keeps in memory about ``payload`` across sends. The delivery
+        worker calls it once the store has dead-lettered a single row it sent ``payload`` for at the
+        retry policy's ``max_attempts``, so a replay of that row starts clean. The default is a no-op:
+        at least the DICOM C-STORE SCU overrides it, for its count of unanswered stores of a large
+        object (vault BACKLOG #4908)."""
         return None
 
     async def validate_startup(self) -> None:
