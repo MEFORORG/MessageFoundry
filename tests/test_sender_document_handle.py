@@ -986,6 +986,58 @@ async def test_a_raw_copy_under_delimiters_that_escape_the_marker_is_refused(
     assert _dead_lettered_at_once(rows)
 
 
+async def _no_read(_sha256: str) -> str | None:
+    raise AssertionError("nothing is bound, so no attachment may be read")
+
+
+def _copy_in_nte_component(msh2: str, value: str) -> str:
+    """A payload in ``msh2`` with plain text in ``OBX-5.5`` and ``value`` set into ``NTE-3.1``: a
+    component set, which escapes every delimiter in the value."""
+    msg = Message.parse(_hl7("plain text", msh2=msh2))
+    msg.add_segment("NTE|1")
+    msg.set("NTE-3.1", value)
+    return msg.encode()
+
+
+@pytest.mark.parametrize(
+    "msh2",
+    ["a~\\&", "d~\\&", "^a\\&", "^~0&", "^~\\a"],
+    ids=["component-a", "component-d", "repetition-a", "escape-0", "subcomponent-a"],
+)
+async def test_a_copy_whose_delimiters_escape_its_address_is_refused(msh2: str) -> None:
+    """A delimiter or escape character that is a hex digit is escaped inside the copied content
+    address too, so the address no longer reads as 64 hex. With nothing bound the copy must still
+    be refused, never carried to the partner as text (BACKLOG #5099)."""
+    from messagefoundry.parsing.binary import (
+        UnreattachableDocumentError,
+        _copy_names_address,
+        reattach_documents_in_hl7,
+    )
+
+    handle = make_doc_ref(hashlib.sha256(b"copied").hexdigest(), "Application")
+    payload = _copy_in_nte_component(msh2, handle)
+    escaped = Message._escape_leaf(DOC_REF_MARKER, *Message.parse(payload)._encoding_chars())
+    # The leak's premise: the copy is in the payload, but neither marker reads an address after it.
+    assert Message.parse(payload).field("NTE-3.1") == handle
+    assert not any(_copy_names_address(payload, m) for m in (escaped, DOC_REF_MARKER))
+
+    with pytest.raises(UnreattachableDocumentError):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+
+
+@pytest.mark.parametrize("msh2", ["^~\\&", ":~\\&"], ids=["default", "colon-component"])
+async def test_a_bare_marker_under_ordinary_delimiters_is_carried_as_text(msh2: str) -> None:
+    """The control: no delimiter is a hex digit, nothing is bound, and the marker names no
+    address, so the payload is carried unchanged."""
+    from messagefoundry.parsing.binary import reattach_documents_in_hl7
+
+    payload = _copy_in_nte_component(msh2, DOC_REF_MARKER + "x")
+    escaped = Message._escape_leaf(DOC_REF_MARKER, *Message.parse(payload)._encoding_chars())
+    assert escaped in payload  # the marker the guard looks for is there
+
+    assert await reattach_documents_in_hl7(payload, _no_read, bound=frozenset()) == payload
+
+
 def _with_marker_mid_document(doc: str) -> str:
     """A streaming body whose one ED Base64 value carries the handle marker past its start. Not
     base64, since base64 has no ':', but nothing at ingress validated the value before."""

@@ -73,6 +73,13 @@ DOC_REF_MARKER = "mfdoc:v1:ref:"
 #: one). Validated on build + parse so a malformed handle fails loud rather than dereferencing garbage.
 _SHA256_HEX_LEN = 64
 
+#: The characters a content address is written in.
+_HEX_DIGITS = "0123456789abcdef"
+
+#: A content address: ``_SHA256_HEX_LEN`` characters of ``_HEX_DIGITS``. Written as a literal so
+#: the static ReDoS scan reads it.
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
 __all__ = [
     "MARKER",
     "DOC_TOMBSTONE_MARKER",
@@ -374,7 +381,7 @@ def make_doc_ref(sha256: str, content_type: str) -> str:
     :func:`make_document_tombstone`, so an arbitrary declared content-type can't break the round-trip.
     Recover the parts with :func:`parse_doc_ref`."""
     h = (sha256 or "").strip().lower()
-    if len(h) != _SHA256_HEX_LEN or any(c not in "0123456789abcdef" for c in h):
+    if not _HEX64.fullmatch(h):
         raise DocRefError(
             f"content address must be a {_SHA256_HEX_LEN}-hex SHA-256, got {sha256!r}"
         )
@@ -397,7 +404,7 @@ def parse_doc_ref(value: str) -> tuple[str, str]:
     body = value[len(DOC_REF_MARKER) :]
     sha256, sep, content_type = body.partition(":")
     sha256 = sha256.lower()
-    if len(sha256) != _SHA256_HEX_LEN or any(c not in "0123456789abcdef" for c in sha256):
+    if not _HEX64.fullmatch(sha256):
         raise DocRefError(f"malformed document handle: bad content address in {value!r}")
     if not sep or not content_type:
         raise DocRefError(f"malformed document handle: missing content-type in {value!r}")
@@ -692,13 +699,10 @@ def _copy_names_address(text: str, marker: str) -> bool:
     handle copy, not a bare marker. Overlapping occurrences each count, and nothing need follow
     the address."""
     # No regex is built from the marker: a pattern read at run time is one the static ReDoS scan
-    # cannot check. The strip keeps the per-hit test in C, since a sender controls how many hits
-    # a body holds.
+    # cannot check. The per-hit test is the literal _HEX64, matched in place without a copy.
     start = text.find(marker)
     while start != -1:
-        after = start + len(marker)
-        address = text[after : after + _SHA256_HEX_LEN]
-        if len(address) == _SHA256_HEX_LEN and not address.strip("0123456789abcdef"):
+        if _HEX64.match(text, start + len(marker)):
             return True
         start = text.find(marker, start + 1)
     return False
@@ -758,8 +762,9 @@ async def reattach_documents_in_hl7(
     the store's ``message_attachment`` linkage (BACKLOG #5099). A handle naming any other address is
     refused before ``reader`` runs, so a value the sender wrote cannot name another message's
     document. The handle marker, raw or as this payload's delimiters escape it, anywhere the
-    splice does not reach is refused too where ``bound`` is not empty or the copy names a content
-    address, so a handle a Handler copied elsewhere is never emitted."""
+    splice does not reach is refused too where ``bound`` is not empty, the copy names a content
+    address, or a delimiter is a hex digit and so may have escaped one, so a handle a Handler
+    copied elsewhere is never emitted."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -817,18 +822,23 @@ async def reattach_documents_in_hl7(
         # The raw marker is checked as well: a whole-field set, a Handler's NTE-3 copy for one,
         # leaves the component separator unescaped, so under delimiters that escape the marker the
         # copy keeps it raw.
-        marker = Message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
+        separators = message._encoding_chars()
+        marker = Message._escape_leaf(DOC_REF_MARKER, *separators)
         markers = (marker, DOC_REF_MARKER) if marker != DOC_REF_MARKER else (marker,)
+        # A separator or escape character that is a hex digit is escaped inside a copied content
+        # address too, so the address after a marker cannot be read: every marker counts as a copy.
+        address_unreadable = any(c in _HEX_DIGITS for c in separators)
         if (
             not found
             and any(m in text for m in markers)
-            and (bound or any(_copy_names_address(text, m) for m in markers))
+            and (bound or address_unreadable or any(_copy_names_address(text, m) for m in markers))
         ):
             # No handle to splice, so the text is what would be sent: a marker in it is a copy.
             # Refused where the message holds a document, and also where the copy names a content
-            # address: a child that inherited none, because its only handle sits outside OBX-5.5,
-            # would otherwise send the engine's handle with no document. A bare marker in a
-            # message that holds nothing names no document, so it is carried as text.
+            # address, or may name one its delimiters escaped: a child that inherited none,
+            # because its only handle sits outside OBX-5.5, would otherwise send the engine's
+            # handle with no document. A bare marker in a message that holds nothing names no
+            # document, so it is carried as text where every delimiter is a non-hex character.
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, markers
 
