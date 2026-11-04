@@ -4442,12 +4442,14 @@ def DatabasePoll(
 
     Lead pattern is a status column: ``poll_statement='SELECT id, payload FROM mf_inbox WHERE status=\\'NEW\\''``
     + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
-    high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
+    high-water-mark ``UPDATE`` runs through the same ``mark_statement``, but a high-water mark can pass
+    a row that was never handed off). ``body_column`` unset → the
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
     (e.g. a column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a
     handler failure stops that poll at the failed row, so a row that fails every time holds back the
-    rows behind it; the *Database source* section of docs/CONNECTIONS.md says what a high-water mark
-    needs on top of that (BACKLOG #4921). Put secrets (``password``) in
+    rows behind it. The stop does not make a high-water mark safe: the *Database source* section of
+    docs/CONNECTIONS.md names at least the cases where one still passes a row (BACKLOG #4921). Put
+    secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
     ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.

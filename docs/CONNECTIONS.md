@@ -2311,12 +2311,13 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls an OS-installed ODBC driver (PostgreSQL / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
 
-**Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
-`SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
-id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
-just runs whatever statement you declare, bound from the row. A high-water mark can still pass a row
-that was never handed off, in at least the cases *Reliability* below names. Where that matters, mark
-with a status column or a delete-from-queue.
+**Mark mechanism — your choice via `mark_statement`.** You can mark with a **status column** (lead
+pattern: `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue**
+(`DELETE … WHERE id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor); the
+connector just runs whatever statement you declare, bound from the row. They are not equally safe: a
+high-water mark can still pass a row that was never handed off, in at least the cases *Reliability*
+below names, even with the poll's stop at a failed row (BACKLOG #4921). Where that matters, mark with
+a status column or a delete-from-queue.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
