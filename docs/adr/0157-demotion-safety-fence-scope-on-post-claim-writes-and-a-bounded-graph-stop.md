@@ -1265,7 +1265,8 @@ At least these, read 2026-10-26:
 - **File.** Bounded by its own `_STOP_GRACE_S` for a blocked share call. When cut, it never cancels
   a poll task that is inside a store call, so the task exits at its next stop check.
 - **Database.** An uncancelled `stop()` joins the poll task with no timeout of its own, through an
-  `asyncio.wait` that a cancel does not forward. A cancel that lands while a row is in its row step,
+  `asyncio.wait` that a cancel does not forward. *(Superseded 2026-11-03: it now has a bound of its
+  own outside a store call. See this bullet's *Amended 2026-11-03 (BACKLOG #4685)* note below.)* A cancel that lands while a row is in its row step,
   from the handler call (parse, validation and the store commit) through the mark, waits up to
   `_ROW_STEP_GRACE_S` for that step, but only while this node leads: `_stop` is set, so the task
   marks the row and exits at its next stop check. A cancel anywhere else cuts the task at once, at
@@ -1300,7 +1301,11 @@ At least these, read 2026-10-26:
   close only: a statement the cancel abandoned on a driver thread is not waited for. A pool close
   that times out leaves the connections it had not closed yet to the driver. A close failure after
   a cancel is logged, never raised over the cancel. An uncancelled `stop()` closes the pool with no
-  bound, as before.
+  bound, as before. *(Superseded in part 2026-11-03: this no longer holds for every uncancelled
+  `stop()`. At least one that cuts its poll task waits for the pool as a cancelled stop does, as the
+  Database bullet's *Amended 2026-11-03 (BACKLOG #4685)* note below says, and one that waits while a
+  connection is held back behind a cancelled borrow stops waiting at a bound (BACKLOG #2394,
+  `DatabaseSource.aclose()`). Stopping the wait closes nothing the driver still holds.)*
 
   A committed row is left unmarked, a duplicate, when its step outlasts the grace, when a second
   cancel reaches it, or when the node does not lead. That can now happen to several Database stops
@@ -1340,7 +1345,9 @@ At least these, read 2026-10-26:
   step finish* now holds for the hand-off and for a mark that ends within a grace of it; the
   task's wait on a longer mark is cut.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
-  `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
+  `gather` cancels the poll task. *(Superseded for RemoteFile 2026-11-03: its join is no longer a
+  `gather`, and a cut cancels the poll task itself. See this bullet's *Amended 2026-11-03 (BACKLOG
+  #4685)* note below.)* Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.
 
   *Amended 2026-11-03 (BACKLOG #4685):* an uncancelled RemoteFile `stop()` now waits

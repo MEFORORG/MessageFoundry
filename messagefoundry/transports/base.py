@@ -1193,14 +1193,14 @@ POLL_STOP_GRACE_S = 5.0
 class PollStopGuard:
     """Bounds a poll source's ordinary stop() without ever cutting a store call (BACKLOG #4685).
 
-    The poll task wraps each store call, a pipeline hand-off or a processed-ledger read or write, in
-    :meth:`store_call`. :meth:`join` then waits for the task: a grace at a time while it is inside a
-    store call, and a full grace after the last one ended, so the task always gets a whole grace to
-    reach its next stop check. Once a grace passes outside a store call it returns False, and the
-    caller cancels the task. That is safe there because the task is blocked on an external call, a
-    listing, a retrieve or a driver call, whose work the next poll does again (at-least-once). The
-    wait is so bounded for a blocked external call, and only as bounded as the store for a store
-    call, as ``FileSource.stop()``'s is.
+    The poll task wraps each store call, at least a pipeline hand-off or a processed-ledger read or
+    write, in :meth:`store_call`. :meth:`join` then waits for the task: a grace at a time while it
+    is inside a store call, and a full grace after the last one ended, so the task always gets a
+    whole grace to reach its next stop check. Once a grace passes outside a store call it returns False, and the
+    caller cancels the task. That is safe there because the task is blocked on an external call (at
+    least a listing, a retrieve or a driver call), and the next poll does that call's work again
+    (at-least-once). The wait is so bounded for a blocked external call, and only as bounded as the
+    store for a store call, as ``FileSource.stop()``'s is.
 
     The inside mark is keyed by task, so a cut task unwinding late cannot clear the mark of a task
     a later start() made. The end time is not: a late one can only lengthen a grace."""

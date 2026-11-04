@@ -3272,12 +3272,12 @@ class DatabaseSource(SourceConnector):
 
         **An ordinary stop() gives up on a blocked driver call after** :data:`POLL_STOP_GRACE_S`
         (BACKLOG #4685), as ``FileSource.stop()`` does on a blocked share call. The poll task sees
-        ``_stop`` between rows and between polls, so it usually returns at once. A select, a pool
-        borrow or a mark hung on an unresponsive server is cut after the grace, logged, and from
-        then on handled as a cut after a cancel: the join and the pool close are bounded as above.
-        A cut ends only the await: a mark already running on its driver thread can still commit
-        there. A row whose mark does not commit re-emits on the next start, the duplicate a failed
-        mark makes.
+        ``_stop`` between rows and between polls, so it usually returns at once. At least a select,
+        a pool borrow or a mark hung on an unresponsive server is cut after the grace, logged, and
+        from then on handled as a cut after a cancel: the join and the pool close are bounded as
+        above. A cut ends only the await: a mark already running on its driver thread can still
+        commit there. A row whose mark does not commit re-emits on the next start, the duplicate a
+        failed mark makes.
         **A hand-off is never cut**; :class:`PollStopGuard` says how long stop() then waits.
 
         **An ordinary stop() the poll task finished in time waits for the pool as before, unless a
