@@ -35,7 +35,15 @@ from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpSource, _client_issuer_index
 from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
-from tests.test_api_tls import _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
+from tests.test_api_tls import (
+    _CaPair,
+    _client_bundle,
+    _dn,
+    _labelled,
+    _new_ca,
+    _pem,
+    _self_signed,
+)
 
 SUBJECT = "CN:partner.example"
 
@@ -48,15 +56,6 @@ def _ca(dn: x509.Name, by: _CaPair | None = None) -> _CaPair:
 def _bundle(tmp_path: Path, signer: _CaPair, **kwargs: Any) -> Path:
     """``tests/test_api_tls.py``'s client bundle, for the partner subject this module lists."""
     return _client_bundle(tmp_path, signer, cn="partner.example", **kwargs)
-
-
-def _labelled(cert: x509.Certificate, label: str) -> bytes:
-    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``, body unchanged."""
-    return (
-        _pem(cert)
-        .replace(b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii"))
-        .replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
-    )
 
 
 def _source(
@@ -137,9 +136,9 @@ async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subjec
     """The defect itself: two loaded CAs, and the unlisted one issues a listed subject.
 
     Run under both labels the TLS context loads a CA from. Under the legacy ``X509 CERTIFICATE`` the
-    handshake verified a leaf, but the index read only ``BEGIN CERTIFICATE``, so it never held the
-    CA: every partner under it was refused, and the start warning said the key named no loaded CA
-    rather than that a block went unread (BACKLOG #4948)."""
+    handshake verifies a leaf, but the shipped index read only ``BEGIN CERTIFICATE``, so it never
+    held the CA: every partner under it would have been refused, with a start warning saying the key
+    named no loaded CA rather than that a block went unread (BACKLOG #4948)."""
     named = _ca(_dn((NameOID.ORGANIZATION_NAME, "Acme"), (NameOID.COMMON_NAME, "Partner CA")))
     other = _ca(_dn((NameOID.ORGANIZATION_NAME, "Other"), (NameOID.COMMON_NAME, "Other CA")))
     listener_log = "messagefoundry.transports.http_listener"
@@ -300,10 +299,11 @@ async def test_two_loaded_cas_with_one_name_and_different_keys_admit_neither(
 async def test_two_cas_with_one_name_admit_neither_when_one_uses_the_legacy_label(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, legacy_one: str
 ) -> None:
-    """The same two CAs, one written under the legacy ``X509 CERTIFICATE`` label. The leaf under the
-    legacy-label CA was refused before this fix too, since its key verifies under no CA the index
-    held. The leaf under the other was admitted: the index saw only its CA, so the two were not
-    known to be ambiguous (BACKLOG #4948). Both are refused now, and the key is warned about."""
+    """The same two CAs, one written under the legacy ``X509 CERTIFICATE`` label. In the shipped
+    code the leaf under the legacy-label CA is refused too, since its key verifies under no CA the
+    index holds; the leaf under the other would have been admitted, because the index saw only its
+    CA and so could not know the two were ambiguous (BACKLOG #4948). Both are refused now, and the
+    key is warned about as naming two."""
     first = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     second = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     legacy, plain = (first, second) if legacy_one == "first" else (second, first)
@@ -320,6 +320,9 @@ async def test_two_cas_with_one_name_admit_neither_when_one_uses_the_legacy_labe
     finally:
         await source.stop()
     assert any("'CN=Acme CA'" in r.getMessage() for r in caplog.records)
+    assert source._issuer_index is not None
+    reason = source._issuer_index.unmatched_keys(["CN=Acme CA"])["CN=Acme CA"]
+    assert reason.startswith("names 2 loaded CA certificates"), reason
 
 
 def _der(cert: x509.Certificate) -> bytes:
@@ -340,8 +343,8 @@ def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
     """Driven at the index builder: a block OpenSSL loads but ``cryptography`` refuses, a CA with
     bytes after its DER, is what this warns about. Under either label the context loads a CA from,
     such a block names no issuer and is counted, so the "could not be parsed" warning
-    ``docs/SECURITY.md`` promises fires. Under the legacy label the block was never read, so it did
-    not (BACKLOG #4948). The good CA beside it is still named."""
+    ``docs/SECURITY.md`` promises fires. The shipped index never reads a legacy-label block, so
+    there it would not (BACKLOG #4948). The good CA beside it is still named."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     cadata = (_pem(good[0]) + _wrapped(_der(odd[0]) + b"\x30\x00", label)).decode("ascii")
@@ -374,8 +377,9 @@ def _v4(cert: x509.Certificate) -> bytes:
 def test_a_version_4_ca_names_nothing_and_does_not_end_the_build(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A CA OpenSSL loads with version 4 is refused by ``cryptography`` with ``InvalidVersion``. It
-    raised out of the index, and so out of the listener's and the API's context build. It now names
+    """A CA OpenSSL loads with version 4 is refused by ``cryptography`` with ``InvalidVersion``. In
+    the shipped code it raises out of the index, and so out of the listener's and the API's context
+    build. It now names
     nothing and is counted, the "could not be parsed" warning fires, and the good CA beside it is
     still named (BACKLOG #4948)."""
     good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
@@ -436,15 +440,13 @@ def _pinned(cn: str) -> x509.Certificate:
 def test_the_index_reads_every_block_the_context_loads(
     label: str, prefix: str, pinned: bool
 ) -> None:
-    """A certificate ``load_verify_locations(cadata=)`` loads, the index reads too (BACKLOG #4948).
+    """The index reads a block exactly where ``load_verify_locations(cadata=)`` loads it, by label
+    and by what precedes the BEGIN marker on its line (BACKLOG #4948).
 
-    Measured on CPython 3.14.7 / OpenSSL 3.5.7: beside a plain block, ``cadata=`` loads a certificate
-    from a ``CERTIFICATE`` or an ``X509 CERTIFICATE`` block whose BEGIN marker starts a line, and
-    skips every other label and a marker after a space, text or a lone CR. A CA the handshake trusts
-    that the index skips denies every partner under it, so each shape is asked of OpenSSL here, not
-    assumed, for a CA and for a pinned client certificate OpenSSL does not count as one. Only that
-    direction is checked: the index also reads a marker that does not start its line, as it did
-    before, where OpenSSL skips the block."""
+    A CA the handshake trusts that the index skips denies every partner under it; a CA the index
+    reads that the handshake never loaded could be named for a leaf whose chain ran through a
+    client-sent copy of it. So each shape is asked of OpenSSL here, not assumed, for a CA and for a
+    pinned client certificate OpenSSL does not count as one."""
     plain = _ca(_dn((NameOID.COMMON_NAME, "Plain CA")))
     probe = _pinned("Probe") if pinned else _ca(_dn((NameOID.COMMON_NAME, "Probe")))[0]
     cadata = (_pem(plain[0]) + prefix.encode("ascii") + _labelled(probe, label)).decode("ascii")
@@ -456,24 +458,61 @@ def test_the_index_reads_every_block_the_context_loads(
     index = IssuerIndex(cadata)
     assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Plain CA"]) == {}  # control: always read
-    if loaded == 2:
-        assert index.unmatched_keys(["CN=Probe"]) == {}, (label, prefix, pinned)
+    probe_read = index.unmatched_keys(["CN=Probe"]) == {}
+    assert probe_read == (loaded == 2), (label, prefix, pinned, loaded)
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        pytest.param("note: -----BEGIN {}----- also loads\n", id="mid-line"),
+        pytest.param("-----BEGIN {}----- blocks follow\n", id="line-start"),
+    ],
+)
+@pytest.mark.parametrize("stray", ["CERTIFICATE", "X509 CERTIFICATE"])
+def test_a_stray_begin_marker_hides_no_block_after_it(note: str, stray: str) -> None:
+    """A note naming a BEGIN marker, mid-line or opening a line with text after it, is skipped by
+    OpenSSL, and every block after it still loads. Two CAs here share a DN under different keys,
+    with a legacy-label CA between them. A stray that ran to the next END of its label would swallow
+    the blocks before it, so the index would read one block fewer, or one of the two CAs. With one
+    of the two missing, a leaf under the other would be named although the two cannot be told apart.
+    The index must read all three, so the name stays ambiguous (BACKLOG #4948)."""
+    dup1, dup2 = (_ca(_dn((NameOID.COMMON_NAME, "Dup CA"))) for _ in range(2))
+    mid = _ca(_dn((NameOID.COMMON_NAME, "Mid CA")))
+    cadata = (
+        note.format(stray).encode("ascii")
+        + _pem(dup1[0])
+        + _labelled(mid[0], "X509 CERTIFICATE")
+        + _pem(dup2[0])
+    ).decode("ascii")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=cadata)
+    assert ctx.cert_store_stats()["x509"] == 3  # the premise: every block loads past the note
+    index = IssuerIndex(cadata)
+    assert index.unreadable == 0
+    assert index.unmatched_keys(["CN=Mid CA"]) == {}
+    assert index.unmatched_keys(["CN=Dup CA"])["CN=Dup CA"].startswith("names 2 loaded CA")
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), dup2)[0])
+    assert index.issuer_of(leaf) == ""
 
 
 @pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
-def test_a_stray_begin_marker_of_one_label_does_not_hide_the_blocks_after_it(label: str) -> None:
-    """A comment naming a BEGIN marker mid-line is skipped by OpenSSL, and its blocks still load.
-    With no END of that label after it, the index passes it over rather than stop reading, so a
-    note naming the legacy marker does not unname every ``CERTIFICATE`` block below it."""
-    stray = "X509 CERTIFICATE" if label == "CERTIFICATE" else "CERTIFICATE"
-    ca = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
-    cadata = f"note: -----BEGIN {stray}----- also loads\n".encode("ascii") + _labelled(ca[0], label)
+def test_a_block_whose_begin_line_is_commented_out_names_no_issuer(label: str) -> None:
+    """An intermediate disabled by commenting out only its BEGIN line is not loaded by OpenSSL. The
+    index must not name it either: a client that sends that intermediate verifies through the root,
+    and would otherwise map under the intermediate's name, though a client-sent intermediate never
+    counts (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    partner = _ca(_dn((NameOID.COMMON_NAME, "Partner CA")), by=root)
+    cadata = (_pem(root[0]) + b"# " + _labelled(partner[0], label)).decode("ascii")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations(cadata=cadata.decode("ascii"))
-    assert ctx.cert_store_stats()["x509"] == 1  # the premise: the CA loads past the note
-    index = IssuerIndex(cadata.decode("ascii"))
-    assert index.unreadable == 0
-    assert index.unmatched_keys(["CN=Acme CA"]) == {}
+    ctx.load_verify_locations(cadata=cadata)
+    assert ctx.cert_store_stats()["x509"] == 1  # the premise: only the root loads
+    index = IssuerIndex(cadata)
+    assert index.unmatched_keys(["CN=Root CA"]) == {}  # control
+    assert "CN=Partner CA" in index.unmatched_keys(["CN=Partner CA"])
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), partner)[0])
+    assert index.issuer_of(leaf) == ""
 
 
 @pytest.mark.parametrize(

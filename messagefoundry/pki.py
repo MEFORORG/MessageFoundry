@@ -1666,23 +1666,27 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
-#: The two PEM labels OpenSSL's ``load_verify_locations(cadata=)`` loads a certificate from, and
-#: ``cryptography`` parses: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE`` (BACKLOG #4948).
-#: Missing the legacy one left a CA the handshake trusts out of the index, so every partner under it
-#: would have been refused, with a start warning naming the wrong cause.
+#: PEM labels OpenSSL's ``load_verify_locations(cadata=)`` loads a certificate from and
+#: ``cryptography`` parses, at least: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE``, measured
+#: on OpenSSL 3.5.7 (BACKLOG #4948). Missing the legacy one left a CA the handshake trusts out of
+#: the index, so every partner under it would have been refused, with a start warning naming the
+#: wrong cause.
 _PEM_CERTIFICATE_BEGIN = re.compile(rb"-----BEGIN (X509 )?CERTIFICATE-----")
 
 
 def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
-    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, each ending at
-    the next END marker of its own label. A BEGIN marker with no END of its label after it is
-    passed over, so a stray marker of one label does not hide the blocks of the other."""
-    at = 0
-    while (begin := _PEM_CERTIFICATE_BEGIN.search(pem, at)) is not None:
+    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order.
+
+    A block opens at a BEGIN marker that starts a line, the rule :func:`_crl_blocks` records for
+    OpenSSL, so a marker inside a comment opens none. It ends at the first END marker of its own
+    label before the next such BEGIN; a BEGIN with none, such as a comment line opening with a
+    marker, is passed over. So a stray marker of either label cannot swallow the blocks after it
+    and leave a CA, or one of two CAs sharing a name, out of the index (BACKLOG #4948)."""
+    starts = [m for m in _PEM_CERTIFICATE_BEGIN.finditer(pem) if _begins_line(pem, m.start())]
+    for i, begin in enumerate(starts):
+        after = starts[i + 1].start() if i + 1 < len(starts) else len(pem)
         end = b"-----END " + (begin[1] or b"") + b"CERTIFICATE-----"
-        stop = pem.find(end, begin.start())
-        if stop < 0:
-            at = begin.end()
-            continue
-        at = stop + len(end)
-        yield pem[begin.start() : at]
+        # Bounded by the next BEGIN, so a file of unterminated markers costs one pass, not one each.
+        stop = pem.find(end, begin.end(), after)
+        if stop >= 0:
+            yield pem[begin.start() : stop + len(end)]

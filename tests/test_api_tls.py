@@ -2487,6 +2487,15 @@ def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
 
 
+def _labelled(cert: x509.Certificate, label: str) -> bytes:
+    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``, body unchanged."""
+    return (
+        _pem(cert)
+        .replace(b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii"))
+        .replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
+    )
+
+
 def _client_bundle(
     tmp_path: Path,
     signer: _CaPair,
@@ -2661,11 +2670,7 @@ def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
     cert, key = _self_signed(tmp_path)
     ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     ca_file = tmp_path / "client-ca.pem"
-    ca_file.write_bytes(
-        _pem(ca[0])
-        .replace(b"BEGIN CERTIFICATE", f"BEGIN {label}".encode("ascii"))
-        .replace(b"END CERTIFICATE", f"END {label}".encode("ascii"))
-    )
+    ca_file.write_bytes(_labelled(ca[0], label))
     uid = "0123456789abcdef0123456789abcdef"
     api = ApiSettings(
         tls_cert_file=str(cert),
