@@ -475,7 +475,10 @@ become the whole listener's capacity for established requests.
 
 `Http()` ships `max_handshakes_per_host` **on, at 32** (vault BACKLOG #4888). It counts only the
 sockets one address holds a connection slot with while their TLS handshake is still running. A
-socket leaves the count when its handshake ends, so the cap never limits established requests.
+socket leaves the count when its handshake ends, so the cap does not bound how many requests one
+address holds once their handshakes are done. It does bound how many can start at once: `Http()`
+answers every request with `Connection: close`, so each request opens a new connection and runs
+its own handshake, and one address could have at most 32 requests in their handshakes together.
 It applies only on a `tls = true` listener where the engine upgrades the socket itself, which is
 the stdlib event loop. uvloop does not run on Windows, so the Windows service always takes this
 path. On uvloop the loop runs the handshake before the engine sees the socket, so no engine cap
@@ -484,8 +487,22 @@ bound there.
 
 Without it, one address that opens sockets and never finishes a handshake could hold every
 `max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
-port can stall its handshake; on an mTLS listener it needs no client certificate to do so. The budget is per address, as `max_connections_per_host` is, so a
-peer with many source addresses gets 32 for each of them.
+port can stall its handshake; on an mTLS listener it needs no client certificate to do so. The
+budget is per address, as `max_connections_per_host` is, so a peer with many source addresses gets
+32 for each of them. The key is the whole address, with no grouping by prefix, so over IPv6 a peer
+that holds a /64, as one site or host commonly does, could use a different address for each socket
+and get 32 on every one of them.
+
+**Without a balancer, one busy partner.** The cap can bite with no balancer and no attacker. One
+partner that keeps many requests in flight at once, from one address, could reach 32 sockets in
+their handshakes by itself, since each request runs its own handshake. Its 33rd concurrent new
+connection would then be closed before any TLS byte, so its client would see the connection close
+during its handshake rather than get an HTTP answer. Each refusal is passed to `notify_refusal`, which feeds the
+security-signal burst detector, so a legitimate burst of refusals could raise a
+`peer_refused_burst` alert for the listener once they reach `[alerts].security_peer_refusals`
+(100 by default) inside the window. If `at_capacity` events with the reason
+`max_handshakes_per_host` name a known partner's address under its ordinary load, raise
+`max_handshakes_per_host` on that `Http()` listener, or set it to `None` or `0` to turn it off.
 
 **What it does not bound.** A peer that completes its handshake leaves the count, and on a listener
 with no `tls_ca_file` a completed handshake proves nothing about who the peer is. Such a peer, or
@@ -500,10 +517,10 @@ lockout meaningfully cheaper, though: without it, the same client would refuse e
 256 sockets instead, which costs it no more. A real client finishes its handshake in one or two
 round trips, but it reaches 32 with no attacker at all on a busy enough listener: at 200 requests
 a second and a 150 ms handshake, about 30 are in flight at once, since `Http()` answers one request
-per connection and so runs a handshake per request. A refused socket is closed with no answer, and each refusal counts as a peer
-refusal for the security-signal burst detector. If `at_capacity` events with the reason
-`max_handshakes_per_host` name the balancer's address under ordinary load, raise the cap, or set
-it to `None` or `0` to turn it off.
+per connection and so runs a handshake per request. The refusals and the alert they could raise
+are the ones *Without a balancer* above describes. If `at_capacity` events with the reason
+`max_handshakes_per_host` name the balancer's address under ordinary load, raise
+`max_handshakes_per_host`, or set it to `None` or `0` to turn it off.
 
 **`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
 an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer with no client certificate passes it and is bounded only by this
