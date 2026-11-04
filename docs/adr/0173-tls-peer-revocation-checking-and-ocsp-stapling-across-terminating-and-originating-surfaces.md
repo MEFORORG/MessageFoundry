@@ -785,8 +785,9 @@ attestation stays visible elsewhere: `messagefoundry check` lists a connection's
 directions, the kept line on a `tls_allow_expired` hop now says what it lacks. Each passes
 `expiry_relaxed` to `RevocationHopGuard.capture`, which it otherwise could not read off the context
 it withholds, and the line then reads *crossed without a revocation check the guard credits*: the
-certificate's validity period is not checked, and a CRL on the hop still refuses a leaf it lists
-but passes once lapsed. A guard handed a context that skips time validity words it the same way.
+chain is verified but not the validity period, and a CRL, where one reaches the hop, is read
+without its own validity window. The refusal and the WARNING on such a hop use the same words. A
+guard handed a context that skips time validity words it the same way.
 The REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
 paragraph describes; their refusal text is left open in §13 too. No disposition reads the flag.
 

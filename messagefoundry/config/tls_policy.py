@@ -2627,10 +2627,10 @@ _NO_REVOCATION_CHECK = (
 #: such a hop still refuses a leaf certificate it lists at the handshake, so "NO revocation
 #: checking" would say less was checked than was; what the hop lacks is a check the guard credits.
 _EXPIRY_RELAXED_NO_CHECK = (
-    "the peer certificate is verified except its validity period (tls_allow_expired), and the "
-    "hop has no revocation check the guard credits: stdlib ssl has no OCSP, and any CRL on this "
-    "hop is checked without its own validity window, so it still refuses a leaf certificate it "
-    "lists but a lapsed CRL passes (ASVS 12.1.4, ADR 0173 section 13)."
+    "the peer certificate's chain is verified but not its validity period (tls_allow_expired), "
+    "and the hop has no revocation check the guard credits: stdlib ssl has no OCSP, and a CRL, "
+    "where one reaches this hop, is read without its own validity window (ASVS 12.1.4, ADR 0173 "
+    "section 13)."
 )
 
 #: The attested crossing's lead on such a hop, for the same reason.
@@ -2673,8 +2673,8 @@ class RevocationHopGuard:
     crl_checked: bool = False
     #: Whether this hop skips the validity-period check (``tls_allow_expired``,
     #: :func:`skips_validity_period`): the caller says so, or the context handed in does. It
-    #: decides :attr:`crl_is_a_check` and the wording of the attested crossing's line; no
-    #: disposition reads it.
+    #: decides :attr:`crl_is_a_check` and the wording of every record built from :meth:`_detail`
+    #: (the refusal, the WARNING and the attested crossing's line); no disposition reads it.
     expiry_relaxed: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
@@ -2748,7 +2748,8 @@ class RevocationHopGuard:
 
         ``expiry_relaxed`` is for a caller that skips validity-period checks and therefore hands
         no context (ADR 0173 §13): the guard cannot read that off a context it never sees, and
-        the attested line words such a hop differently. A context that skips them sets it too."""
+        this hop's refusal, WARNING and attested line word such a hop differently. A context that
+        skips them sets it too."""
         return cls(
             host=host,
             cell=cell,

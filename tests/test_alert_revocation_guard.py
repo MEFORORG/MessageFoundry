@@ -251,13 +251,14 @@ def test_both_smtp_builds_skip_the_guard_for_a_relay_outside_the_allowlist(
         _email(posture, allowed_hosts=("other.example.test",))
         _notifier(posture, allowed_hosts=("other.example.test",))
     assert not log.has(_SMTP_CELL), log.state()
-    if posture is ENFORCING:
-        with pytest.raises(InsecureHopRefused, match="revocation"):
-            _notifier(posture, allowed_hosts=(RELAY.upper(),))
-    else:
-        with _guard_log() as listed:
-            _notifier(posture, allowed_hosts=(RELAY.upper(),))
-        assert listed.has(_SMTP_CELL), listed.state()
+    for build in (_email, _notifier):
+        if posture is ENFORCING:
+            with pytest.raises(InsecureHopRefused, match="revocation"):
+                build(posture, allowed_hosts=(RELAY.upper(),))
+        else:
+            with _guard_log() as listed:
+                build(posture, allowed_hosts=(RELAY.upper(),))
+            assert listed.has(_SMTP_CELL), listed.state()
 
 
 def test_an_smtp_login_on_loopback_still_crosses() -> None:

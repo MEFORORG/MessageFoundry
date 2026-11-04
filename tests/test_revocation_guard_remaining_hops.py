@@ -484,6 +484,10 @@ def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHo
     )
 
 
+#: A phrase only the expiry-relaxed record carries; ``EXPIRY_RELAXED_WAYS_ACROSS`` does not hold it,
+#: so it tells the new wording from that remedy text (BACKLOG #5089).
+_RELAXED_DETAIL = "chain is verified but not its validity period"
+
 #: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089).
 _RELAXED_CROSSING = (
     "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
@@ -521,7 +525,7 @@ def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -
     # The line keeps its own wording there: that CRL still refuses a leaf it lists, so the
     # unrelaxed record's "NO certificate revocation checking" would say less was checked than was.
     assert "NO certificate revocation checking" not in log.audit, log.state()
-    assert "still refuses a leaf certificate it lists" in log.audit, log.state()
+    assert _RELAXED_DETAIL in log.audit, log.state()
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
@@ -1135,7 +1139,7 @@ def _assert_refused_for_the_relaxation(
     assert EXPIRY_RELAXED_WAYS_ACROSS in text
     assert "Configure [tls].crl_file" not in text
     assert f"connection '{connection}';" in text
-    assert "still refuses a leaf certificate it lists" in text
+    assert _RELAXED_DETAIL in text
 
 
 def test_a_crl_does_not_admit_an_mllp_destination_that_ignores_certificate_expiry(
@@ -1171,7 +1175,7 @@ def test_an_expiry_relaxed_mllp_destination_crosses_on_its_attestation_and_is_au
     # The kept line words the hop as what it is (BACKLOG #5089): the CRL that reached it still
     # refuses a leaf it lists, so the unrelaxed "NO certificate revocation checking" would over-state.
     assert _RELAXED_CROSSING in shipped, log.state()
-    assert "still refuses a leaf certificate it lists" in shipped, log.state()
+    assert _RELAXED_DETAIL in shipped, log.state()
     assert "NO certificate revocation checking" not in shipped, log.state()
 
 
@@ -1224,7 +1228,7 @@ def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
     assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
     assert "DICOM C-STORE client (SCU) over TLS" in shipped
     assert _RELAXED_CROSSING in shipped, log.state()
-    assert "still refuses a leaf certificate it lists" in shipped, log.state()
+    assert _RELAXED_DETAIL in shipped, log.state()
 
 
 def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str) -> None:

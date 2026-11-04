@@ -932,12 +932,13 @@ async def _warm_up(
         while correlator.undelivered > 0 and loop.time() < deadline:
             await asyncio.sleep(_WARMUP_POLL_S)
         seconds = loop.time() - start
+        silent = sorted(ports_by_seq[seq] for seq in correlator.undelivered_seqs)
     finally:
         metrics.ack, metrics.e2e = hold_ack, hold_e2e
-    silent = sorted(ports_by_seq[seq] for seq in correlator.undelivered_seqs)
+        # Stop tracking, even on a cancel, so the hold neither pays for a silent seq nor records
+        # its late arrival here.
+        correlator.track_first_deliveries(())
     delivered = sent - len(silent)
-    # Stop tracking, so the hold neither pays for a silent seq nor records its late arrival here.
-    correlator.track_first_deliveries(())
     after = None if pid is None else await asyncio.to_thread(subtree_size, pid)
     if silent:
         log.warning(
