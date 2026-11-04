@@ -419,6 +419,98 @@ def test_an_unreadable_greeting_fails_the_connect_transient(
     assert caught.value.__context__ is None and caught.value.__cause__ is None
 
 
+def _scripted_session(
+    monkeypatch: pytest.MonkeyPatch, unreadable: str
+) -> tuple[list[str], list[bool]]:
+    """Patch ``ftplib`` so a real ``_FtpClient._connect`` runs a session whose reply to the command
+    starting ``unreadable`` is not UTF-8 (a real ``UnicodeDecodeError``); every other command gets a
+    positive reply. Returns the commands sent and the closes seen."""
+    sent: list[str] = []
+    closed: list[bool] = []
+
+    def getresp(self: ftplib.FTP) -> str:
+        cmd = sent[-1]
+        if cmd.startswith(unreadable):
+            f"530 \xe9 {NAME}".encode("latin-1").decode()  # raises, as getline would
+        return {"USER": "331 Password required", "AUTH": "234 Proceed"}.get(
+            cmd.split(" ")[0], "230 Logged in"
+        )
+
+    monkeypatch.setattr(ftplib.FTP, "connect", lambda self, *a, **k: "220 ready")
+    monkeypatch.setattr(ftplib.FTP, "putcmd", lambda self, line: sent.append(line))
+    monkeypatch.setattr(ftplib.FTP, "getresp", getresp)
+    monkeypatch.setattr(ftplib.FTP, "close", lambda self: closed.append(True))
+    return sent, closed
+
+
+@pytest.mark.parametrize("unreadable", ["USER", "PASS"])
+def test_an_unreadable_login_reply_is_a_credential_fault_not_retried(
+    monkeypatch: pytest.MonkeyPatch, unreadable: str
+) -> None:
+    """A login reply the client cannot read must not retry: retried, a refusal it could not read
+    would lock the partner account (BACKLOG #109, ADR 0095). It takes the refused login's class."""
+    sent, closed = _scripted_session(monkeypatch, unreadable)
+    client = _FtpClient(
+        {"host": "ftp.example.com", "username": "synthetic", "password": "synthetic-pw"},
+        tls=False,
+    )
+    with pytest.raises(_RemoteError) as caught:
+        client._connect()
+    assert sent[-1].startswith(unreadable)  # positive control: the reply that failed
+    assert caught.value.permanent is True
+    assert caught.value.credential_fault is True
+    assert str(caught.value) == (
+        "FTP login reply could not be read, taken as a refused login: UnicodeDecodeError"
+    )
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert MRN not in _traceback(caught.value)
+    assert closed == [True]
+
+
+def test_an_unreadable_auth_tls_reply_is_a_config_fault_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent, closed = _scripted_session(monkeypatch, "AUTH")
+    client = _FtpClient(
+        {"host": "ftp.example.com", "username": "synthetic", "password": "synthetic-pw"},
+        tls=True,
+    )
+    with pytest.raises(_RemoteError) as caught:
+        client._connect()
+    assert sent == ["AUTH TLS"]  # no credential was sent
+    assert caught.value.permanent is True
+    assert caught.value.config_fault is True and caught.value.credential_fault is False
+    assert str(caught.value) == (
+        "FTPS server's reply to AUTH TLS could not be read, a TLS configuration fault, not a "
+        "credential fault: UnicodeDecodeError"
+    )
+    assert closed == [True]
+
+
+def test_an_unreadable_size_reply_still_fails_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CONTROL for the login case: a reply the client cannot read after the login, here to
+    ``SIZE``, still retries."""
+    ftp = ftplib.FTP()  # no host: never connects
+    sent: list[str] = []
+
+    def sendcmd(cmd: str) -> str:
+        sent.append(cmd)
+        f"213 \xe9 /in/{NAME}".encode("latin-1").decode()  # raises, as getline would
+        raise AssertionError("unreachable")
+
+    ftp.voidcmd = lambda cmd: "200 Type set to I"  # type: ignore[method-assign]
+    ftp.sendcmd = sendcmd  # type: ignore[method-assign]
+    ftp.quit = lambda: "221 Goodbye"  # type: ignore[method-assign]
+    monkeypatch.setattr(_FtpClient, "_connect", lambda self: ftp)
+    with pytest.raises(_RemoteError) as caught:
+        _FtpClient({"host": "ftp.example.com"}, tls=False).dispose_unless_changed(
+            "/in/a.hl7", 3, None
+        )
+    assert sent == ["SIZE /in/a.hl7"]  # positive control: the reply that failed
+    assert str(caught.value) == "FTP operation failed: UnicodeDecodeError"
+    assert caught.value.permanent is False and caught.value.credential_fault is False
+
+
 def test_a_failed_first_publish_listing_carries_no_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     ftp = _ScriptedFtp({"/in/.t.part": b"new"})
     ftp.list_reply = f"550 {urllib.parse.quote('/in/' + NAME)}: Permission denied"

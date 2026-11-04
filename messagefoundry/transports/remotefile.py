@@ -311,7 +311,10 @@ def _unreadable_reply(exc: ValueError) -> bool:
     Anything else is not, and escapes as itself: at least ``ftplib``'s refusal of a CR or LF in a
     command, raised before the command is sent, an encode error for text the session cannot send,
     and the ``idna`` codec's refusal of the host name. Each would fail alike on every retry, so a
-    transient class would retry it without end."""
+    transient class would retry it without end.
+
+    Mapped is not always transient: :meth:`_FtpClient._connect` makes an unreadable reply to the
+    login a credential fault, and one to ``AUTH TLS`` a configuration fault."""
     if isinstance(exc, UnicodeDecodeError):
         return True
     if type(exc) is not ValueError:
@@ -1143,7 +1146,25 @@ class _FtpClient(_RemoteClient):
             if not _unreadable_reply(exc):
                 ftp.close()
                 raise
-            fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
+            detail = _fault_detail(exc)
+            if step == _FTP_LOGIN:
+                # A login reply nobody can read may be a refusal: retried, it would lock the
+                # partner account (#109, ADR 0095), so it takes a refused login's class.
+                fault = _RemoteError(
+                    f"FTP login reply could not be read, taken as a refused login: {detail}",
+                    permanent=True,
+                    credential_fault=True,
+                )
+            elif step == _FTP_AUTH_TLS:
+                # Before any credential, as a refused AUTH TLS is: every retry meets the same reply.
+                fault = _RemoteError(
+                    f"FTPS server's reply to {step} could not be read, a TLS configuration fault, "
+                    f"not a credential fault: {detail}",
+                    permanent=True,
+                    config_fault=True,
+                )
+            else:
+                fault = _RemoteError(f"FTP connect failed: {detail}", permanent=False)
         except BaseException:
             ftp.close()
             raise
