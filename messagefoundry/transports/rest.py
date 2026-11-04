@@ -1590,7 +1590,9 @@ def refuse_unrevoked_verified_hop(
       the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
       checks that peer's certificate (vault BACKLOG #2188 for the REST destination, #2169 for the
       SMART and OAuth2 token hop).
-    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` is required there too.
+    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` was required there too until
+      vault BACKLOG #5086, since when ``capture`` gives such a context's CRL no credit itself, so
+      passing the opener gives the same disposition; the shipped callers still pass ``None``.
       :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` sets
       ``X509_V_FLAG_NO_CHECK_TIME`` on its context, and OpenSSL applies that flag to a CRL's
       validity window as well as the certificate's: a CRL past ``nextUpdate`` is then accepted at

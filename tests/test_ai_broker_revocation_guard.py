@@ -247,6 +247,18 @@ def test_an_attested_hop_whose_context_skips_time_validity_keeps_the_crossing_li
     assert len(ai_log) == 1
 
 
+def test_an_unattested_hop_whose_context_skips_time_validity_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Such a CRL is no check, so it cannot cross an enforcing hop on its own: the broker reads the
+    one ``crl_checked`` field the disposition reads (vault BACKLOG #5086). Before that row the
+    disposition read the bare CRL flag and this broker constructed. Stood in for as above."""
+    monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
+    monkeypatch.setattr(tls_policy, "skips_validity_period", lambda ctx: True)
+    with pytest.raises(AiBrokerError, match="no revocation check"):
+        _broker(posture=_ENFORCING)
+
+
 def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
     with pytest.raises(AiBrokerError, match="no revocation check"):
         AiBroker(

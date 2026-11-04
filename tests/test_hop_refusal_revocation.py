@@ -229,8 +229,8 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "posture",
         "blanket_attested",
         "crl_checked",
+        # Descriptive only: the record's wording reads it, no disposition does (vault BACKLOG #5086).
         "expiry_relaxed",
-        "context_skips_validity",  # feeds crl_is_a_check, an audit-line condition only
         "ways_across",
         "attested_reason",
         "connection",

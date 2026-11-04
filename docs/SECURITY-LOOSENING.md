@@ -1803,7 +1803,18 @@ count is above `0` (vault BACKLOG #2613).
   the credit whatever CRL the context loads (vault BACKLOG #5089); at least REST, SOAP and FHIR
   hand the guard no context or opener (ADR 0173 §4.3 and §13). CORRECTED 2026-11-03: this said
   `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
-  which stopped being true when `capture` gained that flag. The engine will tell you *which* connections have it set,
+  which stopped being true when `capture` gained that flag. *(Note 2026-11-04: since vault BACKLOG
+  #5086, `capture` also gives no CRL credit to a context it is handed that skips time validity when
+  the flag is not passed, and names the `tls_allow_expired` remedy for a hop that passes no remedy
+  of its own. So a hop handed its relaxed context is decided as above with or without the
+  flag. `capture` reads only the context it is handed, so a call site that handed it some other,
+  unrelaxed context with a CRL would still earn credit. `tests/test_revocation_guard_census.py`
+  fails on such a call site among the ones that reach `relax_verify_expiry` by name, in at least
+  the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
+  some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
+  file's relaxed-hop census say what it reads. REST, SOAP
+  and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
+  (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
