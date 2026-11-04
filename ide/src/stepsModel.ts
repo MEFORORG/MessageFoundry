@@ -17,7 +17,7 @@
 // shells (ADR 0072), never from reaching into LiveDebugController's private trace state.
 import type { TraceInvocation, TraceValue } from "./liveDebugModel";
 
-// ---- the `lens parse --json` contract (ADR 0076 §3; mirror of messagefoundry/lens.py output) --------
+// ---- the `lens parse --json` contract (ADR 0076 §3; mirror of messagefoundry_toolkit/lens.py output) --------
 
 export type RowKind =
   | "action"
@@ -270,7 +270,7 @@ export interface RowViewModel {
   /**
    * The PROJECTION-TIME source text of this row's [lineStart, lineEnd] range — the row exactly as the user
    * saw it when the lens projected the inputs (engine newline model: split on `\r\n`|`\r`|`\n`, joined by
-   * `\n`, no trailing EOL; mirrors `messagefoundry/lens._physical_lines`). Carried through an edit as the
+   * `\n`, no trailing EOL; mirrors `messagefoundry_toolkit/lens._physical_lines`). Carried through an edit as the
    * engine's `expect_src` so `lens rewrite` refuses a stale coordinate before splicing the wrong same-shape
    * row (F7). It is NEVER re-derived from the live buffer at edit time — that is what made the guard
    * tautological (the engine would compare the buffer against itself). Optional so a hand-built
@@ -375,7 +375,7 @@ export function splitLines(source: string): string[] {
 
 /**
  * Split module source into physical lines on `\r\n` / `\r` / `\n` ONLY — the exact newline set the engine
- * uses (`messagefoundry/lens._physical_lines`, matching the CPython tokenizer / AST line numbers). Used for
+ * uses (`messagefoundry_toolkit/lens._physical_lines`, matching the CPython tokenizer / AST line numbers). Used for
  * every source→line-range slice in the build path so a projection-time `expectSrc` compares byte-for-byte
  * against what `lens rewrite` recomputes from the buffer (F7). NOT `str.splitlines()`'s wider Unicode set
  * (vertical tab, form feed, NEL, U+2028/9), which would insert phantom breaks and spuriously refuse.
@@ -528,7 +528,7 @@ export function isRowMovable(row: LensRow): boolean {
 }
 
 /**
- * Whether a row can be DELETED. Mirrors the engine's delete gate (messagefoundry/lens rewrite_source):
+ * Whether a row can be DELETED. Mirrors the toolkit's delete gate (messagefoundry_toolkit/lens rewrite_source):
  * any lens-editable leaf (action/lookup/send/diagnostic), plus a whole `if`/`for` control BLOCK (its
  * header removes the block). A `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it
  * (so the webview greys the trash to avoid an error toast, F6).
@@ -777,7 +777,7 @@ const REFUSAL_CODES: Readonly<Record<string, RewriteRefusalKind>> = {
 };
 
 // The FALLBACK for an engine that predates the codes: substrings of its refusal text
-// (messagefoundry/lens.py, `_render_moded_value`, `_refuse_templated_write`, `_check_parts_spec`,
+// (messagefoundry_toolkit/lens.py, `_render_moded_value`, `_refuse_templated_write`, `_check_parts_spec`,
 // `_render_parts`, `_refuse_overlong_template_lines`). Template-shape is checked FIRST because it is the
 // only mode family whose messages quote user text (a refused path, verbatim), so a path spelling another
 // family's needle must not be filed under it. The other mode families quote only a Python parameter
@@ -1198,7 +1198,7 @@ export interface EditMessage {
   expectSrc?: string;
 }
 
-/** The `lens rewrite` edit spec (mirror of messagefoundry/lens.rewrite_source's contract). */
+/** The `lens rewrite` edit spec (mirror of messagefoundry_toolkit/lens.rewrite_source's contract). */
 export interface EditRequest {
   handler: string;
   line_start: number;

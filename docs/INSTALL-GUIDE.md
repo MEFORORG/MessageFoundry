@@ -82,8 +82,8 @@ A production host needs the engine alone. A site that installs the toolkit on a 
 chosen to carry the authoring commands there, which is what the split exists to avoid (ASVS 15.2.3).
 The split is not finished: the synthetic-HL7 generators, the HL7 schema modules and the
 de-identification package still ship in the engine wheel until later ADR 0201 slices move them, so
-an engine-only host still carries that code. The `messagefoundry` command has no row that runs it,
-but at least one module still runs on its own: `python -m messagefoundry.generators.adt` writes
+an engine-only host still carries that code. The `messagefoundry` command has no subcommand that runs
+it, but at least one module still runs on its own: `python -m messagefoundry.generators.adt` writes
 synthetic ADT messages from the engine wheel alone (`messagefoundry/generators/adt.py`).
 
 The extras, by group. `pyproject.toml` holds the live list.

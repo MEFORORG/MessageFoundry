@@ -12,7 +12,6 @@ import {
   TOOLKIT_MODULE,
   UNTRUSTED_WORKSPACE_STDERR,
   commandLabel,
-  commandName,
   explainMissingToolkit,
   parseJsonResult,
   type CliResult,
@@ -31,7 +30,7 @@ function result(over: Partial<CliResult>): CliResult {
 
 function failure(res: CliResult): CliOutputError {
   try {
-    parseJsonResult(res, ARGS);
+    parseJsonResult(res, ARGS, ENGINE_MODULE);
   } catch (e) {
     assert.ok(e instanceof CliOutputError, `expected a CliOutputError, got ${String(e)}`);
     return e;
@@ -56,7 +55,7 @@ suite("cliJson.parseJsonResult never quotes CLI output (vault BACKLOG #1187, gro
   });
 
   test("the same JSON with no print parses (control arm)", () => {
-    assert.deepStrictEqual(parseJsonResult(result({ stdout: JSON_BODY }), ARGS), [
+    assert.deepStrictEqual(parseJsonResult(result({ stdout: JSON_BODY }), ARGS, ENGINE_MODULE), [
       { source: "a.hl7", disposition: "PROCESSED" },
     ]);
   });
@@ -77,7 +76,7 @@ suite("cliJson.parseJsonResult never quotes CLI output (vault BACKLOG #1187, gro
 
   test('the CLI\'s composed {"error": ...} body still passes through', () => {
     assert.throws(
-      () => parseJsonResult(result({ stdout: '{"error": "no such file or directory: x.hl7"}' }), ARGS),
+      () => parseJsonResult(result({ stdout: '{"error": "no such file or directory: x.hl7"}' }), ARGS, ENGINE_MODULE),
       (e: Error) => !(e instanceof CliOutputError) && e.message === "no such file or directory: x.hl7",
     );
   });
@@ -124,7 +123,7 @@ suite("cliJson.commandLabel", () => {
     assert.strictEqual(commandLabel([]), "command");
   });
 
-  test("a failure names the command that ran: the toolkit's for a toolkit run, the engine's by default", () => {
+  test("a failure names the command that ran: the toolkit's for a toolkit run, the engine's for an engine run", () => {
     const res = result({ stderr: "boom\n", code: 1 });
     const lens = ["lens", "schema"];
     assert.throws(
@@ -132,11 +131,9 @@ suite("cliJson.commandLabel", () => {
       (e: Error) => e.message.startsWith("messagefoundry-toolkit lens schema exited with code 1"),
     );
     assert.throws(
-      () => parseJsonResult(res, lens),
+      () => parseJsonResult(res, lens, ENGINE_MODULE),
       (e: Error) => e.message.startsWith("messagefoundry lens schema exited with code 1"),
     );
-    assert.strictEqual(commandName(TOOLKIT_MODULE), "messagefoundry-toolkit");
-    assert.strictEqual(commandName(ENGINE_MODULE), "messagefoundry");
   });
 });
 
@@ -155,7 +152,7 @@ suite("cliJson.explainMissingToolkit", () => {
       assert.strictEqual(res.stderr, TOOLKIT_MISSING_MESSAGE, stderr);
       assert.strictEqual(res.code, 1);
       assert.throws(
-        () => parseJsonResult(res, ["lens", "schema"]),
+        () => parseJsonResult(res, ["lens", "schema"], TOOLKIT_MODULE),
         (e: unknown) => e instanceof Error && e.message === TOOLKIT_MISSING_MESSAGE,
       );
     }

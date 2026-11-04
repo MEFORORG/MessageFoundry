@@ -156,9 +156,6 @@ def test_the_log_argument_scrub_is_the_escape_with_line_breaks_replaced_first() 
 # an old narrow copy is still caught rather than falling out of view.
 
 _REPO = Path(__file__).resolve().parent.parent
-#: The scan reads ``package_sources()``: the engine, the web console, and the toolkit that holds the
-#: authoring modules ADR 0201 slice 4 moved out of the engine (``corepoint_import.py`` among them,
-#: which strips with this alphabet).
 _DOMAIN = range(0x0000, 0x0300)
 _ALPHABET = frozenset(c for c in _DOMAIN if _is_control_char(chr(c)))
 _C0_DEL = frozenset(range(0x20)) | {0x7F}
@@ -173,12 +170,12 @@ _TARGETS = (_ALPHABET, _C0_DEL)
 #: would only suppress the one case that matters, where it is rewritten into a real copy. Its
 #: exemption is test_the_soap_carve_out_is_the_xml_char_rule_and_not_this_alphabet instead.
 _EXEMPT: dict[tuple[str, str], str] = {
-    ("messagefoundry/controlchars.py", "_is_control_char"): "compare",  # THE definition
-    ("messagefoundry/parsing/sniff.py", "nontext_upload_reason"): "compare",  # byte-wise density
-    (
-        "messagefoundry/spreadsheet.py",
-        "_LEADING_NOISE",
-    ): "range",  # importer leads, harness-mirrored
+    # THE definition
+    ("messagefoundry/controlchars.py", "_is_control_char"): "compare",
+    # byte-wise density count
+    ("messagefoundry/parsing/sniff.py", "nontext_upload_reason"): "compare",
+    # importer-droppable leads, harness-mirrored
+    ("messagefoundry/spreadsheet.py", "_LEADING_NOISE"): "range",
 }
 
 
@@ -285,7 +282,9 @@ def _rederivations(source: str) -> list[tuple[str, str, int]]:
 
 @functools.cache
 def _scan_package() -> tuple[int, dict[tuple[str, str], list[tuple[str, int]]]]:
-    """``(files scanned, hits by site)``. Cached: two tests read it and the scan is the cost."""
+    """``(files scanned, hits by site)``. Cached: two tests read it and the scan is the cost.
+    ``package_sources()`` names the packages read, the toolkit among them since ADR 0201 slice 4
+    moved ``corepoint_import.py``, which strips with this alphabet, out of the engine."""
     hits: dict[tuple[str, str], list[tuple[str, int]]] = {}
     paths = package_sources()
     for path in paths:
@@ -295,14 +294,14 @@ def _scan_package() -> tuple[int, dict[tuple[str, str], list[tuple[str, int]]]]:
     return len(paths), hits
 
 
-def test_no_site_under_messagefoundry_re_derives_the_alphabet() -> None:
+def test_no_site_in_the_engine_packages_re_derives_the_alphabet() -> None:
     """Import :mod:`messagefoundry.controlchars` instead. If a site genuinely needs a different
     set, it is not a copy; if it needs this one for a stated reason, add it to ``_EXEMPT`` and give
     the reason in the controlchars module docstring."""
     scanned, hits = _scan_package()
     offenders = {site: found for site, found in hits.items() if site not in _EXEMPT}
     assert scanned > 0 and offenders == {}, (
-        f"scanned {scanned} files under the engine's packages; re-derived C0+DEL set, import "
+        f"scanned {scanned} files of package_sources(); re-derived C0+DEL set, import "
         f"controlchars instead: {offenders}"
     )
 

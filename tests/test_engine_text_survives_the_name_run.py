@@ -26,8 +26,8 @@ from messagefoundry import redaction
 from tests._ast_sites import callee_name, package_sources, parse_source
 
 _REPO = Path(__file__).resolve().parents[1]
-#: The engine, the web console and the toolkit the authoring commands moved to in ADR 0201 slice 4:
-#: the text of all three is engine-authored, so the scan reads all three.
+#: ``package_sources()`` names the packages read. Their text is engine-authored, the toolkit's too
+#: since ADR 0201 slice 4 moved authoring commands there.
 _SOURCES = package_sources()
 _LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical"})
 
@@ -105,7 +105,7 @@ def _local_positions(tree: ast.Module) -> _Positions:
 def _engine_positions() -> dict[str, _Positions]:
     """Each engine module's module-level functions and classes with their label positions, by dotted
     name (a package's ``__init__`` under the package). Parsed directly, not through the shared
-    ``parse_source`` cache, which holds 16 trees and would only be churned by 290 modules."""
+    ``parse_source`` cache, which holds 16 trees and would only be churned by hundreds of modules."""
     out: dict[str, _Positions] = {}
     for path in _SOURCES:
         parts = path.relative_to(_REPO).with_suffix("").parts

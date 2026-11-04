@@ -804,7 +804,7 @@ suite("Steps edit — the stale-coordinate guard (F7)", () => {
 // message → payload — NOT recomputed from the same live buffer sent as stdin (which made the engine
 // compare the buffer against itself, a tautology that let a shifted same-shape row be silently edited).
 // The `lens rewrite` CLI boundary has no Python here, so these exercise the pure decision/payload and
-// model the engine's F7 comparison (physicalLines, mirroring messagefoundry/lens._physical_lines).
+// model the engine's F7 comparison (physicalLines, mirroring messagefoundry_toolkit/lens._physical_lines).
 
 // Two identical-shape `copy_field` rows — the exact same-shape hazard the F7 guard protects against.
 const F7_SOURCE = [

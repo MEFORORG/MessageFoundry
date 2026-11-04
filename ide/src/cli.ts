@@ -283,8 +283,11 @@ export function runWithStdin(
  * (e.g. `validate` returns 1 when there are diagnostics), so we parse stdout regardless of code.
  * A failure's message never quotes the CLI's output; see cliJson.ts for why.
  */
-export async function runJson<T>(args: string[], cwd?: string, opts?: RunOptions): Promise<T> {
-  return parseJsonResult<T>(await run([...args, "--json"], cwd, opts), args, opts?.module);
+export async function runJson<T>(args: string[], cwd?: string, opts: RunOptions = {}): Promise<T> {
+  // The module is resolved once, here, so the command that runs and the command a failure names
+  // are the same one.
+  const module = opts.module ?? ENGINE_MODULE;
+  return parseJsonResult<T>(await run([...args, "--json"], cwd, { ...opts, module }), args, module);
 }
 
 /**
@@ -296,12 +299,13 @@ export async function runJsonWithStdin<T>(
   args: string[],
   stdin: string,
   cwd?: string,
-  opts?: RunOptions,
+  opts: RunOptions = {},
 ): Promise<T> {
+  const module = opts.module ?? ENGINE_MODULE; // resolved once, as in runJson
   return parseJsonResult<T>(
-    await runWithStdin([...args, "--json"], stdin, cwd, opts),
+    await runWithStdin([...args, "--json"], stdin, cwd, { ...opts, module }),
     args,
-    opts?.module,
+    module,
   );
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// Turning one `messagefoundry ... --json` result into a value or an error. No `vscode` import, so the
+// Turning one `messagefoundry ... --json` or `messagefoundry-toolkit ... --json` result into a value
+// or an error. No `vscode` import, so the
 // unit suite runs it; cli.ts wraps it around the real child process.
 //
 // PHI (ASVS 14.2.6, vault BACKLOG #1187, ground d2). A failure here becomes text the user sees: a
@@ -146,11 +147,7 @@ const USAGE_ON_STDOUT = /^\s*usage:/i;
  * composed message. Every other failure throws a {@link CliOutputError} whose message quotes nothing
  * the CLI printed, and names the command `module` ran.
  */
-export function parseJsonResult<T>(
-  res: CliResult,
-  args: string[],
-  module: CliModule = ENGINE_MODULE,
-): T {
+export function parseJsonResult<T>(res: CliResult, args: string[], module: CliModule): T {
   const label = `${commandName(module)} ${commandLabel(args)}`;
   const text = res.stdout.trim();
   if (!text) {

@@ -14,7 +14,7 @@ import {
   type OpSchema,
 } from "../../stepsModel";
 
-// BACKLOG #1760 — the Steps-view param INPUT widgets are driven by the engine's `lens schema` output
+// BACKLOG #1760 — the Steps-view param INPUT widgets are driven by the toolkit's `lens schema` output
 // (op -> editable params with their kind), not a hand-rolled IDE table. These are the pure, vscode-free
 // renderer + edit-mapping tests (the CI ide job has no Python, so they consume a CANNED op-schema
 // fixture — a faithful dump of `messagefoundry-toolkit lens schema` — never shelling the CLI). Covers: an int
