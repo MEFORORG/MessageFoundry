@@ -24,6 +24,7 @@ import pytest
 
 from messagefoundry.config.models import BatchConfig
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.log_backoff import FailureRun
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.stage_dispatcher import (
@@ -753,7 +754,7 @@ async def test_per_lane_deaths_far_apart_start_a_new_run(
 
 def _dead_run(n: int) -> Any:
     """A run of ``n`` deaths, as a supervisor records it."""
-    run = stage_dispatcher.FailureRun()
+    run = FailureRun()
     for _ in range(n):
         run = run.record(logging.getLogger("test"), _Kill("x"), "death", level=logging.DEBUG)
     return run
