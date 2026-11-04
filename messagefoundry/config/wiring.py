@@ -4455,17 +4455,21 @@ def DatabasePoll(
     """A SQL database polling **source** (inbound, ADR 0003 §3; SQL Server via the ``[sqlserver]`` extra +
     ODBC Driver 18 — **production / supported**). Every ``poll_seconds`` it runs ``poll_statement`` (a ``SELECT``),
     hands each row to the bound router as a body, then runs ``mark_statement`` (bound from the row's
-    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape. At-least-once:
-    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate duplicates**.
+    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape.
+    At-least-once with a poll that does not write and a mark that takes out only the row handed off:
+    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate
+    duplicates**.
 
     Lead pattern is a status column: ``poll_statement='SELECT id, payload FROM mf_inbox WHERE status=\\'NEW\\''``
-    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
-    high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
-    whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
-    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a
-    handler failure stops that poll at the failed row, so a row that fails every time holds back the
-    rows behind it; the *Database source* section of docs/CONNECTIONS.md says what a high-water mark
-    needs on top of that (BACKLOG #4921). Put secrets (``password``) in
+    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` keyed
+    the same way also works as the ``mark_statement``). ``body_column`` unset → the whole row as a
+    JSON object (pair with ``content_type=json``); set → that one column's value verbatim (e.g. a
+    column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a handler
+    failure stops that poll at the failed row, so a row that fails every time holds back the rows
+    behind it (BACKLOG #4921). A high-water-mark ``UPDATE`` also runs as a ``mark_statement``, but
+    even with that stop it is not at-least-once: it can leave a row that was never handed off behind
+    its cursor. The *Database source* section of docs/CONNECTIONS.md says what one needs and names
+    some of the cases where it loses a row even then (BACKLOG #4958). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
     ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
