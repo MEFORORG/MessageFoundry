@@ -372,19 +372,16 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
         rows = await store.list_audit(action="auth.session_revoked", limit=1)
         return dict(json.loads(rows[0]["detail"]))
 
-    real_all, real_user = store.revoke_all_sessions, store.revoke_user_sessions
-
     def answering(kept: bool) -> None:
         # The real revoke runs, and only its `kept` is replaced: the service has nothing else to
         # read the answer from.
-        async def revoke_all(**kwargs: Any) -> RevokeResult:
-            return replace(await real_all(**kwargs), kept=kept)
+        for name in ("revoke_all_sessions", "revoke_user_sessions"):
+            real = getattr(store, name)
 
-        async def revoke_user(user_id: str, **kwargs: Any) -> RevokeResult:
-            return replace(await real_user(user_id, **kwargs), kept=kept)
+            async def flipped(*args: Any, _real: Any = real, **kwargs: Any) -> RevokeResult:
+                return replace(await _real(*args, **kwargs), kept=kept)
 
-        monkeypatch.setattr(store, "revoke_all_sessions", revoke_all)
-        monkeypatch.setattr(store, "revoke_user_sessions", revoke_user)
+            monkeypatch.setattr(store, name, flipped)
 
     for kept, every_scope, self_scope in (
         (True, "all_but_caller", "self_others"),
@@ -443,21 +440,19 @@ async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(
     async def refused(*_args: Any, **_kwargs: Any) -> Any:
         raise sqlite3.OperationalError("database is locked")
 
-    real_all, real_user = store.revoke_all_sessions, store.revoke_user_sessions
+    def then_refuse(name: str) -> None:
+        # The real revoke runs and commits; every session and user read after it is refused.
+        real = getattr(store, name)
 
-    async def then_refuse_all(**kwargs: Any) -> RevokeResult:
-        result = await real_all(**kwargs)
-        monkeypatch.setattr(store, "get_session", refused)
-        monkeypatch.setattr(store, "get_user", refused)
-        return result
+        async def revoke(*args: Any, **kwargs: Any) -> RevokeResult:
+            result: RevokeResult = await real(*args, **kwargs)
+            monkeypatch.setattr(store, "get_session", refused)
+            monkeypatch.setattr(store, "get_user", refused)
+            return result
 
-    async def then_refuse_user(user_id: str, **kwargs: Any) -> RevokeResult:
-        result = await real_user(user_id, **kwargs)
-        monkeypatch.setattr(store, "get_session", refused)
-        monkeypatch.setattr(store, "get_user", refused)
-        return result
+        monkeypatch.setattr(store, name, revoke)
 
-    monkeypatch.setattr(store, "revoke_all_sessions", then_refuse_all)
+    then_refuse("revoke_all_sessions")
     assert await service.revoke_every_session(actor="u", keep_token_hash=hash_token(caller)) == (
         0,
         True,
@@ -466,7 +461,7 @@ async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(
     rows = await store.list_audit(action="auth.session_revoked", limit=1)
     assert json.loads(rows[0]["detail"]) == {"scope": "all_but_caller", "count": 0}
 
-    monkeypatch.setattr(store, "revoke_user_sessions", then_refuse_user)
+    then_refuse("revoke_user_sessions")
     assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 0
     monkeypatch.undo()
     # Kept with nothing else ended writes no row, as before the read-back: the newest row is
