@@ -2532,7 +2532,8 @@ from disk instead. The digest covers `serve`'s environment value file wherever
 where the release reads it into the snapshot after vetting the file and its folder. `serve` parses
 it from the same snapshot, so an edit to it during the load does not apply, and a value file
 created or removed since the snapshot is refused. Every engine shard and cluster node shares one
-config directory by contract, and so must read the same value file. A node whose value file
+config directory by contract, and is expected to read the same value file too. Nothing checks
+that, and a value file outside the config directory is not shared with it. A node whose value file
 differs pages `config_changed` on its starts, because a start compares its digest with the
 store's newest one, whichever node wrote it. It also refuses as `digest_mismatch` a hold filed
 through another node, as the cluster limit below says. In the `environments/` folder every

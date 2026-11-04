@@ -128,7 +128,8 @@ independent of where the bundle sits. A reload reads it into the snapshot it loa
 the file and its folder, and the provider parses those bytes, so a dual-control release checks and
 applies the same value bytes. A start still reads its values when the engine is built, so the start
 digest reads the file again afterwards and can name later bytes. Every engine shard and cluster
-node is assumed to read the same value file, as it shares the config directory; outside that
+node is assumed to read the same value file, though nothing checks it and sharing the config
+directory does not share a value file outside it; outside that
 directory only the active environment's file is folded, so nodes on different `--env` names
 compare as a config change. The DR backup digest describes
 the archive and does not fold it. A sandbox worker is not sent it: it resolves no value. The `v3`
