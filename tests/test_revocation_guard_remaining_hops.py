@@ -470,18 +470,23 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
     assert "connection 'OB_PACS';" in str(exc.value)
 
 
+def _guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
+    """The test hop under an enforcing posture; ``over`` replaces any default, attestation too."""
+    kwargs: dict[str, Any] = {
+        "host": REMOTE,
+        "cell": "test",
+        "description": "verified TLS egress (no revocation check)",
+        "attested": False,
+        "context": context,
+        "posture": ENFORCING,
+        "connection": "OB_TEST",
+    }
+    kwargs.update(over)
+    return RevocationHopGuard.capture(**kwargs)
+
+
 def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
-    return RevocationHopGuard.capture(
-        host=REMOTE,
-        cell="test",
-        description="verified TLS egress (no revocation check)",
-        attested=True,
-        attested_reason=REASON,
-        context=context,
-        posture=ENFORCING,
-        connection="OB_TEST",
-        **over,
-    )
+    return _guard(context, **{"attested": True, "attested_reason": REASON, **over})
 
 
 #: A phrase only the expiry-relaxed record carries; ``EXPIRY_RELAXED_WAYS_ACROSS`` does not hold it,
@@ -530,18 +535,7 @@ def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -
 
 def _relaxed_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
     """An unattested hop under an enforcing posture that says it skips validity-period checks."""
-    kwargs: dict[str, Any] = {
-        "host": REMOTE,
-        "cell": "test",
-        "description": "verified TLS egress (no revocation check)",
-        "attested": False,
-        "context": context,
-        "posture": ENFORCING,
-        "connection": "OB_TEST",
-        "expiry_relaxed": True,
-    }
-    kwargs.update(over)
-    return RevocationHopGuard.capture(**kwargs)
+    return _guard(context, **{"expiry_relaxed": True, **over})
 
 
 def test_expiry_relaxed_alone_denies_a_crl_on_the_context_its_credit() -> None:

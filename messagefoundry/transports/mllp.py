@@ -921,7 +921,6 @@ class MLLPDestination(DestinationConnector):
         # the guard is told with expiry_relaxed, which drops that credit and names the relaxed
         # remedy: see skips_validity_period (owner ruling 2026-10-05; vault BACKLOG #2978 and #5089,
         # ADR 0173 §13).
-        expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
                 host=self.host,
@@ -935,7 +934,7 @@ class MLLPDestination(DestinationConnector):
                 # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting --
                 # so a sibling hop the same CRL never reached keeps its refusal.
                 context=self._ssl,
-                expiry_relaxed=expiry_relaxed,
+                expiry_relaxed=skips_validity_period(self._ssl),
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None
