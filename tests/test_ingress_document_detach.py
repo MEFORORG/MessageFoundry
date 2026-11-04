@@ -132,8 +132,9 @@ def _ack_code(ack: str | None) -> str | None:
 
 def test_iter_obx_documents_yields_verbatim_and_content_type() -> None:
     b64 = _big_b64(64)
-    msg = Message.parse(_hl7_with_doc(b64, obx_type="Application"))
-    docs = list(iter_obx_documents(msg))
+    text = _hl7_with_doc(b64, obx_type="Application")
+    msg = Message.parse(text)
+    docs = list(iter_obx_documents(msg, received=text))
     assert docs == [(1, b64, "Application")]
 
 
@@ -142,9 +143,10 @@ def test_iter_obx_documents_refuses_a_received_handle() -> None:
     # document this engine detached: refused, not skipped as already detached (BACKLOG #5099).
     ref = hashlib.sha256(b"x").hexdigest()
     handle = make_doc_ref(ref, "Application")
-    msg = Message.parse(_hl7_with_doc(handle))
+    text = _hl7_with_doc(handle)
+    msg = Message.parse(text)
     with pytest.raises(InboundDocRefError):
-        list(iter_obx_documents(msg))
+        list(iter_obx_documents(msg, received=text))
 
 
 def test_chunk_b64_concatenates_to_input() -> None:
@@ -703,5 +705,6 @@ def test_an_escape_outside_obx_5_5_does_not_refuse_the_document() -> None:
     """The check reads OBX-5.5 alone: an escape in another component of OBX-5 is the sender's
     ordinary HL7 and leaves the document detachable."""
     b64 = _big_b64(300)
-    msg = Message.parse(_hl7_with_doc(b64, obx_type="App\\T\\lication"))
-    assert [(occ, doc) for occ, doc, _ct in iter_obx_documents(msg)] == [(1, b64)]
+    text = _hl7_with_doc(b64, obx_type="App\\T\\lication")
+    msg = Message.parse(text)
+    assert [(occ, doc) for occ, doc, _ct in iter_obx_documents(msg, received=text)] == [(1, b64)]

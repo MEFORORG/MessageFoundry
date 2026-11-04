@@ -643,7 +643,7 @@ def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> No
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         strip_documents(text, pruned_at=0.0)
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        list(iter_obx_documents(Message.parse(text)))
+        list(iter_obx_documents(Message.parse(text), received=text))
     assert _is_short_msh2_shape(text)
     assert not _is_batch_header_shape(text)
 
@@ -659,7 +659,7 @@ def test_the_batch_header_finding_still_reproduces_through_the_raw_helpers() -> 
         Peek.parse(text)
     message = Message.parse(text)
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        list(iter_obx_documents(message))
+        list(iter_obx_documents(message, received=text))
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         extract_obx_document(message)
     assert _is_batch_header_shape(text)

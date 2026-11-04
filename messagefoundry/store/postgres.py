@@ -289,7 +289,6 @@ from messagefoundry.store.store import (
     approval_fails_seal,
     approval_tombstone,
     approval_update,
-    attachments_named,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -309,6 +308,7 @@ from messagefoundry.store.store import (
     full_authentication_clear,
     held_approval_tombstone,
     if_applied,
+    inheritance_plan,
     judge_totp,
     load_audit_chain,
     lockout_clear,
@@ -3951,10 +3951,12 @@ class PostgresStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
-        Postgres twin of :meth:`MessageStore._insert_passthrough_child`. Returns ``True`` if a child was
+        Postgres twin of :meth:`MessageStore._insert_passthrough_child`, which says what
+        ``inherits`` collects. Returns ``True`` if a child was
         produced, ``False`` if the depth cap was breached (no child; the caller records the parent
         ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
         'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
@@ -4002,7 +4004,9 @@ class PostgresStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
-            await self._inherit_attachments(conn, new_mid, parent_id, body)
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
             # Hoist the row id so the payload binds to its own row tag.
@@ -4458,6 +4462,7 @@ class PostgresStore:
                         loaded = json.loads(pmeta_json)
                         if isinstance(loaded, dict):
                             parent_meta = loaded
+                    inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_pg(
                             conn,
@@ -4468,10 +4473,13 @@ class PostgresStore:
                             parent_meta,
                             correlation_depth_cap,
                             now,
+                            inherits,
                         )
                         await self._insert_passthrough_marker_pg(
                             conn, message_id, pt_name, produced, now
                         )
+                    # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                    await self._inherit_attachments(conn, message_id, inherits)
                 for namespace, key, value in state_ops:
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
@@ -7108,32 +7116,35 @@ class PostgresStore:
         return where, params
 
     async def _inherit_attachments(
-        self, conn: Any, child_id: str, parent_id: str, body: str
+        self, conn: Any, parent_id: str, children: Sequence[tuple[str, str]]
     ) -> None:
-        """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
-        in the CALLER's transaction (BACKLOG #5099). Postgres twin of
-        :meth:`MessageStore._inherit_attachments`, which says why."""
-        # ORDER BY: each incref below takes the attachment header's row lock until commit, so two
-        # transactions that incref the same documents must take them in one order, or each can wait
-        # on the other. The ingress incref takes them in this order too.
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). Postgres
+        twin of :meth:`MessageStore._inherit_attachments`, which says why."""
+        if not children:
+            return
         rows = await conn.fetch(
             "SELECT attachment_id FROM message_attachment WHERE message_id=$1"
             " ORDER BY attachment_id",
             parent_id,
         )
-        for ref in attachments_named([str(r["attachment_id"]) for r in rows], body):
-            # The incref first, and the link only where it found the header (the SQLite twin
+        # Each incref below takes the attachment header's row lock until commit, so two
+        # transactions that incref the same documents must take them in one order, or each can wait
+        # on the other. inheritance_plan gives every child of this transaction one pass in
+        # content-address order, the order the ingress increfs and the retention decrefs take.
+        held = [str(r["attachment_id"]) for r in rows]
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header (the SQLite twin
             # says why): under READ COMMITTED a purge can collect it after the read above.
             status = await conn.execute(
-                "UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref
+                "UPDATE attachment SET refcount = refcount + $1 WHERE id=$2", len(child_ids), ref
             )
             if _rowcount(status) != 1:
                 continue
-            await conn.execute(
+            await conn.executemany(
                 "INSERT INTO message_attachment (message_id, attachment_id, inherited)"
                 " VALUES ($1,$2,TRUE)",
-                child_id,
-                ref,
+                [(child_id, ref) for child_id in child_ids],
             )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -7609,7 +7620,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
-                    await self._inherit_attachments(conn, child_mid, message_id, body)
+                    await self._inherit_attachments(conn, message_id, [(child_mid, body)])
                     await self._event(
                         conn, child_mid, "received", None, f"edit-resend from {message_id}", now
                     )
@@ -7798,7 +7809,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
-                    await self._inherit_attachments(conn, new_mid, origin_message_id, raw)
+                    await self._inherit_attachments(conn, origin_message_id, [(new_mid, raw)])
                     # Hoist the row id so the payload binds to its own row tag.
                     resubmit_row_id = uuid4().hex
                     await conn.execute(

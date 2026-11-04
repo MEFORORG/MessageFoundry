@@ -300,9 +300,14 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   bare or as a copied handle, is not linked. A document whose header a purge collected first is
   not linked either, so `refcount` still equals the live linkage rows. Purging either message then
   releases only its own reference. A handle naming a document the parent does not hold is not
-  linked, and is refused at delivery. On Postgres and SQL Server the increfs run in
-  content-address order, as the ingress increfs and the retention decrefs now do, so an
-  inheritance, an ingress and a purge take the documents' header locks in one order.
+  linked, and is refused at delivery. A transform with several pass-through Sends makes several
+  children in one transaction, so the store links them all in one pass once they exist
+  (`inheritance_plan`): each named document is increfed once, by the number of children naming
+  it, in content-address order. On Postgres and SQL Server each incref holds the document's header
+  row lock until commit, and the ingress increfs and the retention decrefs now take those locks in
+  the same order, so an inheritance, an ingress and a purge take the documents' header locks in one
+  order. SQLite needs no such order, since a write transaction there holds the database-wide write
+  lock; it shares the one-pass shape so the three backends stay twins.
   **An inherited link grants no download.** It is written with `inherited` set, and
   `attachments_for` leaves it out unless the caller asks for it, which only delivery does. So the
   download route and the message detail's attachment list read through the child exactly as

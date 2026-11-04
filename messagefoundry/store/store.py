@@ -1032,6 +1032,23 @@ def attachments_named(held: Iterable[str], body: str) -> list[str]:
     return [ref for ref in held if ref in named]
 
 
+def inheritance_plan(
+    held: Iterable[str], children: Iterable[tuple[str, str]]
+) -> list[tuple[str, list[str]]]:
+    """For every content address in ``held`` that some child's body names (:func:`attachments_named`),
+    the ids of the children that name it, in content-address order (BACKLOG #5099). ``children`` is
+    ``(child_id, body)`` for each child one transaction makes: a transform with several pass-through
+    Sends makes several. The caller increfs each address once, by the number of children naming
+    it, in this order, so the transaction takes each document's header lock once and in the order
+    the ingress increfs and the retention decrefs take them, however many children it makes."""
+    held = list(held)
+    naming: dict[str, list[str]] = {}
+    for child_id, body in children:
+        for ref in attachments_named(held, body):
+            naming.setdefault(ref, []).append(child_id)
+    return sorted(naming.items())
+
+
 @dataclass(frozen=True)
 class ReingressOutcome:
     """The result of a :meth:`QueueStore.reingress` (edit-and-resubmit re-route, ADR 0090 §9,
@@ -10959,36 +10976,42 @@ class MessageStore:
             f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}) AND {_NOT_PT_MARKER_Q})))"
         )
 
-    async def _inherit_attachments(self, child_id: str, parent_id: str, body: str) -> None:
-        """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
-        in the CALLER's transaction (BACKLOG #5099). A pass-through, edit-and-resubmit or
-        edit-and-resend child carries its parent's skeleton under a new message id, and delivery
-        resolves a handle only against the row's own message, so the child must hold the documents
-        it carries. Each holder keeps its own reference, so purging either releases only its own and
-        ``refcount`` still equals the live linkage rows. :func:`attachments_named` says why only a
-        named document is inherited. The link is written ``inherited``, so it serves delivery and
-        retention but grants no download (:meth:`attachments_for`)."""
-        # In content-address order, as the server backends read it, where the order is what stops
-        # two transactions increfing the same documents in opposite orders.
+    async def _inherit_attachments(
+        self, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). A
+        pass-through, edit-and-resubmit or edit-and-resend child carries its parent's skeleton under
+        a new message id, and delivery resolves a handle only against the row's own message, so the
+        child must hold the documents it carries. Each holder keeps its own reference, so purging
+        either releases only its own and ``refcount`` still equals the live linkage rows.
+        :func:`attachments_named` says why only a named document is inherited. The link is written
+        ``inherited``, so it serves delivery and retention but grants no download
+        (:meth:`attachments_for`). Every child one transaction makes comes in one call, the shape
+        the server backends need (:func:`inheritance_plan`); SQLite's database-wide write lock makes
+        the order moot here."""
+        if not children:
+            return
+        # ORDER BY as the server backends read it; inheritance_plan sorts what it returns anyway.
         cur = await self._db.execute(
             "SELECT attachment_id FROM message_attachment WHERE message_id=? ORDER BY attachment_id",
             (parent_id,),
         )
         held = [str(r["attachment_id"]) for r in await cur.fetchall()]
-        for ref in attachments_named(held, body):
-            # The incref first, and the link only where it found the header: a purge that
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header: a purge that
             # collected the document after the read above would otherwise leave a link to no
             # header, and refcount would no longer equal the live linkage rows. The child then
             # holds nothing, and delivery refuses its handle.
             cur = await self._db.execute(
-                "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+                "UPDATE attachment SET refcount = refcount + ? WHERE id=?", (len(child_ids), ref)
             )
             if cur.rowcount != 1:
                 continue
-            await self._db.execute(
+            await self._db.executemany(
                 "INSERT INTO message_attachment (message_id, attachment_id, inherited) "
                 "VALUES (?,?,1)",
-                (child_id, ref),
+                [(child_id, ref) for child_id in child_ids],
             )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -11609,6 +11632,7 @@ class MessageStore:
                     loaded = json.loads(pmeta_json)
                     if isinstance(loaded, dict):
                         parent_meta = loaded
+                inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = await self._insert_passthrough_child(
                         routed_id,
@@ -11618,6 +11642,7 @@ class MessageStore:
                         parent_meta,
                         correlation_depth_cap,
                         now,
+                        inherits,
                     )
                     # The parent's disposition for this Send: a marker outbound row keyed by the PT
                     # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
@@ -11625,6 +11650,8 @@ class MessageStore:
                     # claims take PENDING rows only), so it is inert; it exists solely so the
                     # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
                     await self._insert_passthrough_marker(message_id, pt_name, produced, now)
+                # Every child's documents in one pass, after the children exist (BACKLOG #5099).
+                await self._inherit_attachments(message_id, inherits)
             # JSON-encode + apply each declared state write in the SAME transaction as the outbound
             # rows. Encoding is done up front so a (shouldn't-happen) serialization error aborts the
             # whole handoff cleanly rather than after some rows were inserted. SetState validated
@@ -12643,11 +12670,14 @@ class MessageStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
         Returns ``True`` if a child was produced, ``False`` if the depth cap was breached (no child; the
-        caller records the parent ``ERROR`` instead). The child is a **new, independent** message
+        caller records the parent ``ERROR`` instead). A child it makes is appended to ``inherits`` as
+        ``(child_id, body)``, for the caller to link to the parent's documents once every child of
+        the transaction is made (:meth:`_inherit_attachments`, BACKLOG #5099). The child is a **new, independent** message
         (``source_type='passthrough'``, its own content-addressed id, status ``RECEIVED`` per
         count-and-log), correlated to the parent (``correlation_id``/``correlation_root_id``/
         ``correlation_depth``). The PT inbound's own router worker drains the INGRESS row and re-routes
@@ -12699,7 +12729,9 @@ class MessageStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
-            await self._inherit_attachments(new_mid, parent_id, body)
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
             # Hoist the row id so the ingress payload binds to its own row tag.
@@ -14046,7 +14078,7 @@ class MessageStore:
                     origin=MessageOrigin.OPERATOR_EDIT,
                     origin_actor=actor,
                 )
-                await self._inherit_attachments(child_mid, message_id, body)
+                await self._inherit_attachments(message_id, [(child_mid, body)])
                 await self._event(
                     child_mid, "received", None, f"edit-resend from {message_id}", now
                 )
@@ -14252,7 +14284,7 @@ class MessageStore:
                     origin=MessageOrigin.OPERATOR_EDIT,
                     origin_actor=actor,
                 )
-                await self._inherit_attachments(new_mid, origin_message_id, raw)
+                await self._inherit_attachments(origin_message_id, [(new_mid, raw)])
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
                 # Hoist the row id so the payload binds to its own row tag.
                 resubmit_row_id = uuid4().hex

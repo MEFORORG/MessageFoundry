@@ -1053,8 +1053,9 @@ class QueueStore(StoreLifecycle, Protocol):
         for a message with no detached document (or on a backend without the substrate).
 
         A link a child message inherited from its parent (BACKLOG #5099) is left out unless
-        ``include_inherited`` is set: it serves delivery's handle binding only, and grants no
-        download through the child."""
+        ``include_inherited`` is set, which only delivery's handle binding does. It grants no
+        download through the child. Retention still releases it, as it releases any link, by
+        reading the linkage itself rather than through this method."""
         ...
 
     async def attachment_incref(self, ref: str) -> None:

@@ -289,7 +289,6 @@ from messagefoundry.store.store import (
     approval_fails_seal,
     approval_tombstone,
     approval_update,
-    attachments_named,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -309,6 +308,7 @@ from messagefoundry.store.store import (
     full_authentication_clear,
     held_approval_tombstone,
     if_applied,
+    inheritance_plan,
     judge_totp,
     load_audit_chain,
     lockout_clear,
@@ -909,9 +909,10 @@ _SQL_SELECT_MESSAGE_STATUS: Final[str] = (
 _SQL_UPDATE_MESSAGE_STATUS: Final[str] = "UPDATE messages SET status=? WHERE id=?"
 _SQL_SELECT_MESSAGE_EXISTS: Final[str] = "SELECT 1 FROM messages WHERE id=?"
 # A child message inherits the documents its body names (BACKLOG #5099, _inherit_attachments).
-# ORDER BY: each incref takes the attachment header's row lock until commit, so two transactions
-# that incref the same documents must take them in one order, or each can wait on the other. The
-# ingress incref takes them in this order too.
+# Each incref takes the attachment header's row lock until commit, so two transactions that incref
+# the same documents must take them in one order, or each can wait on the other. inheritance_plan
+# sorts what this reads, across every child of the transaction, into the order the ingress increfs
+# and the retention decrefs take.
 _SQL_SELECT_MESSAGE_ATTACHMENTS: Final[str] = (
     "SELECT attachment_id FROM message_attachment WHERE message_id=? ORDER BY attachment_id"
 )
@@ -920,9 +921,10 @@ _SQL_INSERT_MESSAGE_ATTACHMENT: Final[str] = (
     "INSERT INTO message_attachment (message_id, attachment_id, inherited) VALUES (?,?,1)"
 )
 # Reports through OUTPUT, which a session-wide SET NOCOUNT ON cannot hide, so the caller links
-# only an attachment whose header the incref found.
+# only an attachment whose header the incref found. One incref per document, by the number of
+# children of the transaction that name it.
 _SQL_INCREF_ATTACHMENT: Final[str] = (
-    "UPDATE attachment SET refcount = refcount + 1 OUTPUT inserted.id WHERE id=?"
+    "UPDATE attachment SET refcount = refcount + ? OUTPUT inserted.id WHERE id=?"
 )
 # The channel rides along because the metadata cell is bound to it (BACKLOG #2593).
 _SQL_SELECT_METADATA: Final[str] = "SELECT channel_id, metadata FROM messages WHERE id=?"
@@ -6254,10 +6256,12 @@ class SqlServerStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
-        SQL Server twin of :meth:`MessageStore._insert_passthrough_child`. Returns ``True`` if a child
+        SQL Server twin of :meth:`MessageStore._insert_passthrough_child`, which says what
+        ``inherits`` collects. Returns ``True`` if a child
         was produced, ``False`` if the depth cap was breached (no child; the caller records the parent
         ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
         'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
@@ -6305,7 +6309,9 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
-            await self._inherit_attachments(cur, new_mid, parent_id, body)
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             await cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
@@ -6356,6 +6362,7 @@ class SqlServerStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Synchronous twin of :meth:`_insert_passthrough_child_mssql` (ADR 0071 B5). Same depth math,
         same content-addressed child id, same constant + builder sequence over a synchronous cursor."""
@@ -6397,7 +6404,7 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
-            self._inherit_attachments_sync(cur, new_mid, parent_id, body)
+            inherits.append((new_mid, body))  # linked by the caller, as the async twin says
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
@@ -6987,6 +6994,7 @@ class SqlServerStore:
                         )
                 if pt_deliveries:
                     parent_meta = _parent_meta_from_row(pmeta_dec)
+                    inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_mssql(
                             cur,
@@ -6997,10 +7005,13 @@ class SqlServerStore:
                             parent_meta,
                             correlation_depth_cap,
                             now,
+                            inherits,
                         )
                         await self._insert_passthrough_marker_mssql(
                             cur, message_id, pt_name, produced, now
                         )
+                    # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                    await self._inherit_attachments(cur, message_id, inherits)
                 # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS
                 # same transaction — crash before commit leaves no metadata; a re-run re-derives it.
                 if meta_ops:
@@ -7194,6 +7205,7 @@ class SqlServerStore:
                     )
             if pt_deliveries:
                 parent_meta = _parent_meta_from_row(pmeta_dec)
+                inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = self._insert_passthrough_child_mssql_sync(
                         cur,
@@ -7204,10 +7216,13 @@ class SqlServerStore:
                         parent_meta,
                         correlation_depth_cap,
                         now,
+                        inherits,
                     )
                     self._insert_passthrough_marker_mssql_sync(
                         cur, message_id, pt_name, produced, now
                     )
+                # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                self._inherit_attachments_sync(cur, message_id, inherits)
             # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS txn.
             if meta_ops:
                 merged = merge_user_metadata(pmeta_dec, meta_ops)
@@ -11403,30 +11418,38 @@ class SqlServerStore:
         )
 
     async def _inherit_attachments(
-        self, cur: Any, child_id: str, parent_id: str, body: str
+        self, cur: Any, parent_id: str, children: Sequence[tuple[str, str]]
     ) -> None:
-        """Link ``child_id`` to each attachment ``parent_id`` holds that ``body`` names, and incref it,
-        in the CALLER's transaction (BACKLOG #5099). SQL Server twin of
-        :meth:`MessageStore._inherit_attachments`, which says why."""
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). SQL Server
+        twin of :meth:`MessageStore._inherit_attachments`, which says why."""
+        if not children:
+            return
         await cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
         held = [str(r[0]) for r in await cur.fetchall()]
-        for ref in attachments_named(held, body):
-            # The incref first, and the link only where it found the header (the SQLite twin
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header (the SQLite twin
             # says why): under READ COMMITTED a purge can collect it after the read above.
-            await cur.execute(_SQL_INCREF_ATTACHMENT, (ref,))
+            await cur.execute(_SQL_INCREF_ATTACHMENT, (len(child_ids), ref))
             if await cur.fetchone() is None:
                 continue
-            await cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
+            for child_id in child_ids:
+                await cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
 
-    def _inherit_attachments_sync(self, cur: Any, child_id: str, parent_id: str, body: str) -> None:
+    def _inherit_attachments_sync(
+        self, cur: Any, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
         """Synchronous twin of :meth:`_inherit_attachments` (ADR 0071 B5)."""
+        if not children:
+            return
         cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
         held = [str(r[0]) for r in cur.fetchall()]
-        for ref in attachments_named(held, body):
-            cur.execute(_SQL_INCREF_ATTACHMENT, (ref,))
+        for ref, child_ids in inheritance_plan(held, children):
+            cur.execute(_SQL_INCREF_ATTACHMENT, (len(child_ids), ref))
             if cur.fetchone() is None:
                 continue
-            cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
+            for child_id in child_ids:
+                cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
@@ -11885,7 +11908,7 @@ class SqlServerStore:
                             ),
                         )
                         self.body_copies += 1  # A1: the child messages.raw copy
-                        await self._inherit_attachments(cur, child_mid, message_id, body)
+                        await self._inherit_attachments(cur, message_id, [(child_mid, body)])
                         await self._event(
                             cur, child_mid, "received", None, f"edit-resend from {message_id}", now
                         )
@@ -12141,7 +12164,7 @@ class SqlServerStore:
                                 actor,
                             ),
                         )
-                        await self._inherit_attachments(cur, new_mid, origin_message_id, raw)
+                        await self._inherit_attachments(cur, origin_message_id, [(new_mid, raw)])
                         # Hoist the row id so the payload binds to its own row tag.
                         resubmit_row_id = uuid4().hex
                         await cur.execute(

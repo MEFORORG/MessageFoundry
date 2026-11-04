@@ -8239,10 +8239,11 @@ class RegistryRunner:
             # the longest event-loop stall fell from about 0.3 s to 0.03 s at a 15 MiB body and from
             # 1.5-2.0 s to 0.1-0.2 s at 64 MiB. What is left is the longest single string operation,
             # which holds the GIL in any thread. The scan yields one document at a time, as the budget
-            # assumes, but its first hop does the per-OBX reads for every OBX (OBX-2 and OBX-5.4, each
-            # a split of the field) and scans every raw OBX-5.5 for an escape, so a refusal comes
-            # before any document is stored (vault BACKLOG #2809). Only one thread touches `message`
-            # at a time: each hop is awaited.
+            # assumes, but its first hop does the per-OBX reads for every OBX (OBX-2, OBX-5.4 and
+            # OBX-5.5, each a split of the field, each value dropped before the next is read) and
+            # scans every raw OBX-5.5 for an escape, so a refusal comes before any document is
+            # stored (vault BACKLOG #2809, BACKLOG #5099). Only one thread touches `message` at a
+            # time: each hop is awaited.
             message = await asyncio.to_thread(Message.parse, text)
             # The received text rides along so a body holding the handle marker anywhere is refused
             # here, before the ACK, rather than dead-lettered after the splice (BACKLOG #5099).

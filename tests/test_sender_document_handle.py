@@ -182,7 +182,7 @@ def test_the_detach_scan_refuses_a_handle_in_any_obx_not_only_an_ed_one() -> Non
     handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
     text = _hl7(_b64(10)) + f"OBX|2|TX|NOTE||^^^^{handle}||||||F\r"
     with pytest.raises(InboundDocRefError):
-        list(iter_obx_documents(Message.parse(text)))
+        list(iter_obx_documents(Message.parse(text), received=text))
 
 
 async def test_a_handle_naming_another_messages_document_is_never_delivered(
@@ -433,6 +433,70 @@ async def test_a_child_holds_its_own_reference_so_either_purge_keeps_the_count(
 
     await store.release_message_attachments(child)
     assert await _refcount(store, ref) is None  # the last holder gone, the document is collected
+
+
+def test_the_inheritance_plan_takes_every_childs_documents_in_one_sorted_pass() -> None:
+    """Several pass-through children made in one transaction are linked in one pass: each
+    document once, in content-address order, with every child that names it. Per child, a second
+    child naming a lower address would take that header lock after the first child's higher one,
+    the opposite of the order the ingress increfs and the retention decrefs take."""
+    from messagefoundry.store.store import inheritance_plan
+
+    low, high = sorted(hashlib.sha256(s).hexdigest() for s in (b"one", b"two"))
+    names_high = _hl7(make_doc_ref(high, "Application"))
+    names_both = names_high + f"OBX|2|ED|PDF||^Application^PDF^Base64^{make_doc_ref(low, 'x')}\r"
+    names_low = _hl7(make_doc_ref(low, "Application"))
+
+    plan = inheritance_plan(
+        [high, low], [("c1", names_high), ("c2", names_both), ("c3", names_low), ("c4", "x")]
+    )
+
+    assert plan == [(low, ["c2", "c3"]), (high, ["c1", "c2"])]
+
+
+async def test_several_passthrough_children_of_one_transform_each_hold_their_documents(
+    store: MessageStore,
+) -> None:
+    doc_a, doc_b = _b64(1500, b"A"), _b64(1500, b"B")
+    ref_a = await store.put_attachment(chunk_b64(doc_a), "application/pdf")
+    ref_b = await store.put_attachment(chunk_b64(doc_b), "application/pdf")
+    names_a = _hl7(make_doc_ref(ref_a, "Application"))
+    names_both = names_a + (
+        f"OBX|2|ED|PDF||^Application^PDF^Base64^{make_doc_ref(ref_b, 'Application')}||||||F\r"
+    )
+    parent = await store.enqueue_ingress(
+        channel_id="IB_STREAM", raw=names_both, attachment_refs=[ref_a, ref_b]
+    )
+    ingress = await store.claim_next_fifo("IB_STREAM", stage="ingress")
+    assert ingress is not None
+    assert await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=parent,
+        channel_id="IB_STREAM",
+        handlers=[("h", names_both)],
+        disposition=MessageStatus.ROUTED,
+    )
+    routed = await store.claim_next_fifo("IB_STREAM", stage="routed")
+    assert routed is not None
+
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=parent,
+        channel_id="IB_STREAM",
+        deliveries=[],
+        pt_deliveries=[("PT_ONE", names_both), ("PT_TWO", names_a)],
+    )
+
+    held: dict[str, list[str]] = {}
+    for channel in ("PT_ONE", "PT_TWO"):
+        children = await store.list_messages(channel_id=channel, allowed_channels=None)
+        assert len(children) == 1
+        rows = await store.attachments_for(str(children[0]["id"]), include_inherited=True)
+        held[channel] = [str(r["attachment_id"]) for r in rows]
+    assert held == {"PT_ONE": sorted([ref_a, ref_b]), "PT_TWO": [ref_a]}
+    # The parent's reference plus one per child that names the document.
+    assert await _refcount(store, ref_a) == 3
+    assert await _refcount(store, ref_b) == 2
 
 
 async def test_a_passthrough_child_holds_only_the_documents_its_body_names(
@@ -825,3 +889,50 @@ def test_the_detach_refuses_a_marker_its_delimiters_escape_in_the_received_text(
     # The control: without the copy the same body yields its one document.
     plain = _hl7(_b64(10), msh2=":~\\&")
     assert len(list(iter_obx_documents(Message.parse(plain), received=plain))) == 1
+
+
+def test_the_detach_scan_holds_one_document_value_at_a_time() -> None:
+    """The caller's in-flight budget assumes the scan holds one document at a time. Each
+    ``OBX-5.5`` value the scan reads is wrapped so a weak reference sees when it is freed; at every
+    yield, with the consumer's own reference dropped, at most the yielded value is alive. A scan
+    that kept every value until it finished holds all of them at the first yield."""
+    import weakref
+
+    class _Tracked(str):
+        pass
+
+    live: list[weakref.ref[_Tracked]] = []
+
+    class _TrackingMessage(Message):
+        def field(
+            self, path: str, *, occurrence: int = 1, repetition: int | None = None
+        ) -> str | None:
+            value = super().field(path, occurrence=occurrence, repetition=repetition)
+            if path != "OBX-5.5" or not value:
+                return value
+            tracked = _Tracked(value)
+            live.append(weakref.ref(tracked))
+            return tracked
+
+    count = 6
+    text = _hl7(_b64(4000, b"A")) + "".join(
+        f"OBX|{n}|ED|PDF||^Application^PDF^Base64^{_b64(4000, bytes([65 + n]))}||||||F\r"
+        for n in range(2, count + 1)
+    )
+    scan = iter_obx_documents(_TrackingMessage.parse(text), received=text)
+    held_at_each_yield: list[int] = []
+    occurrences: list[int] = []
+    for document in scan:
+        occurrences.append(document[0])
+        del document
+        held_at_each_yield.append(sum(1 for ref in live if ref() is not None))
+    assert occurrences == list(range(1, count + 1))
+    assert max(held_at_each_yield) == 1, held_at_each_yield
+
+
+def test_the_detach_scan_cannot_be_called_without_the_received_text() -> None:
+    """``received`` is required: a caller that left it out would skip the whole-body marker check
+    (BACKLOG #5099), so the call is refused instead."""
+    text = _hl7(_b64(10))
+    with pytest.raises(TypeError):
+        iter_obx_documents(Message.parse(text))  # type: ignore[call-arg]

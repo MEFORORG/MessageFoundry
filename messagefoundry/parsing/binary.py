@@ -448,7 +448,7 @@ def _is_base64_ed(message: Message, occurrence: int) -> bool:
 
 
 def iter_obx_documents(
-    message: Message, *, min_b64_len: int = 0, received: str | None = None
+    message: Message, *, received: str, min_b64_len: int = 0
 ) -> Iterator[tuple[int, str, str]]:
     """Yield ``(occurrence, verbatim_base64, content_type)`` for every OBX-5 ED **Base64** document in
     ``message`` whose base64 length is at least ``min_b64_len`` (#149, ADR 0105 Phase 1a).
@@ -460,6 +460,9 @@ def iter_obx_documents(
     ``content_type`` is the ED type-of-data component (``OBX-5.2``), the same label the tombstone uses.
     Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``.
 
+    ``received`` is the text ``message`` was parsed from, and is required: the marker check below
+    reads it, so a caller cannot skip that check by leaving it out (BACKLOG #5099).
+
     Raises :class:`EscapedDocumentError` when any ED Base64 ``OBX-5.5`` holds the escape character,
     whose value would be decoded rather than verbatim (vault BACKLOG #2809), and
     :class:`InboundDocRefError` when any ``OBX-5.5``, ED or not, already holds a live handle: only
@@ -468,22 +471,33 @@ def iter_obx_documents(
     none of them when the refusal comes.
 
     It raises :class:`InboundDocRefError` too when a document would be detached and the body holds
-    the handle marker anywhere else: in a document's value past its start, or, where ``received``
-    is the text ``message`` was parsed from, anywhere in that text, raw or as the message's
-    delimiters escape it. Delivery refuses a marker left after the splice
-    (:func:`reattach_documents_in_hl7`), so such a body would be ACKed and then dead-letter on
-    every outbound. No base64 value holds the marker, since base64 has no ``:``, so the refusal
-    turns away no document a conformant sender sends."""
+    the handle marker anywhere else: in a document's value past its start, or anywhere in
+    ``received``, raw or as the message's delimiters escape it. Delivery refuses a marker left after
+    the splice (:func:`reattach_documents_in_hl7`), so such a body would be ACKed and then
+    dead-letter on every outbound. No base64 value holds the marker, since base64 has no ``:``, so
+    the refusal turns away no document a conformant sender sends.
+
+    Each document's value is held one at a time, as the caller's in-flight budget assumes: the
+    checks read each value and drop it, and the value is read again when it is yielded. Holding
+    every value until the scan ends would make the peak the sum of the documents."""
     occurrences: list[int] = []
+    documents: list[int] = []
+    value_holds_marker = False
     for occ in range(1, message.count_segments("OBX") + 1):
+        value = message.field("OBX-5.5", occurrence=occ) or ""
         # Every OBX, as the delivery re-attach resolves a handle in any OBX-5.5 first repetition.
-        if is_doc_ref(message.field("OBX-5.5", occurrence=occ) or ""):
+        if is_doc_ref(value):
             raise InboundDocRefError(
                 f"OBX occurrence {occ}: OBX-5.5 already holds a document handle, which only the "
                 "engine writes; refusing a received value that would name a stored attachment"
             )
         if _is_base64_ed(message, occ):
             occurrences.append(occ)
+            if _is_detachable(value, min_b64_len):
+                documents.append(occ)
+                value_holds_marker = value_holds_marker or DOC_REF_MARKER in value
+    # The last value read would otherwise stay referenced while the documents are yielded.
+    value = ""
     for occ in occurrences:
         if _obx_5_5_holds_escape(message, occ):
             raise EscapedDocumentError(
@@ -491,34 +505,29 @@ def iter_obx_documents(
                 "sequence, which base64 never needs; refusing to detach a value that is not the "
                 "sender's verbatim bytes"
             )
-    documents: list[tuple[int, str]] = []
-    for occ in occurrences:
-        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
-        if not data_b64 or is_document_tombstone(data_b64):
-            continue  # empty / already-stripped: a tombstone resolves nothing, so it rides as text
-        if len(data_b64) < min_b64_len:
-            continue
-        documents.append((occ, data_b64))
-    if documents and _detach_would_leave_a_marker(message, documents, received):
+    if documents and (value_holds_marker or _received_holds_marker(message, received)):
         raise InboundDocRefError(
             "the body holds the document handle marker outside an OBX-5.5 start, and a document "
             "would be detached from it; refusing a body delivery would refuse after the ACK"
         )
-    for occ, data_b64 in documents:
+    for occ in documents:
+        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
         ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
         yield occ, data_b64, ed_type
+        # Dropped before the next read, so no two documents' values are held here at once.
+        del data_b64
 
 
-def _detach_would_leave_a_marker(
-    message: Message, documents: list[tuple[int, str]], received: str | None
-) -> bool:
-    """Whether the handle marker sits where a detach would leave it for delivery's after-the-splice
-    guard to find (BACKLOG #5099): inside a document's value, which the splice puts back verbatim,
-    or anywhere in ``received``, raw or escaped by the message's delimiters."""
-    if any(DOC_REF_MARKER in value for _occ, value in documents):
-        return True
-    if received is None:
-        return False
+def _is_detachable(value: str, min_b64_len: int) -> bool:
+    """Whether an ED Base64 ``OBX-5.5`` value is a document the detach lifts out: non-empty, not a
+    tombstone (one resolves nothing, so it rides as text), and at least ``min_b64_len`` long."""
+    return bool(value) and not is_document_tombstone(value) and len(value) >= min_b64_len
+
+
+def _received_holds_marker(message: Message, received: str) -> bool:
+    """Whether ``received`` holds the handle marker anywhere, raw or escaped by the message's
+    delimiters: where a detach would leave it for delivery's after-the-splice guard to find
+    (BACKLOG #5099). Reads the text the caller already holds, and copies no document."""
     if DOC_REF_MARKER in received:
         return True
     try:
