@@ -9109,9 +9109,10 @@ def _evaluate_config_dacl(
 _WIN_PATH_GONE_ERRORS = frozenset({2, 3})
 
 #: The read failures of the config directory's own owner and DACL that say nothing about its policy,
-#: only that the directory was not there to read. :func:`_assert_safe_config_source` alone may answer
-#: such a refusal from a listing of the directory (vault BACKLOG #5248).
-_WIN_CONFIG_DIR_UNREACHED_ERRORS = _WIN_PATH_GONE_ERRORS
+#: only that the directory was not there to read: gone (2, 3), or on a share Windows cannot reach,
+#: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67). :func:`_assert_safe_config_source` alone may
+#: answer such a refusal from a listing of the directory (vault BACKLOG #5248, #3535).
+_WIN_CONFIG_DIR_UNREACHED_ERRORS = _WIN_PATH_GONE_ERRORS | frozenset({53, 67})
 
 
 class _ConfigDirUnreached(WiringError):
@@ -9178,8 +9179,9 @@ def _enforce_windows_paths(
     For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
     with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
     POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
-    config directory itself. Its refusal is a :class:`_ConfigDirUnreached`, which the load may answer
-    from a listing of the directory. Any other path that is gone by the time it is read is skipped, as below.
+    config directory itself. That refusal, and one of a read of it that could not reach its share,
+    is a :class:`_ConfigDirUnreached`, which the load may answer from a listing of the directory.
+    Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -9704,12 +9706,14 @@ def _assert_safe_config_source(directory: Path) -> None:
     refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
     for a share Windows cannot reach (vault BACKLOG #5117).
 
-    A refusal that came from the directory's own read finding nothing there
-    (:class:`_ConfigDirUnreached`) is judged again by listing the directory: one moved away raises
-    ``ConfigDirMissing``, as the walk's own listing would have, and a reload audits it
-    ``not_found``, not as a config to fix (vault BACKLOG #5248). The refusal is logged then. Every
-    other refusal stands whatever happens to the directory afterwards, a policy refusal above all:
-    a listing must never replace the answer that names what was refused."""
+    A refusal that came from the directory's own read finding nothing there, or no share to reach
+    (:class:`_ConfigDirUnreached`), is judged again by listing the directory, as the walk's own
+    listing would have answered: one moved away raises ``ConfigDirMissing``, which a reload audits
+    ``not_found``, and one that does not list raises that ``OSError``, which a lax load refuses as
+    :class:`ConfigDirUnlistable`, audited ``unreadable`` (vault BACKLOG #5248, #3535). Neither is a
+    config to fix. The refusal is logged then. One that still lists keeps the refusal. Every other
+    refusal stands whatever happens to the directory afterwards, a policy refusal above all: a
+    listing must never replace the answer that names what was refused."""
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
@@ -9734,17 +9738,15 @@ def _assert_safe_config_source(directory: Path) -> None:
     # __context__; the refusal is logged instead, so it is never lost.
     try:
         _require_config_dir(directory, strict=True)
-    except ConfigDirMissing:
+    except OSError:
+        # ConfigDirMissing included. The read never reached the directory's policy, so the listing
+        # answers what the read could not; this refusal is logged rather than lost.
         _logger.warning(
-            "config directory %s is gone after its trust check refused it: %s",
+            "config directory %s cannot be listed after its trust check refused it: %s",
             scrub_log_argument(str(directory)),
             scrub_log_argument(safe_exc(refusal, limit=_REFUSAL_LOG_LIMIT)),
         )
         raise
-    except OSError:
-        # Present but not listable now. The refusal stands: it is the one answer that names what
-        # was refused, and a fault must not mask it.
-        pass
     raise refusal
 
 

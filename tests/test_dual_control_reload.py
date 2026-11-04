@@ -1984,6 +1984,53 @@ async def test_a_policy_refusal_then_a_directory_moved_away_says_not_reached_rel
     ]
 
 
+async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own owner and DACL read failed because its share could not be reached
+    (Win32 53), and the directory then stopped listing: ``unreadable``, as a share lost at the
+    walk's listing is, not a source the check could not vet (#3535, vault BACKLOG #5248)."""
+    from messagefoundry.config import wiring
+
+    cfg = (tmp_path / "cfg").resolve()
+    lost = False
+    real_scandir = os.scandir
+
+    def _read_path(path: Path) -> Any:
+        nonlocal lost
+        if path.name == "cfg":
+            lost = True
+            return wiring._WinPathSecurity(status=53)
+        return _CLEAN_READ
+
+    def _scandir(path: Any) -> Any:
+        if lost and isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
+            raise _share_fault()
+        return real_scandir(path)
+
+    probes = wiring._WinConfigSourceProbes(
+        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        # The strict read already failed, as test_a_directory_lost_after_the_target_check_is_not_
+        # audited_as_missing_inline has it, so the load reads lax.
+        monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
+        monkeypatch.setattr(
+            wiring,
+            "_check_trusted_paths",
+            functools.partial(wiring._enforce_windows_paths, probes=probes),
+        )
+        monkeypatch.setattr(os, "scandir", _scandir)
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert lost, "the directory's own read never ran, so nothing was measured"
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -625,6 +625,53 @@ def test_a_policy_refusal_stands_when_its_directory_then_moves_away(
     assert (tmp_path / "cfg.moved").is_dir(), "the directory never moved, so nothing was measured"
 
 
+@pytest.mark.parametrize("unreached", [53, 67])  # ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME
+def test_a_directory_whose_share_is_lost_at_its_access_read_is_unreadable(
+    unreached: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own owner and DACL read failed because its share could not be reached, and
+    the directory no longer lists: the load cannot read the directory, so it refuses with
+    ``ConfigDirUnlistable`` and a reload audits ``unreadable``, as a share lost at the walk's
+    listing is (#3535, vault BACKLOG #5248). Before, it was a source the check could not vet."""
+    from messagefoundry.config.wiring import ConfigDirUnlistable
+    from tests._share_fault import _share_fault
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    seen = _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: _WinPathSecurity(status=unreached)}
+    )
+    real_scandir = os.scandir
+
+    def _scandir(target: Any) -> Any:
+        if isinstance(target, (str, os.PathLike)) and Path(target) == tmp_path and seen:
+            raise _share_fault(unreached)
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    with pytest.raises(ConfigDirUnlistable, match="could not read"):
+        load_config(tmp_path)
+    assert seen == [tmp_path]
+
+
+def test_a_share_read_fault_on_a_directory_that_still_lists_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: the read said the share could not be reached, but the
+    directory still lists. Nothing shows the share is gone, so the read failure refuses as a source
+    the check could not vet, not as a directory the load cannot read."""
+    from messagefoundry.config.wiring import ConfigDirUnlistable
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: _WinPathSecurity(status=53)}
+    )
+    with pytest.raises(WiringError, match=r"\(Win32 error 53\)") as refused:
+        load_config(tmp_path)
+    assert not isinstance(refused.value, ConfigDirUnlistable)
+
+
 # ---- Tier 2: Windows-gated integration via icacls ---------------------------
 
 
