@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import cache
 from types import MappingProxyType
@@ -154,7 +154,7 @@ _INDEX_TAIL = re.compile(
 _NOT_A_COLUMN = frozenset(
     {"constraint", "primary", "unique", "check", "foreign", "exclude", "default", "period", "index"}
 )
-_TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s+(?:(?:NON)?CLUSTERED\s+)?\(", re.I)
+_TABLE_PRIMARY_KEY = re.compile(r"\bPRIMARY\s+KEY\s*(?:(?:NON)?CLUSTERED\s*)?\(", re.I)
 _PLAIN_KEY = re.compile(r'^(\[?[A-Za-z_][\w$]*\]?|"[^"]+")(?:\s+(ASC|DESC))?$', re.I)
 _PLAIN_NAME = re.compile(r'^(?:\[?[A-Za-z_][\w$]*\]?|"[^"]+")$')
 #: A key that is an expression: a call such as ``left(actor, 200)``, or a parenthesised expression.
@@ -653,6 +653,9 @@ def _declared_key(text: str) -> str:
         inner = inner[1:-1].strip()
     if _PLAIN_NAME.match(inner):
         key = inner
+    elif inner != key and re.search(r"\bCOLLATE\b", inner, re.I):
+        # PostgreSQL stores ((col COLLATE x)) as the column with an index collation.
+        raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     key += direction
     if _NULLS_ORDER.search(key) or (_PLAIN_KEY.match(key) is None and _EXPR_KEY.match(key) is None):
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
@@ -680,39 +683,65 @@ def key_column(text: str) -> str:
     return base + desc + nulls
 
 
-class _Reader:
-    """The state :func:`declared_schema` builds, statement by statement.
+@dataclass
+class _Built:
+    """Every shape a store may hold one column in. ``create`` is what ``CREATE TABLE`` builds on a
+    new store. ``later`` is what a guarded ``ADD`` builds on an older store that lacked the column,
+    and what an ``ALTER COLUMN`` leaves on an older store. Every guard in a shipped batch tests for
+    the old state, so an ``ALTER COLUMN`` is not taken to reach a new store: its result must equal
+    ``create``, or the column is built two ways."""
 
-    ``columns`` maps a table to its columns, and each column to every shape a store may hold it in:
-    one built by ``CREATE TABLE``, and another for each guarded ``ADD`` that builds it differently on
-    an older store, until an ``ALTER COLUMN`` sets one shape for both. No shapes are kept when the
-    DDL is read without a backend."""
+    create: ColumnShape | None = None
+    later: set[ColumnShape] = field(default_factory=set)
+
+    def ways(self) -> set[ColumnShape]:
+        return self.later | ({self.create} if self.create else set())
+
+    def altered(self, change: Callable[[ColumnShape], ColumnShape]) -> None:
+        self.later = {change(s) for s in (self.later or self.ways())}
+
+
+def _pk_columns(text: str) -> set[str]:
+    """The columns of a ``PRIMARY KEY (...)`` in ``text``, a table item or an ``ADD CONSTRAINT``."""
+    if (pk := _TABLE_PRIMARY_KEY.search(text)) is None:
+        return set()
+    inner, _ = _balanced(text, pk.end())
+    return {_bare(k.split()[0]) for k in _top_level_items(inner)}
+
+
+class _Reader:
+    """The state :func:`declared_schema` builds, statement by statement: each table's columns, as
+    :class:`_Built`, and the named indexes. No shapes are kept when the DDL is read without a
+    backend."""
 
     def __init__(self, dialect: Dialect | None) -> None:
         self.dialect = dialect
-        self.columns: dict[str, dict[str, set[ColumnShape]]] = {}
+        self.columns: dict[str, dict[str, _Built]] = {}
         self.indexes: dict[str, IndexShape] = {}
 
     def table(self, text: str, m: re.Match[str]) -> None:
         body, _end = _balanced(text, m.end())
         cols = self.columns.setdefault(_bare(m["name"]), {})
         keys: set[str] = set()
-        pending: dict[str, tuple[_Column, str]] = {}
+        pending: list[tuple[str, _Column, str]] = []
         for item in _top_level_items(body):
             first = item.split()[0]
             if first.lower() in _NOT_A_COLUMN:
-                if pk := _TABLE_PRIMARY_KEY.search(item):
-                    inner, _ = _balanced(item, pk.end())
-                    keys |= {_bare(k.split()[0]) for k in _top_level_items(inner)}
+                keys |= _pk_columns(item)
             elif self.dialect is None:
-                cols.setdefault(_bare(first), set())
+                cols.setdefault(_bare(first), _Built())
             else:
                 name, col = _read_column(self.dialect, item)
-                pending[name] = (col, item)
-        assert self.dialect is not None or not pending
-        for name, (col, item) in pending.items():
+                pending.append((name, col, item))
+        for name, col, item in pending:
+            assert self.dialect is not None
             col.primary_key = col.primary_key or name in keys
-            cols.setdefault(name, set()).add(_finish(self.dialect, col, item))  # type: ignore[arg-type]
+            built = cols.setdefault(name, _Built())
+            shape = _finish(self.dialect, col, item)
+            if built.create is None:
+                built.create = shape
+            else:
+                built.later.add(shape)
 
     def index(self, text: str, m: re.Match[str]) -> None:
         if m["using"]:
@@ -729,11 +758,11 @@ class _Reader:
             text[end:].lstrip().upper().startswith("WHERE"),
         )
 
-    def _column(self, table: str, name: str, action: str) -> dict[str, set[ColumnShape]]:
+    def _built(self, table: str, name: str, action: str) -> _Built:
         cols = self.columns.get(table)
         if cols is None or name not in cols:
             raise ValueError(f"{action} names a column the DDL never declares: {table}.{name}")
-        return cols
+        return cols[name]
 
     def alter(self, text: str, m: re.Match[str], spans: list[tuple[int, int]]) -> None:
         table = _bare(m["table"])
@@ -750,21 +779,21 @@ class _Reader:
             rest = re.sub(r"^ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?", "", clause, flags=re.I)
             first = rest.split()[0].lower() if rest.split() else ""
             if first in _NOT_A_COLUMN:
-                if pk := _TABLE_PRIMARY_KEY.search(rest):
-                    inner, _ = _balanced(rest, pk.end())
-                    for key in _top_level_items(inner):
-                        self._not_null(table, _bare(key.split()[0]))
+                for key in _pk_columns(rest):
+                    self._not_null(table, key)
                 return
             if self.dialect is None:
-                self.columns.setdefault(table, {}).setdefault(_bare(rest.split()[0]), set())
+                self.columns.setdefault(table, {}).setdefault(_bare(rest.split()[0]), _Built())
                 return
             name, col = _read_column(self.dialect, rest)
-            self.columns.setdefault(table, {}).setdefault(name, set()).add(
-                _finish(self.dialect, col, rest)
-            )
+            built = self.columns.setdefault(table, {}).setdefault(name, _Built())
+            built.later.add(_finish(self.dialect, col, rest))
         elif verb == ["drop", "column"]:
             name = re.sub(r"^DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?", "", clause, flags=re.I)
-            self.columns.get(table, {}).pop(_bare(name.split()[0]), None)
+            column = _bare(name.split()[0])
+            self.columns.get(table, {}).pop(column, None)
+            # PostgreSQL drops an index on a dropped column; SQL Server refuses the drop.
+            self._rewrite_keys(table, column, None)
         elif verb in (["drop", "constraint"], ["check", "constraint"], ["nocheck", "constraint"]):
             return  # a key's columns keep their NOT NULL when the key is dropped, on both
         elif verb[:1] == ["set"] and clause[3:].lstrip().startswith("("):
@@ -777,31 +806,30 @@ class _Reader:
             raise ValueError(f"an ALTER TABLE the live-schema check cannot read: {clause[:120]!r}")
 
     def _not_null(self, table: str, name: str) -> None:
-        cols = self._column(table, name, "a PRIMARY KEY")
-        cols[name] = {ColumnShape(s.type, False, s.identity, s.collation) for s in cols[name]}
+        built = self._built(table, name, "a PRIMARY KEY")
+        built.create = built.create and replace(built.create, nullable=False)
+        built.later = {replace(s, nullable=False) for s in built.later}
 
     def _alter_column(self, table: str, clause: str, words: list[str]) -> None:
         if len(words) < 3:
             raise ValueError(f"an ALTER COLUMN with no column: {clause!r}")
-        name = _bare(words[2])
         if self.dialect is None:
             return
-        cols = self._column(table, name, "ALTER COLUMN")
+        built = self._built(table, _bare(words[2]), "ALTER COLUMN")
         rest = " ".join(words[3:])
         if self.dialect == "sqlserver":
-            new, col = _read_column(self.dialect, f"{words[2]} {rest}")
+            # The whole definition is restated; one without COLLATE takes the database default.
+            _name, col = _read_column(self.dialect, f"{words[2]} {rest}")
             if col.identity or col.primary_key:
                 raise ValueError(f"an ALTER COLUMN the live-schema check cannot read: {clause!r}")
-            numbered = {s.identity for s in cols[name]}
-            col.identity = numbered == {True}
-            cols[new] = {_finish(self.dialect, col, clause)}
+            col.identity = {s.identity for s in built.ways()} == {True}
+            new = _finish(self.dialect, col, clause)
+            built.altered(lambda _s: new)
             return
         upper = rest.upper()
         if upper in ("SET NOT NULL", "DROP NOT NULL"):
             nullable = upper.startswith("DROP")
-            cols[name] = {
-                ColumnShape(s.type, nullable, s.identity, s.collation) for s in cols[name]
-            }
+            built.altered(lambda s: replace(s, nullable=nullable))
         elif upper == "DROP DEFAULT" or upper.startswith("SET DEFAULT "):
             return
         elif match := re.match(
@@ -810,17 +838,38 @@ class _Reader:
             if re.search(r"\bCOLLATE\b", match.group(1), re.I):
                 raise ValueError(f"a PostgreSQL column collation is not compared: {clause!r}")
             new_type, _numbered = _canonical_type(self.dialect, match.group(1))
-            cols[name] = {
-                ColumnShape(new_type, s.nullable, s.identity, s.collation) for s in cols[name]
-            }
+            built.altered(lambda s: replace(s, type=new_type))
         else:
             raise ValueError(f"an ALTER COLUMN the live-schema check cannot read: {clause!r}")
 
+    def _rewrite_keys(self, table: str, old: str, new: str | None) -> None:
+        """Rename ``old`` in the keys of ``table``'s indexes, or with ``new`` ``None`` drop the
+        indexes that name it, as the server does."""
+        for name, shape in list(self.indexes.items()):
+            if shape.table != table:
+                continue
+            keys = [k.split(" ", 1) for k in shape.columns]
+            if not any(k[0] == old for k in keys):
+                continue
+            if new is None:
+                del self.indexes[name]
+            else:
+                columns = tuple(
+                    " ".join([new, *k[1:]]) if k[0] == old else " ".join(k) for k in keys
+                )
+                self.indexes[name] = replace(shape, columns=columns)
+
     def _rename(self, table: str, old: str, new: str) -> None:
-        """A store that still has ``old`` gets it as ``new``; one that already has ``new`` keeps it."""
-        cols = self.columns.setdefault(table, {})
-        moved = cols.pop(old, set())
-        cols.setdefault(new, set()).update(moved)
+        """A store that still has ``old`` gets it as ``new``; one that already has ``new`` keeps it.
+        A rename of a table or column the DDL never declares raises, rather than invent one."""
+        cols = self.columns.get(table)
+        if cols is None or (old not in cols and new not in cols):
+            raise ValueError(f"a rename of a column the DDL never declares: {table}.{old}")
+        moved = cols.pop(old, None)
+        built = cols.setdefault(new, _Built())
+        if moved is not None:
+            built.later |= moved.ways()
+        self._rewrite_keys(table, old, new)
 
     def rename(self, m: re.Match[str]) -> None:
         if m["old"].count(".") != 1:
@@ -836,22 +885,30 @@ class _Reader:
                 del self.indexes[index]
 
     def drop_indexes(self, m: re.Match[str]) -> None:
+        """Each index named, but on SQL Server only on the table its ``ON`` names: a name is unique
+        only within its table there."""
         for item in _top_level_items(m["names"]):
-            self.indexes.pop(_bare(item.split()[0]), None)
+            parts = item.split()
+            name = _bare(parts[0])
+            on = _bare(parts[-1]) if len(parts) == 3 else None
+            shape = self.indexes.get(name)
+            if shape is not None and (on is None or shape.table == on):
+                del self.indexes[name]
 
     def shape(self) -> ServerSchemaShape:
         shapes: dict[str, Mapping[str, ColumnShape]] = {}
         for table, cols in self.columns.items():
             one: dict[str, ColumnShape] = {}
             for name, built in cols.items():
-                if len(built) > 1:
-                    ways = " and ".join(sorted(s.describe() for s in built))
+                ways = built.ways()
+                if len(ways) > 1:
+                    listed = " and ".join(sorted(s.describe() for s in ways))
                     raise ValueError(
-                        f"column {table}.{name} is built two ways, as {ways}: a guarded ADD and the"
-                        " CREATE TABLE disagree, and no later ALTER COLUMN settles it"
+                        f"column {table}.{name} is built two ways, as {listed}: a guarded ADD or"
+                        " ALTER COLUMN and the CREATE TABLE disagree"
                     )
-                if built:
-                    one[name] = next(iter(built))
+                if ways:
+                    one[name] = next(iter(ways))
             shapes[table] = MappingProxyType(one)
         return ServerSchemaShape(
             MappingProxyType({t: frozenset(c) for t, c in self.columns.items()}),
@@ -945,25 +1002,32 @@ def server_schema_differences(
                 f"index {name!r} exists but is {unusable[name]}"
                 f" (expected {expected.named_indexes[name].describe()})"
             )
-    skip = set(taken) | set(unusable)
+    # Kept apart: on SQL Server an index name is unique only within its table, so an index named
+    # like a table must not hide that table's columns.
+    skip_tables = {n for n in taken if n in expected.columns}
+    skip_indexes = {n for n in (set(taken) | set(unusable)) if n in expected.named_indexes}
     # A table that exists with no columns is not missing; the shared compare cannot tell the two
     # apart, because SQLite's read lists every table it asked for.
-    empty = {t for t in expected.columns if t not in skip and live.columns.get(t) == frozenset()}
+    empty = {
+        t for t in expected.columns if t not in skip_tables and live.columns.get(t) == frozenset()
+    }
     for table in sorted(empty):
         problems.extend(
             f"table {table!r} is missing column {col!r}" for col in sorted(expected.columns[table])
         )
     rest = SchemaShape(
         MappingProxyType(
-            {t: c for t, c in expected.columns.items() if t not in skip and t not in empty}
+            {t: c for t, c in expected.columns.items() if t not in skip_tables | empty}
         ),
         expected.rowid_columns,
-        MappingProxyType({n: s for n, s in expected.named_indexes.items() if n not in skip}),
+        MappingProxyType(
+            {n: s for n, s in expected.named_indexes.items() if n not in skip_indexes}
+        ),
         expected.constraint_indexes,
     )
     problems.extend(schema_differences(rest, live))
     if isinstance(expected, ServerSchemaShape) and isinstance(live, ServerSchemaShape):
-        for table in sorted(set(expected.column_shapes) - skip):
+        for table in sorted(set(expected.column_shapes) - skip_tables):
             got_table = live.column_shapes.get(table, {})
             for col, want in sorted(expected.column_shapes[table].items()):
                 got = got_table.get(col)

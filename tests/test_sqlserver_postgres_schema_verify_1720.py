@@ -972,7 +972,7 @@ def test_live_sqlserver_types_spell_as_declared_ones() -> None:
 def test_a_guarded_add_that_builds_a_column_another_way_raises_until_altered() -> None:
     """A guarded ADD runs only on a store that lacks the column, so it and the CREATE TABLE each
     build it on some store. Disagreeing, the store's shape depends on its history."""
-    create = "CREATE TABLE t (id INT NOT NULL, a NVARCHAR(64) NULL)"
+    create = "CREATE TABLE t (id INT NOT NULL, a NVARCHAR(64) NOT NULL)"
     add = "IF COL_LENGTH('t','a') IS NULL ALTER TABLE t ADD a NVARCHAR(32) NULL"
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema((create, add), "sqlserver")
@@ -981,7 +981,7 @@ def test_a_guarded_add_that_builds_a_column_another_way_raises_until_altered() -
     assert shape.column_shapes["t"]["a"] == ColumnShape("nvarchar(64)", False)
     pg = declared_schema(
         (
-            "CREATE TABLE t (a VARCHAR(64))",
+            "CREATE TABLE t (a VARCHAR(128) NOT NULL)",
             "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR(128)",
             "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
             "ALTER TABLE t ADD PRIMARY KEY (a)",
@@ -1192,3 +1192,88 @@ def test_a_live_key_keeps_the_options_the_ddl_reader_refuses() -> None:
 
     for fragment in ("indcollation[k - 1]", "indclass[k - 1]", "NULLS FIRST", "NULLS LAST"):
         assert fragment in postgres._LIVE_INDEXES_SQL, fragment
+
+
+# --- review round 1: guarded ALTER, per-table index drop, key rewrites -----------------------------
+
+
+def test_a_guarded_alter_column_that_a_new_store_never_runs_must_match_the_create() -> None:
+    """Every guard in a shipped batch tests for the old state, so a new store keeps what CREATE
+    TABLE built. An ALTER COLUMN to anything else builds the column two ways."""
+    create = "IF OBJECT_ID('t','U') IS NULL CREATE TABLE t (a NVARCHAR(64) NOT NULL)"
+    widen = "IF COL_LENGTH('t','a') = 64 ALTER TABLE t ALTER COLUMN a NVARCHAR(128) NOT NULL"
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema((create, widen), "sqlserver")
+    # SQL Server resets an altered column's collation unless the ALTER restates it.
+    bin2 = "CREATE TABLE t (a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL)"
+    plain = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema((bin2, plain), "sqlserver")
+    restated = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL"
+    assert declared_schema((bin2, restated), "sqlserver").column_shapes["t"]["a"].collation
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema(
+            ("CREATE TABLE t (a VARCHAR(64))", "ALTER TABLE t ALTER COLUMN a TYPE TEXT"),
+            "postgres",
+        )
+
+
+def test_a_drop_index_on_another_table_keeps_the_declared_one() -> None:
+    shape = declared_schema(("CREATE INDEX ix ON a(x)", "DROP INDEX ix ON b"))
+    assert shape.named_indexes["ix"] == IndexShape("a", ("x",), False, False)
+    assert not declared_schema(("CREATE INDEX ix ON a(x)", "DROP INDEX ix ON a")).named_indexes
+
+
+def test_a_primary_key_with_no_space_before_its_list_is_read() -> None:
+    shape = declared_schema(("CREATE TABLE t (a TEXT, b INT, PRIMARY KEY(a))",), "postgres")
+    assert shape.column_shapes["t"]["a"] == ColumnShape("text", False)
+
+
+def test_a_rename_or_drop_of_a_column_follows_into_its_indexes() -> None:
+    renamed = declared_schema(
+        (
+            "CREATE TABLE t (old TEXT, b TEXT)",
+            "CREATE INDEX ix ON t(old DESC, b)",
+            "ALTER TABLE t RENAME COLUMN old TO new",
+        )
+    )
+    assert renamed.named_indexes["ix"].columns == ("new DESC", "b")
+    dropped = declared_schema(
+        (
+            "CREATE TABLE t (a TEXT, b TEXT)",
+            "CREATE INDEX ix ON t(a)",
+            "ALTER TABLE t DROP COLUMN a",
+        )
+    )
+    assert not dropped.named_indexes
+
+
+@pytest.mark.parametrize(
+    ("statements", "match"),
+    [
+        (('CREATE INDEX ix ON t ((a COLLATE "C"))',), "options"),
+        (("EXEC sp_rename 'zz.a', 'b', 'COLUMN'",), "never declares"),
+        (("CREATE TABLE t (a INT)", "ALTER TABLE t RENAME COLUMN x TO y"), "never declares"),
+    ],
+)
+def test_review_round_one_forms_raise(statements: tuple[str, ...], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        declared_schema(statements)
+
+
+def test_an_index_named_like_a_table_does_not_hide_the_table() -> None:
+    expected = live_shape(
+        {"roles": {"id", "name"}},
+        {"roles": IndexShape("other", ("x",), False, False)},
+        {"roles": {"id": ColumnShape("int", False)}},
+    )
+    live = live_shape(
+        {"roles": {"id"}},
+        {"roles": IndexShape("other", ("x",), False, False)},
+        {"roles": {"id": ColumnShape("bigint", False)}},
+    )
+    assert server_schema_differences(expected, live, {}, {"roles": "disabled"}) == [
+        "index 'roles' exists but is disabled (expected on other(x))",
+        "table 'roles' is missing column 'name'",
+        "table 'roles' column 'id' is bigint NOT NULL, expected int NOT NULL",
+    ]

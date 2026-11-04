@@ -32,14 +32,14 @@ def _column(shape: SchemaShape, table: str, column: str, fallback: str) -> Colum
 def mssql_type_row(type_text: str) -> tuple[str, int, int, int]:
     """``(TYPE_NAME, max_length, precision, scale)`` as ``sys.columns`` holds a column of the
     canonical ``type_text``: the inverse of ``mssql_live_type`` for the types the batch uses."""
-    base, _, size = type_text.partition("(")
-    size = size.rstrip(")")
+    base, _, inside = type_text.partition("(")
+    size = inside.rstrip(")")
     if base in ("nvarchar", "nchar", "varchar", "char", "varbinary", "binary"):
         width = -1 if size == "max" else int(size) * (2 if base[0] == "n" else 1)
         return base, width, 0, 0
     if base in ("decimal", "numeric"):
-        precision, scale = size.split(",")
-        return base, 9, int(precision), int(scale)
+        digits, places = size.split(",")
+        return base, 9, int(digits), int(places)
     if base in ("datetime2", "datetimeoffset", "time"):
         return base, 8, 27, int(size)
     widths = {"int": (4, 10), "bigint": (8, 19), "smallint": (2, 5), "tinyint": (1, 3)}
@@ -47,13 +47,13 @@ def mssql_type_row(type_text: str) -> tuple[str, int, int, int]:
     return base, width, precision, 0
 
 
-def pg_declared() -> SchemaShape:
+def pg_declared() -> ServerSchemaShape:
     from messagefoundry.store import postgres
 
     return postgres._declared_schema()
 
 
-def mssql_declared() -> SchemaShape:
+def mssql_declared() -> ServerSchemaShape:
     from messagefoundry.store import sqlserver
 
     return sqlserver._declared_schema()
@@ -178,8 +178,8 @@ def mssql_live_rows(
                 continue
             disabled, hypothetical = flag.get("disabled", False), flag.get("hypothetical", False)
             head = (name, 2, got.unique, got.partial, disabled, hypothetical, 2)
-            for ordinal, col in enumerate(got.columns, start=1):
-                desc = col.endswith(" DESC")
-                rows.append((*head, ordinal, col.removesuffix(" DESC"), desc))
+            for ordinal, key in enumerate(got.columns, start=1):
+                desc = key.endswith(" DESC")
+                rows.append((*head, ordinal, key.removesuffix(" DESC"), desc))
         return rows
     return []

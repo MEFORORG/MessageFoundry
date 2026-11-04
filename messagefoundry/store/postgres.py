@@ -189,7 +189,7 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
-from messagefoundry.store.schema_verify import IndexShape, SchemaShape
+from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -197,6 +197,7 @@ from messagefoundry.store.sealed_cache import (
 )
 from messagefoundry.store.server_schema_verify import (
     ColumnShape,
+    ServerSchemaShape,
     declared_schema,
     key_column,
     refuse_short_schema,
@@ -1362,7 +1363,7 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
     return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
 
 
-def _declared_schema() -> SchemaShape:
+def _declared_schema() -> ServerSchemaShape:
     """What the live-schema check expects: the batch, then every index the migration builds or drops,
     with each column's type and nullability as PostgreSQL's catalog spells them."""
     return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL), "postgres")
@@ -2164,6 +2165,9 @@ class PostgresStore:
                 # commits or rolls back, or once the server sees the holder's session end, which
                 # for a crashed host can take as long as TCP keepalive allows. A role- or
                 # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
+                # Read before the lock and the batch, so DDL the live-schema check cannot read
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
+                _declared_schema()
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 wait = self._settings.schema_lock_timeout
                 lock = self._lock_key(_SCHEMA_LOCK)
@@ -2189,9 +2193,6 @@ class PostgresStore:
                 # tightens: a stricter role- or database-configured lock_timeout is kept. Local to
                 # this transaction, so it reverts at commit or rollback.
                 await conn.execute(_DDL_LOCK_TIMEOUT_SQL, math.ceil(wait * 1000))
-                # Read before the batch runs, so DDL the live-schema check cannot read fails here
-                # and not after the batch has done its work (BACKLOG #5062). Cached per process.
-                _declared_schema()
                 try:
                     for statement in _SCHEMA:
                         await conn.execute(statement)

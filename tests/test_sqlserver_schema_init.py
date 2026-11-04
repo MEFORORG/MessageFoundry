@@ -854,7 +854,8 @@ def _pre_scope_source_hash() -> str:
 
     without = [s for s in sqlserver._SCHEMA if not _is_scope_source_add(s)]
     assert len(without) == len(sqlserver._SCHEMA) - 1, "the ADD is not one _SCHEMA statement"
-    rev = sqlserver.server_schema_verify.SCHEMA_CHECK_REV
+    from messagefoundry.store.server_schema_verify import SCHEMA_CHECK_REV as rev
+
     payload = "\n".join(without) + f"\nschema_check_rev={rev}"
     return hashlib.sha256(payload.encode()).hexdigest()
 

@@ -178,7 +178,7 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
-from messagefoundry.store.schema_verify import IndexShape, SchemaShape
+from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -186,6 +186,7 @@ from messagefoundry.store.sealed_cache import (
 )
 from messagefoundry.store.server_schema_verify import (
     ColumnShape,
+    ServerSchemaShape,
     declared_schema,
     mssql_live_type,
     refuse_short_schema,
@@ -2732,7 +2733,7 @@ def _schema_hash() -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _declared_schema() -> SchemaShape:
+def _declared_schema() -> ServerSchemaShape:
     """What the live-schema check expects: every object the batch declares (BACKLOG #1720), with
     each column's type, nullability, numbering and declared collation (BACKLOG #5085)."""
     return declared_schema(tuple(_SCHEMA), "sqlserver")
@@ -4779,9 +4780,6 @@ class SqlServerStore:
                     lock_bounded = True
                     try:
                         await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
-                        # Read before the batch runs, so DDL the live-schema check cannot read
-                        # fails here, not after the batch (BACKLOG #5062). Cached per process.
-                        _declared_schema()
                         for statement in _SCHEMA:
                             await cur.execute(statement)
                         # BACKLOG #1720: before the marker, on this cursor and under its lifted
