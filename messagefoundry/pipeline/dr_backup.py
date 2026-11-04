@@ -2762,6 +2762,15 @@ def _verify_in_staging(
             reason=f"integrity_check failed: {integrity_msg}",
         )
     # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
+    nothing_compared = _nothing_to_compare(manifest_counts, row_counts)
+    if nothing_compared is not None:
+        return VerifyResult(
+            "FAIL",
+            integrity_ok=True,
+            row_counts=row_counts,
+            manifest_counts=manifest_counts,
+            reason=nothing_compared,
+        )
     #
     # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
     # `_count_tables` derives its table set from the file it is given, so `row_counts` here
@@ -3829,6 +3838,30 @@ def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None
             log.warning("could not remove the partially restored config member %s: %s", path, exc)
 
 
+def _nothing_to_compare(manifest_counts: dict[str, int], row_counts: dict[str, int]) -> str | None:
+    """The refusal reason when the row-count compare would read nothing, else ``None`` (BACKLOG
+    #5056).
+
+    The compare is keyed off the manifest's own tables, so a manifest that records none (its
+    ``row_counts`` empty, missing or not a mapping) has no key to mismatch, and a snapshot whose
+    schema holds no table at all reads every manifest count as 0. Either way a PASS would certify
+    counts nobody compared: the shape BACKLOG #2186 produced, where the backup and the verify both
+    counted an empty stand-in. A full archive never legitimately has either: :func:`_count_tables`
+    reports every table in the snapshot's own schema, and a real store has dozens. A config-only
+    archive carries no snapshot and returns before this compare, so it is not refused here."""
+    if not manifest_counts:
+        return (
+            "the manifest records no row counts, so the row-count compare would read nothing; a "
+            "full archive's manifest lists every table of its store"
+        )
+    if not row_counts:
+        return (
+            "the archive's store.db holds no table, so the row-count compare would read nothing; "
+            f"the manifest recorded {len(manifest_counts)} table(s)"
+        )
+    return None
+
+
 def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
     """``integrity_check`` + the manifest row-count compare on the extracted ``store.db``, run on the
     exact file about to be placed. Same two checks (and the same helpers) as
@@ -3841,7 +3874,8 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     EARLIER build is the ordinary case for this subcommand, so dict equality would refuse on sight the
     archives a restore exists to accept. A table the manifest tracked that the snapshot's schema lacks
     reads as 0, so a manifest count of 0 still passes and a nonzero one still raises: real data loss is
-    still caught. A table the snapshot has that the manifest never tracked is not compared at all."""
+    still caught. A table the snapshot has that the manifest never tracked is not compared at all.
+    A compare with nothing on one side refuses, by :func:`_nothing_to_compare`."""
     integrity_ok, integrity_msg = _integrity_check(snap)
     if not integrity_ok:
         raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
@@ -3850,6 +3884,9 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     manifest_counts = (
         {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
     )
+    nothing_compared = _nothing_to_compare(manifest_counts, row_counts)
+    if nothing_compared is not None:
+        raise BackupError("verify", nothing_compared)
     mismatches = sorted(
         table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
     )

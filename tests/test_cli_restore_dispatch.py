@@ -1123,31 +1123,50 @@ def _snap_with(tmp_path: Path, messages: int) -> Path:
     return snap
 
 
+_MISMATCH = "row-count mismatch"
+_NO_MANIFEST_COUNTS = "the manifest records no row counts"
+
+
 @pytest.mark.parametrize(
-    ("label", "manifest_counts", "raises"),
+    ("label", "manifest_counts", "refusal"),
     [
         # The compare is keyed off the MANIFEST's keys, not dict equality, because `_count_tables`
         # derives its table set from the snapshot's own sqlite_master (BACKLOG #1722). These pin both
         # directions of that: what must still refuse, and what must no longer refuse.
-        ("exact match", {"messages": 3, "queue": 0}, False),
+        ("exact match", {"messages": 3, "queue": 0}, None),
         # Real data loss, which is the whole point of the check.
-        ("torn: manifest declares more rows than survived", {"messages": 5, "queue": 0}, True),
+        ("torn: manifest declares more rows than survived", {"messages": 5, "queue": 0}, _MISMATCH),
         # A table the manifest tracked that the snapshot's schema lacks reads as 0, so a NONZERO
         # manifest count for it is still loss and still refuses.
-        ("dropped table the manifest counted", {"messages": 3, "audit_log": 7}, True),
+        ("dropped table the manifest counted", {"messages": 3, "audit_log": 7}, _MISMATCH),
         # ...and a zero one is the documented convention for a table absent from the schema.
-        ("absent table the manifest recorded as 0", {"messages": 3, "audit_log": 0}, False),
+        ("absent table the manifest recorded as 0", {"messages": 3, "audit_log": 0}, None),
         # The case dict equality got wrong: an archive whose manifest predates the widened table set
         # is the ORDINARY thing to restore, and equality would have refused every one of them.
-        ("older, narrower manifest", {"messages": 3}, False),
-        ("manifest carrying no row_counts at all", None, False),
+        ("older, narrower manifest", {"messages": 3}, None),
+        # BACKLOG #5056: a manifest with no counts has no key to mismatch, so these once returned
+        # the snapshot's counts as if compared. Both now refuse, because nothing was compared.
+        ("manifest carrying no row_counts at all", None, _NO_MANIFEST_COUNTS),
+        ("manifest carrying an empty row_counts", {}, _NO_MANIFEST_COUNTS),
     ],
 )
-def test_restore_row_count_compare(tmp_path, label, manifest_counts, raises) -> None:
+def test_restore_row_count_compare(tmp_path, label, manifest_counts, refusal) -> None:
     snap = _snap_with(tmp_path, messages=3)
     manifest: dict[str, object] = {} if manifest_counts is None else {"row_counts": manifest_counts}
-    if raises:
-        with pytest.raises(dr_backup.BackupError, match="row-count mismatch"):
+    if refusal is not None:
+        with pytest.raises(dr_backup.BackupError, match=refusal):
             dr_backup._verify_extracted_store(snap, manifest)
     else:
         assert dr_backup._verify_extracted_store(snap, manifest) == {"messages": 3, "queue": 0}
+
+
+def test_restore_refuses_a_snapshot_with_no_table(tmp_path: Path) -> None:
+    """BACKLOG #5056, the other side: a ``store.db`` whose schema holds no table reads every
+    manifest count as 0, so an all-zero manifest would agree with a file that holds nothing."""
+    import sqlite3
+
+    snap = tmp_path / "store.db"
+    sqlite3.connect(snap).close()
+    assert dr_backup._count_tables(snap) == {}
+    with pytest.raises(dr_backup.BackupError, match="holds no table"):
+        dr_backup._verify_extracted_store(snap, {"row_counts": {"messages": 0, "queue": 0}})
