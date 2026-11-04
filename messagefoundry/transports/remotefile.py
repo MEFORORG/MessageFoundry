@@ -2132,6 +2132,7 @@ def _guard_ftps_revocation(
         connection=connection,
         context=None if expiry_relaxed else context,
         ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+        expiry_relaxed=expiry_relaxed,
     ).enforce_construction()
 
 

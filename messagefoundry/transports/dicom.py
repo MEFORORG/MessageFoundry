@@ -2379,6 +2379,7 @@ class DicomScuDestination(DestinationConnector):
                 connection=config.name,
                 context=None if expiry_relaxed else self._ssl,
                 ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+                expiry_relaxed=expiry_relaxed,
             ).enforce_construction()
 
     async def send(

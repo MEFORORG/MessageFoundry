@@ -937,6 +937,7 @@ class MLLPDestination(DestinationConnector):
                 # setting -- so a sibling hop the same CRL never reached keeps its refusal.
                 context=None if expiry_relaxed else self._ssl,
                 ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+                expiry_relaxed=expiry_relaxed,
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None

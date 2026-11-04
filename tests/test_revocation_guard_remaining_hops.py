@@ -484,6 +484,12 @@ def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHo
     )
 
 
+#: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089).
+_RELAXED_CROSSING = (
+    "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
+)
+
+
 def _crl_context(*, skip_validity: bool) -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
@@ -511,7 +517,11 @@ def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -
     assert guard.disposition() is HopDisposition.ALLOW
     with _guard_log() as log:
         guard.enforce_construction()
-    assert "crossed without certificate revocation checking" in log.audit, log.state()
+    assert _RELAXED_CROSSING in log.audit, log.state()
+    # The line keeps its own wording there: that CRL still refuses a leaf it lists, so the
+    # unrelaxed record's "NO certificate revocation checking" would say less was checked than was.
+    assert "NO certificate revocation checking" not in log.audit, log.state()
+    assert "still refuses a leaf certificate it lists" in log.audit, log.state()
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
@@ -545,7 +555,7 @@ def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_
     with active_hop_posture(ENFORCING), _guard_log() as relaxed:
         skipped = DicomScuDestination(relaxed_cfg)
     assert context_checks_revocation(skipped._ssl) is True
-    assert "crossed without certificate revocation checking" in relaxed.audit, relaxed.state()
+    assert _RELAXED_CROSSING in relaxed.audit, relaxed.state()
     assert "connection 'OB_PACS';" in relaxed.audit, relaxed.state()
     assert REASON in relaxed.audit, relaxed.state()
 
@@ -1138,6 +1148,7 @@ def _assert_refused_for_the_relaxation(
     assert EXPIRY_RELAXED_WAYS_ACROSS in text
     assert "Configure [tls].crl_file" not in text
     assert f"connection '{connection}';" in text
+    assert "still refuses a leaf certificate it lists" in text
 
 
 def test_a_crl_does_not_admit_an_mllp_destination_that_ignores_certificate_expiry(
@@ -1167,8 +1178,14 @@ def test_an_expiry_relaxed_mllp_destination_crosses_on_its_attestation_and_is_au
     assert dest._ssl is not None and context_checks_revocation(dest._ssl) is True
     assert dest._revocation_guard is not None
     assert dest._revocation_guard.crl_checked is False
+    assert dest._revocation_guard.expiry_relaxed is True
     shipped = _shipped(log.audit)
     assert "connection 'OB_MLLP';" in shipped and REASON in shipped, log.state()
+    # The kept line words the hop as what it is (BACKLOG #5089): the CRL that reached it still
+    # refuses a leaf it lists, so the unrelaxed "NO certificate revocation checking" would over-state.
+    assert _RELAXED_CROSSING in shipped, log.state()
+    assert "still refuses a leaf certificate it lists" in shipped, log.state()
+    assert "NO certificate revocation checking" not in shipped, log.state()
 
 
 def test_a_crl_still_admits_an_mllp_destination_that_checks_expiry(bare_crl: str) -> None:

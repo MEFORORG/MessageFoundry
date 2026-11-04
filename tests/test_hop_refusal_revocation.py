@@ -219,6 +219,7 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "attested_reason",
         "connection",
         "declaration",
+        "expiry_relaxed",
     }
     assert {f.name for f in dataclasses.fields(RevocationHopGuard)} == {
         "host",
@@ -228,7 +229,7 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "posture",
         "blanket_attested",
         "crl_checked",
-        "crl_is_a_check",
+        "expiry_relaxed",
         "ways_across",
         "attested_reason",
         "connection",
