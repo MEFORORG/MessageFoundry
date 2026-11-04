@@ -703,6 +703,12 @@ class _DriverFamily(NamedTuple):
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
+    #: Whether the family's own documentation names ``SERVER`` as the keyword for its target host,
+    #: the one keyword the generic connection string sends a target under and the host
+    #: ``[egress].allowed_db`` checks (BACKLOG #5163). Documented, never measured: no driver was run
+    #: for it (BACKLOG #2705). Its own field, with no default, so a family placed later for its TLS
+    #: keyword says whether it reads ``SERVER`` rather than inheriting it.
+    reads_server: bool
     #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
     #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
     #: BACKLOG #4874).
@@ -726,6 +732,13 @@ class _DriverFamily(NamedTuple):
 # on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
 # escape by the SQL Server preset and the store. The legacy name ``SQL Server`` is left out: on
 # Linux it is commonly a FreeTDS alias, which has not been measured.
+#
+# Each family is documented to read ``SERVER`` as its target host (``reads_server``, BACKLOG
+# #5163), read from its own source on 2026-11-03 and never run: psqlODBC's ``dlg_specific.h``
+# defines ``SPEC_SERVER`` as the connection-string keyword ``server``; MySQL Connector/ODBC's
+# *Connector/ODBC Connection Parameters* page lists ``server`` as the host name of the server; and
+# Microsoft's *ODBC DSN and Connection String Keywords* page lists ``Server``. Any other name gets
+# the warning :func:`_warn_generic_server_unread` logs.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
@@ -733,6 +746,7 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
         frozenset(_LIBPQ_SSL_MODES),
         ("SSLmode", "verify-full"),
         brace_escape=True,
+        reads_server=True,
     ),
     "mysql": _DriverFamily(
         re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
@@ -740,6 +754,7 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
         frozenset(_MYSQL_SSL_MODES),
         ("SSLMODE", "VERIFY_IDENTITY"),
         brace_escape=True,
+        reads_server=True,
     ),
     "msodbc": _DriverFamily(
         re.compile(r"odbc driver [0-9]+ for sql server"),
@@ -747,6 +762,7 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
         None,
         ("Encrypt", "yes"),
         brace_escape=True,
+        reads_server=True,
         reads_comma_port=True,
     ),
 }
@@ -765,6 +781,30 @@ def _driver_family(driver: object) -> str | None:
     return next(
         (key for key, family in _DRIVER_FAMILIES.items() if family.names.fullmatch(name)), None
     )
+
+
+#: Why a generic hop's ``odbc_driver`` is reported as possibly not reading ``SERVER`` (BACKLOG
+#: #5163). The one wording the construction warning and ``messagefoundry check`` share.
+SERVER_UNREAD_REASON = (
+    "odbc_driver names no driver family documented to read SERVER as its target, so "
+    "[egress].allowed_db does not bind this hop if the driver takes its target from another keyword"
+)
+#: What to do about :data:`SERVER_UNREAD_REASON`, shared by the warning and the check line.
+SERVER_UNREAD_REMEDY = (
+    "name psqlODBC, MySQL Connector/ODBC or Microsoft's driver by its registered name, or reach "
+    "this database another way (see Generic ODBC in docs/CONNECTIONS.md)"
+)
+
+
+def odbc_driver_reads_server(driver: object) -> bool:
+    """Whether ``driver``, an ``odbc_driver`` setting as written, places a family
+    :data:`_DRIVER_FAMILIES` records as documented to read ``SERVER`` as its target (BACKLOG
+    #5163). ``False`` is not a finding that the driver ignores ``SERVER``, only that the engine
+    cannot place it: the generic connection string sends its target as ``SERVER`` alone, and
+    ``[egress].allowed_db`` checks that host, so a driver that takes its target from another keyword
+    dials a host the check never saw. Pure."""
+    family = _driver_family(driver)
+    return family is not None and _DRIVER_FAMILIES[family].reads_server
 
 
 def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
@@ -1397,10 +1437,11 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     (vault BACKLOG #2577, BACKLOG #2705; docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). An ``odbc_params`` keyword
     must be on :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
     the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
-    twice is refused. A driver may take its target under a keyword other than ``SERVER``, and the
-    engine does not detect that. The egress check runs outside this builder, at least in
-    ``build_source`` and ``build_destination`` (``transports.base``). This builder sends ``server``
-    as written.
+    twice is refused. A driver may take its target under a keyword other than ``SERVER``; the
+    engine cannot see that, and warns (:func:`_warn_generic_server_unread`, BACKLOG #5163) for any
+    name it cannot place as a family documented to read ``SERVER``. The egress check runs outside
+    this builder, at least in ``build_source`` and ``build_destination`` (``transports.base``).
+    This builder sends ``server`` as written.
 
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
@@ -1509,7 +1550,28 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
     _warn_generic_tls_unenforced(params, driver=driver, connection=connection)
+    _warn_generic_server_unread(driver, connection=connection)
     return ";".join(parts) + ";"
+
+
+def _warn_generic_server_unread(driver: str, *, connection: str | None = None) -> None:
+    """A WARNING when ``driver`` is not documented to read ``SERVER`` as its target
+    (:func:`odbc_driver_reads_server`, BACKLOG #5163), so the ``[egress].allowed_db`` check on
+    ``server`` may bind nothing for the hop.
+
+    Visibility, not a control: it never gates or changes the connection. Refusing such a name is
+    BACKLOG #5041's driver allow-list, not this. ``messagefoundry check``'s advisory
+    ``generic-db-server`` line reports the same hops from the graph, through the same predicate.
+    The connection is named with :func:`hop_name_prefix`, whose ``;`` keeps the log scrub from
+    reading a keyword and what follows it as a credential pair."""
+    if odbc_driver_reads_server(driver):
+        return
+    logger.warning(
+        "%sDATABASE generic dialect; %s; %s",
+        hop_name_prefix(connection),
+        SERVER_UNREAD_REASON,
+        SERVER_UNREAD_REMEDY,
+    )
 
 
 def _warn_generic_tls_unenforced(

@@ -359,6 +359,9 @@ def run_checks(
         # transports.egress.warn_url_query_credentials.
         _check_url_query_credentials(config_dir),
         _check_generic_db_tls(config_dir),
+        # BACKLOG #5163: a generic hop whose driver is not documented to read SERVER, where
+        # [egress].allowed_db may bind nothing. Advisory -- see the check.
+        _check_generic_db_server(config_dir),
         # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
         _check_hop_attested(config_dir),
         # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
@@ -3042,6 +3045,57 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
             # does not import a crypto module for a string (the crypto-inventory gate).
             "tls_hop_attested=true with a tls_hop_attested_reason (the hop is secure by other means), "
             "or, on an outbound only, cleartext_accepted with a cleartext_reason"
+        ),
+    )
+
+
+def _check_generic_db_server(config_dir: str | Path) -> CheckResult:
+    """Surface the generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` is not a family
+    documented to read ``SERVER`` as its target (BACKLOG #5163).
+
+    The generic connection string sends the target as ``SERVER`` alone, and ``[egress].allowed_db``
+    checks that host, so a driver that takes its target elsewhere would dial a host the check never
+    saw. The construction WARNING was the only other report. ``required=False`` on purpose: the
+    engine cannot tell what a driver it cannot place reads, and refusing such a name is BACKLOG
+    #5041's driver allow-list, a separate decision. SKIPs when the graph will not load, as
+    ``generic-db-tls`` does."""
+    from messagefoundry.config.wiring import (
+        WiringError,
+        load_config,
+        server_unread_generic_db_hops,
+    )
+    from messagefoundry.transports.database import SERVER_UNREAD_REMEDY
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "generic-db-server",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    hops = server_unread_generic_db_hops(registry)
+    if not hops:
+        return CheckResult(
+            "generic-db-server",
+            ok=True,
+            required=False,
+            detail=(
+                "no generic-ODBC database connection names a driver the engine cannot place as "
+                "reading SERVER; the families it places are documented to read it, and no driver "
+                "was run to confirm that"
+            ),
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    return CheckResult(
+        "generic-db-server",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(hops)} generic-ODBC database connection(s) name a driver the engine cannot place "
+            f"as reading SERVER -- {listed}; {SERVER_UNREAD_REMEDY}"
         ),
     )
 
