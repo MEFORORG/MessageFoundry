@@ -723,6 +723,7 @@ async def test_security_events_for_user_scopes_to_actor(store) -> None:
         auth_provider="local",
         password_generated=False,
         now=1.0,
+        audits=(),
     )
     await store.record_audit("auth.login_success", actor="alice", detail="1")
     await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
@@ -782,6 +783,7 @@ async def test_auth_users_roles_sessions(store) -> None:
         password_hash="hash",
         now=1000.0,
         password_generated=False,
+        audits=(),
     )
     assert await store.count_users() == 1
     user = await store.get_user_by_username("alice")
@@ -1267,6 +1269,7 @@ async def test_directory_id_comparison_follows_this_servers_collation(store) -> 
         directory_object_id=CASE_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # Unconditional, on every collation: the id as stored resolves to its own row. This is the half
     # the recycle defence rests on, and it is also the control that makes the miss-or-match below a
@@ -1313,6 +1316,7 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
     got = await store.get_user("scope-src")
@@ -1351,7 +1355,12 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
     await store.create_user(
-        user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0, password_generated=False
+        user_id="cas-src",
+        username="cas-src",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
     )
     cas = store.set_user_channel_scope_if_source
     assert (await store.get_user("cas-src")).channel_scope_source is None
@@ -1398,6 +1407,7 @@ async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(st
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_channel_scope("long-scope", scope, source=SCOPE_SOURCE_AD)
     assert (await store.get_user("long-scope")).channel_scope == scope  # stored whole
@@ -1458,6 +1468,7 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
         directory_object_id=BOUND_GUID,
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     found = await store.get_user_by_directory_object_id(BOUND_GUID)
     assert found is not None and found.id == "dir-upgrade"
@@ -1510,6 +1521,7 @@ async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None
         directory_object_id="guid-idp-upgrade",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="i" * 64,
@@ -1550,6 +1562,7 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
@@ -1587,6 +1600,7 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
         password_hash="h0",
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
     seeded = await store.get_user("u3")
@@ -2258,7 +2272,12 @@ async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
         await store.create_user(
-            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+            user_id=uid,
+            username=uname,
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
     try:
         for pid, owner, name, now in (
@@ -5622,7 +5641,11 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         # BACKLOG #3510: a user row, so the leg proves the sealed record and its TOTP secret come
         # through the rotation too, not only the message cells.
         await seed.create_user(
-            user_id="u-rot", username="rot", auth_provider="local", password_generated=False
+            user_id="u-rot",
+            username="rot",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
     finally:

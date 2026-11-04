@@ -171,7 +171,9 @@ async def test_the_form_suggests_the_profile_address_and_a_get_writes_nothing(
     service = await _service(engine, notifier=notifier)
     user_id = await provision(service, "bare", [Role.OPERATOR.value])
     # The directory-sync write: it names ``email`` and never ``notify_email``.
-    await engine.store.update_user_profile(user_id, display_name=None, email=DIRECTORY_ADDRESS)
+    await engine.store.update_user_profile(
+        user_id, display_name=None, email=DIRECTORY_ADDRESS, audits=()
+    )
     async with _client(engine, service) as c:
         await cookie_login(c, "bare")
         page = await c.get(PAGE)
@@ -231,7 +233,9 @@ async def test_a_profile_address_the_submit_would_refuse_is_not_suggested(engine
             "root@localhost",
             too_long,
         ):
-            await engine.store.update_user_profile(user_id, display_name=None, email=value)
+            await engine.store.update_user_profile(
+                user_id, display_name=None, email=value, audits=()
+            )
             page = await c.get(PAGE)
             assert page.status_code == 200, value
             assert "value=" not in _email_input(page.text), value
@@ -260,7 +264,9 @@ async def test_a_non_ascii_profile_address_is_not_suggested(engine: Engine) -> N
             # lookalike rule's. Since vault BACKLOG #2870 the shape check itself refuses a non-ASCII
             # address, because the alert sender could never put it on the RCPT TO line.
             assert _is_single_mailbox(value) == value.isascii(), ascii(value)
-            await engine.store.update_user_profile(user_id, display_name=None, email=value)
+            await engine.store.update_user_profile(
+                user_id, display_name=None, email=value, audits=()
+            )
             page = await c.get(PAGE)
             assert page.status_code == 200, ascii(value)
             assert "value=" not in _email_input(page.text), ascii(value)
@@ -274,7 +280,9 @@ async def test_a_suggested_address_is_escaped_in_the_route(engine: Engine) -> No
     """``&`` and ``'`` pass the mailbox check, so they reach the attribute and must arrive escaped."""
     service = await _service(engine, notifier=_FakeNotifier())
     user_id = await provision(service, "bare", [Role.OPERATOR.value])
-    await engine.store.update_user_profile(user_id, display_name=None, email="o'b&c@example.org")
+    await engine.store.update_user_profile(
+        user_id, display_name=None, email="o'b&c@example.org", audits=()
+    )
     async with _client(engine, service) as c:
         await cookie_login(c, "bare")
         page = await c.get(PAGE)

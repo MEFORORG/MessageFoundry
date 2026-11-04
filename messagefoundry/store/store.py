@@ -7150,6 +7150,13 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
+DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the caller's own per-result
+statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
+alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
+missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
+The one exception is an operator inject, which always writes a message, so its ``None`` return is
+refused too (BACKLOG #5071, :func:`require_ingress_audit`).
+
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
 not read chain state."""
@@ -7516,17 +7523,101 @@ async def _audit_row_mac_verifies(
     )
 
 
-def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
-    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
-    if audit is None:
-        return ()
+def require_operator_audit(audit: object, mutation: str) -> None:
+    """Refuse a missing operator audit before ``mutation`` writes anything (BACKLOG #5069).
+
+    Every operator mutation's ``audit`` is required with no default, so mypy refuses a typed caller
+    that leaves it out or passes ``None``. This is the runtime half, for a caller mypy does not
+    check: an explicit ``None``, or anything else that is not callable, raises :class:`TypeError`.
+    Each mutation calls it first, so the refusal writes nothing."""
+    if not callable(audit):
+        raise TypeError(
+            f"{mutation} needs an operator audit, a callable that builds its audit row; got "
+            f"{type(audit).__name__} (BACKLOG #5069)"
+        )
+
+
+#: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
+#: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
+#: origin is a decision: the test classifies every member as operator or not.
+OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
+
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin
+) -> OperatorAudit[str] | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+
+    Before anything is written, an operator origin with no audit or with one that is not callable,
+    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
+    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+    It keys on ``origin``, so it cannot see an operator's inject written with the default
+    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
+    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
+    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
+    ``audit`` and always writes ``operator_upload``."""
+    operator = origin in OPERATOR_ORIGINS
+    if not operator:
+        if audit is not None:
+            # An audit is an operator's inject; with this origin the message would be labelled
+            # as a receipt, so the caller forgot the origin.
+            raise TypeError(
+                f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
+                " inject names its operator origin (BACKLOG #5071)"
+            )
+        return None
+    if not callable(audit):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
+            f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    build = audit
+
+    def row_required(message_id: str) -> AuditAppend:
+        row = build(message_id)
+        if row is None:
+            raise TypeError(
+                "an operator inject's audit returned no row, and an inject always writes a"
+                " message, so it always records one (BACKLOG #5071)"
+            )
+        return row
+
+    return row_required
+
+
+def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend, ...]:
+    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624).
+
+    A return that is neither ``None`` nor an :class:`AuditAppend` raises :class:`TypeError`
+    (BACKLOG #5069); a ``None`` RETURN stays allowed, see :data:`OperatorAudit`. ``None`` in place
+    of ``audit`` raises here too. Each mutation already refused it at entry, before any write; this
+    is the backstop for a mutation that forgets that line, and here the raise rolls it back."""
+    require_operator_audit(audit, "an operator mutation")
     row = audit(result)
-    return () if row is None else (row,)
+    if row is None:
+        return ()
+    if not isinstance(row, AuditAppend):
+        raise TypeError(
+            f"an operator audit returned {type(row).__name__}, not an AuditAppend or None"
+            " (BACKLOG #5069)"
+        )
+    return (row,)
 
 
 def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
     """``audit`` when the mutation changed a row, otherwise nothing (vault BACKLOG #3217). The
-    operator alert mutations take one, so an unknown or resolved id records no row."""
+    operator alert mutations take one, so an unknown or resolved id records no row.
+
+    Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
+    here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
+    #5069)."""
+    if not isinstance(audit, AuditAppend):
+        raise TypeError(
+            f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
+            " (BACKLOG #5069)"
+        )
     return lambda applied: audit if applied else None
 
 
@@ -11215,6 +11306,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -13821,6 +13913,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, and the row commits with the
         replay (BACKLOG #2624, :data:`OperatorAudit`)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
@@ -13950,6 +14043,7 @@ class MessageStore:
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
         origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
         ``new_message_id`` (vault BACKLOG #2615)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -14181,6 +14275,7 @@ class MessageStore:
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
         ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -14361,6 +14456,7 @@ class MessageStore:
         **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
         BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
         its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -14419,6 +14515,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
@@ -15458,7 +15555,7 @@ class MessageStore:
         ]
 
     async def _append_operator_audit[R](
-        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
         that fails rolls the mutation back with it. ``written`` tees the row once the commit lands."""
@@ -15466,7 +15563,7 @@ class MessageStore:
         written.add(audits, await self._append_audits(audits, now=written.now))
 
     async def _commit_operator_noop[R](
-        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Audit an operator mutation that found nothing to change (BACKLOG #2624). Its row may be
         the only write, so commit only when there is one: a bare commit would count a transaction."""
@@ -15811,7 +15908,7 @@ class MessageStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638). The Store protocol states the contract: the row is read and checked in the write,
@@ -16312,7 +16409,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -16534,7 +16631,7 @@ class MessageStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says why
@@ -16669,7 +16766,7 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG

@@ -191,6 +191,7 @@ async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after
             password_hash=None,
             must_change_password=True,
             password_generated=False,
+            audits=(),
         )
         if crashed_after == "set_password":
             await store.set_password(
@@ -240,6 +241,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             password_hash=None,
             must_change_password=True,
             password_generated=False,
+            audits=(),
         )
         await store.set_user_roles("roled", [Role.OPERATOR.value], assigned_by="test")
         with pytest.raises(FirstAdministratorRefused, match="holds roles"):
@@ -259,6 +261,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
             password_generated=False,
+            audits=(),
         )
         await store.set_user_disabled("off", disabled=True)
         with pytest.raises(FirstAdministratorRefused, match="is disabled"):
@@ -278,6 +281,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             auth_provider=AuthProvider.AD.value,
             password_hash=None,
             password_generated=False,
+            audits=(),
         )
         with pytest.raises(FirstAdministratorRefused, match="provision a separate"):
             await service.provision_first_administrator(
@@ -344,6 +348,7 @@ async def test_a_supplied_address_also_lands_on_a_repaired_row() -> None:
             password_hash=None,
             must_change_password=True,
             password_generated=False,
+            audits=(),
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.notify_email is None, "control: it starts without one"
@@ -1505,6 +1510,7 @@ async def _roleless_account(store: MessageStore, *, email: str | None) -> None:
         password_hash=None,
         must_change_password=True,
         password_generated=False,
+        audits=(),
     )
 
 
@@ -2086,6 +2092,7 @@ def _keyed_store_with_directory_administrator(db: Path, key: str) -> None:
                 auth_provider=AuthProvider.AD.value,
                 password_hash=None,
                 password_generated=False,
+                audits=(),
             )
             await AuthService(store, AuthSettings()).initialize()
             await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
@@ -3350,6 +3357,7 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
             password_hash=None,
             must_change_password=True,
             password_generated=False,
+            audits=(),
         )
         await store.set_password(
             "earlier",
@@ -3454,6 +3462,7 @@ async def test_a_re_run_in_the_same_step_is_not_blocked_by_the_rows_old_step_mar
             password_hash=None,
             must_change_password=True,
             password_generated=False,
+            audits=(),
         )
         kw = provision_totp()
         from messagefoundry.auth import totp
@@ -3643,6 +3652,7 @@ async def test_a_sign_in_during_the_repair_does_not_survive_into_the_administrat
             password_hash=None,
             must_change_password=True,
             password_generated=False,
+            audits=(),
         )
         await store.set_password(
             "earlier",
@@ -3691,6 +3701,7 @@ def test_the_cli_refuses_a_username_it_would_not_complete_before_any_prompt(
                 auth_provider="local",
                 password_hash="h",
                 password_generated=False,
+                audits=(),
             )
             await store.set_user_roles("bob", [Role.VIEWER.value], assigned_by="test")
         finally:

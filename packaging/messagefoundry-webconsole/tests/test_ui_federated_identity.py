@@ -68,6 +68,7 @@ async def _ad_account(engine: Engine, username: str = "jdoe", *, object_id: bool
         auth_provider="ad",
         directory_object_id=f"guid-{username}" if object_id else None,
         password_generated=False,
+        audits=(),
     )
     return user_id
 

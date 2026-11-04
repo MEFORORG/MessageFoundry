@@ -160,7 +160,12 @@ async def test_unbind_of_an_unbound_account_is_refused_and_revokes_nothing(
     try:
         service = await _service(store, rsa_key)
         await store.create_user(
-            user_id="u-ad", username="plain", auth_provider="ad", now=1.0, password_generated=False
+            user_id="u-ad",
+            username="plain",
+            auth_provider="ad",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.create_session(token_hash="t-plain", user_id="u-ad", expires_at=9e9, now=1.0)
 
