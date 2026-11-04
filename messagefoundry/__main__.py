@@ -3406,6 +3406,8 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
+    from messagefoundry.api.tls import plaintext_upstream_hop_off_loopback
+
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3413,17 +3415,37 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r with in-process TLS (https/wss).", settings.api.host
             )
-        elif settings.api.tls_terminated_upstream:
-            # WP-15: a reverse proxy terminates TLS in front; trust forwarded headers only from the
-            # declared proxies (the validator guarantees trusted_proxies is set here). The log names
-            # the CONFIGURED list; uvicorn_trusted_hosts says what serve adds to it for uvicorn.
-            logging.getLogger(__name__).info(
-                "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
-                "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
-                settings.api.host,
-                settings.api.trusted_proxies,
+            if settings.api.tls_terminated_upstream:
+                # WP-15: a reverse proxy terminates TLS in front and re-encrypts to this listener;
+                # trust forwarded headers only from the declared proxies (the validator guarantees
+                # trusted_proxies is set here). The log names the CONFIGURED list;
+                # uvicorn_trusted_hosts says what serve adds to it for uvicorn.
+                logging.getLogger(__name__).info(
+                    "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
+                    "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
+                    "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
+                    settings.api.host,
+                    settings.api.trusted_proxies,
+                )
+        elif plaintext_upstream_hop_off_loopback(settings.api):
+            # BACKLOG #4636: a declared terminator with no operator certificate serves the
+            # proxy-to-engine hop in plaintext, and owner ruling R1 of 2026-10-27 on BACKLOG #1179
+            # accepts that hop from a same-machine proxy only. So off loopback it is refused,
+            # acknowledged or not, in every mode, ahead of the acknowledgement arm below. The
+            # predicate is shared with `messagefoundry check`.
+            print(
+                "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
+                f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
+                "[api].tls_cert_file the engine serves that hop in plaintext, and "
+                "[api].plaintext_upstream_hop_acknowledged accepts it only from a proxy on the same "
+                "machine, with the engine bound to loopback (127.0.0.1, ::1 or localhost). Bind "
+                "the engine to loopback ([security].local_access_only, [security].listen_address or "
+                "serve --host), or set [api].tls_cert_file so the engine serves that hop over TLS, "
+                "and point the proxy at https and have it trust that certificate. See "
+                "docs/SECURITY.md (BACKLOG #4636).",
+                file=sys.stderr,
             )
+            return 2
         elif insecure_bind_ok and not enforcing:
             # The engine goes on to serve https on the minted placeholder (ADR 0172), which
             # tests/test_api_tls.py::test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder
@@ -3456,8 +3478,9 @@ def _serve(args: argparse.Namespace) -> int:
                 "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
                 "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
                 "Configure [api].tls_cert_file for in-process "
-                "TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates "
-                "TLS, or set [security].enforcement=warn to accept serving on the placeholder on a "
+                "TLS (with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
+                "terminates TLS and re-encrypts to the engine, BACKLOG #4636), or set "
+                "[security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
                 file=sys.stderr,
             )
@@ -3469,8 +3492,9 @@ def _serve(args: argparse.Namespace) -> int:
                 "available is the engine's generated self-signed placeholder, which no trust store "
                 "vouches for, so a remote client can authenticate the engine only by pinning that "
                 "exact certificate, handed over out of band. Configure "
-                "[api].tls_cert_file for in-process TLS, set [api].tls_terminated_upstream "
-                "(+ trusted_proxies) if a proxy terminates TLS, or, under "
+                "[api].tls_cert_file for in-process TLS (with [api].tls_terminated_upstream + "
+                "trusted_proxies beside it if a proxy terminates TLS and re-encrypts to the engine, "
+                "BACKLOG #4636), or, under "
                 "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
                 "placeholder on a trusted, firewalled network.",
                 file=sys.stderr,
@@ -3532,10 +3556,10 @@ def _serve(args: argparse.Namespace) -> int:
     # itself, and refusing would hard-stop working deployments on upgrade. The off-loopback arm keeps
     # refusing exactly as before, so this change is additive — it can only add a warning, never a new
     # refusal.
-    # TWO EXCEPTIONS, and neither is dial-governed: the BACKLOG #4636 off-loopback refusal and the
-    # BACKLOG #1179 plaintext-hop acknowledgement at the top of the block refuse in EVERY mode. Do not
-    # move them under `enforcing` to match the paragraphs above; the owner ruled that hop the deploying
-    # site's to secure, and accepted it on a loopback bind only, whatever the dial says.
+    # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
+    # top of the block refuses in EVERY mode. Do not move it under `enforcing` to match the paragraphs
+    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says. Its
+    # BACKLOG #4636 sibling, which refuses that hop off loopback, sits in the exposed-bind gate above.
     if settings.api.tls_terminated_upstream:
         # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
         # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
@@ -3545,27 +3569,8 @@ def _serve(args: argparse.Namespace) -> int:
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
         # enforcing or warn: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import (
-            plaintext_upstream_hop_off_loopback,
-            plaintext_upstream_hop_unacknowledged,
-        )
+        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
 
-        # BACKLOG #4636: the acknowledgement covers a same-machine proxy only, so a plaintext hop off
-        # loopback is refused first, acknowledged or not, in every mode like the arm below.
-        if plaintext_upstream_hop_off_loopback(settings.api):
-            print(
-                "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
-                f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
-                "[api].tls_cert_file the engine serves that hop in plaintext, and "
-                "[api].plaintext_upstream_hop_acknowledged accepts it only from a proxy on the same "
-                "machine, with the engine bound to loopback (127.0.0.0/8, ::1 or localhost). Bind "
-                "the engine to loopback ([security].local_access_only, [security].listen_address or "
-                "serve --host), or set [api].tls_cert_file so the engine serves that hop over TLS, "
-                "and point the proxy at https and have it trust that certificate. See "
-                "docs/SECURITY.md (BACKLOG #4636).",
-                file=sys.stderr,
-            )
-            return 2
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
@@ -3833,7 +3838,8 @@ def _serve(args: argparse.Namespace) -> int:
             "declared TLS-terminating proxy. The only certificate available is the engine's "
             "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
             "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
-            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies); "
+            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies, which off "
+            "loopback also needs that certificate, BACKLOG #4636); "
             "--allow-insecure-bind does not cover it, and neither does "
             "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
             "address (127.0.0.1) for local-only access, or configure one of those two.",

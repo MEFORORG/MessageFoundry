@@ -168,7 +168,7 @@ def test_serve_proxy_terminated_offloopback_starts(
         'security.enforcement = "warn"\n'
         # An operator certificate, so the proxy re-encrypts to the engine: BACKLOG #4636 refuses a
         # plaintext proxy-to-engine hop off loopback. The engine then terminates TLS too, and the
-        # declared proxy still counts as revocation proven in front.
+        # revocation gate still exempts a declared proxy, which this test pins as it stands.
         '[api]\ntls_terminated_upstream = true\ntls_cert_file = "cert.pem"\ntrusted_proxies = ["10.0.0.7"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",

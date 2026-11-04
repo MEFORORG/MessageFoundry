@@ -1230,8 +1230,10 @@ def test_the_app_factories_derive_the_rp_flag_from_their_own_settings(
 def test_serve_allows_non_loopback_with_upstream_tls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A declared TLS-terminating proxy satisfies the exposed-gate WITHOUT in-process TLS: allowed
-    # without --allow-insecure-bind, and uvicorn trusts XFF only from the proxy (no ssl context).
+    # A declared TLS-terminating proxy in front of a NIC bind: allowed without --allow-insecure-bind,
+    # and uvicorn trusts XFF only from the proxy. Since BACKLOG #4636 that bind needs an operator
+    # certificate, because the plaintext proxy-to-engine hop is refused off loopback, so the proxy
+    # re-encrypts to the engine's own TLS listener.
     from messagefoundry.store.crypto import generate_key
     from tests.test_ambient_proxy_disclosure import _kept
 
@@ -1244,15 +1246,14 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     # The upstream-TLS exposed gate is the subject here, so everything around it is pre-satisfied
     # per-gate. Since BACKLOG #1279 a dev box cannot declare its way past the Posture-B attestations
     # either, and an undeclared one would refuse before this gate is reached.
-    # 127.0.0.2: this gate's is_loopback names only 127.0.0.1, ::1 and localhost, so the bind takes
-    # the non-loopback arm, while BACKLOG #4636 reads all of 127.0.0.0/8 as loopback and accepts the
-    # plaintext hop. A NIC bind with no operator certificate is refused by #4636 instead.
+    cert, key = _self_signed(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
         "security.block_unlisted_outbound = true\n"
         "alerts.security_notifications_required = false\n"
-        'security.local_access_only = false\nsecurity.listen_address = "127.0.0.2"\n'
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         'security.enforcement = "warn"\n'
-        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n'
+        f'tls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
@@ -1262,7 +1263,7 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     assert "refusing to serve" not in capsys.readouterr().err
     # XFF trusted only from the proxy, in both its spellings (BACKLOG #3042).
     assert captured["forwarded_allow_ips"] == ["10.0.0.7", "::ffff:10.0.0.7"]
-    assert "ssl_context_factory" not in captured  # TLS is at the proxy, not in-process
+    assert "ssl_context_factory" in captured  # the proxy re-encrypts to in-process TLS
     # The startup line names the CONFIGURED list, not uvicorn's doubled one. That form is not free
     # of CodeQL's clear-text-logging query: alert 209 is open on this configured-list argument, as
     # an alert was raised on the doubled list on PR 2380. Each message is read here, at the end, as
@@ -1721,12 +1722,15 @@ _OFF_LOOPBACK_REFUSAL = "refusing to serve a PLAINTEXT proxy-to-engine hop on th
 
 @pytest.mark.parametrize("ack", [True, False], ids=["acknowledged", "unacknowledged"])
 @pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+# 127.0.0.2 is in 127.0.0.0/8 but is not one of ApiSettings.is_loopback's three hosts.
+@pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.2"])
 def test_serve_refuses_a_plaintext_hop_off_loopback_acknowledged_or_not(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     ack: bool,
     enforcement: str,
+    host: str,
 ) -> None:
     _posture_b_toml(
         tmp_path,
@@ -1735,11 +1739,12 @@ def test_serve_refuses_a_plaintext_hop_off_loopback_acknowledged_or_not(
         enforcement=enforcement,
         ack=ack,
         auto_cert=False,
+        listen_address=host,
     )
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
     err = capsys.readouterr().err
     assert _OFF_LOOPBACK_REFUSAL in err
-    assert "'0.0.0.0'" in err
+    assert f"{host!r}" in err
     assert "[api].plaintext_upstream_hop_acknowledged accepts it only" in err
     assert "point the proxy at https" in err
     # Checked first, so an unacknowledged hop is not told to set an acknowledgement that would
@@ -1747,12 +1752,12 @@ def test_serve_refuses_a_plaintext_hop_off_loopback_acknowledged_or_not(
     assert "without [api].plaintext_upstream_hop_acknowledged" not in err
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "127.255.255.254", "::1", "localhost"])
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
 def test_serve_starts_an_acknowledged_plaintext_hop_on_every_loopback_spelling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], host: str
 ) -> None:
     # The control for the refusal above: the same off-box-declared shape, with the bind host moved
-    # onto loopback, starts. All of 127.0.0.0/8 is loopback, not only 127.0.0.1.
+    # onto each spelling ApiSettings.is_loopback accepts, starts.
     _posture_b_toml(tmp_path, intra="network", floor="1.2", auto_cert=False, listen_address=host)
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
     captured = capsys.readouterr()
@@ -1764,16 +1769,18 @@ def test_serve_starts_an_acknowledged_plaintext_hop_on_every_loopback_spelling(
     ("host", "refused"),
     [
         ("127.0.0.1", False),
-        ("127.0.0.2", False),
         ("::1", False),
         ("localhost", False),
-        ("LOCALHOST", False),
         ("0.0.0.0", True),
         ("::", True),
         ("10.0.0.12", True),
         ("mefor.example.org", True),
-        # is_loopback_hop_host reads an empty host as loopback; an empty bind host listens on every
-        # interface, so the predicate refuses it.
+        # ApiSettings.is_loopback is the exact three hosts above, the one definition every other
+        # bind decision reads, so any other spelling is refused: the fail-closed side.
+        ("127.0.0.2", True),
+        ("LOCALHOST", True),
+        ("::ffff:127.0.0.1", True),
+        # An empty bind host listens on every interface.
         ("", True),
     ],
 )
