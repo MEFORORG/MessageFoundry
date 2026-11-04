@@ -6598,8 +6598,10 @@ class AuthService:
         still an OIDC session; the account is enabled and still a directory account; the token's
         verified ``(issuer, sub)`` is byte-for-byte the pair bound to the account; ``auth_time`` is
         fresh by our clock (see the inline note); the session holds an IdP ``auth_time``, and the
-        new one is later; the directory still has the account; and :meth:`_directory_roles_lost`
-        finds no role lost and the role map sealed (BACKLOG #2154, #3082). Then it elevates through
+        new one is later; the directory still has the account, and its answer names the row's own
+        directory object (BACKLOG #3174); the account still exists on a re-read; and
+        :meth:`_directory_roles_lost` refuses nothing, which for an account holding a role needs
+        no role lost and a sealed role map (BACKLOG #2154, #3082). Then it elevates through
         :meth:`_elevated_hash`, so rotation, the MFA carry and the single-use grant follow the
         password leg's rules exactly.
 
@@ -6762,12 +6764,12 @@ class AuthService:
         mismatch = _directory_answer_mismatch(principal, object_id)
         if mismatch is not None:
             return await refuse(mismatch)
-        # BACKLOG #2154: the role test the TOTP and passkey legs apply (#2240), by calling
-        # _directory_roles_lost directly, whose docstring states the rule. This leg does not go
-        # through _directory_step_up_refusal, the wrapper those legs use, because that wrapper's
-        # own directory probe would replace this leg's not_in_directory reason with the probe's
-        # outcome. The row is read after the directory round trip, through the loader (BACKLOG
-        # #2592).
+        # BACKLOG #2154: the role test, by calling _directory_roles_lost directly, whose docstring
+        # states the rule and the legs that refuse on it. This leg does not go through
+        # _directory_step_up_refusal, the wrapper the second-factor legs reach it through, because
+        # that wrapper's own directory probe would replace this leg's not_in_directory reason with
+        # the probe's outcome. The row is read after the directory round trip, through the loader
+        # (BACKLOG #2592).
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await refuse("session_gone", lost=True)
@@ -12058,8 +12060,8 @@ class AuthService:
         nothing here writes to the directory. A directory that cannot be asked, or that cannot find
         the principal, is a refusal but NOT a failure, on the account or the session: counting an
         outage would lock every operator who tried to step up while a domain controller was down.
-        A right password on an account that lost a role in the directory since sign-in is refused
-        as ``directory_roles_demoted`` and is not a failure either (BACKLOG #3081); nor does it
+        A right password the role test in :meth:`_directory_roles_lost` refuses is not a failure
+        either (BACKLOG #3081); nor does it
         reset the budget or the counter, because nothing was granted.
 
         ``clear`` marks the re-auth leg, whose success rotates the session: only there does a success
@@ -12204,14 +12206,14 @@ class AuthService:
         if current is None:
             return _Reproof(ok=False, user=user)
         if directory:
-            # BACKLOG #3081: the role test the code, passkey and IdP legs apply (#2240, #2154),
-            # stated in _directory_roles_lost's docstring, on the groups the bind just resolved and
-            # the roles of the row read AFTER it, as those legs read theirs. The groups vouch only
+            # BACKLOG #3081: the role test stated in _directory_roles_lost's docstring, on the
+            # groups the bind just resolved and the roles of the row read AFTER it, as the other
+            # legs read theirs. The groups vouch only
             # for the object the bind was keyed on, so a row whose id or provider moved during the
             # round trip is refused rather than judged on another object's groups, as
             # identity_for_cert_user_id refuses it. The password was right, so nothing is charged
             # or registered, and the session's budget and the account counter are left as they
-            # were. Either refusal writes no roles.
+            # were. No refusal in this block writes roles, the moved-row one included.
             refusal: str | None
             if (
                 current.directory_object_id != user.directory_object_id
@@ -12268,9 +12270,8 @@ class AuthService:
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
         re-bind** against the directory so AD operators aren't locked out, and a good re-bind on an
-        account that lost a role in the directory since sign-in is refused as
-        :data:`DIRECTORY_ROLES_DEMOTED`, uncharged, as the code and passkey legs refuse it
-        (BACKLOG #3081). A session the federated
+        account that lost a role in the directory since sign-in is refused, uncharged, by the test
+        :meth:`_directory_roles_lost` states (BACKLOG #3081). A session the federated
         login minted is refused before either (see the first branch): it steps up at the IdP through
         :meth:`complete_oidc_step_up`. Always audited.
 
@@ -14464,8 +14465,8 @@ class AuthService:
         sign-in would renew its window, clear the MFA gate, or be minted an action-bound grant,
         with roles it no longer holds, until the reconciler's role pass. A leg that refuses on
         either outcome writes no roles; it still audits the refusal. For a lost role the
-        reconciler or the next sign-in re-syncs the roles. A failing map is cleared only by an
-        administrator saving it again, since a new sign-in reads the same map.
+        reconciler or the next sign-in re-syncs the roles. A failing map is not cleared that way;
+        :data:`DIRECTORY_ROLE_MAP_UNSEALED` says what its fix is.
 
         :data:`DIRECTORY_ROLES_DEMOTED` for a lost role, and :data:`DIRECTORY_ROLE_MAP_UNSEALED`
         when the role map fails its seal, since every stored role would then read as lost and

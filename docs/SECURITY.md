@@ -3297,11 +3297,11 @@ text names a group, a role or a directory detail.
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
 looks the account up by its directory object id. It now judges the groups that lookup returns by
 the test stated in the paragraph above that opens "Both legs also refuse a present account that
-lost a role in the directory", and refuses an account that fails it, a failing role map
-included. It refuses only; the session stays as it was, with no window and no grant, and no
-roles are written. The `auth.reauth` row carries `reason=directory_roles_demoted`, and the
-refusal tells the operator to sign in again, which takes the roles the current groups grant. A
-failing map is refused as `directory_role_map_unsealed` and is not told to sign in again.
+lost a role in the directory", and refuses an account that fails it. It refuses only; the
+session stays as it was, with no window and no grant, and no roles are written. For a lost role
+the `auth.reauth` row carries `reason=directory_roles_demoted`, and the refusal tells the
+operator to sign in again, which takes the roles the current groups grant. The failing-map case
+is the cited paragraph's.
 Channel scope is not compared on this leg either.
 
 **The password re-bind makes the same role test (BACKLOG #3081).** A good re-bind (`POST
@@ -4849,8 +4849,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     `directory_object_id_missing` or `directory_identity_conflict` (BACKLOG #3174);
   - the account lost no role in the directory, by the role test in the paragraph that opens
     "Both legs also refuse a present account that lost a role in the directory" (BACKLOG
-    #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`, or with
-    `reason=directory_role_map_unsealed` when the role map fails its seal.
+    #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`, or, for an account
+    that holds a role, with `reason=directory_role_map_unsealed` when the role map fails its seal.
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted

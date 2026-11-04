@@ -4336,17 +4336,24 @@ def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
         assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
     rule = "**Both legs also refuse a present account that lost a role in the directory"
     assert rule in doc, "the role-rule paragraph the re-bind paragraph cites lost its opening"
-    # BACKLOG #3822: the IdP step-up paragraph cites the same rule rather than restating it, so
-    # the citation is what states its role test.
+
+
+#: The opening words of the SECURITY.md paragraph that states the directory role rule. The re-bind
+#: and IdP step-up paragraphs cite the rule by these words rather than restating it (#3822).
+_ROLE_RULE_OPENER = "Both legs also refuse a present account that lost a role in the directory"
+
+
+def test_the_idp_step_up_role_test_cites_the_rule_paragraph() -> None:
+    """BACKLOG #3822: the IdP step-up paragraph states its role test only by citing the rule
+    paragraph, so the citation is the statement. RED when the paragraph drops the citation or
+    its lost-role reason, or when the cited words no longer open a paragraph."""
+    doc = _doc_text()
+    assert f"**{_ROLE_RULE_OPENER}" in doc, "the role-rule paragraph lost its opening words"
     idp = "**The IdP step-up leg makes the same role test (BACKLOG #2154).**"
     assert idp in doc, "docs/SECURITY.md lost the IdP step-up role-test paragraph"
-    idp_paragraph = " ".join(doc.split(idp, 1)[1].split("\n\n", 1)[0].split())
-    for fact in (
-        "Both legs also refuse a present account that lost a role in the directory",
-        "reason=directory_roles_demoted",
-        "directory_role_map_unsealed",
-    ):
-        assert fact in idp_paragraph, f"the IdP step-up paragraph no longer says: {fact}"
+    paragraph = " ".join(doc.split(idp, 1)[1].split("\n\n", 1)[0].split())
+    for fact in (_ROLE_RULE_OPENER, "reason=directory_roles_demoted"):
+        assert fact in paragraph, f"the IdP step-up paragraph no longer says: {fact}"
 
 
 def test_the_changelog_records_the_re_bind_role_test() -> None:
