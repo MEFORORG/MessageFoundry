@@ -43,6 +43,7 @@ from messagefoundry.transports.remotefile import (
     _FtpClient,
     _RemoteError,
 )
+from tests._ast_sites import callee_name, parse_source
 from tests._refusal_log_capture import record_texts
 from tests.test_file_write_error_names import MRN, TEMPLATE, _traceback
 from tests.test_remotefile_publish_refuses import _ftp_client, _ScriptedFtp
@@ -278,25 +279,18 @@ def test_a_size_reply_that_is_no_number_reads_as_no_size() -> None:
     assert _ftp_size(ftp, "/in/x") is None
 
 
-class _JunkSizeFtp:
+class _JunkSizeFtp(_ScriptedFtp):
     """An ``MLSD`` that lists a file whose ``size`` fact quotes a path, not a number."""
 
     def mlsd(self, path: str = "", facts: Any = ()) -> Iterator[tuple[str, dict[str, str]]]:
         return iter([("a.hl7", {"type": "file", "size": f"/in/{NAME}"})])
 
-    def quit(self) -> str:
-        return "221 Goodbye"
-
-    def close(self) -> None:
-        return None
-
 
 def test_an_mlsd_size_that_is_no_number_fails_the_listing_as_fixed_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_FtpClient, "_connect", lambda self: _JunkSizeFtp())
     with pytest.raises(_RemoteError) as caught:
-        _FtpClient({"host": "ftp.example.com"}, tls=False).list_entries("/in")
+        _ftp_client(_JunkSizeFtp({}), monkeypatch).list_entries("/in")
     assert str(caught.value) == "FTP MLSD listing gave a size that is not a number"
     assert caught.value.permanent is False
     assert caught.value.__context__ is None and caught.value.__cause__ is None
@@ -379,31 +373,33 @@ def _breaks(source: str) -> set[tuple[str, int, str]]:
     not seen: text read from the exception into a local first, as ``_ftp_connect_refusal`` does."""
     found: set[tuple[str, int, str]] = set()
 
-    def visit(node: ast.AST, qual: str, bound: tuple[str, ...], inside: bool) -> None:
+    def visit(node: ast.AST, qual: str, bound: tuple[str, ...]) -> None:
         for child in ast.iter_child_nodes(node):
-            q, b, i = qual, bound, inside
+            q, b = qual, bound
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                q = f"{qual}.{child.name}" if qual else child.name
+                # A def's body runs when it is called, not in the handler it is written in.
+                q, b = (f"{qual}.{child.name}" if qual else child.name), ()
+            elif isinstance(child, ast.Lambda):
+                b = ()
             if isinstance(child, ast.ExceptHandler) and not _caught(child.type) <= _OWN:
-                b, i = (*bound, child.name or ""), True
-            if isinstance(child, ast.Raise) and child.exc is not None and inside:
+                b = (*bound, child.name or "")
+            if isinstance(child, ast.Raise) and child.exc is not None and bound:
                 found.add((q, child.lineno, "raise inside a handler"))
-            if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "_RemoteError"
-            ):
+            if isinstance(child, ast.Call) and callee_name(child, bare_only=True) == "_RemoteError":
                 for sub in ast.walk(child):
                     if not isinstance(sub, ast.FormattedValue):
                         continue
                     v = sub.value
-                    if isinstance(v, ast.Call) and getattr(v.func, "id", "") == "_fault_detail":
+                    if (
+                        isinstance(v, ast.Call)
+                        and callee_name(v, bare_only=True) == "_fault_detail"
+                    ):
                         continue
                     if any(isinstance(n, ast.Name) and n.id in bound for n in ast.walk(v)):
                         found.add((q, child.lineno, "interpolates the caught exception"))
-            visit(child, q, b, i)
+            visit(child, q, b)
 
-    visit(ast.parse(source), "", (), False)
+    visit(parse_source(source), "", ())
     return found
 
 
