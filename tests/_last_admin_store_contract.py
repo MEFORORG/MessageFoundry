@@ -38,6 +38,7 @@ async def seed(store: Any, admins: tuple[str, ...], others: tuple[str, ...] = ()
             auth_provider="local",
             now=1.0,
             password_generated=False,
+            audits=(),
         )
         await store.set_user_roles(user_id, [ADMIN if user_id in admins else VIEWER])
 

@@ -500,11 +500,19 @@ def test_the_webhook_scheme_and_allowlist_refusals_name_their_settings() -> None
     screened at construction. They name the setting so every refusal in the sink reads the same way."""
     with pytest.raises(ValueError, match=r"\[alerts\]\.webhook_url must be http or https"):
         WebhookTransport(f"ftp://hooks.example.invalid/{SECRET}")
+    # The allowlist refusal fires at the build since BACKLOG #5088, and again at every POST.
+    with pytest.raises(ValueError) as exc:
+        WebhookTransport(
+            f"https://hooks.example.invalid/services/{SECRET}",
+            allowed_hosts=("ok.example",),
+            posture=_NOT_ENFORCING,
+        )
+    assert SECRET not in str(exc.value)
+    assert "[alerts].webhook_allowed_hosts" in str(exc.value)
     sink = WebhookTransport(
-        f"https://hooks.example.invalid/services/{SECRET}",
-        allowed_hosts=("ok.example",),
-        posture=_NOT_ENFORCING,
+        "https://ok.example/hook", allowed_hosts=("ok.example",), posture=_NOT_ENFORCING
     )
+    sink.url = f"https://hooks.example.invalid/services/{SECRET}"
     with pytest.raises(ValueError) as exc:
         sink._post({"type": "t", "connection": "c"})
     assert SECRET not in str(exc.value)
