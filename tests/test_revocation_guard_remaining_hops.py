@@ -526,11 +526,13 @@ def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -
     assert guard.disposition() is HopDisposition.ALLOW
     with _guard_log() as log:
         guard.enforce_construction()
-    assert _RELAXED_CROSSING in log.audit, log.state()
-    # The line keeps its own wording there: that CRL still refuses a leaf it lists, so the
-    # unrelaxed record's "NO certificate revocation checking" would say less was checked than was.
-    assert "NO certificate revocation checking" not in log.audit, log.state()
-    assert _RELAXED_DETAIL in log.audit, log.state()
+    assert "crossed without certificate revocation checking" in log.audit, log.state()
+    # Without the caller's `expiry_relaxed` the guard credited that CRL, so the relaxed wording,
+    # which says no CRL is credited, would contradict the ALLOW it records (vault BACKLOG #5086
+    # owns whether that CRL should admit the hop). The relaxed wording is the flag's alone.
+    assert guard.expiry_relaxed is False
+    assert _RELAXED_CROSSING not in log.audit, log.state()
+    assert _RELAXED_DETAIL not in log.audit, log.state()
 
 
 def _relaxed_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:

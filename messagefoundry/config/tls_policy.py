@@ -855,8 +855,8 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
 #: (``0x200000``, unchanged since OpenSSL 1.0.2 through 3.x). It disables the time checks during
 #: chain verification: the certificate validity period (both ``notBefore`` AND ``notAfter``), and
 #: with it a CRL's own validity window, so a CRL past ``nextUpdate`` is accepted (ADR 0173 §13);
-#: the chain signature, name constraints, key usage / EKU, basic constraints, and — separately — the hostname
-#: match (``check_hostname``) all still apply. Python's ``ssl`` does not expose it as a named
+#: the chain signature, name constraints, key usage / EKU, basic constraints, and — separately —
+#: the hostname match (``check_hostname``) all still apply. Python's ``ssl`` does not expose it as a named
 #: ``VerifyFlags`` member, but ``SSLContext.verify_flags`` accepts a raw ``int`` OR, so the flag is
 #: settable directly. See ADR 0094 for why this OpenSSL-native context-level primitive was chosen over
 #: post-handshake ``cryptography.x509.verification`` (it works uniformly for every transport that funnels
@@ -888,8 +888,9 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
     It relaxes at least these besides the peer leaf's validity period. The validity period of every
     other certificate in the chain, the intermediates and the trust anchor, goes unchecked too.
     OpenSSL applies the same flag to a CRL's validity window, so a CRL past ``nextUpdate`` on this
-    context is accepted, and a revocation guard gives it no credit
-    (:func:`skips_validity_period`, ADR 0173 §13); a leaf the CRL lists is still refused. And
+    context is accepted; a revocation guard told so with ``expiry_relaxed`` gives it no credit
+    (:func:`skips_validity_period`, ADR 0173 §13), and one handed this context without that flag
+    still does (vault BACKLOG #5086). A leaf the CRL lists is still refused. And
     OpenSSL's choice among candidate issuers stops preferring one whose own validity period is
     current, so a chain may be built through an expired issuer where a current one exists.
 
@@ -954,9 +955,11 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
 
 
 #: The remedy a revocation refusal names on a hop whose context skips validity-period checks
-#: (``tls_allow_expired``, :func:`skips_validity_period`). No CRL can relax that refusal, so the
-#: connection-shaped default, which offers ``[tls].crl_file``, would name a lever that cannot work
-#: there (SDS-3.7).
+#: (``tls_allow_expired``, :func:`skips_validity_period`), where the caller tells the guard so
+#: (``RevocationHopGuard.capture(expiry_relaxed=True)``, which names it by default). No CRL can
+#: relax that refusal, so the connection-shaped default, which offers ``[tls].crl_file``, would
+#: name a lever that cannot work there (SDS-3.7). A guard handed such a context without that
+#: flag still credits its CRL (vault BACKLOG #5086) and does not name this text.
 EXPIRY_RELAXED_WAYS_ACROSS = (
     "This hop sets tls_allow_expired, so a CRL cannot admit it. A [tls].crl_file, if set, still "
     "refuses a leaf certificate it lists, but do not attest on its strength: the relaxation "
@@ -2678,11 +2681,17 @@ class RevocationHopGuard:
     #: context in :meth:`capture`, never from a global setting. False for a caller that passes
     #: ``expiry_relaxed=True``, whatever its context loads (ADR 0173 §13).
     crl_checked: bool = False
-    #: Whether this hop skips the validity-period check (``tls_allow_expired``,
-    #: :func:`skips_validity_period`): the caller says so, or the context handed in does. It
-    #: decides :attr:`crl_is_a_check` and the wording of every record built from :meth:`_detail`
-    #: (the refusal, the WARNING and the attested crossing's line); no disposition reads it.
+    #: Whether the caller said this hop skips the validity-period check (``tls_allow_expired``),
+    #: so the guard credits no CRL on it (:meth:`capture`). It decides the wording of every record
+    #: built from :meth:`_detail` (the refusal, the WARNING and the attested crossing's line).
+    #: Only the caller's word sets it: a context that skips the check without it keeps its CRL
+    #: credit (vault BACKLOG #5086), so the relaxed wording, which says no CRL is credited, would
+    #: be false there.
     expiry_relaxed: bool = False
+    #: Whether the context handed to :meth:`capture` skips the validity-period check
+    #: (:func:`skips_validity_period`), whatever the caller said. It feeds :attr:`crl_is_a_check`
+    #: only; no disposition and no wording reads it.
+    context_skips_validity: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
     #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
@@ -2759,9 +2768,9 @@ class RevocationHopGuard:
         CRL the context loads, because the relaxation also skips the CRL's own validity window.
         And an omitted ``ways_across`` becomes :data:`EXPIRY_RELAXED_WAYS_ACROSS`, so the record
         never offers the CRL it has just refused to credit. A caller passes the context it dials
-        with and this flag. A context that skips the check without the flag sets
-        :attr:`expiry_relaxed` for the wording only; whether such a context's CRL should admit
-        the hop is not decided here (vault BACKLOG #5086)."""
+        with and this flag. A context that skips the check without the flag keeps its CRL credit
+        and the unrelaxed wording, and only :attr:`crl_is_a_check` reads it; whether such a
+        context's CRL should admit the hop is not decided here (vault BACKLOG #5086)."""
         return cls(
             host=host,
             cell=cell,
@@ -2770,8 +2779,8 @@ class RevocationHopGuard:
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
             crl_checked=not expiry_relaxed and context_checks_revocation(context),
-            expiry_relaxed=expiry_relaxed
-            or (context is not None and skips_validity_period(context)),
+            expiry_relaxed=expiry_relaxed,
+            context_skips_validity=context is not None and skips_validity_period(context),
             ways_across=(
                 EXPIRY_RELAXED_WAYS_ACROSS
                 if expiry_relaxed and ways_across is None
@@ -2792,12 +2801,12 @@ class RevocationHopGuard:
 
     @property
     def crl_is_a_check(self) -> bool:
-        """Whether this hop's CRL is a real check: :attr:`crl_checked` on a hop that keeps the
+        """Whether this hop's CRL is a real check: :attr:`crl_checked` on a context that keeps the
         validity-period check, which OpenSSL also applies to the CRL's own window. Derived, so it
-        cannot drift from the two fields it reads. It decides whether the attested crossing is
-        logged, at :meth:`enforce_construction` and the AI broker's own arm; no disposition reads
-        it."""
-        return self.crl_checked and not self.expiry_relaxed
+        cannot drift from the fields it reads; :attr:`expiry_relaxed` already makes
+        :attr:`crl_checked` False. It decides whether the attested crossing is logged, at
+        :meth:`enforce_construction` and the AI broker's own arm; no disposition reads it."""
+        return self.crl_checked and not self.context_skips_validity
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return revocation_hop_disposition(

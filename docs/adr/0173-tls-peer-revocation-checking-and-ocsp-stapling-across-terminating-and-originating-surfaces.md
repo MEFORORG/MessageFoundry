@@ -791,10 +791,12 @@ instead, which gave the same disposition; where an older passage of this ADR say
 the guard no context, read this note. The line then reads *crossed without a revocation check the
 guard credits*: the chain is verified but not the validity period, and a CRL, where one reaches the
 hop, is read without its own validity window. The refusal and the WARNING on such a hop use the
-same words, and so does a guard handed a context that skips time validity without the flag; whether
-such a context's CRL should admit the hop is not decided here (vault BACKLOG #5086). The AI broker
-writes its own records, not the guard's, and its line keeps the unrelaxed words: no context that
-skips time validity reaches it, because it dials rest.py's shared opener, which never relaxes. The
+same words. Only the flag sets them. A guard handed a context that skips time validity without the
+flag still credits that context's CRL, so it keeps the unrelaxed words, which do not contradict
+that ALLOW, and keeps the line, by `crl_is_a_check`; whether such a context's CRL should admit the
+hop is not decided here (vault BACKLOG #5086). The AI broker writes its own records, not the
+guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
+because it dials rest.py's shared opener, which never relaxes. The
 REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
 paragraph describes; their refusal text is left open in §13 too.
 
