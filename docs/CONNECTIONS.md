@@ -1704,8 +1704,8 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 - **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
   **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
   service-container job.
-- **`dialect="generic"`** — a **generic ODBC path** for another ODBC-reachable database (PostgreSQL,
-  MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
+- **`dialect="generic"`** — a **generic ODBC path** for a database whose ODBC driver reads `SERVER`
+  as its target (PostgreSQL, MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
   and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
 
 **Host precondition for the SQL Server ODBC hops** (at least this connector, `DatabasePoll(...)`,
@@ -1775,7 +1775,9 @@ outbound(
 
 #### Generic ODBC (PostgreSQL / MySQL)
 
-`dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
+`dialect="generic"` (#66) targets **a database whose ODBC driver reads `SERVER` as its target**
+(see [*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords), which says what the
+engine reports for a driver it cannot place) without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
 `odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
@@ -1928,9 +1930,18 @@ these kinds:
 
 Two limits follow from this:
 
-- **A driver may take its target under another keyword, and the engine does not detect that.** The
-  engine sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
-  target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
+- **A driver may take its target under another keyword.** The engine sends the target as `SERVER`
+  and nothing else, and `[egress].allowed_db` checks the host in `server`. A driver that takes
+  its target from another keyword dials a host that check never saw, so the check binds nothing
+  for that hop. Oracle's ODBC driver documents `DBQ` for its target, and `DBQ` is refused.
+  Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
+  a driver reads. It places three families documented to read `SERVER`, by the registered names
+  [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
+  Microsoft's `ODBC Driver <n> for SQL Server`. No driver was run to confirm it (vault BACKLOG
+  #2705). For any other `odbc_driver` name, building the connection logs a WARNING naming it, and
+  `messagefoundry check`'s advisory `generic-db-server` line lists it (BACKLOG #5163). Neither
+  refuses the connection. To clear it, name a driver of one of those families by its registered
+  name, or reach that database another way than the generic dialect.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
