@@ -356,12 +356,12 @@ def _take_windows_path(
     read: _WinPathSecurity,
     self_sid: str | None,
     by_name: dict[str, _WinPathSecurity] | None = None,
-    moves_away: tuple[Path, int] | None = None,
+    moves_away: tuple[Path, _WinPathSecurity] | None = None,
 ) -> list[Path]:
     """Route load_config down the Windows branch with fake readers; return the paths read.
 
     ``read`` answers every path unless ``by_name`` names that path's file name. ``moves_away``
-    renames that path to ``<name>.moved`` as it is read, and answers it with that Win32 status."""
+    renames that path to ``<name>.moved`` as it is read, and answers it with that read."""
     import messagefoundry.config.wiring as wiring
 
     seen: list[Path] = []
@@ -371,7 +371,7 @@ def _take_windows_path(
         seen.append(path)
         if moves_away is not None and path == moves_away[0] and path.exists():
             path.rename(path.with_name(f"{path.name}.moved"))
-            return _WinPathSecurity(status=moves_away[1])
+            return moves_away[1]
         return overrides.get(path.name, read)
 
     probes = _WinConfigSourceProbes(
@@ -549,7 +549,9 @@ def test_config_directory_moved_away_before_its_read_is_missing(
     cfg = tmp_path / "cfg"
     cfg.mkdir()
     _write_cfg(cfg)
-    seen = _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, moves_away=(cfg, gone))
+    seen = _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, moves_away=(cfg, _WinPathSecurity(status=gone))
+    )
     with pytest.raises(ConfigDirMissing, match="config directory not found"):
         load_config(cfg)
     assert seen == [cfg] and (tmp_path / "cfg.moved").is_dir()
@@ -581,6 +583,46 @@ def test_a_refusal_stands_when_its_directory_then_stops_listing(
     with pytest.raises(WiringError, match=_EVERYONE) as refused:
         load_config(tmp_path)
     assert not isinstance(refused.value, ConfigDirUnlistable)
+    # Without these, a refusal raised before the directory stopped listing would pass for the
+    # wrong reason. A policy refusal is never judged again, so nothing lists it after the refusal;
+    # the listing is tried here to show it had stopped by then.
+    assert seen == [tmp_path, tmp_path / "cfg.py"]
+    with pytest.raises(OSError) as relisted:
+        os.scandir(tmp_path)
+    assert getattr(relisted.value, "winerror", None) == 53
+
+
+# A policy refusal of the directory itself, one per arm: a write grant to Everyone, and an owner
+# that is neither the engine's account nor an administrator.
+_POLICY_REFUSALS: dict[str, tuple[_WinPathSecurity, str]] = {
+    "writable by others": (_EVERYONE_WRITE_READ, _EVERYONE),
+    "foreign owner": (
+        _WinPathSecurity(owner_sid=_FOREIGN, aces=((_ALLOW, _FULL, _SELF),)),
+        "neither the account the engine runs as nor an administrator",
+    ),
+}
+
+
+@pytest.mark.parametrize("arm", sorted(_POLICY_REFUSALS))
+def test_a_policy_refusal_stands_when_its_directory_then_moves_away(
+    arm: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check refused the directory on its policy, and the directory then moved away. The
+    refusal stands: only a refusal that itself came from the directory being gone may be answered
+    as missing, so a reload audits this ``invalid_config``, not ``not_found`` (vault BACKLOG
+    #5248). Before, any refusal was judged again by listing the directory."""
+    from messagefoundry.config.fingerprint import ConfigDirMissing
+
+    read, expected = _POLICY_REFUSALS[arm]
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    _write_cfg(cfg)
+    _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, moves_away=(cfg, read))
+    with pytest.raises(WiringError, match=expected) as refused:
+        load_config(cfg)
+    assert not isinstance(refused.value, ConfigDirMissing)
+    assert (tmp_path / "cfg.moved").is_dir(), "the directory never moved, so nothing was measured"
 
 
 # ---- Tier 2: Windows-gated integration via icacls ---------------------------

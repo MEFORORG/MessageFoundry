@@ -8217,6 +8217,11 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
 #: How every config-source refusal of a load begins.
 _CONFIG_SOURCE_LEAD = "refusing to load config from"
 
+#: The log bound on a config-source refusal the load answers some other way. The clamped escape's
+#: text alone runs past ``safe_exc``'s default 200 characters. The API's own ``_REFUSAL_LOG_LIMIT``
+#: is the same number, for the same reason; this package cannot import it.
+_REFUSAL_LOG_LIMIT: Final = 8192
+
 #: The folder Python's source loader reads compiled modules from. A matching cache file there runs
 #: in place of the source beside it, so whoever can write it changes the code a load runs.
 _BYTECODE_CACHE_DIR = "__pycache__"
@@ -9103,6 +9108,26 @@ def _evaluate_config_dacl(
 # ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
 _WIN_PATH_GONE_ERRORS = frozenset({2, 3})
 
+#: The read failures of the config directory's own owner and DACL that say nothing about its policy,
+#: only that the directory was not there to read. :func:`_assert_safe_config_source` alone may answer
+#: such a refusal from a listing of the directory (vault BACKLOG #5248).
+_WIN_CONFIG_DIR_UNREACHED_ERRORS = _WIN_PATH_GONE_ERRORS
+
+
+class _ConfigDirUnreached(WiringError):
+    """The refusal of a config directory whose own owner and DACL read failed with one of
+    :data:`_WIN_CONFIG_DIR_UNREACHED_ERRORS`. A ``WiringError`` with the refusal's own text, so every
+    caller refuses it as before; its type alone tells the load it may judge the directory again. A
+    policy refusal is never one, so no later listing can replace it."""
+
+
+def _refuse_unreached_config_dir(refuse: Callable[[str], None], message: str) -> None:
+    """``refuse(message)``, with a refusal it raises marked as :class:`_ConfigDirUnreached`."""
+    try:
+        refuse(message)
+    except WiringError as exc:
+        raise _ConfigDirUnreached(str(exc)) from None
+
 
 @dataclass(frozen=True, slots=True)
 class _WinPathSecurity:
@@ -9153,7 +9178,8 @@ def _enforce_windows_paths(
     For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
     with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
     POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
-    config directory itself. Any other path that is gone by the time it is read is skipped, as below.
+    config directory itself. Its refusal is a :class:`_ConfigDirUnreached`, which the load may answer
+    from a listing of the directory. Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -9188,11 +9214,15 @@ def _enforce_windows_paths(
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
-            refuse(
+            message = (
                 f"{lead} {path}: its owner and DACL could not be read (Win32 "
                 f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
                 f"docs/SERVICE.md for required permissions"
             )
+            if first_is_required and index == 0 and sec.status in _WIN_CONFIG_DIR_UNREACHED_ERRORS:
+                _refuse_unreached_config_dir(refuse, message)
+            else:
+                refuse(message)
             continue
         # A NULL DACL means "no DACL present": everyone is implicitly allowed full control. That is an
         # observed insecure state, not an inability to read one.
@@ -9674,11 +9704,12 @@ def _assert_safe_config_source(directory: Path) -> None:
     refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
     for a share Windows cannot reach (vault BACKLOG #5117).
 
-    A refusal is judged again by listing the directory, so one moved away while its owners and
-    access lists were read raises ``ConfigDirMissing``, as the walk's own listing would have, and
-    a reload audits it ``not_found``, not as a config to fix (vault BACKLOG #5248). The refusal is
-    logged then. Any other refusal stands, a directory that has stopped listing included: no
-    listing fault may replace the answer that names what was refused."""
+    A refusal that came from the directory's own read finding nothing there
+    (:class:`_ConfigDirUnreached`) is judged again by listing the directory: one moved away raises
+    ``ConfigDirMissing``, as the walk's own listing would have, and a reload audits it
+    ``not_found``, not as a config to fix (vault BACKLOG #5248). The refusal is logged then. Every
+    other refusal stands whatever happens to the directory afterwards, a policy refusal above all:
+    a listing must never replace the answer that names what was refused."""
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
@@ -9695,7 +9726,7 @@ def _assert_safe_config_source(directory: Path) -> None:
             refuse=_refuse_unsafe_config_source,
             first_is_required=True,
         )
-    except WiringError as exc:
+    except _ConfigDirUnreached as exc:
         refusal = exc
     else:
         return
@@ -9707,12 +9738,12 @@ def _assert_safe_config_source(directory: Path) -> None:
         _logger.warning(
             "config directory %s is gone after its trust check refused it: %s",
             scrub_log_argument(str(directory)),
-            scrub_log_argument(safe_exc(refusal)),
+            scrub_log_argument(safe_exc(refusal, limit=_REFUSAL_LOG_LIMIT)),
         )
         raise
     except OSError:
-        # Present but not listable now, say a share that dropped. The refusal stands: it is the
-        # one answer that names what was refused, and a fault must not mask it.
+        # Present but not listable now. The refusal stands: it is the one answer that names what
+        # was refused, and a fault must not mask it.
         pass
     raise refusal
 

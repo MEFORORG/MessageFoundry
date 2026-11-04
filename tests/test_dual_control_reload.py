@@ -1889,29 +1889,99 @@ async def test_a_directory_moved_away_before_its_windows_access_read_is_not_foun
     reader at its ctypes boundary, as tests/test_config_source_trust.py drives it."""
     from messagefoundry.config import wiring
 
-    cfg = tmp_path / "cfg"
-
-    def _read_path(path: Path) -> Any:
-        if path.name == "cfg" and cfg.exists():
-            cfg.rename(tmp_path / "moved")
-            return wiring._WinPathSecurity(status=2)
-        return _CLEAN_READ
-
-    probes = wiring._WinConfigSourceProbes(
-        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
-    )
-    _windows_check = functools.partial(wiring._enforce_windows_paths, probes=probes)
-
+    gone = wiring._WinPathSecurity(status=2)
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         op = await _token(c, "op")
-        monkeypatch.setattr(wiring, "_check_trusted_paths", _windows_check)
+        monkeypatch.setattr(
+            wiring, "_check_trusted_paths", _windows_check_moving_away(tmp_path, gone)
+        )
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
     assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
     assert r.status_code == 404, r.text
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["not_found"]
+
+
+def _windows_check_moving_away(tmp_path: Path, answer: Any) -> Any:
+    """The pure Windows enforcer over a fake reader that answers ``cfg``'s own read with
+    ``answer`` and moves ``cfg`` away as it reads it; every other path reads clean."""
+    from messagefoundry.config import wiring
+
+    cfg = tmp_path / "cfg"
+
+    def _read_path(path: Path) -> Any:
+        if path.name == "cfg" and cfg.exists():
+            cfg.rename(tmp_path / "moved")
+            return answer
+        return _CLEAN_READ
+
+    probes = wiring._WinConfigSourceProbes(
+        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    return functools.partial(wiring._enforce_windows_paths, probes=probes)
+
+
+#: A write grant to Everyone (S-1-1-0) on the directory: a policy refusal, not a failed read.
+_EVERYONE_MAY_WRITE = (0x00, 0x00000002 | 0x00000004 | 0x00000010 | 0x00010000, "S-1-1-0")
+
+
+async def test_a_policy_refusal_then_a_directory_moved_away_is_invalid_config_inline(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trust check refused the directory on its policy, and the directory then moved away:
+    the refusal stands, audited ``invalid_config``, not ``not_found``. Only a refusal that came
+    from the directory being gone is answered as missing (vault BACKLOG #5248)."""
+    from messagefoundry.config import wiring
+
+    refused = wiring._WinPathSecurity(owner_sid=_SELF, aces=(_EVERYONE_MAY_WRITE,))
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(
+            wiring, "_check_trusted_paths", _windows_check_moving_away(tmp_path, refused)
+        )
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+    assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+
+
+async def test_a_policy_refusal_then_a_directory_moved_away_says_not_reached_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The release's trust check refused the directory on its policy, and it then moved away. The
+    row keeps ``invalid_config`` with ``approval_digest_check`` ``not_reached`` and the approved
+    digest, as any refusal before the digest check does (vault BACKLOG #5248, #2596)."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    approved = config_fingerprint(tmp_path / "cfg")
+    refused = wiring._WinPathSecurity(owner_sid=_SELF, aces=(_EVERYONE_MAY_WRITE,))
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr(
+            wiring, "_check_trusted_paths", _windows_check_moving_away(tmp_path, refused)
+        ),
+    )
+    monkeypatch.undo()
+    assert (tmp_path / "moved").is_dir(), "the directory was never moved, so nothing was measured"
+    assert r.status_code == 422, r.text
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "approved_fingerprint": approved,
+            "approval_digest_check": "not_reached",
+            "reason": "invalid_config",
+        }
+    ]
 
 
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(
