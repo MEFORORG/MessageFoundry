@@ -432,7 +432,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # .pfx import also decrypts each PKCS#12 EncryptedData part (PBKDF2 + AES-CBC) so keywrap can
     # check the key bags inside before the bundle loads.
     # BACKLOG #4948: IssuerIndex loads the client CA bytes the live context already loaded into a
-    # scratch ssl.SSLContext, to prove it indexed exactly the certificates OpenSSL took. The
+    # scratch ssl.SSLContext, to check it indexed exactly the CA certificates OpenSSL took, and a
+    # count of the others OpenSSL's count can match. The
     # scratch context is discarded: it serves no handshake and changes no hop's trust.
     "messagefoundry/pki.py": frozenset({"cryptography", "ssl"}),
     # BACKLOG #1748: hashlib = sha256 of a partner-chosen FILE NAME, so `safe_name` can put a short,

@@ -1661,8 +1661,8 @@ class IssuerIndex:
     itself, whether or not it is marked as a CA.
 
     The index holds exactly the CA certificates OpenSSL loads from ``cadata``, and a count of others
-    OpenSSL's count can match, or the build raises ``ValueError`` naming ``label`` (BACKLOG #4948). :func:`_pem_certificate_blocks` finds them, but
-    it models OpenSSL's PEM reader and is not that reader, so the result is then checked against
+    OpenSSL's count can match, or the build raises ``ValueError`` naming ``label`` (BACKLOG #4948).
+    :func:`_pem_certificate_blocks` finds them, but it models OpenSSL's PEM reader and is not that reader, so the result is then checked against
     OpenSSL itself (:func:`_refuse_unless_openssl_loads`). A CA the index named but OpenSSL never
     loaded could be named for a leaf whose chain ran through a client-sent copy of it; a CA OpenSSL
     loaded but the index missed could hide a same-DN twin, so a leaf under one would be named
@@ -1715,8 +1715,8 @@ class IssuerIndex:
 
         ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA, or a
         self-signed certificate pinned as itself, with a DIFFERENT key shares the issuing CA's
-        subject: the map is keyed by name, so it could not tell the two apart. A loaded certificate OpenSSL reads as no CA names only a leaf that is that
-        certificate. Never raises."""
+        subject: the map is keyed by name, so it could not tell the two apart. A loaded certificate
+        OpenSSL reads as no CA names only a leaf that is that certificate. Never raises."""
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
             issuers = [

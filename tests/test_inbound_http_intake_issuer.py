@@ -880,6 +880,16 @@ def test_the_count_of_certificates_that_are_no_ca_is_still_bounded() -> None:
     assert pki._refuse_unless_openssl_loads(cadata, Counter([root, pinned, pinned]), label="x") == {
         root
     }
+    # OpenSSL holds as many as every copy the index read: the bound's upper edge, accepted.
+    other = _der(_pinned("Other"))
+    both = cadata + ssl.DER_cert_to_PEM_cert(other)
+    assert _openssl_loads(both) == 3
+    assert pki._refuse_unless_openssl_loads(both, Counter([root, pinned, pinned]), label="x") == {
+        root
+    }
+    # One more than every copy read is above it.
+    with pytest.raises(ValueError, match=r"loads 2 certificate\(s\) that are not CAs.*plain PEM"):
+        pki._refuse_unless_openssl_loads(both, Counter([root, pinned]), label="x")
     # The index read one certificate that is no CA, and OpenSSL holds none: below the bound.
     alone = ssl.DER_cert_to_PEM_cert(root)
     with pytest.raises(ValueError, match=r"loads 0 certificate\(s\) that are not CAs.*empty or"):
@@ -919,16 +929,14 @@ async def test_a_certificate_that_is_no_ca_sharing_a_cas_subject_is_no_twin(
     """A loaded certificate OpenSSL reads as no CA, and that does not sign itself, shares a CA's
     subject under another key. It can never be named, so it is not a twin of that CA, and a leaf
     the CA signed is admitted under its subject. In the shipped code its key counted toward the
-    same-DN ambiguity, so every certificate under the CA was refused (BACKLOG #4948): this
-    LOOSENS a deny. A self-signed pinned certificate in its place could be named, as itself, so
-    there the name stays ambiguous and the leaf is refused, as before."""
+    same-DN ambiguity, so every certificate under the CA would have been refused on a first
+    deployment (BACKLOG #4948): this LOOSENS a deny. A self-signed pinned certificate in its place
+    could be named, as itself, so there the name stays ambiguous and the leaf names no issuer, as
+    before."""
     acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
-    (tmp_path / "namesake").mkdir()
-    source = await _started(
-        _source(tmp_path / "namesake", [acme[0], namesake], {"CN=Acme CA": [SUBJECT]})
-    )
+    source = await _started(_source(tmp_path, [acme[0], namesake], {"CN=Acme CA": [SUBJECT]}))
     try:
         assert source._issuer_index is not None
         assert source._issuer_index.unmatched_keys(["CN=Acme CA"]) == {}
