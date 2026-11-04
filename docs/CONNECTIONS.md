@@ -1488,9 +1488,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   access)`: the code and a fixed meaning for at least the common codes, and the code alone for any
   other. An SFTP error names the exception's type and errno, such as `SFTP path not found:
   FileNotFoundError, errno 2 (ENOENT)`; paramiko keeps no other SFTP status apart, so any other
-  refusal reads as a bare `OSError`. To see the server's own wording, read the server's log. One
-  exception: an SFTP connect refusal keeps paramiko's text, since no path has been sent by then.
-  `_RemoteError` in `transports/remotefile.py` states the rule.
+  refusal reads as a bare `OSError`. A TLS failure names OpenSSL's reason and, for a certificate
+  check, its verify message, which are this engine's own wording. To see the server's own wording,
+  read the server's log. One exception: an SFTP connect refusal keeps paramiko's text, since no
+  path has been sent on that connection by then; an earlier connection of the same upload may have
+  sent the temp path. `_RemoteError` in `transports/remotefile.py` states the rule.
 - **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is

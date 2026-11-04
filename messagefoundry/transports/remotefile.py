@@ -72,6 +72,7 @@ import itertools
 import logging
 import posixpath
 import re
+import socket
 import ssl
 import threading
 import time
@@ -260,8 +261,9 @@ def _where(host: str, path: str) -> str:
     return f"{host}:{path}"
 
 
-#: A fixed meaning for each FTP reply code an operation or a login commonly fails with (RFC 959,
-#: RFC 2228 for 534 and 536, RFC 3659 for 430). A code not listed is reported by its number alone.
+#: A fixed meaning for each FTP reply code an operation or a login commonly fails with (RFC 959, and
+#: RFC 2228 for 534 and 536). 430 is in no RFC; several servers send it for a refused login, so its
+#: meaning here is that convention's. A code not listed is reported by its number alone.
 _FTP_REPLY_MEANINGS = {
     "421": "service not available",
     "425": "cannot open the data connection",
@@ -286,8 +288,15 @@ _FTP_REPLY_MEANINGS = {
 }
 
 #: An FTP reply code where ``ftplib`` puts it, at the start of the reply. A digit run longer than
-#: three, or one not followed by a space, a ``-`` or the end, is no reply code.
-_FTP_REPLY_CODE = re.compile(r"[1-5]\d\d(?=[ -]|$)")
+#: three, or one not followed by a space, a ``-`` or the end, is no reply code. ASCII digits only:
+#: ``\d`` would also take a server's non-ASCII digits into the error text.
+_FTP_REPLY_CODE = re.compile(r"[1-5][0-9][0-9](?=[ -]|$)")
+
+#: ``getaddrinfo``'s own codes, which a ``socket.gaierror`` carries as its errno and which
+#: ``errno.errorcode`` does not name. Read from this platform's ``socket`` module.
+_EAI_NAMES: dict[int, str] = {
+    getattr(socket, attr): attr for attr in dir(socket) if attr.startswith("EAI_")
+}
 
 
 def _fault_detail(exc: BaseException) -> str:
@@ -295,8 +304,13 @@ def _fault_detail(exc: BaseException) -> str:
     that reply's free text (BACKLOG #5026; :class:`_RemoteError` states the rule).
 
     - An ``ftplib`` reply error gives its reply code and the code's fixed meaning.
-    - An ``OSError`` gives its type and errno, with the errno's symbolic name. Not its ``strerror``:
-      paramiko raises an SFTP status as an ``OSError`` whose ``strerror`` is the server's text.
+    - An ``ssl.SSLError`` gives its type and OpenSSL's reason, and a failed certificate check also
+      gives OpenSSL's verify message, such as an expired or revoked certificate. Both are this
+      engine's TLS library's fixed wording, never the server's; its errno is an OpenSSL code, not
+      an errno, so it is not shown.
+    - Any other ``OSError`` gives its type and errno, with the errno's symbolic name, or the
+      ``getaddrinfo`` name for a ``socket.gaierror``. Not its ``strerror``: paramiko raises an
+      SFTP status as an ``OSError`` whose ``strerror`` is the server's text.
     - Anything else gives its type, and an integer ``code`` attribute where it has one, such as the
       reason code of paramiko's ``ChannelException``."""
     name = type(exc).__name__
@@ -307,10 +321,22 @@ def _fault_detail(exc: BaseException) -> str:
         code = match.group(0)
         meaning = _FTP_REPLY_MEANINGS.get(code)
         return f"reply {code}" + (f" ({meaning})" if meaning else "")
+    if isinstance(exc, ssl.SSLError):
+        parts = [name]
+        for attr in ("reason", "verify_message"):
+            value = getattr(exc, attr, None)
+            if isinstance(value, str) and value:
+                parts.append(value)
+        return ", ".join(parts)
     if isinstance(exc, OSError):
-        if isinstance(exc.errno, int):
-            return f"{name}, errno {exc.errno} ({errno.errorcode.get(exc.errno, 'unknown')})"
-        return name
+        if not isinstance(exc.errno, int):
+            return name
+        known = (
+            _EAI_NAMES.get(exc.errno)
+            if isinstance(exc, socket.gaierror)
+            else errno.errorcode.get(exc.errno)
+        )
+        return f"{name}, errno {exc.errno}" + (f" ({known})" if known else "")
     status = getattr(exc, "code", None)
     if isinstance(status, int) and not isinstance(status, bool):
         return f"{name}, code {status}"
@@ -345,8 +371,9 @@ class _RemoteError(Exception):
     :func:`_fault_detail`. A denylist over the reply cannot do this: a reply that cuts a name short
     or encodes it some other way keeps that form. Each client raises it outside the handler that
     caught the reply, so the reply is on neither ``__cause__`` nor ``__context__`` either. One
-    carve-out: an SFTP connect refusal keeps paramiko's text; :meth:`_SftpClient._connect` says
-    why."""
+    carve-out: an SFTP connect refusal keeps paramiko's text and chain; :meth:`_SftpClient._connect`
+    says why. ``tests/test_remotefile_error_reply_text.py`` scans this module for a raise that
+    breaks the rule."""
 
     def __init__(
         self,
@@ -495,11 +522,25 @@ def _ftp_size(ftp: ftplib.FTP, path: str) -> int | None:
 
     A #116 caller sends ``TYPE I`` first on its session: several common servers refuse ``SIZE`` in
     ASCII mode, and the binary size is the one ``retrbinary`` reads. A transient reply still raises,
-    for ``_op`` to map."""
+    for ``_op`` to map. A ``213`` reply whose value is not a number is the server not saying
+    either: ``ftplib`` raises a ``ValueError`` that quotes the reply, which would otherwise escape
+    ``_op`` unmapped, its text the server's (BACKLOG #5026)."""
     try:
         return ftp.size(path)
-    except (ftplib.error_perm, ftplib.error_proto):
+    except (ftplib.error_perm, ftplib.error_proto, ValueError):
         return None
+
+
+def _mlsd_size(facts: Mapping[str, str]) -> int:
+    """An ``MLSD`` entry's ``size`` fact, 0 where it is absent. A value that is not a number fails
+    the listing transient, as a fixed text: ``int()``'s own ``ValueError`` quotes the server's
+    value, and :meth:`_FtpClient._op` does not map it (BACKLOG #5026)."""
+    try:
+        return int(facts.get("size", 0))
+    except ValueError:
+        pass
+    # Outside the handler, so the server's value is not chained.
+    raise _RemoteError("FTP MLSD listing gave a size that is not a number", permanent=False)
 
 
 #: The one permanent ``NLST`` reply read as an empty directory rather than a failure (BACKLOG
@@ -966,8 +1007,8 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
     ``credential_fault_policy``; ``"dead_letter"`` dead-letters instead. :meth:`_list_or_retry`
     passes both markers through unchanged.
 
-    The reply text decides the class and is read here only; the error carries the reply code
-    (BACKLOG #5026, :func:`_fault_detail`).
+    The reply text decides the class, here and in :meth:`_FtpClient._connect`'s 4xx arm, and is
+    never put in the error, which carries the reply code (BACKLOG #5026, :func:`_fault_detail`).
     """
     reply = str(exc)
     detail = _fault_detail(exc)
@@ -1105,7 +1146,7 @@ class _FtpClient(_RemoteClient):
                 # RFC 3659 fact values are case-insensitive; _names lowercases them too.
                 if name in (".", "..") or facts.get("type", "").lower() != "file":
                     continue
-                out.append(_Listed(name, int(facts.get("size", 0)), facts.get("modify") or None))
+                out.append(_Listed(name, _mlsd_size(facts), facts.get("modify") or None))
             return out
         except (ftplib.error_perm, ftplib.error_proto):
             pass
@@ -1799,10 +1840,12 @@ class _SftpClient(_RemoteClient):
         client is closed on every failure.
 
         **These errors keep paramiko's text and chain its exception**, the one carve-out from the
-        rule :class:`_RemoteError` states (BACKLOG #5026). They come before any path is sent on the
-        session, so the server has no upload name to quote yet, and the text carries this engine's
-        own refusals, such as the host-key fix :class:`_RefuseUnknownHostKey` names. At least one
-        part of it is the server's: paramiko quotes a banner it cannot read."""
+        rule :class:`_RemoteError` states (BACKLOG #5026). They come before any path is sent on this
+        connection, so the server has no upload name of this session to quote. An earlier
+        connection of the same upload may have sent the temp path, so the carve-out rests on a
+        server not quoting an earlier session's path in a connect refusal. The text carries this
+        engine's own refusals, such as the host-key fix :class:`_RefuseUnknownHostKey` names. At
+        least one part of it is the server's: paramiko quotes a banner it cannot read."""
         paramiko = _import_paramiko()
         client = paramiko.SSHClient()
         started = time.monotonic()
@@ -2450,10 +2493,11 @@ class RemoteFileDestination(DestinationConnector):
         # Write to a unique temp name then rename, so a poller on the far side never sees a partial
         # file. The temp suffix is unguessable so two concurrent uploads never collide on it.
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
-        # Every cleanup and raise below runs outside the handlers (BACKLOG #5026), so neither a
-        # cleanup that raises something other than a _RemoteError nor the failure itself carries
-        # the caught error on __context__. Its text never quotes the server's reply in any case
-        # (_RemoteError states the rule), and the clients chain no reply.
+        # Every cleanup and raise below runs outside the handlers (BACKLOG #5026), so a cleanup
+        # that raises something other than a _RemoteError does not carry the caught error on
+        # __context__. The failure is raised as the client raised it: its text never quotes the
+        # server's reply (_RemoteError states the rule), and it chains none, except an SFTP
+        # connect refusal, which keeps paramiko's text and chain (_SftpClient._connect says why).
         failed: _RemoteError | None = None
         try:
             self._client.store(tmp, data)
