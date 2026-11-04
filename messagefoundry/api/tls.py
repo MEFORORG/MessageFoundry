@@ -183,8 +183,8 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     if index.unconfirmed:
         log.warning(
             "[api].tls_client_ca_file: %d certificate(s) could not be matched to what the TLS context "
-            "loaded, for the mTLS identity map; no client certificate can map under them "
-            "(BACKLOG #4948)",
+            "loaded, or were loaded by it and could not be parsed, for the mTLS identity map; no "
+            "client certificate can map under them (BACKLOG #4948)",
             index.unconfirmed,
         )
     for key, reason in index.unmatched_keys(cert_map).items():

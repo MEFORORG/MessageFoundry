@@ -1597,12 +1597,16 @@ class IssuerIndex:
     itself, whether or not it is marked as a CA.
 
     **The PEM scan is checked against what the TLS context loaded** (BACKLOG #4948). The scan models
-    OpenSSL's reader and can disagree with it, so ``cadata`` is also loaded into a scratch context.
-    A certificate OpenSSL counts as a CA is named only where its DER is one that context holds, and
-    one the scan missed is taken from there. A certificate it does not count as a CA, such as a
-    pinned self-signed client certificate, cannot be listed back from a context, so those the scan
-    read are kept only where their number equals the context's. Anything set aside here is counted
-    in :attr:`unconfirmed`, and names no issuer, which denies rather than admits."""
+    OpenSSL's reader and can disagree with it, so ``cadata`` is also loaded into a scratch context,
+    and each certificate the scan read is judged by itself. One OpenSSL counts as a CA is named only
+    where its DER is one that context lists. One it does not count as a CA, such as a pinned
+    self-signed client certificate, cannot be listed back, so it is named only where loading it
+    ahead of ``cadata`` adds nothing to the context's store: a store keeps one copy of a
+    certificate. A CA the context lists that no block the scan read explains is taken from the
+    context, but only where ``cryptography`` reads it and every block it refused was matched to
+    what OpenSSL loaded from it. A certificate OpenSSL loads and ``cryptography`` refuses is never
+    named. Anything set aside names no issuer, which denies rather than admits, and is counted in
+    :attr:`unreadable` or :attr:`unconfirmed`."""
 
     def __init__(self, cadata: str) -> None:
         self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
@@ -1610,16 +1614,23 @@ class IssuerIndex:
         # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
         # are, because the map names only the name.
         self._subject_keys: dict[str, set[bytes]] = {}
-        #: Blocks the scan read that ``cryptography`` could not parse.
+        #: Blocks the scan read that ``cryptography`` could not parse, and certificates it parsed
+        #: whose name or key it could not read. None names an issuer.
         self.unreadable = 0
-        #: Certificates the scan and the scratch context disagree on, set aside or not found.
+        #: Certificates set aside because the scan and the scratch context disagree on them: read by
+        #: the scan and not held by the context, or held by the context and read from no block, or a
+        #: CA the context holds that ``cryptography`` cannot read. None names an issuer. A block
+        #: counted in :attr:`unreadable` is not counted here as well, except where OpenSSL cannot
+        #: read that block by itself, so nothing matches it to what the context loaded.
         self.unconfirmed = 0
         scanned: dict[bytes, x509.Certificate] = {}  # by DER, so a certificate listed twice is one
+        refused: list[str] = []
         for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
             try:
                 cert = x509.load_pem_x509_certificate(block)
-            except (ValueError, UnsupportedAlgorithm):
+            except (*_UNREADABLE_CA, UnsupportedAlgorithm):
                 self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
+                refused.append(block.decode("ascii"))
                 continue
             scanned.setdefault(cert.public_bytes(serialization.Encoding.DER), cert)
         loaded = _context_load(cadata)
@@ -1628,27 +1639,43 @@ class IssuerIndex:
             return
         ca_ders, total = loaded
         named: list[x509.Certificate] = []
-        for der in ca_ders:
-            found = scanned.get(der)
-            if found is None:
-                try:
-                    found = x509.load_der_x509_certificate(der)
-                except ValueError:
-                    self.unconfirmed += 1
-                    continue
-            named.append(found)
-        others = [cert for der, cert in scanned.items() if der not in ca_ders]
-        if len(others) == total - len(ca_ders):
-            named.extend(others)
-        else:
-            self.unconfirmed += max(len(others), total - len(ca_ders))
+        held_others: list[str] = []  # each certificate the context holds and does not list, as PEM
+        for der, cert in scanned.items():
+            pem = cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+            if der in ca_ders:
+                named.append(cert)
+            elif _context_holds(cadata, total, pem):
+                named.append(cert)
+                held_others.append(pem)
+            else:
+                self.unconfirmed += 1
+        # What OpenSSL loads from each refused block by itself, so the context's copy of it is
+        # neither taken from the context nor counted a second time.
+        explained = set(scanned)
+        matched = True
+        for text in refused:
+            alone = _context_load(text)
+            if alone is None:
+                matched = False
+                continue
+            explained |= alone[0]
+            if alone[1] > len(alone[0]) and _context_holds(cadata, total, text):
+                held_others.append(text)
+        for der in ca_ders - explained:
+            recovered = _readable_certificate(der) if matched else None
+            if recovered is None:
+                self.unconfirmed += 1
+            else:
+                named.append(recovered)
+        # Certificates the context holds and does not list that no block explains are counted, never
+        # named. Loading the explained ones into one store counts a certificate two blocks hold once.
+        explained_others = _context_load("\n".join(held_others)) if held_others else None
+        unlisted = total - len(ca_ders) - (explained_others[1] if explained_others else 0)
+        self.unconfirmed += max(0, unlisted)
         for cert in named:
             try:
-                subject = cert.subject.rfc4514_string()
-                key = cert.public_key().public_bytes(
-                    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-                )
-            except (ValueError, UnsupportedAlgorithm):
+                subject, key = _subject_and_key(cert)
+            except (*_UNREADABLE_CA, UnsupportedAlgorithm):
                 self.unreadable += 1
                 continue
             self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
@@ -1667,7 +1694,7 @@ class IssuerIndex:
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
                 if _directly_issued(leaf, anchor.cert)
             ]
-        except ValueError:
+        except _UNREADABLE_CA:
             return ""
         subjects = {anchor.subject for anchor in issuers}
         if len(subjects) != 1:
@@ -1702,6 +1729,36 @@ def _context_load(cadata: str) -> tuple[frozenset[bytes], int] | None:
     except (ssl.SSLError, ValueError):
         return None
     return frozenset(ctx.get_ca_certs(binary_form=True)), ctx.cert_store_stats()["x509"]
+
+
+def _context_holds(cadata: str, total: int, pem: str) -> bool:
+    """Whether the context :func:`_context_load` builds from ``cadata``, which holds ``total``
+    certificates, already holds the certificate in the one PEM block ``pem``.
+
+    A store keeps one copy of a certificate, so loading ``pem`` ahead of ``cadata`` then adds
+    nothing. OpenSSL reads ``pem`` whole first and ``cadata`` after it from a line start, so
+    ``cadata`` reads as it does alone. A ``pem`` OpenSSL cannot read refuses the load: not held."""
+    loaded = _context_load(pem + "\n" + cadata)
+    return loaded is not None and loaded[1] == total
+
+
+def _subject_and_key(cert: x509.Certificate) -> tuple[str, bytes]:
+    """``cert``'s subject as the issuer map names it, and its public key, for :class:`IssuerIndex`."""
+    key = cert.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return cert.subject.rfc4514_string(), key
+
+
+def _readable_certificate(der: bytes) -> x509.Certificate | None:
+    """``der`` as a certificate, or ``None`` where ``cryptography`` cannot read it, its subject or
+    its key: the engine never names a CA its own parser cannot read (BACKLOG #4948)."""
+    try:
+        cert = x509.load_der_x509_certificate(der)
+        _subject_and_key(cert)
+    except (*_UNREADABLE_CA, UnsupportedAlgorithm):
+        return None
+    return cert
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:

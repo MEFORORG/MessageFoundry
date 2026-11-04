@@ -727,8 +727,8 @@ def _client_issuer_index(
     if index.unconfirmed:
         logger.warning(
             "HTTP source %s: %d certificate(s) in tls_ca_file could not be matched to what the TLS "
-            "context loaded, for intake_client_subjects; no client certificate is admitted under "
-            "them (BACKLOG #4948)",
+            "context loaded, or were loaded by it and could not be parsed, for "
+            "intake_client_subjects; no client certificate is admitted under them (BACKLOG #4948)",
             name,
             index.unconfirmed,
         )
