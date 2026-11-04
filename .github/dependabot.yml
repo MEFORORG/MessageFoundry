@@ -176,6 +176,10 @@ updates:
       # Why: the comment above the [vault] extra in pyproject.toml.
       - dependency-name: "hvac"
         versions: [">=3.0.0"]
+      # Why: the comment above the [sqlserver] extra in pyproject.toml (BACKLOG #5005). A 0.5.x
+      # patch release still gets a PR; read its private names before moving the pin.
+      - dependency-name: "aioodbc"
+        versions: [">=0.6.0"]
       # Why: the comment above the [harness] extra in pyproject.toml. The TRADE-OFF note's
       # detection premise does NOT hold for this entry: an advisory against Qt names Qt, not
       # `pyside6`, so pip-audit would not red on a Qt fix this range withholds.

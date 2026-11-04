@@ -475,11 +475,13 @@ def _expiry_relaxed_opener(
     *extra_handlers: urllib.request.BaseHandler,
     trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
-    """A no-redirect opener that verifies chain + hostname but tolerates an EXPIRED server cert (#129,
-    ADR 0094). Built per connection (not the shared module-level verifying opener) only when
-    ``tls_allow_expired=true``: it starts from the same verifying default context (OS trust store,
-    ``check_hostname=True``) and relaxes ONLY the validity-period check via
-    :func:`~messagefoundry.config.tls_policy.relax_verify_expiry`. Verification stays ON, so this is the
+    """A no-redirect opener that verifies the chain's signatures + hostname but tolerates an EXPIRED
+    server cert (#129, ADR 0094). Built per connection (not the shared module-level verifying opener)
+    only when ``tls_allow_expired=true``: it starts from the same verifying default context (OS trust
+    store, ``check_hostname=True``) and relaxes the validity-period checks via
+    :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` -- at least the leaf's, the
+    intermediates' and the trust anchor's, and a CRL's own window (vault BACKLOG #5089), not the
+    leaf's alone. Verification stays ON, so this is the
     granular alternative to ``verify_tls=false`` — a MITM-able peer (wrong host / untrusted chain) is
     still rejected. Shared verbatim by the SOAP destination.
 
@@ -488,7 +490,8 @@ def _expiry_relaxed_opener(
     tolerance and anchor narrowing are independent — relaxing the validity window never widens the
     trust store, and vice versa."""
     ctx = build_verifying_client_context(trust_anchor)
-    relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    # The chain's signatures + hostname stay enforced; the validity windows do not (BACKLOG #5089).
+    relax_verify_expiry(ctx, host=host)
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return build_strict_opener(
@@ -2763,8 +2766,9 @@ class RestDestination(DestinationConnector):
             )
         verify = bool_setting(s, "verify_tls", default=True)
         if verify:
-            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
-            # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
+            # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
+            # but tolerate an expired server cert, and at least the other chain certificates' and a CRL's
+            # validity windows (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
             anchor = http_family_trust_anchor(

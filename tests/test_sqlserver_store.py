@@ -38,6 +38,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._claim_lock_helpers import claim_past_empty_yield
 from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
 from tests._keyed_reopen_contract import (
     CONTROL_CELL,
@@ -47,12 +48,14 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
 from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
+from tests._undecryptable_reply_contract import SPOILS as UNDECRYPTABLE_REPLY_SPOILS
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -76,15 +79,9 @@ _ACK_AA = "MSH|^~\\&|C|D|A|B|20260101||ACK^A01|MSG1|P|2.5.1\rMSA|AA|MSG1\r"
 # re-issues past a transient EMPTY-all for the sites that assert a NON-empty outcome; a successful claim
 # never retries, and a genuinely-unclaimable head stays EMPTY-all every pass and still fails after the
 # cap (masks nothing). Sites that assert EMPTY-all itself (a fenced ex-leader) call claim_fifo_heads
-# directly. Mirrors _claim_heads in test_claim_fifo_heads.py (the fix for this same never-block class).
+# directly. tests/_claim_lock_helpers.py holds the loop.
 async def _claim_until(store: Any, *args: Any, **kwargs: Any) -> Any:
-    res = await store.claim_fifo_heads(*args, **kwargs)
-    for _ in range(16):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(0.01)
-        res = await store.claim_fifo_heads(*args, **kwargs)
-    return res
+    return await claim_past_empty_yield(lambda: store.claim_fifo_heads(*args, **kwargs))
 
 
 @pytest.fixture
@@ -4710,7 +4707,7 @@ async def test_attachment_dead_purge_releases_after_body_purge(store) -> None:
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     assert await _a_refcount(store, ref) == 1  # kept: dead row still replayable
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None  # last replayable holder gone → GC
     assert await _a_joins(store, mid) == 0
@@ -4720,7 +4717,9 @@ async def test_attachment_dead_purge_releases_when_run_first(store) -> None:
     ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
     mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1  # dead purge BEFORE body purge
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 1  # dead purge BEFORE body purge
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None  # released here — dead row was the last holder
     assert await _a_joins(store, mid) == 0
@@ -4736,8 +4735,10 @@ async def test_attachment_dead_purge_idempotent_no_underflow(store) -> None:
     m2, _ = await _a_dead_deliver(store, now=20 * DAY, ref=ref, dest="OB_2")
     assert await _a_refcount(store, ref) == 2
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1  # only m1 past cutoff
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # re-run: nothing to blank
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1  # only m1 past cutoff
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 0  # re-run: nothing to blank
 
     assert await _a_refcount(store, ref) == 1  # m1 released once; m2 survives
     assert await _a_chunks(store, ref) == len(_A_CHUNKS)
@@ -5896,7 +5897,7 @@ async def test_over_max_message_bytes_naks_ar_ss(store) -> None:
     assert await _attachment_count(store) == 0
 
 
-async def test_stream_inflight_budget_naks_ae_ss(store) -> None:
+async def test_stream_inflight_budget_naks_ar_ss(store) -> None:
     b64 = _big_b64(2000)
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
@@ -5909,7 +5910,8 @@ async def test_stream_inflight_budget_naks_ae_ss(store) -> None:
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
-    assert _stream_ack_code(ack) == "AE"  # detach refused (backpressure) → NAK AE
+    # The body alone is over the whole budget, so no re-send could fit: final, AR (BACKLOG #5078).
+    assert _stream_ack_code(ack) == "AR"
     row = await _only_message(store)
     assert row["status"] == MessageStatus.ERROR.value
     assert "streaming detach failed" in row["error"]
@@ -6381,7 +6383,7 @@ async def test_queue_tag_contract(store) -> None:
 
 
 def _raw_adapters(s) -> tuple[Any, Any]:
-    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+    """``(raw, fetch)`` for the contracts below, on pooled connections, outside the store."""
 
     async def raw(sql: str, params: tuple[Any, ...]) -> None:
         async with s._pool.acquire() as conn:
@@ -6422,6 +6424,24 @@ async def test_erased_reply_contract(store, case, keyed) -> None:
         await sealed.close()
 
 
+@pytest.mark.parametrize("spoil", UNDECRYPTABLE_REPLY_SPOILS, ids=lambda s: s.__name__)
+async def test_undecryptable_reply_contract(store, spoil) -> None:
+    """BACKLOG #4995: a reply body that does not decrypt is dead-lettered with its reference kept and
+    the loopback lane moves, the same contract the SQLite suite runs, on a keyed handle."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests import _undecryptable_reply_contract as contract
+
+    raw, fetch = _raw_adapters(store)
+    sealed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await contract.assert_lane_moves_past_an_undecryptable_reply(sealed, fetch, raw, spoil)
+    finally:
+        await sealed.close()
+
+
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
 async def test_keyless_blank_contract(store, case) -> None:
     """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
@@ -6431,9 +6451,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> SqlServerStore:
+    async def open_keyed(**kw: Any) -> SqlServerStore:
         return await SqlServerStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)

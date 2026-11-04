@@ -276,6 +276,12 @@ def validate(
     that is reported as an error (a feed sending the wrong version is a misconfiguration
     a strict channel should reject). ``max_bytes`` / ``max_segments`` reject an oversized
     message before the (slow) strict parse.
+
+    Every engine caller leaves ``max_bytes`` at the engine default, deliberately, so it does NOT
+    follow an inbound's ``max_message_bytes`` (BACKLOG #5078). That setting admits a larger body
+    to the tolerant parse, and this function then refuses one over 16 MiB as ``oversize``: this is
+    the whole-body ``hl7apy`` parse the cap exists to bound, and it runs on a worker thread the
+    listener's timeout cannot stop. ``docs/HL7-VALIDATION.md`` says so for operators.
     """
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import ChildNotFound, HL7apyException

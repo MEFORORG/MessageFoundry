@@ -381,9 +381,10 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_key_file` | both | — | private key for `tls_cert_file`. |
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
 | `tls_ca_pin` | both | - | the SHA-256 of `tls_ca_file`; the syntax is *Trust-anchor pin syntax* in [CONFIGURATION.md](CONFIGURATION.md#api). Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. An outbound connection's CA takes the same checks at start and at every reload, under `outbound:<connection name>`, and there a matching pin is no escape: see [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) (vault BACKLOG #2371). It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
+| `tls_client_subjects` | in | - (off) | the senders this listener expects (BACKLOG #4907): a table whose keys are issuing-CA DNs and whose values are lists of **qualified** names, `"SAN:DNS:feed.partner.example"` / `"CN:feed.partner.example"`. `tls_ca_file` alone admits any certificate its CAs ever signed; with this set, a verified certificate with no listed name under the loaded CA that signed it is refused. Needs `tls` and `tls_ca_file`. Unset, the listener behaves as it did without it. [Expected senders](#expected-senders-tls_client_subjects) below says which names count, how they match, and what a refused sender gets. |
 | `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and the MLLP verify-off refusal does not read [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested) either. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). `false` keeps the chain check and accepts any certificate from the trust anchor, whatever host it names. It is a [reported loosening](SECURITY-LOOSENING.md): a WARNING at each build, a `tls-check-hostname` line in `messagefoundry check`, and a `security_loosenings()` entry (ASVS 12.3.2). |
-| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain and key usage, and the hostname too unless `tls_check_hostname = false` — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on a verifying hop with no revocation gate nothing else would catch that certificate either (CORRECTED 2026-10-28: this named DICOM-SCU and FTPS as such hops; BACKLOG #2193 has since gated both). It takes one lever away from the revocation gate: on every connector this row names as taking it, a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). **No posture gate covers this setting itself.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it. It **is reported**, by the WARNING logged at each connector build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture`; the serve-time loosening warning fires before the graph loads and cannot name it. CORRECTED 2026-10-01: this row said it was absent from `security_loosenings()` and from `check`, which stopped being true under BACKLOG #333. Nothing expires a "two-week bridge" set when a partner's cert lapses, so record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and on the `Ftp(tls=True)` inbound poller, which dials out through the same FTPS context (CORRECTED 2026-10-01: this said "six outbound connectors only"), and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
+| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain's signatures and key usage, and the hostname too unless `tls_check_hostname = false`. It is not the leaf's validity period alone: at least the validity periods of the intermediates and the trust anchor, and a CRL's own validity window, go unchecked too (CORRECTED 2026-11-03: this said the chain was still validated, unqualified). It is the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on a verifying hop with no revocation gate nothing else would catch that certificate either (CORRECTED 2026-10-28: this named DICOM-SCU and FTPS as such hops; BACKLOG #2193 has since gated both). It takes one lever away from the revocation gate: on every connector this row names as taking it, a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). **No posture gate covers this setting itself.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it. It **is reported**, by the WARNING logged at each connector build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture`; the serve-time loosening warning fires before the graph loads and cannot name it. CORRECTED 2026-10-01: this row said it was absent from `security_loosenings()` and from `check`, which stopped being true under BACKLOG #333. Nothing expires a "two-week bridge" set when a partner's cert lapses, so record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and on the `Ftp(tls=True)` inbound poller, which dials out through the same FTPS context (CORRECTED 2026-10-01: this said "six outbound connectors only"), and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
 | `encoding_characters` | out | (off) | **(Corepoint `-override` parity)** re-encode each outgoing message with a different set of HL7 delimiters (the 5 MSH chars in MSH order: MSH-1 + the 4 MSH-2 chars, e.g. `"#@*!%"`) before framing. Validated at build (exactly 5, all distinct). Unset = payload **byte-identical**. A non-HL7 payload, or a value the new delimiters cannot carry as data, fails the delivery permanently (code `reencode`, [ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md)) and is dead-lettered at once. On a batched outbound the whole batch goes with it; ADR 0206 records that gap. |
 | `hl7_raw_separators` | out | `false` | **(BACKLOG #107) escape-hatch for a partner that cannot decode HL7 escapes:** emit the four reserved **structural** separators as RAW bytes (`\F\ \S\ \R\ \T\` become the message's own field/component/repetition/subcomponent char) instead of their escape sequences. Reserved chars are read from the payload's own MSH; re-serialized via the parsed model, never string-slicing. `false` (default) = payload **byte-identical**. Enabling it can produce **non-conformant** output (a formerly-escaped `^` now reads as a component separator); that is the point; use only for such a broken partner. Composes after `encoding_characters` (delimiter rewrite first, then raw-separator emit). A non-HL7 payload fails the delivery permanently (code `reencode`, ADR 0206) and is dead-lettered at once; on a batched outbound, see ADR 0206. **HL7v2/MLLP outbound only.** |
 | `verify_ack_control_id` | out | `false` | **(BACKLOG #82)** tighten the *accept* decision: accept a **positive** ACK (MSA-1 AA/CA) only if its MSA-2 (message control id) echoes the sent message's MSH-10 — a reply carrying a different id is a correlation failure (retryable `DeliveryError` → retried per the at-least-once path). Both ids are read **separator-aware** from the message (never hardcoded `\|^~\&`). If the sent MSH-10 is absent/unreadable there is nothing to correlate, so the check is skipped and the message delivers as before. Does not alter a **negative** ACK's handling. `false` (default) = **byte-identical** (no correlation). |
@@ -408,6 +409,142 @@ simulated lane shows as `simulated` on `GET /connections` and `[SIMULATED]` in t
 > gates. Loopback test rigs
 > may stay plaintext. On the **outbound** side, `tls=true` is subject to the revocation gate described at
 > the top of this section.
+
+#### Expected senders (`tls_client_subjects`)
+
+An MLLP listener with `tls_ca_file` verifies each client certificate's chain, and nothing more: any
+certificate its CAs ever signed is admitted as any sender. `tls_client_subjects` binds each expected
+sender to a name under the CA that issued it (BACKLOG #4907, the first slice of the expected-sender
+assertion). It takes the same table as the HTTP listener's `intake_client_subjects`, and the same
+matcher reads both:
+
+```toml
+[[inbound]]
+name = "IB_ACME_ADT"
+transport = "mllp"
+router = "acme_router"
+  [inbound.settings]
+  port = 2575
+  tls = true
+  tls_cert_file = "C:/certs/engine.pem"
+  tls_key_file = "C:/certs/engine.key"
+  tls_ca_file = "C:/certs/acme-ca.pem"
+  [inbound.settings.tls_client_subjects]
+  'CN=Acme Partner CA,O=Acme' = ["SAN:DNS:adt-feed.acme.example"]
+```
+
+In code: `MLLP(port=2575, tls=True, ..., tls_client_subjects={"CN=Acme Partner CA,O=Acme":
+["SAN:DNS:adt-feed.acme.example"]})`.
+
+**Which certificate field counts.** The operator names it, in the entry. `SAN:<type>:<value>`
+matches a subjectAltName entry of that type, such as `SAN:DNS:...` or `SAN:URI:...`, and `CN:<value>`
+matches a commonName in the subject. Prefer a SAN entry where the partner's certificate carries one;
+`CN:` is the defined fallback for a certificate that carries none. The two never stand in for each
+other: a `CN:` entry does not match a SAN with the same text, so a commonName cannot pass as a pinned
+SAN. The rest of the subject DN is not read, so an entry cannot name an `O=` or `OU=`. A name in any
+other form is refused at build, since it could never match. So is a SAN type spelled other than as
+Python's `ssl` spells it: `DNS`, `email`, `URI`, `IP Address`, `Registered ID`, `DirName` and
+`othername`, so `SAN:IP:...` and `SAN:dns:...` are refused with the right spelling named. An
+`IP Address` value is written as `ssl` writes it: IPv4 dotted, and IPv6 as eight upper-case hex
+groups with no leading zeros and no `::`, such as `2001:DB8:0:0:0:0:0:1`. A `DirName` value is the
+Python tuple `ssl` reports, such as `((('commonName', 'feed.example'),),)`, and an `othername` value
+carries its form first, such as `UPN:feed@partner.example`; either in another form is refused.
+
+**A placeholder is not a name.** For a SAN it cannot render, `ssl` reports fixed text instead:
+at least `othername:<unsupported>` for an otherName of a type OpenSSL does not print,
+`X400Name:<unsupported>` and `EdiPartyName:<unsupported>` whatever those names hold,
+`IP Address:<invalid>` for a malformed address, and, by CPython's source, `Registered ID:<INVALID>`
+in upper case. A placeholder is recognized in any case. Every certificate carrying such a name
+presents the same text, so one such entry would admit all of them under that CA. The same holds
+for a name `ssl` may have cut short: it reads an `othername` or `Registered ID` as one printed line
+of at most 2046 bytes, stopping after a newline, so such a value can be the first part of many
+names. An entry
+holding either is refused at build, and the matcher never reads either from a certificate, so it
+matches nothing even on a listener built some other way. That matcher is shared, so the operator
+API's `tls_client_cert_identities` and the HTTP listener's `intake_client_subjects` skip a
+placeholder too; neither of those settings refuses one at build.
+
+**An `othername` holding a NUL is never matched.** `ssl` reports an otherName as the text OpenSSL
+prints for it, and that text stops at the value's first NUL byte: a UPN
+`victim@partner.example<NUL>evil` is reported as `UPN:victim@partner.example`, which is the whole of
+a different name. So the listener reads the certificate's own DER after the handshake, and when any
+otherName value in it holds a zero byte, or cannot be read, none of that certificate's `othername`
+names is matched; its other names still are. A zero byte inside a value `ssl` reports only as
+`<unsupported>` counts too, which can only refuse. A `tls_client_subjects` entry holding a NUL is
+refused at build. The operator API and the HTTP listener read the DER the same way for the shared
+matcher (BACKLOG #4907), so neither matches such an `othername` either.
+
+**How it matches.** Exactly, character for character, as Python's `ssl` module reports the name: no
+case folding, no wildcards, no prefix or suffix match. A DNS name in a different case does not match,
+so write the name as the certificate carries it. A certificate is admitted when any one of its names
+is listed.
+
+**Bound to the issuing CA.** Each key is the DN of a CA loaded from `tls_ca_file`, written as
+`cryptography`'s `Name.rfc4514_string()` renders that CA's subject. A name counts only under the
+loaded CA whose key signed the leaf, found by signature and never by the leaf's issuer field alone,
+so a second CA in `tls_ca_file` that issues a listed name is refused. A leaf signed by an
+intermediate the client sends counts only when that intermediate is itself loaded in `tls_ca_file`.
+At start the listener warns about a key naming no loaded CA, or naming two with one subject and
+different keys; no sender is admitted under such a key. The HTTP listener's `intake_client_subjects`
+row above says the same, at more length.
+
+**What a refused sender gets.** The connection completes its TLS handshake, then the listener reads
+from the sender and hands each message that read completed to the engine's refusal, which records
+it as an `ERROR` row before any reply is built. So each message read is counted and logged, never
+accepted and dropped.
+
+- On an HL7 v2 inbound with acknowledgements on, the sender then gets an `AR` (`CR` in enhanced
+  mode) whose MSA-3 reads `sender not permitted`, and the connection closes. `AR`, not `AE`, because
+  the same sender is refused the same way on every resend.
+- On an inbound that is not HL7 v2, or whose `ack_mode` is `none`, there is no HL7 reply to give.
+  The message is recorded the same way, then the connection closes with nothing written; the close
+  is that feed's refusal.
+- If the `ERROR` row cannot be written, no `AR` is sent. On an inbound that replies in HL7 the
+  sender gets the listener's `AE`, the one any inbound-handler fault gets, so it resends. On any
+  other inbound nothing is sent and the connection closes; that message is then recorded only by a
+  `handler_error` connection event and an ERROR log line, not as a row, which is the gap the
+  `SourceConnector` docstring names for a sender that waits for no reply.
+
+The connection closes after the first read that completes a message, which can include a message
+begun in earlier reads, up to `max_frame_bytes`, because the certificate cannot change within the
+session, and the listener refuses a TLS renegotiation, so a TLS 1.2 client cannot present another
+certificate after the check; anything the sender has not yet had read stays with it.
+
+**Held to the HTTP listener's posture.** The refusal is the decision the HTTP listener's
+`intake_auth = "mtls_subject"` makes, and it is charged, audited and evented the same way:
+
+- Each refusal writes an `audit_log` row `intake.auth_subject_denied` and an `auth_subject_denied`
+  connection event, as the HTTP listener does. The row's detail is `mode=tls_client_subjects`; the
+  row and the event name the connection and peer address, never a certificate field.
+- Each refusal is charged one failed attempt against the peer's address, under the HTTP listener's
+  failed-attempt budget at the `Http()` defaults: 10 per address per minute, and 60 per minute
+  across all addresses. This listener has no setting to change or turn off those figures. An
+  address that has spent its own budget is closed unread once its handshake completes, before its
+  certificate is compared, whatever certificate it now presents, as the HTTP listener answers it
+  `429`; a listed sender behind that address is closed too while its budget is spent. The
+  60-per-minute arm is read only once the compare has refused a sender, since it bounds refusals
+  and a listed sender makes none: an unlisted sender is closed unread while that arm is spent, and
+  a listed sender is never closed by it, however many refusals other addresses have made. A close
+  on either arm is written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited`
+  connection event, and leaves no message row, since nothing was read. The count is in process,
+  so each engine shard keeps its own.
+- What each arm bounds is refusals: the per-address arm those from one address, the global arm
+  those from every address, and with each refusal its `ERROR` rows, its
+  `intake.auth_subject_denied` row and its event. Neither arm bounds the closes on a spent budget.
+  Each such close still writes its `intake.auth_rate_limited` row and its event, and only its
+  WARNING line is throttled, so a peer that keeps reconnecting on a spent budget would drive one
+  audit write per completed handshake.
+
+The stored reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate
+field, since a subject can name a person; the log line gives the connection name and peer address,
+at most once per address per minute, with a running count. The body is stored under the inbound's
+refused-body allowance, like every other refusal. A refused connection gets no `established` /
+`closed` pair; an event for another cause on that connection, such as `frame_oversize` or
+`handler_error`, is still written as on any connection.
+
+**What this does not cover yet.** The other listeners, and any further per-inbound form of the
+expected-sender assertion, are still open on BACKLOG #4907. The HTTP listener's own allowlist is
+`intake_client_subjects`.
 
 **Operability (optional, validated at wiring time — caught in dry-run / `messagefoundry check`):**
 `metadata` — a free-form table of operator labels (owner / runbook / environment) on **either**
@@ -740,19 +877,27 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 `{"error": "message was not accepted", "refused_message_id": "<id>"}`. The status says whether to re-send:
 
 - **`503`** with `Retry-After` when the refusal is temporary: the engine's own, not the body's.
-  At least two refusals are classed so: the streaming detach's in-flight budget, while other
-  detaches hold it, and an inbound `encoding` naming no text codec, which refuses every body until
-  an operator fixes the name (BACKLOG #2431), so a sender re-sending every few seconds meanwhile
-  leaves one `ERROR` row per attempt. Re-send the same body later. A body larger than that whole
-  budget is over-size instead.
+  At least three refusals are classed so: the streaming detach's in-flight budget, while other
+  detaches hold it; a strict-validation timeout that fired before any worker thread began the
+  validate, so nothing is known of the body (BACKLOG #5078); and an inbound `encoding` naming no
+  text codec, which refuses every body until an operator fixes the name (BACKLOG #2431), so a
+  sender re-sending every few seconds meanwhile leaves one `ERROR` row per attempt. Re-send the
+  same body later. A body larger than the whole in-flight budget is over-size instead.
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
-  with `max_message_bytes`.
+  with `max_message_bytes`. Strict validation keeps its own 16 MiB cap, which does NOT follow
+  `max_message_bytes`, so a strict inbound that raises it answers `413` for a body between 16 MiB
+  and its limit unless the body is at or over `stream_threshold_bytes`
+  ([HL7-VALIDATION.md](HL7-VALIDATION.md) says why).
 - **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
   body the engine cannot decode in a usable charset, one that does not match the declared `content_type`, or an HL7 parse
-  or strict-validation failure. A strict-validation timeout is one too, deliberately: even one caused
-  by load answers `422` and is final. BACKLOG #2105's filing listed that timeout as temporary; it is
-  reclassified as permanent.
+  or strict-validation failure. A strict-validation timeout whose validate had begun is one too,
+  deliberately, even where load slowed it: it answers `422` and is final (owner ruling of
+  2026-11-03, decision log d20261104T032854299-7235a9, stamped in UTC).
+  Only a timeout that never
+  began is told apart as temporary, above; the
+  [ADR 0154 amendment of 2026-11-03](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
+  says what was measured and what it does not cover.
 
 The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
 `422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in
@@ -1378,7 +1523,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS **poll** carries the same gate, with the inbound's own `tls_revocation_attested` pair as its attestation. With `tls_allow_expired` set, a CRL cannot admit either direction; off-box on an enforcing instance only the attestation crosses |
-| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` on an anonymous login (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers the setting itself**, but it takes the CRL lever away from the revocation gate, as below (ADR 0173 §13). It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. Both FTPS directions have a revocation gate since BACKLOG #2193 (CORRECTED 2026-10-28: this said the poll had none). With this setting on, a CRL does not admit either direction, because the relaxation skips the CRL's validity window too: off-box on an enforcing instance the hop is refused unless the connection attests revocation, and a hop that crosses still accepts an expired *and* revoked partner certificate that no CRL lists: with no `[tls].crl_file` nothing is listed, and a CA may drop an expired certificate from its CRL. A CRL that does reach the hop still refuses a leaf certificate it lists, even past its `nextUpdate`; do not attest on its strength. Put the connection name and a removal date in your own risk register |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain's signatures (not the other chain certificates' validity periods, as the MLLP row says), and the hostname too unless a hand-built spec sets `tls_check_hostname = false` on an anonymous login (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers the setting itself**, but it takes the CRL lever away from the revocation gate, as below (ADR 0173 §13). It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. Both FTPS directions have a revocation gate since BACKLOG #2193 (CORRECTED 2026-10-28: this said the poll had none). With this setting on, a CRL does not admit either direction, because the relaxation skips the CRL's validity window too: off-box on an enforcing instance the hop is refused unless the connection attests revocation, and a hop that crosses still accepts an expired *and* revoked partner certificate that no CRL lists: with no `[tls].crl_file` nothing is listed, and a CA may drop an expired certificate from its CRL. A CRL that does reach the hop still refuses a leaf certificate it lists, even past its `nextUpdate`; do not attest on its strength. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
@@ -1570,7 +1715,7 @@ one.
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential, or a static header outside a short allowlist: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
-| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while the chain's signatures + hostname stay verified (not the other chain certificates' validity periods or a CRL's own window; see the MLLP row) — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `encoding` | `utf-8` | request-body charset |
@@ -1725,8 +1870,8 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 - **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
   **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
   service-container job.
-- **`dialect="generic"`** — a **generic ODBC path** for another ODBC-reachable database (PostgreSQL,
-  MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
+- **`dialect="generic"`** — a **generic ODBC path** for a database whose ODBC driver reads `SERVER`
+  as its target (PostgreSQL, MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
   and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
 
 **Host precondition for the SQL Server ODBC hops** (at least this connector, `DatabasePoll(...)`,
@@ -1797,7 +1942,9 @@ outbound(
 
 #### Generic ODBC (PostgreSQL / MySQL)
 
-`dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
+`dialect="generic"` (#66) targets **a database whose ODBC driver reads `SERVER` as its target**
+(see [*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords), which says what the
+engine reports for a driver it cannot place) without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
 `odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
@@ -1934,10 +2081,23 @@ When the connection is built, the engine refuses a value that starts with two se
 with a device prefix, such as a share spelling. That part is enforced on every platform. On
 Windows the engine also runs a best-effort check of the path, and refuses the value when that
 check finds the path leads to another host, or cannot finish reading the trimmed path. Both
-refusals apply in every SSL mode. The check is defence in depth, not a guarantee. It misses at
-least: links to some object paths; paths that change after the build; the contents of an
-`SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The check does not change the
-value sent to the driver.
+refusals apply in every SSL mode. At least these count as paths the check cannot finish (vault
+BACKLOG #5197): a link whose target is rooted with no drive (`\RPC Control\...`, `/Device/...`);
+a drive-relative spelling (`C:ca.pem`, `D:link\ca.pem`); a name in the path that ends in a space
+or a dot; a link whose target starts with a device prefix written with forward slashes
+(`//?/S:/ca.pem`); a stream name after a link; and a `subst` drive whose target cannot be read.
+The check reads the path one name at a time, so a name ending in a space or a dot, or a stream
+name, counts only when every folder before it exists; a path that ends at a missing folder first
+is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
+another host.
+When the check cannot finish, a WARNING names the kind of cause, never the path; the path is
+logged at DEBUG only. The value is judged as the text the build sends, so `0` is checked as the
+path `0`. The check is defence in depth, not a guarantee. It misses at least: links to some
+object paths; paths that change after the build; the contents of an `SSLCAPATH` folder; and, on
+POSIX, anything beyond the spelling. The owner, 2026-11-03, accepted two of these as recorded
+limits: a path that changes after a check, which also leaves the anchor check below a swap
+window, and the contents of an `SSLCAPATH` folder, which that anchor check does not read either.
+The check does not change the value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -1969,7 +2129,10 @@ anchor. There is no pin for this file. A missing file or a directory is left to 
 too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
-for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all.
+for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all. The swap window and
+the `SSLCAPATH` contents are the recorded limits the paragraph on file keywords above names. A
+padded or boolean `SSLCA` value is refused here too, as the build refuses it, before either
+spelling is read.
 
 An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key
@@ -2002,9 +2165,25 @@ these kinds:
 
 Two limits follow from this:
 
-- **A driver may take its target under another keyword, and the engine does not detect that.** The
-  engine sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
-  target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
+- **A driver may take its target under another keyword.** The engine sends the target as `SERVER`
+  and nothing else, and at least `[egress].allowed_db` and the cleartext-hop guard's on-box test
+  read the host in `server`. A driver that takes its target from another keyword dials a host
+  neither judged, so neither binds that hop: a `server` of `127.0.0.1` passes the on-box test
+  while such a driver dials elsewhere. Oracle's ODBC driver documents `DBQ` for its target, and
+  `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
+  a driver reads. It places three families documented to read `SERVER`, by the registered names
+  [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
+  Microsoft's `ODBC Driver <n> for SQL Server`. In the 2026-10-30 probes under BACKLOG #2705,
+  psqlODBC 18.00.0005 connected, and MySQL Connector/ODBC was run, through engine-built strings
+  that name the host only in `SERVER`, which is consistent with that. No run was designed to test
+  whether `SERVER` is read, and Microsoft's driver was not run. A placed family is the
+  documentation's claim, not proof that either check binds the address the driver dials. For
+  any other `odbc_driver` name, building the connection logs a WARNING naming the connection,
+  not the driver, and `messagefoundry check`'s advisory `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
+  the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, or
+  reach that database another way than the generic dialect. For SQL Server that is
+  `dialect="sqlserver"` with Microsoft's driver, since on the generic dialect Microsoft's driver
+  ignores `PORT`.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
@@ -2198,7 +2377,7 @@ in-process layers are defence in depth and neither is authority:
 
 | Layer | What it does | What it cannot do |
 |---|---|---|
-| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword or an ODBC `{call ...}` escape outside a literal or comment, or that chains a second statement. A keyword glued to a following `#` or `@` (`INTO#x`) is still a keyword to it, and a `--` comment holding a line break other than LF, or a NUL, before its LF is refused. It also refuses a number with a letter or one of `_$#@` glued to its end, because SQL Server reads a write such as `1e1INTO copy` or `0xUPDATE` as a number then a keyword | it reads text. A write executed on a linked server through a pass-through literal is opaque to it. It fails closed on some valid reads, at least a word glued to a number, a name or a keyword (`#1tmp`, `@1x`, `:1st`, `x=1AND y=2`, `TOP 10PERCENT`, MySQL `2024_orders`, Oracle `1.5f`), a name such as `update#n` or `t#1x`, a `--` comment in a statement with CR-only line endings, and a scalar `INSERT(...)` or `TRUNCATE(...)` call, an ODBC `{fn TRUNCATE(...)}` escape included |
+| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword or an ODBC `{call ...}` escape outside a literal or comment, or that chains a second statement after a `;`. A keyword glued to a following `#` or `@` (`INTO#x`) is still a keyword to it, and a `--` comment holding a line break other than LF, or a NUL, before its LF is refused. It also refuses a number with a letter or one of `_$#@` glued to its end, because SQL Server reads a write such as `1e1INTO copy` or `0xUPDATE` as a number then a keyword | it reads text. A write executed on a linked server through a pass-through literal is opaque to it, and it passes at least a `SELECT` calling a function that writes, and a T-SQL second statement with no `;` whose verb it does not list. It fails closed on some valid reads, at least a word glued to a number, a name or a keyword (`#1tmp`, `@1x`, `:1st`, `x=1AND y=2`, `TOP 10PERCENT`, MySQL `2024_orders`, Oracle `1.5f`), a name such as `update#n` or `t#1x`, a `--` comment in a statement with CR-only line endings, a scalar `INSERT(...)` or `TRUNCATE(...)` call, an ODBC `{fn TRUNCATE(...)}` escape included, and an unquoted name spelled like a refused keyword (at least a column `receive`; quote it the way the database quotes a name) |
 | `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | read at least by an Always On availability group, where read-only routing sends it to a **readable secondary** and a primary set to `ALLOW_CONNECTIONS = READ_WRITE` refuses it, and by Azure SQL read scale-out, which sends it to a read-only replica; where nothing reads it, it changes nothing |
 
 Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
@@ -2242,6 +2421,7 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
 - **The statement gate.** The `statement` goes through the same `_require_read_only` test as a
   `db_lookup` statement: it must open with `SELECT` or `WITH`, carry no write, `EXEC` or DDL keyword
   or ODBC `{call ...}` escape outside a literal or comment, wherever it sits, and chain no second statement.
+  An unquoted column named `receive` is refused with them; quote it as `[receive]`.
   **A stored procedure is therefore refused**; read the procedure's tables or a view with a `SELECT` instead. A literal statement is
   tested when the `DatabaseRef(...)` is declared, so loading the config fails on every path (`serve`,
   `messagefoundry check`, dry-run, reload). An `env()` statement is tested by the build check once
@@ -2415,7 +2595,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 |---------|---------|---------|
 | `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
 | `database` | — (required) | database name |
-| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the read-only test for the poll's dialect is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused, a write keyword or `EXEC` glued to a following `#` or `@` (`INTO#x`) and a `{CALL ...}` escape after the `SELECT`, or in the ODBC `--(*vendor(...),product(ODBC) call ... *)--` form, included (BACKLOG #5259). A `--` comment that holds a line break other than LF, or a NUL, before its LF, such as a lone CR, is refused on every dialect, because lexers disagree about where it ends. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too, and so is a word glued to a number (see *Give `db_lookup` a read-only login* for the list), a name such as `update#n` whose part before an internal `#` or `@` is a write keyword, and a `--` comment in a statement with CR-only line endings. Only on `dialect='generic'` is MySQL's scalar `INSERT(...)` or `TRUNCATE(...)` admitted, and only with the `(` as the very next character (`TRUNCATE (1.2, 2)`, valid MySQL, is refused); the `db_lookup` test, always on the SQL Server preset, refuses it. While `dialect` is an `env()` value, the declaration tests the poll as `generic` and the build tests it again with the resolved dialect, so the declaration can refuse a read that the resolved `sqlserver` dialect would admit, at least a `--` comment with no space after the dashes that holds a write keyword. On every dialect but `sqlserver` the test scans the statement twice and refuses it if either scan does: once with the T-SQL comment model, which PostgreSQL shares, and once with MySQL's, where `#` starts a comment, `--` starts one only when whitespace follows, block comments do not nest, and a `/*! ... */` or `/*M! ... */` comment is refused, because a server may run its body or read it as a plain comment. It also refuses a bare `CALL` there. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, a `#` comment containing a write keyword, a `--` comment with no space after the dashes or with a non-ASCII character right after them, any `/*!` or `/*M!` comment (`/*!40001 SQL_NO_CACHE */` included), a nested block comment's tail holding a write keyword or a lone quote, a column named `call`, and a T-SQL `#temp` name whose line ends inside a multi-line literal) and can miss at least a write hidden in a MySQL backslash escape, a PostgreSQL `E'...'` escape or a PostgreSQL dollar quote, or behind a line comment that a lexer ends at a character the test does not know. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the read-only test for the poll's dialect is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused, a write keyword or `EXEC` glued to a following `#` or `@` (`INTO#x`) and a `{CALL ...}` escape after the `SELECT`, or in the ODBC `--(*vendor(...),product(ODBC) call ... *)--` form, included (BACKLOG #5259). A `--` comment that holds a line break other than LF, or a NUL, before its LF, such as a lone CR, is refused on every dialect, because lexers disagree about where it ends. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too, and so is a word glued to a number (see *Give `db_lookup` a read-only login* for the list), a name such as `update#n` whose part before an internal `#` or `@` is a write keyword, a `--` comment in a statement with CR-only line endings, and an unquoted column named `receive` (quote it the way the database quotes a name). Only on `dialect='generic'` is MySQL's scalar `INSERT(...)` or `TRUNCATE(...)` admitted, and only with the `(` as the very next character (`TRUNCATE (1.2, 2)`, valid MySQL, is refused); the `db_lookup` test, always on the SQL Server preset, refuses it. While `dialect` is an `env()` value, the declaration tests the poll as `generic` and the build tests it again with the resolved dialect, so the declaration can refuse a read that the resolved `sqlserver` dialect would admit, at least a `--` comment with no space after the dashes that holds a write keyword. On every dialect but `sqlserver` the test scans the statement twice and refuses it if either scan does: once with the T-SQL comment model, which PostgreSQL shares, and once with MySQL's, where `#` starts a comment, `--` starts one only when whitespace follows, block comments do not nest, and a `/*! ... */` or `/*M! ... */` comment is refused, because a server may run its body or read it as a plain comment. It also refuses a bare `CALL` there. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, a `#` comment containing a write keyword, a `--` comment with no space after the dashes or with a non-ASCII character right after them, any `/*!` or `/*M!` comment (`/*!40001 SQL_NO_CACHE */` included), a nested block comment's tail holding a write keyword or a lone quote, a column named `call` or an unquoted column named `begin`, and a T-SQL `#temp` name whose line ends inside a multi-line literal) and can miss at least a write hidden in a MySQL backslash escape, a PostgreSQL `E'...'` escape or a PostgreSQL dollar quote, or behind a line comment that a lexer ends at a character the test does not know. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
@@ -2424,12 +2604,19 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls an OS-installed ODBC driver (PostgreSQL / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
 
-**Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
-`SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
-id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
-just runs whatever statement you declare, bound from the row. A high-water mark can still pass a row
-that was never handed off, in at least the cases *Reliability* below names. Where that matters, mark
-with a status column or a delete-from-queue.
+**Mark mechanism — your choice via `mark_statement`.** You can mark with a **status column** (lead
+pattern: `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue**
+(`DELETE … WHERE id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor); the
+connector just runs whatever statement you declare, bound from the row. They are not equally safe. A
+high-water mark can leave a row that was never handed off behind its cursor, even with the poll's
+stop at a failed row (BACKLOG #4921). It does at least in the cases *Reliability* below names, and in
+two more with no handler failure at all. Over a cursor column with ties and a `>` predicate, a row
+not yet handed off that shares its cursor value with a row already marked is never selected, such as
+one that falls just past the `poll_max_rows` cut. And a row that commits after a row with a higher cursor value was
+already polled and marked is never selected either, as concurrent inserts into an identity or
+sequence column can do. The engine never reads a row lost those two ways, so nothing records it.
+Unless the feed can afford such a loss, mark with a status column or a delete-from-queue whose
+`WHERE` matches only the row handed off, by a unique key.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
@@ -2437,7 +2624,8 @@ pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefl
 **unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
 `poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
 `mark_statement` over a `poll_statement` that does not return rows in cursor order, or over a
-cursor column that is not unique (below).
+cursor column that is not unique (below). A high-water mark loses a row in further cases, in cursor
+order too; *Mark mechanism* above names them.
 **With a `mark_statement`, a handler failure also stops the
 poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
 next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on: no
@@ -2517,7 +2705,7 @@ follow-on and is **not** built.
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
-| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `encoding` | `utf-8` | envelope charset |
@@ -2858,7 +3046,7 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
-| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA; `FhirLookup()` takes it too. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `encoding` | `utf-8` | body charset |
@@ -3198,7 +3386,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `presentation_contexts` | `None` → SR + common image storage + Verification | the SOP classes the SCP negotiates (transfer syntaxes default to the standard set) |
 | `calling_ae_allowlist` | `None` → any (subject to the IP gate) | only these calling AE titles may associate (fail-closed when set) |
 | `require_called_ae_title` | `True` | a peer must address this engine's `ae_title` as the called AE |
-| `max_object_bytes` | `134217728` (128 MiB), **but the SCP never honours more than the engine's 16 MiB binary ingress ceiling** | reject a single C-STORE object larger than this (OOM/DoS guard). **The SCP's effective cap is the smaller of this value and 16 MiB**, because the engine records any larger object as `ERROR` and never processes it, and an SCP that accepted one would tell the sender Success for an object the engine dropped (BACKLOG #1910). So the shipped default resolves to 16 MiB on the SCP, and a larger value cannot raise it. When the SCP clamps a value you set, for example 64 MiB or `0`, it logs a `WARNING` at build naming the value, the ceiling and the inflate bound (BACKLOG #1962). It stays silent on 128 MiB, since the shipped default cannot be told from an explicit setting. It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It **also** bounds the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. The inflate bound is never above 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). `0`/`None` does not remove the check on the SCP: it resolves to the same 16 MiB ceiling, and a negative value is refused at build. An over-cap object is refused before any commit, so nothing is recorded for it. The SCP does not answer Success for an object that the engine's ingress, or the codec's inflate ceiling, would then refuse. An object past **twice** the effective cap gets no status: the SCP aborts the association as the object arrives, so it never holds more than that of one object (owner ruling B462-R3). The C-STORE status each refusal answers, and whether a sender should re-send, is stated once in [`DICOM.md`](DICOM.md) section 3 |
+| `max_object_bytes` | `134217728` (128 MiB), **but the SCP never honours more than the engine's 16 MiB binary ingress ceiling** | reject a single C-STORE object larger than this (OOM/DoS guard). **The SCP's effective cap is the smaller of this value and 16 MiB**, because the engine records any larger object as `ERROR` and never processes it, and an SCP that accepted one would tell the sender Success for an object the engine dropped (BACKLOG #1910). So the shipped default resolves to 16 MiB on the SCP, and a larger value cannot raise it. When the SCP clamps a value you set, for example 64 MiB or `0`, it logs a `WARNING` at build naming the value, the ceiling and the inflate bound (BACKLOG #1962). It stays silent on 128 MiB, the shipped default, whether that value was set explicitly or left unset. It is charged **twice**: first against the **raw received Data Set**, before `pydicom` decodes it, so an over-cap object is refused without ever being decoded or re-encoded; then against the re-encoded Part-10 bytes, which the raw length cannot see (the preamble, `DICM` and file meta are added there). Both charges land **before** the durable commit. It **also** bounds the pre-decode **inflate** of a *Deflated Explicit VR LE* object, whose compressed raw length says nothing about how far it inflates: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. The inflate bound is never above 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). `0`/`None` does not remove the check on the SCP: it resolves to the same 16 MiB ceiling, and a negative value is refused at build. An over-cap object is refused before any commit, so nothing is recorded for it. The SCP does not answer Success for an object that the engine's ingress, or the codec's inflate ceiling, would then refuse. An object past **twice** the effective cap gets no status: the SCP aborts the association as the object arrives, so it never holds more than that of one object (owner ruling B462-R3). The C-STORE status each refusal answers, and whether a sender should re-send, is stated once in [`DICOM.md`](DICOM.md) section 3 |
 | `max_associations` | `10` | cap on concurrent inbound associations. Connections with no association yet have their own fixed caps ([DICOM.md](DICOM.md) section 3) |
 | `max_associations_per_second` | **off** | sustained rate at which this SCP **accepts new associations** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). Over budget the SCP **waits before reading the association request**, so the peer is back-pressured by TCP and then served in full — **the wait itself drops, refuses and answers nothing differently**, and a rejected association charges nothing. **The unit is an association, not a message,** and that is a property of DIMSE: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object is already read and decoded, and pacing there would delay a message the count-and-log invariant has already obliged us to account for. **So an established association is NOT bounded in the objects it may push** — `max_object_bytes` and `timeout_seconds` bound those instead. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule, exactly as on the listen intakes: a guessed rate throttles a real modality, so the number has to come from your own feed profile. **Choose a rate that keeps few peers waiting.** A waiting peer has no association yet, so it holds one of the fixed slots [DICOM.md](DICOM.md) section 3 states, and raising `max_associations` does not change that: a connection over those slots is closed. Keep the wait inside your senders' ACSE timeouts too, or a paced modality aborts. |
 | `association_burst` | = the rate | tokens the bucket holds, i.e. how large a burst of associations passes unpaced before the sustained rate applies. Only meaningful with `max_associations_per_second` set. Floor of 1 so an SCP can always make progress. |
@@ -3332,18 +3520,34 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `host` | — (required for outbound) | the downstream PACS host (`env()`-able) |
 | `port` | `104` | the peer's DIMSE port |
 | `called_ae_title` | `None` → `ANY-SCP` | the peer SCP's AE title to address |
-| `max_object_bytes` | `134217728` (128 MiB) | reject an over-cap object **before** dialing (permanent — no retry) |
+| `max_object_bytes` | `33554432` (32 MiB, `DEFAULT_SCU_MAX_OBJECT_BYTES`) | reject an over-cap object **before** dialing (permanent — no retry). The default is the SCU's own, not the SCP's 128 MiB: it is twice the engine's 16 MiB binary ingress ceiling, the most an engine SCP holds of one object before it aborts the association with no status (owner ruling B462-R3, vault BACKLOG #4908). The SCU cannot read a peer's limit, and that is the one it knows, so at the default an engine SCP at a cap of 16 MiB or more does not abort an object it is sent for the object's size. One whose cap is set lower aborts smaller objects; set this to that SCP's cap. Raise it for a PACS that takes larger objects, and give `timeout_seconds` room for that PACS to answer one: three stores in a row of an object over 32 MiB that end with no response, the SCU's own timeout included, dead-letter it (the status paragraph below). It also bounds the inflate of a deflated object, so the default inflate bound is 32 MiB too, and `0`/`None` leaves that bound at the codec's 16 MiB. Leaving it unset in `DICOM(...)` writes no value, so each role applies its own default |
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
 | `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. Since BACKLOG #2193 it carries the **revocation gate** MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL carry: `tls=true` to an off-box PACS **is refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (CORRECTED 2026-10-04: this row said the hop had no revocation gate and was not refused). With `tls_allow_expired` set, a CRL cannot admit it; off-box on an enforcing instance only the attestation crosses (vault BACKLOG #2978) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
-| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with chain + hostname still verified. Combined with a `tls_revocation_attested` declaration, this hop can be pinned to a certificate that is **both expired and revoked** with nothing in the engine refusing it — **no posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) (see the [MLLP row](#mllp--mllp)) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). Combined with a `tls_revocation_attested` declaration, this hop can be pinned to a certificate that is **both expired and revoked** with nothing in the engine refusing it — **no posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) (see the [MLLP row](#mllp--mllp)) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
 
 **Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a
 caveat) → delivered; **Out of Resources** (`0xA7xx`) or an association/transport failure → transient
 `DeliveryError` (retried with backoff); any other hard refusal (Cannot Understand, dataset-does-not-match-SOP,
-Not Authorized, SOP-class-not-supported) → permanent `NegativeAckError` → dead-letter. **Idempotency:**
+Not Authorized, SOP-class-not-supported) → permanent `NegativeAckError` → dead-letter. **A store that
+ends with no response** (at least an aborted association, a timeout, or any error raised while the
+store is sent other than the `ValueError` pynetdicom raises for an unencodable dataset) is transient,
+with one bound (vault BACKLOG #4908): for an object over 32 MiB, which only a raised or removed
+`max_object_bytes` lets through, the third such end in a row is a permanent `NegativeAckError`
+(`unanswered-over-ceiling`) and dead-letters, whatever the retry policy, `max_attempts=None` included.
+Every engine SCP aborts such an object with no status (owner ruling B462-R3), and the SCU cannot tell
+that abort from any other end with no response, at least another peer's abort or the SCU's own DIMSE
+timeout on a slow link to any peer, so each counts, and the refusal names no cause. The count is of one
+object, keyed by its length and two checksums of all its bytes, so identical bytes share one count, and two objects that differ, with or without a SOP instance UID, share one only by a checksum collision. Any answered store, a refusal included, starts its count again,
+and so does a dead-letter of the row at the retry policy's `max_attempts` or on any permanent refusal of it, so a replay of it gets all three sends. The
+count is kept in memory with this connection's connector, so anything that builds a new connector starts
+it again: at least a restart and a reload that changes this connection's settings. An operator
+stop and start keeps the connector, and so the count. A reload that leaves the connection unchanged, with its worker running, keeps it. An unanswered end of an object
+at or under 32 MiB is not counted and keeps re-sending. It would still re-send without end under
+`max_attempts=None` against a peer whose own limit is lower, such as an engine SCP whose `max_object_bytes`
+was set below 16 MiB; set this SCU's `max_object_bytes` to that peer's limit. **Idempotency:**
 delivery is at-least-once, so a retry re-sends the same object — the receiving PACS must be idempotent on
 `SOPInstanceUID`. **PHI:** logs carry only routing-safe identifiers (SOP class/instance UID, peer host).
 
@@ -4449,7 +4653,7 @@ reading this page already applies to a file the scan never opened.
 | FHIR destination + `fhir_lookup` | as REST; `fhir_lookup` additionally runs off the event loop on the thread executor | as REST; a lookup that cannot run raises into the Handler | transient → retry; a `fhir_lookup` failure fails the message, never silently degrades |
 | DICOMweb STOW-RS destination | as REST — indirect via the lane budget | as REST | as REST |
 | DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` is the fragment size the SCP offers, not a limit on an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit. A PDU longer than `max_pdu_size`, or an object past twice the effective `max_object_bytes`, aborts the association | the modality re-sends; nothing is half-committed |
-| DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter |
+| DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter; an object over 32 MiB whose store ends with no response three times in a row → dead-letter, whatever `RetryPolicy` says (vault BACKLOG #4908) |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
 | DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
@@ -4500,7 +4704,7 @@ reading this page already applies to a file the scan never opened.
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
 | DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest) | `RetryPolicy` |
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future, and as a fixed deadline on the association request, on each later read, and on each whole send ([DICOM.md](DICOM.md) section 3) | on the timers, the association is released by pynetdicom; a read deadline ends the association by closing the connection, not by a release; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
-| DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent | `RetryPolicy` |
+| DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent; the third end with no response in a row of one object over 32 MiB → permanent (`unanswered-over-ceiling`, vault BACKLOG #4908) | `RetryPolicy`, except that permanent class, which dead-letters whatever the policy says |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL | `RetryPolicy` |
 | DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |

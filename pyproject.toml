@@ -191,7 +191,13 @@ harness = [
 # scripts/ci/retry-native-crash.sh was tied to mkleehammer/pyodbc#1459. That issue is closed, and its
 # root cause is the ODBC driver, not pyodbc, so it is no reason to raise this floor. The upstream
 # reading is recorded once, in docs/RISKY-COMPONENTS.md, section "The sqlserver extra".
-sqlserver = ["aioodbc>=0.5"]
+# aioodbc is pinned exactly (BACKLOG #5005): messagefoundry/odbc_call_gate.py, the DATABASE
+# connector and the SQL Server store reach aioodbc 0.5.0's private names and behaviour, none a
+# public hook. At least: Connection._execute, _conn, _executor, Connection.closed read as "_conn is
+# None", a cursor's _impl, and Pool._wakeup. A release that renames one turns the call gate off,
+# and with it the BACKLOG #2049 native-crash guard. Read the new release's connection, cursor and
+# pool modules, and grep the engine for each name, before moving the pin.
+sqlserver = ["aioodbc==0.5.0"]
 # PostgreSQL store backend (production server-DB with single-node parity). No OS-level dependency
 # (ships compiled C/Cython wheels). Lazy-imported, so SQLite-only installs skip it.
 postgres = ["asyncpg>=0.30"]
@@ -566,7 +572,7 @@ release-tools = [
 #                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
 #                  disagree.
 ci-quality = [
-    "diff-cover==10.6.0",
+    "diff-cover==11.0.0",
     "mutmut==3.8.0",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3.1",

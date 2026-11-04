@@ -513,6 +513,19 @@ Manager keep their exemption: they never use `AskUserQuestion`, and put an owner
 table instead. A Builder still gets one turn: it puts an owner question in its report, never in
 `AskUserQuestion`.
 
+**No new process machinery until 2026-12-02 (ledger ruling R5, owner-signed 2026-11-04, in session:
+*"Sign R1-R9"*).** For the four weeks from that signature to 2026-12-02, no seat adds a new gate,
+hook, required context, seat or method rule, except a fix for a red `main` or a security control.
+Existing machinery is still repaired, and review effort is not touched. The freeze lapses on
+2026-12-02. The drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they
+require is carrying them out, not new machinery; that reading is recorded beside the signed text
+and is not part of the signature. The signature covers R1-R9 as they stand in vault
+`docs/LEDGER-INFLOW-RULINGS-DRAFT.md` at commit `22579b25071c`, anchored at the vault ref
+`refs/liaison/owner-ruling-20261104-r1-r9`; that commit is not on vault `main`, so fetch the ref.
+The copy on vault `main` is `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (`a03b25550`). At
+`a03b25550` it keeps R1-R9 as signed, edits the sections around them, and adds, as its last
+section, the Manager's reading that this file calls "recorded beside the signed text".
+
 The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
@@ -709,6 +722,13 @@ Manager's watch reached the cloud session 29 seconds after its question.
   that weakens a control, so it goes to the owner under the 2026-10-12 ruling, and the PR waits
   for that ruling. A finding the Lander cannot classify goes to the owner (decision
   d20261029T165623191-578690).
+  **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
+  are filed, and nothing else in this bullet.** A merged PR files at most one row, holding its open
+  findings as numbered items. Its deferred scope becomes steps on the row it cites, or is briefed to
+  that row's next Builder, and goes into a new row only when the PR cites none. A finding about
+  code the PR did not touch goes instead into the one open row for that module, as an item. The
+  merge permission, and what goes to the owner, are unchanged. The signed text is cited under R5
+  above.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus

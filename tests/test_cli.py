@@ -4048,7 +4048,9 @@ def _handlerless_root() -> Iterator[logging.Logger]:
     handlers to the root logger at the start of each test phase, so a fixture that strips them in
     setup would watch them come back for the call (the same measurement
     ``tests/test_audit_offbox_tee.py::_handlerless_process`` records). Both the handler list and the
-    level are restored on the way out, which also removes whatever main() installed."""
+    level are restored on the way out, which also removes the root handler main() installed. The
+    ``logging.lastResort`` main() replaces is put back by the conftest's ``root_logging_restored``,
+    not here."""
     root = logging.getLogger()
     saved_handlers, saved_level = list(root.handlers), root.level
     root.handlers.clear()
@@ -4102,6 +4104,8 @@ def test_backup_warning_is_redacted_through_the_real_argument_parser(
     subcommand body is replaced, so the record is deterministic."""
     seen: dict[str, object] = {}
     monkeypatch.setitem(cli_module._DISPATCH, "backup", _phi_logging_probe(seen))
+    # Off, so the redaction asserted below is the root sink's and not the filtered lastResort's.
+    monkeypatch.setattr(cli_module, "install_filtered_last_resort", lambda: None)
     argv = ["backup", "--db", str(tmp_path / "x.db"), "--destination", str(tmp_path / "out")]
     with _handlerless_root():
         assert main(argv) == 0
@@ -4122,6 +4126,8 @@ def test_every_subcommand_logs_through_the_phi_filter_chain(
     required arguments and this test is about what main() does around dispatch, not argparse."""
     seen: dict[str, object] = {}
     monkeypatch.setitem(cli_module._DISPATCH, command, _phi_logging_probe(seen))
+    # Off, so the redaction asserted below is the root sink's and not the filtered lastResort's.
+    monkeypatch.setattr(cli_module, "install_filtered_last_resort", lambda: None)
     monkeypatch.setattr(
         argparse.ArgumentParser,
         "parse_args",
@@ -4151,8 +4157,9 @@ def test_the_logging_exemption_covers_only_subcommands_that_configure_their_own(
     cannot be used as a way to skip the chain.
 
     What this does NOT prove is that the call comes before the subcommand's first log record. It
-    does not for ``serve``, whose pre-configure window ``_CONFIGURES_OWN_LOGGING`` describes. The
-    ``serve`` startup-sink tests below cover that window (BACKLOG #3768)."""
+    does not for ``serve`` or ``supervise``, whose pre-configure windows
+    ``_CONFIGURES_OWN_LOGGING`` describes. The child-process tests below cover them (BACKLOG
+    #3768, #4716)."""
     assert cli_module._CONFIGURES_OWN_LOGGING == _SELF_CONFIGURING
     # Both controls read THIS test: it calls `_calls`, and it names configure_logging only in its
     # docstring and a message string, which must not count as a call.
@@ -4182,14 +4189,15 @@ def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.Mo
     assert seen["handlers"] == [], f"main() installed a sink for exempt `{command}`"
 
 
-# --- BACKLOG #3768: `serve` filters the window before configure_logging -------------------------
+# --- BACKLOG #3768: main() filters the window before a subcommand's handlers ------------------
 #
 # `serve` is exempt from main()'s sink and installs its handlers only after its settings, key and
-# egress gates, so in that window a record no handler takes goes to `logging.lastResort`. These
+# egress gates, so in that window a record no handler takes goes to `logging.lastResort`, which
+# main() replaced with the filtered one before it parsed. These
 # tests log in that window and read stderr. It is entered for real: `suppress_crash_dumps` is the
 # first call `_serve` makes after its imports, and a `--service-config` naming a directory refuses
-# the start before configure_logging runs. `lastResort` is process-wide, so each test puts back the
-# one it found.
+# the start before configure_logging runs. `lastResort` is process-wide; the conftest's
+# `root_logging_restored` puts back the one each test found.
 
 
 def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> None:
@@ -4198,7 +4206,6 @@ def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, objec
     record on a logger whose own level lets INFO through."""
     import messagefoundry.crashdump as crashdump
 
-    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
     warn = _phi_logging_probe(seen)
 
     def probe() -> None:
@@ -4262,10 +4269,18 @@ def test_serve_window_without_the_filtered_last_resort_leaks_the_same_value(
 
 
 def _run_warning_driver(
-    tmp_path: Path, name: str, body: str, *, returncode: int, handlers_line: str
+    tmp_path: Path,
+    name: str,
+    body: str,
+    *,
+    returncode: int,
+    handlers_line: str,
+    leaks: bool = False,
+    module: str = "messagefoundry.__main__",
 ) -> None:
-    """Run ``body`` in a child after ``import logging`` and the CLI module, then assert it reached
-    main() with no root handler, printed ``handlers_line``, and logged the probe once, redacted.
+    """Run ``body`` in a child after ``import logging`` and the CLI ``module``, as ``m``, then
+    assert it reached main() with no root handler, printed ``handlers_line``, and logged the probe
+    once, redacted, or whole where ``leaks`` says the child took the filter out (a control).
     ``body`` prints ``handlers_line`` itself, at the moment it means to measure."""
     import subprocess
     import sys
@@ -4273,7 +4288,7 @@ def _run_warning_driver(
     driver = tmp_path / name
     driver.write_text(
         "import logging\n"
-        "import messagefoundry.__main__ as m\n"
+        f"import {module} as m\n"
         "print('handlers-before-main', len(logging.getLogger().handlers), flush=True)\n" + body,
         encoding="utf-8",
     )
@@ -4289,7 +4304,8 @@ def _run_warning_driver(
     assert handlers_line in proc.stdout, proc.stdout
     assert proc.stderr.count("probe: PID|") == 1, f"the WARNING did not print once: {proc.stderr!r}"
     for fragment in _PID_FRAGMENTS:
-        assert fragment not in proc.stderr + proc.stdout, proc.stderr
+        assert (fragment in proc.stderr) is leaks, proc.stderr
+        assert fragment not in proc.stdout, proc.stdout
 
 
 #: The child's probe line: one WARNING carrying the synthetic segment, at four spaces of indent.
@@ -4298,18 +4314,100 @@ _CHILD_PROBE = (
 )
 
 
+def _child_window_probe(label: str) -> str:
+    """A child ``def _probe():`` that prints ``label``, the root handler count and the type of
+    ``logging.lastResort``, then logs the probe. The caller appends the body's last line."""
+    return (
+        "def _probe():\n"
+        "    resort = type(logging.lastResort).__name__\n"
+        f"    print({label!r}, len(logging.getLogger().handlers), resort, flush=True)\n"
+        + _CHILD_PROBE
+    )
+
+
+def _warn_while_parsing(*, prefix: str = "") -> str:
+    """A child body that logs the probe while main() builds its parser for ``serve``, before
+    ``_serve`` runs, then exits 3 there, so nothing past the parse window is paid for."""
+    return (
+        prefix + _child_window_probe("parsing") + "    raise SystemExit(3)\n"
+        "m._build_parser = _probe\n"
+        "raise SystemExit(m.main(['serve']))\n"
+    )
+
+
+def test_a_real_serve_process_redacts_a_warning_while_it_parses_its_arguments(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #3768: main() installs the filtered ``lastResort`` before it parses, so a WARNING
+    logged while the parser is built, before ``_serve`` runs, reaches stderr redacted."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_while_parsing.py",
+        _warn_while_parsing(),
+        returncode=3,
+        handlers_line="parsing 0 _FilteredLastResort",
+    )
+
+
+def test_a_real_serve_process_without_the_install_leaks_while_it_parses(tmp_path: Path) -> None:
+    """The control for the test above, through the same child: with the install taken out, the
+    same WARNING meets the stdlib's own ``lastResort`` and the synthetic segment reaches stderr
+    whole, so the absence above is the filter's doing and not a record that never arrived."""
+    _run_warning_driver(
+        tmp_path,
+        "leak_while_parsing.py",
+        _warn_while_parsing(prefix="m.install_filtered_last_resort = lambda: None\n"),
+        returncode=3,
+        handlers_line="parsing 0 _StderrHandler",
+        leaks=True,
+    )
+
+
+def _warn_in_supervise_window(*, prefix: str = "") -> str:
+    """A child body whose probe stands in for ``supervise``'s remote-debug guard, the first thing
+    it runs before its own ``configure_logging``, then exits 3 before anything is supervised."""
+    return (
+        prefix + _child_window_probe("window") + "    raise SystemExit(3)\n"
+        "m.install_remote_debug_guard = _probe\n"
+        "raise SystemExit(m.main(['supervise']))\n"
+    )
+
+
+def test_a_real_supervise_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
+    """BACKLOG #4716: ``supervise`` logs before its own ``configure_logging`` too, and that window
+    now meets the filtered ``lastResort``."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_in_the_supervise_window.py",
+        _warn_in_supervise_window(),
+        returncode=3,
+        handlers_line="window 0 _FilteredLastResort",
+    )
+
+
+def test_a_real_supervise_process_without_the_install_leaks(tmp_path: Path) -> None:
+    """The control for the test above: with the install taken out, the same WARNING meets the
+    stdlib's own ``lastResort`` and the synthetic segment reaches stderr whole."""
+    _run_warning_driver(
+        tmp_path,
+        "leak_in_the_supervise_window.py",
+        _warn_in_supervise_window(prefix="m.install_filtered_last_resort = lambda: None\n"),
+        returncode=3,
+        handlers_line="window 0 _StderrHandler",
+        leaks=True,
+    )
+
+
 def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
     """The premise the in-process ``serve`` tests stand on, measured in a child: a real process
-    reaches ``_serve`` with no root handler, so ``install_filtered_last_resort`` acts and the
-    WARNING reaches stderr redacted. The child exits 2 on the directory ``--service-config``."""
+    reaches ``_serve`` with no root handler and with the filtered ``lastResort`` main() installed,
+    so the WARNING reaches stderr redacted. The child exits 2 on the directory
+    ``--service-config``."""
     _run_warning_driver(
         tmp_path,
         "warn_in_the_serve_window.py",
         "import messagefoundry.crashdump as crashdump\n"
-        "def _probe():\n"
-        "    resort = type(logging.lastResort).__name__\n"
-        "    print('window', len(logging.getLogger().handlers), resort, flush=True)\n"
-        + _CHILD_PROBE
+        + _child_window_probe("window")
         + "crashdump.suppress_crash_dumps = _probe\n"
         f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n",
         returncode=2,
