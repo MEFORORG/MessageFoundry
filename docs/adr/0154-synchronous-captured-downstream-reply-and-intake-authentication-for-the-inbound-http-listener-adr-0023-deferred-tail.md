@@ -1547,9 +1547,12 @@ time validating. When every worker is busy for the whole timeout, the validate n
 
 **The discriminator.** Each strict validate now runs through `_StrictValidateRun` in
 `pipeline/wiring_runner.py`. "Began" is decided when the timeout fires, not when the listener gets
-round to handling it. The run carries the timeout's deadline on `time.monotonic()`, the clock
-asyncio's event loop times with, taken just before the timeout's own, so it is never the later of the
-two. The worker, as its first act and under the run's lock, checks the deadline and whether the
+round to handling it. The run carries the timeout's deadline, read from the event loop's own clock
+(`loop.time()`) just before the timeout's timer is set from the same expression, so on asyncio's own
+loops, where that clock is `time.monotonic()`, the deadline is never the later of the two. On uvloop,
+which runs the engine on CPython outside Windows, the loop's clock is libuv's millisecond loop time;
+that it shares `time.monotonic()`'s base, and that libuv rounds the timer by under a millisecond, are
+read from the libraries' design and were not measured. The worker, as its first act and under the run's lock, checks the deadline and whether the
 listener abandoned the run: if either holds, it records the run as not begun and returns without
 calling `hl7apy` at all; otherwise it marks the run started. The listener, when it handles the
 timeout, marks the run abandoned under the same lock, so the two cannot cross. Without the deadline

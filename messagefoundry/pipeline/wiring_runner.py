@@ -939,8 +939,9 @@ class _StrictValidateRun:
     """One strict validate on a worker thread, which records whether it began (BACKLOG #5078).
 
     "Began" is decided when the timeout fires, not when the listener handles it. The run carries the
-    timeout's deadline on ``time.monotonic()``, the clock asyncio's event loop times with, taken
-    before the timeout's own. A worker that reaches the run at or past it does not begin: it records
+    timeout's deadline, read from the event loop's clock just before the timeout's own timer is set
+    (:func:`_validate_strictly` says why that clock), and the worker compares ``time.monotonic()``
+    with it. A worker that reaches the run at or past it does not begin: it records
     "not begun" and returns without validating. Without that, a worker that came free after the
     deadline but before a busy event loop handled the timeout would begin, and the listener would
     answer a body nobody had looked at inside the timeout as final.
@@ -992,9 +993,15 @@ async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResu
     design (mirrors ``_run_lookup``), bounded by ``enforce_size_limits``' 16 MiB and segment caps
     that fire before the slow parse."""
     timeout = _strict_validate_timeout(ic)
-    # Taken before wait_for starts its own timer on the same clock, so the run's deadline is never
-    # later than the timeout's.
-    run = _StrictValidateRun(None if timeout is None else time.monotonic() + timeout)
+    # The same expression wait_for's own timer is set from, read just before it, so the run's deadline
+    # is the timer's or earlier. On asyncio's own loops loop.time() IS time.monotonic(), the clock the
+    # worker reads. On uvloop (CPython outside Windows) it is libuv's loop time, in milliseconds and
+    # updated by the loop rather than read fresh, so it can read behind time.monotonic(), and the
+    # timer is set from it; time.monotonic() + timeout there could be later than the timer. That the
+    # two share a base on uvloop, and libuv's sub-millisecond timer rounding, are read from the
+    # libraries' design, not measured: no uvloop runs on the Windows machine this was built on.
+    deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+    run = _StrictValidateRun(deadline)
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(run, text, ic.validation.hl7_version), timeout

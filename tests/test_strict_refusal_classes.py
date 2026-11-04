@@ -395,6 +395,31 @@ async def test_a_worker_that_comes_free_after_the_deadline_does_not_begin_the_va
     assert raised.value.nak_code == "AE"
 
 
+async def test_the_runs_deadline_is_read_from_the_event_loops_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline comes from ``loop.time()``, the clock ``wait_for``'s timer is set from, not from
+    a fresh ``time.monotonic()``. uvloop's loop clock can read behind ``time.monotonic()``; here the
+    loop's clock is set 0.5 s behind it, so a 0.3 s deadline read from the loop is already past by
+    the worker's clock and a free worker does not begin. Red with the deadline taken from
+    ``time.monotonic()``: the validate begins and returns its result."""
+    calls: list[int] = []
+
+    def _validate(*_: Any, **__: Any) -> ValidationResult:
+        calls.append(1)
+        return _OK
+
+    monkeypatch.setattr(wiring_runner, "validate", _validate)
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    monkeypatch.setattr(loop, "time", lambda: real_time() - 0.5)
+    ic = _strict_ic(ConnectorType.HTTP, timeout=0.3)
+    with pytest.raises(wiring_runner._StrictValidateTimedOut) as raised:
+        await wiring_runner._validate_strictly(ic, _ADT)
+    assert calls == []
+    assert raised.value.refusal_kind is RefusalKind.TEMPORARY
+
+
 async def test_control_a_validate_that_began_in_time_and_finished_late_answers_with_its_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -405,13 +430,14 @@ async def test_control_a_validate_that_began_in_time_and_finished_late_answers_w
 
     def _slow(*_: Any, **__: Any) -> ValidationResult:
         began.set()
-        time.sleep(0.3)  # began at about 0 s, finishes at about 0.3 s, past the 0.2 s deadline
+        time.sleep(1.2)  # began near 0 s, finishes at about 1.2 s, past the 1.0 s deadline
         return _OK
 
     monkeypatch.setattr(wiring_runner, "validate", _slow)
-    ic = _strict_ic(ConnectorType.MLLP, timeout=0.2)
-    # The loop is stalled from 0.05 s to 0.55 s, so it handles the timeout after the validate ended.
-    asyncio.get_running_loop().call_later(0.05, time.sleep, 0.5)
+    # A 1 s deadline, so a free default-executor thread slow to start under load still begins in it.
+    ic = _strict_ic(ConnectorType.MLLP, timeout=1.0)
+    # The loop is stalled from 0.05 s to 1.55 s, so it handles the timeout after the validate ended.
+    asyncio.get_running_loop().call_later(0.05, time.sleep, 1.5)
     result = await wiring_runner._validate_strictly(ic, _ADT)
     assert began.is_set()
     assert result is _OK
