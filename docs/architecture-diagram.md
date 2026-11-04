@@ -406,7 +406,7 @@ sequenceDiagram
   alt The listener cannot accept the message
     SND->>LSN: HL7 message
     LSN->>MST: record the message as ERROR, with no ingress row
-    LSN-->>SND: NAK with AR for a decode or parse failure,<br/>AE for a strict validation failure
+    LSN-->>SND: NAK with AR for a decode, parse or strict validation failure,<br/>AE for at least a strict validation timeout that never began or an unusable codec name
   else A Router or a Handler raises, after the ACK
     WRK->>MST: dead-letter the row at its own stage
     MST->>MST: the finalizer sets ERROR<br/>when no other row is pending or in flight
@@ -431,8 +431,9 @@ The table lists the main failures. It is not a full list.
 | Failure | What the sender sees | Where the message ends |
 |---|---|---|
 | The body cannot be decoded or parsed, or it holds a NUL character | NAK `AR` | `ERROR`, recorded with no ingress row |
-| Strict validation fails or times out | NAK `AE` | `ERROR`, recorded with no ingress row |
-| A streaming inbound cannot store a large document | NAK `AE` | `ERROR`, recorded with no ingress row |
+| Strict validation fails | NAK `AR` | `ERROR`, recorded with no ingress row |
+| Strict validation times out | NAK `AR` once the validate began, `AE` if it never began | `ERROR`, recorded with no ingress row |
+| A streaming inbound cannot store a large document | NAK `AE` when only concurrent detaches hold the streaming budget, `AR` for every other detach refusal | `ERROR`, recorded with no ingress row |
 | The store cannot commit the message | NAK `AE` from the MLLP listener, then the connection closes | Nothing was ACKed, so the sender sends it again |
 | A Router or a Handler raises | The `AA` it already holds | `ERROR`, with the row dead-lettered at its own stage |
 | The engine stops before a handoff commits | The `AA` it already holds | The stage runs again after the restart |

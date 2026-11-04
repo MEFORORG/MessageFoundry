@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import socket
 import ssl
 import time
@@ -83,7 +84,13 @@ from messagefoundry.mllpcodec import (
 )
 from messagefoundry.parsing._builtin_hl7 import DelimiterRewriteRefused
 from messagefoundry.parsing.message import emit_raw_separators, reencode_with_separators
-from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
+from messagefoundry.parsing.peek import (
+    PEEK_READ_FAULTS,
+    HL7PeekError,
+    Peek,
+    normalize,
+    starts_with_msh,
+)
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.tls_handshake_failures import (
     HUNG_UP,
@@ -348,6 +355,31 @@ def _bounded_ack_field(value: str | None) -> str:
     ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
     redactor's thresholds and walks the identifier into the log downstream."""
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
+
+
+#: A segment break in a payload not yet normalized (``normalize`` maps both to ``\r``).
+_LINE_BREAK = re.compile(r"[\r\n]")
+
+
+def _outgoing_control_id(payload: str) -> str | None:
+    """MSH-10 of an outgoing payload, read from its MSH segment alone (BACKLOG #4905).
+
+    MSH-10 lives in the header, so parsing the whole body to read it was both waste and a hole: a
+    body over a :meth:`Peek.parse` cap (16 MiB, 10,000 segments, the escape budget) raised
+    ``HL7PeekError`` although its MSH-10 was readable, and correlation switched off. The slice runs
+    up to the first line break after the leading ``MSH``, keeping anything before it, so the parser
+    sees the same header the whole-body parse would have, and nothing past the header is copied.
+
+    ``None`` for a payload that does not lead with ``MSH``: it is not HL7 and has no MSH-10, which
+    the whole-body parse refused too. Raises ``HL7PeekError`` only where an MSH-led header cannot be
+    read, so a caller may treat every such raise as a delivery check switched off."""
+    if not starts_with_msh(payload):
+        return None
+    # Leading whitespace holds no "MSH", so the first one is the header's own.
+    brk = _LINE_BREAK.search(payload, payload.find("MSH") + 3)
+    if brk is not None:
+        payload = payload[: brk.start()]
+    return Peek.parse(payload).control_id
 
 
 # --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
@@ -1060,13 +1092,24 @@ class MLLPDestination(DestinationConnector):
                 return await self._send_persistent_no_ack(wire)
             # BACKLOG #82: read the OUTGOING control id (MSH-10) once, off the final on-wire payload
             # (after any delimiter/raw-separator rewrite), so _check_ack can correlate it to the reply's
-            # MSA-2. Off → None → no correlation (byte-identical). Defensive: a non-HL7 / unparseable
-            # payload has no MSH-10 to correlate, so we skip (deliver as before) rather than fail.
+            # MSA-2. Off → None → no correlation (byte-identical). Defensive: a non-HL7 payload has no
+            # MSH-10 to correlate, so we skip (deliver as before) rather than fail.
             sent_control_id: str | None = None
             if self.verify_ack_control_id:
                 try:
-                    sent_control_id = Peek.parse(payload).control_id
-                except HL7PeekError:
+                    sent_control_id = _outgoing_control_id(payload)
+                except HL7PeekError as exc:
+                    # BACKLOG #4905: only the header is parsed, so a whole-message cap (size,
+                    # segments, escape budget) can no longer reach here, and a payload that is not
+                    # HL7 returns None quietly. What does reach here is a header that leads with MSH
+                    # and still cannot be read; that switches off a delivery check, so say so, by
+                    # type name only.
+                    logger.warning(
+                        "MLLP send to %s:%s: MSH-10 read refused (%s); ACK correlation skipped",
+                        self.host,
+                        self.port,
+                        type(exc).__name__,
+                    )
                     sent_control_id = None
                 except PEEK_READ_FAULTS as exc:
                     # A faulting MSH-10 read is unreadable too (BACKLOG #1594), so correlation is
@@ -2289,10 +2332,16 @@ class MLLPSource(SourceConnector):
         on, or ``None`` if none can be framed. Call it only when a reply is owed.
 
         **Why AE.** It is this engine's code for "not accepted, and not because of what the message
-        says". The runner answers ``AE`` for its own transient conditions (a strict-validation
-        timeout, a streaming-detach budget) and ``AR`` only for a body it could not read. The
-        engine's own MLLP destination reads the same split: it retries ``AE`` and dead-letters
-        ``AR`` at once. An ``AR`` here would dead-letter an engine-to-engine hop on a store blip.
+        says". The runner answers ``AR`` for every refusal it treats as final and ``AE`` only for a
+        temporary one, at least a strict-validation timeout that fired before any worker thread
+        began the validate and a streaming-detach budget held by concurrent detaches
+        (BACKLOG #5078, owner ruling of 2026-11-03, decision log d20261104T032854299-7235a9,
+        stamped in UTC). The strict outcomes are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*;
+        the detach classes are
+        ``_detach_refusal_kind`` in ``pipeline/wiring_runner.py``. A handler fault is the engine's
+        own and says nothing about the body, so it takes the temporary code. The engine's own MLLP
+        destination reads the same split: it retries ``AE`` and dead-letters ``AR`` at once. An
+        ``AR`` here would dead-letter an engine-to-engine hop on a store blip.
 
         Built defensively, because the fault may have come from reading this very message. Only a
         bounded prefix up to the first segment break is decoded and parsed, so a large frame costs

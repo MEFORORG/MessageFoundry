@@ -10789,7 +10789,11 @@ class PostgresStore:
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a Postgres database's
-        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`.
+
+        So a DBA restore of this store is not recorded at start: no session is ended, and no
+        ``store_restored`` row or alert is written. docs/SECURITY.md, *A restored store brings its
+        sessions back*, names the steps an operator takes by hand (BACKLOG #5092)."""
         return None
 
     async def enforce_session_cap(

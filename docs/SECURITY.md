@@ -5639,6 +5639,46 @@ step-up. So an id shown on a sessions page can go stale. The console's revoke sa
 revoked" when the id no longer matches, rather than reporting a revoke that did not happen, and
 `DELETE /me/sessions/{id}` answers 404.
 
+### A restored store brings its sessions back, and only `messagefoundry restore` records it
+
+A store restored from a backup brings back the whole store as it was when the backup was taken,
+accounts and sessions included. **The engine records a restore only when `messagefoundry restore`
+placed a SQLite store** (BACKLOG #2614). That command ends every session in the store it places
+and writes a marker into it, and the first `serve` on that store ends every session again, writes
+one `store_restored` audit row and raises a `store_restored` alert. The
+[early-adopter guide](EARLY-ADOPTER-GUIDE.md#10-backup-restore--disaster-recovery) says what an
+operator sees, and what a restore rolls back.
+
+**Every other restore writes no marker** (BACKLOG #5092). At least these: a PostgreSQL or SQL
+Server store restored with the database's own tools, such as `pg_restore`, point-in-time recovery
+or `RESTORE DATABASE`, and a SQLite store put back by copying its files. Neither server backend
+holds a marker (`consume_restore_record` returns nothing there). So the first `serve` ends no
+session, writes no `store_restored` row and raises no `store_restored` alert, and the backup's
+sessions are accepted until they expire or are revoked.
+
+**One start-up signal that can catch such a restore is the audit anchor's, and only where it is
+set up.** With `[integrity].audit_verify_on_start = true` and `[integrity].audit_anchor_file`
+holding an anchor taken after the backup, the start-up audit walk reports the restored log as
+truncated and raises an `integrity_drift` alert
+([CONFIGURATION.md](CONFIGURATION.md#integrity) says how). That alert ends no session and writes
+no `store_restored` row. Both settings are off by default, the anchor file is only as recent as
+the operator keeps it, and it catches the restore only if audit rows were written between the
+backup and the anchor. Other start-up signals may follow from what the restore rolled back, at
+least a `config_changed` alert against the store's older baseline, but none of them records the
+restore as one.
+
+**After such a restore, before the first `serve`, an operator must by hand** (an in-place restore
+under running engines skips that moment, so stop every engine process and cluster node on the
+store before the restore):
+
+- run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
+  finds, of every account, and writes one `auth.session_revoked` audit row; *Limits of the session
+  sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
+  may miss;
+- re-apply the changes the restore undid. `messagefoundry restore --help` prints the statement of
+  what a restore rolls back, and the guide lists its classes; it applies to these restores too.
+  The source's audit log, or its off-host copy, lists the changes themselves.
+
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
 Users are notified of security-relevant changes to their account through **two** channels:

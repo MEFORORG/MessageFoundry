@@ -8,7 +8,7 @@ compose.
 | Tier | Engine | When | Checks | On failure |
 |---|---|---|---|---|
 | 1. Tolerant peek | The built-in parser ([parsing/peek.py](../messagefoundry/parsing/peek.py), ADR 0054) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
-| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK (AR/AE) at the listener |
+| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK at the listener, `AR` (Tier 2 below has the codes) |
 | 3. Business consistency | `parsing/consistency.py` (this WP) | In a Router/Handler | **Cross-field** coherence the schema can't express | Handler decides: `FILTERED` or `ERROR`/dead-letter |
 
 ## Tier 1 — tolerant peek (always on)
@@ -32,11 +32,37 @@ from messagefoundry import MLLP, inbound
 inbound("IB_ACME_ADT", MLLP(port=2575), router="adt_router", strict=True, hl7_version="2.5")
 ```
 
-A non-conformant message is **NAK'd synchronously** (AR/AE) at the listener, before it is ever routed —
+A non-conformant message is **NAK'd synchronously** at the listener, before it is ever routed —
 the sender is told immediately. Be **explicit about `hl7_version`** for a strict feed; don't rely on
 silent autodetection. Enable strict when: the downstream system is intolerant of malformed structure,
 the feed is contractually conformant, or correctness outweighs throughput. Leave it off for a tolerant
 archival/forwarding feed.
+
+What the sender hears (BACKLOG #5078, owner ruling of 2026-11-03, decision log
+d20261104T032854299-7235a9, stamped in UTC):
+
+| Strict outcome | MLLP / TCP | `Http()` |
+|---|---|---|
+| the body fails validation, an MSH-12 version mismatch included | `AR`: final, the same body fails the same way on a re-send | `422` |
+| the body is over strict validation's own size cap | `AR` | `413` |
+| the validate began and ran past `validation.strict_timeout_s` | `AR` | `422` |
+| the timeout fired before any worker thread began the validate | `AE` | `503` with `Retry-After` |
+
+The engine's own MLLP outbound dead-letters an `AR` at once and retries an `AE`. A third-party sender
+that reads MSA-1 by the HL7 v2 letter, where `AE` marks a content error, would read these two codes
+the other way round, so set such a sender up to give up on `AR` and re-send on `AE`
+([`messagefoundry/CLAUDE.md`](../messagefoundry/CLAUDE.md), *ACK/NAK*, states the convention). Why a timeout splits
+on whether the validate began is in the
+[ADR 0154 amendment of 2026-11-03](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
+
+**Strict validation's size cap does NOT follow `max_message_bytes`.** It is the engine default, 16 MiB,
+whatever the inbound sets. An inbound that raises `max_message_bytes` above 16 MiB admits a larger body
+to the tolerant parse, and strict validation then refuses a body between 16 MiB and that limit as
+over-size (`AR` above, `413` on `Http()`). This is deliberate: `hl7apy` parses the whole body into an
+object tree on a worker thread the timeout cannot stop, and the 16 MiB cap, checked before that parse,
+is what bounds it. A streaming inbound (`stream_threshold_bytes`) validates only the header of a body at or over its
+threshold, so a large-document feed keeps working; set the threshold at or below 16 MiB on a strict
+streaming inbound.
 
 Strict validation surfaces a single conformance error (not a full report) — a full report of a PHI
 message would be a data leak. See [parsing/validate.py](../messagefoundry/parsing/validate.py).
