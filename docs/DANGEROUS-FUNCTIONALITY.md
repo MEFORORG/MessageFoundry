@@ -490,9 +490,10 @@ pure-Python equivalent:
   act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
   with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
   staging fail-safe, which empties the files a failed backup left in its staging directory, calls
-  these same helpers on Windows rather than `ctypes` of its own: it holds each directory and opens
-  each file as itself, refuses a link or junction, and confirms the object lies under the staging
-  directory before it is truncated through that handle (BACKLOG #2420, #4992)
+  these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
+  file as itself, and refuses a link or junction. It confirms that file lies under the staging
+  directory before any filter serves it. A deduplicated, cloud or tiered file is then truncated
+  through a second open by name, which must reach the same file (BACKLOG #2420, #4992)
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
