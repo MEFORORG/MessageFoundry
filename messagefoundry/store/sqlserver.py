@@ -8314,8 +8314,9 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
-                # materialized once, so a replay can commit between that read and the erasure. It
+                # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says
+                # how a token reaches here). `#eligible` is materialized once, so a replay can
+                # commit between that read and the erasure. It
                 # must never become a child message. A missing row is damage, not an erasure, so
                 # that token is not blanked: its sealed reference is the evidence.
                 if art is None:
@@ -9590,8 +9591,7 @@ class SqlServerStore:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
         idempotent, because a row left with neither no longer matches. Returns a
-        :class:`DeadLetterPurge` as the SQLite twin does: a row already blank that only loses its
-        ``last_error`` is left out of ``bodies`` and counted in ``errors_cleared`` (BACKLOG #4996).
+        :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9610,7 +9610,7 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # As on SQLite: only the body blank is counted (BACKLOG #4996). DATALENGTH, not
+                # As on SQLite: two statements, one count each (BACKLOG #4996). DATALENGTH, not
                 # `<> ''`: T-SQL pads trailing spaces before comparing, so a whitespace-only body
                 # would otherwise read as blank and survive.
                 await cur.execute(

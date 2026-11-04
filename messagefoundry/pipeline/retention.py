@@ -258,9 +258,8 @@ class RetentionPass:
     # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata-only, on the same
     # window as connection events. Never an open/acknowledged instance.
     alert_instances_purged: int = 0
-    # Dead rows whose `last_error` the dead-letter purge nulled this pass (BACKLOG #4996), a row whose
-    # body it blanked included. `dead_purged` counts bodies only, so a pass whose sole change was
-    # clearing error text, which may carry PHI, still needs this to count as audited work.
+    # `DeadLetterPurge.errors_cleared` (BACKLOG #4996): `dead_purged` counts bodies only, so a pass
+    # whose sole change was clearing dead-letter error text still needs this to count as work.
     dead_errors_cleared: int = 0
     # Application log FILES deleted this pass (#120): app-log files past the `app_log_days` window
     # removed from `[logging].log_dir`. Metadata only (mtime) — file content is never read. 0 when the

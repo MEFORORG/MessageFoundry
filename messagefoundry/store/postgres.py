@@ -5642,9 +5642,9 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that re-pended this token after the purge's
-                    # snapshot made the purge's token blank skip it, while the same statement still
-                    # erased the reply. This branch is the only control for that, and the reply
+                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that
+                    # re-pended this token after the purge's snapshot made the purge's token blank
+                    # skip it, while the same statement still erased the reply. This branch is the only control for that, and the reply
                     # must never become a child message. A missing row is damage, not an erasure,
                     # so that token is not blanked: its sealed reference is the evidence.
                     if art is None:
@@ -11115,9 +11115,7 @@ class PostgresStore:
     ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
         retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns a :class:`DeadLetterPurge` as the SQLite twin does: a row
-        already blank that only loses its ``last_error`` is left out of ``bodies`` and counted in
-        ``errors_cleared`` (BACKLOG #4996).
+        Ported, not stubbed. Returns a :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -11139,7 +11137,7 @@ class PostgresStore:
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
-                # As on SQLite: only the body blank is counted (BACKLOG #4996).
+                # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
                     "UPDATE queue SET payload=''"
                     f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",

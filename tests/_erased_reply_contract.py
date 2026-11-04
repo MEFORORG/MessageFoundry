@@ -25,6 +25,8 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.store import REINGRESS_ARTIFACT_MISSING
 from tests._queue_tag_contract import RawFetch, RawSql
 from tests._store_audit import no_operator_audit
 
@@ -303,6 +305,10 @@ async def assert_missing_artifact_row_dead_letters_under_its_own_error(
     events = await store.events_for(mid)
     dead = [str(e["detail"]) for e in events if e["event"] == "dead"]
     assert any("missing" in d for d in dead) and not any("corrupt" in d for d in dead), dead
+    # The operator-visible half: the token's own error names the missing row.
+    [err] = await fetch("SELECT last_error FROM queue WHERE id=?", (token,))
+    opened = store.cipher().decrypt(err["last_error"], aad=cell_aad("queue", "last_error", token))
+    assert opened == REINGRESS_ARTIFACT_MISSING, opened
     assert await children(fetch) == []
 
     # One dead end per replay, not a loop.
