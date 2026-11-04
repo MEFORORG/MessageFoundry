@@ -375,8 +375,28 @@ _MEFOR_SECRET = re.compile(
 # copy's case fold, and that change is what the comment above ``redact_log_line`` records as
 # printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses
 # them.
+# THE FIRST BRANCH IS A CONNECTION-STRING MEMBER (BACKLOG #5030): a key right after a ";" that ends
+# in a credential word, glued on or not (``;PWD=``, ``;sslpassword=``), its value taken to the next
+# ";". The plain class stops at a space, "," or "&", which a credential the generic ODBC dialect sends
+# unbraced may hold, and ``sslpassword`` has no ``\b`` before its word at all. The rule, its guards
+# and its cost are stated once, on ``_CONNECTION_STRING_MEMBER`` in ``messagefoundry/secretscrub.py``;
+# this copy spells its keywords literally, so the regex scanner in ``tests/test_security_static.py``
+# still reads it. The label branch keeps group 2, which ``_keep_label`` reads.
+_CONNECTION_STRING_MEMBER = (
+    r"(?<=;)([A-Za-z0-9_]++(?:(?<=(?i:password))|(?<=(?i:passwd))|(?<=(?i:passphrase))"
+    r"|(?<=(?i:pass))|(?<=(?i:pwd))|(?<=(?i:secret))|(?<=(?i:credential))|(?<=(?i:token))))=(?:"
+    + _ODBC_BRACED
+    + r"|"
+    + _ODBC_BRACED_OVERRUN
+    + r"|(?:[^;'\"{:\r\n]|:(?!//))++(?:(?=[;\r\n])|\Z|(?<![:=\s])(?=['\"])))"
+)
 _CREDENTIAL_KV = re.compile(
-    _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
+    _LABEL_START
+    + r"(?:"
+    + _CONNECTION_STRING_MEMBER
+    + r"|("
+    + _LABEL_PREFIX
+    + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _ODBC_BRACED
@@ -386,7 +406,7 @@ _CREDENTIAL_KV = re.compile(
     + _ODBC_BRACED_OVERRUN
     + r"|"
     + _PLAIN_KV_VALUE
-    + r")"
+    + r"))"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -636,8 +656,10 @@ def redact_log_text(text: str) -> str:
 
 def _keep_label(m: re.Match[str]) -> str:
     """Replace a ``<label>=<value>`` match, keeping the label so a reviewer sees WHICH credential
-    leaked, and never the value. Group 1 is the label in every pattern that uses this."""
-    return f"{m.group(1)}={REDACTION_PLACEHOLDER}"
+    leaked, and never the value. Group 1 is the label in every pattern that uses this, except where
+    ``_CREDENTIAL_KV``'s label branch matched: its connection-string branch holds group 1, so the
+    label is group 2 there."""
+    return f"{m.group(1) or m.group(2)}={REDACTION_PLACEHOLDER}"
 
 
 def _keep_scheme(m: re.Match[str]) -> str:

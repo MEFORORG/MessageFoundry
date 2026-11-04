@@ -248,7 +248,10 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
 #: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.
-#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``. This module is stdlib-only and cannot
+#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``. The member arm is the key and "=" of
+#: ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030), a key after a ";" that ends in a
+#: credential word with nothing between them, such as ``;sslpassword=``, which the label arm's
+#: ``\b`` cannot read. This module is stdlib-only and cannot
 #: import them, so ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour
 #: that this pattern matches every text either filter changes when the filters start a label at
 #: ``\b`` alone. A plain literal, so the static regex gate reads it. The prefix bound keeps the scan
@@ -260,6 +263,8 @@ _CREDENTIAL_AHEAD = re.compile(
     r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
     r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
     r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
+    r"""|(?<=;)[A-Za-z0-9_]++(?:(?<=(?i:password))|(?<=(?i:passwd))|(?<=(?i:passphrase))"""
+    r"""|(?<=(?i:pass))|(?<=(?i:pwd))|(?<=(?i:secret))|(?<=(?i:credential))|(?<=(?i:token)))="""
 )
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``

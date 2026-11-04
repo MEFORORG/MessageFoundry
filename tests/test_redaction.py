@@ -2846,6 +2846,14 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
     assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
+    # The member arm (BACKLOG #5030): the words of secretscrub's connection-string branch.
+    member_words = re.findall(r"\(\?<=\(\?i:([a-z]+)\)\)", pattern)
+    assert set(member_words) == {
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._MEMBER_EXTRA_WORDS,
+    }, member_words
+    assert secretscrub._CONNECTION_STRING_MEMBER.startswith(r"(?<=;)([A-Za-z0-9_]++")
+    assert r"(?<=;)[A-Za-z0-9_]++" in pattern
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:

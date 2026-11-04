@@ -46,6 +46,7 @@ from messagefoundry.transports.egress import (
     check_fhir_lookup_allowed,
     warn_url_query_credentials,
 )
+from tests._phi_log_capture import filtered_sink
 
 _MARK = "carries a credential in its query string"
 
@@ -806,8 +807,9 @@ async def test_a_raising_warning_step_isolates_its_lookup_and_the_rest_start(
             raise RuntimeError("synthetic failure in the warning step")
         real(label, settings)
 
+    # Patched where the runner's pre-build step reads it (BACKLOG #4997).
     monkeypatch.setattr(
-        "messagefoundry.pipeline.wiring_runner.warn_url_query_credentials", warn_or_raise
+        "messagefoundry.transports.egress.warn_url_query_credentials", warn_or_raise
     )
     reg = Registry()
     for name in ("LK_A", "LK_BOOM", "LK_Z"):
@@ -1093,3 +1095,80 @@ async def test_a_plain_engine_start_warns_then_a_reload_warns_once(
             assert _warned(caplog, label) == 1, label
     finally:
         await eng.stop()
+
+
+# --- the record survives the configured log filters (BACKLOG #4998) ----------------------------
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "FhirLookup 'LK_TOKEN'",
+        "FhirLookup 'LK_SECRET'",
+        "outbound 'OB_PARTNER_PASSWORD'",
+        "outbound 'OB_X_SESSION'",
+        "outbound 'OB_PRIVATE_KEY'",
+        "FhirLookup 'LK'",
+    ],
+)
+def test_the_warning_survives_the_configured_log_filters_whole(label: str) -> None:
+    """caplog reads a record before any handler filter runs, so every test above saw the line the
+    scrubber never touched. This one reads what a configured handler WRITES. With the label written
+    as ``FhirLookup 'LK_TOKEN': the ...``, the scrubber read the quoted name and its colon as a
+    credential label, and the sink got ``'LK_TOKEN=<redacted> endpoint ...``. ``'LK'`` is the
+    control: a name with no credential word was never touched."""
+    with filtered_sink("messagefoundry.transports.egress") as sink:
+        warn_url_query_credentials(label, {"url": "https://p.example.invalid/x?key=PLACEHOLDER"})
+    out = sink.text
+    assert (
+        f"the endpoint url of {label} carries a credential in its query string (parameter(s) key)."
+        in out
+    ), out
+    assert "<redacted>" not in out, out
+
+
+# --- one pre-build step for an outbound and a FhirLookup (BACKLOG #4997) -----------------------
+
+
+async def test_an_outbound_that_fails_before_the_egress_check_still_warns_once(
+    reload_store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``OB_DOWN``'s ``bearer_token`` is an ``env()`` setting that does not resolve, so its build
+    fails in ``_dest_config``, before ``check_egress_allowed`` ever runs. It used to log no WARNING
+    while ``LK_DOWN``, failing the same way, logged one. Both now take the same step, once each at
+    the start, and once at the operator start that builds the lane again. ``OB_UNSET_URL``'s url
+    itself does not resolve, so it has nothing to read and logs the INFO line instead."""
+    reg = Registry()
+    token = EnvRef("MEFOR_UNSET_OUTBOUND_TOKEN")
+    outbounds: dict[str, dict[str, Any]] = {
+        "OB_DOWN": {"url": _KEYED.format(v=1), "bearer_token": token},
+        "OB_UNSET_URL": {"url": EnvRef("MEFOR_UNSET_OUTBOUND_URL")},
+    }
+    for name, settings in outbounds.items():
+        spec = ConnectionSpec(type=ConnectorType.REST, settings=settings)
+        reg.add_outbound(build_outbound_connection(name, spec))
+    reg.add_fhir_lookup(
+        FhirLookupSpec(
+            name="LK_DOWN",
+            settings={"url": _LOOKUP_URL, "bearer_token": EnvRef("MEFOR_UNSET_LOOKUP_TOKEN")},
+        )
+    )
+    runner = _reload_runner(reload_store, reg)
+    try:
+        with caplog.at_level(logging.INFO):
+            await runner.start()
+        assert runner.outbound_failed("OB_DOWN") is not None
+        assert runner.outbound_failed("OB_UNSET_URL") is not None
+        assert "LK_DOWN" in runner.degraded_fhir_lookups()
+        assert _warned(caplog, "outbound 'OB_DOWN'") == 1
+        assert _warned(caplog, "FhirLookup 'LK_DOWN'") == 1
+        assert _warned(caplog, "outbound 'OB_UNSET_URL'") == 0
+        unread = [m for m in _messages(caplog) if _UNREAD in m]
+        assert unread == ["the url of outbound 'OB_UNSET_URL' " + _UNREAD]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await runner._ensure_destination_built("OB_DOWN")
+        assert "OB_DOWN" not in runner._destinations
+        assert _warned(caplog, "outbound 'OB_DOWN'") == 1
+    finally:
+        await runner.stop()

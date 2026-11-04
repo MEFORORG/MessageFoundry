@@ -1944,15 +1944,17 @@ count is above `0` (vault BACKLOG #2613).
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
-  again. At a start that logs it, each `FhirLookup` whose `url` resolved logs it once, before any
-  build, so the URL is named while the lookup is down, whether its build or another setting failed;
-  its failure is recorded and alerted. The exception is a lookup whose warning step itself raises:
-  it is degraded, with an ERROR line and no WARNING. A lookup whose `url` did not resolve has no
-  URL to read and logs none. The egress check logs it
-  before any of its refusals, so an outbound or a lookup that check refuses, for example over an
-  unlisted forward proxy, has logged it. An outbound that fails before that check, at least on an
-  unresolved `env()` value, logs none. An `env()` URL on a connection that logged none appears
-  nowhere until a later build or check logs it. There is also a
+  again. At a start that logs it, each outbound and each `FhirLookup` whose `url` resolved logs it
+  once, in one step before any build, and an operator start does the same for its outbound. So the
+  URL is named while the connection is down, whether its build or another setting failed, at least
+  on an unresolved `env()` value; its failure is recorded and alerted (BACKLOG #4997). The exception is a
+  connection whose warning step itself raises: a lookup is degraded and an outbound lane fails,
+  with an ERROR line or a failure record and no WARNING. A connection whose `url` did not resolve
+  has no URL to read and logs an INFO line saying so instead. Everywhere else the egress check
+  logs it, before any of its refusals, so an outbound or a lookup that check refuses, for example
+  over an unlisted forward proxy, has logged it. There, at least in a build check and a connection
+  test, an outbound or a lookup that fails before that check logs none. An `env()` URL on a
+  connection that logged none appears nowhere until a later build or check logs it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
