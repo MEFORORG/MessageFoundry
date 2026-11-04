@@ -2652,7 +2652,7 @@ def _read_environment_values(
     env_file = values_file_path(base_dir, dir_name, environment)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
-        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+        raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
     # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
     # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
     assert_trusted_start_paths(

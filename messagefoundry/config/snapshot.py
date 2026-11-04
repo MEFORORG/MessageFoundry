@@ -268,12 +268,14 @@ class ConfigSnapshot:
         value_file = Path(path)
         folder = self._folder_of(value_file)
         if folder is None:
-            raise NotInSnapshot(f"{value_file} is not in the config snapshot's environments folder")
+            raise NotInSnapshot(f"{value_file} is not a value file the config snapshot read")
         prefix = f"{folder}/"
         want = os.path.normcase(prefix + value_file.name)
         if any(rel == folder or os.path.normcase(rel) == want for rel in self.unreadable):
             raise OSError(errno.EACCES, "the config snapshot could not read this value file")
-        present = os.path.lexists(value_file)
+        # A regular file, following links, as a start judges it (``Path.is_file``) and as the
+        # snapshot read it: a folder or a dangling link by that name is no value file to either.
+        present = os.path.isfile(value_file)
         data = self.files.get(prefix + value_file.name)
         if data is None and present and os.path.normcase("A") != "A":
             # Windows names files without case, so the open of this path reads a file the listing
@@ -312,16 +314,18 @@ def with_value_file(
     bytes and a reload parses them (:meth:`ConfigSnapshot.environment_file`; vault BACKLOG #2596).
 
     ``value_file`` is the path a start reads, ``<base_dir>/<dir>/<env>.toml``, wherever
-    ``[environments].base_dir`` puts it; it is recorded made absolute. Returns ``snapshot`` itself
-    when ``value_file`` is ``None``, sits in the snapshot's ``environments/`` folder, which the
-    snapshot already read, or is the file the snapshot already holds. A file that is not there is
+    ``[environments].base_dir`` puts it; it is read and recorded by its resolved path. Returns
+    ``snapshot`` itself when ``value_file`` is ``None``, sits in the snapshot's ``environments/``
+    folder, which the snapshot already read, or is the file the snapshot already holds. A file that is not there is
     held as absent, so creating one changes the digest. With ``strict`` a fault reading it raises
     its ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. It is read as
     :func:`read_config_snapshot` reads a file, following links. Its access list is not vetted
     here: a caller that gates on the bytes vets the file and its folder before this read."""
     if value_file is None:
         return snapshot
-    path = Path(os.path.abspath(value_file))
+    # Resolved as an open resolves it, links before ``..``, so the file read here is the file a
+    # provider's open of the same path reads; ``abspath`` folds ``..`` as text and can name another.
+    path = Path(os.path.realpath(value_file))
     if snapshot.covers_environment_file(path):
         return snapshot
     files = {k: v for k, v in snapshot.files.items() if not k.startswith(_VALUE_FILE_PREFIX)}

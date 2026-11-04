@@ -4,6 +4,7 @@
   now reads it into the snapshot it loads, after vetting the file and its folder, folds it into the
   digest, and `serve` parses the values from those bytes. A dual-control release so checks and
   applies the same value bytes, and refuses a value file edited, created or removed since its
-  approval. The start's provenance digest folds it too, and the fingerprint scheme is now
+  approval. The start's provenance digest folds it too, read after the start resolved its values,
+  so it can name later bytes. The fingerprint scheme is now
   `mefor-cfg-fp:v4`, so a digest recorded before this change reads as not comparable rather than as
   a changed config. (vault `BACKLOG #2596`)

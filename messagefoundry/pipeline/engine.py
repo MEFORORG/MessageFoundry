@@ -2720,9 +2720,10 @@ class Engine:
         return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
 
     def _value_file(self) -> Path | None:
-        """The value file this engine's provider reads, which every config digest it takes folds
-        and a reload's snapshot holds, wherever ``[environments].base_dir`` puts it (vault
-        BACKLOG #2596). ``None`` for a provider that names none, or no provider."""
+        """The value file this engine's provider reads, wherever ``[environments].base_dir`` puts
+        it, which a reload's snapshot holds and at least the approval, reload, provenance and
+        start digests fold (vault BACKLOG #2596). ``None`` for a provider that names none, or no
+        provider."""
         provider = self._env_values_provider
         if isinstance(provider, SnapshotEnvValuesProvider):
             return provider.value_file
@@ -2735,13 +2736,17 @@ class Engine:
         inventory scanner, which does not follow ``asyncio.to_thread``, keeps the hash on its record."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
+        # Each keyword only when set, so a call with neither is the plain one it always was.
+        kwargs: dict[str, Any] = {}
+        if snapshot is not None:
+            kwargs["snapshot"] = snapshot
+        value_file = self._value_file()
+        if value_file is not None:
+            kwargs["value_file"] = value_file
         try:
             # A direct call, so the crypto inventory scanner, which follows a call it can see,
             # keeps the hash on its record. A snapshot that holds the value file is not read again.
-            detail = config_fingerprint_detail(
-                path, snapshot=snapshot, value_file=self._value_file()
-            )
-            return detail, None
+            return config_fingerprint_detail(path, **kwargs), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)
@@ -2820,16 +2825,6 @@ class Engine:
 
         try:
             snapshot = read_trusted_snapshot(path, strict=True)
-            if value_file is None or snapshot.covers_environment_file(value_file):
-                return snapshot
-            # Vetted before it is read, as the config directory is: the bytes read here are the
-            # ones a reload applies (vault BACKLOG #2596, step 4).
-            assert_trusted_start_paths(
-                [value_file],
-                lead="refusing to read environment values from",
-                folders=[value_file.parent],
-            )
-            return with_value_file(snapshot, value_file, strict=True)
         except ConfigDirMissing:
             raise
         except OSError as exc:
@@ -2839,9 +2834,28 @@ class Engine:
                 "config content digest failed for %s: %s. The reload's snapshot could not be "
                 "read whole, so a released reload is refused. Any other reload reads the "
                 "directory again and refuses any file the load reads that it cannot read, every "
-                "*.py module and helper included; only the environments folder, its files and "
-                "the environment value file are left out",
+                "*.py module and helper included; only the environments folder and its files "
+                "are left out",
                 scrub_log_argument(str(path)),
+                safe_exc(exc),
+            )
+            return None
+        if value_file is None or snapshot.covers_environment_file(value_file):
+            return snapshot
+        try:
+            # Vetted before it is read, as the config directory is: the bytes read here are the
+            # ones a reload applies (vault BACKLOG #2596, step 4).
+            assert_trusted_start_paths(
+                [value_file],
+                lead="refusing to read environment values from",
+                folders=[value_file.parent],
+            )
+            return with_value_file(snapshot, value_file, strict=True)
+        except OSError as exc:
+            log.warning(
+                "environment value file %s could not be read into the reload's snapshot: %s. "
+                "A released reload is refused; any other reload reads the values from disk",
+                scrub_log_argument(str(value_file)),
                 safe_exc(exc),
             )
             return None

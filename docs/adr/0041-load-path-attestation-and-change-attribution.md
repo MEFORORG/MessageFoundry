@@ -121,13 +121,15 @@ by its resolved path is the remainder of #2596 step 1. The `v2` text above is ke
 what was decided on its date.
 *Amended 2026-11-03 (vault BACKLOG #2596, the rest of step 1): the scheme is now `mefor-cfg-fp:v4`.*
 The value file the engine's value provider reads, `<base_dir>/<dir>/<env>.toml` resolved wherever
-`[environments].base_dir` puts it, is folded into every config digest the engine takes, as
-`@value-file/<env>.toml` when it is outside the config directory's `environments/` folder: the file
-name and not the path, so the digest stays independent of where the bundle sits. A reload reads it
-into the snapshot it loads, after vetting the file and its folder, and the provider parses those
-bytes, so a dual-control release checks and applies the same value bytes. A sandbox worker is not
-sent it: it resolves no value. The `v3` text above is kept as the record of what was decided on its
-date.
+`[environments].base_dir` puts it, is read by the path an open resolves and folded into at least
+the approval, reload, provenance and start digests, as `@value-file/<env>.toml` when it is outside
+the config directory's `environments/` folder: the file name and not the path, so the digest stays
+independent of where the bundle sits. A reload reads it into the snapshot it loads, after vetting
+the file and its folder, and the provider parses those bytes, so a dual-control release checks and
+applies the same value bytes. A start still reads its values when the engine is built, so the start
+digest reads the file again afterwards and can name later bytes. The DR backup digest describes
+the archive and does not fold it. A sandbox worker is not sent it: it resolves no value. The `v3`
+text above is kept as the record of what was decided on its date.
 
 This binds "reviewed-and-merged in git" to "what actually loaded," makes two reloads with different
 on-disk code distinguishable, defeats attribution-laundering (the audit now shows *which code* a given

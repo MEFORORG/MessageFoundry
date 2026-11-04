@@ -140,7 +140,7 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
             _log.info(
                 "environment value file %s is outside the config snapshot; the reload reads it "
                 "from disk",
-                values_file_path(self.base_dir, self.dir_name, self.environment),
+                self.value_file,
             )
             return None
 

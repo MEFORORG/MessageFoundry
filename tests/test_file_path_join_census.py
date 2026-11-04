@@ -585,7 +585,7 @@ SITES: dict[str, Site] = {
         "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
     ),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
-    "messagefoundry/config/snapshot.py::ConfigSnapshot.covers_environment_file": Site(
+    "messagefoundry/config/snapshot.py::ConfigSnapshot._folder_of": Site(
         1, OPERATOR, _CONFIG_FIXED
     ),
     "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),

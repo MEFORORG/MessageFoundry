@@ -26,7 +26,7 @@ from messagefoundry.config.snapshot import (
     read_config_snapshot,
     with_value_file,
 )
-from messagefoundry.config.wiring import WiringError
+from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.engine import Engine
 from tests.test_dual_control_reload import (
@@ -88,11 +88,40 @@ def test_the_snapshot_holds_the_bytes_it_read_and_answers_them_after_an_edit(
     cfg, value_file = _layout(tmp_path)
     snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
     value_file.write_text(_UNREVIEWED, encoding="utf-8")
-    assert snapshot.value_file == value_file.absolute()
+    assert snapshot.value_file == value_file.resolve()
     assert snapshot.covers_environment_file(value_file)
     assert snapshot.environment_file(value_file) == _APPROVED.encode()
     # Another file in the same folder is not covered.
     assert not snapshot.covers_environment_file(value_file.with_name("prod.toml"))
+
+
+def test_a_folder_named_like_the_value_file_is_no_value_file_as_a_start_judges_it(
+    tmp_path: Path,
+) -> None:
+    cfg, value_file = _layout(tmp_path, None)
+    value_file.mkdir()
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+    assert snapshot.environment_file(value_file) is None
+
+
+def test_the_value_file_is_read_by_the_path_an_open_resolves(tmp_path: Path) -> None:
+    """A link before ``..`` resolves first, as an open resolves it, so the snapshot reads the file
+    a provider of the same path reads, not the one ``..`` names as text."""
+    cfg, _ = _layout(tmp_path)
+    real = tmp_path / "releases" / "42" / "project"
+    real.mkdir(parents=True)
+    (real.parent / "environments").mkdir()
+    (real.parent / "environments" / "dev.toml").write_bytes(b'HOST = "linked"\n')
+    link = tmp_path / "current"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account cannot create a directory link")
+    via = link / ".." / "environments" / "dev.toml"
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), via, strict=True)
+    # The bytes an open of the same path reads: on POSIX the linked file, while Windows folds
+    # ``..`` before it opens, and ``realpath`` there does the same.
+    assert snapshot.environment_file(via) == via.read_bytes()
 
 
 def test_a_value_file_in_the_config_directory_is_not_read_twice(tmp_path: Path) -> None:
@@ -252,7 +281,7 @@ async def test_a_value_file_edited_before_the_release_is_refused_as_not_approved
 
 
 async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_applies(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """Before, the provider read the file from disk after the check, and the edited values applied
     under the approved digest."""
@@ -266,6 +295,8 @@ async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_app
         return snapshot
 
     approved_values = {"host": "approved.example.invalid"}
+    # Its own patcher, so the control below undoes this patch and nothing else.
+    edit = pytest.MonkeyPatch()
     try:
         assert cast(Any, engine)._env_values == approved_values
         service = await _service(engine)
@@ -273,7 +304,7 @@ async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_app
             engine,
             service,
             {},
-            between=lambda: monkeypatch.setattr(
+            between=lambda: edit.setattr(
                 Engine, "_reload_snapshot_blocking", staticmethod(_read_then_edit)
             ),
         )
@@ -287,10 +318,11 @@ async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_app
             approved["fingerprint"]
         ]
         # The control: a reload that reads afresh applies the edited file.
-        monkeypatch.undo()
+        edit.undo()
         await engine.reload_detail(dry_run=False)
         assert cast(Any, engine)._env_values == {"host": "unreviewed.example.invalid"}
     finally:
+        edit.undo()
         await engine.stop()
 
 
@@ -304,7 +336,11 @@ async def test_the_start_digest_folds_the_value_file_as_a_reload_does(tmp_path: 
         assert reloaded is not None
         assert reloaded["fingerprint"] == config_fingerprint(cfg, value_file=value_file)
         assert reloaded["fingerprint"] == await engine.reload_target_digest(None)
-        bundle, reason = await engine.fingerprint_bundle(cfg)
+        # The start's shape: capture_start_provenance digests the start load's snapshot, which
+        # holds no value file from outside the config directory, so the digest reads it in.
+        start_snapshot = load_config(cfg).config_snapshot
+        assert start_snapshot is not None and start_snapshot.value_file is None
+        bundle, reason = await engine.fingerprint_bundle(cfg, start_snapshot)
         assert reason is None and bundle is not None
         assert bundle["fingerprint"] == reloaded["fingerprint"]
     finally:
