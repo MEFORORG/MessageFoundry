@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -46,6 +46,7 @@ from messagefoundry.api.tls import (
     _generated_pair,
     build_api_ssl_context,
     ensure_api_tls_material,
+    plaintext_upstream_hop_off_loopback_remedy,
 )
 from messagefoundry.api.tls_client_cert import (
     ISSUER_INDEX_ATTR,
@@ -1531,7 +1532,11 @@ def _run_posture_b(
     env: str,
     key: bool = True,
     probe: Callable[[str], Any] = lambda origin: _PassingProbe(),
+    attest: bool | None = None,
+    extra_args: Sequence[str] = (),
 ) -> int:
+    """``attest`` None attests revocation exactly when the TOML carries a certificate (below);
+    True or False sets or clears the attestation by hand. ``extra_args`` follow ``serve``'s own."""
     monkeypatch.chdir(tmp_path)
     if key:
         monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
@@ -1551,12 +1556,16 @@ def _run_posture_b(
     # no longer exempts an off-loopback operator certificate from the ADR 0078 revocation gate, so a
     # case whose TOML carries one (`_posture_b_toml`'s cert branch) attests revocation, as a
     # deployment of that shape must. The gate reads the attestation only for in-process TLS.
-    api_table = tomllib.loads((tmp_path / "messagefoundry.toml").read_text(encoding="utf-8")).get(
-        "api", {}
-    )
-    if api_table.get("tls_cert_file"):
+    if attest is None:
+        api_table = tomllib.loads(
+            (tmp_path / "messagefoundry.toml").read_text(encoding="utf-8")
+        ).get("api", {})
+        attest = bool(api_table.get("tls_cert_file"))
+    if attest:
         monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
-    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
+    else:
+        monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env, *extra_args])
 
 
 def test_serve_refuses_posture_b_prod_without_intra_service_auth(
@@ -1758,8 +1767,9 @@ def test_serve_refuses_a_plaintext_hop_off_loopback_acknowledged_or_not(
     err = capsys.readouterr().err
     assert _OFF_LOOPBACK_REFUSAL in err
     assert f"{host!r}" in err
-    assert "[api].plaintext_upstream_hop_acknowledged accepts it only" in err
-    assert "point the proxy at https" in err
+    assert "accepts only on a loopback bind" in err
+    # The remedy sentence the next test drives to a start, word for word.
+    assert plaintext_upstream_hop_off_loopback_remedy(_SERVE_LOOPBACK_LEVERS) in err
     # Checked first, so an unacknowledged hop is not told to set an acknowledgement that would
     # then be refused.
     assert "without [api].plaintext_upstream_hop_acknowledged" not in err
@@ -1776,6 +1786,126 @@ def test_serve_starts_an_acknowledged_plaintext_hop_on_every_loopback_spelling(
     captured = capsys.readouterr()
     assert _OFF_LOOPBACK_REFUSAL not in captured.err
     assert "AUDIT: [api].plaintext_upstream_hop_acknowledged=true" in captured.out
+
+
+#: The loopback levers serve's off-loopback plaintext-hop refusal names. The remedy sentence itself
+#: comes from plaintext_upstream_hop_off_loopback_remedy, the one source serve and the check share.
+_SERVE_LOOPBACK_LEVERS = "[security].listen_address or serve --host"
+
+
+@pytest.mark.parametrize("enforcement", ["enforce", "warn"])
+@pytest.mark.parametrize(
+    ("ack", "host", "extra", "cert"),
+    [
+        (True, "127.0.0.1", (), False),
+        (True, "0.0.0.0", ("--host", "127.0.0.1"), False),
+        (False, "0.0.0.0", (), True),
+    ],
+    ids=["listen_address", "serve --host", "certificate"],
+)
+def test_serve_starts_once_the_off_loopback_plaintext_hop_remedy_is_applied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    enforcement: str,
+    ack: bool,
+    host: str,
+    extra: tuple[str, ...],
+    cert: bool,
+) -> None:
+    # The refusal is only as good as the remedy it names: each one, applied to the config the refusal
+    # test above refuses and nothing else, must start. The certificate arm attests revocation (the
+    # _run_posture_b default for a TOML carrying a certificate), which the remedy names because off
+    # loopback the certificate alone meets the ADR 0078 revocation gate; the next test shows that.
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        enforcement=enforcement,
+        ack=ack,
+        auto_cert=False,
+        listen_address=host,
+        cert=_self_signed(tmp_path) if cert else None,
+    )
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod", extra_args=extra)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _OFF_LOOPBACK_REFUSAL not in err
+
+
+def test_the_certificate_remedy_needs_the_revocation_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control for the certificate arm above: without the attestation the revocation gate refuses.
+    _posture_b_toml(
+        tmp_path,
+        intra="network",
+        floor="1.2",
+        ack=False,
+        auto_cert=False,
+        cert=_self_signed(tmp_path),
+    )
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod", attest=False) == 2
+    assert "in-process TLS on non-loopback" in capsys.readouterr().err
+
+
+def test_the_phi_read_refusal_names_the_loopback_and_certificate_remedies() -> None:
+    from fastapi import FastAPI
+
+    from messagefoundry.api.security import enforce_phi_read_hop
+    from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV, HopDisposition
+
+    app = FastAPI()
+    app.state.phi_read_hop_disposition = HopDisposition.REFUSE
+    with pytest.raises(HTTPException) as refused:
+        enforce_phi_read_hop(Request({"type": "http", "app": app}))
+    detail = str(refused.value.detail)
+    for spelling in (
+        _SERVE_LOOPBACK_LEVERS,
+        "[api].tls_cert_file",
+        f"{TLS_REVOCATION_ATTESTED_ENV}=1",
+    ):
+        assert spelling in detail, detail
+
+
+_OFF_LOOPBACK_SYNTHETIC_TOML = _SYNTHETIC_LOOPBACK_TOML.replace(
+    "security.local_access_only = true\n", "security.local_access_only = false\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("listen", "cert", "extra"),
+    [
+        ("127.0.0.1", False, ()),
+        ("0.0.0.0", False, ("--host", "127.0.0.1")),
+        ("0.0.0.0", True, ()),
+    ],
+    ids=["listen_address", "serve --host", "certificate + attestation"],
+)
+def test_each_phi_read_remedy_starts_with_a_secure_serve_hop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    listen: str,
+    cert: bool,
+    extra: tuple[str, ...],
+) -> None:
+    # Each remedy the PHI-read 403 names, applied to an off-loopback config serve refuses, must start
+    # AND hand create_managed_app a serve hop it counts as secure, which is what keeps the 403 away.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    refused = f'{_OFF_LOOPBACK_SYNTHETIC_TOML}security.listen_address = "0.0.0.0"\n'
+    (tmp_path / "messagefoundry.toml").write_text(refused, encoding="utf-8")
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
+    toml = f'{_OFF_LOOPBACK_SYNTHETIC_TOML}security.listen_address = "{listen}"\n'
+    if cert:
+        cert_file, key_file = _self_signed(tmp_path)
+        toml += (
+            f'[api]\ntls_cert_file = "{cert_file.as_posix()}"\n'
+            f'tls_key_file = "{key_file.as_posix()}"\n'
+        )
+        monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    handed, _ = _serve_capturing(tmp_path, monkeypatch, toml, extra)
+    assert handed["phi_read_hop_secure"] is True
 
 
 @pytest.mark.parametrize(

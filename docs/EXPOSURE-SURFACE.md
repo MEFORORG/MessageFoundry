@@ -91,8 +91,8 @@ Each one is in `_serve` in `messagefoundry/__main__.py`.
 |---|---|
 | Sign-in off | Authentication disabled, on any bind, loopback included (vault BACKLOG #2719). No setting turns it off; a config that sets the removed `[security].require_sign_in` key is refused at load, before this guard |
 | Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator |
-| Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate, with or without a declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set (BACKLOG #4636) |
-| Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true. On a non-loopback bind it refuses even then (BACKLOG #4636) |
+| Certificate revocation | The rule [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate) states |
+| Plaintext proxy hop | The rule [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) states |
 | Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version`. Behind a proxy named in `[api].trusted_proxies` with no declared terminator, the same bind refuses when it lacks `[api].proxy_tls_min_version` (vault BACKLOG #3538) |
 | Proxy TLS-floor probe | Applies under `enforce`, behind a declared TLS terminator or a proxy named in `[api].trusted_proxies`, on any bind (ASVS 12.1.1). It refuses an unset `[security].web_console_public_address`. It also refuses a front door at that address that it cannot reach, that accepts TLS 1.0 or 1.1, or that does not negotiate TLS 1.3. The `trusted_proxies` shape joined in vault BACKLOG #3538 |
 | Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. The `egress_open` expression in `_serve` holds the rule |

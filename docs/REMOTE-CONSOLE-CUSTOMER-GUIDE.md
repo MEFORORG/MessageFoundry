@@ -87,6 +87,9 @@ Notes:
   `MEFOR_API_TLS_KEY_PASSWORD` — never put it in the file.
 - The engine **will refuse to start** if you open it to the network **without** a certificate (this
   protects you from accidentally sending credentials in clear text).
+- Opened to the network with a certificate, the engine also needs the environment variable
+  `MEFOR_TLS_REVOCATION_ATTESTED=1` on the service. `SECURITY.md`, *API revocation gate*, says what
+  setting it means.
 
 Open the firewall on the chosen port (default **8765/TCP**) so remote PCs can reach the server, then
 **restart the MessageFoundry service** for the change to take effect.
@@ -95,13 +98,13 @@ Open the firewall on the chosen port (default **8765/TCP**) so remote PCs can re
 > instead, set `tls_terminated_upstream = true` and list the proxy's address in
 > `trusted_proxies = ["..."]` under `[api]`, and have the proxy forward to the engine. Also set
 > `plaintext_upstream_hop_acknowledged = true` under `[api]`: the link from the proxy to the engine
-> is not encrypted, so keeping it private is your job, and the engine will not start until you
-> confirm that. That unencrypted link is allowed only with the proxy on this same server and the
-> engine kept on loopback: leave out `local_access_only = false` and `listen_address`, and list
+> is not encrypted, so keeping it private is your job. Keep the proxy on this same server and the
+> engine on loopback: leave out `local_access_only = false` and `listen_address`, and list
 > `127.0.0.1` in `trusted_proxies`, since that is the address the proxy connects from. For a proxy
-> on another machine, keep the certificate settings above, leave out
-> `plaintext_upstream_hop_acknowledged`, and have the proxy connect to the engine over https. See the
-> technical reference (`REMOTE-CONSOLE.md`) for details.
+> on another machine, keep the certificate settings above and the revocation variable, leave out
+> `plaintext_upstream_hop_acknowledged`, and have the proxy connect to the engine over https.
+> `SECURITY.md`, *Plaintext proxy hop*, has the rule, and the technical reference
+> (`REMOTE-CONSOLE.md`) the details.
 
 ---
 

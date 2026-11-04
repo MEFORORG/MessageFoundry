@@ -1010,29 +1010,12 @@ def in_process_tls_revocation_refused(
 ) -> bool:
     """Whether ``serve`` must REFUSE an in-process off-loopback ``[api]`` TLS bind on revocation grounds.
 
-    The **ENFORCED** (not merely documented) delegation of certificate revocation (ASVS 12.1.4, ADR
-    0078). When the engine terminates TLS itself (uvicorn, ``tls_enabled``) on a network-reachable host
-    (``not is_loopback``), a **revoked-but-unexpired** certificate would still be accepted — stdlib
-    ``ssl`` performs no OCSP/CRL check and the engine deliberately attempts none (on-prem, offline-by-
-    default; CLAUDE.md §2 / ADR 0002). So refuse to start UNLESS ``attested``: the operator's explicit
-    :data:`TLS_REVOCATION_ATTESTED_ENV` claim that the certificates this terminator serves and accepts
-    are backed by a revocation-checking PKI (the opt-out).
-
-    **A declared upstream terminator does not exempt the bind** (BACKLOG #4636, Manager decision
-    d20261104T080839080-981796). Off loopback, ``serve`` refuses a plaintext proxy-to-engine hop, so a
-    terminator in front of an off-loopback bind means the engine terminates TLS itself on that hop,
-    with an operator certificate and, under mTLS, a client certificate it accepts. The WP-15
-    declaration says a proxy terminates the browser's hop. It does not attest that the proxy checks
-    the revocation of the engine's certificate on the hop behind it, and the engine cannot observe
-    whether it does, so only the attestation clears the bind.
-
-    Exempt, and starting **byte-identically**: any loopback bind (``is_loopback``, whatever it
-    serves, the loopback plaintext terminator included); an attested bind; and a bind with no
-    operator certificate (``not tls_enabled``). Off loopback that last case is the engine's minted
-    self-signed placeholder, which only ``[security].enforcement = warn`` with
-    ``--allow-insecure-bind`` (or ``require_encryption_for_remote = false``) starts; no PKI issued
-    it, so there is nothing to revoke. Pure predicate
-    so the ``_serve`` gate stays a one-liner and is unit-testable in isolation."""
+    The enforced half of ADR 0078 (ASVS 12.1.4): True for an ``[api].tls_cert_file`` bind
+    (``tls_enabled``) on a host that is not loopback, unless ``attested`` (the operator's
+    :data:`TLS_REVOCATION_ATTESTED_ENV`). It reads nothing else, so a declared upstream terminator
+    does not exempt the bind (BACKLOG #4636, Manager decision d20261104T080839080-981796). The rule
+    and its reasons are stated once, in docs/SECURITY.md, *API revocation gate*. Pure predicate so the
+    ``_serve`` gate stays a one-liner and is unit-testable in isolation."""
     return tls_enabled and not is_loopback and not attested
 
 

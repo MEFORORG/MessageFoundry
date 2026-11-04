@@ -3543,6 +3543,7 @@ def _check_upstream_hop_ack(
     from messagefoundry.api.tls import (
         api_tls_source,
         plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_off_loopback_remedy,
         plaintext_upstream_hop_unacknowledged,
     )
     from messagefoundry.config.settings import settings_error_detail
@@ -3579,10 +3580,10 @@ def _check_upstream_hop_ack(
             detail=(
                 "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
                 f"proxy-to-engine hop in plaintext on the non-loopback API bind host {api.host!r}, "
-                "and [api].plaintext_upstream_hop_acknowledged accepts that hop only with the "
-                "engine bound to loopback -- serve would refuse to start (exit 2, in every "
-                "enforcement mode). Bind the engine to loopback, or set [api].tls_cert_file "
-                "(see docs/SECURITY.md)"
+                "which serve accepts only on a loopback bind, acknowledged or not -- serve would "
+                "refuse to start (exit 2, in every enforcement mode). "
+                f"{plaintext_upstream_hop_off_loopback_remedy('[security].listen_address')} (see "
+                "docs/SECURITY.md, Plaintext proxy hop)"
             ),
         )
     if plaintext_upstream_hop_unacknowledged(api):
@@ -3595,7 +3596,7 @@ def _check_upstream_hop_ack(
                 "proxy-to-engine hop in plaintext, and [api].plaintext_upstream_hop_acknowledged "
                 "is not set -- serve would refuse to start (exit 2, in every enforcement mode). "
                 "Set the acknowledgement once your site secures that hop, or set "
-                "[api].tls_cert_file (see docs/SECURITY.md)"
+                "[api].tls_cert_file (see docs/SECURITY.md, Plaintext proxy hop)"
             ),
         )
     source = api_tls_source(

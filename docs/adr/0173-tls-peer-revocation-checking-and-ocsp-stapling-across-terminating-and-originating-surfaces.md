@@ -276,8 +276,8 @@ false-premise defect:
    and the declaration does not attest that the proxy checks that certificate's revocation. Such a
    bind now needs
    `MEFOR_TLS_REVOCATION_ATTESTED`. A plaintext proxy-terminated bind exists only on loopback, and
-   it still never trips the refusal. The predicate's docstring in `config/tls_policy.py` is the
-   source of record. The item keeps its original wording.)*
+   it still never trips the refusal. docs/SECURITY.md, *API revocation gate*, states the rule. The
+   item keeps its original wording.)*
 3. **Terminating mTLS listeners — `check_inbound_revocation`** (`pipeline/wiring_runner.py:6779`,
    body `:6800-6826`). Refuses an mTLS listener that verifies client certificates with no
    `tls_crl_file`, on an enforcing production-PHI instance.

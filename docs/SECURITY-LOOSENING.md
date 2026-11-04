@@ -355,16 +355,13 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **When acceptable:** a real remote-operations need, on a trusted/segmented network, with TLS.
 - **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
   revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`) for the
-  browser's hop. Off box that does not stand in for revocation of the engine's own certificate: the
-  bind still needs `MEFOR_TLS_REVOCATION_ATTESTED=1` (BACKLOG #4636). A managed admin host / mTLS
+  browser's hop; it does not clear the [API revocation gate](SECURITY.md#api-revocation-gate). A managed admin host / mTLS
   (OFF-LOOPBACK-DEPLOYMENT.md).
-- **Still refused:** an off-box bind with no operator certificate, with or without a declared
-  TLS-terminating proxy (BACKLOG #4636).
+- **Still refused:** an off-box bind with no operator certificate.
   The engine's self-signed placeholder does not count. Under the default `enforce`, nothing lifts this.
   With no declared proxy, under `[security].enforcement = warn`, `require_encryption_for_remote = false`
   (below) or `--allow-insecure-bind` lets the bind serve on the placeholder. With a declared proxy,
-  nothing lifts it in any mode: the engine mints no placeholder there, and `serve` refuses the
-  plaintext hop.
+  [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) applies instead.
 - **`serve --host <non-loopback>` counts as this deviation**, even with no `[security]` block in the file.
   The flag is merged after the `[security]` desugar so it wins over the config, and the loader then folds
   the effective bind back into the posture view: `local_access_only` reads `false` and `listen_address`
@@ -428,8 +425,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) has the rule). With an operator
   certificate, no proxy and no address, this check only warns: the `/ui` origin checks then use the
   request Host, and passkeys fail closed until the address is set. Other gates can still refuse that
-  start, at least the in-process TLS revocation gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and
-  MFA-at-exposure.
+  start, at least the [API revocation gate](SECURITY.md#api-revocation-gate) and MFA-at-exposure.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
@@ -710,7 +706,7 @@ is refused, so an opt-out does nothing and is not reported.
   **AUDIT** line is a gate's own, and not every gate writes one at `warn`: [*The switches*](#the-switches)
   says so.
 - **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
-  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
+  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. So are the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals and the [API revocation gate](SECURITY.md#api-revocation-gate), which read no enforcement level. `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
@@ -1414,12 +1410,11 @@ count is above `0` (vault BACKLOG #2613).
   decision 3). So the hop from the proxy to the engine is **plaintext**, and the engine does nothing to
   protect it. At least sign-in credentials, session tokens and PHI reads cross that hop unencrypted.
 - **When acceptable:** only on a same-host loopback hop, with the proxy on the engine's machine and
-  the engine bound to loopback. Without the acknowledgement, `serve` refuses this topology in every
-  mode (BACKLOG #1179). Off loopback it refuses the plaintext hop even with it (BACKLOG #4636;
-  [SECURITY.md](SECURITY.md) states the rule).
+  the engine bound to loopback. [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)
+  states when `serve` refuses it.
 - **Compensating controls:** set `[api].tls_cert_file` so the engine serves that hop over TLS, and point
-  the proxy at https with that certificate trusted. Off loopback that bind is in-process TLS, so it
-  also needs `MEFOR_TLS_REVOCATION_ATTESTED=1` ([SECURITY.md](SECURITY.md)). Short of that, the
+  the proxy at https with that certificate trusted; off loopback the
+  [API revocation gate](SECURITY.md#api-revocation-gate) then applies. Short of that, the
   same-host proxy that `serve` already requires is the only isolation. Isolation limits who can read the hop; it does not
   encrypt it.
 - **Visibility:** each start with the acknowledgement honoured writes a WARNING-level startup **AUDIT**

@@ -28,6 +28,7 @@ from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
+    TLS_REVOCATION_ATTESTED_ENV,
     apply_operator_tls_ciphers,
     harden_cipher_suites,
     harden_crl_check,
@@ -323,6 +324,21 @@ def plaintext_upstream_hop_off_loopback(api: ApiSettings) -> bool:
     ``messagefoundry check``.
     """
     return api.serves_plaintext_upstream_hop and not api.is_loopback
+
+
+def plaintext_upstream_hop_off_loopback_remedy(loopback_lever: str) -> str:
+    """The two ways out of the :func:`plaintext_upstream_hop_off_loopback` refusal, as one sentence.
+
+    ``serve`` and the ``upstream-hop-ack`` check leg both print it, so the remedies cannot drift
+    apart. ``loopback_lever`` names how to bind loopback: ``serve`` adds ``serve --host``, which the
+    check, reading only the file's bind host, cannot see. The certificate remedy names the revocation
+    attestation because off loopback that bind is in-process TLS (docs/SECURITY.md, *API revocation
+    gate*)."""
+    return (
+        f"Either bind the engine to loopback ({loopback_lever}) and set "
+        "[api].plaintext_upstream_hop_acknowledged = true, or set [api].tls_cert_file and "
+        f"{TLS_REVOCATION_ATTESTED_ENV}=1 and point the proxy at https"
+    )
 
 
 @dataclass(frozen=True)

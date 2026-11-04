@@ -457,13 +457,13 @@ below are what you do about it. Complete this checklist **before any real PHI fl
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
       `tls_min_version` ≥ 1.2, opt-in mTLS via `tls_client_ca_file`) **or** front it with a TLS terminator
-      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`, plus the required
-      `[api].plaintext_upstream_hop_acknowledged = true` when no `[api].tls_cert_file` is set: the
-      proxy-to-engine hop is then plaintext and securing it is your job, and it is accepted only with
-      the proxy on the same machine and the engine on loopback, BACKLOG #4636). Without a terminator the engine
+      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`; with no `[api].tls_cert_file`
+      the proxy-to-engine hop is plaintext, on the rule
+      [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) states). Off loopback a
+      certificate also needs `MEFOR_TLS_REVOCATION_ATTESTED=1`
+      ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)). Without a terminator the engine
       serves TLS anyway, but with no operator certificate it uses a self-signed placeholder. So a
-      non-loopback bind **without** an operator certificate (or a trusted terminator) is **refused at
-      startup**. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it
+      non-loopback bind **without** an operator certificate is **refused at startup**. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it
       works only under `[security].enforcement = warn`. It serves bearer tokens and PHI behind that
       placeholder. No trust store vouches for the placeholder. So an on-path attacker can pose as the
       engine to any client that has not pinned it.

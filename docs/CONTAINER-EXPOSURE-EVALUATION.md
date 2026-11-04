@@ -55,7 +55,7 @@ operational notes.
 | MFA-at-exposure gate | [`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block | Exposed (a non-loopback bind, a declared TLS-terminating proxy, or a set `[api].trusted_proxies`, vault BACKLOG #2251) + **not** `require_mfa`: **refuse** under `[security].enforcement = enforce`, the default, unless `[security].allow_single_factor_admin_when_exposed` is set; **warn** otherwise. It reads neither the PHI tier nor the kind of account. `require_mfa` gates every account `[security].require_mfa_scope` covers -- `every_local_account` by default, directory accounts included (BACKLOG #1144). |
 | MLLP-over-TLS (WP-13b) | [`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_mllp_ssl_context`; `MLLP(...)` in [`config/wiring.py`](../messagefoundry/config/wiring.py) | Per-connection `tls=true`. Inbound presents `tls_cert_file`/`tls_key_file`; `tls_ca_file` opts into mTLS (`CERT_REQUIRED`). Outbound verifies the peer (`tls_verify=true` default; `false` refused unless `MEFOR_ALLOW_INSECURE_TLS`), optional client cert. `start_server(ssl=)` / `open_connection(ssl=, server_hostname=)`. TLS 1.2+. |
 | MLLP exposed gate | [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) `check_mllp_tls_exposure` | A non-loopback MLLP listener **without** `tls=true` raises `WiringError` at wiring time (before start); a per-connection `tls_hop_attested`, with its mandatory `tls_hop_attested_reason`, permits it with a warning. `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) does the same only under `[security].enforcement = warn`, and is inert under the default `enforce`. Loopback or `tls=true` pass. Sibling `check_dimse_tls_exposure` covers DICOM SCP. |
-| Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips`, built by `uvicorn_trusted_hosts` in [`__main__.py`](../messagefoundry/__main__.py) `_serve` | Off loopback `tls_terminated_upstream` passes the gate only beside an operator `tls_cert_file` (a plaintext proxy-to-engine hop there is **refused**, acknowledged or not, BACKLOG #4636), and the model validator **requires** `trusted_proxies` to be set with it. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). With no `[api].tls_cert_file`, the proxy-to-engine hop is plaintext, and serve **refuses** in every enforcement mode unless `[api].plaintext_upstream_hop_acknowledged = true` records that the deploying site has taken that hop on. The acknowledgement secures nothing, and nothing verifies that the hop is secured (BACKLOG #1179). What the engine serves on that hop: [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md). |
+| Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips`, built by `uvicorn_trusted_hosts` in [`__main__.py`](../messagefoundry/__main__.py) `_serve` | The model validator **requires** `trusted_proxies` to be set with `tls_terminated_upstream`. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). When `serve` accepts a plaintext proxy-to-engine hop: [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop). What the engine serves on that hop: [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md). |
 | TOTP MFA (WP-14) | ADR 0002 §3; `[security].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP; access gate on every authorized route; admin reset; recovery codes. Built 2026-06-17. |
 | Cert-expiry monitor | [`pipeline/cert_expiry.py`](../messagefoundry/pipeline/cert_expiry.py); `[cert_monitor]` in [`config/settings.py`](../messagefoundry/config/settings.py) | Engine-owned asyncio task (started in `Engine.start`). `certs_from_registry` watches the `[api]` cert + every connection `tls_cert_file`; reads `notAfter` only (never the key); `warn_days` default 30, 12 h cadence; raises a `cert_expiry` AlertSink event. |
 | Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
@@ -80,7 +80,7 @@ the gate. The right topology depends on the orchestrator.
 |---|---|---|---|
 | **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443` | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
 | **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` + `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055) | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
-| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS, re-encrypted** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP>]` + an operator `tls_cert_file` the proxy trusts, so the proxy-to-engine hop is TLS (a plaintext hop is refused off loopback, BACKLOG #4636), plus `MEFOR_TLS_REVOCATION_ATTESTED=1`, because that bind is in-process TLS; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
+| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS, re-encrypted** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP>]` + an operator `tls_cert_file` the proxy trusts + `MEFOR_TLS_REVOCATION_ATTESTED=1` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and [API revocation gate](SECURITY.md#api-revocation-gate) say why); do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
 
 ### The three options, justified
 
@@ -90,8 +90,7 @@ the gate. The right topology depends on the orchestrator.
   it and go" and for the byte-identical multi-instance rollout ADR 0017 wants.
 
 - **(b) Sidecar / ingress reverse proxy (WP-15) — first-class alternative.** Keep the engine
-  behind a TLS terminator. It may speak `http` to that terminator only over the pod's own loopback.
-  Two sub-cases:
+  behind a TLS terminator. Two sub-cases:
   - **Same pod / shared netns (recommended for k8s):** the sidecar reaches the engine on `127.0.0.1`,
     so the engine stays **loopback-bound** and the gate never even trips. Still set
     `trusted_proxies=[127.0.0.1]` so the audit/rate-limit source IP is the real client from
@@ -108,8 +107,9 @@ the gate. The right topology depends on the orchestrator.
     the engine restarts until it does.
   - **Separate container, different netns:** the engine binds the internal interface (off-loopback),
     so you **must** set `tls_terminated_upstream=true` + `trusted_proxies`, plus an operator
-    `tls_cert_file` the proxy trusts and connects to over https. `serve` refuses a plaintext
-    proxy-to-engine hop off loopback, acknowledged or not (BACKLOG #4636). Do not publish the engine's port to the host.
+    `tls_cert_file` the proxy trusts and connects to over https, and `MEFOR_TLS_REVOCATION_ATTESTED=1`.
+    [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and
+    [API revocation gate](SECURITY.md#api-revocation-gate) say why. Do not publish the engine's port to the host.
 
 - **(c) "Loopback-only publish" — does the guard still trip? Yes (mostly).** Publishing to
   `-p 127.0.0.1:8765:8765` only narrows *who on the host* can reach the port; the engine inside the
@@ -135,9 +135,9 @@ bind host is all that matters.
 
 | Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
-| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`), plus `MEFOR_TLS_REVOCATION_ATTESTED=1` (ADR 0078); sign-in is always on (vault BACKLOG #2719) |
+| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`), plus `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)); sign-in is always on (vault BACKLOG #2719) |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
-| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file`, so the engine serves that hop over TLS (a plaintext hop off loopback is **refused**, in every mode, acknowledged or not, BACKLOG #4636); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them); and `MEFOR_TLS_REVOCATION_ATTESTED=1`, because that bind is in-process TLS (BACKLOG #4636) |
+| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them); and `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
 MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].bind_host`, typically
@@ -186,10 +186,9 @@ listen_address = "0.0.0.0"
 [api]
 port = 8765
 tls_terminated_upstream = true
-# REQUIRED off loopback: serve refuses a plaintext proxy->engine hop there (BACKLOG #4636). The
-# proxy connects to the engine over https and trusts this certificate. The engine then terminates
-# TLS itself, so serve also refuses this bind until MEFOR_TLS_REVOCATION_ATTESTED=1 is set in the
-# container's environment (ADR 0078); the proxy in front does not exempt it.
+# REQUIRED off loopback, with MEFOR_TLS_REVOCATION_ATTESTED=1 in the container's environment;
+# docs/SECURITY.md, "Plaintext proxy hop" and "API revocation gate", say why. The proxy connects
+# to the engine over https and trusts this certificate.
 tls_cert_file = "/etc/mefor/tls/api.crt"
 tls_key_file  = "/etc/mefor/tls/api.key"
 trusted_proxies = ["10.4.2.7"]                # the proxy's EXACT address(es) — see the warning below
@@ -379,13 +378,13 @@ The console stays a **host-side process**; only its target URL changes.
 ## 7. Gaps / residuals to flag
 
 1. **In-engine TLS revocation is delegated (ADR 0002, accepted).** The in-process API-TLS and direct
-   MLLP-over-TLS paths do **not** do live OCSP/CRL — a revoked-but-unexpired cert is not rejected by
-   the engine itself (`harden_verify_flags` does strict RFC 5280 *path* validation, not revocation).
-   An **OCSP-must-staple** terminator + the org PKI enforces revocation for the browser's hop. Only
-   the loopback (c to b) topology keeps the engine off the gate; topologies (a) and (b) both serve
-   in-process TLS off loopback and need `MEFOR_TLS_REVOCATION_ATTESTED=1`, which attests that the
-   org PKI enforces revocation for the engine's certificate too (BACKLOG #4636). Document this for
-   any topology-(a) or (b) deployment that has a revocation requirement.
+   MLLP-over-TLS paths fetch **no** OCSP or CRL, so unless a CRL is loaded on the hop, a
+   revoked-but-unexpired cert is not rejected by the engine itself (`harden_verify_flags` does strict
+   RFC 5280 *path* validation, not revocation). An **OCSP-must-staple** terminator + the org PKI
+   enforces revocation for the browser's hop. The API bind's rule is
+   [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate). Of the §2 topologies it
+   applies to each one that binds off loopback with an operator certificate: (a), (b) separate proxy
+   container, and (c). Document this for any such deployment that has a revocation requirement.
 
 2. **MLLP TLS private keys may be passphrase-encrypted (BUILT in the container work).** `_mllp_ssl_context`
    now plumbs `password=` into `load_cert_chain` on both the inbound and outbound paths, fed by a

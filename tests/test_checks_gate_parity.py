@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.api.tls import plaintext_upstream_hop_off_loopback_remedy
 from messagefoundry.checks import CheckResult, run_checks
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_NO_ALERTS_TOML,
@@ -434,6 +435,21 @@ def test_checks_mirror_hop_ack_parity_with_serve(
     if not result.ok:
         assert "plaintext_upstream_hop_acknowledged" in result.detail
         assert ("non-loopback API bind host" in result.detail) == off_loopback_plaintext
+        if off_loopback_plaintext:
+            # serve's remedies, less serve --host: the check reads only the file's bind host.
+            remedy = plaintext_upstream_hop_off_loopback_remedy("[security].listen_address")
+            assert remedy in result.detail, result.detail
+
+
+def test_hop_ack_check_clears_an_acknowledged_hop_on_a_loopback_listen_address(
+    tmp_path: Path,
+) -> None:
+    # The file-borne loopback remedy the off-loopback detail names, on a spelling the parity matrix
+    # above does not bind.
+    _posture_b_toml(
+        tmp_path, intra="network", floor="1.2", ack=True, auto_cert=False, listen_address="::1"
+    )
+    assert _hop_ack_check(tmp_path / "messagefoundry.toml").ok
 
 
 def test_hop_ack_check_passes_without_a_terminator(tmp_path: Path) -> None:

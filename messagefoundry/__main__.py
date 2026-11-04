@@ -3408,6 +3408,7 @@ def _serve(args: argparse.Namespace) -> int:
     # messages say why.
     from messagefoundry.api.tls import (
         plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_off_loopback_remedy,
         plaintext_upstream_hop_unacknowledged,
     )
 
@@ -3436,16 +3437,16 @@ def _serve(args: argparse.Namespace) -> int:
             # accepts that hop from a same-machine proxy only. So off loopback it is refused,
             # acknowledged or not, in every mode, ahead of the acknowledgement arm below. The
             # predicate is shared with `messagefoundry check`.
+            remedy = plaintext_upstream_hop_off_loopback_remedy(
+                "[security].listen_address or serve --host"
+            )
             print(
                 "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
                 f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
-                "[api].tls_cert_file the engine serves that hop in plaintext, and "
-                "[api].plaintext_upstream_hop_acknowledged accepts it only from a proxy on the same "
-                "machine, with the engine bound to loopback (127.0.0.1, ::1 or localhost). Bind "
-                "the engine to loopback ([security].local_access_only, [security].listen_address or "
-                "serve --host), or set [api].tls_cert_file so the engine serves that hop over TLS, "
-                "and point the proxy at https and have it trust that certificate. See "
-                "docs/SECURITY.md (BACKLOG #4636).",
+                "[api].tls_cert_file the engine serves that hop in plaintext, which serve accepts "
+                "only on a loopback bind (127.0.0.1, ::1 or localhost), acknowledged or not. "
+                f"{remedy}, trusting that certificate. See docs/SECURITY.md, Plaintext proxy hop "
+                "(BACKLOG #4636).",
                 file=sys.stderr,
             )
             return 2
@@ -3532,9 +3533,8 @@ def _serve(args: argparse.Namespace) -> int:
             f"{terminator_note}Set "
             "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
             "certificates this engine serves and accepts, or bind the engine to loopback "
-            "([security].local_access_only, [security].listen_address or serve --host) behind a "
-            "revocation-checking reverse proxy on the same machine. See "
-            "docs/adr/0078-certificate-revocation-posture.md.",
+            "([security].listen_address or serve --host) behind a revocation-checking reverse "
+            "proxy on the same machine. See docs/SECURITY.md, API revocation gate (ADR 0078).",
             file=sys.stderr,
         )
         return 2
@@ -3588,7 +3588,8 @@ def _serve(args: argparse.Namespace) -> int:
                 "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
                 "it on. Or set [api].tls_cert_file so the engine serves that hop over TLS, and then "
                 "point the proxy at https and have it trust that certificate: a proxy still speaking "
-                "http to an https listener fails every request. See docs/SECURITY.md (ADR 0172).",
+                "http to an https listener fails every request. See docs/SECURITY.md, Plaintext "
+                "proxy hop (ADR 0172).",
                 file=sys.stderr,
             )
             return 2

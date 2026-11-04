@@ -206,12 +206,10 @@ certificate on first run and saves it beside the store database as `api-generate
 browser warns about that certificate, and other clients reject it, until you import it into the
 trust store or configure your own. The engine renews it at startup once less than a third of its
 lifetime is left, so import it again after a renewal. The one exception is a declared TLS-terminating proxy in front
-(`[api].tls_terminated_upstream`) on the same machine, with the engine bound to loopback: the engine
-then speaks plain HTTP to the proxy, and you browse to the proxy's address. Securing that hop is your
-job. So `serve` refuses to start there until you set
-`[api].plaintext_upstream_hop_acknowledged = true`. On any other bind host it refuses the plain HTTP
-hop even then. With your own certificate the hop is TLS instead, and the proxy must speak https to
-the engine; off loopback that bind also needs `MEFOR_TLS_REVOCATION_ATTESTED=1`. See [docs/SECURITY.md](docs/SECURITY.md).
+(`[api].tls_terminated_upstream`) with no certificate of your own: the engine then speaks plain HTTP
+to the proxy, and you browse to the proxy's address.
+[docs/SECURITY.md, Plaintext proxy hop](docs/SECURITY.md#plaintext-proxy-hop) says when `serve`
+accepts that.
 
 Then open the admin console in a browser (install the web console alongside the engine with
 `pip install -e packaging/messagefoundry-webconsole`; it is on by default for a loopback bind, so
