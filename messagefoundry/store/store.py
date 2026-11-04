@@ -7481,8 +7481,8 @@ def require_ingress_audit(
 ) -> OperatorAudit[str] | None:
     """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
 
-    Before anything is written, an operator origin with no audit, or any audit that is not
-    callable, raises :class:`TypeError`. For an operator origin the audit returned must also build
+    Before anything is written, an operator origin with no audit or with one that is not callable,
+    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
     a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
     rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
 
@@ -7492,13 +7492,20 @@ def require_ingress_audit(
     The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
     ``audit`` and always writes ``operator_upload``."""
     operator = origin in OPERATOR_ORIGINS
-    if (operator or audit is not None) and not callable(audit):
+    if not operator:
+        if audit is not None:
+            # An audit is an operator's inject; with this origin the message would be labelled
+            # as a receipt, so the caller forgot the origin.
+            raise TypeError(
+                f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
+                " inject names its operator origin (BACKLOG #5071)"
+            )
+        return None
+    if not callable(audit):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
         )
-    if not operator or audit is None:
-        return audit
     build = audit
 
     def row_required(message_id: str) -> AuditAppend:
@@ -7541,7 +7548,7 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
     #5069)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
-            f"an operator alert mutation needs an AuditAppend; got {type(audit).__name__}"
+            f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
             " (BACKLOG #5069)"
         )
     return lambda applied: audit if applied else None

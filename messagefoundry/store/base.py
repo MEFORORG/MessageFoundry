@@ -382,8 +382,9 @@ class QueueStore(StoreLifecycle, Protocol):
         message id, commits in the same transaction. A live receipt passes none. It stays optional
         in the type because this one method is both paths, so nothing at the type level holds a
         direct caller here. At runtime an operator ``origin`` (``operator_edit``,
-        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written,
-        and so does an operator inject whose audit builds no row (BACKLOG #5071,
+        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written;
+        an operator inject whose audit builds no row raises inside the transaction, which rolls
+        the inject back (BACKLOG #5071,
         ``store.require_ingress_audit``, where the limit is stated: it keys on ``origin``). The
         engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires one.
 

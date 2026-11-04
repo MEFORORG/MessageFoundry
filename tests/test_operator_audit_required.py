@@ -388,8 +388,9 @@ def test_the_ingress_refusal_keys_on_an_operator_origin() -> None:
     def partner_audit(_mid: str) -> None:
         return None
 
-    # Not an operator origin, so a None row is not refused: the audit runs as given.
-    assert require_ingress_audit(partner_audit, MessageOrigin.PARTNER) is partner_audit
+    # An audit with any other origin is an inject that forgot its origin: refused, not run.
+    with pytest.raises(TypeError, match="was given an audit with origin 'partner'"):
+        require_ingress_audit(partner_audit, MessageOrigin.PARTNER)
     with pytest.raises(TypeError, match="BACKLOG #5071"):
         require_ingress_audit("not-a-callable", MessageOrigin.PARTNER)  # type: ignore[arg-type]
 
@@ -402,11 +403,22 @@ def test_every_origin_is_classified() -> None:
     assert set(MessageOrigin) == OPERATOR_ORIGINS | not_operator
 
 
-#: Each backend's operator mutations, and the call each must make before anything else.
+#: Each backend's operator mutations, and the statement each must open with, exactly.
 _ENTRY_GUARDS = {
-    **dict.fromkeys(sorted(FLOOR[Store]), "require_operator_audit"),
-    "enqueue_ingress": "require_ingress_audit",
+    **{m: f"require_operator_audit(audit, 'store.{m}')" for m in sorted(FLOOR[Store])},
+    "enqueue_ingress": "audit = require_ingress_audit(audit, origin)",
 }
+
+
+def entry_problem(where: str, source: str, expected: str) -> str | None:
+    """Why the function in ``source`` does not open, after its docstring, with ``expected``."""
+    fn = ast.parse(textwrap.dedent(source)).body[0]
+    assert isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef), where
+    body = fn.body
+    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    first = ast.unparse(body[0])
+    return None if first == expected else f"{where} starts with {first!r}"
 
 
 @pytest.mark.parametrize("cls", (MessageStore, PostgresStore, SqlServerStore))
@@ -414,24 +426,31 @@ def test_each_mutation_refuses_before_its_first_statement(cls: type[Any]) -> Non
     """The runtime refusal comes BEFORE any write (BACKLOG #5069, #5071). The contract cannot tell
     that from the ``operator_audits`` backstop, which raises inside the transaction and rolls the
     write back with the same message. So this reads each method's syntax tree: its first statement
-    after the docstring must call the guard, passing ``audit``."""
-    problems = []
-    for method, guard in _ENTRY_GUARDS.items():
-        tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(getattr(cls, method)))))
-        fn = tree.body[0]
-        assert isinstance(fn, ast.AsyncFunctionDef), f"{cls.__name__}.{method}"
-        body = fn.body
-        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
-            body = body[1:]
-        first = body[0]
-        call = first.value if isinstance(first, (ast.Expr, ast.Assign)) else None
-        ok = (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-            and call.func.id == guard
-            and isinstance(call.args[0], ast.Name)
-            and call.args[0].id == "audit"
+    after the docstring must be the guard, exactly, ``enqueue_ingress``'s with its result kept."""
+    problems = [
+        entry_problem(
+            f"{cls.__name__}.{method}",
+            inspect.getsource(inspect.unwrap(getattr(cls, method))),
+            expected,
         )
-        if not ok:
-            problems.append(f"{cls.__name__}.{method} starts with {ast.unparse(first)!r}")
-    assert problems == []
+        for method, expected in _ENTRY_GUARDS.items()
+    ]
+    assert [p for p in problems if p is not None] == []
+
+
+def test_control_a_missing_or_discarded_guard_fails_the_check() -> None:
+    """Control: the check refuses a mutation with no guard, an ingress guard whose result is
+    dropped, and one given the wrong origin, and accepts the real shape."""
+    ingress = _ENTRY_GUARDS["enqueue_ingress"]
+    shapes = {
+        "absent": "now = time.time()",
+        "dropped": "require_ingress_audit(audit, origin)",
+        "wrong origin": "audit = require_ingress_audit(audit, MessageOrigin.PARTNER)",
+        "real": ingress,
+    }
+    template = 'async def f(audit, origin):\n    """Doc."""\n    {}\n'
+    got = {
+        name: entry_problem(name, template.format(line), ingress) for name, line in shapes.items()
+    }
+    assert got["real"] is None
+    assert all(got[name] is not None for name in ("absent", "dropped", "wrong origin"))
