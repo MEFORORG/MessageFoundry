@@ -680,6 +680,55 @@ def test_generic_verifying_keyword_is_not_gated() -> None:
         assert DatabaseDestination(_generic_dest(odbc_params={"SSLmode": "verify-full"}))
 
 
+@pytest.mark.parametrize(
+    ("driver", "params"),
+    [
+        # BACKLOG #5053: psqlODBC has no Encrypt keyword, so this set no TLS at all.
+        ("PostgreSQL Unicode", {"Encrypt": "yes"}),
+        ("MySQL ODBC 8.0 Unicode Driver", {"Encrypt": "yes"}),
+        # BACKLOG #5053, #5029: a name the engine cannot place, so no keyword counts.
+        ("/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so", {"SSLmode": "verify-full"}),
+        ("MySQL", {"SSLmode": "verify-full"}),
+    ],
+)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_mode_the_driver_family_does_not_read_is_refused(
+    driver: str,
+    params: dict[str, str],
+    connector: Callable[[Any], object],
+    config: Callable[..., Any],
+) -> None:
+    """Red on the previous head, which cleared each of these on any driver name. The engine counts
+    a mode only on the keyword and spelling the named family reads. The attestation is the control:
+    it still allows the hop, so the refusal is the classifier's and nothing else."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(odbc_driver=driver, odbc_params=params))
+    attested = config(
+        odbc_driver=driver,
+        odbc_params=params,
+        tls_hop_attested=True,
+        tls_hop_attested_reason="mesh sidecar mTLS",
+    )
+    with active_hop_posture(PROD_PHI):
+        assert connector(attested)
+
+
+@pytest.mark.parametrize(
+    ("driver", "params"),
+    [
+        ("MySQL ODBC 8.0 Unicode Driver", {"SSLMODE": "VERIFY_IDENTITY"}),
+        ("ODBC Driver 18 for SQL Server", {"Encrypt": "yes"}),
+        ("PostgreSQL", {"SSLmode": "verify-full"}),
+    ],
+)
+def test_generic_mode_the_driver_family_reads_is_not_gated(
+    driver: str, params: dict[str, str]
+) -> None:
+    # The control for the test above: each family's own keyword and spelling stays delegated.
+    with active_hop_posture(PROD_PHI):
+        assert DatabaseDestination(_generic_dest(odbc_driver=driver, odbc_params=params))
+
+
 def test_sqlserver_preset_is_untouched_by_the_generic_gate() -> None:
     # Scope: the preset keeps its own weakened-TLS refusal and gains none of this gradient's arms.
     with active_hop_posture(PROD_PHI):

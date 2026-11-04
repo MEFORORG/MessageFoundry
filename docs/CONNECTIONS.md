@@ -1946,7 +1946,7 @@ built, and the error names the setting and never the value:
 | Setting | Sent as | Rule |
 |---|---|---|
 | `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
-| `SSLmode`, in any case of the keyword | plain | for every driver but MySQL Connector/ODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
+| `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; for every other driver, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
 | `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
 | `password` | braced for a listed driver, otherwise plain | printable ASCII. See below |
@@ -1971,12 +1971,29 @@ each of those as TLS addressed. So on the generic dialect an `SSLmode` value mus
 exactly one of libpq's six modes, in lower case, or the connection is refused when it is built,
 with an error that lists the six.
 
-The rule depends on the driver, read from the `odbc_driver` name. MySQL Connector/ODBC takes the
-same keyword with its own upper-case values (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`,
-`VERIFY_IDENTITY`). So when `odbc_driver` is a whole MySQL Connector/ODBC registered name, `MySQL
-ODBC <version> Unicode Driver` or `... ANSI Driver` in any case, its value is left to MySQL as
-before. Every other driver name takes the libpq spellings, including psqlODBC under any name and
-MySQL's driver under a library path or an alias.
+The rule depends on the driver family, read from the `odbc_driver` name. The engine places a name
+only when it is a whole registered name, in any case but spelled with single spaces:
+
+| Family | Registered names | `SSLmode` values accepted | The keyword counted as a TLS mode |
+|---|---|---|---|
+| psqlODBC | `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with `(x64)`, or the bare `PostgreSQL` | libpq's six, in lower case | `SSLmode`, at one of those six |
+| MySQL Connector/ODBC | `MySQL ODBC <version> Unicode Driver` or `... ANSI Driver` | `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case | `SSLMODE`, at one of those five |
+| Microsoft ODBC Driver for SQL Server | `ODBC Driver <n> for SQL Server` | libpq's six, which the driver does not read | `Encrypt`, at any value the no-TLS list does not name |
+
+MySQL takes the same keyword with its own upper-case values. Per engine PR 2691, a value it does
+not recognize leaves it at `PREFERRED`, which can fall back to plaintext, so under a MySQL name
+any other value is refused when the connection is built (BACKLOG #5035). The five spellings are
+the ones MySQL's parameter page documents. **No MySQL driver was run for this rule**, and whether
+the driver reads another case was not measured, so only the documented upper case is accepted.
+
+**A name the engine cannot place**, at least a library path, an odbcinst alias such as RHEL's
+bare `MySQL` section, another vendor's driver for the same database, or a registered name with a
+doubled space, takes the libpq spellings at build, as before. The engine cannot tell which
+spelling such a driver reads, so the refusal says so, and never offers libpq's list alone: a
+MySQL spelling is pointed at MySQL's registered name, and any other value gets libpq's list
+beside that pointer (BACKLOG #5029). **No `SSLmode` on such a name counts as a TLS mode**, so its
+hop is gated as one with no mode (see the TLS note below). To have a driver's TLS mode counted,
+name it by one of the registered names above; otherwise declare the hop with `tls_hop_attested`.
 
 **The password.** When `odbc_driver` is, in any case but spelled with single spaces, the whole
 registered name of one of these drivers, the password is **always** sent braced, with the ODBC
@@ -2017,8 +2034,13 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > connection logs a **WARNING** at construction, naming itself,
 > when `odbc_params` set **no** TLS mode **or** set one to a no-TLS value
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`optional`/`0`/`false`/`off`) —
-> dropped to DEBUG only once `SSLmode` or `Encrypt` has a value outside that deny-list. **The engine
-> counts only those two as a mode** (BACKLOG #2483). No other TLS keyword counts, at least
+> dropped to DEBUG only once the mode keyword the driver family reads has a value outside that
+> deny-list. **The engine counts only `SSLmode` and `Encrypt` as a mode** (BACKLOG #2483), and
+> only the one the `odbc_driver` family reads, at that family's own spellings (BACKLOG #5053,
+> #5035; the table under [*The `SSLmode` spelling*](#the-sslmode-spelling)). So `Encrypt=yes`
+> counts on Microsoft's driver alone, and on a name the engine cannot place no keyword counts, so
+> such a hop always reads as at risk. The warning's example is the family's own spelling. No other
+> TLS keyword counts, at least
 > `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and `SSLCIPHER`, so one of them alone reads as no mode.
 > So does a blank mode, or one with a blank at either end; since BACKLOG #2705 the build refuses
 > such a value outright, on any posture (see *Values on the generic dialect*). Name the mode as
@@ -2032,7 +2054,8 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > as no mode until `SSLMODE=...` is set beside it. That page lists no `Encrypt` keyword.
 >
 > **Spell a psqlODBC mode exactly, in lower case.** Its keyword parser has no `Encrypt`, so
-> `Encrypt=yes` would clear this check with no TLS attempted. It also reads `SSLmode` by a
+> `Encrypt=yes` cleared this check with no TLS attempted until BACKLOG #5053; it now counts as no
+> mode on a psqlODBC name. It also reads `SSLmode` by a
 > case-sensitive first letter and sends anything it does not recognize to `disable`. Since BACKLOG
 > #2705 the build refuses an `sslmode` outside libpq's six lower-case spellings for every driver but
 > MySQL Connector/ODBC, so `SSLmode=REQUIRE` is refused at build rather than cleared here. These
@@ -2062,8 +2085,8 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > build when `serve` starts it fails that connection, which is recorded failed while the rest of the
 > graph starts (ADR 0031).
 >
-> What is gated is the case the classifier can judge: **no** TLS mode, or one pinned to
-> a no-TLS value. A mode set to anything outside that deny-list is still delegated, because the
+> What is gated is the case the classifier can judge: **no** TLS mode the driver family reads, or
+> one pinned to a no-TLS value. A mode set to anything outside that deny-list is still delegated, because the
 > engine cannot tell whether an arbitrary driver's value verifies the certificate — that residual is
 > unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
 > per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by

@@ -6821,6 +6821,23 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     return str(resolved["dialect"]).lower()
 
 
+def _db_driver(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> object:
+    """A DATABASE connection's ``odbc_driver``, resolved as :func:`_db_dialect` resolves the
+    dialect, or ``None`` when it is an ``env()`` reference this reader cannot resolve.
+
+    The generic hop classifier reads the driver family from it (BACKLOG #5053), and ``None`` places
+    no family, so an unresolved name is listed as at risk: the safe direction for an advisory list."""
+    driver = settings.get("odbc_driver")
+    if not isinstance(driver, EnvRef):
+        return driver
+    if env_values is None:
+        return None
+    try:
+        return resolve_env_settings({"odbc_driver": driver}, env_values)["odbc_driver"]
+    except WiringError:
+        return None
+
+
 def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     """Whether ``conn`` is ``deployed=False`` with an ``env()`` dialect, which both DATABASE readers
     skip before :func:`_db_dialect` can resolve it.
@@ -6882,14 +6899,17 @@ def unverified_generic_db_hops(
     Pure — it reads the loaded graph and touches nothing else."""
     from messagefoundry.transports.database import generic_odbc_tls_unenforced
 
-    def unenforced(settings: Mapping[str, Any]) -> str | None:
+    def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
         dialect = _db_dialect(settings, env_values)
         if dialect is not None and dialect != "generic":
             return None
         params = settings.get("odbc_params") or {}
         if not isinstance(params, Mapping):
             return None
-        reason = generic_odbc_tls_unenforced(params)
+        # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
+        # env() driver reads as unplaced: listed, the safe direction for an advisory list.
+        driver = _db_driver(settings, env_values if deployed else None)
+        reason = generic_odbc_tls_unenforced(params, driver=driver)
         if reason is None or dialect is not None:
             return reason
         # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would
@@ -6906,7 +6926,7 @@ def unverified_generic_db_hops(
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
-            reason = unenforced(conn.spec.settings)
+            reason = unenforced(conn.spec.settings, deployed=conn.deployed)
             if reason is not None:
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")

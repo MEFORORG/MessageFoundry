@@ -355,10 +355,11 @@ _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 # as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
 # docs/CONNECTIONS.md records what the drivers read so far do with one.
 #
-# `encrypt` IS UNPROVEN. It is here for a driver that reads it. docs/CONNECTIONS.md records that
-# neither psqlODBC's keyword parser nor MySQL Connector/ODBC's parameter page has it. On a driver
-# that ignores it, `Encrypt=yes` would clear this gate and leave the driver at its own default, so
-# treat that spelling as the operator's claim, not a tested control.
+# Which of the two counts, and with which values, depends on the driver family the ``odbc_driver``
+# name places (:data:`_FAMILY_TLS_MODES`, BACKLOG #5053). psqlODBC's keyword parser and MySQL
+# Connector/ODBC's parameter page have no `encrypt`, so on those drivers `Encrypt=yes` counts as
+# nothing; only Microsoft's ODBC Driver for SQL Server is counted on it. A name the engine cannot
+# place has no keyword that counts. A test holds this set to the keywords that table names.
 _ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
 
 # Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
@@ -380,10 +381,9 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   assorted `Encrypt`  : no / 0 / false / off
 #   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
 #
-# Since BACKLOG #2705 the build also holds `sslmode` to libpq's six lower-case spellings on every
-# driver but MySQL Connector/ODBC (_refuse_unread_sslmode), so for a built hop this list's open end
-# matters for `encrypt`, and for `sslmode` on MySQL's driver. The posture readers classify specs
-# that were never built, so they still apply the list alone.
+# Since BACKLOG #5053 and #5035 a mode counts only on the keyword the driver family reads, and for
+# psqlODBC and MySQL only at one of that family's own spellings (_FAMILY_TLS_MODES), so this list's
+# open end matters only for `encrypt` on Microsoft's driver.
 #
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
 # `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
@@ -430,11 +430,15 @@ def _is_tls_keyword(name: str) -> bool:
     return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
 
 
-def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
-    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value with no
-    blank at either end. Anything else sets nothing: the engine has no evidence of how a driver reads
-    it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good
-    one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+def _sets_tls_mode(params: Mapping[str, Any], family: str) -> bool:
+    """True when the keyword ``family`` reads as its TLS mode (:data:`_FAMILY_TLS_MODES`) has a
+    non-blank string value with no blank at either end, and, where that table lists the family's
+    spellings, one of them exactly. Anything else sets nothing: the engine has no evidence of how
+    the driver reads it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether
+    a counted value is a good one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+
+    The spellings are checked here as well as at build (:func:`_refuse_unread_sslmode`), because
+    the posture readers classify specs that were never built (BACKLOG #5035).
 
     A padded value does not count because a driver that does not trim would read something other
     than the word judged here: psqlODBC switches on the first character, so ``" require"`` would
@@ -445,11 +449,13 @@ def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
     Every key is read, not the first spelling of each, so the answer for a table that names a mode
     keyword twice in different case does not depend on key order. The build refuses such a table;
     the posture readers classify specs that were never built."""
+    keyword, spellings = _FAMILY_TLS_MODES[family]
     return any(
-        odbc_keyword_name(str(key)) in _ODBC_TLS_MODE_KEYWORDS
+        odbc_keyword_name(str(key)) == keyword
         and isinstance(value, str)
         and value.strip()
         and value == value.strip()
+        and (spellings is None or value in spellings)
         for key, value in params.items()
     )
 
@@ -480,20 +486,33 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     return found
 
 
-def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
-    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
-    finds a usable mode value and no TLS keyword holds a no-TLS word. A blank, padded or non-string
-    mode value is not usable, so it does not clear the hop.
+#: The reason a hop gets when its ``odbc_driver`` name places no driver family (BACKLOG #5053).
+_UNPLACED_DRIVER_REASON = (
+    "the engine cannot place odbc_driver in a driver family whose TLS keyword it reads, so no TLS "
+    "keyword in odbc_params counts as a mode"
+)
 
-    Three ways to be at risk, and they read differently to an operator, so they are reported
-    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a TLS keyword with
-    no mode beside it, such as a lone ``sslcert`` or a blank ``sslmode`` (BACKLOG #2483), or no TLS
-    keyword at all. Only :data:`_ODBC_TLS_MODE_KEYWORDS` can clear a hop. Shares
+
+def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) -> str | None:
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
+    finds a usable mode value for the family ``driver`` names and no TLS keyword holds a no-TLS
+    word. A blank, padded or non-string mode value is not usable, so it does not clear the hop.
+
+    ``driver`` is the ``odbc_driver`` setting, as written; :func:`_driver_family` places it. It is
+    required, so no caller can judge a keyword without saying which driver reads it (BACKLOG #5053).
+
+    Four ways to be at risk, and they read differently to an operator, so they are reported
+    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a driver name
+    the engine cannot place, so no keyword counts (BACKLOG #5053), a TLS keyword with no mode the
+    family reads beside it, such as a lone ``sslcert``, a blank ``sslmode``, or ``Encrypt=yes`` on
+    psqlODBC (BACKLOG #2483, #5053), or no TLS keyword at all. Only the keyword
+    :data:`_FAMILY_TLS_MODES` names for the family can clear a hop. Shares
     :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
     :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
-    this deliberately does not classify. An unrecognized mode value stays delegated here for the same
-    reason, though since BACKLOG #2705 the build refuses an ``sslmode`` spelling
-    :func:`_refuse_unread_sslmode` rejects before this verdict is used.
+    this deliberately does not classify. That deny-list reads every TLS keyword whatever the family,
+    since it can only add a reason. For psqlODBC and MySQL Connector/ODBC a mode value must be one
+    of the family's own spellings to count; Microsoft's ``Encrypt`` value stays delegated, judged
+    by the deny-list alone.
 
     Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
     non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so
@@ -503,7 +522,10 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if _sets_tls_mode(params):
+    family = _driver_family(driver)
+    if family is None:
+        return _UNPLACED_DRIVER_REASON
+    if _sets_tls_mode(params, family):
         return None
     if any(_is_tls_keyword(str(k)) for k in params):
         return "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
@@ -671,6 +693,25 @@ _LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verif
 # which can fall back to plaintext. No MySQL driver was run for this list: whether the driver reads
 # another case was not measured, so only the documented spelling is accepted.
 _MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY")
+
+# What each placed family reads as its TLS mode: the keyword, in the form
+# :func:`odbc_keyword_name` gives, and the values that count, or ``None`` where any usable value
+# counts and the deny-list alone judges it (BACKLOG #5053). Microsoft's ODBC Driver for SQL Server
+# reads ``Encrypt`` and no ``sslmode``; psqlODBC and MySQL Connector/ODBC read ``sslmode`` and no
+# ``Encrypt``. A family missing here, and an unplaced name, has no keyword that counts.
+_FAMILY_TLS_MODES: dict[str, tuple[str, frozenset[str] | None]] = {
+    "psqlodbc": ("sslmode", frozenset(_LIBPQ_SSL_MODES)),
+    "mysql": ("sslmode", frozenset(_MYSQL_SSL_MODES)),
+    "msodbc": ("encrypt", None),
+}
+
+# The example a warning gives of a verifying mode, per family, so it never names a spelling the
+# named driver would ignore (BACKLOG #5029).
+_FAMILY_TLS_EXAMPLE = {
+    "psqlodbc": "SSLmode=verify-full",
+    "mysql": "SSLMODE=VERIFY_IDENTITY",
+    "msodbc": "Encrypt=yes",
+}
 
 
 def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
@@ -1405,12 +1446,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
-    _warn_generic_tls_unenforced(params, connection=connection)
+    _warn_generic_tls_unenforced(params, driver=driver, connection=connection)
     return ";".join(parts) + ";"
 
 
 def _warn_generic_tls_unenforced(
-    params: Mapping[str, Any], *, connection: str | None = None
+    params: Mapping[str, Any], *, driver: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
@@ -1431,27 +1472,37 @@ def _warn_generic_tls_unenforced(
     ``connection`` names the declaring connection (#333). Without it a site running several generic DB
     connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.
     It stays optional because :func:`_build_odbc_dsn` is also called directly (tests, DSN-shape checks)
-    where there is no connection to name; every engine construction path supplies it."""
+    where there is no connection to name; every engine construction path supplies it.
+
+    The remedy's example is the named driver family's own spelling, and for a name the engine
+    cannot place it names none, so the line never steers a driver to a value it ignores (BACKLOG
+    #5029)."""
     where = (
         f"DATABASE connection {connection!r} (generic ODBC dialect)"
         if connection
         else "DATABASE generic ODBC dialect"
     )
-    reason = generic_odbc_tls_unenforced(params)
+    reason = generic_odbc_tls_unenforced(params, driver=driver)
     if reason is None:
         logger.debug(
             "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
             "MessageFoundry does not enforce or verify it on this path",
             where,
         )
-    else:
-        logger.warning(
-            "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
-            "verifying TLS via the driver's own keyword (e.g. SSLmode=verify-full) so PHI is not sent "
-            "in plaintext",
-            where,
-            reason,
-        )
+        return
+    example = _FAMILY_TLS_EXAMPLE.get(_driver_family(driver) or "")
+    remedy = (
+        f"via the driver's own keyword (e.g. {example})"
+        if example
+        else "by naming a driver the engine can place, by its registered name, then its own keyword"
+    )
+    logger.warning(
+        "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
+        "verifying TLS %s so PHI is not sent in plaintext",
+        where,
+        reason,
+        remedy,
+    )
 
 
 # --- the generic-ODBC dialect's cleartext hop, GATED (BACKLOG #1178) ---------------------------
@@ -1512,7 +1563,7 @@ def generic_cleartext_hop_guard(
         # A malformed odbc_params is :func:`_build_odbc_dsn`'s own ValueError, not a hop decision —
         # guessing a disposition off a value that will not load would report the wrong cause.
         return None
-    reason = generic_odbc_tls_unenforced(params)
+    reason = generic_odbc_tls_unenforced(params, driver=settings.get("odbc_driver"))
     if reason is None:
         return None
     host, port = generic_hop_endpoint(str(settings.get("server") or ""), params)
