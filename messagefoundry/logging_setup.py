@@ -2144,8 +2144,9 @@ class _FilteredLastResort(logging.StreamHandler[TextIO]):
 
     Like the stdlib's own: level ``WARNING``, and ``sys.stderr`` looked up at every emit rather
     than bound when built, so a later swap of ``sys.stderr`` is followed. ``StreamHandler.__init__``
-    is skipped for that reason, as the stdlib's ``_StderrHandler`` skips it, and the setter
-    ignores the assignment ``setStream`` would make."""
+    is skipped for that reason, as the stdlib's ``_StderrHandler`` skips it. Assigning the stream,
+    as ``setStream`` does, raises ``AttributeError`` as it does on the stdlib's, rather than being
+    dropped while the caller is told nothing (BACKLOG #4716)."""
 
     def __init__(self) -> None:
         logging.Handler.__init__(self, logging.WARNING)
@@ -2158,7 +2159,7 @@ class _FilteredLastResort(logging.StreamHandler[TextIO]):
 
     @stream.setter
     def stream(self, value: TextIO) -> None:
-        pass
+        raise AttributeError("the filtered lastResort always writes to the current sys.stderr")
 
 
 def install_filtered_last_resort() -> logging.Handler | None:
@@ -2167,17 +2168,24 @@ def install_filtered_last_resort() -> logging.Handler | None:
 
     The standard library hands a record to ``logging.lastResort`` when no handler took it: no
     handler on the logger or any ancestor it propagates to. That handler prints ``WARNING`` and
-    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``. ``serve``
-    calls this first, because it calls :func:`configure_logging` only after its settings, key and
-    egress gates run (``__main__._serve``), and until then its root has no handler. Records keep
-    the level gate, the stream and the rule for when they arrive; each is now redacted and
-    scrubbed, and carries the text formatter's prefix. A record a handler took never reaches it,
-    so nothing is written twice. Left in place for the life of the process, it also covers a
-    logger that does not propagate after :func:`configure_logging` has run.
+    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``.
+    ``__main__.main`` calls this before it parses the arguments, for every subcommand. ``serve``
+    is why: it calls :func:`configure_logging` only after its settings, key and egress gates run
+    (``__main__._serve``), and until then its root has no handler. Records keep the level gate,
+    the stream and the rule for when they arrive; each is now redacted and scrubbed, and carries
+    the text formatter's prefix. A record a handler took never reaches it, so nothing is written
+    twice.
+
+    Left in place for the life of the process, it still takes a record no handler takes after
+    :func:`configure_logging` has run, such as one from a logger that does not propagate and has
+    no handler. It prints that record to stderr only, in the text format: the record never reaches
+    the configured handlers, ``[logging].file`` or the forwarder, and ``[logging].format = "json"``
+    does not apply to it, before or after :func:`configure_logging`.
 
     **Only on an empty root**, as ``run_cli``'s sink: ``lastResort`` is process-wide, and a host
     that configured logging first, such as an embedding host or pytest's capture, owns that
-    choice. Records logged before the call, such as at module import, meet the stdlib's own."""
+    choice and keeps the stdlib's. Records logged before the call, at module import, meet the
+    stdlib's own; ``docs/PHI.md`` section 7 row 1 states that window."""
     if logging.getLogger().handlers:
         return None
     if not isinstance(logging.lastResort, _FilteredLastResort):

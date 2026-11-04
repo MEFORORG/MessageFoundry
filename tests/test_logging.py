@@ -124,7 +124,7 @@ def test_unknown_level_raises() -> None:
 def test_the_filtered_last_resort_redacts_what_no_handler_takes(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #3768: ``serve``'s ``lastResort`` for the window before its handlers. It redacts at
+    """BACKLOG #3768: the CLI's ``lastResort`` for the window before its handlers. It redacts at
     WARNING on whatever ``sys.stderr`` is at the emit, from a logger that does not propagate too,
     and a record a handler takes never reaches it, so nothing is written twice."""
     monkeypatch.setattr(logging, "lastResort", logging.lastResort)  # process-wide: put it back
@@ -177,6 +177,19 @@ def test_the_filtered_last_resort_leaves_a_configured_root_alone(
     root.handlers[:] = [hosts]
     assert logging_setup.install_filtered_last_resort() is None
     assert logging.lastResort is before and root.handlers == [hosts]
+
+
+def test_the_filtered_last_resort_refuses_a_stream_assignment() -> None:
+    """BACKLOG #4716: assigning the stream raises, as it does on the stdlib's own ``lastResort``,
+    rather than being dropped with the caller told nothing. ``setStream`` to the stream it already
+    writes to is a no-op on both, so that path does not raise."""
+    resort = logging_setup._FilteredLastResort()
+    stdlib = logging._StderrHandler()  # type: ignore[attr-defined]  # the stdlib's own, the control
+    for handler in (stdlib, resort):
+        with pytest.raises(AttributeError):
+            handler.setStream(io.StringIO())
+        assert handler.setStream(sys.stderr) is None
+    assert resort.stream is sys.stderr
 
 
 def test_routes_uvicorn_loggers_to_root() -> None:

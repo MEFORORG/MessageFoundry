@@ -33,7 +33,8 @@ from contextlib import contextmanager
 def root_logging_restored() -> Iterator[None]:
     """Restore root handlers, each one's filters/level/formatter, root filters, level and guard.
 
-    Also restores the process-wide ``logging.disable`` level, which silences every capture.
+    Also restores the process-wide ``logging.disable`` level, which silences every capture, and
+    ``logging.lastResort``, which ``__main__.main`` replaces on a handler-less root (BACKLOG #3768).
 
     pytest re-uses its capture handler instances across phases, so re-adding the snapshot re-adds
     live handlers, not stale ones. A handler the body added is closed, which releases a forwarder's
@@ -48,6 +49,7 @@ def root_logging_restored() -> Iterator[None]:
     saved_root_filters = list(root.filters)
     level = root.level
     disabled = logging.root.manager.disable
+    last_resort = logging.lastResort
     guard = active_guard()
     # BACKLOG #2612: what the last configure_logging call was asked about a forwarder. Module
     # state, so it outlives the handlers; left behind, later tests read a forwarder that is gone.
@@ -72,6 +74,7 @@ def root_logging_restored() -> Iterator[None]:
             handler.setFormatter(formatter)
         root.filters[:] = saved_root_filters
         root.setLevel(level)
+        logging.lastResort = last_resort
         if logging.root.manager.disable != disabled:
             logging.disable(disabled)  # clears every logger's level cache, so only when it moved
         set_active_guard(guard)

@@ -4105,7 +4105,8 @@ def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.Mo
 # --- BACKLOG #3768: `serve` filters the window before configure_logging -------------------------
 #
 # `serve` is exempt from main()'s sink and installs its handlers only after its settings, key and
-# egress gates, so in that window a record no handler takes goes to `logging.lastResort`. These
+# egress gates, so in that window a record no handler takes goes to `logging.lastResort`, which
+# main() replaced with the filtered one before it parsed. These
 # tests log in that window and read stderr. It is entered for real: `suppress_crash_dumps` is the
 # first call `_serve` makes after its imports, and a `--service-config` naming a directory refuses
 # the start before configure_logging runs. `lastResort` is process-wide, so each test puts back the
@@ -4182,10 +4183,17 @@ def test_serve_window_without_the_filtered_last_resort_leaks_the_same_value(
 
 
 def _run_warning_driver(
-    tmp_path: Path, name: str, body: str, *, returncode: int, handlers_line: str
+    tmp_path: Path,
+    name: str,
+    body: str,
+    *,
+    returncode: int,
+    handlers_line: str,
+    leaks: bool = False,
 ) -> None:
     """Run ``body`` in a child after ``import logging`` and the CLI module, then assert it reached
-    main() with no root handler, printed ``handlers_line``, and logged the probe once, redacted.
+    main() with no root handler, printed ``handlers_line``, and logged the probe once, redacted, or
+    whole where ``leaks`` says the child took the filter out (a control).
     ``body`` prints ``handlers_line`` itself, at the moment it means to measure."""
     import subprocess
     import sys
@@ -4209,7 +4217,8 @@ def _run_warning_driver(
     assert handlers_line in proc.stdout, proc.stdout
     assert proc.stderr.count("probe: PID|") == 1, f"the WARNING did not print once: {proc.stderr!r}"
     for fragment in _PID_FRAGMENTS:
-        assert fragment not in proc.stderr + proc.stdout, proc.stderr
+        assert (fragment in proc.stderr) is leaks, proc.stderr
+        assert fragment not in proc.stdout, proc.stdout
 
 
 #: The child's probe line: one WARNING carrying the synthetic segment, at four spaces of indent.
@@ -4218,10 +4227,73 @@ _CHILD_PROBE = (
 )
 
 
+def _warn_while_parsing(tmp_path: Path, *, prefix: str = "") -> str:
+    """A child body that logs the probe while main() builds its parser, before ``_serve`` runs,
+    then lets ``serve`` refuse the directory ``--service-config`` and exit 2."""
+    return (
+        prefix + "build = m._build_parser\n"
+        "def _probe():\n"
+        "    resort = type(logging.lastResort).__name__\n"
+        "    print('parsing', len(logging.getLogger().handlers), resort, flush=True)\n"
+        + _CHILD_PROBE
+        + "    return build()\n"
+        "m._build_parser = _probe\n"
+        f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n"
+    )
+
+
+def test_a_real_serve_process_redacts_a_warning_while_it_parses_its_arguments(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #3768: main() installs the filtered ``lastResort`` before it parses, so a WARNING
+    logged while the parser is built, before ``_serve`` runs, reaches stderr redacted."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_while_parsing.py",
+        _warn_while_parsing(tmp_path),
+        returncode=2,
+        handlers_line="parsing 0 _FilteredLastResort",
+    )
+
+
+def test_a_real_serve_process_without_the_install_leaks_while_it_parses(tmp_path: Path) -> None:
+    """The control for the test above, through the same child: with the install taken out, the
+    same WARNING meets the stdlib's own ``lastResort`` and the synthetic segment reaches stderr
+    whole, so the absence above is the filter's doing and not a record that never arrived."""
+    _run_warning_driver(
+        tmp_path,
+        "leak_while_parsing.py",
+        _warn_while_parsing(tmp_path, prefix="m.install_filtered_last_resort = lambda: None\n"),
+        returncode=2,
+        handlers_line="parsing 0 _StderrHandler",
+        leaks=True,
+    )
+
+
+def test_a_real_supervise_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
+    """BACKLOG #4716: ``supervise`` logs before its own ``configure_logging`` too, from its
+    remote-debug guard on, and that window now meets the filtered ``lastResort``. The probe stands
+    in for the guard, then exits 3 before anything is supervised."""
+    _run_warning_driver(
+        tmp_path,
+        "warn_in_the_supervise_window.py",
+        "def _probe():\n"
+        "    resort = type(logging.lastResort).__name__\n"
+        "    print('window', len(logging.getLogger().handlers), resort, flush=True)\n"
+        + _CHILD_PROBE
+        + "    raise SystemExit(3)\n"
+        "m.install_remote_debug_guard = _probe\n"
+        "raise SystemExit(m.main(['supervise']))\n",
+        returncode=3,
+        handlers_line="window 0 _FilteredLastResort",
+    )
+
+
 def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
     """The premise the in-process ``serve`` tests stand on, measured in a child: a real process
-    reaches ``_serve`` with no root handler, so ``install_filtered_last_resort`` acts and the
-    WARNING reaches stderr redacted. The child exits 2 on the directory ``--service-config``."""
+    reaches ``_serve`` with no root handler and with the filtered ``lastResort`` main() installed,
+    so the WARNING reaches stderr redacted. The child exits 2 on the directory
+    ``--service-config``."""
     _run_warning_driver(
         tmp_path,
         "warn_in_the_serve_window.py",
