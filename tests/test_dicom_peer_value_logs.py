@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import io
 import logging
 import socket
 import threading
 import time
+import traceback
 import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -309,7 +311,9 @@ def test_a_traceback_the_filter_cannot_read_is_withheld_not_raised() -> None:
     assert record.exc_text == "Unprintable (traceback withheld: it did not render)"
 
 
-def test_a_rewritten_traceback_keeps_the_codec_error_protection() -> None:
+def _refusal_from_a_codec_error() -> logging.LogRecord:
+    """A DUL record whose exception is a refusal with the planted value, raised during a decode error,
+    so ``safe_traceback`` rewrites the chain."""
     refusal = f"Invalid 'Transfer Syntax Name' value '{_PLANTED}' - must not exceed 64 characters"
     try:
         try:
@@ -318,13 +322,55 @@ def test_a_rewritten_traceback_keeps_the_codec_error_protection() -> None:
             raise ValueError(refusal)  # noqa: B904 - the implicit context is the case under test
     except ValueError as exc:
         info = (ValueError, exc, exc.__traceback__)
-        record = logging.LogRecord("pynetdicom.dul", logging.ERROR, __file__, 1, exc, (), info)
+        return logging.LogRecord("pynetdicom.dul", logging.ERROR, __file__, 1, exc, (), info)
+    raise AssertionError("the refusal was not raised")
+
+
+def test_a_rewritten_traceback_keeps_the_codec_error_protection() -> None:
+    record = _refusal_from_a_codec_error()
     assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
     assert record.exc_info is None and record.exc_text is not None
     assert "value '[redacted]' - must not exceed 64 characters" in record.exc_text
     # Rendered by safe_traceback, which names no byte a codec failed on (vault BACKLOG #3185).
     assert "UnicodeDecodeError" in record.exc_text
     assert _PLANTED not in record.exc_text and "0xc3" not in record.exc_text
+
+
+def test_a_traceback_rendered_without_the_private_line_is_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A CPython with no TracebackException._str makes safe_traceback fall back to safe_exc's own
+    # rewrite of the root line, which the filter's replace does not find; that must not leak the value.
+    original = traceback.TracebackException.__init__
+
+    def init(self: traceback.TracebackException, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        self.__dict__["_renamed"] = self.__dict__.pop("_str")
+
+    monkeypatch.setattr(traceback.TracebackException, "__init__", init)
+    record = _refusal_from_a_codec_error()
+    passed = dicom_module._PEER_VALUE_FILTER.filter(record)
+    monkeypatch.undo()  # before any assertion, so pytest can render a failure
+    assert passed is True
+    assert record.exc_info is None and record.exc_text is not None
+    assert _PLANTED not in record.exc_text, record.exc_text
+    assert record.exc_text == "ValueError (traceback withheld: its value was not redacted)"
+
+
+def test_a_message_that_will_not_format_is_withheld_with_its_args(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The handler's handleError prints a record's args to stderr, which the service writes to a file.
+    record = _refusal_from_a_codec_error()
+    record.msg, record.args = "Unable to decode %d", (_PLANTED,)
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    assert not record.args
+    assert _PLANTED not in record.getMessage()
+    stream = io.StringIO()
+    logging.StreamHandler(stream).handle(record)
+    written = stream.getvalue() + capsys.readouterr().err
+    assert _PLANTED not in written, written
+    assert "value '[redacted]' - must not exceed 64 characters" in written
 
 
 def test_a_traceback_with_no_flagged_value_is_left_to_the_formatter() -> None:

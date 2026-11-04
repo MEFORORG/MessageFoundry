@@ -536,7 +536,7 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
 
 #: The ``pynetdicom._handlers`` labels whose value is an AE title, or a version name pynetdicom checks
 #: as one. :func:`_kept` applies ``set_ae``'s check to each, including the A-ASSOCIATE-AC's two
-#: titles, which pynetdicom reads from reserved fields without any check.
+#: titles, which pynetdicom reads from reserved fields with ``decode_bytes`` and no title check.
 _TITLE_LABELS = frozenset(
     {
         "Move Originator",
@@ -649,10 +649,15 @@ class _PeerValueFilter(logging.Filter):
         if not shapes:
             return True
         try:
-            text: str | None = record.getMessage()
-        except Exception:  # noqa: BLE001 - bad %-args, or a msg whose str() raises: never raise here
-            text = None  # the handler reports it, as it would anyway
-        if text is not None:
+            text = record.getMessage()
+        except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
+            # Withheld with its args, as prepare_log_record does: a stock handler's handleError
+            # prints both, and either may hold the value. The engine's own chain withholds such a
+            # record too, but a host's handler need not. A filter that raised would raise on the
+            # pynetdicom thread that logged the line.
+            record.msg = f"[log message withheld: {type(failed).__name__} while formatting it]"
+            record.args = ()
+        else:
             redacted = _redacted_line(shapes, text)
             if redacted is not None:
                 record.msg, record.args = redacted, ()
@@ -677,7 +682,13 @@ def _redact_traceback(
     which redacting the record's own message does not reach. The traceback is rendered through
     :func:`~messagefoundry.redaction.safe_traceback` into ``exc_text`` and ``exc_info`` cleared, as
     ``prepare_log_record`` does, so a formatter writes the rendered copy and its codec-error lines
-    keep that function's protection. A traceback with no such message is left as it was."""
+    keep that function's protection. A traceback with no such message is left as it was.
+
+    The redaction is a replace of each message in the rendered text, so a message the rendering
+    does not hold verbatim withholds the whole traceback. ``safe_traceback`` rewrites a line, or
+    falls back to :func:`~messagefoundry.redaction.safe_exc`'s single line, at least for a codec
+    error and on a CPython without ``TracebackException._str``, and the value could survive there
+    in a form the replace does not find."""
     redactions: list[tuple[str, str]] = []
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -687,10 +698,19 @@ def _redact_traceback(
         redacted = _redacted_line(shapes, message)
         if redacted is not None:
             redactions.append((message, redacted))
-        current = current.__cause__ or current.__context__
+        # The links the stdlib prints, so a suppressed context, which it leaves out, is not looked for.
+        if current.__cause__ is not None:
+            current = current.__cause__
+        else:
+            current = None if current.__suppress_context__ else current.__context__
     if not redactions:
         return
     rendered = safe_traceback((type(exc), exc, exc.__traceback__))
+    # All checked before any replace, since one link's message can repeat or hold another's.
+    if any(message not in rendered for message, _ in redactions):
+        record.exc_info = None
+        record.exc_text = f"{type(exc).__name__} (traceback withheld: its value was not redacted)"
+        return
     for message, redacted in redactions:
         rendered = rendered.replace(message, redacted)
     record.exc_info, record.exc_text = None, rendered

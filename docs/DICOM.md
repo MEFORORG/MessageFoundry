@@ -315,10 +315,12 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
   exception its DUL logs when a received PDU does not decode, with its traceback; pydicom's invalid value
   line; and the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
-  association acceptance and a DIMSE message. A dump field keeps its value only when it is a conformant UID,
-  a name in pydicom's UID dictionary on a field that is no instance UID, or an AE title that passes
-  pynetdicom's AE title check. pynetdicom runs no check on the two titles of an association acceptance, and
-  the filter applies the title check to them anyway. The dump's `unknown` for a missing implementation class
+  association acceptance and a DIMSE message. A dump field keeps at least these values: an empty one; a
+  conformant UID; a name in pydicom's UID dictionary, on a field that is no instance UID; and, on the AE title
+  fields and on Their Implementation Version Name, a value that passes pynetdicom's AE title check, which an
+  empty or all-space value does. `_kept` in `messagefoundry/transports/dicom.py` is the source of record.
+  pynetdicom runs no AE title check on the two titles of an association acceptance, only `decode_bytes` on
+  their bytes, and the filter applies the title check to them anyway. The dump's `unknown` for a missing implementation class
   UID is redacted too, since a peer can send that word itself. The lines are a list of the known pynetdicom
   3.0.4 and pydicom 3.0.2 shapes. A line of another shape, or on another logger, passes whole, so a new shape
   that a library upgrade adds reaches the log until it is added to the list. The pin tests in
