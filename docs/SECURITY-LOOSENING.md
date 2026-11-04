@@ -1805,8 +1805,8 @@ count is above `0` (vault BACKLOG #2613).
   `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
   which stopped being true when `capture` gained that flag. *(Note 2026-11-04: since vault BACKLOG
   #5086, `capture` also gives no CRL credit to a context it is handed that skips time validity when
-  the flag is not passed, and names the `tls_allow_expired` remedy for a connection that passes no
-  remedy of its own. So a hop handed its relaxed context is decided as above with or without the
+  the flag is not passed, and names the `tls_allow_expired` remedy for a hop that passes no remedy
+  of its own. So a hop handed its relaxed context is decided as above with or without the
   flag. `capture` reads only the context it is handed, so a call site that handed it some other,
   unrelaxed context with a CRL would still earn credit; `tests/test_revocation_guard_census.py`
   fails on such a call site among the ones that reach `relax_verify_expiry` by name. REST, SOAP

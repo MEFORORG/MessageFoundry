@@ -715,7 +715,10 @@ def _rebinds(node: ast.AST, target: str) -> bool:
 
 def _bindings(fn: ast.AST, target: str) -> list[ast.expr]:
     """Every value code under ``fn`` binds to ``target``, an ``ast.unparse`` spelling such as
-    ``self._ssl``. A binding it does not read as a value is :data:`_UNREAD`."""
+    ``self._ssl``, in any order: a binding after the use counts as one before it. A binding it does
+    not read as a value is :data:`_UNREAD`. At least these are not seen: a binding made in another
+    function ``fn`` calls (a method that resets ``self._ssl``), and an ``except ... as``, ``import
+    ... as`` or ``match`` capture."""
     values: list[ast.expr] = []
     for sub in ast.walk(fn):
         if isinstance(sub, ast.Assign):
@@ -789,19 +792,26 @@ def _none_when_relaxed(value: ast.expr, fn: ast.AST, builders: frozenset[str]) -
 
 
 def _none_param(value: ast.expr) -> str | None:
-    """The parameter ``P`` when ``value`` is ``None if P is None else ...``, else ``None``."""
+    """The parameter ``P`` when ``value`` is ``None if P is None else E``, where ``E`` is ``P`` or a
+    call that takes ``P`` as an argument, else ``None``. What the call does with ``P`` is not read."""
     if not (isinstance(value, ast.IfExp) and _is_none(value.body)):
         return None
-    test = value.test
-    if (
+    test, orelse = value.test, value.orelse
+    if not (
         isinstance(test, ast.Compare)
         and isinstance(test.left, ast.Name)
         and len(test.ops) == 1
         and isinstance(test.ops[0], ast.Is)
         and _is_none(test.comparators[0])
     ):
-        return test.left.id
-    return None
+        return None
+    param = test.left.id
+    uses = isinstance(orelse, ast.Name) and orelse.id == param
+    takes = isinstance(orelse, ast.Call) and any(
+        isinstance(arg, ast.Name) and arg.id == param
+        for arg in (*orelse.args, *(kw.value for kw in orelse.keywords))
+    )
+    return param if uses or takes else None
 
 
 def _keyword(call: ast.Call, name: str) -> ast.expr | None:
@@ -874,6 +884,8 @@ def _guard_call_cannot_credit(
         return False
     wrapper = found[0]
     params = [arg.arg for arg in (*wrapper.args.posonlyargs, *wrapper.args.args)]
+    if params and params[0] in {"self", "cls"} and isinstance(call.func, ast.Attribute):
+        params = params[1:]  # a method called through its receiver: the receiver is not an argument
     bound: dict[str, ast.expr] = dict(zip(params, call.args, strict=False))
     bound.update({kw.arg: kw.value for kw in call.keywords if kw.arg})
     bound = {name: arg for name, arg in bound.items() if not _bindings(wrapper, name)}
@@ -1006,6 +1018,7 @@ class Dest(DestinationConnector):
         self._ssl = _relaxed(config.settings)
         self._other = ssl.create_default_context()
         relaxed = skips_validity_period(self._ssl)
+        PRE
         RevocationHopGuard.capture(
             host="h", cell="c", description="d", attested=False, connection=config.name,
             context=HANDOFF, expiry_relaxed=FLAG,
@@ -1029,6 +1042,8 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
     ``None if relaxed else ...`` (and negated)."""
     for handoff, flag, extra, faulted in (
         ("self._other", "False", "pass", True),
+        # Bound before the call: the reader is order-blind, so after the call (below) is the same.
+        ("self._ssl", "False", "PRE:self._ssl = ssl.create_default_context()", True),
         ("self._other", "relaxed", "pass", False),
         ("self._other", "not relaxed", "pass", True),
         # A flag asked of the context it hands over says nothing capture does not already read.
@@ -1043,24 +1058,25 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
         ("None if skips_validity_period(self._other) else self._other", "False", "pass", True),
     ):
         text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
-        sources = {"fake.py": text.replace("EXTRA", extra)}
+        pre, post = (extra[4:], "pass") if extra.startswith("PRE:") else ("pass", extra)
+        sources = {"fake.py": text.replace("PRE", pre).replace("EXTRA", post)}
         reach = _relaxed_reach(sources, frozenset())
         assert sorted(reach.units) == ["fake.py::Dest.__init__", "fake.py::_relaxed"], reach
         faults = _handoff_faults(sources, [reach.units["fake.py::Dest.__init__"]], reach.names)
         assert bool(faults) is faulted, (handoff, flag, extra, faults)
         if faulted:
             assert faults == [
-                "fake.py::Dest.__init__: RevocationHopGuard.capture at line 7 may credit a CRL on "
+                "fake.py::Dest.__init__: RevocationHopGuard.capture at line 8 may credit a CRL on "
                 "the relaxed hop"
             ], faults
     # A context passed through ** is not read, so it is a fault even beside the relaxed one.
     text = _SYNTHETIC_HOP.replace("HANDOFF", "self._ssl").replace("FLAG", "False")
     text = text.replace("expiry_relaxed=False,", '**{"context": self._other},')
-    sources = {"fake.py": text.replace("EXTRA", "pass")}
+    sources = {"fake.py": text.replace("PRE", "pass").replace("EXTRA", "pass")}
     reach = _relaxed_reach(sources, frozenset())
     faults = _handoff_faults(sources, [reach.units["fake.py::Dest.__init__"]], reach.names)
     assert faults == [
-        "fake.py::Dest.__init__: RevocationHopGuard.capture at line 7 may credit a CRL on the "
+        "fake.py::Dest.__init__: RevocationHopGuard.capture at line 8 may credit a CRL on the "
         "relaxed hop"
     ], faults
 
@@ -1136,6 +1152,41 @@ def test_the_wrapper_alias_constructor_and_exemption_reads_each_fail_on_a_synthe
             assert faults == [
                 f"{hop}: refuse_unrevoked_verified_hop at line 6 may credit a CRL on the relaxed hop"
             ], faults
+    # The wrapper's else branch must be the parameter or take it: a fresh context there is faulted.
+    fresh = _SYNTHETIC_WRAPPED.replace(
+        "context=None if opener is None else opener", "context=None if opener is None else fresh()"
+    )
+    for wrapped, faulted in ((_SYNTHETIC_WRAPPED, False), (fresh, True)):
+        text = wrapped.replace("OPENER", "self._opener").replace("FLAG", "False")
+        sources = {"fake.py": text.replace("EXTRA", "pass").replace("SECOND", "pass")}
+        reach = _relaxed_reach(sources, frozenset({"fake.py::Src.__init__"}))
+        assert bool(_handoff_faults(sources, [reach.units[hop]], reach.names)) is faulted
+    # A method wrapper binds its arguments after self: here the unrelaxed one reaches capture.
+    method_hop = """
+class Dest(DestinationConnector):
+    def __init__(self, config):
+        self._ssl = _relaxed(config.settings)
+        self.refuse_unrevoked_verified_hop(FIRST, SECOND, connection=config.name)
+
+    def refuse_unrevoked_verified_hop(self, context, spare, connection):
+        RevocationHopGuard.capture(host="h", cell="c", description="d", attested=False,
+                                   connection=connection, context=context)
+
+
+def _relaxed(s):
+    ctx = ssl.create_default_context()
+    if s.get("tls_allow_expired"):
+        relax_verify_expiry(ctx, host="h")
+    return ctx
+"""
+    for first, second, faulted in (
+        ("self._ssl", "self._other", False),
+        ("self._other", "self._ssl", True),
+    ):
+        sources = {"fake.py": method_hop.replace("FIRST", first).replace("SECOND", second)}
+        reach = _relaxed_reach(sources, frozenset())
+        faults = _handoff_faults(sources, [reach.units[hop]], reach.names)
+        assert bool(faults) is faulted, (first, second, faults)
     # A hop on a method other than __init__ is not a constructor, so it is faulted as one.
     method = ast.parse(_SYNTHETIC_WRAPPED).body[0]
     assert isinstance(method, ast.ClassDef)

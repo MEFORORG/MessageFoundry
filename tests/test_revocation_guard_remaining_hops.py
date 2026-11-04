@@ -22,6 +22,7 @@ Nothing here dials: construction reads settings only. All certificates and CRLs 
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import logging
 import ssl
@@ -543,7 +544,7 @@ def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -
     assert EXPIRY_RELAXED_WAYS_ACROSS in log.audit, log.state()
     # The control: a context that keeps the check, with no CRL, keeps the unrelaxed words.
     with _guard_log() as plain:
-        _attested_guard(None).enforce_construction()
+        _attested_guard(ssl.create_default_context()).enforce_construction()
     assert "crossed without certificate revocation checking" in plain.audit, plain.state()
     assert _RELAXED_DETAIL not in plain.audit, plain.state()
 
@@ -609,11 +610,13 @@ def test_an_unattested_time_skipping_crl_is_refused_without_the_flag() -> None:
     assert "Configure [tls].crl_file" not in str(exc.value)
     own = _guard(_crl_context(skip_validity=True), ways_across="")
     assert own.ways_across == ""
-    # A hop that is not a connection is refused the same way, but not given that remedy, which
-    # names a connection's flags.
+    # A hop that is not a connection is refused the same way.
     not_a_connection = _guard(_crl_context(skip_validity=True), connection=None)
     assert not_a_connection.disposition() is HopDisposition.REFUSE
-    assert not_a_connection.ways_across is None
+    assert not_a_connection.ways_across == EXPIRY_RELAXED_WAYS_ACROSS
+    # The rule holds for a guard built directly too, not only through capture().
+    with pytest.raises(ValueError, match="cannot credit a CRL"):
+        dataclasses.replace(relaxed, crl_checked=True)
     kept = _guard(_crl_context(skip_validity=False))
     assert kept.ways_across is None
     assert kept.disposition() is HopDisposition.ALLOW
