@@ -33,9 +33,7 @@ from messagefoundry.parsing.peek import (
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse
 from messagefoundry.transports.mllp import _outgoing_control_id
 from tests.test_mllp_nak_detail_bound import _ack_with_control_id, _dest, _NakPeer
-
-_LOGGER = "messagefoundry.transports.mllp"
-_SKIPPED = "ACK correlation skipped"
+from tests.test_mllp_send_peek_fault import _LOGGER, _skip_warnings
 
 _SENT_ID = "CTL4905"
 _OTHER_ID = "NOTMINE4905"
@@ -104,10 +102,6 @@ async def _send(payload: str, echoed: str) -> tuple[_NakPeer, DeliveryResponse |
     finally:
         await peer.stop()
     return peer, result
-
-
-def _skip_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if r.name == _LOGGER and _SKIPPED in r.getMessage()]
 
 
 async def test_a_capped_body_with_a_wrong_msa2_is_refused(caplog: pytest.LogCaptureFixture) -> None:

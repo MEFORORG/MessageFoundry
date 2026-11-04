@@ -370,12 +370,16 @@ def _outgoing_control_id(payload: str) -> str | None:
     ``HL7PeekError`` although its MSH-10 was readable, and correlation switched off. The slice runs
     up to the first line break after the leading ``MSH``, keeping anything before it, so the parser
     sees the same header the whole-body parse would have, and nothing past the header is copied.
-    Raises ``HL7PeekError`` where the header itself cannot be read, as the whole-body parse did."""
-    if starts_with_msh(payload):
-        # Leading whitespace holds no "MSH", so the first one is the header's own.
-        brk = _LINE_BREAK.search(payload, payload.find("MSH") + 3)
-        if brk is not None:
-            payload = payload[: brk.start()]
+
+    ``None`` for a payload that does not lead with ``MSH``: it is not HL7 and has no MSH-10, which
+    the whole-body parse refused too. Raises ``HL7PeekError`` only where an MSH-led header cannot be
+    read, so a caller may treat every such raise as a delivery check switched off."""
+    if not starts_with_msh(payload):
+        return None
+    # Leading whitespace holds no "MSH", so the first one is the header's own.
+    brk = _LINE_BREAK.search(payload, payload.find("MSH") + 3)
+    if brk is not None:
+        payload = payload[: brk.start()]
     return Peek.parse(payload).control_id
 
 
@@ -1093,16 +1097,16 @@ class MLLPDestination(DestinationConnector):
                     sent_control_id = _outgoing_control_id(payload)
                 except HL7PeekError as exc:
                     # BACKLOG #4905: only the header is parsed, so a whole-message cap (size,
-                    # segments, escape budget) can no longer reach here. What does is a header that
-                    # leads with MSH and still cannot be read; that switches off a delivery check, so
-                    # say so, by type name only. A payload that is not HL7 has no MSH-10: quiet.
-                    if starts_with_msh(payload):
-                        logger.warning(
-                            "MLLP send to %s:%s: MSH-10 read refused (%s); ACK correlation skipped",
-                            self.host,
-                            self.port,
-                            type(exc).__name__,
-                        )
+                    # segments, escape budget) can no longer reach here, and a payload that is not
+                    # HL7 returns None quietly. What does reach here is a header that leads with MSH
+                    # and still cannot be read; that switches off a delivery check, so say so, by
+                    # type name only.
+                    logger.warning(
+                        "MLLP send to %s:%s: MSH-10 read refused (%s); ACK correlation skipped",
+                        self.host,
+                        self.port,
+                        type(exc).__name__,
+                    )
                     sent_control_id = None
                 except PEEK_READ_FAULTS as exc:
                     # A faulting MSH-10 read is unreadable too (BACKLOG #1594), so correlation is
