@@ -759,8 +759,9 @@ SITES: dict[str, Site] = {
         2,
         REVIEWED,
         "A file link's own target, joined to the real folder holding the link, and that hop's "
-        "name re-joined to its own resolved folder, only to name the folder the vet checks "
-        "before the value file is read; nothing is opened or written through either "
+        "name re-joined to its own resolved folder, to name the folder the vet checks before "
+        "the value file is read. The walk lstats each joined hop and reads its link target "
+        "before that vet runs; no file's contents are read or written through either join "
         "(vault BACKLOG #2596).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
