@@ -75,7 +75,7 @@
                    end, pass or fail, it turns the VM off and reverts it to -Checkpoint again, and
                    reads back that it is off; where either step fails it prints a STOP line naming
                    the VM's state, which the owner then turns off and reverts by hand. Every guest
-                   call, its connect included, is a job with a timeout, as in hvtest's runner; a
+                   call, its connect included, is a job with a timeout, after hvtest's runner; a
                    call that hangs is asked to stop without waiting on it, the run turns the VM off,
                    reverts it, releases the hvtest lock and prints a STOP line naming the step and
                    the arm, or the read or copy, that hung.
@@ -915,20 +915,18 @@ function Start-GuestJob($Credential, [hashtable]$Call) {
 }
 
 function Invoke-GuestCall($Credential, [string]$What, [int]$Seconds, [hashtable]$Call) {
-    # Every guest call is a job waited on with a timeout, as in hvtest's runner (HvTestRunner.ps1
+    # Every guest call is a job waited on with a timeout, after hvtest's runner (HvTestRunner.ps1
     # Invoke-RunVerb), so a guest that stops answering cannot hold the run, the VM and the hvtest
-    # lock forever. Each call opens its own PowerShell Direct connection: New-PSSession and
-    # Copy-Item -FromSession cannot be time-bound, so a held session would leave both unbounded.
+    # lock forever. hvtest bounds only the run; this bounds the connect too (Start-GuestJob says
+    # why). Each call opens its own PowerShell Direct connection: New-PSSession and Copy-Item
+    # -FromSession cannot be time-bound, so a held session would leave both unbounded.
     # Streams the call's output as it arrives; throws its first error after that output, or a
     # TimeoutException naming $What once $Seconds pass. No STOP in it: Wait-Guest takes a hung probe
     # as one failed attempt, and only the rig, which ends the run on it, words it as a STOP.
-    # A hung job is asked to stop without waiting (StopJobAsync), and left: Stop-Job and Remove-Job
-    # wait for it, which a guest that never answers would make forever.
     if ($Seconds -le 0) { throw "no timeout is set for $What" }
     $job = Start-GuestJob $Credential $Call
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     $errs = New-Object System.Collections.ArrayList
-    $abandoned = $false
     try {
         while ($true) {
             $left = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
@@ -938,16 +936,24 @@ function Invoke-GuestCall($Credential, [string]$What, [int]$Seconds, [hashtable]
             if ($more) { $errs.AddRange(@($more)) }
             if ($finished) { break }
             if ([DateTime]::UtcNow -ge $deadline) {
-                $abandoned = $true
-                $script:AbandonedJobs = @($script:AbandonedJobs) + $job
-                try { $job.StopJobAsync() } catch [System.Management.Automation.PSInvalidOperationException] { Write-Log "could not ask the hung job to stop: $($_.Exception.Message)" }
-                throw [TimeoutException]::new("$What did not finish within $Seconds s")
+                $why = ''
+                if ($errs.Count) { $why = "; its first error: $($errs[0].Exception.Message)" }
+                throw [TimeoutException]::new("$What did not finish within $Seconds s$why")
             }
         }
         if ($errs.Count) { throw $errs[0] }
         if ($job.State -ne 'Completed') { throw "$What ended $($job.State): $($job.JobStateInfo.Reason.Message)" }
     } finally {
-        if (-not $abandoned) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        # However the call ended, a job still running is asked to stop without waiting
+        # (StopJobAsync) and left: Stop-Job and Remove-Job wait for it, which a guest that never
+        # answers would make forever.
+        if ($job.State -in 'Completed', 'Failed', 'Stopped') { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        else {
+            $script:AbandonedJobs = @($script:AbandonedJobs) + $job
+            # Broad on purpose: whatever the stop request throws is logged, and must not replace
+            # the error that ended the call, which is how the rig knows a call hung.
+            try { $job.StopJobAsync() } catch { Write-Log "could not ask the hung job to stop: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
+        }
     }
 }
 
@@ -960,13 +966,13 @@ function Invoke-Guest($Credential, [string]$GuestStep, [string]$ArmName = '') {
     } | ForEach-Object { Write-Log ([string]$_) }
 }
 
-function Copy-GuestReports($Credential, [string]$Reports, [string]$When) {
+function Copy-GuestReports($Credential, [string]$Reports, [string]$When, [int]$Seconds = $GuestCallSeconds['Copy']) {
     # The reports come back as the job's output, since Copy-Item -FromSession cannot be time-bound.
     # One file the guest cannot read is reported and costs only itself. The name is the guest's
     # word, so only its leaf is used, under the provider path of $Reports, since .NET resolves a
     # relative path against the process directory rather than PowerShell's.
     $dir = (Resolve-Path -LiteralPath $Reports).ProviderPath
-    $files = Invoke-GuestCall $Credential "the copy of the reports $When" $GuestCallSeconds['Copy'] @{
+    $files = Invoke-GuestCall $Credential "the copy of the reports $When" $Seconds @{
         ArgumentList = $Work
         ScriptBlock  = {
             param($Dir)
@@ -1150,11 +1156,17 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         # guest call is time-bound, so none can keep the revert below from running.
         if ($guestUp) {
             try {
-                Copy-GuestReports $Credential $Reports 'at the end'
-                # The revert discards the install anyway; after a hang it is one more wait.
+                # After a hang the guest has just failed to answer, so the copy gets 60 s, not its
+                # full budget, before the revert; the uninstall, which the revert discards anyway,
+                # is skipped.
+                if ($hung) { Copy-GuestReports $Credential $Reports 'at the end' ([Math]::Min(60, $GuestCallSeconds['Copy'])) } else { Copy-GuestReports $Credential $Reports 'at the end' }
                 if ($hung) { Write-Log 'uninstall skipped: a guest call hung' } else { Invoke-Guest $Credential 'Uninstall' }
             } catch {
                 Write-Log "could not copy the reports or uninstall: $($_.Exception.Message)"
+                # A hang here loses report-A4 and report-A5, so it is a STOP like any other.
+                if ($_.Exception -is [TimeoutException] -and -not $stopLine) {
+                    $stopLine = "STOP     $($_.Exception.Message), so the guest is taken as hung; the judge reads only the reports copied before it"
+                }
             }
         } else {
             Write-Log 'no answering guest at the end, so the judge reads only the reports copied before the reboot, if any'

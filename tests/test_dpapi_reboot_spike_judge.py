@@ -786,15 +786,29 @@ function Start-GuestJob($Credential, [hashtable]$Call) {
         # the stop would wait the whole 8 s.
         'hang' { Start-ThreadJob { 'partial line'; [Threading.Thread]::Sleep(8000) } }
         'fail' { Start-ThreadJob { 'before the error'; throw 'guest boom' } }
-        # Ends Stopped with no error, as a dropped transport may.
-        'stopped' { $j = Start-ThreadJob { Start-Sleep -Seconds 30 }; Stop-Job -Job $j; $j }
+        # Ends Stopped with no error record, as a dropped transport may: stopped once it has run,
+        # since a job stopped before it starts makes Receive-Job raise an error of its own.
+        'stopped' {
+            $j = Start-ThreadJob { 'out'; Start-Sleep -Seconds 30 }
+            while (-not $j.HasMoreData) { [Threading.Thread]::Sleep(50) }
+            [Threading.Thread]::Sleep(300)
+            Stop-Job -Job $j
+            $j
+        }
+        # The copy at the end hangs, the one after A3 does not.
+        'hang-second' {
+            $script:copies++
+            if ($script:copies -ge 2) { Start-ThreadJob { [Threading.Thread]::Sleep(8000) } }
+            else { Start-ThreadJob { [pscustomobject]@{ Name = 'report-A1.txt'; Bytes = [byte[]](104, 105); Error = '' } } }
+        }
         default {
             if ($label -eq 'uptime') { Start-ThreadJob { 0 } }
             # A guest-supplied name with a path in it, of which only the leaf may be written, and
             # a file the guest could not read, which costs only itself.
             elseif ($label -eq 'copy') {
                 Start-ThreadJob {
-                    [pscustomobject]@{ Name = '..\report-A1.txt'; Bytes = [byte[]](104, 105); Error = '' }
+                    # '/', which GetFileName splits on Windows and Linux alike; on the host a '\' too.
+                    [pscustomobject]@{ Name = '../report-A1.txt'; Bytes = [byte[]](104, 105); Error = '' }
                     [pscustomobject]@{ Name = 'crash-1.txt'; Bytes = $null; Error = 'in use' }
                 }
             } else { $l = $label; Start-ThreadJob { "ok $using:l" } }
@@ -804,9 +818,12 @@ function Start-GuestJob($Credential, [hashtable]$Call) {
 function Show-Run([string]$Name) {
     foreach ($line in $script:log) { "$Name log=$line" }
     "$Name calls=$($script:calls -join ',')"
-    $kept = @(Get-Job | Where-Object { $script:AbandonedJobs -notcontains $_ }).Count
+    $script:allAbandoned = @($script:allAbandoned) + @($script:AbandonedJobs)
+    $kept = @(Get-Job | Where-Object { $script:allAbandoned -notcontains $_ }).Count
     "$Name restores=$script:restores stops=$script:stops released=$global:released jobs=$kept"
     $script:log.Clear(); $script:calls.Clear(); $script:restores = 0; $script:stops = 0; $global:released = $false
+    # Each run counts only the calls it left hung.
+    $script:AbandonedJobs = @()
 }
 
 # One call: its output, an error after output, a hang, a job that ended Stopped, and no budget.
@@ -823,13 +840,13 @@ try { Invoke-GuestCall 'cred' 'the guest step Stopped' 10 @{ FilePath = 'f'; Arg
 catch { "stopped=$($_.Exception.Message)" }
 try { Invoke-GuestCall 'cred' 'the guest step Unbudgeted' 0 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Report', '' }; 'budget=RETURNED' }
 catch { "budget=$($_.Exception.Message) calls=$($script:calls.Count)" }
-$script:calls.Clear()
+$script:calls.Clear(); $script:allAbandoned = @($script:AbandonedJobs); $script:AbandonedJobs = @()
 
 # A hang before the reboot, through Invoke-HostRun, so the lock release is seen.
 $OutDir = Join-Path $Arg 'pre'
 $script:behaviour = @{ 'step Start A2' = 'hang' }
 try { Invoke-HostRun; 'pre run=RETURNED' } catch { "pre run=$($_.Exception.Message)" }
-"pre leaf=$(Test-Path -LiteralPath (Join-Path $OutDir 'reports\report-A1.txt')) escaped=$(Test-Path -LiteralPath (Join-Path $OutDir 'report-A1.txt'))"
+"pre leaf=$(Test-Path -LiteralPath (Join-Path (Join-Path $OutDir 'reports') 'report-A1.txt')) escaped=$(Test-Path -LiteralPath (Join-Path $OutDir 'report-A1.txt'))"
 Show-Run 'pre'
 
 # A hang after the reboot, at A5.
@@ -845,6 +862,13 @@ $script:behaviour = @{}; $script:nic = [pscustomobject]@{ SwitchName = 'External
 try { Invoke-HostRun; 'nic run=RETURNED' } catch { "nic run=$($_.Exception.Message)" }
 $script:nic = $null
 Show-Run 'nic'
+
+# Every step answers, and the copy at the end hangs: that loses report-A4 and report-A5, so it is
+# a STOP too, though nothing failed before it.
+$OutDir = Join-Path $Arg 'endcopy'
+$script:behaviour = @{ 'copy' = 'hang-second' }; $script:copies = 0
+try { Invoke-HostRun; 'endcopy run=RETURNED' } catch { "endcopy run=$($_.Exception.Message)" }
+Show-Run 'endcopy'
 
 # No hang: the whole run, and the uninstall at its end.
 $OutDir = Join-Path $Arg 'clean'
@@ -890,9 +914,9 @@ def test_a_hung_guest_call_is_abandoned_without_waiting_and_named(hang_lines: li
 
 
 def test_a_job_that_ends_other_than_completed_is_a_failure(hang_lines: list[str]) -> None:
-    # Receiving from a stopped thread job raises its own error first; either way it is no success.
+    # Stopped with output and no error record: only the state check can fail it.
     stopped = next(line for line in hang_lines if line.startswith("stopped="))
-    assert stopped != "stopped=RETURNED"
+    assert stopped.startswith("stopped=the guest step Stopped ended Stopped"), stopped
     budget = next(line for line in hang_lines if line.startswith("budget="))
     # Refused before any job starts, rather than read as a hang at 0 s.
     assert budget == "budget=no timeout is set for the guest step Unbudgeted calls=4", budget
@@ -947,6 +971,21 @@ def test_any_stop_that_ends_the_run_is_printed_last(hang_lines: list[str]) -> No
     assert _run_lines(hang_lines, "nic", "restores")[0] == "2 stops=1 released=True jobs=0"
 
 
+def test_a_hang_in_the_end_copy_is_a_stop_too(hang_lines: list[str]) -> None:
+    # Nothing failed before the copy, so the run returns, and the STOP is printed last.
+    assert _run_lines(hang_lines, "endcopy", "run") == ["RETURNED"]
+    log = _run_lines(hang_lines, "endcopy", "log")
+    assert log[-1].startswith(
+        "STOP     the copy of the reports at the end did not finish within 5 s"
+    ), log[-1]
+    calls = _run_lines(hang_lines, "endcopy", "calls")[0].split(",")
+    assert calls[-1] == "copy"
+    assert "step Start A5" in calls
+    assert "step Uninstall" not in calls
+    assert "REVTEST01 turned off and reverted to cp; output in" in " ".join(log)
+    assert any(line.startswith("1 hung guest call(s) still running") for line in log), log
+
+
 def test_a_run_without_a_hang_reaches_a5_and_uninstalls(hang_lines: list[str]) -> None:
     assert _run_lines(hang_lines, "clean", "run") == ["RETURNED"]
     calls = _run_lines(hang_lines, "clean", "calls")[0].split(",")
@@ -957,4 +996,5 @@ def test_a_run_without_a_hang_reaches_a5_and_uninstalls(hang_lines: list[str]) -
     assert calls[-1] == "step Uninstall"
     log = _run_lines(hang_lines, "clean", "log")
     assert not any(line.startswith("STOP") for line in log)
+    assert not any("hung guest call" in line for line in log)
     assert _run_lines(hang_lines, "clean", "restores")[0] == "2 stops=1 released=True jobs=0"
