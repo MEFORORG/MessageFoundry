@@ -659,10 +659,14 @@ def iter_obx_documents(
 
 def _delimiters_readable(message: Message) -> bool:
     """Whether ``Message._encoding_chars`` names ``message``'s delimiters. Its refusal quotes
-    ``MSH-1`` and ``MSH-2``, so the caller raises outside this handler, with nothing chained."""
+    ``MSH-1`` and ``MSH-2``, so the caller raises outside this handler, with nothing chained.
+    Only that refusal, a bare ``ValueError``, answers False: a subclass is some other fault, and
+    is let out rather than blamed on the sender's header."""
     try:
         message._encoding_chars()
-    except ValueError:
+    except ValueError as exc:
+        if type(exc) is not ValueError:
+            raise
         return False
     return True
 

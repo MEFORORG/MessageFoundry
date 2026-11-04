@@ -1771,6 +1771,26 @@ def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> No
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
+def test_another_fault_in_the_separator_read_is_not_blamed_on_the_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the separator read's own refusal, a bare ``ValueError``, is the sender's header; a
+    subclass from that read is some other fault and escapes as itself."""
+    from messagefoundry.parsing.binary import UnreadableDelimitersError
+
+    class _Fault(ValueError):
+        pass
+
+    def _raise(_self: Message) -> tuple[str, str, str, str, str]:
+        raise _Fault("not the header")
+
+    message = Message.parse(_hl7(_b64(2000)))
+    monkeypatch.setattr(Message, "_encoding_chars", _raise)
+    with pytest.raises(_Fault) as caught:
+        next(iter_obx_documents(message, received=""))
+    assert not isinstance(caught.value, UnreadableDelimitersError)
+
+
 async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_before_the_ack(
     store: MessageStore,
 ) -> None:
