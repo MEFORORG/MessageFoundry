@@ -259,6 +259,11 @@ class TimerSource(SourceConnector):
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
+            # No grace bound of its own, unlike the Database and RemoteFile sources (BACKLOG #4685):
+            # every await in _run and _run_cron is the stop signal, which returns at once, or the
+            # hand-off, a store call their bounds never cut either. So this wait is already as
+            # bounded as theirs. A cancel of stop() still cuts the hand-off through gather, as
+            # theirs can (#4686).
             # return_exceptions: a faulted timer task must not re-raise here — stop() runs during reload
             # quiesce, outside its rollback. _run already guards each fire; this is belt-and-suspenders.
             await asyncio.gather(self._task, return_exceptions=True)

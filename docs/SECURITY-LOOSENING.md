@@ -259,6 +259,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode that verifies the server, such as psqlODBC `SSLmode=verify-full` or MySQL `SSLMODE=VERIFY_IDENTITY` (*connection-scoped*; inbound **and** outbound). The engine cannot check that a mode verifies; its gate refuses only a missing or no-TLS mode |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
+| | `ech_sidecar` | no `ech_egress`, or an `https://` sidecar, on every `REST` outbound (*connection-scoped*; an `http://` sidecar is the loosening, named as `ech_sidecar`) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
@@ -354,12 +355,14 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **What you lose:** the API + web console become reachable from the network, not just this host.
 - **When acceptable:** a real remote-operations need, on a trusted/segmented network, with TLS.
 - **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
-  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
-  host / mTLS (OFF-LOOPBACK-DEPLOYMENT.md).
-- **Still refused:** an off-box bind with no operator certificate and no declared TLS-terminating proxy.
+  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`) for the
+  browser's hop; it does not clear the [API revocation gate](SECURITY.md#api-revocation-gate). A managed admin host / mTLS
+  (OFF-LOOPBACK-DEPLOYMENT.md).
+- **Still refused:** an off-box bind with no operator certificate.
   The engine's self-signed placeholder does not count. Under the default `enforce`, nothing lifts this.
-  Under `[security].enforcement = warn`, `require_encryption_for_remote = false` (below) or
-  `--allow-insecure-bind` lets the bind serve on the placeholder.
+  With no declared proxy, under `[security].enforcement = warn`, `require_encryption_for_remote = false`
+  (below) or `--allow-insecure-bind` lets the bind serve on the placeholder. With a declared proxy,
+  [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) applies instead.
 - **`serve --host <non-loopback>` counts as this deviation**, even with no `[security]` block in the file.
   The flag is merged after the `[security]` desugar so it wins over the config, and the loader then folds
   the effective bind back into the posture view: `local_access_only` reads `false` and `listen_address`
@@ -397,11 +400,16 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   - **An inbound MLLP, HTTP, DICOM SCP, raw-TCP or X12 listener** without `tls` binds in cleartext, so
     PHI crosses the network unencrypted.
 - **When acceptable:** a lab/loopback-adjacent trusted, firewalled segment; never for real remote PHI.
-- **Compensating controls:** network isolation; prefer in-process TLS (`[api].tls_cert_file`) or a
-  TLS-terminating proxy instead.
+- **Compensating controls:** network isolation; prefer an operator certificate (`[api].tls_cert_file`)
+  or a TLS-terminating proxy in front of a loopback-bound engine instead.
+  [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) and
+  [API revocation gate](SECURITY.md#api-revocation-gate) say what each one needs.
 - **Still refused:** either bind under `[security].enforcement = enforce`, the shipped default — the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
-  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
+  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`. In every mode it also leaves at
+  least the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals, the
+  [API revocation gate](SECURITY.md#api-revocation-gate) and the off-loopback `/ui` certificate refusal
+  in place.
 
 ### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)
 > **Not a loosening — the inverse.** The console is **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
@@ -415,16 +423,15 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
-  than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
-  operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
+  than the JSON API: an explicitly-enabled console off-loopback is refused without an operator
+  `[api].tls_cert_file`, and that refusal holds even under
   `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` behind a declared
   terminator (`[api].tls_terminated_upstream`). Under `enforce` it also refuses one behind a proxy named
   in `[api].trusted_proxies` alone, for the ASVS 12.1.1 probe (vault BACKLOG #3538; the
   `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) has the rule). With an operator
   certificate, no proxy and no address, this check only warns: the `/ui` origin checks then use the
   request Host, and passkeys fail closed until the address is set. Other gates can still refuse that
-  start, at least the in-process TLS revocation gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and
-  MFA-at-exposure.
+  start, at least the [API revocation gate](SECURITY.md#api-revocation-gate) and MFA-at-exposure.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
@@ -705,7 +712,7 @@ is refused, so an opt-out does nothing and is not reported.
   **AUDIT** line is a gate's own, and not every gate writes one at `warn`: [*The switches*](#the-switches)
   says so.
 - **Still refused (even at `warn`):** running without sign-in. No setting turns it off, on any bind,
-  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
+  loopback included (vault BACKLOG #2719), so `enforcement = warn` cannot open it. The unconditional ePHI audit floor is untouched. So are the [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) refusals, the [API revocation gate](SECURITY.md#api-revocation-gate) and the off-loopback `/ui` certificate refusal, which read no enforcement level. `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
   per-connection `cleartext_accepted` declaration is the way to cross one, recorded per hop.
@@ -1408,12 +1415,14 @@ count is above `0` (vault BACKLOG #2613).
   ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
   decision 3). So the hop from the proxy to the engine is **plaintext**, and the engine does nothing to
   protect it. At least sign-in credentials, session tokens and PHI reads cross that hop unencrypted.
-- **When acceptable:** the site keeps the hop private by means the engine cannot see: a same-host
-  loopback hop, an isolated network segment, or a host firewall. Without the acknowledgement, `serve`
-  refuses this topology in every mode (BACKLOG #1179).
+- **When acceptable:** only on a same-host loopback hop, with the proxy on the engine's machine and
+  the engine bound to loopback. [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)
+  states when `serve` refuses it.
 - **Compensating controls:** set `[api].tls_cert_file` so the engine serves that hop over TLS, and point
-  the proxy at https with that certificate trusted. Short of that, keep the proxy on the same host.
-  Isolation limits who can read the hop; it does not encrypt it.
+  the proxy at https with that certificate trusted; off loopback the
+  [API revocation gate](SECURITY.md#api-revocation-gate) then applies. Short of that, the
+  same-host proxy that `serve` already requires is the only isolation. Isolation limits who can read the hop; it does not
+  encrypt it.
 - **Visibility:** each start with the acknowledgement honoured writes a WARNING-level startup **AUDIT**
   line, and `GET /security/posture` names it. That makes the loosening visible; it protects nothing.
 - **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing
@@ -1803,7 +1812,18 @@ count is above `0` (vault BACKLOG #2613).
   the credit whatever CRL the context loads (vault BACKLOG #5089); at least REST, SOAP and FHIR
   hand the guard no context or opener (ADR 0173 §4.3 and §13). CORRECTED 2026-11-03: this said
   `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
-  which stopped being true when `capture` gained that flag. The engine will tell you *which* connections have it set,
+  which stopped being true when `capture` gained that flag. *(Note 2026-11-04: since vault BACKLOG
+  #5086, `capture` also gives no CRL credit to a context it is handed that skips time validity when
+  the flag is not passed, and names the `tls_allow_expired` remedy for a hop that passes no remedy
+  of its own. So a hop handed its relaxed context is decided as above with or without the
+  flag. `capture` reads only the context it is handed, so a call site that handed it some other,
+  unrelaxed context with a CRL would still earn credit. `tests/test_revocation_guard_census.py`
+  fails on such a call site among the ones that reach `relax_verify_expiry` by name, in at least
+  the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
+  some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
+  file's relaxed-hop census say what it reads. REST, SOAP
+  and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
+  (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -1915,6 +1935,43 @@ count is above `0` (vault BACKLOG #2613).
   `cleartext_accepted`. `messagefoundry security show` and a graphless `GET /security/posture`
   cannot see it either, and say so in `loosenings_scope`.
 
+### `ech_sidecar` at an `http://` URL — the hop to the ECH sidecar is cleartext
+> **Connection-scoped:** a `REST` outbound that sets `ech_egress` and points `ech_sidecar` at an
+> `http://` listener. The keys are raw settings, written code-first as
+> [`samples/ech-sidecar/README.md`](../samples/ech-sidecar/README.md) shows. ADR 0139.
+- **What you lose:** the engine sends each request to the sidecar over cleartext http on this host,
+  and the sidecar does the TLS to the partner. That hop carries the request body and every request
+  header, any credential included. On a SMART or OAuth2 connection the token-endpoint request takes
+  the same hop, with its client credential. A process on this host that can capture loopback
+  traffic, or that binds the sidecar's port first, reads all of it.
+- **What you keep:** the sidecar must be a loopback address. A sidecar anywhere else is refused at
+  build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
+  `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
+  it.
+- **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
+  normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
+  `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
+  `url`.
+- **The fix:** run the sidecar's listener on `https://`, which encrypts the hop and takes it off
+  this list. The two hops verify the listener's certificate against different stores. The delivery
+  request reads the operating system's trust store alone, not the connection's `tls_ca_file` or
+  the `[tls]` policy. On a SMART or OAuth2 connection the token-endpoint request reads the anchor
+  its token URL resolves to, the connection's `tls_ca_file` included. So the certificate must name
+  the loopback host the URL uses and chain to a CA every hop that takes it reads.
+- **It is never silent:** a WARNING at every construction naming the connection, never a header
+  value; an `ech-sidecar-cleartext` line in `messagefoundry check` naming every such connection;
+  and an `ech_sidecar` entry in `security_loosenings()`, which `GET /security/posture` shows. The
+  last two read one list. It leaves out a sidecar the build refuses, but it reads only
+  `ech_egress` and `ech_sidecar`, so a connection the build refuses for another reason, such as a
+  `proxy_url` beside them, can still be on it. An `env()` value is
+  resolved where the reader has the instance's values: `GET /security/posture` on a running engine
+  does, and `messagefoundry check` does not. One it cannot resolve is listed, marked possibly,
+  unless the other key alone rules the hop out, as a literal `https://` sidecar does. A
+  `deployed = false` connection with an `env()` value is left off, because it is never built.
+- **Where it is NOT reported:** the serve-time loosening warning, which fires before the graph is
+  loaded, exactly as for `cleartext_accepted`. `messagefoundry security show` and a graphless
+  `GET /security/posture` cannot see it either, and say so in `loosenings_scope`.
+
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
 > outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
@@ -1952,15 +2009,21 @@ count is above `0` (vault BACKLOG #2613).
   already logged it, so a reload logs it once for each connection that check builds. That holds for
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
-  again. At a start that logs it, each `FhirLookup` whose `url` resolved logs it once, before any
-  build, so the URL is named while the lookup is down, whether its build or another setting failed;
-  its failure is recorded and alerted. The exception is a lookup whose warning step itself raises:
-  it is degraded, with an ERROR line and no WARNING. A lookup whose `url` did not resolve has no
-  URL to read and logs none. The egress check logs it
-  before any of its refusals, so an outbound or a lookup that check refuses, for example over an
-  unlisted forward proxy, has logged it. An outbound that fails before that check, at least on an
-  unresolved `env()` value, logs none. An `env()` URL on a connection that logged none appears
-  nowhere until a later build or check logs it. There is also a
+  again. At a start that logs it, each outbound lane the start builds logs it in a step just before
+  its own build, and every later build of an unbuilt lane through `start_outbound` does the same,
+  at least an operator start and a schedule window's opening. After the outbound lanes and
+  the `DatabaseLookup` executor, each `FhirLookup` logs it in the same step, before any lookup is
+  built. So the URL is named while the connection is down, whether its build or another setting
+  failed, at least on an unresolved `env()` value; its failure is recorded and alerted (BACKLOG
+  #4997). A graph-wide failure before the lookups' step, at least a `DatabaseLookup` executor that
+  fails to build, ends the start before any `FhirLookup` logs it. The exception is a
+  connection whose warning step itself raises: a lookup is degraded and an outbound lane fails,
+  with an ERROR line or a failure record and no WARNING. A connection whose `url` did not resolve
+  has no URL to read and logs an INFO line saying so instead. Everywhere else the egress check
+  logs it, before any of its refusals, so an outbound or a lookup that check refuses, for example
+  over an unlisted forward proxy, has logged it. There, at least in a build check and a connection
+  test, an outbound or a lookup that fails before that check logs none. An `env()` URL on a
+  connection that logged none appears nowhere until a later build or check logs it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup

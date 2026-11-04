@@ -131,7 +131,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # WORKDIR is writable so a relative File-output / store path still lands on the volume, not a read-only layer.
 WORKDIR /var/lib/mefor
 USER 10001
-# API (in-process TLS / plaintext-behind-proxy) + MLLP data plane. Documentation only; publish per topology.
+# API (TLS; plaintext only to a proxy on the engine's loopback) + MLLP data plane. Documentation only; publish per topology.
 EXPOSE 8443 8765 2575
 # Liveness probe: GET /health is tokenless and always 200 (it answers even before the engine finishes
 # starting, so it is a pure liveness signal, not readiness; there is no unauthenticated readiness
@@ -156,8 +156,8 @@ EXPOSE 8443 8765 2575
 # loopback. -k skips VERIFICATION on a hop that never leaves the container's network namespace; it
 # does not skip encryption and it cannot reach a cleartext socket.
 #
-# NOT COVERED, deliberately: [api].tls_terminated_upstream, where a proxy terminates TLS in front
-# and the engine speaks plaintext to it. ADR 0172 mints nothing there, so that deployment must
+# NOT COVERED, deliberately: [api].tls_terminated_upstream with no [api].tls_cert_file, where a
+# proxy terminates TLS in front and the engine speaks plaintext to it. ADR 0172 mints nothing there, so that deployment must
 # override this HEALTHCHECK rather than have the image infer a plaintext hop from a TLS failure.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS -k "https://127.0.0.1:${MEFOR_API_PORT:-8765}/health" || exit 1

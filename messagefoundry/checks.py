@@ -403,6 +403,9 @@ def run_checks(
         # vault BACKLOG #2570: every path-form update that declares no If-Match, which a server
         # requiring one on update would refuse. Advisory -- see the check.
         _check_fhir_update_if_match(config_dir),
+        # ADR 0139: every REST outbound whose ECH sidecar hop is cleartext http on this host. No hop
+        # gate refuses it, because it is loopback. Advisory -- see the check.
+        _check_ech_cleartext_sidecar(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -2891,6 +2894,46 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
     )
 
 
+def _check_ech_cleartext_sidecar(config_dir: str | Path) -> CheckResult:
+    """Name every ``REST`` outbound that sends through an ``http://`` ECH sidecar (ADR 0139).
+
+    The set and its ``env()`` case are in
+    :func:`~messagefoundry.config.wiring.ech_cleartext_sidecar_hops`; what the hop carries is in
+    ``docs/SECURITY-LOOSENING.md``, ``ech_sidecar``. Advisory (``required=False``): nothing refuses
+    the hop, and an https sidecar listener is the fix.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, ech_cleartext_sidecar_hops, load_config
+
+    name = "ech-sidecar-cleartext"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    found = ech_cleartext_sidecar_hops(registry)
+    if not found:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no REST connection sends through an http:// ECH sidecar",
+        )
+    listed = "; ".join(f"{conn} ({note})" for conn, note in found)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(found)} REST connection(s) send through an ECH sidecar whose hop on this host "
+            f"is cleartext http, or may where marked possibly — {listed}. That hop carries the "
+            "body and every request header, any credential included; an https sidecar listener "
+            "encrypts it (ADR 0139)"
+        ),
+    )
+
+
 def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
     """Surface every connection that declares ``tls_revocation_attested`` (ADR 0173), with its reason.
 
@@ -3583,11 +3626,13 @@ def _check_upstream_hop_ack(
 ) -> CheckResult:
     """Refuse a declared upstream TLS terminator with no ``[api].tls_cert_file`` and no
     ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
-    brought forward to commit/CI time.
+    brought forward to commit/CI time. Also refuse that plaintext hop on a non-loopback bind host,
+    acknowledged or not, which ``serve`` refuses too (BACKLOG #4636).
 
-    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decision is
-    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicate ``serve``
-    calls, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
+    Without it the gate passes a config that ``serve`` then refuses with exit 2. The decisions are
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_off_loopback` and
+    :func:`~messagefoundry.api.tls.plaintext_upstream_hop_unacknowledged`, the predicates ``serve``
+    calls in the same order, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
     enforcement mode, so this check reads no dial either.
 
     Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
@@ -3598,7 +3643,12 @@ def _check_upstream_hop_ack(
     The file lookup differs from ``serve``'s in the ways :func:`_check_posture` documents."""
     from pydantic import ValidationError
 
-    from messagefoundry.api.tls import api_tls_source, plaintext_upstream_hop_unacknowledged
+    from messagefoundry.api.tls import (
+        api_tls_source,
+        plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_off_loopback_remedy,
+        plaintext_upstream_hop_unacknowledged,
+    )
     from messagefoundry.config.settings import settings_error_detail
 
     toml, env_only = _settings_source(
@@ -3624,6 +3674,22 @@ def _check_upstream_hop_ack(
             detail=f"settings did not load: {settings_error_detail(exc)}",
         )
     api = settings.api
+    # Checked first, in serve's order: off loopback no acknowledgement covers the plaintext hop.
+    if plaintext_upstream_hop_off_loopback(api):
+        return CheckResult(
+            "upstream-hop-ack",
+            ok=False,
+            required=True,
+            detail=(
+                "[api].tls_terminated_upstream with no [api].tls_cert_file serves the "
+                f"proxy-to-engine hop in plaintext on the non-loopback API bind host {api.host!r}, "
+                "which serve accepts only on a loopback bind; off loopback the acknowledgement "
+                "does not clear it -- serve would refuse to start (exit 2, in every enforcement "
+                "mode). "
+                f"{plaintext_upstream_hop_off_loopback_remedy('[security].listen_address')} (see "
+                "docs/SECURITY.md, Plaintext proxy hop)"
+            ),
+        )
     if plaintext_upstream_hop_unacknowledged(api):
         return CheckResult(
             "upstream-hop-ack",
@@ -3634,7 +3700,7 @@ def _check_upstream_hop_ack(
                 "proxy-to-engine hop in plaintext, and [api].plaintext_upstream_hop_acknowledged "
                 "is not set -- serve would refuse to start (exit 2, in every enforcement mode). "
                 "Set the acknowledgement once your site secures that hop, or set "
-                "[api].tls_cert_file (see docs/SECURITY.md)"
+                "[api].tls_cert_file (see docs/SECURITY.md, Plaintext proxy hop)"
             ),
         )
     source = api_tls_source(

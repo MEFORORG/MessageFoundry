@@ -28,6 +28,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http
 from messagefoundry.transports import http_listener as http_module
+from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HANDSHAKES_PER_HOST, HttpSource
 from messagefoundry.transports.receipt import receipt_handler
@@ -151,6 +152,46 @@ async def test_the_budget_is_inert_where_the_loop_runs_the_handshake(
             await _close_raw(writer)
         await asyncio.wait_for(source.stop(), timeout=10.0)
     assert intake.received == [b"hi"]
+
+
+class _SubclassedLoop(asyncio.SelectorEventLoop):
+    """A subclass of a stdlib loop, which the MLLP listener treats as an unknown loop (vault
+    BACKLOG #4552) and the HTTP listener does not."""
+
+
+def test_the_budget_still_applies_on_a_subclass_of_a_stdlib_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The HTTP listener has no accept loop of its own, so if a BaseEventLoop subclass took it off
+    its own upgrade, its caps would apply only after the loop's handshake and this budget never.
+    It keeps the upgrade there, as before vault BACKLOG #4552. The control: the same loop is one the MLLP
+    listener's exact match refuses, so the HTTP listener passes the looser test on purpose."""
+    monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        assert type(loop) is _SubclassedLoop
+        assert mllp_module._upgrades_tls_itself(loop) is False
+        source, _cert = _tls_source(tmp_path, max_handshakes_per_host=1)
+        events = _Events()
+        source.on_connection_event = events
+        await source.start(receipt_handler(_Intake()))
+        opened: list[asyncio.StreamWriter] = []
+        try:
+            assert source._upgrade_tls is True
+            opened.append((await _silent_socket(source.sockport))[1])
+            await _until(lambda: source._admission.handshaking == {HOST: 1}, "not in handshake")
+            r2, w2 = await _silent_socket(source.sockport)
+            opened.append(w2)
+            await _closed_by_listener(r2, within=5.0)
+            await _until(lambda: "at_capacity" in events.kinds(), "no at_capacity event")
+            assert events.seen == [("at_capacity", HOST, "max_handshakes_per_host")]
+        finally:
+            for writer in opened:
+                await _close_raw(writer)
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+
+    asyncio.run(scenario(), loop_factory=_SubclassedLoop)
 
 
 def _http(**settings: Any) -> HttpSource:

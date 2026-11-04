@@ -249,7 +249,8 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: lines, so no encoded run in one is scrubbed. Moving the credential filters ahead of this module
 #: in the log chain would lift it.
 #:
-#: **Each arm is a copy of its source, or wider, with ONE stated exception.** The label arm is
+#: **Each arm is a copy of its source, or wider, with ONE stated exception, and one source has no
+#: arm.** The label arm is
 #: ``secretscrub``'s own: the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and
 #: the separator. Its start is ``\b`` alone. Since BACKLOG #2999 ``secretscrub`` also starts a label
 #: right after a ``%XX`` escape (``_LABEL_START``), and this arm deliberately does not. Taking that
@@ -260,7 +261,15 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
 #: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.
-#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``. This module is stdlib-only and cannot
+#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
+#:
+#: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
+#: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one
+#: of that pattern's words (``password``, ``pass``, ``pwd``, ``token`` and the rest), ``;Bypass=1``
+#: among them, so an encoded PHI run beside one printed where the run hid it. Without the arm the
+#: run applies as it did before #5030. The price: where a member sits in the run's own token, as in
+#: ``a%7Cb%7Cc;sslpassword=x y``, the run takes the token and the value's tail after a space prints,
+#: as it did before #5030. This module is stdlib-only and cannot
 #: import them, so ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour
 #: that this pattern matches every text either filter changes when the filters start a label at
 #: ``\b`` alone. A plain literal, so the static regex gate reads it. The prefix bound keeps the scan

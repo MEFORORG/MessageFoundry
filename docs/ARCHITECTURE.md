@@ -259,7 +259,7 @@ Some also carry an upper bound, and at least uvicorn and websockets are pinned e
 - `hl7apy` — version-aware validation + profiles (opt-in strict path)
 - `pydantic` — config / connector models and validation
 - `aiosqlite` — async SQLite for the message store / queue
-- `fastapi` + `uvicorn` (with `httptools`, `websockets` and, outside Windows, `uvloop`) — localhost engine API
+- `fastapi` + `uvicorn` (with `httptools`, `websockets` and `uvloop`, the last wherever its environment marker in `pyproject.toml` allows) — localhost engine API
 - `argon2-cffi` — argon2id password hashing
 - `cryptography` — AES-256-GCM at-rest encryption for the store
 - `ldap3` + `pyspnego` — Active Directory / LDAP auth and Windows SSO (Kerberos)

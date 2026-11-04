@@ -212,6 +212,8 @@ __all__ = [
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
+    "ech_cleartext_sidecar_hops",
+    "UNRESOLVED_ECH_SIDECAR",
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
@@ -7024,6 +7026,69 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+#: The note :func:`ech_cleartext_sidecar_hops` gives a connection whose ``ech_egress`` or
+#: ``ech_sidecar`` is an ``env()`` reference it could not resolve. ``GET /security/posture`` keeps
+#: only names, so it marks such a name with this text rather than state the hop is cleartext.
+UNRESOLVED_ECH_SIDECAR = "possibly: an env() value this reading could not resolve"
+
+
+def ech_cleartext_sidecar_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """Every outbound that sends through an ECH sidecar at an ``http://`` URL, as ``(name, note)``
+    (ADR 0139).
+
+    The single reader of that set, on the contract of :func:`path_form_fhir_updates`:
+    ``messagefoundry check`` and the ``ech_sidecar`` entry of ``security_loosenings()`` read it.
+    Sorted by name. What the hop carries is stated once, in ``docs/SECURITY-LOOSENING.md``.
+
+    It decides each connection with the build's own rules, imported lazily for the one-way rule:
+    the connector types ``transports.base`` lets take ``ech_egress`` (every other one refuses it at
+    build), ``transports.rest.ech_sidecar_url_from_settings``, so a sidecar the build refuses
+    (off-host, a bad scheme) is not listed, and ``ech_sidecar_is_cleartext``, the rule the
+    construction WARNING applies. It reads only those two keys, so a connection the build refuses
+    for another reason, such as a ``proxy_url`` beside ``ech_egress``, can still be listed.
+
+    An ``env()`` value is resolved against ``env_values`` when the caller has them, as the build
+    resolves it (the live posture route passes the runner's). One it cannot resolve is listed with
+    :data:`UNRESOLVED_ECH_SIDECAR` rather than left off, unless the other key alone already rules
+    the hop out. A ``deployed=False`` connection with an ``env()`` value is skipped, as the
+    DATABASE readers skip one: its values are never resolved and it is never built (ADR 0111 AC-1).
+
+    Pure: it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.base import _ECH_ROUTING_DESTINATIONS
+    from messagefoundry.transports.rest import (
+        ech_sidecar_is_cleartext,
+        ech_sidecar_url_from_settings,
+    )
+
+    out: list[tuple[str, str]] = []
+    for oc in registry.outbound.values():
+        if oc.spec.type not in _ECH_ROUTING_DESTINATIONS:
+            continue
+        settings = oc.spec.settings
+        if not oc.deployed and any(
+            isinstance(settings.get(key), EnvRef) for key in ("ech_egress", "ech_sidecar")
+        ):
+            continue
+        egress = _db_setting(settings, "ech_egress", None, env_values)
+        sidecar = _db_setting(settings, "ech_sidecar", None, env_values)
+        if not egress:
+            continue
+        if sidecar is _UNRESOLVED:
+            out.append((oc.name, UNRESOLVED_ECH_SIDECAR))
+            continue
+        try:
+            resolved = ech_sidecar_url_from_settings({"ech_egress": True, "ech_sidecar": sidecar})
+        except ValueError:
+            continue  # the build refuses this sidecar, so no hop to it is ever made
+        if resolved is None or not ech_sidecar_is_cleartext(resolved):
+            continue
+        note = UNRESOLVED_ECH_SIDECAR if egress is _UNRESOLVED else "an http:// sidecar"
+        out.append((oc.name, note))
+    return sorted(out)
+
+
 #: Opens the reason :func:`unverified_generic_db_hops` gives for a hop whose ``env()`` dialect it
 #: could not resolve. ``GET /security/posture`` keeps only names, so it marks such a name with this
 #: text rather than state the hop is generic.
@@ -7050,7 +7115,7 @@ _UNRESOLVED = object()
 def _db_setting(
     settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
 ) -> object:
-    """A DATABASE connection's ``key`` setting, an ``env()`` reference resolved as the build
+    """A connection's ``key`` setting, an ``env()`` reference resolved as the build
     resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
     values, or a key the values do not hold and no default."""
     value = settings.get(key, default)

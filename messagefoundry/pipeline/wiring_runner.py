@@ -233,6 +233,7 @@ from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
+from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -258,7 +259,7 @@ from messagefoundry.transports.base import (
     guarded_source_dirs,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
-from messagefoundry.transports.egress import warn_url_query_credentials
+from messagefoundry.transports.egress import warn_url_query_credentials_before_build
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import reply_seconds
@@ -1076,6 +1077,28 @@ class _StreamBudgetExceeded(Exception):
         # The default keeps cls(*args), which pickle and copy rebuild an exception with, working.
         super().__init__(message)
         self.alone = alone
+
+
+#: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
+#: SQL Server's ``NVARCHAR(256)`` (SQLite and PostgreSQL use unbounded ``TEXT``). OBX-5.2 is
+#: sender-controlled, so a longer label would fail the write with error 2628 on every resend.
+_ATTACHMENT_CONTENT_TYPE_MAX = 256
+
+
+def _label_fits_every_backend(label: str) -> bool:
+    """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
+    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), and no wider than
+    :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing either would fail the write on every
+    resend. The length test comes first, so a long sender-controlled label is never copied to be
+    measured.
+
+    A lone surrogate is deliberately not tested. A label can hold one only when the decoded body
+    does, and the same character then stays in the skeleton, whose ingress write fails on it
+    whatever the label is. Downgrading it would only store an unreferenced attachment first, so
+    ``put_attachment``'s own encode fault propagates instead, writing nothing."""
+    if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
+        return False
+    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
 
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
@@ -2791,13 +2814,12 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
-        ``warn_query_credentials`` logs the URL query-credential WARNING once per lookup whose
-        ``url`` resolved, before any build, so an ``env()`` URL carrying a query credential is
-        recorded while its lookup is down, whether its build or another setting failed (ASVS
-        14.2.1). The exception is a lookup whose warning step itself raises: it is degraded, with
-        an ERROR line and no WARNING. A lookup whose ``url`` did not resolve has no URL to read
-        and logs none. A caller
-        whose build check has already warned passes False (vault BACKLOG #2910)."""
+        ``warn_query_credentials`` runs
+        :func:`~messagefoundry.transports.egress.warn_url_query_credentials_before_build` once per
+        lookup, before any build, so an ``env()`` URL carrying a query credential is recorded while
+        its lookup is down (ASVS 14.2.1). A lookup whose warning step itself raises is degraded,
+        with an ERROR line and no WARNING. A caller whose build check has already warned passes
+        False (vault BACKLOG #2910)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
@@ -2805,28 +2827,6 @@ class RegistryRunner:
         def resolve(name: str) -> dict[str, Any]:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
             return _fhir_lookup_settings(specs[name], self._env_values, self._egress)
-
-        def warn(name: str, resolved: Mapping[str, Any] | None) -> None:
-            # ``resolved`` is None when a setting failed to resolve. The url alone is then
-            # resolved, so an env() URL is still named while the lookup is down.
-            if resolved is None:
-                try:
-                    resolved = resolve_env_settings(
-                        {"url": specs[name].settings.get("url")},
-                        self._env_values,
-                        connection=fhir_lookup_record_name(name),
-                    )
-                except WiringError:  # names the key, never a value
-                    # The lookup's own failure may name another setting, so say this one too.
-                    # No ":" or "=" after the name: the log scrubber reads "LABEL: value"
-                    # as a secret, and a lookup name may end in a credential word.
-                    log.info(
-                        "the url of FhirLookup %r did not resolve, so the URL query-credential "
-                        "check could not read it",
-                        name,
-                    )
-                    return
-            warn_url_query_credentials(f"FhirLookup {name!r}", resolved)
 
         def build(
             resolved: Mapping[str, Mapping[str, Any]],
@@ -2872,7 +2872,14 @@ class RegistryRunner:
             if not warn_query_credentials:
                 continue
             try:
-                warn(name, settled.get(name))
+                # The one pre-build step an outbound's start takes too (BACKLOG #4997). It reads
+                # the url alone, so an env() URL is still named while the lookup is down.
+                warn_url_query_credentials_before_build(
+                    f"FhirLookup {name!r}",
+                    specs[name].settings,
+                    self._env_values,
+                    connection=fhir_lookup_record_name(name),
+                )
             except Exception as exc:
                 log.error(
                     "FhirLookup %r URL query-credential check failed, so it is not started",
@@ -4510,6 +4517,11 @@ class RegistryRunner:
             return None
         connector: DestinationConnector | None = None
         try:
+            if warn_query_credentials:
+                # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371: the operator start of a lane the boot gates left unbuilt checks
             # its CA too, isolated with the build below.
@@ -4518,8 +4530,9 @@ class RegistryRunner:
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
             # (fail-closed/no-op default) posture.
             with active_hop_posture(self._hop_posture):
+                # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                    dest, egress=self._egress, warn_query_credentials=False
                 )
             # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
@@ -5721,6 +5734,14 @@ class RegistryRunner:
         )  # at/above threshold this run — clear any prior parked marker
         connector: DestinationConnector | None = None
         try:
+            if warn_query_credentials:
+                # The one pre-build step a FhirLookup's start takes too (BACKLOG #4997). Before
+                # env() resolves the rest and before any check, so a lane that is down for an
+                # unresolved setting, a refused CA or any other build failure keeps its ASVS 14.2.1
+                # record. Inside this try, so a step that raises fails this lane only.
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.
             await self._check_lane_anchor("outbound", name, dest.settings)
@@ -5733,8 +5754,9 @@ class RegistryRunner:
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
             # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
+                # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=warn_query_credentials
+                    dest, egress=self._egress, warn_query_credentials=False
                 )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
@@ -6251,8 +6273,10 @@ class RegistryRunner:
 
         Abandonment is safe for those four. It is NOT safe for DICOM, which releases its port inside
         ``await to_thread(server.shutdown)`` — an abandoned DICOM stop can still hold the port at
-        re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and
-        parks on that Event, so an abandoned one finishes at most its single in-flight scan.
+        re-promotion. File/RemoteFile/Database/Timer set an Event, and each is leader-gated and
+        parks on that Event, so an abandoned one finishes at most its single in-flight scan. File,
+        RemoteFile and Database then cancel a poll task still outside a store call after their own
+        grace (BACKLOG #1620, #4685), so that scan's blocked external call is cut, not waited on.
 
         The bound is applied HERE, at the call site — never by editing a transport constant, which would
         make ``transports/`` know about clustering (the one-way dependency rule).
@@ -6361,11 +6385,11 @@ class RegistryRunner:
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge engine shutdown, and the reload, re-promotion and connection API calls
         queued behind its lock, for as long as a wedged
-        File/Database ``stop()`` runs. (Database waits on its poll task with no timeout of its own;
-        once cancelled, it lets a row's hand-off and mark run for a bounded grace, which a
-        non-leader skips, then cuts the task and bounds both the join and the pool close. File now
-        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
-        without a bound while that task is inside a store call.)
+        File/Database/RemoteFile ``stop()`` runs. (File, BACKLOG #1620, and Database and
+        RemoteFile, BACKLOG #4685, cut a poll task blocked on an external call after a grace, but still wait without a bound while
+        that task is inside a store call. Once cancelled, Database lets a row's hand-off and mark
+        run for a bounded grace, which a non-leader skips, then cuts the task and bounds both the
+        join and the pool close.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and
@@ -8367,7 +8391,8 @@ class RegistryRunner:
                 kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns a refusal — never accepted-and-dropped.
+        # refusal records ERROR + returns a refusal — never accepted-and-dropped. Any other fault, a
+        # put_attachment fault among them (#1619), propagates with no row.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8505,8 +8530,12 @@ class RegistryRunner:
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
+                # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
+                # tested first so an over-long label is never copied by the MIME check.
                 safe_ct = content_type
-                if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
+                if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
+                    content_type, b64_head(verbatim_b64)
+                ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
                 await asyncio.to_thread(
@@ -8775,8 +8804,9 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
-        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
+        # detach refusal is a synchronous ERROR + NAK, in the receipt path's class (below) — the
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. Any
+        # other fault, a put_attachment fault among them (#1619), propagates to the transport.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:

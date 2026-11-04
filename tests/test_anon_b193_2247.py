@@ -163,7 +163,11 @@ def test_the_cli_prints_the_coverage_line_when_the_level_hides_info(
 
 _REPAIR = (
     "Repair the line no rule can reach: give it a well-formed segment id, or give a header line "
-    "the separator after its encoding characters."
+    "the separator after its encoding characters. For a line with no fields under a header whose "
+    "MSH-12 holds no readable HL7 version, give the header its real version (the one the sender used), or "
+    "map a field of that segment with a rule that rewrites. A rule on MSH-12 does not help: the anonymizer and "
+    "anonymize_checked judge the input's version, and a direct leak check judges it when given "
+    "version=message_version(raw)."
 )
 _EXTEND = "Extend the rule map so the field that carries it is scrubbed."
 _KEEP = "Add a rule for each field named, or a keep for one you reviewed."
@@ -284,11 +288,27 @@ def test_a_bare_header_id_is_refused_on_both_sides(header_id: str) -> None:
 def test_an_odd_hl7_version_never_raises_out_of_the_check(version: str) -> None:
     """MSH-12 is untrusted. A superscript two passes ``str.isdigit`` and ``int`` then raises a
     ``ValueError`` that quotes it, outside the adapters' body-free conversion. The version is
-    read as unknown instead, which widens the table to every version."""
+    read as unknown instead. Field addresses still name any id some version defines, but no
+    table says which ids are empty segments of this message, so a bare ``PV2`` that no rule
+    names is refused, with the body-free ``AnonError``, the same on both sides (vault BACKLOG
+    #3001). It was emitted before."""
     raw = "\r".join((_HEADER.replace("2.5.1", version), _PID, "PV2"))
     for leak in (engine_leak, tee_leak):
         assert leak.known_segments(version) == leak.known_segments("")
-    assert engine_anonymize(raw, salt=_SALT) == tee_anonymize(raw, salt=_SALT)
+    refusals: list[str] = []
+    for side in (engine_anonymize, tee_anonymize):
+        with pytest.raises(ValueError, match="a line no rule can reach") as exc:
+            side(raw, salt=_SALT)
+        assert type(exc.value).__name__ == "AnonError"
+        # A one-letter ASCII needle would match ordinary words of the refusal, so it proves nothing.
+        if not version.isascii() or len(version) > 1:
+            assert version not in str(exc.value)
+        refusals.append(str(exc.value))
+    assert refusals[0] == refusals[1]
+    # The emitting control: a line with fields under the same header is still emitted, and the
+    # two sides still agree on the output.
+    emitted = "\r".join((_HEADER.replace("2.5.1", version), _PID, "PV2|||WARD"))
+    assert engine_anonymize(emitted, salt=_SALT) == tee_anonymize(emitted, salt=_SALT)
 
 
 def test_a_blank_line_is_dropped_and_the_lines_around_it_are_kept() -> None:

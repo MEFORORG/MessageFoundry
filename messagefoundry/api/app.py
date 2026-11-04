@@ -23,10 +23,12 @@ refuse that opt-in beside an auth service or auth settings. Only embedders and t
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
 engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
-``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
+``[api].tls_terminated_upstream`` with no ``[api].tls_cert_file`` declares a reverse proxy
+terminating TLS in front and speaking
 plaintext to the engine, and :func:`messagefoundry.api.tls.ensure_api_tls_material` returns
-``None`` there, so nothing is minted. *Always serves TLS* means the engine never leaves a hop
-unprotected, NOT that it terminates TLS in every topology. Remote network exposure (opening the
+``None`` there, so nothing is minted; docs/SECURITY.md, Plaintext proxy hop, says when ``serve``
+accepts that plaintext hop. *Always serves TLS*
+does NOT mean the engine terminates TLS in every topology. Remote network exposure (opening the
 bind beyond loopback) is a separate, later question from whether the hop is encrypted.
 """
 
@@ -403,6 +405,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
     UNRESOLVED_DRIVER_REASON,
+    UNRESOLVED_ECH_SIDECAR,
     ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
@@ -410,6 +413,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     accepted_cleartext_hops,
     attested_secure_hops,
+    ech_cleartext_sidecar_hops,
     expiry_relaxed_hops,
     hostname_unchecked_hops,
     load_config,
@@ -2067,13 +2071,26 @@ def _posture_loosenings(
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
     path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
+    # Resolved against the same values as the DATABASE hops above. A name the values cannot
+    # resolve keeps the reader's marker, because the entry keeps names only.
+    ech_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note == UNRESOLVED_ECH_SIDECAR else name
+            for name, note in ech_cleartext_sidecar_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
+            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar declarations are "
+            "NOT included "
             "(see `messagefoundry check`)"
         )
     if visible is not None:
@@ -2095,6 +2112,7 @@ def _posture_loosenings(
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
             path_form_fhir_hops=path_form_hops,
+            ech_cleartext_sidecar_hops=ech_hops,
             api=api_settings,
             # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
             # gate that enforces them.
@@ -4533,8 +4551,8 @@ def create_app(
         else webauthn_rp_from_request
     )
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
-    # is the OPERATOR'S declaration that the browser-facing scheme is https (in-process TLS or a
-    # declared terminator). It forces the session cookie's Secure flag and HSTS regardless of the
+    # is the OPERATOR'S declaration that the browser-facing scheme is https (an operator
+    # certificate or a declared terminator; the minted placeholder does not count). It forces the session cookie's Secure flag and HSTS regardless of the
     # per-request scheme — the scheme is computed ONCE at login and a proxy that omits
     # X-Forwarded-Proto would otherwise poison the cookie for the whole session.
     # tls_terminated_upstream additionally arms the one-shot /ui cleartext-scheme tripwire.

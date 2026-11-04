@@ -22,6 +22,7 @@ Nothing here dials: construction reads settings only. All certificates and CRLs 
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import logging
 import ssl
@@ -527,20 +528,25 @@ def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
 
 def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -> None:
     """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check that may
-    silence the line. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
-    the condition cannot be ``self.crl_checked``, which is what this arm tells apart."""
+    silence the line. ``crl_checked`` is False on it without the caller's ``expiry_relaxed`` (vault
+    BACKLOG #5086), so the hop crosses on its attestation, ALLOW, and keeps the line. It carries the
+    relaxed words, which say no CRL is credited: the context skips the check, so they are true here,
+    and since #5086 nothing credits that CRL for them to contradict. Before #5086 this guard credited
+    the CRL and kept the unrelaxed words (#5089's version of this test pinned that)."""
     guard = _attested_guard(_crl_context(skip_validity=True))
-    assert guard.crl_checked is True
+    assert guard.crl_checked is False
+    assert guard.expiry_relaxed is True
     assert guard.disposition() is HopDisposition.ALLOW
     with _guard_log() as log:
         guard.enforce_construction()
-    assert "crossed without certificate revocation checking" in log.audit, log.state()
-    # Without the caller's `expiry_relaxed` the guard credited that CRL, so the relaxed wording,
-    # which says no CRL is credited, would contradict the ALLOW it records (vault BACKLOG #5086
-    # owns whether that CRL should admit the hop). The relaxed wording is the flag's alone.
-    assert guard.expiry_relaxed is False
-    assert _RELAXED_CROSSING not in log.audit, log.state()
-    assert _RELAXED_DETAIL not in log.audit, log.state()
+    assert _RELAXED_CROSSING in log.audit, log.state()
+    assert _RELAXED_DETAIL in log.audit, log.state()
+    assert EXPIRY_RELAXED_WAYS_ACROSS in log.audit, log.state()
+    # The control: a context that keeps the check, with no CRL, keeps the unrelaxed words.
+    with _guard_log() as plain:
+        _attested_guard(ssl.create_default_context()).enforce_construction()
+    assert "crossed without certificate revocation checking" in plain.audit, plain.state()
+    assert _RELAXED_DETAIL not in plain.audit, plain.state()
 
 
 def _relaxed_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
@@ -585,6 +591,48 @@ def test_expiry_relaxed_alone_names_the_relaxed_remedy() -> None:
         _relaxed_guard(None, ways_across="Set [x].y_attested.").enforce_construction()
     assert "Set [x].y_attested." in str(own.value)
     assert EXPIRY_RELAXED_WAYS_ACROSS not in str(own.value)
+
+
+def test_an_unattested_time_skipping_crl_is_refused_without_the_flag() -> None:
+    """The case #5089 left open. A CRL past ``nextUpdate`` passes a ``NO_CHECK_TIME`` context at
+    the handshake, so that CRL is no revocation check and must not cross an enforcing hop on its
+    own, whether or not the caller passes ``expiry_relaxed`` (vault BACKLOG #5086, owner ruling
+    2026-11-03). Before #5086 a guard handed such a context WITHOUT the flag credited the bare CRL
+    flag, so it was ALLOWed with no attestation and no line. The keep-time CRL is the control: it
+    is a check, and it still crosses. The refusal offers only levers that can cross it, never the
+    CRL it already has; a caller's own ``ways_across`` still wins."""
+    relaxed = _guard(_crl_context(skip_validity=True))
+    assert relaxed.crl_checked is False
+    assert relaxed.disposition() is HopDisposition.REFUSE
+    with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+        relaxed.enforce_construction()
+    assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+    assert "Configure [tls].crl_file" not in str(exc.value)
+    own = _guard(_crl_context(skip_validity=True), ways_across="")
+    assert own.ways_across == ""
+    # A hop that is not a connection is refused the same way.
+    not_a_connection = _guard(_crl_context(skip_validity=True), connection=None)
+    assert not_a_connection.disposition() is HopDisposition.REFUSE
+    assert not_a_connection.ways_across == EXPIRY_RELAXED_WAYS_ACROSS
+    # The rule holds for a guard built directly too, not only through capture().
+    with pytest.raises(ValueError, match="cannot credit a CRL"):
+        dataclasses.replace(relaxed, crl_checked=True)
+    kept = _guard(_crl_context(skip_validity=False))
+    assert kept.ways_across is None
+    assert kept.disposition() is HopDisposition.ALLOW
+    kept.enforce_construction()
+
+
+def test_an_unattested_crl_on_a_context_that_skips_time_validity_warns_when_not_enforcing() -> None:
+    """The same CRL earns no credit on a non-enforcing instance either, so the hop takes the WARN
+    any unchecked off-box hop takes there, where the bare CRL flag used to ALLOW it with no line
+    (vault BACKLOG #5086). The posture-blind read is what ``docs/SECURITY-LOOSENING.md`` states
+    for ``tls_allow_expired`` ("in either posture"). The keep-time CRL is the control."""
+    relaxed = _guard(_crl_context(skip_validity=True), posture=NOT_ENFORCING)
+    assert relaxed.crl_checked is False
+    assert relaxed.disposition() is HopDisposition.WARN
+    kept = _guard(_crl_context(skip_validity=False), posture=NOT_ENFORCING)
+    assert kept.disposition() is HopDisposition.ALLOW
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
@@ -1226,7 +1274,7 @@ def _assert_refused_for_the_relaxation(
     built: list[ssl.SSLContext], exc: pytest.ExceptionInfo[InsecureHopRefused], connection: str
 ) -> None:
     # The CRL did reach the context the hop built, so this is the relaxation's refusal and not a CRL
-    # that never arrived: a guard that read that context's CRL flag would have admitted it.
+    # that never arrived: a guard that credited that context's bare CRL flag would have admitted it.
     assert len(built) == 1
     assert context_checks_revocation(built[0]) is True
     assert skips_validity_period(built[0]) is True

@@ -56,10 +56,17 @@ invariants can't silently regress.
   outside :data:`_XML_PARSER_MODULES`. The one *import-free* route that exists in this tree —
   ``parsing/xml/_deps.py``'s lazy loaders — is covered by its own clause
   (:data:`_XML_DEPS_CONSUMERS`) rather than left to the module-name matcher. Separately,
-  ``transports/soap.py`` triages SOAP faults with regexes over the XML response body
-  (``_FAULT_RE``/``_FAULTCODE_RE``/``_CODEVALUE_RE``) — an ad-hoc same-type extraction that is
-  deliberately out of the clause's scope, because it drives only retry-vs-dead-letter classification,
-  never a security decision.
+  ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
+  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
+  whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
+  ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
+  longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
+  ``<Value-x>``.
+  ``_code_text`` takes the text from the next ``>`` after a match to the next ``</``. Which match,
+  inside the Fault ``_FAULT_RE`` matched, and when the code is empty instead, its docstring and
+  ``_fault_code``'s say. That is an ad-hoc same-type extraction, deliberately out of the clause's scope, as are at least
+  ``_FAULT_RE``, ``_WSSE_FAULT_RE``, ``_SENDER_RE`` and ``_RECEIVER_RE``. The fault-code text drives
+  at least retry versus dead-letter.
 """
 
 from __future__ import annotations
