@@ -1201,10 +1201,22 @@ async def _reload_hold_params(
     bytes it releases and the release refuses any others (vault BACKLOG #2596, step 3). It is taken
     only when dual control gates the reload, and is ``None`` otherwise, because an inline reload
     holds nothing and takes its own digest. A target the reload would refuse, or one whose digest
-    cannot be taken, raises one of :data:`_RELOAD_REFUSALS` here, so no hold is filed for it."""
+    cannot be taken, raises one of :data:`_RELOAD_REFUSALS` here, so no hold is filed for it.
+
+    ``value_file``, present only when the engine binds one, is the keyed binding of the environment
+    value file it reads from outside the config directory, which ``fingerprint`` leaves out:
+    every approver sees these params, and that file can hold credentials
+    (:meth:`~messagefoundry.pipeline.engine.Engine.reload_target_approval`)."""
     gated = gate is not None and gate.gates("config_reload")
-    digest = await engine.reload_target_digest(config_dir) if gated else None
-    return {"config_dir": config_dir, "requester": requester, "fingerprint": digest}
+    approval = await engine.reload_target_approval(config_dir) if gated else None
+    params: dict[str, Any] = {
+        "config_dir": config_dir,
+        "requester": requester,
+        "fingerprint": None if approval is None else approval.fingerprint,
+    }
+    if approval is not None and approval.value_file is not None:
+        params["value_file"] = approval.value_file
+    return params
 
 
 def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException | None:
@@ -1818,7 +1830,9 @@ def _build_approval_gate(
         # a key the params are sealed with the rest of the request, so a writer to pending_approvals
         # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
         approved = p.get("fingerprint")
-        approval = ApprovedConfig(approved if isinstance(approved, str) else None)
+        approval = ApprovedConfig(
+            approved if isinstance(approved, str) else None, p.get("value_file")
+        )
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
@@ -2708,6 +2722,11 @@ async def _audit_refused_reload(
         detail["reason"] = "no_approved_digest" if unbound else "digest_mismatch"
         detail["approved_fingerprint"] = exc.approved
         detail["current_fingerprint"] = exc.current
+        if exc.value_file:
+            # The two digests match: the value file outside the config directory, which neither
+            # covers, is not the one the approval bound (vault BACKLOG #2596). A marker, never a
+            # digest of it.
+            detail["value_file_check"] = "mismatch"
         status = 422
         answer = (
             "this request named no config digest, so it cannot be released; request the reload "

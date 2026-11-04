@@ -2620,8 +2620,9 @@ def _read_environment_values(
 
     With ``snapshot``, the value file is parsed from the bytes the snapshot read and never read
     from disk, so a file edited after that read does not apply, and one created or removed since is
-    refused (vault BACKLOG #2596). A value file outside the snapshot's ``environments/`` folder
-    raises :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
+    refused (vault BACKLOG #2596). A value file the snapshot does not cover, outside its
+    ``environments/`` folder and not the value file the engine read into it, raises
+    :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
     import os
 
     from messagefoundry.config.environments import (
@@ -2663,7 +2664,7 @@ def _read_environment_values(
     env_file = values_file_path(base_dir, dir_name, environment)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
-        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+        raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
     # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
     # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
     assert_trusted_start_paths(
