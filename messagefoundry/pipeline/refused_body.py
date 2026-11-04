@@ -47,8 +47,9 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from messagefoundry.config.settings import (
     REFUSED_BODY_ALLOWANCE_BYTES as DEFAULT_ALLOWANCE_BYTES,
@@ -112,12 +113,17 @@ class BoundedRefusal:
 
     raw: str
     error: str
-    record: dict[str, object]
+    record: Mapping[str, object]
+
+    @property
+    def fields(self) -> dict[str, object]:
+        """The metadata keys that hold :attr:`record`, for a store that merges them in."""
+        return {METADATA_KEY: dict(self.record)}
 
     @property
     def metadata(self) -> str:
-        """The metadata JSON that holds :attr:`record`."""
-        return json.dumps({METADATA_KEY: self.record})
+        """:attr:`fields` as the metadata JSON a store writes."""
+        return json.dumps(self.fields)
 
 
 class RefusedBodyAllowance:
@@ -210,7 +216,15 @@ class RefusedBodyAllowance:
         stored_bytes = len(wire) if text is not None else len(body)  # carriage is ASCII
         fits_in_head = len(wire) <= head_bytes
         whole = fits_in_head or self.try_charge(inbound, stored_bytes)
-        stored = body if whole else _head(wire, text, content_type, head_bytes)
+        if whole:
+            stored = body
+        elif text is None:
+            stored = _head(wire, None, content_type, head_bytes)
+        else:
+            # Cut the held text first. Its UTF-8 is not received bytes, so a latin-1 view of it, which
+            # _head takes for a text holding a NUL, would store mojibake.
+            cut = wire[:head_bytes].decode("utf-8", "ignore")
+            stored = _head(cut.encode("utf-8", "surrogatepass"), cut, content_type, head_bytes)
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
 
     def _refusal(
@@ -230,7 +244,7 @@ class RefusedBodyAllowance:
             # The bound this head was cut to, kept because the policy may change before anyone reads
             # it: the edit-and-resubmit refusal names it (:func:`head_only_resubmit_refusal`).
             record["head_bytes"] = self.policy.head_bytes
-        return BoundedRefusal(raw=stored, error=error, record=record)
+        return BoundedRefusal(raw=stored, error=error, record=MappingProxyType(record))
 
 
 def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | None:
@@ -258,9 +272,18 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
     body = f"this {total:,}-byte refused body" if total is not None else "this refused body"
     # The bound, not a count of the sender's bytes: a decoded head is cut to this much UTF-8.
     kept = f", cut to a {head:,}-byte head bound" if head is not None else ""
+    origin = parsed.get("correlation_id") if "reingress_of_seq" in parsed else None
+    remedy = (
+        # A loopback re-ingress child (vault BACKLOG #4796): its sender is a partner's reply, which
+        # the engine captured whole on the origin message.
+        f"its whole reply stays in the captured response of origin message {origin} until"
+        " retention erases it"
+        if isinstance(origin, str)
+        else "have the sender send its own copy again"
+    )
     return (
         f"message {message_id} stored only the head of {body}{kept}, so it cannot be edited and"
-        " resubmitted from this copy; have the sender send its own copy again"
+        f" resubmitted from this copy; {remedy}"
     )
 
 

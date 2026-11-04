@@ -189,11 +189,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_max_rows,
     reference_statement,
 )
-from messagefoundry.pipeline.refused_body import (
-    METADATA_KEY,
-    RefusedBodyAllowance,
-    with_refusal_note,
-)
+from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, with_refusal_note
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -10341,7 +10337,8 @@ class RegistryRunner:
         if peek_failed:
             # Vault BACKLOG #4796: the refused reply is charged to the loopback's refused-body
             # allowance, as a listener's refusal is. A handoff that then stores no child (a consumed
-            # or depth-capped token) leaves the charge spent, which errs toward storing less.
+            # or depth-capped token), or that raises and is retried, leaves the charge spent: that
+            # errs toward storing less, never more.
             refused = self._refused_body.bound_held(
                 name,
                 body,
@@ -10359,7 +10356,7 @@ class RegistryRunner:
             peek_failed=peek_failed,
             peek_error=None if refused is None else refused.error,
             refused_raw=None if refused is None else refused.raw,
-            refused_metadata=None if refused is None else {METADATA_KEY: refused.record},
+            refused_metadata=None if refused is None else refused.fields,
         )
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op

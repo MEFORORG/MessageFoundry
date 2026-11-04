@@ -29,6 +29,7 @@ from messagefoundry.pipeline.refused_body import (
     METADATA_KEY,
     RefusedBodyAllowance,
     RefusedBodyPolicy,
+    head_only_resubmit_refusal,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, Stage
@@ -126,6 +127,10 @@ async def assert_a_refused_reply_flood_stores_heads_past_the_allowance(store: An
             assert child["raw"] == body[:HEAD]
             assert record["stored"] == "head" and record["head_bytes"] == HEAD
             assert child["error"] == note + REINGRESS_PEEK_FAILED
+            # Edit-and-resubmit refuses the cut child and points at the whole reply's origin.
+            refusal = head_only_resubmit_refusal(child["id"], json.dumps(child["meta"]))
+            origin = child["meta"]["correlation_id"]
+            assert refusal is not None and f"origin message {origin} " in refusal
         stored += len(child["raw"].encode())
     assert stored <= allowance_bytes + len(bodies) * HEAD
     # No refused reply became ingress work on the loopback.

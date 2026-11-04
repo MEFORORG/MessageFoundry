@@ -26,6 +26,7 @@ from messagefoundry.pipeline.refused_body import (
     METADATA_KEY,
     RefusedBodyAllowance,
     RefusedBodyPolicy,
+    head_only_resubmit_refusal,
 )
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher, verify_refused_body_digest
@@ -48,10 +49,12 @@ async def test_reingress_refused_body_contract(store: MessageStore, case: Any) -
 
 
 def _allowance(allowance_bytes: int, head_bytes: int = 256) -> RefusedBodyAllowance:
+    # A frozen clock, so no refill between two charges can make a spent allowance read as unspent.
     return RefusedBodyAllowance(
         RefusedBodyPolicy(
             allowance_bytes=allowance_bytes, window_seconds=60.0, head_bytes=head_bytes
-        )
+        ),
+        clock=lambda: 1000.0,
     )
 
 
@@ -141,3 +144,31 @@ def test_the_loopback_spends_its_own_allowance_not_a_listeners() -> None:
     assert _record(spent.metadata)["stored"] == "whole"
     assert allowance.try_charge("IB_LISTENER", 1000)
     assert not allowance.try_charge("IB_LOOP", 1)
+
+
+def test_a_held_text_with_a_nul_keeps_its_characters_in_the_head() -> None:
+    # The held text's UTF-8 is not received bytes, so its head must not be their latin-1 view.
+    body = "café " * 100 + "\x00" + "tail"
+    bounded = _allowance(0, head_bytes=16).bound_held(
+        "IB_LOOP", body, ContentType.JSON.value, "e", cipher=_KEYLESS
+    )
+    assert bounded.raw == "café café caf"  # 15 UTF-8 bytes: cut before a split character
+    # A NUL inside the head is stored as carriage of the text's own UTF-8.
+    nul_head = _allowance(0, head_bytes=16).bound_held(
+        "IB_LOOP", "café\x00" + "x" * 100, ContentType.JSON.value, "e", cipher=_KEYLESS
+    )
+    assert decode_carriage(nul_head.raw) == ("café\x00" + "x" * 10).encode()
+
+
+def test_a_head_only_reingress_child_names_its_origin_as_the_remedy() -> None:
+    record = {"refused_body": {"bytes": 9000, "stored": "head", "head_bytes": 256}}
+    child = {"correlation_id": "origin-1", "reingress_of_seq": 1, **record}
+    text = head_only_resubmit_refusal("child-1", json.dumps(child))
+    assert text is not None
+    assert text.endswith(
+        "; its whole reply stays in the captured response of origin message origin-1 until"
+        " retention erases it"
+    )
+    # A listener's head-only row keeps the sender remedy.
+    listener = head_only_resubmit_refusal("row-1", json.dumps(record))
+    assert listener is not None and listener.endswith("; have the sender send its own copy again")

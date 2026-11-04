@@ -8406,11 +8406,12 @@ class SqlServerStore:
                 if await cur.fetchone() is None:
                     child_meta = json.dumps(
                         {
+                            # First, so the lineage keys win (vault BACKLOG #4796).
+                            **(refused_metadata if peek_failed and refused_metadata else {}),
                             "correlation_id": origin_id,
                             "correlation_root_id": root,
                             "correlation_depth": child_depth,
                             "reingress_of_seq": seq,
-                            **(refused_metadata if peek_failed and refused_metadata else {}),
                         }
                     )
                     await cur.execute(
