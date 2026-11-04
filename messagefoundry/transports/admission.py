@@ -8,8 +8,9 @@ frame deadline and a refuse-while-stopping check, and every listener wrote one W
 refusal (vault BACKLOG #2606). This module holds those controls once.
 
 * :class:`ListenerAdmission` makes the pre-read decision, in order: refuse while stopping, the source
-  allowlist, the global connection cap and the per-host cap. It owns the live-connection counts and
-  the throttled refusal log. Each listener keeps its own read loop; only the admission is shared.
+  allowlist, the global connection cap, the per-host cap and, for a socket admitted before its TLS
+  handshake, the per-host handshake budget (vault BACKLOG #4888). It owns the live-connection counts
+  and the throttled refusal log. Each listener keeps its own read loop; only the admission is shared.
 * :class:`RefusalLog` is the per-address, windowed log throttle the DICOM server introduced, moved here
   so the four socket listeners and the DICOM server share one.
 * :class:`FrameClock` is the frame deadline: the bound on one frame from its first byte to its last.
@@ -23,8 +24,9 @@ Everything here runs before ingress, so no message is read, persisted or acknowl
 ACK-on-receipt and count-and-log invariants are untouched: a refused connection has delivered
 nothing, and the sender retries.
 
-**TLS is not in the helper.** The MLLP and HTTP listeners upgrade a socket to TLS themselves, after
-admission, on the stdlib loop (BACKLOG #1606, #2479), so that step stays in their accept handlers.
+**TLS is not in the helper.** The MLLP listener on every loop, and the HTTP listener on the stdlib
+loop, start TLS on a socket themselves after admission (BACKLOG #1606, #2479), so that step stays
+in their accept handlers.
 """
 
 from __future__ import annotations
@@ -33,8 +35,10 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 from messagefoundry.netaddr import peer_ip_allowed
 
@@ -171,6 +175,14 @@ _STOPPING = Refusal(kind=None)
 _NOT_ALLOWLISTED = Refusal(kind="peer_not_allowlisted")
 _AT_CAPACITY = Refusal(kind="at_capacity")
 _AT_HOST_CAPACITY = Refusal(kind="at_capacity", reason="max_connections_per_host")
+_AT_HANDSHAKE_CAPACITY = Refusal(kind="at_capacity", reason="max_handshakes_per_host")
+
+
+class PeerInfo(Protocol):
+    """What admission reads of a connection: its ``peername``. An ``asyncio.StreamWriter`` is one,
+    and so is the MLLP listener's stand-in for a socket no transport owns yet (BACKLOG #1606)."""
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any: ...
 
 
 class ListenerAdmission:
@@ -184,6 +196,14 @@ class ListenerAdmission:
     from one peer address, so one address cannot take the whole listener. It keys on the source IP,
     so behind a source-NAT proxy every partner is one peer and the per-host cap becomes the whole
     capacity; switch it off there.
+
+    ``max_handshakes_per_host`` counts only sockets from one peer address that hold a slot while
+    still in their TLS handshake, and a socket leaves that count when its handshake ends, however
+    it ends (:meth:`handshake`). So it bounds a peer that stalls its handshakes without capping an
+    address's established connections (vault BACKLOG #4888; ``docs/DEPLOYMENT.md``, *Per-address
+    listener caps behind the VIP*, holds what it does and does not bound). Only a listener that
+    admits a socket before upgrading it passes ``handshake`` to :meth:`check`, then runs the
+    handshake inside :meth:`handshake`.
     """
 
     def __init__(
@@ -194,6 +214,7 @@ class ListenerAdmission:
         max_connections: int | None,
         max_connections_per_host: int | None,
         source_ip_allowlist: list[str] | None,
+        max_handshakes_per_host: int | None = None,
     ) -> None:
         self.transport = transport
         #: The inbound connection's name, for :func:`notify_refusal`. Required, so a new listener
@@ -202,6 +223,7 @@ class ListenerAdmission:
         self.max_connections = max_connections
         self.max_connections_per_host = max_connections_per_host
         self.source_ip_allowlist = source_ip_allowlist
+        self.max_handshakes_per_host = max_handshakes_per_host
         #: Set from the start of the listener's stop() until its next start().
         self.stopping = False
         self.active = 0
@@ -212,25 +234,32 @@ class ListenerAdmission:
         self.per_host: dict[str, int] = {}
         #: Hosts already warned about their per-host cap this episode, cleared with the count above.
         self.host_capacity_warned: set[str] = set()
+        #: Admitted sockets per peer address still in their TLS handshake, kept and dropped at zero
+        #: like :attr:`per_host`, so it inherits that table's bound, with a warned set of its own.
+        self.handshaking: dict[str, int] = {}
+        self.handshake_capacity_warned: set[str] = set()
         self.refusal_log = RefusalLog()
         #: Which run of the listener the per-host tables describe. :meth:`admit` hands it to the
         #: connection and :meth:`reset` advances it, so a release from an earlier run can be told
         #: from one the tables still count (vault BACKLOG #2939).
         self._epoch = 0
 
-    def check(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
+    def check(
+        self, writer: PeerInfo, peer_host: str | None, *, handshake: bool = False
+    ) -> Refusal | None:
         """Decide whether to admit this connection. Logs a refusal, throttled; emits no event.
 
-        Every refusal but the stopping one is passed to :func:`notify_refusal`."""
+        ``handshake`` says the socket will hold its slot through a TLS handshake, so the handshake
+        budget applies to it. Every refusal but the stopping one is passed to :func:`notify_refusal`."""
         if self.stopping:
             logger.debug("%s connection refused: the listener is stopping", self.transport)
             return _STOPPING
-        refusal = self._refusal(writer, peer_host)
+        refusal = self._refusal(writer, peer_host, handshake)
         if refusal is not None:
             notify_refusal(self.name)
         return refusal
 
-    def _refusal(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
+    def _refusal(self, writer: PeerInfo, peer_host: str | None, handshake: bool) -> Refusal | None:
         if self.source_ip_allowlist is not None:
             peer = writer.get_extra_info("peername")
             if not peer_ip_allowed(peer, self.source_ip_allowlist):
@@ -240,10 +269,26 @@ class ListenerAdmission:
             # No line: a refused connection is free to the peer, and this budget is the listener's
             # whole capacity. The `at_capacity` event records each one.
             return _AT_CAPACITY
-        if self._at_host_capacity(peer_host):
-            assert peer_host is not None  # _at_host_capacity is False without an address
-            self._log_host_capacity_once(peer_host)
+        if _at_cap(self.per_host, self.max_connections_per_host, peer_host):
+            assert peer_host is not None  # _at_cap is False without an address
+            self._log_capacity_once(
+                peer_host,
+                self.host_capacity_warned,
+                _AT_HOST_CAPACITY,
+                self.max_connections_per_host,
+                "it has no connections left",
+            )
             return _AT_HOST_CAPACITY
+        if handshake and _at_cap(self.handshaking, self.max_handshakes_per_host, peer_host):
+            assert peer_host is not None  # as above
+            self._log_capacity_once(
+                peer_host,
+                self.handshake_capacity_warned,
+                _AT_HANDSHAKE_CAPACITY,
+                self.max_handshakes_per_host,
+                "none of its sockets is in a TLS handshake",
+            )
+            return _AT_HANDSHAKE_CAPACITY
         return None
 
     def admit(self, peer_host: str | None) -> int:
@@ -254,6 +299,22 @@ class ListenerAdmission:
         if peer_host is not None:
             self.per_host[peer_host] = self.per_host.get(peer_host, 0) + 1
         return self._epoch
+
+    @contextmanager
+    def handshake(self, peer_host: str | None, epoch: int) -> Iterator[None]:
+        """Count an admitted socket against its host's handshake budget for the body of the
+        ``with``, which runs its TLS handshake, however the handshake ends. Enter it straight after
+        :meth:`admit`, with no ``await`` between, so the budget :meth:`check` read still holds.
+        ``epoch`` follows :meth:`release`'s rule on exit."""
+        if peer_host is None:
+            yield
+            return
+        self.handshaking[peer_host] = self.handshaking.get(peer_host, 0) + 1
+        try:
+            yield
+        finally:
+            if epoch == self._epoch:
+                _drop_one(self.handshaking, self.handshake_capacity_warned, peer_host)
 
     def release(self, peer_host: str | None, epoch: int) -> None:
         """Give both slots back. One place for both counters, so they cannot drift: a per-host count
@@ -270,14 +331,7 @@ class ListenerAdmission:
         self.active -= 1
         if peer_host is None or epoch != self._epoch:
             return
-        remaining = self.per_host.get(peer_host, 0) - 1
-        if remaining > 0:
-            self.per_host[peer_host] = remaining
-        else:
-            self.per_host.pop(peer_host, None)
-            # Dropped with the count, so the next episode for this host warns again and neither
-            # table outlives the connections it describes.
-            self.host_capacity_warned.discard(peer_host)
+        _drop_one(self.per_host, self.host_capacity_warned, peer_host)
 
     def reset(self) -> None:
         """Forget the per-host tables, at stop. ``active`` is left to the releases still running.
@@ -293,12 +347,8 @@ class ListenerAdmission:
         self._epoch += 1
         self.per_host.clear()
         self.host_capacity_warned.clear()
-
-    def _at_host_capacity(self, peer_host: str | None) -> bool:
-        # A cap that cannot name its subject must not refuse anybody.
-        if self.max_connections_per_host is None or peer_host is None:
-            return False
-        return self.per_host.get(peer_host, 0) >= self.max_connections_per_host
+        self.handshaking.clear()
+        self.handshake_capacity_warned.clear()
 
     def _log_not_allowlisted(self, peer_host: str | None) -> None:
         address = peer_host or "an unknown address"
@@ -314,25 +364,51 @@ class ListenerAdmission:
             total,
         )
 
-    def _log_host_capacity_once(self, peer_host: str) -> None:
-        """Warn the FIRST time a host hits its cap, then stay quiet until it has no connections left.
+    def _log_capacity_once(
+        self, peer_host: str, warned: set[str], refusal: Refusal, cap: int | None, until: str
+    ) -> None:
+        """Warn the FIRST time a host hits a per-host cap, then stay quiet until its count for that
+        cap drops to zero, which is ``until`` in words. The line names the knob by the refusal's
+        reason, so the log and the `at_capacity` event cannot spell it differently.
 
         Clearing at zero rather than when the host drops back under the cap is deliberate: a peer
         oscillating on the boundary would otherwise earn a line per cycle. A per-refusal line would
         let a peer looping ``connect()`` fill the log volume. The `at_capacity` event still records
-        every refusal. The warned set is keyed and cleared exactly like :attr:`per_host`, so it
-        inherits that table's bound.
+        every refusal. Each warned set is keyed and cleared exactly like its count table
+        (:func:`_drop_one`), so it inherits that table's bound.
         """
-        if peer_host in self.host_capacity_warned:
+        if peer_host in warned:
             return
-        self.host_capacity_warned.add(peer_host)
+        warned.add(peer_host)
         logger.warning(
-            "%s connections from %s refused: it holds max_connections_per_host (%d). Further "
-            "refusals for this host are not logged until it has no connections left.",
+            "%s connections from %s refused: it holds %s (%d). Further refusals for this host are "
+            "not logged until %s.",
             self.transport,
             peer_host,
-            self.max_connections_per_host,
+            refusal.reason,
+            cap,
+            until,
         )
+
+
+def _at_cap(counts: dict[str, int], cap: int | None, peer_host: str | None) -> bool:
+    """Whether ``peer_host`` already holds ``cap`` entries of a per-host count table."""
+    # A cap that cannot name its subject must not refuse anybody.
+    if cap is None or peer_host is None:
+        return False
+    return counts.get(peer_host, 0) >= cap
+
+
+def _drop_one(counts: dict[str, int], warned: set[str], peer_host: str) -> None:
+    """Take one entry for ``peer_host`` off a per-host count table."""
+    remaining = counts.get(peer_host, 0) - 1
+    if remaining > 0:
+        counts[peer_host] = remaining
+    else:
+        counts.pop(peer_host, None)
+        # Dropped with the count, so the next episode for this host warns again and neither
+        # table outlives the connections it describes.
+        warned.discard(peer_host)
 
 
 def _frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None) -> float | None:

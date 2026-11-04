@@ -400,10 +400,12 @@ rules are in [SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs
   directory**. This matters when the engine runs as a **Windows service under NSSM**, where the launch
   directory isn't your repo. (Omit it only when you always launch from the repo root.)
 - The engine **binds `127.0.0.1` by default** and **requires authentication**. To expose a channel
-  off-loopback, configure **native TLS** (API: `[api].tls_cert_file`/`tls_key_file` or a trusted upstream
-  terminator; MLLP inbound: per-connection `tls = true`) — a non-loopback bind without them is **refused at
+  off-loopback, configure **native TLS** (API: `[api].tls_cert_file`/`tls_key_file`; MLLP inbound:
+  per-connection `tls = true`) — a non-loopback bind without them is **refused at
   startup**. The API's own self-signed placeholder certificate does not count off loopback
-  ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+  ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)),
+  and the certificate is not all the API bind needs:
+  [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the rule.
   See [DEPLOYMENT.md](DEPLOYMENT.md).
 - For production, run the engine as a **Windows service via NSSM** — see [SERVICE.md](SERVICE.md).
 - For **multi-node high availability** (active-passive failover of a single instance), see

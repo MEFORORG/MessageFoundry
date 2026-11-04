@@ -955,10 +955,11 @@ def _unwrap_transaction_reply(
     occurrence of a repeated key reads a third way (vault BACKLOG #3796); see :func:`_agreed_reading`.
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
-    entry carries suppresses the reply header of the same name, which describes the Bundle, even
-    when the entry's value is then dropped. A value carrying a control character, or longer than a
-    header value may be, is dropped: it came from a JSON body, which, unlike an HTTP header line,
-    bounds neither. The rest are offered to the #154 allow-list."""
+    entry carries with a non-null value suppresses the reply header of the same name, which
+    describes the Bundle, even when the entry's value is then dropped. At least a value that is not
+    a JSON string, carries a C0 control character or DEL, or is longer than a header value may be,
+    is dropped: it came from a JSON body, which, unlike an HTTP header line, bounds none of those.
+    The rest are offered to the #154 allow-list."""
     try:
         obj: dict[str, Any] | None = FhirPeek.parse(body).obj
     except FhirPeekError:
@@ -1196,8 +1197,9 @@ class FhirDestination(DestinationConnector):
 
         verify = bool_setting(s, "verify_tls", default=True)
         if verify:
-            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
-            # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
+            # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
+            # but tolerate an expired FHIR-server cert, and at least the other chain certificates' and a
+            # CRL's validity windows (opt-in; default off = the shared verifying opener, byte-identical).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy

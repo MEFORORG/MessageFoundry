@@ -12,11 +12,12 @@ verify leg with the store refusing a session stamp for its seal, which must end 
 from __future__ import annotations
 
 import ast
+import json
 import pathlib
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import (
     SESSION_SEAL_EXCLUDED,
     MessageStore,
+    RevokeResult,
     SessionRecord,
     session_seal_ok,
 )
@@ -133,7 +135,7 @@ async def test_a_key_rotation_ends_every_session(tmp_path: Path) -> None:
     store = await MessageStore.open(path, cipher=make_cipher(old, write_v2=True))
     try:
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         token = mint_token()
         await store.create_session(
@@ -159,7 +161,7 @@ async def test_a_session_sealed_under_a_retired_key_ends_without_an_alert(tmp_pa
     store = await MessageStore.open(path, cipher=make_cipher(old, write_v2=True))
     try:
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         stale, bent = mint_token(), mint_token()
         for token in (stale, bent):
@@ -191,7 +193,7 @@ async def test_the_inventory_hides_a_session_from_an_older_epoch(
     store, path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     token = mint_token()
     await store.create_session(
@@ -208,7 +210,7 @@ async def test_a_keyless_store_writes_no_seal_and_checks_none(tmp_path: Path) ->
     try:
         assert store.row_sealer() is None
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         token = mint_token()
         await store.create_session(
@@ -228,7 +230,7 @@ async def test_a_refused_session_is_audited_and_alerted_once_per_interval(
     alerts: list[str] = []
     service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     good = mint_token()
     await store.create_session(
@@ -259,7 +261,7 @@ async def test_signing_out_elsewhere_ends_every_session_when_the_callers_own_fai
     store, path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     tokens = [mint_token() for _ in range(3)]
     for token in tokens:
@@ -277,6 +279,226 @@ async def test_signing_out_elsewhere_ends_every_session_when_the_callers_own_fai
         assert row is not None and row.revoked_at is not None
 
 
+async def test_a_kept_session_a_sweep_missed_is_not_reported_kept(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """BACKLOG #4975 and its follow-up: a revoke does not stamp a kept session an earlier sweep
+    missed, and ends it in the same transaction. The service must not report it kept, and its
+    counts must say what ended: the every-account revoke answers not kept, counts the caller's
+    row and audits scope ``all``; signing out elsewhere audits ``self_all`` and counts only the
+    other sessions, even with none to end. Each has a control, a current kept session."""
+    store, path = keyed
+    raw = _raw_for(path)
+    service = AuthService(store, AuthSettings())
+    await store.create_user(
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
+    )
+
+    async def missed() -> str:
+        # A revoked row's sealed copy restored: live, sealed, an epoch behind, as a missed row.
+        token = mint_token()
+        await store.create_session(
+            token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600
+        )
+        snapshot = await store.get_session(hash_token(token))
+        assert snapshot is not None
+        await store.revoke_user_sessions("u")
+        await raw(
+            "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+            (snapshot.seal, hash_token(token)),
+        )
+        return token
+
+    async def scopes() -> list[str]:
+        rows = await store.list_audit(action="auth.session_revoked", limit=50)
+        return [str(json.loads(row["detail"])["scope"]) for row in rows]
+
+    current = mint_token()
+    await store.create_session(
+        token_hash=hash_token(current), user_id="u", expires_at=time.time() + 3600
+    )
+    identity = await service.identity_for_token(current)
+    assert identity is not None
+    assert await service.revoke_every_session(actor="u", keep_token_hash=hash_token(current)) == (
+        0,
+        True,
+    )  # control: a current session is kept, and said to be
+    assert await scopes() == ["all_but_caller"]
+
+    async def ended(token: str) -> bool:
+        row = await store.get_session(hash_token(token))
+        return row is not None and row.revoked_at is not None
+
+    async def last_count() -> int:
+        rows = await store.list_audit(action="auth.session_revoked", limit=1)
+        return int(json.loads(rows[0]["detail"])["count"])
+
+    stale = await missed()
+    assert await service.revoke_every_session(actor="u", keep_token_hash=hash_token(stale)) == (
+        1,
+        False,
+    )  # the caller's own row, ended by the revoke and counted
+    assert (await scopes())[0] == "all" and await last_count() == 1
+    assert await ended(stale)
+
+    stale = await missed()
+    assert await service.revoke_other_sessions(identity, hash_token(stale), actor="u") == 0
+    assert (await scopes())[0] == "self_all" and await last_count() == 0  # the others only
+    assert await ended(stale)
+    # Control: a current caller ending a stale row is audited as keeping its own session.
+    stale = await missed()
+    fresh = mint_token()
+    await store.create_session(
+        token_hash=hash_token(fresh), user_id="u", expires_at=time.time() + 3600
+    )
+    caller = await service.identity_for_token(fresh)
+    assert caller is not None
+    assert await service.revoke_other_sessions(caller, hash_token(fresh), actor="u") == 1
+    assert (await scopes())[0] == "self_others"
+    assert await service.identity_for_token(fresh) is not None
+    assert await service.identity_for_token(stale) is None
+
+
+async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #4975: whether a revoke kept the caller's session is the store's answer from the
+    revoke's own transaction, and the reply and the audit scope follow it. Three cases, kept,
+    declined and the seal failure, each beside a control that differs only in that answer. The
+    count is the rows the call's sweep revoked: the every-account revoke's fallback sweep counts
+    the caller's sealed-out row, and signing out elsewhere ends it apart from its count."""
+    store, path = keyed
+    service = AuthService(store, AuthSettings())
+    await store.create_user(
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
+    )
+
+    async def mint() -> str:
+        token = mint_token()
+        await store.create_session(
+            token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600
+        )
+        return token
+
+    async def last() -> dict[str, Any]:
+        rows = await store.list_audit(action="auth.session_revoked", limit=1)
+        return dict(json.loads(rows[0]["detail"]))
+
+    def answering(kept: bool) -> None:
+        # The real revoke runs, and only its `kept` is replaced: the service has nothing else to
+        # read the answer from.
+        for name in ("revoke_all_sessions", "revoke_user_sessions"):
+            real = getattr(store, name)
+
+            async def flipped(*args: Any, _real: Any = real, **kwargs: Any) -> RevokeResult:
+                return replace(await _real(*args, **kwargs), kept=kept)
+
+            monkeypatch.setattr(store, name, flipped)
+
+    for kept, every_scope, self_scope in (
+        (True, "all_but_caller", "self_others"),
+        (False, "all", "self_all"),  # declined: the same current session, the answer flipped
+    ):
+        answering(kept)
+        caller = await mint()
+        await mint()
+        identity = await service.identity_for_token(caller)
+        assert identity is not None
+        assert await service.revoke_every_session(
+            actor="u", keep_token_hash=hash_token(caller)
+        ) == (1, kept)
+        assert await last() == {"scope": every_scope, "count": 1}
+        await mint()
+        assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 1
+        assert await last() == {"scope": self_scope, "count": 1}
+        monkeypatch.undo()
+        await store.revoke_user_sessions("u")
+
+    # --- the seal failure: the caller's own row fails its seal, so nothing is kept --------------
+    for bent in (False, True):  # control first: the same three rows, the seal intact
+        caller, *_ = [await mint() for _ in range(3)]
+        if bent:
+            await _raw_for(path)(
+                "UPDATE sessions SET reauth_at=? WHERE token_hash=?", (1.0, hash_token(caller))
+            )
+        assert await service.revoke_every_session(
+            actor="u", keep_token_hash=hash_token(caller)
+        ) == ((3, False) if bent else (2, True))
+        assert await last() == (
+            {"scope": "all", "count": 3} if bent else {"scope": "all_but_caller", "count": 2}
+        )
+        await store.revoke_user_sessions("u")
+    # Signing out everywhere else ends the caller's sealed-out row too, but apart from its counted
+    # sweep, so its count and reply stay the other sessions only; the scope says the caller's ended.
+    for bent in (False, True):
+        caller, *_ = [await mint() for _ in range(3)]
+        identity = await service.identity_for_token(caller)
+        assert identity is not None
+        if bent:
+            await _raw_for(path)(
+                "UPDATE sessions SET reauth_at=? WHERE token_hash=?", (1.0, hash_token(caller))
+            )
+        assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 2
+        assert await last() == {"scope": "self_all" if bent else "self_others", "count": 2}
+        caller_row = await store.get_session(hash_token(caller))
+        assert caller_row is not None and (caller_row.revoked_at is not None) is bent
+        await store.revoke_user_sessions("u")
+
+
+async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #4975: the service once re-derived "kept" by reading the session and its account
+    back after the revoke committed, and a refused read made it report a kept session as ended.
+    The answer now comes from the revoke itself, so a session or user read failing after the
+    commit cannot reach the reply or the audit scope. RED on the read-back: it answered False."""
+    store, _path = keyed
+    service = AuthService(store, AuthSettings())
+    await store.create_user(
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
+    )
+    caller = mint_token()
+    await store.create_session(
+        token_hash=hash_token(caller), user_id="u", expires_at=time.time() + 3600
+    )
+    identity = await service.identity_for_token(caller)
+    assert identity is not None
+
+    async def refused(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    def then_refuse(name: str) -> None:
+        # The real revoke runs and commits; every session and user read after it is refused.
+        real = getattr(store, name)
+
+        async def revoke(*args: Any, **kwargs: Any) -> RevokeResult:
+            result: RevokeResult = await real(*args, **kwargs)
+            monkeypatch.setattr(store, "get_session", refused)
+            monkeypatch.setattr(store, "get_user", refused)
+            return result
+
+        monkeypatch.setattr(store, name, revoke)
+
+    then_refuse("revoke_all_sessions")
+    assert await service.revoke_every_session(actor="u", keep_token_hash=hash_token(caller)) == (
+        0,
+        True,
+    )
+    monkeypatch.undo()
+    rows = await store.list_audit(action="auth.session_revoked", limit=1)
+    assert json.loads(rows[0]["detail"]) == {"scope": "all_but_caller", "count": 0}
+
+    then_refuse("revoke_user_sessions")
+    assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 0
+    monkeypatch.undo()
+    # Kept with nothing else ended writes no row, as before the read-back: the newest row is
+    # still the every-account one.
+    rows = await store.list_audit(action="auth.session_revoked", limit=5)
+    assert [json.loads(row["detail"])["scope"] for row in rows] == ["all_but_caller"]
+    # Control: the reads the hooks refuse are real ones, and they work once the hooks are gone.
+    assert await service.identity_for_token(caller) is not None
+
+
 async def test_signing_out_elsewhere_keeps_the_callers_own_session(
     keyed: tuple[MessageStore, Path],
 ) -> None:
@@ -284,7 +506,7 @@ async def test_signing_out_elsewhere_keeps_the_callers_own_session(
     store, _ = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     tokens = [mint_token() for _ in range(3)]
     for token in tokens:

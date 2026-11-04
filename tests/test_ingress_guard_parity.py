@@ -689,14 +689,17 @@ async def test_a_strict_validate_past_the_timeout_is_the_same_error_on_both_side
     """The listener refuses a validate that outruns ``validation.strict_timeout_s`` (#89); a dry-run
     that validated un-timed waited it out and previewed hl7apy's own refusal of the body instead
     ("Missing required child ADT_A01.PV1"). Both must now say the same words."""
-    _slow_validate(monkeypatch, 0.3)
-    ic = _strict_inbound(0.05)
+    # A 0.5 s timeout, not a few ms: one that fires before a worker thread begins the validate is
+    # TEMPORARY with its own text (BACKLOG #5078), and under GIL contention a thread can take tens
+    # of ms to begin. The validate outlasts it so both sides still time out.
+    _slow_validate(monkeypatch, 1.0)
+    ic = _strict_inbound(0.5)
 
     preview = dry_run(_registry(ic), ADT_UTF8)
     rows = await _live_rows(store, ic, ADT_UTF8, listener)
 
     assert preview.disposition is MessageStatus.ERROR, preview.error
-    assert preview.error == "strict-validation timed out after 0.05s"
+    assert preview.error == "strict-validation timed out after 0.5s"
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     # Permanent on the receipt path: ADR 0154's 2026-10-30 amendment keeps the timeout final.
     assert rows[0]["error"] == _as_stored(listener, preview.error, kind="permanent")

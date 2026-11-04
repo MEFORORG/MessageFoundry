@@ -964,6 +964,40 @@ async def test_genuine_source_failure_still_retries_and_keeps_last_good(
         await store.close()
 
 
+async def test_a_trailing_space_collision_is_logged_with_its_ordinals(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #4917: ``sync_all`` logs a source error by class name only, since its text may hold a
+    key. ``ReferenceKeyCollision`` holds the set name and two ordinals, never a key, so it is logged
+    whole and the operator can find the rows. It stays a transient failure: last-good kept, retried.
+    The SQL Server store raises it; this fakes the write, since SQLite stores both keys."""
+    from messagefoundry.store.base import ReferenceKeyCollision
+
+    csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
+    store = await MessageStore.open(tmp_path / "padded.db")
+    text = "reference set 'provider_npi': keys #3 and #7 differ only by trailing spaces"
+
+    async def colliding_write(*, name: str, version: str, rows: Any) -> None:
+        raise ReferenceKeyCollision(text)
+
+    store.write_reference_snapshot = colliding_write  # type: ignore[method-assign]
+    runner = ReferenceSyncRunner(
+        store,
+        lambda: [_spec("provider_npi", csv)],
+        REF,
+        alert_sink=_CapturingAlerts(),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    try:
+        with caplog.at_level("WARNING"):
+            result = await runner.sync_all()
+        assert result.failed == 1 and result.synced == 0
+        assert f"{text} (not synced)" in caplog.text  # the ordinals reach the log
+        assert "keeping last-good): ReferenceKeyCollision" in caplog.text  # still transient
+    finally:
+        await store.close()
+
+
 # --- ASVS 14.2.7: purge_reference_snapshots (orphan-scoped) ------------------
 #
 # `reference.value` is PL-2 (PHI.md §2) and until 14.2.7 had NO purge path at all: a set dropped from

@@ -67,7 +67,7 @@ WS-Security `<wsse:Nonce>` / `<wsu:Created>` are **per-call and non-deterministi
 crash-replay of the transform stage must re-derive **byte-identical** output, which a nonce or wall-clock
 timestamp cannot. The existing SOAP destination already lives on the correct side of that boundary — it
 runs in the **delivery worker, after the queue handoff**, not in the transform
-([`transports/soap.py:156`](../../messagefoundry/transports/soap.py) is `send()`, invoked by the
+([`transports/soap.py`](../../messagefoundry/transports/soap.py) `SoapDestination.send`, invoked by the
 per-outbound worker). So the WS-\* non-determinism **belongs in the transport's `send()`**, never in the
 Handler. **That single value-placement decision (§1) is the spine of this ADR** — it, not any string scan,
 is what guarantees re-run purity.
@@ -75,11 +75,12 @@ is what guarantees re-run purity.
 ### Why this is additive, not a new connector
 
 A new `ConnectorType.WSSOAP` would re-implement everything `soap.py` already owns: the SOAP 1.1/1.2
-`Content-Type` + `SOAPAction` handling ([`soap.py:132-143`](../../messagefoundry/transports/soap.py)), the
-`_classify_soap` Sender/Receiver fault routing ([`soap.py:70`](../../messagefoundry/transports/soap.py)),
+`Content-Type` + `SOAPAction` handling (`SoapDestination._build_headers`,
+[`soap.py`](../../messagefoundry/transports/soap.py)), the
+`_classify_soap` Sender/Receiver fault routing ([`soap.py`](../../messagefoundry/transports/soap.py)),
 the reused no-redirect opener, `refuse_cleartext_credentials`
 ([`rest.py:93`](../../messagefoundry/transports/rest.py)), and the ADR 0013 capture branch
-([`soap.py:161-173`](../../messagefoundry/transports/soap.py)). It would also have to **re-earn two engine
+(`SoapDestination.send`, [`soap.py`](../../messagefoundry/transports/soap.py)). It would also have to **re-earn two engine
 guards that are keyed on `ConnectorType.SOAP`**:
 
 - the **egress allowlist** branch [`wiring_runner.py:1490`](../../messagefoundry/pipeline/wiring_runner.py)
@@ -132,14 +133,36 @@ is a new message envelope), not a purity violation. (The idempotency footgun thi
   part and it is pure.
 - The **transport** (`SoapDestination._wrap_envelope`, new) builds the `<soap:Envelope>`, injects the
   stamped `<soap:Header>` (`wsa:` + `wsse:` elements built in `send()`), serializes with the existing
-  `encoding`, and POSTs via `_post` ([`soap.py:199`](../../messagefoundry/transports/soap.py)).
+  `encoding`, and POSTs via `SoapDestination._post` ([`soap.py`](../../messagefoundry/transports/soap.py)).
 
 #### 2a. Envelope assembly mechanism — stdlib string templating, no XML parser (Q4)
 
-This is **load-bearing** because the codebase is **regex-only and imports no XML parser** today: response
-faults are detected by regex (`_FAULT_RE` / `_FAULTCODE_RE` /`_CODEVALUE_RE`,
-[`soap.py:56-61`](../../messagefoundry/transports/soap.py)) and there is no `xml.etree` / `ElementTree` /
-`lxml` / `defusedxml` import anywhere under `messagefoundry/`. We keep that posture:
+*(Corrected 2026-11-04: this heading, the "regex-only" premise and the import sentence below claim
+more than is true now; the correction at the end of the next paragraph says what holds.)*
+
+This is **load-bearing** because the codebase is **regex-only and imports no XML parser** today
+*(corrected 2026-11-04, see below)*:
+response faults are detected by regex (`_FAULT_RE`, [`soap.py`](../../messagefoundry/transports/soap.py)).
+The fault code is found without a parser too. `_FAULTCODE_RE` / `_CODEVALUE_RE` each match a `<`,
+optional whitespace, an optional prefix of word characters, dots and hyphens ending in `:`, and the name
+`faultcode` or `Value` in any case with no word character after it, so a longer name that goes on with
+at least `.`, `-` or `:`, such as `<faultcode.detail>` or `<Value-x>`, matches too. `_code_text` takes the text from
+the next `>` after a match to the next `</`, with `str.find`. Which match it reads, inside the Fault
+`_FAULT_RE` matched, and when it yields an empty code instead, the `_fault_code` and `_code_text`
+docstrings say. *(Corrected 2026-11-04, for the fault-code sentences: until BACKLOG #2827 made
+the scan linear, the two patterns captured the code text themselves, from the first faultcode anywhere
+in the reply, else the first Value, the Header included, and an empty `<faultcode/>` took the next element's text as its code.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
+`messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
+"no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
+`tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports
+`xml.sax` for the one hardened, non-resolving parse of the Handler `<Body>` fragment that the third
+bullet below describes, `_assert_well_formed_fragment`, which `_wrap_envelope` runs on every WS-* send.
+What still holds is narrower: the SOAP envelope is built by string concatenation, never from a parsed
+tree; the fragment check keeps no tree; and `_classify_soap` calls no parser. "That posture" below
+means only that.
+For these 2026-11-04 corrections, the XML parser imports under `messagefoundry/` and the `soap.py`
+symbols this section names were re-read; the rest of this section is as accepted and was not
+re-read.)* We keep that posture:
 
 - **Assembly is stdlib `str` templating** (an f-string / `str.format` skeleton), **not** `xml.etree`. The
   transport builds the `<soap:Envelope>` + `<soap:Header>` from its own controlled, namespace-fixed
@@ -147,11 +170,14 @@ faults are detected by regex (`_FAULT_RE` / `_FAULTCODE_RE` /`_CODEVALUE_RE`,
   trusted (it comes only from config + send()-stamped values, all XML-escaped via stdlib
   `xml.sax.saxutils.escape`/`quoteattr` — both are pure string helpers, **not** parsers).
 - **Response classification stays regex** (`_classify_soap` + the new `_classify_wssecurity_fault`,
-  §5) — **no XML parser is introduced on the response side either**, so no XXE / entity-expansion /
+  §5) *(corrected 2026-11-04: built inline in `_classify_soap`, see §5; classification is regex plus
+  `str.find`, as above)* — **no XML parser is introduced on the response side either**, so no XXE /
+  entity-expansion /
   billion-laughs surface is added. This is a deliberate continuation of the regex-only design, not an
   oversight.
 - **Handler `<Body>` well-formedness is asserted before concatenation.** Because we do not parse, we cannot
-  *prove* the fragment is valid XML; instead `_wrap_envelope` runs a **stdlib well-formedness assertion**
+  *prove* the fragment is valid XML *(corrected 2026-11-04: `_assert_well_formed_fragment` does parse
+  the fragment, with `xml.sax`; see the correction above)*; instead `_wrap_envelope` runs a **stdlib well-formedness assertion**
   on the fragment alone, *isolated from our envelope*, using `xml.sax`'s incremental parser in
   **non-resolving, no-DTD mode** (`feature_external_ges=False`, `feature_external_pes=False` — external
   entity resolution off, so it is **not** an XXE vector) — purely as a *balanced-tags / no-smuggled-close*
@@ -258,10 +284,11 @@ The token credentials are dedicated `ws_username` / `ws_password` settings (fall
 
 ### 5. Response / error capture + classification (Q5) — reuse ADR 0013, extend the fault map
 
-Capture is **already built** and stays regex-based (no XML parser; §2a). `_classify_soap`
-([`soap.py:70`](../../messagefoundry/transports/soap.py)) distinguishes Sender(permanent) /
-Receiver(transient) / HTTP; the `capture_response` branch
-([`soap.py:161-173`](../../messagefoundry/transports/soap.py)) returns `DeliveryResponse`
+Capture is **already built** and stays regex-based (no XML parser; §2a) *(corrected 2026-11-04: see the
+correction in §2a)*. `_classify_soap`
+([`soap.py`](../../messagefoundry/transports/soap.py)) distinguishes Sender(permanent) /
+Receiver(transient) / HTTP; the `capture_response` branch of `SoapDestination.send`
+([`soap.py`](../../messagefoundry/transports/soap.py)) returns `DeliveryResponse`
 ([`transports/base.py:129`](../../messagefoundry/transports/base.py)) outcomes `accepted` / `rejected` /
 `no_reply`. The capture is persisted by the delivery worker: on a captured reply it calls
 `complete_with_response` ([`wiring_runner.py:883-891`](../../messagefoundry/pipeline/wiring_runner.py)),
@@ -273,13 +300,17 @@ worker (ADR 0013 Increment 2, design doc lines [18](0013-increment-2-reingress-d
 nothing to that path. `reingress_to=` is declared on the factory
 ([`wiring.py:941`](../../messagefoundry/config/wiring.py)).
 
-**One extension:** a `_classify_wssecurity_fault` step (composed into `_classify_soap`) maps the common
+**One extension:** a `_classify_wssecurity_fault` step (composed into `_classify_soap`) *(corrected
+2026-11-04: no function of that name exists; `_classify_soap` matches these codes itself, with
+`_WSSE_FAULT_RE`)*
+maps the common
 WS-Security fault codes — `wsse:FailedAuthentication`, `wsse:InvalidSecurityToken`,
 `wsse:MessageExpired` — to **permanent** (`NegativeAckError`, `permanent=True`). A cert/credential reject
 or an expired timestamp **won't fix on a retry**, so it must **dead-letter** rather than loop the FIFO
 lane forever — consistent with the existing "unrecognized fault → permanent" stance
-([`soap.py:82`](../../messagefoundry/transports/soap.py)). Fault bodies are still **not** echoed into
-errors/logs (they may carry PHI; [`soap.py:16`](../../messagefoundry/transports/soap.py)).
+(`_classify_soap`, [`soap.py`](../../messagefoundry/transports/soap.py)). Fault bodies are still **not**
+echoed into errors/logs (they may carry PHI; the [`soap.py`](../../messagefoundry/transports/soap.py)
+module docstring).
 
 ### 6. Invariants (Q6) — inherited by staying `ConnectorType.SOAP`
 
@@ -366,7 +397,8 @@ parser.
   per-connection `SSLContext`-gated-by-`insecure_tls_allowed()` shape from `mllp.py:312-353`, and REST's
   `_NoRedirectHandler` PHI defense.
 - **Response capture / re-ingress is free** — ADR 0013 + Increment 2 untouched; a partner confirmation can
-  be reconciled or routed with only the small `_classify_wssecurity_fault` extension.
+  be reconciled or routed with only the small `_classify_wssecurity_fault` extension *(corrected
+  2026-11-04: built inline in `_classify_soap`, see §5)*.
 
 ### Negative / costs
 

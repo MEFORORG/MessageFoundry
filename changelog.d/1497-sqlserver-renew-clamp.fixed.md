@@ -8,6 +8,6 @@
   land up to about twice the clamp after it is issued, while the config check compares the clamp
   alone with the detection margin; `serve` logs a warning at start-up when twice the clamp reaches
   that margin, which the shipped 10/20/30 timings do. Neither the clamp nor `command_timeout` is
-  known to bound the COMMIT after the statement, or the rollback after a failed claim; that is a
-  reading of pyodbc's documentation, not a measurement, and `docs/CONFIGURATION.md` says why. ADR
-  0157 Inc 0, deviation 3. (`BACKLOG #1497`)
+  known to bound the COMMIT after the statement; that is a reading of pyodbc's documentation, not a
+  measurement, and `docs/CONFIGURATION.md` says why. The rollback after a failed claim has its own
+  bound at the clamp (`BACKLOG #5066`). ADR 0157 Inc 0, deviation 3. (`BACKLOG #1497`)

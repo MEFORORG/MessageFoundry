@@ -5,13 +5,13 @@
 # which hold `id-token: write` and publish what the backend emits. The pin picks one immutable release.
 # It does NOT stop the fetch, check a hash, or pin hatchling's own dependencies; BACKLOG #1546 records
 # that residual and the `--no-isolation` form that would close it. Dependabot's uv updater bumps THIS
-# table and neither of the two under packaging/, so a Dependabot hatchling bump reds the lockstep test
-# until those two are moved by hand in the same PR. Read the backend's changes, not only its version:
+# table and none of the tables under packaging/, so a Dependabot hatchling bump reds the lockstep test
+# until every one of those is moved by hand in the same PR. Read the backend's changes, not only its version:
 # 1.32.4 writes core-metadata `Version:` in the spelling the version root was TYPED in, where 1.32.0
 # wrote the PEP 440 canonical form. The release.yml version gates compare PEP 440 versions, so none
 # reds on that, but prose that says the backend canonicalises `Version:` (at least in release.yml,
 # tests/test_release_pipeline.py and tests/test_version.py) now holds only for a canonical __version__.
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 # Single source of truth for the version: hatchling reads __version__ from the package module, so the
@@ -191,7 +191,13 @@ harness = [
 # scripts/ci/retry-native-crash.sh was tied to mkleehammer/pyodbc#1459. That issue is closed, and its
 # root cause is the ODBC driver, not pyodbc, so it is no reason to raise this floor. The upstream
 # reading is recorded once, in docs/RISKY-COMPONENTS.md, section "The sqlserver extra".
-sqlserver = ["aioodbc>=0.5"]
+# aioodbc is pinned exactly (BACKLOG #5005): messagefoundry/odbc_call_gate.py, the DATABASE
+# connector and the SQL Server store reach aioodbc 0.5.0's private names and behaviour, none a
+# public hook. At least: Connection._execute, _conn, _executor, Connection.closed read as "_conn is
+# None", a cursor's _impl, and Pool._wakeup. A release that renames one turns the call gate off,
+# and with it the BACKLOG #2049 native-crash guard. Read the new release's connection, cursor and
+# pool modules, and grep the engine for each name, before moving the pin.
+sqlserver = ["aioodbc==0.5.0"]
 # PostgreSQL store backend (production server-DB with single-node parity). No OS-level dependency
 # (ships compiled C/Cython wheels). Lazy-imported, so SQLite-only installs skip it.
 postgres = ["asyncpg>=0.30"]
@@ -566,8 +572,8 @@ release-tools = [
 #                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
 #                  disagree.
 ci-quality = [
-    "diff-cover==10.6.0",
-    "mutmut==3.8.0",
+    "diff-cover==11.0.0",
+    "mutmut==3.8.1",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3.1",
 ]

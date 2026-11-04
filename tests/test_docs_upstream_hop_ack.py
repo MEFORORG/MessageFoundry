@@ -32,7 +32,8 @@ from typing import Any
 import pytest
 from _docs_toml import TOML_FENCE_RE, dedent
 
-from messagefoundry.config.settings import ApiSettings
+from messagefoundry.api.tls import plaintext_upstream_hop_off_loopback
+from messagefoundry.config.settings import ApiSettings, SecuritySettings
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -64,26 +65,42 @@ def _tracked_markdown() -> tuple[Path, ...]:
     return tuple(_ROOT / rel for rel in out.split("\0") if rel)
 
 
-def _api_table(body: str) -> dict[str, Any] | None:
-    """The ``[api]`` table a block defines, in any TOML spelling, or None if it is not TOML."""
+def _tables(body: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The ``[api]`` and ``[security]`` tables a block defines, in any TOML spelling, or None if it
+    is not TOML or has no ``[api]`` table. A block with no ``[security]`` table gets an empty one."""
     try:
         doc = tomllib.loads(body)
     except tomllib.TOMLDecodeError:
         return None  # an illustrative fragment with placeholders, not a copy-pasteable block
-    api = doc.get("api")
-    return api if isinstance(api, dict) else None
+    api, security = doc.get("api"), doc.get("security", {})
+    if not isinstance(api, dict) or not isinstance(security, dict):
+        return None
+    return api, security
 
 
 @functools.cache
-def _terminator_blocks(path: Path) -> tuple[tuple[int, dict[str, Any]], ...]:
-    """``(line, [api] table)`` for every fenced toml block in ``path`` that turns the terminator on."""
+def _terminator_blocks(
+    path: Path,
+) -> tuple[tuple[int, dict[str, Any], dict[str, Any]], ...]:
+    """``(line, [api] table, [security] table)`` for every fenced toml block in ``path`` that turns
+    the terminator on."""
     text = _QUOTE_RE.sub("", path.read_text(encoding="utf-8"))
-    found: list[tuple[int, dict[str, Any]]] = []
+    found: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
     for fence in TOML_FENCE_RE.finditer(text):
-        api = _api_table(dedent(fence.group("body"), fence.group("indent")))
-        if api is not None and api.get("tls_terminated_upstream") is True:
-            found.append((text.count("\n", 0, fence.start()) + 2, api))
+        tables = _tables(dedent(fence.group("body"), fence.group("indent")))
+        if tables is not None and tables[0].get("tls_terminated_upstream") is True:
+            found.append((text.count("\n", 0, fence.start()) + 2, *tables))
     return tuple(found)
+
+
+def _bind_host(security: dict[str, Any]) -> str:
+    """The API bind host the loader derives from a block's ``[security]`` table: loopback unless
+    ``local_access_only = false``, then ``listen_address``. Both defaults are read from the model,
+    so a changed default moves this too."""
+    fields = SecuritySettings.model_fields
+    if security.get("local_access_only", fields["local_access_only"].default):
+        return "127.0.0.1"
+    return str(security.get("listen_address", fields["listen_address"].default))
 
 
 def _pages() -> list[Path]:
@@ -102,7 +119,7 @@ def test_the_derivation_still_finds_every_known_page() -> None:
 @pytest.mark.parametrize("path", _pages(), ids=lambda p: p.name)
 def test_every_plaintext_terminator_block_acknowledges_the_hop(path: Path) -> None:
     rel = path.relative_to(_ROOT)
-    for lineno, api in _terminator_blocks(path):
+    for lineno, api, _security in _terminator_blocks(path):
         if api.get("tls_cert_file"):
             continue  # the engine serves that hop over TLS, so there is nothing to acknowledge
         assert api.get(_ACK) is True, (
@@ -111,3 +128,36 @@ def test_every_plaintext_terminator_block_acknowledges_the_hop(path: Path) -> No
             f"plaintext there, so serve refuses the block (exit 2) in every mode. Add the "
             f"acknowledgement to the block."
         )
+
+
+@pytest.mark.parametrize("path", _pages(), ids=lambda p: p.name)
+def test_every_plaintext_terminator_block_binds_loopback(path: Path) -> None:
+    # BACKLOG #4636: serve refuses a plaintext proxy-to-engine hop off loopback, acknowledged or not,
+    # so a block that prints one on a NIC bind is refused the first time an operator starts it.
+    rel = path.relative_to(_ROOT)
+    for lineno, api, security in _terminator_blocks(path):
+        if api.get("tls_cert_file"):
+            continue  # the engine serves that hop over TLS, so any bind host is allowed
+        host = _bind_host(security)
+        assert not _refused_off_loopback(host), (
+            f"{rel} line {lineno} prints a copy-pasteable [api].tls_terminated_upstream = true block "
+            f"with no [api].tls_cert_file on the non-loopback bind host {host!r}. serve refuses that "
+            f"plaintext proxy-to-engine hop (exit 2) in every mode, acknowledged or not. Keep the "
+            f"engine on loopback, or add an operator [api].tls_cert_file to the block."
+        )
+
+
+def _refused_off_loopback(host: str) -> bool:
+    """serve's own predicate, on a plaintext terminator bound to ``host``."""
+    api = ApiSettings(host=host, tls_terminated_upstream=True, trusted_proxies=["127.0.0.1"])
+    return plaintext_upstream_hop_off_loopback(api)
+
+
+def test_the_bind_host_reading_has_a_positive_control() -> None:
+    # Without this the loopback guard above could pass because _bind_host always read loopback, or
+    # because the predicate never refused.
+    assert _bind_host({}) == "127.0.0.1"
+    assert not _refused_off_loopback(_bind_host({}))
+    nic = {"local_access_only": False, "listen_address": "0.0.0.0"}
+    assert _bind_host(nic) == "0.0.0.0"
+    assert _refused_off_loopback(_bind_host(nic))

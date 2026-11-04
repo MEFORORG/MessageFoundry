@@ -37,7 +37,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, RevokeResult
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import prove, reproving_transport
 
@@ -660,7 +660,7 @@ async def test_a_row_checked_inside_the_write_to_revoke_window_stops_on_the_scop
     written = asyncio.Event()
     release = asyncio.Event()
 
-    async def held_revoke(user_id: str) -> int:
+    async def held_revoke(user_id: str) -> RevokeResult:
         written.set()  # set_channel_scope has written the scope and is about to revoke
         await release.wait()
         return await real_revoke(user_id)

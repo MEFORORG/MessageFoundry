@@ -17,9 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -163,14 +161,14 @@ def test_a_file_swapped_for_a_hard_link_after_its_check_is_not_truncated(
     swapped.write_bytes(b"synthetic")
     real_open = dr_backup._open_unfollowed
 
-    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         if entry.name == "swap.dat":
             os.unlink(swapped)
             try:
                 os.link(outside, swapped)
             except OSError as exc:  # pragma: no cover - a file system without hard links
                 pytest.skip(f"hard links unavailable here: {exc}")
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
@@ -192,14 +190,14 @@ def test_a_file_swapped_for_a_symlink_after_its_check_is_not_truncated(
     swapped.write_bytes(b"synthetic")
     real_open = dr_backup._open_unfollowed
 
-    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         if entry.name == "swap.dat":
             os.unlink(swapped)
             try:
                 os.symlink(outside, swapped)
             except OSError as exc:  # pragma: no cover - Windows without the symlink privilege
                 pytest.skip(f"symlinks unavailable here: {exc}")
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
@@ -212,8 +210,8 @@ def test_a_file_swapped_for_a_symlink_after_its_check_is_not_truncated(
 def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
     tmp_path, monkeypatch
 ) -> None:
-    """The subdirectory passed the walk's link filter, then was moved away and replaced by a link
-    to a directory outside before the walk entered it."""
+    """The subdirectory was listed in the root, then was moved away and replaced by a link to a
+    directory outside while the root's own file was being emptied, before the walk entered it."""
     staging = tmp_path / "mefor-verify-planted"
     (staging / "sub").mkdir(parents=True)
     (staging / "sub" / "inner.tar").write_bytes(b"synthetic plaintext")
@@ -221,16 +219,15 @@ def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
     (outside_dir / "victim.dat").write_bytes(_OUTSIDE)
-    real_walk = dr_backup._walk
+    real_open = dr_backup._open_unfollowed
 
-    def walk_then_swap(top: Path, **kwargs: Any) -> Iterator[Any]:
-        listing = iter(real_walk(top, **kwargs))
-        yield next(listing)  # the root, whose dirnames the caller filters before resuming
-        os.rename(staging / "sub", tmp_path / "moved")
-        _link_dir(outside_dir, staging / "sub")
-        yield from listing
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
+        if entry.name == "own.tar":  # the root's file, emptied before the walk enters `sub`
+            os.rename(staging / "sub", tmp_path / "moved")
+            _link_dir(outside_dir, staging / "sub")
+        return real_open(entry, dir_fd, inside)
 
-    monkeypatch.setattr(dr_backup, "_walk", walk_then_swap)
+    monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
     assert (outside_dir / "victim.dat").read_bytes() == _OUTSIDE
     assert (staging / "own.tar").read_bytes() == b""
@@ -276,7 +273,7 @@ def test_two_files_of_one_name_that_refuse_are_both_reported(tmp_path, monkeypat
         (staging / sub).mkdir(parents=True)
         (staging / sub / "extracted_store.db").write_bytes(b"synthetic plaintext")
 
-    def refuse(entry: Path, dir_fd: int | None) -> int:
+    def refuse(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         raise PermissionError(13, "synthetic sharing violation", str(entry))
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", refuse)
@@ -326,16 +323,8 @@ async def test_the_os_temp_sweep_is_keyed_on_the_process_owner(tmp_path, monkeyp
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     dead_verify = _abandoned(tmp_path / "ostemp", "mefor-verify-")
     data = (tmp_path / "data").absolute()
-    real_owner = dr_backup._owner_of
-
-    def owner(path: Path) -> object | None:
-        p = Path(path).absolute()
-        # Everything the run makes in its data dir carries the share's owner.
-        if p != data and p.is_relative_to(data):
-            return "share-owner"
-        return real_owner(path)
-
-    monkeypatch.setattr(dr_backup, "_owner_of", owner)
+    # Everything the run makes in its data dir carries the share's owner, its owner probe included.
+    _share_owner_for(data, monkeypatch)
     try:
         result = await runner.run_once(now=1.0)
     finally:
@@ -372,18 +361,69 @@ async def test_a_backup_that_will_not_fit_opens_no_staging_directory(tmp_path, m
     assert opened == []
 
 
-def _share_owner_for(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _share_owner_for(
+    data: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    made_by_another: Path | None = None,
+    root_too: bool = False,
+) -> None:
     """A server-owner stand-in: everything made under ``data`` reports the share's owner, not the
-    process's, as on an SMB or NFS share whose server sets the owner."""
+    process's, as on an SMB or NFS share whose server sets the owner. ``made_by_another`` is a
+    directory another principal made there that carries the owner this process's own directories
+    get elsewhere, as SYSTEM on the file server can. ``root_too`` has ``data`` itself report the
+    share's owner, as a staging root this account made on such a share does. It drives both the
+    path read and the descriptor read, which a POSIX owner probe uses."""
     real_owner = dr_backup._owner_of
+    real_fd_owner = dr_backup._owner_of_fd
+
+    def on_share(path: Path) -> bool:
+        p = Path(path).absolute()
+        if p == data:
+            return root_too
+        return p != made_by_another and p.is_relative_to(data)
 
     def owner(path: Path) -> object | None:
-        p = Path(path).absolute()
-        if p != data and p.is_relative_to(data):
-            return "share-owner"
-        return real_owner(path)
+        return "share-owner" if on_share(path) else real_owner(path)
+
+    def fd_owner(fd: int, opened_as: Path) -> object | None:
+        return "share-owner" if on_share(opened_as) else real_fd_owner(fd, opened_as)
 
     monkeypatch.setattr(dr_backup, "_owner_of", owner)
+    monkeypatch.setattr(dr_backup, "_owner_of_fd", fd_owner)
+
+
+def _root_probe_answers_none(
+    data: Path, monkeypatch: pytest.MonkeyPatch, *, first: int | None = 1
+) -> list[Path]:
+    """The probe of ``data`` answers None for its ``first`` calls (every call when ``None``), as
+    when it cannot be created there. The early sweep then goes by ``_fallback_root_owner`` (BACKLOG
+    #4988). Returns the calls, one per probe of ``data``."""
+    real_probe = dr_backup._probe_owner
+    calls: list[Path] = []
+
+    def probe(root: Path | None) -> object | None:
+        if root is not None and Path(root).absolute() == data:
+            calls.append(root)
+            if first is None or len(calls) <= first:
+                return None
+        return real_probe(root)
+
+    monkeypatch.setattr(dr_backup, "_probe_owner", probe)
+    return calls
+
+
+def _exists_at_open(monkeypatch: pytest.MonkeyPatch, path: Path) -> list[bool]:
+    """Whether ``path`` still exists at each staging open, in order."""
+    seen: list[bool] = []
+    real_open = dr_backup._open_staging
+
+    def recording_open(root: Path, prefix: str, *, secure: bool):
+        seen.append(path.exists())
+        return real_open(root, prefix, secure=secure)
+
+    monkeypatch.setattr(dr_backup, "_open_staging", recording_open)
+    return seen
 
 
 def _recording_open(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
@@ -401,16 +441,18 @@ def _recording_open(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 async def test_a_killed_runs_leftover_on_a_server_owner_share_is_freed_before_space_refuses(
     tmp_path, monkeypatch
 ) -> None:
-    """On a share whose server sets the owner, the early sweep, keyed on the process's owner, misses
-    a killed run's large leftover. Before this, the free-space check then refused with `space`, and
-    every later backup did too until someone deleted it by hand. The check now sweeps by the owner a
-    probe directory there gets, and the run proceeds."""
+    """On a share whose server sets the owner, an early sweep that did not go by the owner a probe
+    there gets misses a killed run's large leftover; since BACKLOG #4988 that is one whose probe
+    answered None. Before this, the free-space check then refused with `space`, and every later
+    backup did too until someone deleted it by hand. The check now sweeps by the owner a probe
+    directory there gets, and the run proceeds."""
     import shutil
 
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
     dead = _abandoned(data, "mefor-backup-")
     _share_owner_for(data, monkeypatch)
+    _root_probe_answers_none(data, monkeypatch)
 
     class _Usage:
         def __init__(self, free: int) -> None:
@@ -440,6 +482,7 @@ async def test_a_leftover_emptied_but_not_removed_by_the_probe_sweep_still_lets_
     dead = _abandoned(data, "mefor-backup-")
     heavy = dead / "archive.tar"
     _share_owner_for(data, monkeypatch)
+    _root_probe_answers_none(data, monkeypatch)
     real_teardown = dr_backup._teardown_staging
 
     def emptied_not_removed(path: Path) -> str | None:
@@ -471,14 +514,16 @@ async def test_a_leftover_emptied_but_not_removed_by_the_probe_sweep_still_lets_
 async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
     tmp_path, monkeypatch
 ) -> None:
-    """The control: with the same stand-in, a volume that is short even once the leftover is swept
-    still refuses with `space`, opens no run directory, and leaves no probe behind."""
+    """The control: with the same stand-in and the same failed first probe, a volume that is short
+    even once the second probe's sweep takes the leftover still refuses with `space`, opens no run
+    directory, and leaves no probe behind."""
     import shutil
 
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
     dead = _abandoned(data, "mefor-backup-")
     _share_owner_for(data, monkeypatch)
+    probes = _root_probe_answers_none(data, monkeypatch)
 
     class _Usage:
         free = 1
@@ -492,6 +537,8 @@ async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
         await store.close()
     assert caught.value.kind == "space"
     assert opened == []
+    # Probed twice: the leftover went by the second probe's owner, the path this test controls.
+    assert len(probes) == 2
     assert not dead.exists()  # swept by the probed owner before the refusal
     assert not any(
         p.name.startswith(("mefor-owner-probe-", "mefor-backup-")) for p in data.iterdir()
@@ -499,8 +546,9 @@ async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
 
 
 async def test_a_leaked_owner_probe_is_swept_by_the_next_run(tmp_path, monkeypatch) -> None:
-    """A probe whose removal failed is an empty directory with no lock. The next sweep of its root
-    removes it, and leaves a probe-named directory that holds anything."""
+    """An empty probe-named directory with no lock, as an earlier build's directory probe whose
+    removal failed left. The next sweep of its root removes it, and leaves a probe-named directory
+    that holds anything."""
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
     leaked = Path(tempfile.mkdtemp(prefix="mefor-owner-probe-", dir=data))
@@ -540,3 +588,19 @@ def test_a_volume_without_final_paths_empties_nothing_and_says_so(
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("fail-safe cannot run on the volume" in m for m in warnings)
     assert not any("extracted_store.db" in m for m in warnings)
+
+
+def test_a_file_that_vanishes_only_after_its_open_is_still_reported(tmp_path, monkeypatch) -> None:
+    """BACKLOG #4992: only the OPEN's "not found" means there was nothing to empty. The same error
+    from a check on the already-open file leaves that file full, so it is reported by name, and the
+    teardown does not read the directory as holding no plaintext."""
+    staging = tmp_path / "mefor-verify-own"
+    staging.mkdir()
+    (staging / "extracted_store.db").write_bytes(b"synthetic plaintext")
+
+    def gone(fd: int, length: int) -> None:
+        raise FileNotFoundError(2, "synthetic: not found after the open")
+
+    monkeypatch.setattr(os, "ftruncate", gone)
+    assert dr_backup._empty_files_in_place(staging) == ["extracted_store.db"]
+    assert (staging / "extracted_store.db").read_bytes() == b"synthetic plaintext"

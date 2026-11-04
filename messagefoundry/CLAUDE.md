@@ -51,3 +51,8 @@ scripts and coordination sessions that never touch `messagefoundry/`. Nothing ch
   or delivery failure happens **after** the sender was told AA — it is **not** NAK'd; operators rely
   on the message's `ERROR`/dead-letter disposition + the AlertSink, not the ACK, for post-ingress
   failures. (`ack_after=delivered`, deferring the ACK until delivery, is planned, not built.)
+  The engine's MLLP answers **AR** for a refusal it treats as final, a strict-validation content
+  failure included, and **AE** for one a re-send may clear, which departs from the HL7 v2 letter,
+  where AE marks a content error (owner ruling of 2026-11-03, decision log
+  d20261104T032854299-7235a9, stamped in UTC; the strict matrix is in
+  [`docs/HL7-VALIDATION.md`](../docs/HL7-VALIDATION.md)).

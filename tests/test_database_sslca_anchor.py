@@ -144,12 +144,14 @@ def test_a_value_that_names_no_regular_file_is_left_to_the_driver(tmp_path: Path
     assert ta.lane_anchor_spec("outbound", _OUT, _settings(tmp_path)) is None
 
 
-def test_a_padded_value_is_checked_at_the_spelling_that_names_a_file(tmp_path: Path) -> None:
-    """The build checks the value as sent and trimmed; the spec takes the spelling that names a
-    regular file, so a padded value still gets the lane check."""
+def test_a_padded_value_is_refused_as_the_build_refuses_it(tmp_path: Path) -> None:
+    """The build refuses a padded value, so the lane check refuses it too, rather than clearing
+    the trimmed spelling of a value no driver is handed (vault BACKLOG #5197 item 8). The refusal
+    names the setting, never the path."""
     ca = _ca(tmp_path)
-    spec = ta.lane_anchor_spec("outbound", _OUT, _settings(f" {ca} "))
-    assert spec is not None and spec.path == str(ca)
+    with pytest.raises(ValueError, match="start or end with a space") as refused:
+        ta.lane_anchor_spec("outbound", _OUT, _settings(f" {ca} "))
+    assert str(tmp_path) not in str(refused.value)
 
 
 def test_the_sqlserver_preset_and_a_plain_tls_ca_lane_are_unchanged(tmp_path: Path) -> None:

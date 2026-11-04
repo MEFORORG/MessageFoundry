@@ -53,6 +53,7 @@ from messagefoundry.cli_common import (  # noqa: E402
 )
 from messagefoundry.cli_surface import TOOLKIT_COMMAND  # noqa: E402
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.logging_setup import install_filtered_last_resort  # noqa: E402
 from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 from messagefoundry.terminal_text import escape_for_terminal  # noqa: E402
 
@@ -66,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     # FIRST STATEMENT, as in every console entry point (BACKLOG #1875):
     # tests/test_cp1252_console_safety.py reads it here. run_cli() hardens again, which is a no-op.
     harden_console_streams()
+    # BACKLOG #3768: before parsing, as the engine's main() does, so a record no handler takes
+    # meets the filter chain. A second main() in one process builds nothing new.
+    install_filtered_last_resort()
     args = sys.argv[1:] if argv is None else argv
     mismatch = version_mismatch(metadata.version)
     if mismatch is not None:

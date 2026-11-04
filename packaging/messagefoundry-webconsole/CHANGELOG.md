@@ -69,6 +69,29 @@ this line.**
 
 ### Security
 
+- **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
+  /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
+  before the engine handler's scope check, so on a first deployment such a caller's probe there
+  would have left no `auth.channel_denied` row. It now writes that row, marked
+  `"flag_direction_not_inbound": true`, and answers the 403 the handler gives a non-inbound target.
+  An all-channels caller still gets the 404. Needs an engine whose `messagefoundry.api.message_scope`
+  has `CONNECTION_DENIED_DETAIL` and whose `audit_channel_denied` takes
+  `flag_direction_not_inbound`, which no published engine does yet. As for BACKLOG #1624 above, the
+  release that carries this raises the `messagefoundry` floor to the engine release that adds them:
+  the seam digest covers neither a module constant nor that callback's signature, so the handshake
+  will not catch an older engine. (BACKLOG #3378)
+- **On a GET, the same-origin check reads `Origin` when `Sec-Fetch-Site` is empty or unknown.**
+  Such a value now counts as absent there, so a foreign `Origin` beside it is refused. Before, any
+  present value settled a GET and `Origin` was never read. A value an intermediary folded from two
+  lines into one is an unknown value. Only a GET that runs `assert_same_origin` is affected, and
+  most `/ui` GETs do not. At least two do: the skipped-interstitial `GET /ui/oidc/start`, which now
+  answers such a request `403` instead of going on to the identity provider, and the unlock-page
+  continuation, which now records none for it. A GET with neither header still passes, so the
+  sign-in GETs owner rulings R4 and R4b protect still pass it. A browser that sends Fetch Metadata
+  sends one of the four named values, so its requests do not change. The rule is the table in the
+  `assert_same_origin` docstring. Seam only: that function is hashed into the seam, so the
+  supported digest moved. (B291-R1 of the vault file `OWNER-RULINGS-2026-10-17-BATCH291.md`, vault
+  BACKLOG #3316)
 - **An IPv4 entry that is not one host's address covers nothing.** Engine settings refuse such an
   entry at load: at least all of `0.0.0.0/8`, a multicast address and the reserved class E range.
   The console matched one that reached it another way, so a URL to that address skipped the

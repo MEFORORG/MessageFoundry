@@ -105,7 +105,7 @@ column before you plan around a row.
 |---|---|---|---|
 | **Sign-in, RBAC and the hash-chained audit log** | Built | Always on. `serve` always requires sign-in, and no setting turns it off. | [SECURITY.md](SECURITY.md) |
 | **At-rest body encryption** (AES-256-GCM) and key rotation | Built | Required. The engine refuses to start without a store key unless you take the audited opt-out. | [PHI.md §3](PHI.md#3-encryption-at-rest) |
-| **API TLS** (HTTPS/WSS, TLS 1.2 or later) | Built | Always served, with one exception. With no operator certificate the engine serves a self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). The exception is a declared TLS-terminating proxy with no operator certificate: the engine then speaks plain HTTP to that proxy. At the shipped `[security].enforcement = enforce`, a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused, and the placeholder does not count. §6 says what `warn` changes. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **API TLS** (HTTPS/WSS, TLS 1.2 or later) | Built | Always served, with one exception. With no operator certificate the engine serves a self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). The exception is a declared TLS-terminating proxy with no operator certificate: the engine then speaks plain HTTP to that proxy. A non-loopback bind with no operator certificate is refused, and the placeholder does not count. [SECURITY.md, Enforcement model](SECURITY.md#enforcement-model) states the rule and its one dev escape. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **MLLP-over-TLS** (TLS 1.2 or later) | Built | Off. MLLP is plaintext until you set `tls = true` on the connection. At the shipped `[security].enforcement = enforce`, a non-loopback plaintext MLLP listener is refused. [PHI.md §4](PHI.md#4-data-in-transit) states the exceptions. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **mTLS** (API clients and MLLP partners) | Built | Off. API mTLS acts only once `[api].tls_client_ca_file` names a CA. An inbound MLLP connection asks for a client certificate only once its `tls_ca_file` names a CA. An outbound one presents a client certificate only once you give it `tls_cert_file`. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **Certificate revocation checking** | Built | Not on every hop. Where it is built, it reads a CRL file your PKI publishes. You name one per hop, for example `[logging].forward_tls_crl_file`. | [DEPLOYMENT.md](DEPLOYMENT.md#revocation-guard-behavior) says which hops are covered and which are not |
@@ -462,12 +462,13 @@ below are what you do about it. Complete this checklist **before any real PHI fl
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
       `tls_min_version` ≥ 1.2, opt-in mTLS via `tls_client_ca_file`) **or** front it with a TLS terminator
-      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`, plus the required
-      `[api].plaintext_upstream_hop_acknowledged = true` when no `[api].tls_cert_file` is set: the
-      proxy-to-engine hop is then plaintext and securing it is your job). Without a terminator the engine
-      serves TLS anyway, but with no operator certificate it uses a self-signed placeholder. So a
-      non-loopback bind **without** an operator certificate (or a trusted terminator) is **refused at
-      startup**. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it
+      (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`). With no `[api].tls_cert_file`
+      the proxy-to-engine hop is plaintext, and
+      [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says which bind that needs.
+      Off loopback a certificate also needs `MEFOR_TLS_REVOCATION_ATTESTED=1`
+      ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)). With no operator
+      certificate and no terminator the engine serves TLS anyway, on a self-signed placeholder. A
+      non-loopback bind **without** an operator certificate is **refused at startup**, terminator or not. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it
       works only under `[security].enforcement = warn`. It serves bearer tokens and PHI behind that
       placeholder. No trust store vouches for the placeholder. So an on-path attacker can pose as the
       engine to any client that has not pinned it.
@@ -680,12 +681,14 @@ becomes the bottleneck.
 - **PostgreSQL:** use your standard DB backups — `pg_dump` for logical backups and/or WAL archiving /
   PITR for point-in-time recovery. The engine is greenfield-only on server DBs, so the DB tier owns
   store-level DR here. A `.mfbak` taken against a server DB is **config-only** and cannot restore the
-  database.
+  database. A config-only pass with no config file to archive, such as one over an empty config dir, fails instead of writing an archive, so that pass does not take the retention slot of a good one; on a PostgreSQL or SQL Server store, `[backup].enabled = true` with `[backup].config_only_on_server_db = true` and `[backup].include_config = false` is refused when the settings load ([`CONFIGURATION.md`](CONFIGURATION.md) `[backup]` lists at least what each refuses).
 
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
 decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /
 `-shm` sidecar) — point `--to` at a clean path and move the old store aside yourself. Add
-`--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
+`--config-to <dir>` to restore the config bundle alongside it. A config-only archive carries no store,
+so restore its config bundle with `messagefoundry restore <archive> --config-to <dir>` and no `--to`;
+an archive that carries a store is refused that way. Check the archive without writing anything
 with `messagefoundry restore-verify <archive>`.
 
 **A restore brings back the archive's whole store, accounts and sessions included (BACKLOG
@@ -731,6 +734,15 @@ line. A custom email template cannot name that key, and a rule with `transports 
 For those, the alert's reason in the web console's alert list keeps the archive's age, the count of
 sessions ended and a pointer to `messagefoundry restore --help`, all inside the about 200 characters
 it keeps.
+
+**Only `messagefoundry restore` onto SQLite is recorded (BACKLOG #5092).** A PostgreSQL or SQL
+Server store restored with the database's own tools, or a SQLite store put back by copying its
+files, carries no marker: the first `serve` ends no session, writes no `store_restored` row and
+raises no `store_restored` alert. Stop every engine process and cluster node on the store before
+such a restore. Before the first `serve` after it, run `messagefoundry
+admin-revoke-sessions` against the restored store, and re-apply by hand the changes listed above.
+[SECURITY.md](SECURITY.md#a-restored-store-brings-its-sessions-back-and-only-messagefoundry-restore-records-it)
+says what is and is not recorded, and at least one start-up signal such a restore can raise.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,

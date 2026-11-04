@@ -380,13 +380,16 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     [ADR 0172](../../docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
     makes the engine mint a certificate and serve TLS when the operator configures none, so a stock
     engine no longer answers ``http`` at all: with the escape on, the client constructs and then the
-    first request dies at the TLS layer with an opaque ``ReadError``. The escape therefore buys a
-    working hop in exactly one shipped topology -- an operator-declared ``tls_terminated_upstream``
-    engine, which ADR 0172 excludes on purpose and which genuinely speaks plaintext. Deleting the
-    parameter outright would remove the only way to express that topology and would leave the two-box
-    bench rig (``harness/load/shardcert.py``) with no posture at all, while the credential clamp
-    removes the harm the refusal text names without removing the expression. Every caller that
-    threads ``allow_insecure=True`` today polls tokenless, so the clamp costs them nothing.
+    first request dies at the TLS layer with an opaque ``ReadError``. The one engine that genuinely
+    speaks plaintext is an operator-declared ``tls_terminated_upstream`` engine with no operator
+    certificate, which ADR 0172 excludes on purpose. Since BACKLOG #4636 ``serve`` accepts that
+    engine only bound to loopback, so a non-loopback ``http`` URL reaches it in no shipped topology:
+    the escape buys a working remote hop only to something ``serve`` does not start, such as a
+    forwarder on the engine's machine or an engine started outside ``serve``. Deleting the parameter
+    outright would still leave the two-box bench rig (``harness/load/shardcert.py``) with no posture
+    at all, while the credential clamp removes the harm the refusal text names without removing the
+    expression. Every caller that threads ``allow_insecure=True`` today polls tokenless, so the clamp
+    costs them nothing.
     """
     parts = urlsplit(base_url)
     scheme = parts.scheme.lower()
@@ -413,8 +416,9 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
         f"refusing to use plaintext http to non-loopback host {host!r}: the bearer token and PHI "
         "would cross the network in cleartext. Use an https URL -- the engine serves TLS on its "
         "shipped default (ADR 0172), so a stock engine will not answer http whatever this client "
-        "permits. The allow_insecure escape covers only an engine declared tls_terminated_upstream, "
-        "and it carries no credential."
+        "permits. The allow_insecure escape carries no credential, and serve starts no engine that "
+        "answers plaintext http off loopback: an engine declared tls_terminated_upstream with no "
+        "certificate must bind loopback (BACKLOG #4636)."
     )
 
 
@@ -1828,7 +1832,10 @@ class EngineClient:
         self._request("DELETE", f"/me/sessions/{_seg(session_id)}")
 
     def revoke_other_sessions(self) -> str:
-        """Revoke every session except this one ("sign out everywhere else"); returns the summary."""
+        """Revoke the user's other sessions ("sign out everywhere else"); returns the summary.
+
+        The server keeps this session only when its revoke re-stamps it, and otherwise ends it too;
+        docs/SECURITY.md, *Limits of the session sweep*, says when."""
         return _decode(self._request("DELETE", "/me/sessions"), SimpleMessage).detail
 
     def revoke_user_sessions(self, user_id: str) -> str:

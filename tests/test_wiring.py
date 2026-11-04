@@ -130,8 +130,10 @@ def test_config_source_owner_rule(
     if refused:
         with pytest.raises(
             WiringError, match=f"owned by uid {owner} -- the engine runs as uid {euid}"
-        ):
+        ) as caught:
             _assert_safe_config_source(tmp_path)
+        # The refusal names the foreign owner as the writer, not the owner the engine trusts.
+        assert f"; uid {owner} could rewrite what the engine loads" in str(caught.value)
     else:
         _assert_safe_config_source(tmp_path)
 

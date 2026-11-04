@@ -49,6 +49,7 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
             directory_object_id=f"guid-{uid}",
             now=1_000.0,
             password_generated=False,
+            audits=(),
         )
     await store.create_session(
         token_hash="t-bind-a", user_id="bind-a", expires_at=_EXPIRES, now=1_000.0
@@ -172,6 +173,7 @@ async def _assert_bind_audit_names_factors_contract(store: Any) -> None:
             directory_object_id=f"guid-{uid}",
             now=1_000.0,
             password_generated=False,
+            audits=(),
         )
 
     # 1. A first bind of an account with no factor says so, on both fields.

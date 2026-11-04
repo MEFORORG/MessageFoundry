@@ -146,6 +146,44 @@ def test_toolkit_help_names_its_commands_and_encodes_on_a_legacy_codepage(
         pytest.fail(f"toolkit --help is not cp1252-encodable: U+{ord(bad):04X} {bad!r}")
 
 
+# --- BACKLOG #3768: the toolkit's main() filters the window before its handlers too ---------------
+
+
+def _warn_while_the_toolkit_parses(tmp_path: Path, *, prefix: str = "", leaks: bool) -> None:
+    """Run the engine tests' child driver against the toolkit: one WARNING carrying the synthetic
+    segment, logged while the toolkit's ``main()`` builds its parser with no root handler, which
+    then exits 3 there. ``prefix`` runs first, so a control can take the install out."""
+    from tests.test_cli import _child_window_probe, _run_warning_driver
+
+    _run_warning_driver(
+        tmp_path,
+        "warn_while_the_toolkit_parses.py",
+        prefix + _child_window_probe("parsing") + "    raise SystemExit(3)\n"
+        "m._build_parser = _probe\n"
+        "raise SystemExit(m.main(['adr-analyze']))\n",
+        returncode=3,
+        handlers_line="parsing 0 " + ("_StderrHandler" if leaks else "_FilteredLastResort"),
+        leaks=leaks,
+        module="messagefoundry_toolkit.__main__",
+    )
+
+
+def test_a_real_toolkit_process_redacts_a_warning_while_it_parses(tmp_path: Path) -> None:
+    """The toolkit runs the same ``run_cli`` shell as the engine, so its ``main()`` installs the
+    filtered ``lastResort`` first too, and a WARNING logged while it parses reaches stderr
+    redacted."""
+    _warn_while_the_toolkit_parses(tmp_path, leaks=False)
+
+
+def test_a_real_toolkit_process_without_the_install_leaks(tmp_path: Path) -> None:
+    """The control for the test above, through the same child: with the install taken out, the
+    same WARNING meets the stdlib's own ``lastResort`` and the synthetic segment reaches stderr
+    whole, so the absence above is the filter's doing and not a record that never arrived."""
+    _warn_while_the_toolkit_parses(
+        tmp_path, prefix="m.install_filtered_last_resort = lambda: None\n", leaks=True
+    )
+
+
 #: One fresh interpreter answers two questions, because a cold start is the cost here. It runs the
 #: package the way ``python -m`` does (``runpy.run_module`` IS what ``-m`` calls), then reports which
 #: engine modules that loaded. A fresh process, because this one already imported the engine CLI.

@@ -1582,8 +1582,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> SimpleMessage:
         """End every account's sessions at once (BACKLOG #2614), the response to a suspected
-        compromise. The caller's own session is kept, so the reply reaches them; their other
-        sessions end with everyone's. ``users:manage``, as the per-account revoke above, behind a
+        compromise. The caller's own session is kept where the revoke re-stamps it, so the caller
+        stays signed in; otherwise it ends too, and the reply says which. Their other sessions end
+        with everyone's. ``users:manage``, as the per-account revoke above, behind a
         single-use proof bound to this action, since it ends sessions of the caller's own.
         Audited, with the count, even when nothing was live."""
         revoked, kept = await service.revoke_every_session(

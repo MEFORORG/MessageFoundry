@@ -796,12 +796,27 @@ from typing import Any
 #: ``ConfigWriteNotRecorded`` for ``ConnectionFlagNotRecorded``, because the audit refusal that
 #: #3811 typed went with the config write.
 #:
+#: Vault BACKLOG #3316, B291-R1 of the vault file ``OWNER-RULINGS-2026-10-17-BATCH291.md``: on a
+#: GET, ``assert_same_origin`` now treats an empty or unknown ``Sec-Fetch-Site`` as absent, so the
+#: ``Origin`` decides. That function is a hashed gate helper (BACKLOG #2709), so the digest moved
+#: from ``1a399261c0bf7e2b``; no engine field changed. The new ``_KNOWN_FETCH_SITE`` set it reads is
+#: NOT hashed: the walk follows functions only, so a change to that set's members moves no digest.
+#: ``test_ui_origin_guard.py`` drives its effect, through the docstring table.
+#:
+#: BACKLOG #3378: the console imports ``api.message_scope.CONNECTION_DENIED_DETAIL``, a module
+#: constant, and passes the keyword ``flag_direction_not_inbound`` to the ``audit_channel_denied``
+#: callback. The digest covers neither a module constant (BACKLOG #1624) nor that callback's
+#: signature, so it did not move, and the handshake catches neither skew. A newer console on an
+#: older engine raises ImportError at mount; the console release that carries this raises its
+#: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
+#: answers a scoped caller's bad flag direction with the unaudited 404.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1a399261c0bf7e2b"
+ENGINE_UI_SEAM: str = "734e7007fb95eb75"
 
 
 @dataclass(frozen=True, slots=True)

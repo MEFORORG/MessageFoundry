@@ -262,7 +262,7 @@ def test_a_direct_leak_report_takes_the_version(side: Any) -> None:
     ]
     report = side.leak.leak_report(older, rules=rules, version="2.7")
     assert report.structural_hits == []
-    assert "PRT (line with no fields)" in report.unmapped_fields
+    assert "PRT at line 3 (line with no fields)" in report.unmapped_fields
 
 
 @pytest.mark.parametrize("index", _REFUSING_SALTS)
@@ -438,7 +438,7 @@ def test_the_tally_explains_a_bare_line_entry_only_when_it_lists_one(side: Any) 
     plain.add(report("ZPD-1"))
     assert _BARE_NOTE not in plain.summary()
     bare = side.leak.CoverageTally()
-    bare.add(report("ZPD-1", "PV2 (line with no fields)"))
+    bare.add(report("ZPD-1", "PV2 at line 3 (line with no fields)"))
     assert _BARE_NOTE in bare.summary()
 
 
@@ -470,6 +470,8 @@ def test_the_tee_error_line_names_a_short_header_line(
     code, text, _ = run_tee(_message("BHS|TEXT"))
     assert code == 1
     assert (
-        f"repair each line no rule can reach (a malformed segment id, or {_SHORT_HEADER})" in text
+        "repair each line no rule can reach (kinds include at least a malformed segment id, "
+        f"{_SHORT_HEADER}, and a line with no fields under a header whose MSH-12 holds no "
+        "readable HL7 version)" in text
     )
     assert _NOT_COUNTED.format(n=1) in text
