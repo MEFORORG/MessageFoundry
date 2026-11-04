@@ -6058,6 +6058,39 @@ async def test_session_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_every_account_revoke_contracts(store) -> None:
+    """BACKLOG #5091 and #2614: the global session epoch's contract, a revoke racing sign-ins, and
+    the every-account revoke's own contract, on a keyed handle. Run here because the leg runs this
+    file and not ``tests/test_b5091_global_session_epoch.py`` or ``tests/test_b2614_revoke_all.py``.
+    The race is the lock-order check ``SqlServerStore.revoke_all_sessions`` states: a cycle would
+    raise the server's deadlock error out of it. The fixture clears the session and user tables on
+    the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests.test_b2614_revoke_all import assert_revoke_all_contract
+    from tests.test_b5091_global_session_epoch import (
+        assert_global_epoch_contract,
+        assert_revoke_all_races_sign_ins,
+    )
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        await assert_global_epoch_contract(keyed, raw)
+        await assert_revoke_all_races_sign_ins(keyed)
+        await assert_revoke_all_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_user_seal_contract(store) -> None:
     """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
     handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement

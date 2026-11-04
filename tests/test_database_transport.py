@@ -53,6 +53,7 @@ from messagefoundry.transports.database import (
     generic_odbc_tls_unenforced,
 )
 from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
+from tests.test_poll_source_tick_ceilings import _CapturingSink
 
 INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
 
@@ -956,13 +957,16 @@ def _src(**over: Any) -> DatabaseSource:
 
 
 class _RecordingHandler:
-    def __init__(self, exc: Exception | None = None) -> None:
+    """Records each body; raises ``exc`` for every body, or only those in ``fail_on`` when given."""
+
+    def __init__(self, exc: Exception | None = None, *, fail_on: set[bytes] | None = None) -> None:
         self.bodies: list[bytes] = []
         self._exc = exc
+        self._fail_on = fail_on
 
     async def __call__(self, raw: bytes) -> str | None:
         self.bodies.append(raw)
-        if self._exc is not None:
+        if self._exc is not None and (self._fail_on is None or raw in self._fail_on):
             raise self._exc
         return None
 
@@ -1109,14 +1113,124 @@ async def test_source_handler_failure_leaves_row_unmarked() -> None:
     assert cur.marks == []  # but the row is NOT marked → it re-emits next poll (at-least-once)
 
 
-async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
+HWM_POLL = "SELECT id, payload FROM mf_inbox WHERE id > (SELECT last_id FROM mf_cursor) ORDER BY id"
+HWM_MARK = "UPDATE mf_cursor SET last_id=:id"
+
+
+class _HighWaterCursor(_SrcCursor):
+    """A table read through a high-water-mark cursor: the poll selects the rows above ``last_id`` in
+    id order, and a mark sets ``last_id`` to the marked row's id."""
+
+    def __init__(self, table: list[tuple[int, str]]) -> None:
+        super().__init__(["id", "payload"], [])
+        self._table = table
+        self.last_id = 0
+
+    async def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        await super().execute(sql, params)
+        if params is None:
+            self._rows = [row for row in self._table if row[0] > self.last_id]
+            self._position = 0
+        else:
+            self.last_id = params[0]
+
+
+async def test_source_handler_failure_does_not_lose_the_row_under_a_high_water_mark() -> None:
+    """BACKLOG #4921. With a high-water-mark ``mark_statement``, a later row's mark used to move the
+    cursor past an earlier row whose handler failed, so no later poll selected that row again. A
+    handler failure now stops the poll: the row before it is handed off and marked, nothing after
+    it is, and the next poll starts at the failed row.
+
+    Red mutation: drop the ``break`` on a failed hand-off in ``_poll_once``. Row 3 is then marked in
+    the first poll, the cursor passes row 2, and the second poll selects nothing."""
+    src = _src(body_column="payload", poll_statement=HWM_POLL, mark_statement=HWM_MARK)
+    h = _RecordingHandler(RuntimeError("store write failed"), fail_on={b"B"})
+    cur = _HighWaterCursor([(1, "A"), (2, "B"), (3, "C")])
+    src._pool = _SrcPool(_SrcConn(cur))
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"A", b"B"]  # row 3 is not handed off in the poll where row 2 failed
+    assert cur.last_id == 1  # ... and the cursor stays below the failed row
+    h._fail_on = set()  # the outage is over
+    await src._poll_once()
+    assert h.bodies == [b"A", b"B", b"B", b"C"]  # the next poll starts at the failed row
+    assert cur.last_id == 3
+
+
+async def test_source_handler_failure_emits_a_handler_error_event() -> None:
+    """BACKLOG #4921, the visibility half. Stopping the batch means one row that fails every time
+    holds the feed, so the failure must reach the event log, not only a WARNING. One event per
+    poll, NULL peer (a poll source dials out), and a reason that leads with the fixed outcome, which
+    is what lets the store's 200-character bound cut the error text rather than the outcome (this
+    test reads the sink, not the store), and names the driver error but not the value it quotes.
+
+    Red mutation: delete the ``_emit_event`` call in ``_ingest_row``. Reds here."""
+    truncated = (
+        "[22001] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]String or binary data would "
+        "be truncated in table 'mf.dbo.messages', column 'control_id'. Truncated value: "
+        f"'MRN{_SYNTHETIC_ID}'. (2628) (SQLExecDirectW)"
+    )
     src = _src(body_column="payload")
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler(exc=_driver_exc("22001", truncated))  # every row would fail
+    await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B")], h)
+    assert [(kind, peer) for kind, peer, _reason in sink.events] == [("handler_error", None)]
+    reason = sink.events[0][2] or ""
+    assert reason.startswith("row left unmarked and poll stopped")
+    assert "[22001] driver error 2628" in reason
+    assert _SYNTHETIC_ID not in reason
+
+
+async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
+    """A row whose mark failed was still ingested, so the batch goes on and no event is emitted;
+    only a handler failure stops the poll (BACKLOG #4921)."""
+    src = _src(body_column="payload")
+    sink = _CapturingSink()
+    src.on_connection_event = sink
     h = _RecordingHandler()
     cur = await _run_poll(
         src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
     )
     assert h.bodies == [b"A", b"B"]  # both rows handled despite the first mark erroring
     assert len(cur.marks) == 2  # both marks attempted (the error is logged, not fatal)
+    assert sink.events == []
+
+
+async def test_source_handler_failure_without_a_mark_statement_does_not_stop_the_batch() -> None:
+    """With no ``mark_statement`` there is no cursor to protect and every row is read again next
+    poll anyway, so a handler failure does not hold back the rows behind it (BACKLOG #4921). The
+    failure is still reported.
+
+    Red mutation: stop the batch on every handler failure. Row 3 is then not handed off."""
+    src = _src(body_column="payload", mark_statement=None)
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler(RuntimeError("store write failed"), fail_on={b"B"})
+    await _run_poll(src, ["id", "payload"], [(1, "A"), (2, "B"), (3, "C")], h)
+    assert h.bodies == [b"A", b"B", b"C"]
+    assert [kind for kind, _peer, _reason in sink.events] == ["handler_error"]
+    assert (sink.events[0][2] or "").startswith("row left unmarked: ")
+
+
+async def test_source_row_it_cannot_encode_is_skipped_not_a_stall() -> None:
+    """A body the configured ``encoding`` cannot carry fails on every poll and never reaches the
+    handler, so it is skipped and reported like an undecodable row rather than stopping the batch
+    as a handler failure would (BACKLOG #4921). It is not marked.
+
+    Red mutation: encode inside the handler's ``try`` again. The row then stops the poll, row 2 is
+    neither handed off nor marked, and the event is ``handler_error``."""
+    src = _src(body_column="payload", encoding="ascii")
+    sink = _CapturingSink()
+    src.on_connection_event = sink
+    h = _RecordingHandler()
+    cur = await _run_poll(src, ["id", "payload"], [(1, "caf\xe9"), (2, "B")], h)
+    assert h.bodies == [b"B"]
+    assert [params for _sql, params in cur.marks] == [(2,)]
+    assert [kind for kind, _peer, _reason in sink.events] == ["row_undecodable"]
+    reason = sink.events[0][2] or ""
+    assert "UnicodeEncodeError" in reason
+    assert "caf" not in reason
 
 
 async def test_source_without_mark_statement_does_not_mark() -> None:

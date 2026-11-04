@@ -18,11 +18,13 @@ the acts that could re-grade 2.4.1 are the owner's.
 
 from __future__ import annotations
 
+import codecs
 import inspect
 import logging
 import posixpath
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -512,6 +514,16 @@ async def test_remote_refused_listing_name_does_not_charge_the_ceiling(
 #: caught once per poll and never reaches a row at all.
 _POISON = b"\xff\xfe\xfd"
 
+#: Both per-row shapes ``_select`` skips: a value that does not decode, and a body the configured
+#: ``encoding`` cannot carry (BACKLOG #4921), given as the value and the source settings it needs.
+_POISON_KINDS = pytest.mark.parametrize(
+    ("poison", "over"),
+    [
+        pytest.param(_POISON, {}, id="undecodable"),
+        pytest.param("caf\xe9", {"encoding": "ascii"}, id="unencodable"),
+    ],
+)
+
 
 class _FakeTable:
     """A poll table. ``mark`` deletes a row, which is the shape ``mark_statement`` is documented to
@@ -764,28 +776,30 @@ class _CapturingSink:
         self.events.append((kind, peer_host, reason))
 
 
+@_POISON_KINDS
 async def test_db_a_poison_row_does_not_starve_the_ceiling(
-    caplog: pytest.LogCaptureFixture,
+    poison: object, over: dict[str, Any], caplog: pytest.LogCaptureFixture
 ) -> None:
     """The measured starvation, at the ceiling that reproduces it in one poll.
 
     With ``poll_max_rows=1`` and an undecodable row sorting first, the shipped code charged the
     ceiling at the fetch and skipped the row afterwards: every poll handled nothing, marked nothing
-    and logged one ERROR, for ever, while the good row behind it was never reached.
+    and logged one ERROR, for ever, while the good row behind it was never reached. A body the
+    encoding cannot carry must be skipped at the same place (BACKLOG #4921).
 
     Red mutation: charge the ceiling at the fetch again (take ``fetchmany(poll_max_rows)`` once and
     decode in ``_poll_once``) — no body arrives, the good row is still in the table, and the
-    single-fetch assertion reds with it.
-    """
-    table = _FakeTable(0, rows=[(0, _POISON), (1, _ADT.format(n=1))])
-    src = _db_source(poll_max_rows=1)
+    single-fetch assertion reds with it. Second red mutation, the ``unencodable`` case only: encode
+    at the hand-off in ``_ingest_row`` and skip there."""
+    table = _FakeTable(0, rows=[(0, poison), (1, _ADT.format(n=1))])
+    src = _db_source(poll_max_rows=1, **over)
     fetches = _attach(src, table)
     handler = _RecordingHandler()
     src._handler = handler
     with caplog.at_level(logging.ERROR, logger=_DB_LOGGER):
         await src._poll_once()
     assert [b.decode() for b in handler.bodies] == [_ADT.format(n=1)]  # the row behind IS reached
-    assert table.rows == [(0, _POISON)]  # ... and marked; the poison row stays, unmarked
+    assert table.rows == [(0, poison)]  # ... and marked; the poison row stays, unmarked
     assert "skipping row" in caplog.text  # the skip is still reported, not swallowed
     # The top-up asks only for the SHORTFALL, so one poll pulls at most the ceiling plus the rows it
     # skipped — never the rest of the result set.
@@ -847,10 +861,12 @@ async def test_db_a_missing_body_column_is_reported_once_per_poll_not_once_per_r
     assert len(table.rows) == 4  # nothing marked
 
 
+@_POISON_KINDS
 async def test_db_the_skip_budget_stops_one_poll_and_defers_the_rest(
-    caplog: pytest.LogCaptureFixture,
+    poison: object, over: dict[str, Any], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Replacement is bounded: one poll steps past at most ``_MAX_SKIPPED_ROWS_PER_POLL`` rows.
+    """Replacement is bounded: one poll steps past at most ``_MAX_SKIPPED_ROWS_PER_POLL`` rows,
+    and a body the encoding cannot carry counts against the same bound (BACKLOG #4921).
 
     Without this bound a table whose rows all fail per-row decoding would be walked end to end on
     every tick, one log line per row.
@@ -858,9 +874,9 @@ async def test_db_the_skip_budget_stops_one_poll_and_defers_the_rest(
     Red mutation: remove the budget check — every poison row is skipped and logged, so both the
     budget line and the skip count red.
     """
-    poison = [(n, _POISON) for n in range(db_mod._MAX_SKIPPED_ROWS_PER_POLL + 5)]
-    table = _FakeTable(0, rows=poison)
-    src = _db_source(poll_max_rows=500)
+    rows = [(n, poison) for n in range(db_mod._MAX_SKIPPED_ROWS_PER_POLL + 5)]
+    table = _FakeTable(0, rows=rows)
+    src = _db_source(poll_max_rows=500, **over)
     _attach(src, table)
     handler = _RecordingHandler()
     src._handler = handler
@@ -869,7 +885,144 @@ async def test_db_the_skip_budget_stops_one_poll_and_defers_the_rest(
     assert handler.bodies == []
     assert caplog.text.count("skipping row") == db_mod._MAX_SKIPPED_ROWS_PER_POLL
     assert "stopped fetching" in caplog.text
-    assert len(table.rows) == len(poison)  # deferred, not dropped and not marked
+    assert len(table.rows) == len(rows)  # deferred, not dropped and not marked
+
+
+async def test_db_the_batch_holds_each_body_once_unless_the_mark_binds_it() -> None:
+    """``_select`` hands back each body as the encoded bytes, so it drops the ``body_column`` value
+    from the record that ``_mark`` reads, unless the mark binds that column (BACKLOG #4921).
+
+    Red mutation: drop the ``del``. The first record then still holds the body."""
+    src = _db_source()
+    _attach(src, _FakeTable(1))
+    batch = await src._select()
+    assert batch.rows == [({"id": 0}, _ADT.format(n=0).encode())]
+    bound = _db_source(mark_statement="UPDATE mf_inbox SET status='DONE' WHERE payload=:payload")
+    _attach(bound, _FakeTable(1))
+    batch = await bound._select()
+    assert batch.rows == [({"id": 0, "payload": _ADT.format(n=0)}, _ADT.format(n=0).encode())]
+
+
+_REFUSING_CODEC = "mefor_test_refusing_codec"
+
+#: Synthetic stand-in for a row value a codec's own message quotes. Plain letters and digits, so no
+#: redaction pattern touches it, which is the case a third-party codec's message is.
+_CODEC_SENTINEL = "ZQXSENTINEL4921"
+
+
+def _refusing_codec(exc_type: type[Exception]) -> Callable[[str], codecs.CodecInfo | None]:
+    """A codec search function for a text codec whose encoder and decoder raise ``exc_type`` on
+    every non-empty input, with a message that quotes :data:`_CODEC_SENTINEL`. It passes the
+    build's ``"".encode(...)`` probe."""
+
+    def search(name: str) -> codecs.CodecInfo | None:
+        if name != _REFUSING_CODEC:
+            return None
+
+        def refuse(value: Any, errors: str = "strict") -> Any:
+            if value:
+                raise exc_type(f"refused the value {_CODEC_SENTINEL}")
+            return (b"" if isinstance(value, str) else ""), 0
+
+        return codecs.CodecInfo(refuse, refuse, name=_REFUSING_CODEC)
+
+    return search
+
+
+@contextmanager
+def _refusing_codec_source(
+    exc_type: type[Exception], value: object
+) -> Iterator[tuple[DatabaseSource, _RecordingHandler, _CapturingSink, _FakeTable]]:
+    """A source over two rows holding ``value``, whose ``encoding`` is :func:`_refusing_codec`,
+    registered for the ``with`` block only."""
+    search = _refusing_codec(exc_type)
+    codecs.register(search)
+    try:
+        table = _FakeTable(0, rows=[(0, value), (1, value)])
+        src = _db_source(encoding=_REFUSING_CODEC)
+        _attach(src, table)
+        sink = _CapturingSink()
+        src.on_connection_event = sink
+        handler = _RecordingHandler()
+        src._handler = handler
+        yield src, handler, sink, table
+    finally:
+        codecs.unregister(search)
+
+
+_CODEC_STEPS = pytest.mark.parametrize(
+    ("value", "step"),
+    [pytest.param("A", "encode", id="encode"), pytest.param(b"A", "decode", id="decode")],
+)
+
+
+@_CODEC_STEPS
+@pytest.mark.parametrize("exc_type", [UnicodeError, ValueError, TypeError])
+async def test_db_a_codec_failure_skips_the_row_without_the_codec_message(
+    exc_type: type[Exception], value: object, step: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A codec need not raise ``UnicodeEncodeError``. For each failure a codec raises on a value it
+    cannot convert, ``_select`` skips the row and the poll goes on, rather than the error ending
+    the poll as a poll failure that recurs on every tick (BACKLOG #4921).
+
+    The codec's message, which here quotes a synthetic value, must not reach the reason, the event
+    or the log record: a ``row_undecodable`` reason never carries a row value (docs/PHI.md section
+    7, row 7). A ``UnicodeError`` is rendered by ``safe_exc`` from its attributes, a bare one as
+    its class alone; anything else becomes fixed text naming the step and the class.
+
+    Red mutation: re-raise a plain ``ValueError`` or a ``TypeError`` unchanged in
+    ``_through_codec``, and the sentinel reaches the reason, since ``_select`` skips both."""
+    with (
+        _refusing_codec_source(exc_type, value) as (src, handler, sink, table),
+        caplog.at_level(logging.DEBUG, logger=_DB_LOGGER),
+    ):
+        await src._poll_once()
+    assert handler.bodies == []
+    assert [kind for kind, _peer, _reason in sink.events] == ["row_undecodable", "row_undecodable"]
+    reasons = [reason or "" for _kind, _peer, reason in sink.events]
+    if exc_type is UnicodeError:
+        assert reasons == ["UnicodeError", "UnicodeError"]
+    else:
+        fixed = f"the configured encoding could not {step} the row ({exc_type.__name__})"
+        assert all(fixed in reason for reason in reasons)
+    assert all(_CODEC_SENTINEL not in reason for reason in reasons)
+    assert _CODEC_SENTINEL not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert len(table.rows) == 2  # not marked
+    if exc_type is not UnicodeError:
+        # Nor is the codec's error on the chain of what _select skips, so nothing that walks the
+        # chain reaches its message. Red mutation: raise inside the handler ``from None``.
+        with (
+            _refusing_codec_source(exc_type, value) as (src, _handler, _sink, _table),
+            pytest.raises(ValueError, match="the configured encoding could not") as raised,
+        ):
+            src._body({"payload": value})
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("value", [pytest.param("A", id="encode"), pytest.param(b"A", id="decode")])
+@pytest.mark.parametrize(
+    "exc_type", [LookupError, KeyError, RuntimeError, RecursionError, MemoryError]
+)
+async def test_db_a_codec_fault_that_is_no_conversion_failure_ends_the_poll(
+    exc_type: type[Exception], value: object
+) -> None:
+    """Only what a codec raises for a value it cannot convert is a skip (CLAUDE.md section 6). A
+    ``LookupError`` names the codec, not the row, and a codec's own bug or a resource failure is no
+    conversion failure, so each propagates out of ``_poll_once``, which the poll loop logs as a
+    poll failure and retries next tick; nothing is handed off, emitted or marked (BACKLOG #4921).
+
+    Red mutation: widen ``_through_codec``'s catch back to ``Exception``, or add ``LookupError`` to
+    it. The poll then skips the rows and this reds."""
+    with (
+        _refusing_codec_source(exc_type, value) as (src, handler, sink, table),
+        pytest.raises(exc_type),
+    ):
+        await src._poll_once()
+    assert handler.bodies == []
+    assert sink.events == []
+    assert len(table.rows) == 2  # not marked
 
 
 async def test_db_a_poison_row_is_never_marked() -> None:

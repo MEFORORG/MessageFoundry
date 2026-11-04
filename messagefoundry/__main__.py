@@ -10479,6 +10479,73 @@ def _sqlite_store_held_elsewhere(path: str) -> _OfflineProbe:
     return _OfflineProbe()
 
 
+def _shown_path(path: str) -> str:
+    """``path`` made absolute for a message, or as configured when the working directory a relative
+    path resolves against cannot be read, so printing a path never raises (BACKLOG #4940)."""
+    try:
+        return str(Path(path).absolute())
+    except OSError:
+        return path
+
+
+class _UploadsRootLost(Exception):
+    """``rotate-key``'s uploads pass could not list a root that passed :func:`_uploads_root_refusal`
+    (BACKLOG #4940). Raised before the audit roll, so the run stops short of it."""
+
+
+def _uploads_root_refusal(uploads_dir: str) -> str | None:
+    """Why ``rotate-key`` refuses the configured uploads directory, or ``None`` (BACKLOG #4940).
+    Checked before anything is written, so a refusal costs nothing, the audit roll included. Why a
+    directory it cannot list is not zero uploads is on :attr:`ResealResult.root_missing`, which is
+    the backstop for one that goes away after this check."""
+    import os
+
+    if "\0" in uploads_dir:
+        # No filesystem call accepts one: it raises ValueError, not OSError.
+        return (
+            f"the uploads directory {uploads_dir!r} ([store].uploads_dir) contains a NUL "
+            "character, which no path can hold, so rotate-key changed nothing. Correct "
+            "uploads_dir and re-run."
+        )
+    try:
+        # Resolving a relative path reads the working directory, which can itself be gone.
+        root = Path(uploads_dir).absolute()
+    except OSError as exc:
+        cause = exc.strerror or type(exc).__name__
+        return (
+            f"the uploads directory {uploads_dir} ([store].uploads_dir) is relative, and the "
+            f"directory this command runs in cannot be read ({cause}), "
+            "so rotate-key changed nothing. Make uploads_dir absolute, or run from the directory "
+            "serve uses, and re-run."
+        )
+    where = f"the uploads directory {root} ([store].uploads_dir)"
+    try:
+        with os.scandir(root):
+            return None
+    except (FileNotFoundError, NotADirectoryError):
+        return (
+            f"{where} does not exist or is not a directory, so rotate-key changed nothing. The "
+            "causes include at least a volume that is not mounted, a path that is wrong or is "
+            "relative (it is read from the directory this command runs in) and, since the "
+            "directory is created on the first upload, a site that has never stored one. Create "
+            "it, empty and readable only by the account the engine runs as, only in that last "
+            "case: the engine does not tighten a directory that is already there, and anywhere "
+            "else an empty directory hides the uploads this run must re-seal. Fix the cause and "
+            "re-run."
+        )
+    except OSError as exc:
+        # Not only a missing right: Windows raises PermissionError for a volume that is not ready
+        # (ERROR_NOT_READY), and a stale network mount (ESTALE) lands here too, so the message must
+        # not name one cause as the only one.
+        return (
+            f"{where} cannot be listed ({exc.strerror or type(exc).__name__}), so rotate-key "
+            "changed nothing. The causes include at least an account that may not list it and a "
+            "volume that is offline, not mounted or a stale network mount, whose uploads may "
+            "still be under the prior key. Grant the account the right to list it, or bring the "
+            "volume back, and re-run."
+        )
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10516,8 +10583,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     **What the order of the steps guarantees (BACKLOG #3737).** The rotation record opens before
     either data pass, the audit range rolls after both, and the stamp and the record's close come
-    last, on a run with no skip and a good roll. A skip does not stop the roll (owner ruling
-    2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
+    last, on a run with no skip, an uploads directory both its pre-check and its uploads pass could
+    list (BACKLOG #4940; a listable directory that is not the one holding the uploads passes both,
+    which docs/PHI.md states) and a good roll. One it cannot list at the start refuses before
+    anything is written; one its uploads pass cannot list aborts the run before the roll, which is
+    not a skip. A skip does not stop the roll (owner ruling 2026-10-30), so after a roll that succeeds an engine started on the new key alone keeps a chain
     that verifies. A refused roll rolls nothing. A roll that succeeds costs the way back to the prior
     key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
     the close follow. A run that stops
@@ -10600,6 +10670,22 @@ def _rotate_key(args: argparse.Namespace) -> int:
         unchecked = probe.unchecked
     else:
         unchecked = f"it is a {settings.store.backend.value} store"
+    uploads_shown = ""  # the uploads directory as checked, resolved once for every message
+    if settings.store.uploads_dir:
+        refusal = _uploads_root_refusal(settings.store.uploads_dir)
+        if refusal is not None:
+            print(f"error: {refusal}", file=sys.stderr)
+            return 2
+        uploads_shown = _shown_path(settings.store.uploads_dir)
+        if not Path(settings.store.uploads_dir).is_absolute():
+            # An empty directory of the same name where this command runs passes the check, and
+            # serve, under NSSM, reads the path from its own AppDirectory.
+            print(
+                f"note: [store].uploads_dir is relative, so it was read here as "
+                f"{uploads_shown}. Confirm that is the directory "
+                "serve uses: an empty one elsewhere reads as no uploads.",
+                file=sys.stderr,
+            )
     if unchecked is not None:
         print(
             f"note: rotate-key could not check for a running engine: {unchecked}. Confirm every "
@@ -10645,6 +10731,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
                 if settings.store.uploads_dir
                 else ResealResult()
             )
+            if uploads.root_missing:
+                # BACKLOG #4940: stop before the one-way audit roll, as a listing error the pass let
+                # escape did before the pass caught it. The owner ruling of 2026-10-30 rolls on a
+                # skip, and this is not one: the pass reached no upload at all. Nothing below runs,
+                # so the chain stays on the prior key, nothing is stamped and the record stays open.
+                raise _UploadsRootLost
             # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
             # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
             # gets a range under the NEW key, whose first row commits to a digest of the old range, so
@@ -10663,7 +10755,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.skipped:
+            if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.incomplete:
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
@@ -10733,6 +10825,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except _StoreOpenRefused as exc:  # #2109, #2532, #1720: the open refused; nothing re-encrypted
         print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
         return 2
+    except _UploadsRootLost:
+        # BACKLOG #4940. Exit 1, not 2: the store pass has already re-encrypted under the active key
+        # and the rotation record is open, so this run changed things. See ResealResult.root_missing.
+        print(
+            f"error: rotation aborted -- the uploads directory {uploads_shown} "
+            "([store].uploads_dir) could be listed when this run started and could not be by its "
+            "uploads pass, so no uploaded file was re-sealed, and its uploads may still be under "
+            "the prior key. The log names the cause. It was there at the start, so do not create "
+            "an empty one. The causes include at least a volume that went offline or was "
+            "unmounted, a directory that was moved and a right to list it that was taken away. "
+            "The run stopped before its audit chain step, so the audit chain did not roll, the "
+            "key's rotation date was not stamped, and the rotation stays open. Fix the cause and "
+            "re-run rotate-key BEFORE retiring any prior key "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
+            file=sys.stderr,
+        )
+        return 1
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     done = (
@@ -10742,7 +10851,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
     # uploaded file may still be under that key (BACKLOG #3181).
-    complete = rolled_ok and not uploads.skipped
+    complete = rolled_ok and not uploads.incomplete
     print(f"OK: {done}" if complete else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
