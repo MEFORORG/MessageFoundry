@@ -337,7 +337,19 @@ def test_egress_port_agrees_with_the_hop_guard_port(server: str, params: dict[st
     )
     assert endpoint.conflict is None
     assert endpoint.host == server
-    assert (endpoint.port or 0) == generic_hop_endpoint(server, params)[1]
+    assert (endpoint.port or 0) == generic_hop_endpoint(server, params, reads_comma_port=False)[1]
+
+
+def test_egress_refuses_the_sql_server_comma_port_the_hop_guard_splits() -> None:
+    # BACKLOG #4874. On Microsoft's driver the hop guard reads `127.0.0.1,1433` as host and port,
+    # the driver's own spelling, while the egress reading still refuses the comma: it matches
+    # `server` whole and reads the generic port from PORT alone. generic_hop_endpoint says why.
+    server = "127.0.0.1,1433"
+    endpoint = database_dial_endpoint(
+        _generic(server=server, odbc_driver="ODBC Driver 18 for SQL Server"), dialect="generic"
+    )
+    assert endpoint.conflict is not None and "comma" in endpoint.conflict
+    assert generic_hop_endpoint(server, {}, reads_comma_port=True) == ("127.0.0.1", 1433)
 
 
 @pytest.mark.parametrize(

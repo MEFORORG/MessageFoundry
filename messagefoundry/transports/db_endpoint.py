@@ -86,7 +86,7 @@ def split_generic_server(server: str) -> tuple[str, str]:
     is left whole. A comma is NOT split on (BACKLOG #4874): libpq reads a comma in a host as a list
     of hosts, so the text before it need not be the only host dialled. Both callers deal with a
     comma before they get here: the egress reading refuses it, and :func:`generic_hop_endpoint`
-    reads the whole text as the host."""
+    reads it as its docstring says."""
     host = server.strip()
     in_server = ""
     if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
@@ -99,7 +99,24 @@ def split_generic_server(server: str) -> tuple[str, str]:
     return host.strip(), in_server.strip()
 
 
-def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, int]:
+def _exact_split(text: str) -> tuple[str, str] | None:
+    """:func:`split_generic_server` of ``text``, or ``None`` unless ``text`` is a host,
+    ``host:port`` or ``[v6]:port`` written exactly, with a usable port where it carries one.
+
+    Anything else, at least ``[::1]remote``, ``[::1]:5432x`` and ``127.0.0.1 : 5432``, gets
+    ``None``, so no text the split would drop can sit behind a loopback host."""
+    host, in_server = split_generic_server(text)
+    written = (f"[{host}]" if text.startswith("[") else host) + (
+        f":{in_server}" if in_server else ""
+    )
+    if written != text or (in_server and not port_or_zero(in_server)):
+        return None
+    return host, in_server
+
+
+def generic_hop_endpoint(
+    server: str, params: Mapping[str, Any], *, reads_comma_port: bool
+) -> tuple[str, int]:
     """Split a generic-dialect ``server`` setting into ``(host, port)`` for the hop guard.
 
     The loopback carve-out is decided on the HOST alone and
@@ -118,26 +135,41 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
     allowlist admits, so it is reviewed as a change to a control, not to a log line. This function
     alone reads a port in the ``server`` text; the egress reading refuses such a ``server``.
 
-    **A ``server`` holding a comma anywhere is read whole, as the host** (BACKLOG #4874). libpq
-    reads a comma in a host as a list of hosts, so ``127.0.0.1,remote``, ``[::1]:5432,remote`` and
-    ``127.0.0.1,5432`` each name a host after the comma, the last one the host ``5432``. The whole
-    text is never an address or ``localhost``, so the loopback check reads it as remote. Before
-    this, the host was the text before the first comma, so such a value counted as on-box under
-    the empty-allowlist opt-out. Put the port in the ``PORT`` keyword, as the egress reading's
-    remedy says."""
+    **A ``server`` holding a comma is read whole, as the host** (BACKLOG #4874), with one
+    exception below. libpq reads a comma in a host as a list of hosts, so ``127.0.0.1,remote``,
+    ``[::1]:5432,remote`` and ``127.0.0.1,5432`` each name a host after the comma, the last one the
+    host ``5432``. The whole text is never an address or ``localhost``, so the loopback check reads
+    it as remote. Before this, the host was the text before the first comma, so such a value
+    counted as on-box under the empty-allowlist opt-out. On psqlODBC and MySQL the port goes in the
+    ``PORT`` keyword, which both read, as the egress reading's remedy says.
+
+    **The exception is ``reads_comma_port``**, which the caller sets only for a driver it places as
+    Microsoft's ODBC Driver for SQL Server. That driver reads ``SERVER=host,port`` as one host and
+    its port, its own documented spelling, and ignores ``PORT``, so ``host,port`` is the only port
+    spelling it reads on this dialect. There, and only for exactly one comma followed by ASCII digits
+    that make a port, the text before the comma is read as the rest of this function reads a
+    ``server`` with no comma; it must name a host and carry no port of its own. Anything else
+    holding a comma, ``127.0.0.1,remote`` and ``127.0.0.1,1433,x`` included, is still read whole.
+
+    The egress reading still refuses that ``server`` on every driver, and the two differ on
+    purpose. The hop guard asks only whether the hop leaves the box, and a wrong ``no`` there only
+    refuses. The egress reading matches ``server`` whole against an ``allowed_db`` entry and reads
+    the generic port from ``PORT`` alone, so it has no reading of a SQL Server driver's port on this
+    dialect, and for that driver it points at the SQL Server preset, which sends ``host,port``
+    itself. With an empty allowlist it refuses nothing, so the hop guard is then the only reader."""
     keyword = str(odbc_param(params, "port") or "")
     text = server.strip()
     if "," in text:
+        head, _, tail = text.partition(",")
+        if reads_comma_port and tail.isascii() and tail.isdecimal() and port_or_zero(tail):
+            split = _exact_split(head)
+            if split is not None and split[0] and not split[1]:
+                return split[0], port_or_zero(tail)
         return text, port_or_zero(keyword)
-    host, in_server = split_generic_server(text)
-    # Only a host, ``host:port`` or ``[v6]:port`` written exactly is split. Anything else, at least
-    # ``[::1]remote``, ``[::1]:5432x`` and ``127.0.0.1 : 5432``, is read whole too, so no text the
-    # split dropped can sit behind a loopback host.
-    written = (f"[{host}]" if text.startswith("[") else host) + (
-        f":{in_server}" if in_server else ""
-    )
-    if written != text or (in_server and not port_or_zero(in_server)):
+    split = _exact_split(text)
+    if split is None:
         return text, port_or_zero(keyword)
+    host, in_server = split
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
     return host, port_or_zero(in_server) or port_or_zero(keyword)

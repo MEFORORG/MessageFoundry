@@ -1601,7 +1601,13 @@ def generic_cleartext_hop_guard(
     reason = generic_odbc_tls_unenforced(params, driver=settings.get("odbc_driver"))
     if reason is None:
         return None
-    host, port = generic_hop_endpoint(str(settings.get("server") or ""), params)
+    # Microsoft's driver alone reads ``host,port`` as one host and its port; generic_hop_endpoint
+    # says why that spelling is split for it and read whole for every other driver (BACKLOG #4874).
+    host, port = generic_hop_endpoint(
+        str(settings.get("server") or ""),
+        params,
+        reads_comma_port=_driver_family(settings.get("odbc_driver")) == "msodbc",
+    )
     return InsecureHopGuard.capture(
         host=host,
         port=port,

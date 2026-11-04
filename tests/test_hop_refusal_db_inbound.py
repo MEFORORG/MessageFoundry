@@ -777,6 +777,40 @@ def test_generic_server_with_a_comma_is_not_on_box(
         assert connector(config(server=first))
 
 
+_MS_DRIVER = "ODBC Driver 18 for SQL Server"
+
+
+@pytest.mark.parametrize("server", ["127.0.0.1,1433", "localhost,1433", "[::1],1433"])
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_sql_server_comma_port_is_on_box(
+    server: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    """BACKLOG #4874. ``host,port`` is Microsoft's own spelling of a SQL Server ``server``, and
+    its driver ignores ``PORT``, so a loopback host with a comma port is on-box on that driver.
+    Red on the previous head, which read every comma ``server`` whole. The control is the same
+    text on psqlODBC, which reads the comma as a host list and is refused."""
+    with active_hop_posture(PROD_PHI):
+        assert connector(config(server=server, odbc_driver=_MS_DRIVER))
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(server=server))
+
+
+@pytest.mark.parametrize(
+    "server",
+    ["127.0.0.1,remote.example", "127.0.0.1,1433,x", "127.0.0.1,1433,remote.example", ",1433"],
+)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_sql_server_other_comma_is_not_on_box(
+    server: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    # BACKLOG #4874: on Microsoft's driver only `host,<port>` is split; anything else holding a
+    # comma is read whole, as a remote host. The control is a plain loopback host on that driver.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(server=server, odbc_driver=_MS_DRIVER))
+    with active_hop_posture(PROD_PHI):
+        assert connector(config(server="127.0.0.1", odbc_driver=_MS_DRIVER))
+
+
 def test_generic_attestation_allows_and_is_audited(caplog: pytest.LogCaptureFixture) -> None:
     cfg = _generic_dest(tls_hop_attested=True, tls_hop_attested_reason="mesh sidecar mTLS")
     with caplog.at_level("WARNING"), active_hop_posture(PROD_PHI):
@@ -878,7 +912,40 @@ def test_generic_guard_is_none_off_the_arm() -> None:
 def test_generic_hop_endpoint_splits(
     server: str, params: dict[str, str], expected: tuple[str, int]
 ) -> None:
-    assert generic_hop_endpoint(server, params) == expected
+    assert generic_hop_endpoint(server, params, reads_comma_port=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("server", "params", "comma_port", "expected"),
+    [
+        # BACKLOG #4874: Microsoft's driver reads `host,port` as one host and its port.
+        ("127.0.0.1,1433", {}, True, ("127.0.0.1", 1433)),
+        ("[::1],1433", {}, True, ("::1", 1433)),
+        ("db.example,1433", {"PORT": "5432"}, True, ("db.example", 1433)),
+        ("127.0.0.1,01433", {}, True, ("127.0.0.1", 1433)),
+        # Anything else holding a comma is read whole on that driver too.
+        ("127.0.0.1,remote.example", {}, True, ("127.0.0.1,remote.example", 0)),
+        ("127.0.0.1,1433,x", {}, True, ("127.0.0.1,1433,x", 0)),
+        ("127.0.0.1,1433,1433", {}, True, ("127.0.0.1,1433,1433", 0)),
+        ("127.0.0.1,99999", {}, True, ("127.0.0.1,99999", 0)),
+        ("127.0.0.1,0", {}, True, ("127.0.0.1,0", 0)),
+        ("127.0.0.1, 1433", {}, True, ("127.0.0.1, 1433", 0)),
+        ("127.0.0.1 ,1433", {}, True, ("127.0.0.1 ,1433", 0)),
+        ("127.0.0.1,\u00b9433", {}, True, ("127.0.0.1,\u00b9433", 0)),
+        ("127.0.0.1,", {}, True, ("127.0.0.1,", 0)),
+        (",1433", {}, True, (",1433", 0)),
+        ("127.0.0.1:5432,1433", {}, True, ("127.0.0.1:5432,1433", 0)),
+        ("tcp:127.0.0.1,1433", {}, True, ("tcp:127.0.0.1,1433", 0)),
+        ("[::1]x,1433", {}, True, ("[::1]x,1433", 0)),
+        # The same spelling on every other driver stays whole.
+        ("127.0.0.1,1433", {}, False, ("127.0.0.1,1433", 0)),
+        ("127.0.0.1,1433", {"PORT": "5432"}, False, ("127.0.0.1,1433", 5432)),
+    ],
+)
+def test_generic_hop_endpoint_comma_port(
+    server: str, params: dict[str, str], comma_port: bool, expected: tuple[str, int]
+) -> None:
+    assert generic_hop_endpoint(server, params, reads_comma_port=comma_port) == expected
 
 
 # --- INBOUND: the --allow-insecure-bind clamp predicate -----------------------------------------

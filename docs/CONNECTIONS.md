@@ -2097,11 +2097,20 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > other means. Otherwise set a verifying TLS mode, or run at `[security].enforcement = warn`.
 >
 > The on-box carve-out reads the host from `server` without resolving it. **A `server` holding a
-> comma anywhere is read whole, as a remote host** (BACKLOG #4874): libpq reads a comma in a host
-> as a list of hosts, so `127.0.0.1,remote` names `remote` too, and `127.0.0.1,5432` names a host
-> `5432`. Before this, the guard read the host from the text before the first comma, so such a
-> value counted as on-box. Name one host in `server` and put the port in the `PORT` keyword, as
-> the `[egress].allowed_db` check already requires.
+> comma is read whole, as a remote host** (BACKLOG #4874): libpq reads a comma in a host as a list
+> of hosts, so `127.0.0.1,remote` names `remote` too, and `127.0.0.1,5432` names a host `5432`.
+> Before this, the guard read the host from the text before the first comma, so such a value
+> counted as on-box. On psqlODBC and MySQL, name one host in `server` and put the port in the
+> `PORT` keyword, which both read, as the `[egress].allowed_db` check already requires.
+>
+> **The exception is Microsoft's ODBC Driver for SQL Server**, placed by its registered name
+> `ODBC Driver <n> for SQL Server`. That driver reads `host,port` as one host and its port, its own
+> documented spelling, and ignores `PORT`. On that name only, `server` written as a host, one comma
+> and a port in ASCII digits, such as `127.0.0.1,1433`, is read as that host and port, so a
+> loopback host stays on-box. Anything else holding a comma, at least `127.0.0.1,remote` and
+> `127.0.0.1,1433,x`, is still read whole. The `[egress].allowed_db` check still refuses a comma in
+> a generic `server` on every driver, so with a non-empty allowlist that spelling is refused there;
+> for Microsoft's driver use the SQL Server preset, which sends `server,port` itself.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
