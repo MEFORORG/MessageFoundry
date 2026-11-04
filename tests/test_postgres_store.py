@@ -5558,8 +5558,6 @@ async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
     global epoch it stayed live. It now carries the global epoch the revoke is replacing. The hook
     is the kept session's re-seal, which runs between the sweep and the commit (the epoch read it
     used to hook went with BACKLOG #4975, which takes the epochs from the raises)."""
-    from typing import Any
-
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import AuthSettings, load_settings
