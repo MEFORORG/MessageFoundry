@@ -1778,8 +1778,7 @@ dialects send it differently (vault BACKLOG #2704):
 **The check compares the port the connection string sends, not the port the driver opens.** A
 driver that ignores `PORT` connects to its own default port, and the check cannot see that. Check
 that your driver reads the keyword. The preset refuses a driver name that is not Microsoft's, as
-below, but an odbcinst alias that registers a Microsoft name against another library is not
-visible to it.
+below.
 
 **On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
 string is built and by the egress check (BACKLOG #4873). This holds for every factory that builds
@@ -1810,7 +1809,8 @@ host.
   under a folder with a non-ASCII name is refused.
 - A path is accepted when its file name, in any case, is the Microsoft ODBC Driver library:
   `libmsodbcsql-18.so`, `libmsodbcsql.18.dylib` or `msodbcsql18.dll`, with a version suffix
-  allowed. A path that opens with two separators or a device prefix, such as a UNC path or
+  allowed, and either separator before the version on Linux and macOS. A bare file name with no
+  directory is accepted too, and the loader then finds it on its own search path. A path that opens with two separators or a device prefix, such as a UNC path or
   `\??\UNC\`, or holds `://` is refused, since it can name a library on another host.
 - The preset's `odbc_driver` may hold no `;`, `{`, `}` or `=`, anywhere in a path included. The
   driver is sent braced, but whether every driver manager reads the brace escape there is
