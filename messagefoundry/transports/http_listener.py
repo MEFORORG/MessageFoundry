@@ -240,20 +240,23 @@ _NOT_ACCEPTED = "message was not accepted"
 TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS = 5
 
 
-def _refusal_status(kind: RefusalKind) -> int:
-    """The status a refusal of ``kind`` is answered with (ADR 0154 amendments 2026-10-30 and
-    2026-11-04). Only a temporary refusal invites a re-send soon, with ``Retry-After``; a
-    configuration refusal is the same ``503`` without it, since it clears only when an operator acts
-    (BACKLOG #5102). An over-size body answers the same ``413`` as one over ``max_body_bytes``. A
-    ``match`` with ``assert_never``, so mypy refuses a new kind left unmapped rather than a
-    ``KeyError`` answering ``500`` after the ``ERROR`` row was written."""
+def _refusal_status(kind: RefusalKind) -> tuple[int, dict[str, str] | None]:
+    """The status a refusal of ``kind`` is answered with, and its extra headers (ADR 0154
+    amendments 2026-10-30 and 2026-11-04). Only a temporary refusal invites a re-send soon, with
+    ``Retry-After``; a configuration refusal is the same ``503`` without it, since it clears only
+    when an operator acts (BACKLOG #5102). An over-size body answers the same ``413`` as one over
+    ``max_body_bytes``. One ``match`` with ``assert_never`` decides both, so mypy refuses a new kind
+    left unmapped rather than a ``KeyError`` answering ``500`` after the ``ERROR`` row was written,
+    and no kind gets its header from a second test."""
     match kind:
-        case RefusalKind.TEMPORARY | RefusalKind.CONFIGURATION:
-            return 503
+        case RefusalKind.TEMPORARY:
+            return 503, {"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)}
+        case RefusalKind.CONFIGURATION:
+            return 503, None
         case RefusalKind.OVERSIZE:
-            return 413
+            return 413, None
         case RefusalKind.PERMANENT:
-            return 422
+            return 422, None
         case _:
             assert_never(kind)
 
@@ -1520,18 +1523,14 @@ class HttpSource(SourceConnector):
             # this is a post-record refusal with no connection-event kind of its own, so the outer
             # ``closed`` still fires. The drain gets the receipt-sized budget in both modes: this is a
             # fixed few dozen bytes, never the partner-sized body reply_write_timeout exists for.
-            retry = (
-                {"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)}
-                if receipt.refusal is RefusalKind.TEMPORARY
-                else None
-            )
+            status, headers = _refusal_status(receipt.refusal)
             # ``refused_message_id``, never ``message_id``: where this listener's own answer carries
             # ``message_id``, it names a committed message, so a refusal must not read as one. A
             # proxied reply_from 200 or 502 carries the partner's own bytes, which may hold its own.
             refused = json.dumps({"error": _NOT_ACCEPTED, "refused_message_id": message_id})
             await self._respond(
                 writer,
-                build_response(_refusal_status(receipt.refusal), refused, extra_headers=retry),
+                build_response(status, refused, extra_headers=headers),
                 budget=_CLIENT_SHUTDOWN_GRACE,
             )
             return False

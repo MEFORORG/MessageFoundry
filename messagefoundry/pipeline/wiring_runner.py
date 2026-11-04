@@ -8475,8 +8475,10 @@ class RegistryRunner:
             # anything is the configuration's fault, so AE (resend once it is fixed); bytes invalid
             # in a usable charset are the message's, so AR.
             #
-            # A poll source that gets here, at least the file and remote-file sources (the timer and
-            # database sources fail to build on such a name), gets no NAK: its handler's answer
+            # A poll source that gets here, at least the file and remote-file sources for a name no
+            # codec answers to (the timer and database sources fail to build on such a name, and a
+            # name such as "undefined" raises in those two sources' own batch split before the
+            # hand-off, docs/CONNECTIONS.md says), gets no NAK: its handler's answer
             # cannot say "refused", so it consumes its input after this ERROR row as it does for
             # every refusal. That row stores the input whole, since a poll source is exempt from the
             # refused-body allowance, so the store keeps what the source consumed; holding the input
@@ -8518,8 +8520,11 @@ class RegistryRunner:
                 error=body_err,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
+            # The receipt path's class decides MSA-1, as on the decode arm (BACKLOG #5102): AR today,
+            # since every such body refusal is permanent there.
+            body_code = _nak_code(_guard_refusal_kind(exc))
             ack = (
-                build_ack(raw, code="AR", text=exc.ack_text, ack_mode=ack_mode)
+                build_ack(raw, code=body_code, text=exc.ack_text, ack_mode=ack_mode)
                 if (hl7v2 and reply)
                 else None
             )
@@ -8527,7 +8532,7 @@ class RegistryRunner:
                 await self._capture_ack(
                     mid,
                     ic.name,
-                    ack_code="AR",
+                    ack_code=body_code,
                     ack_phase="decode",
                     ack_body=None,
                     detail=body_err,

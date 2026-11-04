@@ -122,9 +122,11 @@ async def _the_one_error_row(store: MessageStore) -> dict[str, Any]:
 def _assert_names_the_row(resp: _Response, row: dict[str, Any]) -> None:
     assert resp.json() == {"error": "message was not accepted", "refused_message_id": row["id"]}
     # BACKLOG #2105: the row itself says which kind of refusal it was, so an operator can tell a
-    # temporary one, which the sender will re-send, from a final one before resending it. The
-    # configuration kind's 503 is pinned in tests/test_inbound_http_source.py (BACKLOG #5102).
+    # temporary one, which the sender will re-send, from a final one before resending it. A 503
+    # without Retry-After is the configuration kind (BACKLOG #5102).
     kind = {503: "temporary", 413: "oversize", 422: "permanent"}[resp.status]
+    if resp.status == 503 and "retry-after" not in resp.headers:
+        kind = "configuration"
     assert row["error"].startswith(f"[refusal kind: {kind}] "), row["error"]
     # The harness reads only an accepted answer's message_id, so this real refusal reads as none.
     assert message_id_of(resp.body) is None

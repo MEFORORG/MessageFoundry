@@ -34,12 +34,14 @@ class RefusalKind(StrEnum):
     #: thread began the validate (BACKLOG #5078). A strict-validation timeout whose validate began
     #: is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
     TEMPORARY = "temporary"
-    #: The inbound's own configuration refuses every body until an operator changes it, so the body
-    #: is not at fault, yet no re-send clears it on its own (BACKLOG #5102). At least an inbound codec
-    #: name that sets up no decode (BACKLOG #2431). Told apart from TEMPORARY so that no source
-    #: answers an operator-only fault as retry-soon, and from the final kinds so that no sender drops
-    #: a body the engine takes once the fault is fixed. ADR 0154's amendment of 2026-11-04 says what
-    #: each source answers.
+    #: The inbound's own configuration refuses every body alike, whatever it holds, until an
+    #: operator changes it, so the body is not at fault, yet no re-send clears it on its own
+    #: (BACKLOG #5102). At least an inbound codec name that sets up no decode (BACKLOG #2431). A
+    #: refusal that depends on the body, such as a backend that cannot stream refusing only a body
+    #: over the streaming threshold, is not this kind. Told apart from TEMPORARY so that no source
+    #: invites a re-send soon for an operator-only fault, and from the final kinds so that the answer
+    #: does not tell a sender to drop a body the engine takes once the fault is fixed. ADR 0154's
+    #: amendment of 2026-11-04 says what each source answers.
     CONFIGURATION = "configuration"
     #: About the body itself: a re-send of the same bytes is refused the same way.
     PERMANENT = "permanent"

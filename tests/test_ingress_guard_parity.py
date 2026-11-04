@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, ContentType, Validation
+from messagefoundry.config.models import ConnectorType, ContentType, Source, Validation
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -39,6 +39,7 @@ from messagefoundry.parsing.message import RawMessage
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import disposition_for, dry_run, route_message, split_messages
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.file import FileSource
 
 #: A conformant 2.5.1 ADT^A01 whose PID-5 family name carries a byte that is latin-1 but NOT UTF-8
 #: (U+00DC, "Ü"). Which of the two charsets an inbound declares is exactly what decides whether the
@@ -623,6 +624,46 @@ async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: Messag
     )
     invalid = await runner_utf8._handle_inbound(reg_utf8.inbound["in"], ADT_LATIN1)
     assert invalid is not None and "MSA|AR|" in invalid
+
+
+@pytest.mark.parametrize(
+    ("encoding", "reaches_the_runner"),
+    [("not-a-real-codec", True), ("undefined", False)],
+    ids=["no_codec_answers", "refuses_every_conversion"],
+)
+async def test_a_file_source_with_an_unusable_codec_name_does_what_connections_md_says(
+    store: MessageStore, tmp_path: Path, encoding: str, reaches_the_runner: bool
+) -> None:
+    """BACKLOG #5102, closing step 2: a poll source does not hold its input on a configuration
+    fault, and docs/CONNECTIONS.md (*An inbound encoding follows one rule on every source*) says
+    what it does instead. A name no codec answers to reaches the runner, which records one ERROR row
+    holding the input whole and returns no reply, so the source goes on to consume the file. A name
+    that refuses every conversion raises in the source's own batch split, before any hand-off, so no
+    row is written and the scan leaves the file in place."""
+    ic = _inbound_declaring(encoding)
+    reg = _registry(ic)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
+    source = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(tmp_path), "encoding": encoding},
+        )
+    )
+    source._handler = runner._make_handler(reg.inbound["in"])
+
+    if reaches_the_runner:
+        assert await source._emit(ADT_UTF8) is True
+    else:
+        with pytest.raises(UnicodeError):
+            await source._emit(ADT_UTF8)
+
+    cur = await store._db.execute("SELECT status, raw FROM messages")
+    rows = [dict(r) for r in await cur.fetchall()]
+    if reaches_the_runner:
+        assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+        assert "PID|" in rows[0]["raw"], "a poll source's refused input is stored whole"
+    else:
+        assert rows == []
 
 
 def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:
