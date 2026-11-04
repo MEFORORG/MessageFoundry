@@ -31,9 +31,9 @@ protocol class is replaced.
 * **The peer's address, which the hook does not read.** These reports name no peer, and a trailing
   report for several failures names none anyway. A TLS object holds two memory buffers and no
   socket. Measured for vault BACKLOG #3302 on CPython 3.14.7 and uvicorn 0.54.0, with the stdlib
-  Proactor loop on Windows: inside ``do_handshake`` the address was reachable only through private
-  loop state, at least through the caller's frame and through ``gc.get_referrers``, each to the
-  loop protocol's private ``_transport``. uvloop was not measured, since it has no Windows build.
+  Proactor loop on Windows: inside ``do_handshake`` the address was reachable through private loop
+  state, at least through the caller's frame and through ``gc.get_referrers``, each to the loop
+  protocol's private ``_transport``. uvloop was not measured, since it has no Windows build.
   Whether to build a peer report is an open owner question (vault BACKLOG #3302).
 * **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
