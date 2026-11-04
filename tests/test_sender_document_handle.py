@@ -1792,32 +1792,31 @@ def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> 
     assert documents == 1 and stripped != readable
 
 
-def test_the_retention_strip_logs_a_skip_with_no_byte_of_the_body(
+def test_the_retention_strip_reports_an_unreadable_skip_to_its_caller(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A row the strip skips keeps its document past the strip window, so the skip is logged at
-    WARNING rather than passed over silently, and the record carries nothing of the body: the
-    separator read's refusal quotes MSH-1 and MSH-2, so its text is left out too (BACKLOG
-    #5099). A readable body logs nothing, the control that the record marks the skip."""
+    """A row the strip skips because its delimiters cannot be read keeps any document past the
+    strip window, so ``strip_documents`` reports the skip through ``on_unreadable`` for the store
+    to log against the row (BACKLOG #5099). The codec logs nothing itself. A readable body, and a
+    body with no OBX, are not reported: the controls that the call marks this skip alone."""
     from messagefoundry.parsing.binary import strip_documents
 
-    logger = "messagefoundry.parsing.binary"
-    with caplog.at_level(logging.WARNING, logger=logger):
-        assert strip_documents(_hl7(_b64(2000)), pruned_at=0.0)[1] == 1
-    assert [r for r in caplog.records if r.name == logger] == []
+    calls: list[str] = []
 
-    body = _SHORT_MSH2_DOCUMENT
-    with caplog.at_level(logging.WARNING, logger=logger):
-        assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
-    records = [r for r in caplog.records if r.name == logger]
-    assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-    text = records[0].getMessage()
-    assert "document strip skipped" in text
-    assert records[0].exc_info is None
-    # No field of the body, its header's delimiters and the document included.
-    for piece in ("^~", "APP", "FAC", "RCVF", "MSGID001", "20260101120000", "MDM", _b64(2000)[:16]):
-        assert piece not in text, piece
+    def report() -> None:
+        calls.append("unreadable")
+
+    with caplog.at_level(logging.DEBUG):
+        assert strip_documents(_hl7(_b64(2000)), pruned_at=0.0, on_unreadable=report)[1] == 1
+        assert strip_documents("MSH|^~|A\rPID|1\r", pruned_at=0.0, on_unreadable=report)[1] == 0
+        assert calls == []
+        body = _SHORT_MSH2_DOCUMENT
+        assert strip_documents(body, pruned_at=0.0, on_unreadable=report) == (body, 0, 0)
+        assert calls == ["unreadable"]
+        batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
+        assert strip_documents(batch, pruned_at=0.0, on_unreadable=report) == (batch, 0, 0)
+        assert calls == ["unreadable", "unreadable"]
+    assert [r for r in caplog.records if r.name.startswith("messagefoundry.parsing")] == []
 
 
 def test_the_retention_strip_contains_any_fault_in_the_separator_read(

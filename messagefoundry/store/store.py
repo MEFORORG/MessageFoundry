@@ -146,7 +146,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
-from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.document_strip import (
+    StripResult,
+    cutoff_for,
+    log_unreadable_skips,
+)
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
     bounded_cipher,
@@ -18510,6 +18514,7 @@ class MessageStore:
         reclaimed = 0
         updates: list[tuple[str, float, str]] = []
         failures: list[CellTagError] = []
+        unreadable: list[object] = []
         for row in rows:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
@@ -18543,6 +18548,7 @@ class MessageStore:
                 pruned_at=now,
                 min_bytes=min_bytes,
                 content_type=content_types.get(row["channel_id"]),
+                on_unreadable=functools.partial(unreadable.append, row["id"]),
             )
             if n_docs == 0:
                 continue  # no embedded document in this body — leave it (and its NULL flag) untouched
@@ -18567,6 +18573,7 @@ class MessageStore:
                     "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
                 )
                 await self._commit()
+        log_unreadable_skips(unreadable)
         await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed

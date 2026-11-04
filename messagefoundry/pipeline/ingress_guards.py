@@ -140,8 +140,8 @@ STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
 #: than four characters (BACKLOG #5099). A body with no MSH never reaches this check: ``Peek.parse``
 #: refuses it first. It names no byte of the body.
 DOC_REF_MARKER_REFUSED_REASON = (
-    "document handle refused: the body holds the handle marker, and a delimiter is a base64 "
-    "character, or the delimiters are unreadable"
+    "document handle refused: the body holds the handle marker, and either a delimiter is a "
+    "base64 character or the delimiters are unreadable"
 )
 
 

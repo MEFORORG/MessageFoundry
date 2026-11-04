@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
@@ -47,8 +46,6 @@ if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
     # is one-way (message.py imports binary.py, never the reverse) and there is no import cycle.
     from messagefoundry.parsing.message import Message
-
-_log = logging.getLogger(__name__)
 
 #: The self-describing carriage marker. ``v1`` versions the *algorithm* (standard base64); a future
 #: carrier (e.g. base85, if the ~33% inflation ever bites) would ship as ``v2`` without ambiguity.
@@ -182,7 +179,9 @@ class UnreadableDelimitersError(ValueError):
     cause there; with no MSH, MSH-1 and MSH-2 both read empty.
     Every ``OBX-5.5`` read raises on such a body, so the ingress detach refuses it by this name,
     before anything is stored and before the ACK, rather than letting a plain ``ValueError`` out
-    that no listener records. The text names no byte of the body."""
+    that no listener records. Only the short MSH-2 reaches the detach on a listener, whose
+    ``Peek.parse`` refuses a body with no MSH first; the text names whichever cause the body has,
+    and no byte of it."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -612,11 +611,14 @@ def iter_obx_documents(
     obx_count = message.count_segments("OBX")
     if obx_count and not _delimiters_readable(message):
         # Every OBX-5.5 read below would raise a plain ValueError, which no listener records;
-        # named here, it is a refusal both of them answer (BACKLOG #5099).
-        raise UnreadableDelimitersError(
-            "the body has no MSH, or its MSH-2 is shorter than four characters, so no OBX-5.5 "
-            "can be read; refusing the detach"
+        # named here, it is a refusal both of them answer (BACKLOG #5099). The text names the one
+        # cause the body has, since the listeners store it: only a short MSH-2 reaches them.
+        cause = (
+            "its first MSH's MSH-2 is shorter than four characters"
+            if message.count_segments("MSH")
+            else "the body has no MSH"
         )
+        raise UnreadableDelimitersError(f"{cause}, so no OBX-5.5 can be read; refusing the detach")
     occurrences: list[int] = []
     documents: list[int] = []
     value_holds_marker = False
@@ -752,6 +754,7 @@ def strip_documents(
     pruned_at: float | None = None,
     min_bytes: int = 0,
     content_type: str | None = None,
+    on_unreadable: Callable[[], object] | None = None,
 ) -> tuple[str, int, int]:
     """Strip embedded documents from a stored ``raw`` body in place, returning
     ``(new_raw, documents_stripped, bytes_reclaimed)`` (#47, ADR 0042).
@@ -762,12 +765,16 @@ def strip_documents(
     * an **HL7 message carrying OBX-5 ED embeds** → each qualifying OBX-5 value is tombstoned via the
       parsed :class:`Message` model and the message is re-encoded (so it re-parses cleanly).
 
-    Anything else (plain HL7 with no ED, HL7 with an MSH-2 shorter than four characters, a body
-    with no MSH segment such as an FHS- or BHS-led batch, including one whose first eight
-    characters hold ``MSH``, JSON/XML/text, an already-stripped tombstone) is returned
-    unchanged with ``(raw, 0, 0)`` — so the caller can skip a no-op write and the pass is idempotent.
-    A body skipped because its delimiters cannot be read is logged at WARNING, with no byte of it,
-    since its document then stays past the strip window.
+    Anything else is returned unchanged with ``(raw, 0, 0)``, so the caller can skip a no-op
+    write and the pass is idempotent. At least: plain HL7 with no ED; a body whose first eight
+    characters do not hold ``MSH``, such as an FHS- or BHS-led batch, whatever segments follow;
+    HL7 whose delimiters cannot be read, because it has no MSH segment (an FHS- or BHS-led body
+    whose first eight characters hold ``MSH`` reaches this) or its MSH-2 is shorter than four
+    characters; JSON/XML/text; an already-stripped tombstone.
+
+    ``on_unreadable`` is called, with nothing, once for a body skipped because its delimiters
+    cannot be read: its documents, if it holds any, stay past the strip window, so the caller
+    can log the skip against its own row. The codec logs nothing itself. No other skip calls it.
 
     ``min_bytes`` skips a document whose decoded size is below the threshold (small embeds aren't worth
     evicting; ``0`` = strip every embed). ``content_type`` (the connection's declared format) labels a
@@ -783,7 +790,7 @@ def strip_documents(
         # Only attempt the HL7/OBX path on something that looks like an HL7 message (starts with MSH).
         # A non-HL7 body that merely contains the substring "OBX" is left untouched by the parse guard
         # below (a parse failure / no OBX-5 ED → returned unchanged).
-        return _strip_obx_ed(raw, pruned_at, min_bytes)
+        return _strip_obx_ed(raw, pruned_at, min_bytes, on_unreadable)
     return raw, 0, 0
 
 
@@ -841,10 +848,12 @@ def strip_documents_in_hl7(
     return stripped, reclaimed
 
 
-def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int, int]:
+def _strip_obx_ed(
+    raw: str, pruned_at: float, min_bytes: int, on_unreadable: Callable[[], object] | None
+) -> tuple[str, int, int]:
     """Parse ``raw`` as HL7, strip its OBX-5 ED embeds, and re-encode. Returns the original unchanged on
-    a parse failure, when its delimiters cannot be read, or when nothing was stripped (so the caller
-    skips the write)."""
+    a parse failure, when its delimiters cannot be read (calling ``on_unreadable`` first), or when
+    nothing was stripped (so the caller skips the write)."""
     # Local import keeps the one-way dependency (message.py imports binary.py, never the reverse) — the
     # cycle is broken by importing inside the function, not at module top.
     from messagefoundry.parsing.message import Message
@@ -856,20 +865,16 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
         return raw, 0, 0
     try:
         message._encoding_chars()
-    except ValueError as exc:
+    except ValueError:
         # No MSH, or an MSH-2 shorter than four characters: every OBX read would raise, and the
         # retention pass calls this with no try, so one such stored row would abort the pass on
         # every run. Its document stays, as any body this strip cannot read does (BACKLOG #5099).
         # Any ValueError, not only the bare one _delimiters_readable answers for: the detach lets
         # another fault out, but a retention pass must contain it as it contains a parse failure.
-        # Logged, not silent, because the document now outlives its window. Only the exception's
-        # class name goes in the record, never its text or the body: the separator read's refusal
-        # quotes MSH-1 and MSH-2, which are the body's.
-        _log.warning(
-            "document strip skipped a stored HL7 body: its delimiters could not be read (%s), so "
-            "its embedded documents stay",
-            type(exc).__name__,
-        )
+        # Reported, not silent, because a document it holds now outlives its window; the caller
+        # holds the row id and logs it, so this pure codec has no logging side effect.
+        if on_unreadable is not None:
+            on_unreadable()
         return raw, 0, 0
     stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:

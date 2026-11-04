@@ -706,17 +706,13 @@ def test_a_carve_out_does_not_swallow_the_engine_message_on_any_other_body(
     """
     text = _OBX_ED_ADT.decode()
     assert not _is_short_msh2_shape(text) and not _is_batch_header_shape(text)
-    calls: list[str] = []
-
-    def planted(*_args: object, **_kwargs: object) -> Never:
-        calls.append("iter_obx_documents")
-        raise ValueError("cannot determine HL7 separators: planted")
-
+    planted = _boom(ValueError("cannot determine HL7 separators: planted"))
     monkeypatch.setattr(fuzz_targets, "iter_obx_documents", planted)
+    # The control: the same plant on a registered shape is swallowed, which proves it sits inside
+    # the carve-out's try. Were the scan moved outside it, this call would raise.
+    TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
     with pytest.raises(ValueError, match="planted"):
         TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
-    # The raise came from inside the carve-out's try, so it is the shape check that let it out.
-    assert calls == ["iter_obx_documents"]
 
 
 def test_a_carve_out_does_not_swallow_a_valueerror_subclass(
