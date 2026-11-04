@@ -110,6 +110,7 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
+    _carries_a_codec_error,
     acquire_pooled,
     driver_sqlstate,
     warm_pool_connections,
@@ -1565,24 +1566,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
-    try:
-        ctx = _verifying_context(settings)
-    except ValueError as exc:
-        # BACKLOG #5000: the context builder refuses the hop's own TLS settings with a ValueError,
-        # at least for the pin file, the CRL file and its dates, and the suites. Typed here, at the
-        # open only, so such a refusal is could not start rather than the CLI floor's exit 1. Not
-        # an OSError that is also a ValueError, such as a CRL staging copy that failed: that is a
-        # fault of the host, not a verdict on the settings, and keeps its own type. Nor an OSError
-        # alone, such as a CRL file the engine may not read, which this does not catch (a pin file
-        # it may not read arrives as a ValueError naming the setting, and is typed). Nor a
-        # UnicodeError, or a ValueError raised from one, as the CRL judge re-raises one with its
-        # text: `str()` of one names the byte it met, and wrapped in a plain message
-        # `codec_safe_str` could no longer tell it from any other text (BACKLOG #2532), so it
-        # propagates as it did before. The pool's per-connection rebuild calls the builder
-        # directly, so a refusal there is not typed.
-        if isinstance(exc, (InsecureHopRefused, OSError)) or _from_a_codec_error(exc):
-            raise
-        raise StoreTlsRefused(str(exc)) from exc
+    ctx = _verifying_context_at_open(settings)
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
@@ -1592,17 +1576,38 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     return ctx
 
 
-def _from_a_codec_error(exc: BaseException) -> bool:
-    """Whether ``exc`` is a ``UnicodeError``, or was raised from or while handling one, along
-    its ``__cause__`` and ``__context__`` links. A link already seen ends the walk."""
-    seen: set[int] = set()
-    link: BaseException | None = exc
-    while link is not None and id(link) not in seen:
-        if isinstance(link, UnicodeError):
-            return True
-        seen.add(id(link))
-        link = link.__cause__ if link.__cause__ is not None else link.__context__
-    return False
+def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
+    """:func:`_verifying_context`, with its ``ValueError`` typed as :class:`StoreTlsRefused`
+    (BACKLOG #5000), for :func:`_build_ssl` at the open only. The pool's per-connection rebuild
+    calls the builder directly, so a refusal there is not typed.
+
+    The builder refuses the hop's own TLS settings with a ``ValueError``, at least for the pin
+    file, the CRL file and its dates, and the suites; typed, such a refusal is could not start
+    rather than the CLI floor's exit 1. Not an ``OSError`` that is also a ``ValueError``, such as a
+    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and
+    keeps its own type. Nor an ``OSError`` alone, such as a CRL file the engine may not read, which
+    this does not catch (a pin file it may not read arrives as a ``ValueError`` naming the setting,
+    and is typed).
+
+    **A codec error is neither quoted nor chained**, as
+    :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
+    #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
+    has one on its chain is refused with a fixed text naming the settings and the class, raised
+    outside the handler. Not its ``codec_safe_str`` rendering: the CRL judge re-raises a codec
+    error as a ``ValueError`` whose own text already quotes the byte, which that rendering prints
+    whole. Every other ``ValueError`` keeps its text and its chain."""
+    try:
+        return _verifying_context(settings)
+    except ValueError as exc:
+        if isinstance(exc, (InsecureHopRefused, OSError)):
+            raise
+        if not _carries_a_codec_error(exc):
+            raise StoreTlsRefused(str(exc)) from exc
+        kind = type(exc).__name__
+    raise StoreTlsRefused(
+        "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
+        f"[store].ssl_crl_file or the system trust store: a {kind} from a codec error, not quoted"
+    )
 
 
 def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:

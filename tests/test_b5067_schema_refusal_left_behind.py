@@ -201,7 +201,7 @@ def test_provision_admin_key_refusal_at_the_write_open_names_the_entry(
     and before any write: could not start, exit 2, with the pre-check's text and the entry named.
     It escaped to the CLI floor's exit 1 with no hint.
 
-    Mutation: drop the ``_ProvisionWriteOpenRefused`` arm; the exit is then 1."""
+    Mutation: drop the write's ``(StoreKeylessError, CipherError)`` arm; the exit is then 1."""
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
 
     refusal: Exception = (
@@ -224,7 +224,8 @@ def test_provision_admin_names_no_entry_once_the_write_has_started(
     entry: the seed may then be stored, and deleting the entry would leave the Administrator
     without its factor. A real SQLite store, so the open succeeds and the write is reached.
 
-    Mutation: drop ``write_started`` from ``after_the_key``; the hint is then printed."""
+    Mutation: drop the ``write_started`` branch from ``after_the_key``; the hint is then
+    printed."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
@@ -246,6 +247,8 @@ def test_provision_admin_names_no_entry_once_the_write_has_started(
     out = _run(argv, capsys)
     assert "synthetic hop refusal inside the write" in out, out
     assert _UNUSED_ENTRY not in out, out
+    assert "nothing was written" not in out.lower(), out
+    assert "may be missing or incomplete" in out, out
 
 
 def test_provision_admin_pre_check_cipher_refusal_quotes_no_key_byte(

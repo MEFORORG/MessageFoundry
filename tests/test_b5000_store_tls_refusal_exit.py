@@ -194,50 +194,38 @@ def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
             refuse()
 
 
-def test_a_codec_error_from_the_context_builder_is_not_wrapped(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("chained", [False, True])
+def test_a_codec_error_from_the_context_builder_is_typed_and_not_quoted(
+    chained: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``UnicodeError`` the context builder raises propagates as it did, so ``codec_safe_str``
-    still recognizes it (BACKLOG #2532). Wrapped as ``StoreTlsRefused(str(exc))`` it would be a
-    plain message naming the byte it met, which ``codec_safe_str`` prints whole.
+    """A codec error the context builder raises, itself or as the cause of a ``ValueError`` whose
+    text quotes it, as the CRL judge re-raises one, is could not start too, with no byte quoted
+    and no chain (BACKLOG #2532). Wrapped as ``StoreTlsRefused(str(exc))`` it would be a plain
+    message naming the byte, which ``codec_safe_str`` prints whole.
 
-    Mutation: drop ``UnicodeError`` from ``_build_ssl``'s re-raise; the wrap then names the byte."""
+    Mutation: wrap a codec-carrying ``ValueError`` as ``StoreTlsRefused(str(exc))``."""
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store import postgres
 
     def decoding(_settings: object) -> object:
-        b"\xe9".decode("ascii")
-        raise AssertionError("unreachable")
-
-    monkeypatch.setattr(postgres, "_verifying_context", decoding)
-    with pytest.raises(UnicodeDecodeError) as caught:
-        postgres._build_ssl(_pg(), posture=HopPosture(enforcing=True))
-    assert not isinstance(caught.value, StoreTlsRefused)
-    assert "xe9" not in codec_safe_str(caught.value).lower()
-    # The control: the text a wrap would have carried does name the byte.
-    assert "xe9" in codec_safe_str(StoreTlsRefused(str(caught.value))).lower()
-
-
-def test_a_value_error_raised_from_a_codec_error_is_not_wrapped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The CRL judge re-raises a ``ValueError`` with the text of the one it caught, so a codec
-    error there arrives as a ``ValueError`` raised from it. That propagates unwrapped too.
-
-    Mutation: test only the top-level class in ``_build_ssl``; the wrap then names the byte."""
-    from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.store import postgres
-
-    def judging(_settings: object) -> object:
         try:
             b"\xe9".decode("ascii")
         except UnicodeDecodeError as exc:
-            raise ValueError(f"[store].ssl_crl_file: {exc}") from exc
+            if chained:
+                raise ValueError(f"[store].ssl_crl_file: {exc}") from exc
+            raise
         raise AssertionError("unreachable")
 
-    monkeypatch.setattr(postgres, "_verifying_context", judging)
-    with pytest.raises(ValueError) as caught:
+    monkeypatch.setattr(postgres, "_verifying_context", decoding)
+    with pytest.raises(StoreTlsRefused) as caught:
         postgres._build_ssl(_pg(), posture=HopPosture(enforcing=True))
-    assert not isinstance(caught.value, StoreTlsRefused)
-    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+    refusal = caught.value
+    assert "xe9" not in str(refusal).lower() and "xe9" not in codec_safe_str(refusal).lower()
+    assert "[store].ssl_crl_file" in str(refusal), refusal
+    assert refusal.__cause__ is None and refusal.__context__ is None
+    # The control: the text a plain wrap would have carried does name the byte.
+    try:
+        decoding(None)
+    except ValueError as exc:
+        assert "xe9" in codec_safe_str(StoreTlsRefused(str(exc))).lower()

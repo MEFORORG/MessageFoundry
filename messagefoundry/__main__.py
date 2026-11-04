@@ -7813,12 +7813,6 @@ class _KeylessProvisionRefused(RuntimeError):
     """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
 
 
-class _ProvisionWriteOpenRefused(RuntimeError):
-    """``provision-admin``'s write open refused for its key or cipher (``StoreKeylessError`` or
-    ``CipherError``, the cause), before the write wrote anything (BACKLOG #5067). Raised for the
-    open only: the same classes from the write itself may follow a row it wrote."""
-
-
 class _UnauditableWrite(RuntimeError):
     """A command's audit row would be refused, found before its first write (BACKLOG #1916)."""
 
@@ -9099,32 +9093,40 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # Set just before the service's write, which stores the seed (BACKLOG #5067).
     write_started = False
 
-    def after_the_key(text: str) -> str:
-        """``text`` for a refusal of the write's open or of its keyless checks, raised before the
-        write wrote anything but after the key was shown (BACKLOG #5067). It then names the entry
-        the operator may have added, as ``admin-reset-totp`` does, or the app keeps an entry for a
-        seed that was never stored. Unchanged under ``--no-totp``: no key was shown. Unchanged too
-        once the write has started, whatever class reached the arm: the seed may then be stored,
-        and deleting the entry would leave the Administrator without its factor."""
-        if totp_secret is None or write_started:
-            return text
+    def after_the_key(refusal: str, before_write: str) -> str:
+        """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
+        ``refusal`` is the refusal alone; ``before_write`` is the arm's whole text for one raised
+        before the service's write, which wrote nothing.
+
+        Before the write, ``before_write``, and under a shown key it then names the entry the
+        operator may have added, as ``admin-reset-totp`` does, or the app keeps an entry for a seed
+        that was never stored; under ``--no-totp`` no key was shown. Once the write has started,
+        whatever class reached the arm, neither: the account and its seed may then be stored, so
+        it says so, as an integrity refusal does, and never to delete the entry, which would leave
+        the Administrator without its factor."""
+        if write_started:
+            return (
+                f"{_sentence(refusal)} The write had started, so the Administrator may be missing "
+                "or incomplete. Once the refusal is cleared, run the command again: it completes a "
+                "partly written account, or says why it cannot."
+            )
+        if totp_secret is None:
+            return before_write
         return (
-            f"{_sentence(text)} If you added the entry this run showed to the authenticator app, "
-            "delete it: its seed was never stored, and a run that succeeds shows a new key."
+            f"{_sentence(before_write)} If you added the entry this run showed to the "
+            "authenticator app, delete it: its seed was never stored, and a run that succeeds "
+            "shows a new key."
         )
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         nonlocal write_started
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        try:
-            store = await open_store(
-                settings.store,
-                create=True,
-                posture=posture,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            )
-        except (StoreKeylessError, CipherError) as exc:
-            raise _ProvisionWriteOpenRefused(type(exc).__name__) from exc
+        store = await open_store(
+            settings.store,
+            create=True,
+            posture=posture,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
@@ -9209,23 +9211,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
         # Each is raised before the write, so the shown key's entry has no seed (#5067).
-        _emit_error(after_the_key(str(exc)), as_json=args.json)
+        _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
-        _emit_error(after_the_key(_provision_open_refusal(exc, settings.store)), as_json=args.json)
+        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        _emit_error(text, as_json=args.json)
         return 2
-    except _ProvisionWriteOpenRefused as exc:
-        # A key or cipher refusal of the write's open, after the key was shown, which the
-        # pre-check exits 2 on too: the shown key's entry has no seed (#5067). Printed from the
-        # cause, codec-safe.
-        cause = exc.__cause__ or exc
-        _emit_error(
-            after_the_key(_provision_open_refusal(cause, settings.store)), as_json=args.json
-        )
+    except (StoreKeylessError, CipherError) as exc:
+        # A key or cipher refusal before the write, at its open or a read before it, which the
+        # pre-check exits 2 on too: the shown key's entry has no seed (#5067). One from the
+        # write itself may follow a row it wrote, so it reaches the floor as it did.
+        if write_started:
+            raise
+        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        _emit_error(text, as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
@@ -12584,7 +12587,8 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     open's DDL batch back and writes no schema marker, and the command has written no store row,
     so it could not start, exit 2. Not "changed
     nothing": a SQL Server open under ``auto`` may already have switched database options on,
-    before the batch; :func:`_open_refusal_left_behind` names them. Its text lists the tables, columns and indexes that differ and
+    before the batch; :func:`_open_refusal_left_behind` names them, and at least
+    ``provision-admin`` and ``admin-reset-totp`` print it, not every caller. Its text lists the tables, columns and indexes that differ and
     the remedy, and names no row's content. ``audit-verify`` and ``audit-anchor`` open read-only,
     which runs no DDL batch and so never raises it. Only the
     OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop
