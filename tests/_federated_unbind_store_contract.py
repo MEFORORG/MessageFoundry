@@ -42,7 +42,12 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     """
     for uid in ("fed-first", "fed-second", "fed-never"):
         await store.create_user(
-            user_id=uid, username=uid, auth_provider="ad", now=1_000.0, password_generated=False
+            user_id=uid,
+            username=uid,
+            auth_provider="ad",
+            now=1_000.0,
+            password_generated=False,
+            audits=(),
         )
     await store.set_user_federated_subject("fed-first", ISSUER, FIRST_SUB, now=1_000.0)
     await store.set_user_federated_subject("fed-second", ISSUER, SECOND_SUB, now=1_000.0)
@@ -231,6 +236,7 @@ async def _assert_session_binding_guard_contract(store: Any) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_federated_subject(GUARD_USER, ISSUER, GUARD_SUB, now=1.0)
 
@@ -285,7 +291,12 @@ async def _assert_bind_sweeps_and_unbound_guard_contract(store: Any) -> None:
     """
     for user in (GUARD_USER + "-2", GUARD_BYSTANDER):
         await store.create_user(
-            user_id=user, username=user, auth_provider="ad", now=1.0, password_generated=False
+            user_id=user,
+            username=user,
+            auth_provider="ad",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
     account = GUARD_USER + "-2"
 
@@ -330,6 +341,7 @@ async def _assert_bind_sweeps_and_unbound_guard_contract(store: Any) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     assert (
         await store.set_user_federated_subject("fed-guard-quiet", ISSUER, "S-1-quiet", now=5.0) == 0
@@ -365,7 +377,12 @@ async def _assert_bind_and_user_delete_take_one_lock_order(
     """
     account = "fed-bind-delete"
     await store.create_user(
-        user_id=account, username=account, auth_provider="ad", now=1.0, password_generated=False
+        user_id=account,
+        username=account,
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
     )
     await store.create_session(token_hash="bd-live", user_id=account, expires_at=_EXPIRES, now=1.0)
 

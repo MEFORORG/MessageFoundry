@@ -407,7 +407,9 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   (`api_key` or `bearer` with an `intake_api_key` read through `env()`, or `mtls_subject` with
   `tls_ca_file` and `intake_client_subjects`, keyed by the CA that issues each partner's
   certificate), DoS caps (`max_connections`, `receive_timeout`,
-  `max_body_bytes`, `max_header_bytes`), the off-loopback exposed-gate (`check_http_tls_exposure`), and
+  `max_body_bytes`, `max_header_bytes`, and the per-address handshake budget
+  `max_handshakes_per_host`, which applies only with `tls = true` on the stdlib loop; see
+  [Per-address listener caps behind the VIP](#per-address-listener-caps-behind-the-vip)), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
   listener with an authenticating reverse proxy.
@@ -465,6 +467,90 @@ none of this.
 and the hybrid edge-relay topology — see [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md); for the cloud PHI /
 HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)
 (both per [ADR 0047](adr/0047-cloud-kubernetes-ha-deployment-packaging.md)).
+
+### Per-address listener caps behind the VIP
+
+An L4 load balancer or a source-NAT hop can make every client reach a listener from one source
+address. A cap keyed on the peer address then applies to all clients together. That is why
+`Http()` ships `max_connections_per_host` **off** (vault BACKLOG #2606): a cap of 32 there would
+become the whole listener's capacity for established requests.
+
+The MLLP, raw-TCP and X12 listeners differ: they ship `max_connections_per_host` **on, at 32**
+(BACKLOG #1725, vault BACKLOG #2606). Behind a balancer or source-NAT hop that collapses
+addresses, those 32 would bound every client's concurrent connections together, and the 33rd
+would be refused with an `at_capacity` event whose reason is `max_connections_per_host`. In that
+topology set `max_connections_per_host` to `None` or `0` on those listeners. The rest of this
+section is about `Http()`.
+
+`Http()` ships `max_handshakes_per_host` **on, at 32** (vault BACKLOG #4888). It counts only the
+sockets one address holds a connection slot with while their TLS handshake is still running. A
+socket leaves the count when its handshake ends, so the cap does not bound how many requests one
+address holds once their handshakes are done. It does bound how many can start at once: `Http()`
+answers every request with `Connection: close`, so each request opens a new connection and runs
+its own handshake, and one address could have at most 32 requests in their handshakes together.
+It applies only on a `tls = true` listener where the engine upgrades the socket itself, which is
+the stdlib event loop. uvloop does not run on Windows, so the Windows service always takes this
+path. On uvloop the loop runs the handshake before the engine sees the socket, so no engine cap
+counts a socket in its handshake, this one included. The loop's 10 s handshake bound is the only
+bound there.
+
+Without it, one address that opens sockets and never finishes a handshake could hold every
+`max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
+port can stall its handshake; on an mTLS listener it needs no client certificate to do so. The
+budget is per address, as `max_connections_per_host` is, so a peer with many source addresses gets
+32 for each of them. The key is the whole address, with no grouping by prefix, so over IPv6 a peer
+that holds a /64, as one site or host commonly does, could use a different address for each socket
+and get 32 on every one of them.
+
+**Without a balancer, one busy partner.** The cap can bite with no balancer and no attacker. One
+partner that keeps many requests in flight at once, from one address, could reach 32 sockets in
+their handshakes by itself, since each request runs its own handshake. Its 33rd concurrent new
+connection would then be closed before any TLS byte, so its client would see the connection close
+during its handshake rather than get an HTTP answer. Each refusal is passed to `notify_refusal`, which feeds the
+security-signal burst detector, so a legitimate burst of refusals could raise a
+`peer_refused_burst` alert for the listener once they reach `[alerts].security_peer_refusals`
+(100 by default) inside the window. If `at_capacity` events with the reason
+`max_handshakes_per_host` name a known partner's address under its ordinary load, raise
+`max_handshakes_per_host` on that `Http()` listener, or set it to `None` or `0` to turn it off.
+
+**What it does not bound.** A peer that completes its handshake leaves the count, and on a listener
+with no `tls_ca_file` a completed handshake proves nothing about who the peer is. Such a peer, or
+any peer on a plaintext listener, can still hold a slot until `receive_timeout` (60 s) by sending
+nothing. Of the admission controls, at least `max_connections`, and `max_connections_per_host`
+where it is set, bound that, with `source_ip_allowlist` limiting who can try, as before this
+budget. The 32 is fixed and does not follow `max_connections`, so on a listener with
+`max_connections` at 32 or fewer it adds no bound: one stalling address could again hold every
+slot.
+
+**The counter-case, behind a balancer that collapses addresses.** There the 32 bound every client's
+handshakes together. A client behind the balancer that stalls 32 handshakes would refuse every
+other client's new connection for as long as it keeps them stalled. The budget does not make that
+lockout meaningfully cheaper, though: without it, the same client would refuse everyone by stalling
+256 sockets instead, which costs it no more. A real client finishes its handshake in one or two
+round trips, but it reaches 32 with no attacker at all on a busy enough listener: at 200 requests
+a second and a 150 ms handshake, about 30 are in flight at once, since `Http()` answers one request
+per connection and so runs a handshake per request. The refusals and the alert they could raise
+are the ones *Without a balancer* above describes. If `at_capacity` events with the reason
+`max_handshakes_per_host` name the balancer's address under ordinary load, raise
+`max_handshakes_per_host`, or set it to `None` or `0` to turn it off.
+
+**`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
+an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer
+with no client certificate passes it. On the stdlib loop each socket it holds in a handshake takes
+a slot, so this budget, `max_connections` and `max_connections_per_host` where it is set all bound
+how many it holds, each for up to the 10 s handshake bound. On uvloop such a socket takes no slot,
+so no engine cap counts it, this budget included, and only the loop's 10 s handshake bound limits
+each one. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
+it cannot tell clients apart either.
+
+Two other shapes were weighed and not built:
+
+- Turning `max_connections_per_host` on for TLS listeners. TLS listeners are the off-loopback ones,
+  which is where a balancer sits, so this would bring back #2606's counter-case for established
+  traffic.
+- A listener-wide total of sockets in their handshake. Every new connection needs a handshake, so a
+  stalling peer that fills such a total would refuse every newcomer, exactly as a full
+  `max_connections` does. It would add no protection.
 
 ---
 
@@ -572,7 +658,7 @@ self-signed placeholder).
 | **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); no TLS to enable, so keep loopback / firewall-segment / proxy-terminate |
 | **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); keep loopback / firewall-segment / proxy-terminate |
 | **File source** | local filesystem | n/a (no network) | n/a | — | n/a |
-| **Database poll source** | dials an **operator-configured DB host** — its own `server`/`port`, **not** the `[store]` database and **not** `[store]` TLS | **Yes, per connection** — on the default `sqlserver` dialect its own `encrypt` (default true) / `trust_server_certificate` (default false), weakened only via the escape. On `dialect='generic'` TLS is the ODBC **driver's** own keyword (`SSLmode=verify-full`, …) and is **NOT engine-verified** — a missing mode, **or one pinned to a no-TLS value**, logs a WARNING, and an enforcing instance refuses the hop off-loopback unless the connection declares `tls_hop_attested` with its reason; a hop with any other mode value is delegated to the driver, not gated, and not on the `generic-db-tls` line | ODBC `sql` / `integrated` / `entra`, per connection | `[egress].allowed_db` | n/a (outbound DB connection) |
+| **Database poll source** | dials an **operator-configured DB host** — its own `server`/`port`, **not** the `[store]` database and **not** `[store]` TLS | **Yes, per connection** — on the default `sqlserver` dialect its own `encrypt` (default true) / `trust_server_certificate` (default false), weakened only via the escape. On `dialect='generic'` TLS is the ODBC **driver's** own keyword (`SSLmode=verify-full`, …) and is **NOT engine-verified** — a missing mode, **or one pinned to a no-TLS value**, logs a WARNING, and an enforcing instance refuses the hop off-loopback unless the connection declares `tls_hop_attested` with its reason; a hop whose mode is set on the keyword, and at a spelling, its driver family reads is delegated to the driver, not gated, and not on the `generic-db-tls` line; on a driver name the engine cannot place no mode counts (BACKLOG #5053; the families are in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)) | ODBC `sql` / `integrated` / `entra`, per connection | `[egress].allowed_db` | n/a (outbound DB connection) |
 
 ### Outbound (the engine dials a destination)
 
@@ -585,10 +671,10 @@ self-signed placeholder).
 | **SOAP destination** | dials URL | **HTTPS by default** — reuses the REST client + no-redirect opener; per-connection client-cert mTLS; ≥TLS 1.2 in the mTLS context | optional WS-Security `UsernameToken` (Nonce + Timestamp) | `[egress].allowed_http` |
 | **FHIR destination** (ADR 0024/0043) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | SMART Backend Services bearer (signed `client_assertion`), or static bearer / basic — refused over plaintext | `[egress].allowed_http` — **and the SMART token endpoint host is checked against the same list** |
 | **DICOMweb destination** (STOW-RS, ADR 0025) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | optional bearer / basic, refused over plaintext | `[egress].allowed_http` |
-| **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
+| **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired`, which skips at least the intermediates' and the trust anchor's validity periods and a CRL's own window, not the leaf's alone — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
 | **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` (relay) + `[egress].allowed_recipient_domains` (recipients and the sender's domain) |
 | **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. `use_tls=false` is gated by the clamped `MEFOR_ALLOW_INSECURE_TLS`, read directly — it does **not** route through the cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` are not read (AUTH credentials stay refused). CORRECTED 2026-10-13: this row said the raw variable, not clamped | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
-| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-verified** — a hop with no TLS mode, **or one pinned to a no-TLS value** (at least `SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`/`optional`; the full list is in the TLS note under [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and is refused off-loopback on an enforcing instance unless the connection declares `tls_hop_attested` with its reason, or `cleartext_accepted`, which warns and audits; a hop with any other mode value is delegated to the driver, not gated, and not on the `generic-db-tls` line | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
+| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/MySQL, through a driver that reads `SERVER`): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-verified** — a hop with no TLS mode, **or one pinned to a no-TLS value** (at least `SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`/`optional`; the full list is in the TLS note under [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and is refused off-loopback on an enforcing instance unless the connection declares `tls_hop_attested` with its reason, or `cleartext_accepted`, which warns and audits; a hop whose mode is set on the keyword, and at a spelling, its driver family reads is delegated to the driver, not gated, and not on the `generic-db-tls` line; on a driver name the engine cannot place no mode counts (BACKLOG #5053; the families are in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)) | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
 | **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused) | username/password or SSH key | `[egress].allowed_remote` |
 
@@ -616,9 +702,13 @@ REST obey the authority does not settle these:
 
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
   it reports the hop as **non-weakened by construction**, and only what `odbc_params` say can reach the
-  authority. A hop that sets no TLS mode, or pins one to a no-TLS value, goes there and is refused
-  off-loopback on an enforcing instance, unless a per-connection declaration relaxes it (BACKLOG #1178). A hop with **any other mode value never reaches it**: if the
-  driver ignored or misread that value, plaintext PHI to a Postgres / Oracle / MySQL ODBC target would
+  authority. A mode counts only on the keyword the named driver's family reads, and for psqlODBC and
+  MySQL only at that family's own spellings; a driver name the engine cannot place has no counted
+  mode (BACKLOG #5053; the families are in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)).
+  A hop with no counted mode, or with a TLS keyword pinned to a no-TLS value, goes there and is
+  refused off-loopback on an enforcing instance, unless a per-connection declaration relaxes it
+  (BACKLOG #1178). A hop whose counted mode holds **any other value never reaches it**: if the
+  driver ignored or misread that value, plaintext PHI to a Postgres / MySQL / SQL Server ODBC target would
   cross with no refusal, on any posture. **The TLS readers do not name that hop either**: construction logs it at
   DEBUG only, and neither the `generic_odbc_tls_unenforced` entry nor the `generic-db-tls` line lists it. The hops the authority does see are also
   reported: a construction WARNING naming the connection, plus an entry in
@@ -649,9 +739,12 @@ in either posture it changes the revocation guard's answer, as the end of this s
 the `Ftp` (FTPS) inbound poller, which dials out through the same context. The six are **MLLP,
 REST, SOAP, FHIR, DICOM C-STORE SCU, and RemoteFile FTPS** (a factory parameter, and therefore also a
 `connections.toml` `[settings]` key and a GUI field — the connection schema is derived from the factory
-signatures). It relaxes **only** the certificate validity-period check: an **expired** server
-certificate is accepted **indefinitely**, while the **chain and key usage are still fully verified**,
-and the **hostname** too unless the connection also sets `tls_check_hostname = false` (ADR 0094).
+signatures). It relaxes the validity-period checks: an **expired** server certificate is accepted
+**indefinitely**, and at least the validity periods of the intermediates and the trust anchor, and a
+CRL's own validity window, go unchecked too. The **chain's signatures and key usage are still
+verified**, and the **hostname** too unless the connection also sets `tls_check_hostname = false`
+(ADR 0094). CORRECTED 2026-11-03 (vault BACKLOG #5089): this said it relaxes only the certificate
+validity-period check and that the chain is still fully verified.
 CORRECTED 2026-10-01: this said the hostname is verified without condition, which is false on an MLLP
 or hand-built FTPS hop that also turns the name check off. It is genuinely narrower than `tls_verify=false` — that is the point of it — but:
 
@@ -710,14 +803,17 @@ there is for MLLP:
 engine will not always refuse them for you:
 
 - **`dialect='generic'` DATABASE** (source *or* destination) — TLS is the ODBC driver's own keyword in
-  `odbc_params`, which MessageFoundry cannot introspect. With no TLS mode, or with one set to a no-TLS
-  value, the connection logs a construction WARNING naming
+  `odbc_params`, which MessageFoundry cannot introspect. With no mode the named driver's family reads
+  (a driver name the engine cannot place has none; the rule is under
+  [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)), or with a TLS
+  keyword set to a no-TLS value, the connection logs a construction WARNING naming
   itself, and an enforcing instance refuses it off-loopback unless the connection declares
-  `tls_hop_attested` with its reason, or, outbound only, `cleartext_accepted`. With any other mode value
-  the engine neither enforces nor verifies it, and the `generic-db-tls` line does not list the hop. A hop the engine can judge
+  `tls_hop_attested` with its reason, or, outbound only, `cleartext_accepted`. With a counted mode at
+  any other value the engine neither enforces nor verifies it, and the `generic-db-tls` line does not list the hop. A hop the engine can judge
   **is** reported (`security_loosenings()` /
   `GET /security/posture` / `messagefoundry check`'s `generic-db-tls`), for **both** directions. Set
-  `SSLmode=verify-full` (psqlODBC) / `SSLMODE=VERIFY_IDENTITY` (MySQL) / the equivalent, and treat it as
+  `SSLmode=verify-full` (psqlODBC) / `SSLMODE=VERIFY_IDENTITY` (MySQL) / `Encrypt=yes` (Microsoft's
+  ODBC Driver for SQL Server), under the driver's registered name, and treat it as
   a deployment requirement rather than a default.
 - **Direct (S/MIME) with `use_tls = false`** — the message body is S/MIME signed and encrypted, but the
   SMTP session (envelope metadata, recipients) is cleartext. This path is gated by the raw
@@ -1154,17 +1250,15 @@ posture gate refuses the setting itself — **reported is not gated**, and the t
 either implied the other (a `dialect='generic'` DATABASE hop with a mode outside the no-TLS deny-list is
 not gated and not on the `generic-db-tls` line, so name it as that). `tls_allow_expired` is not inert to the revocation guard, though: it also
 skips a CRL's own validity window, so a hop that sets it must earn **no CRL credit**. Its call site
-hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
-context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directions do, and a new call
-site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
-setting and hands the guard its relaxed context, with a CRL on that context, has been refused
-off-box under an enforcing posture unless attested since vault BACKLOG #5086, which made
-`RevocationHopGuard.capture` give that CRL no credit; before it, the guard admitted such a hop on
-that CRL. With no CRL on the context, the hop was refused before #5086 too. That is no reason to
-drop the call-site rule above, which still stands (ADR 0173 §13; §4.3's note of 2026-11-03 says
-what the guard now does). CORRECTED 2026-11-03:
-this said such a connector "lets a stale CRL admit the hop", which stopped being true under vault
-BACKLOG #5086. CORRECTED 2026-10-30:
+says so when the setting is on: at least MLLP, the DICOM C-STORE SCU and both FTPS directions pass
+the context they dial with and `expiry_relaxed=True` to `RevocationHopGuard.capture`, which drops the
+CRL credit and names `EXPIRY_RELAXED_WAYS_ACROSS` as the remedy, and at least REST, SOAP and FHIR hand
+the guard no context or opener (ADR 0173 §13 and its §4.3 note of 2026-11-03). A new call site passes
+the flag. A connector that takes the setting and hands the guard its relaxed context without the flag
+earns no CRL credit either, since vault BACKLOG #5086 made `capture` read the time-validity flag off
+the context itself; it gets the same refusal and remedy. CORRECTED 2026-11-04: this said such a
+connector "lets a stale CRL admit the hop" (vault BACKLOG #5089), which stopped being true under
+#5086. CORRECTED 2026-10-30:
 this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
 true once the call sites handed the guard no context or opener for such a hop, so it earns no CRL
 credit (on MLLP and the DICOM C-STORE SCU since vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`

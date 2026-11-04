@@ -619,7 +619,8 @@ def test_ftp_publish_with_the_temp_gone_is_not_a_collision(monkeypatch: pytest.M
     with pytest.raises(_RemoteError) as caught:
         _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7", "/in/msg-1.hl7"])
     assert caught.value.permanent is True
-    assert "RNFR" in str(caught.value)
+    # The RNFR's 550, by its code: the error never carries the reply's text (BACKLOG #5026).
+    assert "reply 550" in str(caught.value) and "RNFR" not in str(caught.value)
     assert ftp.calls == ["MLSD /in"]  # no fresh listing, no RNTO: the refusal was never weighed
 
 
@@ -666,7 +667,8 @@ def test_ftp_publish_never_confirms_an_empty_dir_from_an_unquoted_pwd(
     with pytest.raises(_RemoteError) as caught:
         _ftp_client(ftp, monkeypatch).publish("in/.t.part", ["in/msg.hl7"])
     assert caught.value.permanent is False
-    assert "No files found" in str(caught.value)
+    # The NLST reply stands, reported by its code alone (BACKLOG #5026).
+    assert "reply 550" in str(caught.value) and "No files found" not in str(caught.value)
     assert ftp.calls == ["MLSD in", "PWD"]
     assert ftp.files == {"in/.t.part": b"new"}
 

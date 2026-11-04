@@ -251,6 +251,7 @@ async def test_two_runs_with_different_usernames_make_one_administrator(
                 auth_provider=AuthProvider.AD.value,
                 password_hash=None,
                 password_generated=False,
+                audits=(),
             )
             await stores[0].set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
             directory = {"dir-a"}
@@ -381,6 +382,7 @@ async def _roleless_row(store: MessageStore, username: str) -> None:
         password_hash=None,
         must_change_password=True,
         password_generated=False,
+        audits=(),
     )
 
 
@@ -594,6 +596,7 @@ async def test_an_unknown_grant_outcome_names_an_administrator_that_appeared_mea
                 auth_provider=AuthProvider.AD.value,
                 password_hash=None,
                 password_generated=False,
+                audits=(),
             )
             await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
         return await roleless(*a, **k)

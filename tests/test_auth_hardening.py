@@ -405,6 +405,7 @@ async def test_lockout_counter_resets_after_window(engine: Engine) -> None:
         auth_provider="local",
         password_hash=hash_password(PW),
         password_generated=False,
+        audits=(),
     )
     # simulate a prior lockout whose window has already lapsed
     await engine.store.record_login_failure(
@@ -772,6 +773,7 @@ async def test_session_reaper_purges_expired_sessions(
         auth_provider="local",
         password_hash=hash_password(PW),
         password_generated=False,
+        audits=(),
     )
     await engine.store.create_session(
         token_hash="expired-hash", user_id="u", expires_at=1.0, now=1.0
@@ -848,7 +850,11 @@ async def test_a_step_under_the_tolerance_deletes_no_session_the_validator_accep
     store = await MessageStore.open(":memory:")
     try:
         await store.create_user(
-            user_id="u", username="stepped", auth_provider="local", password_generated=False
+            user_id="u",
+            username="stepped",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
 
         async def _row(h: str, *, last_used: float, expires: float) -> None:

@@ -37,16 +37,17 @@ in another module, and renaming the Vault guard's ``_crossed_unrevoked`` call fa
 :func:`test_the_vault_root_decides_through_the_authority`.
 
 **The relaxed-hop handoff census** at the end of this file is a second list, of the sites that
-reach ``relax_verify_expiry`` (vault BACKLOG #5086). Measured when it was written, against
-in-memory copies of the package: FHIR handing its relaxed opener to the guard, MLLP handing its
-relaxed context, the FTPS guard wrapper handing its context on, and
-``refuse_unrevoked_verified_hop`` ignoring a ``None`` opener each failed
-:func:`test_every_relaxed_hop_is_a_connection_that_hands_its_guard_no_relaxed_context`, naming
-the hops. A new relaxed builder caller in ``rest.py``, and one in ``dicomweb.py`` reached through
-an import alias, each failed
-:func:`test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption`. Those runs
-are a record, not a test; the two synthetic controls at the end of this file are what stays
-checked.
+reach ``relax_verify_expiry`` (vault BACKLOG #5086). ``RevocationHopGuard.capture`` gives no CRL
+credit to a context that skips time validity, with or without ``expiry_relaxed``, so a relaxed hop
+can earn that credit only by handing the guard some other, unrelaxed context without the flag;
+that is what :func:`test_every_relaxed_hop_is_a_connection_whose_guard_call_cannot_credit_a_crl`
+fails on. Measured when it was rebuilt on main after vault BACKLOG #5089, against in-memory copies
+of the package: MLLP handing a fresh context with no flag, the DICOM SCU doing so with the flag
+negated, the FTPS guard wrapper dropping its flag, and FHIR handing its relaxed opener each failed
+that test, naming the hops (the last two are false faults the census accepts: see
+:func:`_from_relaxing_builder`), and ``remotefile.py``'s module code calling ``_FtpClient`` failed
+its exemption. Those runs are a record, not a test; the synthetic controls at the end of this file
+are what stays checked.
 """
 
 from __future__ import annotations
@@ -532,10 +533,11 @@ def test_every_builder_name_is_still_defined() -> None:
 
 # The relaxed-hop handoff census (vault BACKLOG #5086). ``relax_verify_expiry`` sets
 # ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's validity window too, so a CRL on a
-# relaxed context is no revocation check. ``RevocationHopGuard.capture`` gives such a CRL no credit,
-# and each relaxed hop also hands its guard no context or opener at all (ADR 0173 §13). The tests
-# below find every reach of the function, through any builder that hands the relaxed context or
-# opener on, and read that handoff at each hop the reach ends in.
+# relaxed context is no revocation check. ``RevocationHopGuard.capture`` gives such a CRL no credit
+# whether or not the caller passes ``expiry_relaxed``, since it reads the flag off the context it is
+# handed. The tests below find every reach of the function, through any builder that hands the
+# relaxed context or opener on, and read the guard call at each hop the reach ends in: it must hand
+# the guard that relaxed context, pass the flag, or hand no context (ADR 0173 §4.3 and §13).
 
 _RELAX = "relax_verify_expiry"
 
@@ -567,14 +569,18 @@ _RELAXED_HOPS = frozenset(
 )
 
 #: Sites that reach a builder above and build no relaxed client context. Each names the builder and
-#: the keyword that keeps it off its relaxing branch, checked as ``True`` at every call in the site.
-_NOT_RELAXED: dict[str, tuple[str, str]] = {
+#: the keyword that keeps it off its relaxing branch, checked as ``True`` at every call in the site,
+#: or ``None`` for a site that only reads the builder's name and must never call it.
+_NOT_RELAXED: dict[str, tuple[str, str | None]] = {
     # The server branch of _mllp_ssl_context returns before its relax_verify_expiry call.
     "messagefoundry/transports/mllp.py::MLLPSource.__init__": ("_mllp_ssl_context", "server"),
     "messagefoundry/transports/http_listener.py::HttpSource.__init__": (
         "_mllp_ssl_context",
         "server",
     ),
+    # _REPLY_PARSERS reads _FtpClient._list.__code__ to match a reply parser's frame; it builds
+    # no client.
+    "messagefoundry/transports/remotefile.py::<module>": ("_FtpClient", None),
 }
 
 #: The bases a hop's class must name directly, so the hop is a connection.
@@ -754,18 +760,73 @@ def _is_capture(call: ast.Call) -> bool:
     return callee_name(call) == "capture" and _is_guard(call)
 
 
-def _hands_no_context_when_relaxed(
-    call: ast.Call, fn: ast.AST, defs: dict[str, list[_Def]]
+def _is_relaxed_flag(value: ast.expr, fn: ast.AST) -> bool:
+    """Whether ``value``, passed as ``expiry_relaxed``, holds on a relaxed hop: ``True``, or a
+    condition :func:`_reads_relaxation` accepts."""
+    if isinstance(value, ast.Constant):
+        return value.value is True
+    return _reads_relaxation(value, fn)
+
+
+def _from_relaxing_builder(value: ast.expr, fn: ast.AST, builders: frozenset[str]) -> bool:
+    """Whether ``value`` is the context or opener a relaxing builder handed ``fn``: a name or
+    attribute that ``fn`` assigns, every time, from a call to one of ``builders``. Read as written,
+    so at least a value reassigned through another name, read off such an object's attribute, or
+    assigned on another branch from something else, does not count. Such a hop is faulted although
+    ``capture`` would read the relaxed context it hands over: a false fault, which fails closed."""
+    target = ast.unparse(value)
+    values = [
+        sub.value
+        for sub in ast.walk(fn)
+        if isinstance(sub, ast.Assign | ast.AnnAssign)
+        and sub.value is not None
+        and target
+        in [ast.unparse(t) for t in (sub.targets if isinstance(sub, ast.Assign) else [sub.target])]
+    ]
+    return bool(values) and all(
+        isinstance(v, ast.Call) and callee_name(v) in builders - {_RELAX} for v in values
+    )
+
+
+def _capture_cannot_credit(
+    capture: ast.Call,
+    where: ast.AST,
+    builders: frozenset[str],
+    bound: dict[str, ast.expr] | None = None,
+    fn: ast.AST | None = None,
 ) -> bool:
-    """Whether the guard call ``call``, made in ``fn``, hands ``RevocationHopGuard.capture`` no
-    context on a relaxed hop. A ``capture`` call is read where it is. A wrapper is read one level
-    down, in its one def: each ``capture`` there either decides on the relaxation itself, or passes
-    ``None if P is None else ...`` for a parameter ``P`` that ``call`` binds to ``None`` on a relaxed
-    hop. Any other shape is not read, so it counts as a fault: so does a wrapper that makes a guard
-    call other than ``capture``, since that call is not read."""
+    """Whether ``capture``, a ``RevocationHopGuard.capture`` call made in ``where``, can give a CRL
+    no credit on a relaxed hop. One of three holds (vault BACKLOG #5086): it hands ``capture`` no
+    context there, it passes ``expiry_relaxed`` as true there, or the context it hands is the one
+    a relaxing builder returned, whose own time-validity flag ``capture`` reads. In a wrapper,
+    ``bound`` maps its parameters to the hop's arguments, read in ``fn``, the hop's code."""
+    context = _keyword(capture, "context")
+    flag = _keyword(capture, "expiry_relaxed")
+    if context is None or _none_when_relaxed(context, where):
+        return True
+    if flag is not None and _is_relaxed_flag(flag, where):
+        return True
+    if bound is None or fn is None:
+        return _from_relaxing_builder(context, where, builders)
+    if isinstance(flag, ast.Name) and flag.id in bound and _is_relaxed_flag(bound[flag.id], fn):
+        return True
+    param = context.id if isinstance(context, ast.Name) else _none_param(context)
+    arg = bound.get(param) if param is not None else None
+    return arg is not None and (
+        _none_when_relaxed(arg, fn) or _from_relaxing_builder(arg, fn, builders)
+    )
+
+
+def _guard_call_cannot_credit(
+    call: ast.Call, fn: ast.AST, defs: dict[str, list[_Def]], builders: frozenset[str]
+) -> bool:
+    """Whether the guard call ``call``, made in ``fn``, can give a CRL no credit on a relaxed hop.
+    A ``capture`` call is read where it is (:func:`_capture_cannot_credit`). A wrapper is read one
+    level down, in its one def, and each ``capture`` there must pass that read with the wrapper's
+    parameters bound to ``call``'s arguments. Any other shape is not read, so it counts as a
+    fault: so does a wrapper that makes a guard call other than ``capture``."""
     if _is_capture(call):
-        context = _keyword(call, "context")
-        return context is None or _none_when_relaxed(context, fn)
+        return _capture_cannot_credit(call, fn, builders)
     found = defs.get(str(callee_name(call)), [])
     if len(found) != 1:
         return False
@@ -777,15 +838,7 @@ def _hands_no_context_when_relaxed(
     captures = [sub for sub in inner if _is_capture(sub)]
     if not captures or len(captures) != len(inner):
         return False
-    for capture in captures:
-        context = _keyword(capture, "context")
-        if context is None or _none_when_relaxed(context, wrapper):
-            continue
-        param = _none_param(context)
-        arg = bound.get(param) if param is not None else None
-        if arg is None or not _none_when_relaxed(arg, fn):
-            return False
-    return True
+    return all(_capture_cannot_credit(c, wrapper, builders, bound, fn) for c in captures)
 
 
 def _defs_named(sources: dict[str, str], names: set[str]) -> dict[str, list[_Def]]:
@@ -797,11 +850,14 @@ def _defs_named(sources: dict[str, str], names: set[str]) -> dict[str, list[_Def
     return found
 
 
-def _handoff_faults(sources: dict[str, str], hops: list[_Unit]) -> list[str]:
+def _handoff_faults(
+    sources: dict[str, str], hops: list[_Unit], builders: frozenset[str]
+) -> list[str]:
     """Every way a hop in ``hops`` fails: it runs no guard, it is not the ``__init__`` of a class
     naming a connection base, or a guard call passes no ``connection`` argument (or a literal
-    ``None``) or may hand the guard the relaxed context or opener. The ``connection`` argument is
-    read as written, so one that is ``None`` only at run time passes."""
+    ``None``) or could credit a CRL on a relaxed hop (:func:`_guard_call_cannot_credit`).
+    ``builders`` are the names the reach followed. The ``connection`` argument is read as written,
+    so one that is ``None`` only at run time passes."""
     wrappers = {
         str(callee_name(call))
         for hop in hops
@@ -820,8 +876,8 @@ def _handoff_faults(sources: dict[str, str], hops: list[_Unit]) -> list[str]:
             faults.append(f"{hop.key}: its class names neither of {sorted(_CONNECTION_BASES)}")
         for call in calls:
             where = f"{hop.key}: {ast.unparse(call.func)} at line {call.lineno}"
-            if not _hands_no_context_when_relaxed(call, hop.node, defs):
-                faults.append(f"{where} may hand the guard the relaxed context or opener")
+            if not _guard_call_cannot_credit(call, hop.node, defs, builders):
+                faults.append(f"{where} may credit a CRL on the relaxed hop")
             connection = _keyword(call, "connection")
             if connection is None or _is_none(connection):
                 faults.append(f"{where} names no connection")
@@ -841,10 +897,11 @@ def _package_reach() -> _Reach:
     return _relaxed_reach(_package_sources(), frozenset(_NOT_RELAXED))
 
 
-def _not_relaxed_faults(reach: _Reach, not_relaxed: dict[str, tuple[str, str]]) -> list[str]:
+def _not_relaxed_faults(reach: _Reach, not_relaxed: dict[str, tuple[str, str | None]]) -> list[str]:
     """Every way a site in ``not_relaxed`` fails its exemption: the one reached name it reads is not
-    its builder, or a call to that builder does not pass its keyword as ``True``. A stop site passes
-    no alias on, so this is the only read of it."""
+    its builder, a call to that builder does not pass its keyword as ``True``, or, for a site with
+    no keyword, it calls the builder at all. A stop site passes no alias on, so this is the only
+    read of it."""
     faults: list[str] = []
     for key, (builder, keyword) in not_relaxed.items():
         node = reach.units[key].node
@@ -852,6 +909,9 @@ def _not_relaxed_faults(reach: _Reach, not_relaxed: dict[str, tuple[str, str]]) 
         if other:
             faults.append(f"{key}: reads {other} beside {builder}")
         calls = call_sites(node, builder)
+        if keyword is None:
+            faults.extend(f"{key}: calls {builder} at line {call.lineno}" for call in calls)
+            continue
         if not calls:
             faults.append(f"{key}: no longer calls {builder}")
         for call in calls:
@@ -873,6 +933,9 @@ def test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption
     assert sorted(expected - reach.units.keys()) == [], "listed sites that no longer reach it"
     hops = sorted(key for key, unit in reach.units.items() if _guard_calls(unit.node))
     assert hops == sorted(_RELAXED_HOPS), "a builder runs a guard, or a hop runs none"
+    # 7 builders when this floor was set (vault BACKLOG #5086), so the walk below cannot pass on an
+    # emptied list.
+    assert len(_RELAXING_BUILDERS) >= 7, f"only {len(_RELAXING_BUILDERS)} relaxing builders"
     # A module's top-level code has no name a caller reads, so listing it would end the trace.
     nameless = sorted(key for key in _RELAXING_BUILDERS if not reach.units[key].alias)
     assert not nameless, f"builders with no name to follow: {nameless}"
@@ -880,15 +943,17 @@ def test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption
     assert not faults, faults
 
 
-def test_every_relaxed_hop_is_a_connection_that_hands_its_guard_no_relaxed_context() -> None:
+def test_every_relaxed_hop_is_a_connection_whose_guard_call_cannot_credit_a_crl() -> None:
     """Each hop above is the ``__init__`` of a class naming a connection base, and each of its guard
-    calls passes a ``connection`` argument and hands ``RevocationHopGuard.capture`` no context on a
-    relaxed hop, read at the call or one wrapper down. ADR 0173 §4.3's note of 2026-11-03 and
-    ``capture``'s docstring rest on this. It reads shapes, as :func:`_reads_relaxation` and
-    :func:`_handoff_faults` say."""
+    calls passes a ``connection`` argument and, read at the call or one wrapper down, either hands
+    ``RevocationHopGuard.capture`` its relaxed context, passes ``expiry_relaxed`` as true on a
+    relaxed hop, or hands no context there. ``capture`` gives no CRL credit in any of the three
+    (vault BACKLOG #5086); what it cannot see is a different, unrelaxed context handed over without
+    the flag, which is what this fails on. It reads shapes, as :func:`_reads_relaxation` and
+    :func:`_from_relaxing_builder` say."""
     reach = _package_reach()
     hops = [reach.units[key] for key in sorted(_RELAXED_HOPS)]
-    faults = _handoff_faults(_package_sources(), hops)
+    faults = _handoff_faults(_package_sources(), hops, reach.names)
     assert not faults, faults
 
 
@@ -896,11 +961,13 @@ _SYNTHETIC_HOP = """
 class Dest(DestinationConnector):
     def __init__(self, config):
         self._ssl = _relaxed(config.settings)
+        self._other = ssl.create_default_context()
         relaxed = skips_validity_period(self._ssl)
         RevocationHopGuard.capture(
             host="h", cell="c", description="d", attested=False, connection=config.name,
-            context=HANDOFF,
+            context=HANDOFF, expiry_relaxed=FLAG,
         ).enforce_construction()
+        EXTRA
 
 
 def _relaxed(s):
@@ -911,24 +978,31 @@ def _relaxed(s):
 """
 
 
-def test_a_relaxed_hop_that_hands_its_guard_the_relaxed_context_is_flagged() -> None:
-    """The positive control. A synthetic hop that reaches ``relax_verify_expiry`` through a builder
-    and hands its guard the context is found and faulted, and so is one whose test is negated. The
-    same hop handing ``None if relaxed else ...`` is clean, so the fault comes from the handoff."""
-    for handoff, faulted in (
-        ("self._ssl", True),
-        ("None if not relaxed else self._ssl", True),
-        ("None if relaxed else self._ssl", False),
+def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
+    """The positive controls for the three ways a direct ``capture`` call passes. A synthetic hop
+    reaches ``relax_verify_expiry`` through a builder. Handing its guard some other context with no
+    flag is faulted, and each pass is shown clean beside a fault that undoes it: the flag read off
+    the relaxation (and negated), the relaxed context itself (and reassigned from elsewhere), and
+    ``None if relaxed else ...`` (and negated)."""
+    for handoff, flag, extra, faulted in (
+        ("self._other", "False", "pass", True),
+        ("self._other", "relaxed", "pass", False),
+        ("self._other", "not relaxed", "pass", True),
+        ("self._ssl", "False", "pass", False),
+        ("self._ssl", "False", "self._ssl = ssl.create_default_context()", True),
+        ("None if relaxed else self._other", "False", "pass", False),
+        ("None if not relaxed else self._other", "False", "pass", True),
     ):
-        sources = {"fake.py": _SYNTHETIC_HOP.replace("HANDOFF", handoff)}
+        text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
+        sources = {"fake.py": text.replace("EXTRA", extra)}
         reach = _relaxed_reach(sources, frozenset())
         assert sorted(reach.units) == ["fake.py::Dest.__init__", "fake.py::_relaxed"], reach
-        faults = _handoff_faults(sources, [reach.units["fake.py::Dest.__init__"]])
-        assert bool(faults) is faulted, (handoff, faults)
+        faults = _handoff_faults(sources, [reach.units["fake.py::Dest.__init__"]], reach.names)
+        assert bool(faults) is faulted, (handoff, flag, extra, faults)
         if faulted:
             assert faults == [
-                "fake.py::Dest.__init__: RevocationHopGuard.capture at line 6 may hand the guard "
-                "the relaxed context or opener"
+                "fake.py::Dest.__init__: RevocationHopGuard.capture at line 7 may credit a CRL on "
+                "the relaxed hop"
             ], faults
 
 
@@ -936,16 +1010,18 @@ _SYNTHETIC_WRAPPED = """
 class Dest(DestinationConnector):
     def __init__(self, config):
         self._opener = _relaxed(config.settings)
-        refuse_unrevoked_verified_hop(opener=OPENER, connection=config.name)
+        self._other = build_strict_opener()
+        refuse_unrevoked_verified_hop(opener=OPENER, connection=config.name, expiry_relaxed=FLAG)
 
     def reconnect(self):
         RevocationHopGuard.capture(host="h", cell="c", description="d", attested=False,
                                    connection="n", context=self._ssl)
 
 
-def refuse_unrevoked_verified_hop(*, opener, connection):
+def refuse_unrevoked_verified_hop(*, opener, connection, expiry_relaxed=False):
     RevocationHopGuard.capture(host="h", cell="c", description="d", attested=False,
-                               connection=connection, context=None if opener is None else opener)
+                               connection=connection, context=None if opener is None else opener,
+                               expiry_relaxed=expiry_relaxed)
     EXTRA
 
 
@@ -975,38 +1051,45 @@ def _aliased(s):
 
 
 def test_the_wrapper_alias_constructor_and_exemption_reads_each_fail_on_a_synthetic_fault() -> None:
-    """The controls for the reads the first one does not reach. One wrapper down: a relaxed opener
-    passed to a wrapper that forwards it is faulted, and ``None if relaxed else ...`` is clean; a
-    wrapper making a second guard call is faulted. A hop that is not a constructor is faulted. An
-    import alias of a builder is followed whatever order the files are read in. An exemption that
-    also reads ``relax_verify_expiry`` is faulted."""
+    """The controls for the reads the first one does not reach. One wrapper down: some other opener
+    forwarded with no flag is faulted, and each pass is clean (the flag bound off the relaxation,
+    the relaxed opener itself, ``None if relaxed else ...``); a wrapper making a second guard call
+    is faulted. A hop that is not a constructor is faulted. An import alias of a builder is followed
+    whatever order the files are read in. An exemption that also reads ``relax_verify_expiry`` is
+    faulted, and so is a read-only exemption that calls its builder."""
     hop = "fake.py::Dest.__init__"
-    for opener, extra, faulted in (
-        ("self._opener", "pass", True),
-        ('None if s.get("tls_allow_expired") else self._opener', "pass", False),
-        ('None if s.get("tls_allow_expired") else self._opener', "_guard_ftps_revocation(o)", True),
+    relaxed = 'config.settings.get("tls_allow_expired")'
+    for opener, flag, extra, faulted in (
+        ("self._other", "False", "pass", True),
+        ("self._other", relaxed, "pass", False),
+        ("self._opener", "False", "pass", False),
+        (f"None if {relaxed} else self._other", "False", "pass", False),
+        (f"None if {relaxed} else self._other", "False", "_guard_ftps_revocation(o)", True),
     ):
-        text = _SYNTHETIC_WRAPPED.replace("OPENER", opener).replace("EXTRA", extra)
-        sources = {"fake.py": text.replace("SECOND", "pass")}
+        text = _SYNTHETIC_WRAPPED.replace("OPENER", opener).replace("FLAG", flag)
+        sources = {"fake.py": text.replace("EXTRA", extra).replace("SECOND", "pass")}
         reach = _relaxed_reach(sources, frozenset({"fake.py::Src.__init__"}))
-        faults = _handoff_faults(sources, [reach.units[hop]])
-        assert bool(faults) is faulted, (opener, extra, faults)
+        faults = _handoff_faults(sources, [reach.units[hop]], reach.names)
+        assert bool(faults) is faulted, (opener, flag, extra, faults)
         if faulted:
             assert faults == [
-                f"{hop}: refuse_unrevoked_verified_hop at line 5 may hand the guard the relaxed "
-                "context or opener"
+                f"{hop}: refuse_unrevoked_verified_hop at line 6 may credit a CRL on the relaxed hop"
             ], faults
     # A hop on a method other than __init__ is not a constructor, so it is faulted as one.
     method = ast.parse(_SYNTHETIC_WRAPPED).body[0]
     assert isinstance(method, ast.ClassDef)
     bases = frozenset({"DestinationConnector"})
     reconnect = _Unit("fake.py::Dest.reconnect", "reconnect", method.body[1], bases)
-    faults = _handoff_faults({}, [reconnect])
+    faults = _handoff_faults({}, [reconnect], frozenset())
     assert "fake.py::Dest.reconnect: is not a constructor" in faults, faults
     # The alias file sorts first and is parsed on the first pass, before _relaxed is reached.
-    clean = _SYNTHETIC_WRAPPED.replace("OPENER", "None").replace("EXTRA", "pass")
+    clean = (
+        _SYNTHETIC_WRAPPED.replace("OPENER", "None")
+        .replace("FLAG", "False")
+        .replace("EXTRA", "pass")
+    )
     sources = {"a.py": _SYNTHETIC_ALIAS, "fake.py": clean.replace("SECOND", "pass")}
-    stop = {"fake.py::Src.__init__": ("_relaxed", "server")}
+    stop: dict[str, tuple[str, str | None]] = {"fake.py::Src.__init__": ("_relaxed", "server")}
     reach = _relaxed_reach(sources, frozenset(stop))
     assert "a.py::_aliased" in reach.units, sorted(reach.units)
     assert _not_relaxed_faults(reach, stop) == []
@@ -1016,3 +1099,14 @@ def test_the_wrapper_alias_constructor_and_exemption_reads_each_fail_on_a_synthe
     assert _not_relaxed_faults(reach, stop) == [
         "fake.py::Src.__init__: reads ['relax_verify_expiry'] beside _relaxed"
     ]
+    # A read-only exemption: reading the builder's name is clean, calling it is faulted.
+    read_only: dict[str, tuple[str, str | None]] = {"fake.py::Src.__init__": ("_relaxed", None)}
+    call = "self._ssl = _relaxed(config.settings, server=True)"
+    line = clean.splitlines().index(f"        {call}") + 1
+    for text, expected in (
+        (clean.replace(call, "self._code = _relaxed.__code__"), []),
+        (clean, [f"fake.py::Src.__init__: calls _relaxed at line {line}"]),
+    ):
+        sources = {"fake.py": text.replace("SECOND", "pass")}
+        reach = _relaxed_reach(sources, frozenset(read_only))
+        assert _not_relaxed_faults(reach, read_only) == expected, text

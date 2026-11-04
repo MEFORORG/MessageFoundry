@@ -571,6 +571,88 @@ async def _assert_alert_mutations_atomic(store: Any, tag: str) -> None:
     assert await _rows(store, none_action) == []
 
 
+async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
+    """An explicit ``None`` in place of the audit is refused with ``TypeError`` and changes nothing
+    (BACKLOG #5069), and so is an operator-origin inject with no audit (BACKLOG #5071). Each call
+    would type-check only as ``Any``, which is the caller mypy cannot hold, so this is the runtime
+    half. ``_check`` above is the control: the same mutations with an audit did change the store."""
+    ch, dest = f"IB_N{tag}", f"OB_N{tag}"
+    dead = await _seed(store, ch, dest, settle="dead")
+    done_dest = f"OB_NS{tag}"
+    done = await _seed(store, ch, done_dest, settle="done")
+    purge_dest = f"OB_NP{tag}"
+    pending = await _seed(store, ch, purge_dest, settle=None)
+    refused: dict[str, Callable[[], Awaitable[Any]]] = {
+        "replay": lambda: store.replay(dead, audit=None),
+        "replay_dead": lambda: store.replay_dead(channel_id=ch, destination_name=dest, audit=None),
+        "cancel_queued": lambda: store.cancel_queued(None, purge_dest, audit=None),
+        "resend_to": lambda: store.resend_to(
+            message_id=done, to=f"OB_NA{tag}", idempotency_key=f"none-{tag}", audit=None
+        ),
+        "reingress": lambda: store.reingress(
+            origin_message_id=pending,
+            raw=_RAW,
+            idempotency_key=f"none-re-{tag}",
+            audit=None,
+            actor="contract-op",
+        ),
+        "replay, not callable": lambda: store.replay(dead, audit="not-a-callable"),
+    }
+    for label, call in refused.items():
+        with pytest.raises(TypeError, match="BACKLOG #5069"):
+            await call()
+        assert await _statuses(store, dead) == {dest: "dead"}, label
+        assert await _statuses(store, done) == {done_dest: "done"}, label
+        assert await _statuses(store, pending) == {purge_dest: "pending"}, label
+    assert int(await store.count_messages(channel_id=ch, allowed_channels=None)) == 3
+
+    inject_ch = f"IB_NI{tag}"
+    for origin in (MessageOrigin.OPERATOR_UPLOAD, MessageOrigin.OPERATOR_EDIT):
+        with pytest.raises(TypeError, match="BACKLOG #5071"):
+            await store.enqueue_ingress(
+                channel_id=inject_ch, raw=_RAW, origin=origin, origin_actor="contract-op"
+            )
+        # An inject always writes a message, so an audit that builds no row is refused too; the
+        # raise comes inside the transaction and rolls the inject back.
+        with pytest.raises(TypeError, match="returned no row"):
+            await store.enqueue_ingress(
+                channel_id=inject_ch,
+                raw=_RAW,
+                audit=lambda _mid: None,
+                origin=origin,
+                origin_actor="contract-op",
+            )
+    with pytest.raises(TypeError, match="BACKLOG #5071"):
+        await store.enqueue_ingress(channel_id=inject_ch, raw=_RAW, audit="not-a-callable")
+    assert int(await store.count_messages(channel_id=inject_ch, allowed_channels=None)) == 0
+    # Control: a live receipt, the partner default with no audit, is still accepted.
+    await store.enqueue_ingress(channel_id=inject_ch, raw=_RAW)
+    assert int(await store.count_messages(channel_id=inject_ch, allowed_channels=None)) == 1
+
+    # The alert mutations and the connection flag take an AuditAppend, which ``if_applied`` refuses
+    # when it is None; the raise comes inside the write's transaction, so it rolls the change back.
+    conn = f"OB_NAL{tag}"
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection=conn, severity="warning"
+    )
+    [alert_id] = [
+        r.id
+        for r in await store.list_active_alert_instances(limit=1000, allowed_channels=None)
+        if r.connection == conn
+    ]
+    with pytest.raises(TypeError, match="BACKLOG #5069"):
+        await store.ack_alert_instance(alert_id, actor="contract-op", audit=None)
+    got = await store.get_alert_instance(alert_id, allowed_channels=None)
+    assert got is not None and (got.status, got.acked_by) == ("open", None)
+    # Leave no open alert behind on a shared server database.
+    resolved = AuditAppend(f"contract.alert_cleanup.{tag}", actor="contract-op")
+    assert await store.resolve_alert_instance(alert_id, audit=resolved) is True
+    flag_conn = f"OB_NF{tag}"
+    with pytest.raises(TypeError, match="BACKLOG #5069"):
+        await store.set_connection_flag(flag_conn, "outbound", flagged=True, audit=None)
+    assert (flag_conn, "outbound") not in await store.list_connection_flags()
+
+
 async def assert_operator_audit_atomic(store: Any) -> None:
     """Every operator mutation commits its audit row with its change, or neither."""
     tag = uuid4().hex[:8]
@@ -767,6 +849,7 @@ async def assert_operator_audit_atomic(store: Any) -> None:
 
     await _assert_alert_mutations_atomic(store, tag)
     await _assert_connection_flag_atomic(store, tag)
+    await _assert_missing_audit_refused(store, tag)
 
     # The rows joined the hash chain the way record_audit's do: the chain still verifies.
     ok, message = await store.verify_audit_chain()

@@ -216,9 +216,10 @@ def _client_cert_opener(
     with ``verify_tls=False``. TLS 1.2+ floor (ADR 0002), as in ``mllp.py``/``api/tls.py``. Per
     connection — REST's shared module-level openers are left untouched.
 
-    ``allow_expired`` (#129, ADR 0094) relaxes ONLY the peer cert's validity-period check (chain +
-    hostname stay enforced) — the granular expiry tolerance, composable with mTLS. Default off =
-    byte-identical.
+    ``allow_expired`` (#129, ADR 0094) relaxes the validity-period checks (the chain's signatures +
+    hostname stay enforced) -- at least the peer cert's, the intermediates' and the trust anchor's, and
+    a CRL's own window, not the peer cert's alone (vault BACKLOG #5089). The granular expiry
+    tolerance, composable with mTLS. Default off = byte-identical.
 
     ``trust_anchor`` (#1180, ADR 0093) selects the roots that verify the SERVER; the client identity
     loaded below is a separate direction and is untouched by it. The default resolves to the OS trust
@@ -241,7 +242,7 @@ def _client_cert_opener(
     if allow_expired:
         relax_verify_expiry(
             ctx, host=host
-        )  # server chain + hostname still verified; expiry relaxed
+        )  # chain signatures + hostname still verified; validity windows relaxed (BACKLOG #5089)
     # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). The docstring above
     # already claimed parity with mllp.py / api/tls.py on the TLS floor; this makes the claim true of
     # the cipher assertion those siblings also carry.
@@ -450,8 +451,9 @@ class SoapDestination(DestinationConnector):
                 trust_anchor=anchor,
             )
         elif verify:
-            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
-            # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
+            # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
+            # but tolerate an expired peer cert, and at least the other chain certificates' and a CRL's
+            # validity windows (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",

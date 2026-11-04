@@ -25,6 +25,7 @@ from typing import Protocol
 
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.redaction import log_timestamp
+from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 
 __all__ = [
     "INTAKE_DEPTH_REASON",
@@ -227,6 +228,18 @@ def utc_or_unknown(ts: float | None) -> str:
         return "unknown"
 
 
+#: The oldest archive age, in days, :func:`store_restored_detail` writes as a number. A manifest's
+#: time parses as a calendar date, so its age is at most about 739,000 days, but the time the
+#: start reads is the store's restore marker, where a value written outside ``restore`` can be any
+#: finite float and print hundreds of digits. Capped, the count and the pointer still fit the
+#: reason column's cut (BACKLOG #5094).
+_STORE_RESTORED_MAX_AGE_DAYS = 99_999
+#: How far after the restore an archive's time may fall and still read as an age: the hour of
+#: clock skew ``restore``'s age refusal allows (``dr_backup._ARCHIVE_CLOCK_SKEW_SECONDS``, which
+#: this module cannot import: dr_backup imports it).
+_STORE_RESTORED_CLOCK_SKEW = 3600.0
+
+
 def store_restored_detail(
     *,
     archive_created_at: float | None,
@@ -234,21 +247,31 @@ def store_restored_detail(
     restored_at: float,
     revoked: int,
 ) -> str:
-    """The one-line description of a ``store_restored`` alert both sinks show (BACKLOG #2614).
-    A time in UTC, an age in days and a count: nothing read from a row's content.
+    """The description of a ``store_restored`` alert both sinks show (BACKLOG #2614). Fixed
+    words, an age in days, a count,
+    :data:`~messagefoundry.restore_notice.RESTORE_NOTICE_POINTER` (BACKLOG #5094) and a time in
+    UTC: nothing read from a row's content.
 
     The alert instance's reason column keeps only about the first 200 characters, and the store's
-    redaction turns the time in it into ``[redacted]``. So the age and the count lead, and the
-    line names the ``store_restored`` audit row, which carries the time whole."""
-    age = (
-        "of unknown age"
-        if archive_created_at is None
-        else f"{max(0.0, restored_at - archive_created_at) / 86400:.1f} days old"
-    )
+    redaction turns the time in it into ``[redacted]``. So the age and the count lead and the
+    pointer follows, all three short enough to fit that cut whole, and the time comes last, naming
+    the ``store_restored`` audit row, which carries it whole. The notice itself rides the event as
+    its own ``rollback_notice`` key."""
+    if archive_created_at is None or archive_created_at > restored_at + _STORE_RESTORED_CLOCK_SKEW:
+        # A time after the restore says the backup host's clock was wrong, as the age refusal
+        # reads it, so "0.0 days old" would understate what to re-apply.
+        age = "of unknown age"
+    else:
+        days = max(0.0, restored_at - archive_created_at) / 86400
+        age = (
+            f"{days:.1f} days old"
+            if days <= _STORE_RESTORED_MAX_AGE_DAYS
+            else f"over {_STORE_RESTORED_MAX_AGE_DAYS} days old"
+        )
     return (
-        f"started on a store restored from an archive {age}; {revoked} session(s) revoked. "
-        "Re-apply every disable, delete, role change and reset made after its newest audit row "
-        f"({utc_or_unknown(last_audit_at)}; also in the store_restored audit row)."
+        f"Started on a store restored from an archive {age}; {revoked} session(s) revoked. "
+        f"Re-apply what it undid: {RESTORE_NOTICE_POINTER} The archive's newest audit row "
+        f"is {utc_or_unknown(last_audit_at)} (also in the store_restored audit row)."
     )
 
 
@@ -1022,17 +1045,19 @@ class AlertSink(Protocol):
 
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
         """The engine started on a store that ``messagefoundry restore`` placed, and recorded it:
-        every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614). The
-        restored accounts, password hashes, roles and factors are the archive's, so every
-        disable, delete, role change and reset made after its newest audit row is undone until
-        an operator applies it again.
+        every session was revoked and a ``store_restored`` audit row written (BACKLOG #2614).
+        What the restore undid, which an operator must apply again, is
+        :data:`~messagefoundry.restore_notice.RESTORE_ROLLBACK_NOTICE` (BACKLOG #5094), fixed
+        text that is not passed in: a sink adds it itself where it has the room, as the logging
+        sink's line and the notifier's ``rollback_notice`` key do. ``detail`` names the command
+        that prints it, for every path that shows only ``detail``.
 
         ``name`` is :data:`STORE_RESTORED_SUBJECT`. ``detail`` is built by
-        :func:`store_restored_detail`: a time, an age and a count, no PHI. ``last_audit_at`` is
-        that time on its own, as ISO 8601 UTC or ``unknown``, because the store's redaction turns
-        a date in the alert instance's reason column into ``[redacted]``; the event carries it
-        whole. Raised once per restore, by the start that consumed the marker. Nothing resolves
-        it automatically."""
+        :func:`store_restored_detail`: an age, a count, fixed words and a time, no PHI.
+        ``last_audit_at`` is that time on its own, as ISO 8601 UTC or ``unknown``, because the
+        store's redaction turns a date in the alert instance's reason column into
+        ``[redacted]``; the event carries it whole. Raised once per restore, by the start that
+        consumed the marker. Nothing resolves it automatically."""
         ...
 
 
@@ -1532,7 +1557,8 @@ class LoggingAlertSink:
         )
 
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
-        log.warning("ALERT store_restored: %r %s", name, detail)
+        # BACKLOG #5094: the notice is fixed text, so the log line carries it whole.
+        log.warning("ALERT store_restored: %r %s %s", name, detail, RESTORE_ROLLBACK_NOTICE)
 
     def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
         log.warning(

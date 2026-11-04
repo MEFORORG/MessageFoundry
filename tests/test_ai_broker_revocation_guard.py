@@ -12,7 +12,6 @@ for this hop. All endpoints and keys here are synthetic.
 from __future__ import annotations
 
 import json
-import logging
 import ssl
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -44,6 +43,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
+from tests.test_revocation_guard_remaining_hops import _guard_log
 
 _ENDPOINT = "https://ai.internal/v1/messages"
 _KEY = "synthetic-ai-key-value"
@@ -94,8 +94,16 @@ def _managed_ai(**over: object) -> AiSettings:
     return AiSettings(**kw)  # type: ignore[arg-type]
 
 
-def _crossing_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.name == _LOGGER]
+@pytest.fixture
+def ai_log() -> Iterator[list[str]]:
+    """The WARNING-and-above messages the broker's own logger emits during the test.
+
+    Not the root-level capture fixture, which depends on every logger between the emitter and the
+    root staying as this test found it; a test elsewhere on the same xdist worker can change that,
+    and an arm that asserts no line would then pass with its records lost. The suite's shared
+    capture on the emitting logger, which says what it sets and puts back."""
+    with _guard_log(_LOGGER) as log:
+        yield log.messages
 
 
 # --- the guard -----------------------------------------------------------------------------------
@@ -118,13 +126,12 @@ def test_an_off_box_endpoint_with_no_attestation_is_refused(posture: HopPosture 
 
 
 def test_the_attestation_crosses_an_enforcing_posture_and_logs_once(
-    caplog: pytest.LogCaptureFixture,
+    ai_log: list[str],
 ) -> None:
     """Mutation: drop ``attested=`` from the disposition call. Red: the refusal raises."""
-    caplog.set_level(logging.WARNING, logger=_LOGGER)
     broker = _broker(posture=_ENFORCING, attested=True, reason=_REASON)
     assert broker.endpoint_host == "ai.internal"
-    lines = _crossing_lines(caplog)
+    lines = ai_log
     assert len(lines) == 1
     assert "on operator attestation" in lines[0]
     assert _PAIR in lines[0]
@@ -132,7 +139,7 @@ def test_the_attestation_crosses_an_enforcing_posture_and_logs_once(
     assert "tls_revocation_attested;" not in lines[0]  # not a connection's declaration
     # The broker is built for every request; the line is written once per process for the host.
     _broker(posture=_ENFORCING, attested=True, reason=_REASON)
-    assert len(_crossing_lines(caplog)) == 1
+    assert len(ai_log) == 1
 
 
 def test_an_unknown_posture_is_crossed_by_the_attestation_too() -> None:
@@ -141,12 +148,11 @@ def test_an_unknown_posture_is_crossed_by_the_attestation_too() -> None:
 
 
 def test_a_warn_instance_crosses_with_one_warning_that_names_the_pair(
-    caplog: pytest.LogCaptureFixture,
+    ai_log: list[str],
 ) -> None:
-    caplog.set_level(logging.WARNING, logger=_LOGGER)
     _broker(posture=_WARN)
     _broker(posture=_WARN)
-    lines = _crossing_lines(caplog)
+    lines = ai_log
     assert len(lines) == 1
     assert "insecure transport hop permitted" in lines[0]
     assert _PAIR in lines[0]
@@ -154,18 +160,17 @@ def test_a_warn_instance_crosses_with_one_warning_that_names_the_pair(
 
 
 def test_a_loopback_endpoint_is_on_the_box_and_logs_nothing(
-    caplog: pytest.LogCaptureFixture,
+    ai_log: list[str],
 ) -> None:
-    caplog.set_level(logging.WARNING, logger=_LOGGER)
     broker = _broker(
         endpoint="https://127.0.0.1:8443/v1/messages", allowed=("127.0.0.1",), posture=_ENFORCING
     )
     assert broker.endpoint_host == "127.0.0.1"
-    assert _crossing_lines(caplog) == []
+    assert ai_log == []
 
 
 def test_the_process_wide_attestation_does_not_cross_an_enforcing_posture(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, ai_log: list[str]
 ) -> None:
     """BACKLOG #299's clamp holds here: the blanket variable names no hop."""
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
@@ -174,9 +179,8 @@ def test_the_process_wide_attestation_does_not_cross_an_enforcing_posture(
     with pytest.raises(AiBrokerError, match="no revocation check"):
         _broker(posture=None)
     # On a warn instance it crosses, silently, as the authority ranks it.
-    caplog.set_level(logging.WARNING, logger=_LOGGER)
     _broker(posture=_WARN)
-    assert _crossing_lines(caplog) == []
+    assert ai_log == []
 
 
 def test_the_decision_reads_the_context_the_broker_dials_with(
@@ -223,26 +227,24 @@ def test_a_broker_built_directly_refuses_a_reason_that_could_forge_a_log_line() 
 
 
 def test_an_attested_hop_whose_context_checks_a_crl_logs_no_attested_crossing(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, ai_log: list[str]
 ) -> None:
     """That hop crossed on a real check, so a line saying it crossed without one would be false."""
     monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
-    caplog.set_level(logging.WARNING, logger=_LOGGER)
     _broker(posture=_ENFORCING, attested=True, reason=_REASON)
-    assert _crossing_lines(caplog) == []
+    assert ai_log == []
 
 
 def test_an_attested_hop_whose_context_skips_time_validity_keeps_the_crossing_line(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, ai_log: list[str]
 ) -> None:
     """Such a context accepts a lapsed CRL, so its CRL does not silence the line, as at
     ``RevocationHopGuard.enforce_construction``. No CRL reaches this hop today, so the context's two
     answers are stood in for; the test above is the control."""
     monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
     monkeypatch.setattr(tls_policy, "skips_validity_period", lambda ctx: True)
-    caplog.set_level(logging.WARNING, logger=_LOGGER)
     _broker(posture=_ENFORCING, attested=True, reason=_REASON)
-    assert len(_crossing_lines(caplog)) == 1
+    assert len(ai_log) == 1
 
 
 def test_an_unattested_hop_whose_context_skips_time_validity_is_refused(

@@ -24,7 +24,6 @@ storms, the pool assay) runs on the bench box per WO-0114-GATES — not here.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import warnings
 from collections.abc import AsyncIterator
@@ -39,8 +38,10 @@ from messagefoundry.store.store import OutboxStatus, Stage
 from tests._claim_lock_helpers import (
     assert_skip_named,
     claim_heads_no_block,
+    claim_past_empty_yield,
     ss_hold_row_lock,
     ss_lane_pending,
+    ss_release_row_lock,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -51,20 +52,11 @@ pytestmark = pytest.mark.skipif(
 
 # claim_fifo_heads' SQL Server dispatch — BOTH the batch path and the proc path (_claim_proc_body also
 # emits SET LOCK_TIMEOUT 0, ADR 0066 §9 never-block) — can transiently fail-close the whole claim to
-# EMPTY-all: by_lane AND rearm both empty, rolled back, nothing consumed. That yield is contract-legal
-# but flakes a single-shot assertion. _claim_until re-issues past a transient EMPTY-all for the sites
-# that assert a NON-empty outcome; a successful claim never retries, and a genuinely-unclaimable head
-# stays EMPTY-all every pass and still fails after the cap (masks nothing). Sites that assert EMPTY-all
-# itself (fenced ex-leader, no-match/oversized lane) call claim_fifo_heads directly — immune to the yield.
-# Mirrors _claim_heads in test_claim_fifo_heads.py (the fix for this same never-block flake class).
+# EMPTY-all. _claim_until re-issues past it for the sites that assert a NON-empty outcome. Sites that
+# assert EMPTY-all itself (fenced ex-leader, no-match/oversized lane) call claim_fifo_heads directly —
+# immune to the yield.
 async def _claim_until(store: Any, *args: Any, **kwargs: Any) -> Any:
-    res = await store.claim_fifo_heads(*args, **kwargs)
-    for _ in range(16):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(0.01)
-        res = await store.claim_fifo_heads(*args, **kwargs)
-    return res
+    return await claim_past_empty_yield(lambda: store.claim_fifo_heads(*args, **kwargs))
 
 
 async def _open(**flag_overrides: Any) -> SqlServerStore:
@@ -282,9 +274,16 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     N, N+1, N+2, hold N's lock, and the CALL must return the lane EMPTY and name it, never
     ``[N+1, N+2]`` and never silently. After release, N leads.
 
-    ``abort_ok=True`` admits the one other legal answer, a whole-claim 1222 abort, which names the
-    route through ``lock_timeout`` and no lane. The lock is taken on the fifo index key, the shape
-    every real contender holds, so the READPAST probe skips it rather than waiting on it."""
+    The lock is taken on the fifo index key, the shape every real contender holds, so the READPAST
+    probe skips it rather than waiting on it.
+
+    A 1222 abort is the one other legal answer. At INGRESS it comes before the fetch, so it names no
+    lane and never read the marker, and a pass on it proves nothing about the ``_v2`` CALL. Each
+    abort is a full rollback, so the claim is re-issued until one COMPLETES, and the test FAILS if
+    none does (BACKLOG #4915). It used to pass on that route with only a UserWarning. Every abort is
+    still held to ``assert_skip_named``, so one that echoes the lane fails rather than stopping the
+    re-issue as though it had read the marker. Every abort seen still rides out as a warning, even
+    when a later attempt blocks or an assertion fails, so a re-issue never hides one."""
     lane = "IB_V2_HEADSKIP"
     mids = [
         await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|SKIP|{t}", now=t)
@@ -296,25 +295,44 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     )
     conn, cur = await ss_hold_row_lock(proc_store, mids[0], Stage.INGRESS.value)
     try:
-        res = await claim_heads_no_block(
-            proc_store, Stage.INGRESS.value, [lane], now=200.0, per_lane_limit=8
-        )
-        assert res.by_lane == {} and res.rearm == frozenset()
-        assert_skip_named(res, lane, abort_ok=True)
-        if res.lock_timeout is not None:
-            # Legal, and it still names a route, but it did not exercise the _v2 marker: say so in
-            # the warnings summary rather than let a green run read as proof of the marker path.
-            warnings.warn(
-                "the _v2 head-skip test passed on the 1222 abort route; the marker was not read",
-                stacklevel=1,
+        attempts: list[Any] = []
+
+        async def _claim() -> Any:
+            attempt = await claim_heads_no_block(
+                proc_store, Stage.INGRESS.value, [lane], now=200.0, per_lane_limit=8
             )
+            attempts.append(attempt)
+            return attempt
+
+        def _completed(r: Any) -> bool:
+            return r.lock_timeout is None
+
+        try:
+            res = await claim_past_empty_yield(_claim, done=_completed)
+        finally:
+            # Say so in the warnings summary: a 1222 nobody sees is the defect class BACKLOG #1270
+            # is about, and a re-issue must not become one. In a finally and BEFORE the assertions
+            # below (BACKLOG #4915), so a run that blocks or fails one of them still shows the
+            # aborts it saw.
+            aborts = sum(a.lock_timeout is not None for a in attempts)
+            if aborts:
+                warnings.warn(
+                    f"the _v2 head-skip test saw {aborts} 1222 abort(s) in {len(attempts)} claim(s)",
+                    stacklevel=1,
+                )
+        assert all(a.by_lane == {} and a.rearm == frozenset() for a in attempts)
+        for a in attempts:  # an abort that named the lane at INGRESS echoed the request list
+            assert_skip_named(a, lane, abort_ok=True, stage=Stage.INGRESS.value)
+        assert _completed(res), (
+            f"all {len(attempts)} claims aborted on 1222 ({res.lock_timeout!r}), so the _v2"
+            " head-skip marker was never read and this test proved nothing about it"
+        )
+        assert_skip_named(res, lane, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(proc_store, lane)
         assert len(rows) == 3
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await proc_store._pool.release(conn)
+        await ss_release_row_lock(proc_store, conn, cur)
     assert proc_store.claim_proc_effective is True  # still the CALL path for the release half
     after = await _claim_until(proc_store, Stage.INGRESS.value, [lane], now=201.0, per_lane_limit=8)
     assert [it.message_id for it in after.by_lane[lane]] == mids  # N first, whole prefix

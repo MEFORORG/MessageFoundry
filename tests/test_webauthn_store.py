@@ -11,6 +11,7 @@ The ceremony/verify tests (which DO need the ``[webauthn]`` extra) live in ``tes
 from __future__ import annotations
 
 import dataclasses
+import functools
 from pathlib import Path
 from typing import Any, cast
 
@@ -65,11 +66,17 @@ async def test_the_conditional_bind_predicate_fails_closed_on_seals_and_epochs(
 ) -> None:
     """BACKLOG #3014, #3690 item 1: the branches a keyless contract store cannot reach. RED when
     ``session_owes_unproven_factor`` trusts a session or account row whose seal fails, or a
-    session minted under an older account epoch, which ``identity_for_token`` ends."""
+    session minted under an older account epoch or an older global epoch (BACKLOG #5091), which
+    ``identity_for_token`` ends."""
     store = await MessageStore.open(tmp_path / "pred.db")
     try:
         await store.create_user(
-            user_id="p1", username="p1", auth_provider="local", now=1.0, password_generated=False
+            user_id="p1",
+            username="p1",
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         assert await store.create_session(token_hash="ps", user_id="p1", expires_at=1e10, now=1.0)
         await store.mark_session_mfa_verified("ps", now=2.0)
@@ -77,14 +84,18 @@ async def test_the_conditional_bind_predicate_fails_closed_on_seals_and_epochs(
         record = await store._read_user_record("p1")
         assert session is not None and record is not None
         sound = cast(Any, _Sealer(session_ok=True, user_ok=True))
+        current = session.global_epoch
+        owes = functools.partial(session_owes_unproven_factor, global_epoch=current)
         # The control: a stamped, sealed, current session owes nothing.
-        assert session_owes_unproven_factor(sound, session, record, []) is False
+        assert owes(sound, session, record, []) is False
         bad_session = cast(Any, _Sealer(session_ok=False, user_ok=True))
-        assert session_owes_unproven_factor(bad_session, session, record, []) is True
+        assert owes(bad_session, session, record, []) is True
         bad_user = cast(Any, _Sealer(session_ok=True, user_ok=False))
-        assert session_owes_unproven_factor(bad_user, session, record, []) is True
+        assert owes(bad_user, session, record, []) is True
         stale = dataclasses.replace(session, user_epoch=record.row.session_epoch + 1)
-        assert session_owes_unproven_factor(sound, stale, record, []) is True
+        assert owes(sound, stale, record, []) is True
+        # BACKLOG #5091: an every-account revoke raised the global epoch past the session's.
+        assert owes(sound, session, record, [], global_epoch=current + 1) is True
     finally:
         await store.close()
 
@@ -134,6 +145,7 @@ async def test_webauthn_public_key_plaintext_under_cipher(tmp_path: Path) -> Non
             password_hash="h",
             now=1.0,
             password_generated=False,
+            audits=(),
         )
         await store.add_webauthn_credential(_cred("u1", "key", id_hash="h1", created_at=2.0))
         async with store._read() as conn:  # noqa: SLF001 - white-box: raw column, no decrypt
