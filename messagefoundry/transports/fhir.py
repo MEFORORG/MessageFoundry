@@ -1196,8 +1196,9 @@ class FhirDestination(DestinationConnector):
 
         verify = bool_setting(s, "verify_tls", default=True)
         if verify:
-            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
-            # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
+            # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
+            # but tolerate an expired FHIR-server cert, and at least the other chain certificates' and a
+            # CRL's validity windows (opt-in; default off = the shared verifying opener, byte-identical).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy

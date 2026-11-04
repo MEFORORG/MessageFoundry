@@ -340,11 +340,15 @@ async def test_cli_restore_verify_config_only_unaffected(tmp_path: Path) -> None
 
         store.snapshot_to = _delegated  # type: ignore[method-assign]
         ss = StoreSettings(path=str(tmp_path / "msg.db"), encryption_key=key)
+        # A config-only pass must carry a config file to be written at all (vault BACKLOG #5220).
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        (cfg / "feed.py").write_text("# synthetic router\n")
         runner = BackupRunner(
             store,
             BackupSettings(enabled=True, destination=str(tmp_path / "b")),
             store_settings=ss,
-            config_dir=None,
+            config_dir=cfg,
         )
         res = await runner.run_once(now=1.0, force_config_only=True)
         assert res is not None and res.config_only  # a config-only archive was produced

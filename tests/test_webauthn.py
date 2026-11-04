@@ -719,6 +719,7 @@ async def test_a_shared_authenticator_racing_an_enrolment_is_not_a_label_clash(
                 password_hash="h",
                 now=1.0,
                 password_generated=False,
+                audits=(),
             )
         opts = json.loads(
             await service.begin_webauthn_registration(

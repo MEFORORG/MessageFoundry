@@ -93,6 +93,7 @@ async def _must_change_admin(service: AuthService) -> str:
         password_hash=await asyncio.to_thread(hash_password, _ADMIN_PW),
         must_change_password=True,
         password_generated=False,
+        audits=(),
     )
     await service.initialize()  # seeds the roles the assignment below refers to
     await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")

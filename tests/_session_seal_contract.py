@@ -72,6 +72,7 @@ async def _user(store: Any, user_id: str) -> None:
         password_hash="h",
         now=time.time(),
         password_generated=False,
+        audits=(),
     )
 
 

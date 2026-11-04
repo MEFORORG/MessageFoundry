@@ -444,7 +444,7 @@ def test_relax_text_says_the_hostname_is_not_verified_when_it_is_not(
         relax_verify_expiry(ctx, host="partner.example.invalid")
     [line] = [r.getMessage() for r in caplog.records if "RELAXED" in r.getMessage()]
     assert "the hostname is NOT" in line
-    assert "chain, hostname, and key-usage are still verified" not in line
+    assert "the hostname and key usage are still verified" not in line
 
 
 def test_relax_text_keeps_the_hostname_claim_when_it_holds(
@@ -455,7 +455,25 @@ def test_relax_text_keeps_the_hostname_claim_when_it_holds(
     with caplog.at_level(logging.WARNING):
         relax_verify_expiry(ctx, host="partner.example.invalid")
     [line] = [r.getMessage() for r in caplog.records if "RELAXED" in r.getMessage()]
-    assert "chain, hostname, and key-usage are still verified" in line
+    assert "the chain's signatures, the hostname and key usage are still verified" in line
+
+
+def test_relax_text_names_what_else_goes_unchecked(caplog: pytest.LogCaptureFixture) -> None:
+    """BACKLOG #5089: the flag skips more than the leaf's validity period, so the line must not
+    read as if the whole chain were still validated. It names the other certificates' validity
+    periods and a CRL's window on both hostname arms, and claims only the chain's signatures."""
+    for check_hostname in (True, False):
+        caplog.clear()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = check_hostname
+        with caplog.at_level(logging.WARNING):
+            relax_verify_expiry(ctx, host="partner.example.invalid")
+        [line] = [r.getMessage() for r in caplog.records if "RELAXED" in r.getMessage()]
+        assert "validity periods of the intermediates and the trust anchor" in line
+        assert "a CRL's own validity window, go unchecked too" in line
+        assert "the chain's signatures" in line
+        assert "the chain, hostname, and key-usage are still verified" not in line
+        assert "the chain and key-usage are still verified" not in line
 
 
 def test_mllp_relax_runs_after_the_hostname_is_set(caplog: pytest.LogCaptureFixture) -> None:

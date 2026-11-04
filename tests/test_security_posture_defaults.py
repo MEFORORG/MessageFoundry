@@ -2778,6 +2778,16 @@ def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> N
     assert "tls_check_hostname=false" in risk
 
 
+def test_the_expiry_entry_no_longer_claims_the_whole_chain_is_verified() -> None:
+    """CORRECTED 2026-11-03 (vault BACKLOG #5089): the entry said "the chain signature and key usage
+    are still fully verified". The relaxation also skips at least the other chain certificates'
+    validity periods and a CRL's own window, and the entry now says so."""
+    risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
+    assert "still fully verified" not in risk
+    assert "validity periods of the intermediates and the trust anchor" in risk
+    assert "a CRL's own validity window" in risk
+
+
 def test_the_revocation_attestation_is_actually_wired() -> None:
     """Another REPORTED entry, driven the same way as the ones above: through its reader AND through
     `security_loosenings`. ADR 0173 made the pair authorable on an outbound, so the reader must see it
@@ -3411,6 +3421,119 @@ def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
     unresolved = dict(static_credential_db_hops(reg))
     assert "unresolved env()" in unresolved["OB_ENV"] and "env(d)" not in unresolved["OB_ENV"]
     assert "possibly generic" in dict(unverified_generic_db_hops(reg))["OB_ENV"]
+
+
+def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
+    """BACKLOG #5053. The classifier judges a TLS keyword by the driver family, so the posture
+    reader resolves an ``env()`` ``odbc_driver`` as it resolves an ``env()`` dialect: a psqlODBC
+    name with ``SSLmode=verify-full`` is delegated, as the build delegates it. With no value, or
+    on a connection that is not deployed (ADR 0111 AC-1, where the cast never runs), the hop is
+    listed under a reason that says the name was not read, and a no-TLS value is still named."""
+    from messagefoundry.config.wiring import (
+        UNRESOLVED_DRIVER_REASON,
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+    from messagefoundry.transports.database import UNPLACED_DRIVER_REASON
+
+    cast_ran: list[str] = []
+
+    def driver_cast(value: object) -> str:
+        cast_ran.append(str(value))
+        return str(value)
+
+    def outbound(name: str, *, deployed: bool) -> None:
+        reg.add_outbound(
+            build_outbound_connection(
+                name,
+                Database(
+                    server="db.example.invalid",
+                    dialect="generic",
+                    odbc_driver=env(f"{name.lower()}_driver", cast=driver_cast),  # type: ignore[arg-type]
+                    odbc_params={"SSLmode": "verify-full"},
+                    statement="INSERT INTO r (a) VALUES (:a)",
+                ),
+                deployed=deployed,
+            )
+        )
+
+    reg = Registry()
+    outbound("OB_LIVE", deployed=True)
+    outbound("OB_DARK", deployed=False)
+    values = {"ob_live_driver": "PostgreSQL Unicode", "ob_dark_driver": "PostgreSQL Unicode"}
+    resolved = dict(unverified_generic_db_hops(reg, env_values=values))
+    assert "OB_LIVE" not in resolved
+    # The dark connection's driver is never resolved, so it is listed as unread, not as unplaced.
+    assert resolved["OB_DARK"].startswith(UNRESOLVED_DRIVER_REASON)
+    assert cast_ran == ["PostgreSQL Unicode"], "only the deployed connection's value is resolved"
+    # The control: the same live hop with a value that names no family is listed.
+    listed = dict(unverified_generic_db_hops(reg, env_values={**values, "ob_live_driver": "MySQL"}))
+    assert listed["OB_LIVE"].startswith(UNPLACED_DRIVER_REASON)
+    # No values: the driver is unresolved, so the hop is listed rather than guessed clear, and the
+    # reason says the name was not read rather than that it cannot be placed.
+    unread = dict(unverified_generic_db_hops(reg))["OB_LIVE"]
+    assert unread.startswith(UNRESOLVED_DRIVER_REASON)
+    # A no-TLS value never depended on the driver, so a dark connection still reports it.
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_DARK_OFF",
+            Database(
+                server="db.example.invalid",
+                dialect="generic",
+                odbc_driver=env("ob_dark_off_driver", cast=driver_cast),  # type: ignore[arg-type]
+                odbc_params={"SSLmode": "disable"},
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+            deployed=False,
+        )
+    )
+    off = dict(unverified_generic_db_hops(reg, env_values=values))["OB_DARK_OFF"]
+    assert off.startswith("TLS is explicitly not required: SSLmode=disable")
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        # At risk on every family: the reason they all give, never "possibly delegated".
+        ({}, "no TLS keyword is set in odbc_params"),
+        ({"sslcert": "client.pem"}, "a TLS keyword is set in odbc_params, but no TLS mode"),
+        ({"SSLmode": "on"}, "no TLS mode is set in odbc_params that any driver family"),
+        # Some family counts the mode set, so the hop is possibly delegated.
+        ({"SSLmode": "verify-full"}, "possibly delegated"),
+        ({"Encrypt": "yes"}, "possibly delegated"),
+    ],
+)
+def test_an_unread_env_driver_is_possibly_delegated_only_where_a_family_clears_it(
+    params: dict[str, str], expected: str
+) -> None:
+    """Review of BACKLOG #5053. An unresolved ``env()`` ``odbc_driver`` was labelled possibly
+    delegated whatever ``odbc_params`` held, so a hop with no TLS keyword, at risk on every driver,
+    read as one whose risk depended on the driver."""
+    from messagefoundry.config.wiring import (
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_UNREAD",
+            Database(
+                server="db.example.invalid",
+                dialect="generic",
+                odbc_driver=env("ob_unread_driver"),  # type: ignore[arg-type]
+                odbc_params=params,
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    assert expected in dict(unverified_generic_db_hops(reg))["OB_UNREAD"]
 
 
 def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:

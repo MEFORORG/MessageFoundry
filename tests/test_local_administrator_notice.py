@@ -34,6 +34,7 @@ async def _directory_admin(service: AuthService, username: str) -> str:
         username=username,
         auth_provider=AuthProvider.AD.value,
         password_generated=False,
+        audits=(),
     )
     await service.initialize()  # seeds the role the assignment refers to
     await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")

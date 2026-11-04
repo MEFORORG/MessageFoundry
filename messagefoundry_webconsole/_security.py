@@ -218,7 +218,8 @@ and requires each one here.
   included), :func:`._auth.assert_same_origin` and :func:`._auth.assert_not_cross_site`.
 * **``Sec-Fetch-Mode``** — the middleware, and the Kerberos and OIDC sign-in routes.
 * **``Sec-Fetch-Dest``** and **``Sec-Fetch-User``** — the middleware only.
-* **``Origin``** — :func:`._auth.assert_same_origin` on a form POST; :func:`._auth.authorize_ui_ws`
+* **``Origin``** — :func:`._auth.assert_same_origin` on a form POST, and on a GET that runs it,
+  such as the skipped-interstitial ``GET /ui/oidc/start``; :func:`._auth.authorize_ui_ws`
   and the engine's ``api.security._ws_origin_allowed`` (``[api].ws_allowed_origins``) on the
   ``/ws/stats`` handshake.
 """
