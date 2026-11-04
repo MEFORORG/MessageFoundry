@@ -112,14 +112,14 @@ async def test_an_undecryptable_row_names_the_drifted_collation(
     store, _ = _bare_store([row])
     store._cipher = object()  # type: ignore[assignment]
     with pytest.raises(CipherError) as drifted:
-        await store._load_state_cache(folded_collation="SQL_Latin1_General_CP1_CI_AS")
+        await store._load_state_cache_noting("SQL_Latin1_General_CP1_CI_AS")
     notes = getattr(drifted.value, "__notes__", [])
     assert any("SQL_Latin1_General_CP1_CI_AS" in n and "#4917" in n for n in notes)
 
     store2, _ = _bare_store([row])
     store2._cipher = object()  # type: ignore[assignment]
     with pytest.raises(CipherError) as plain:
-        await store2._load_state_cache()
+        await store2._load_state_cache_noting(None)
     assert getattr(plain.value, "__notes__", []) == []
 
 
@@ -127,14 +127,15 @@ def test_reference_keys_differing_only_by_trailing_spaces_are_refused() -> None:
     """``pk_reference`` pads trailing spaces, so these would raise a PK duplicate mid-transaction.
     The guard refuses first, naming both keys by ordinal and hash, never by value."""
     store = object.__new__(SqlServerStore)
-    for rows, later, first in (
-        ({"MRN-1": 1, "MRN-1 ": 2}, 1, 0),
-        ({"MRN-1  ": 1, "other": 2, "MRN-1 ": 3}, 2, 0),
+    for rows, first, later in (
+        ({"MRN-1": 1, "MRN-1 ": 2}, 0, 1),
+        ({"MRN-1  ": 1, "other": 2, "MRN-1 ": 3}, 0, 2),  # two padded keys, no bare one
+        ({"MRN-1 ": 1, "other": 2, "MRN-1": 3}, 0, 2),  # the bare key comes later
     ):
         with pytest.raises(ValueError, match="only by trailing spaces") as exc:
             store._guard_reference_widths("set", rows)
         text = str(exc.value)
-        assert f"key #{later} " in text and f"key #{first} " in text
+        assert f"keys #{first} and #{later} differ" in text
         assert "MRN" not in text  # raw keys withheld (PHI)
 
 

@@ -3708,7 +3708,7 @@ async def test_reference_keys_differing_by_a_trailing_space_fail_guard(
     twins = {"MRN-1": "a", "MRN-1 ": "b"}
     with pytest.raises(ValueError, match="only by trailing spaces") as exc:
         await store.write_reference_snapshot(name="padded", version="v2", rows=twins)
-    assert "key #1" in str(exc.value) and "key #0" in str(exc.value)
+    assert "keys #0 and #1 differ" in str(exc.value)
     assert "MRN" not in str(exc.value)  # raw keys withheld (PHI)
     assert store.reference_view()["padded"] == {"ok": "1"}
     # A lone key with a trailing space is not a collision and lands as written.
@@ -3731,7 +3731,8 @@ async def test_state_keys_at_the_pair_bound_land_and_one_unit_over_fails(store) 
     from messagefoundry.config.wiring import STATE_KEY_MAX_PAIR_UNITS, STATE_KEY_MAX_UNITS, SetState
 
     rest = STATE_KEY_MAX_PAIR_UNITS - STATE_KEY_MAX_UNITS
-    ops = [SetState("n" * STATE_KEY_MAX_UNITS, "k" * rest, 1), SetState("m" * rest, "j" * 256, 2)]
+    full = STATE_KEY_MAX_UNITS
+    ops = [SetState("n" * full, "k" * rest, 1), SetState("m" * rest, "j" * full, 2)]
     mid, rid = await _ss_seed_routed(store, channel_id="IB", raw=RAW, now=100.0)
     assert await store.transform_handoff(
         routed_id=rid,

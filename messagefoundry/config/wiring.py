@@ -4981,8 +4981,11 @@ class SetState:
             if "\x00" in text:
                 raise StateKeyError(f"SetState {name} must not contain U+0000 (NUL)")
             # NVARCHAR counts UTF-16 code units; surrogatepass so a lone surrogate is counted, not
-            # raised from here as an unrelated UnicodeEncodeError.
-            field_units = len(text.encode("utf-16-le", "surrogatepass")) // 2
+            # raised from here as an unrelated UnicodeEncodeError. ASCII is one unit per char, so
+            # the usual MRN-style key skips the encode.
+            field_units = (
+                len(text) if text.isascii() else len(text.encode("utf-16-le", "surrogatepass")) // 2
+            )
             if field_units > STATE_KEY_MAX_UNITS:
                 raise StateKeyError(
                     f"SetState {name} is {field_units} UTF-16 code units; the limit is "

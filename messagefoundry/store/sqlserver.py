@@ -3883,7 +3883,7 @@ class SqlServerStore:
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
                 # ADR 0005 read-through cache warm-up
-                await store._load_state_cache(folded_collation=folded)
+                await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
@@ -8544,15 +8544,9 @@ class SqlServerStore:
         return MappingProxyType(self._state_cache)
 
     async def _report_state_key_collation(self) -> str | None:
-        """Report a ``state`` table whose key columns are not BIN2, and return the collation found.
-
-        BACKLOG #4917. The ``state`` CREATE runs only where the table is absent, so a table made
-        before BACKLOG #1588 keeps the database default. Under a case-insensitive default it merged
-        ``MRN-abc`` and ``mrn-ABC`` into one row, kept the stored spelling and sealed the value to the
-        incoming one. This logs a WARNING naming the collation and the remedy. It repairs nothing,
-        and the open goes on: such a row may still decrypt, and :meth:`_load_state_cache` notes
-        the cause on any row that does not. Returns ``None`` when both columns are BIN2 or the
-        table is absent."""
+        """Log a WARNING for a ``state`` table whose key columns are not BIN2 (BACKLOG #4917; the
+        ``state`` comment in ``_SCHEMA`` says how one arises). Repairs nothing, and the open goes
+        on. Returns the collation found, or ``None`` when both are BIN2 or the table is absent."""
         rows = await self._fetchall(
             "SELECT name, collation_name FROM sys.columns"
             " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
@@ -8574,11 +8568,8 @@ class SqlServerStore:
         )
         return collation
 
-    async def _load_state_cache(self, *, folded_collation: str | None = None) -> None:
-        """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005).
-
-        ``folded_collation`` is what :meth:`_report_state_key_collation` found. When it is set, a
-        row that fails to decrypt carries a note naming that collation as a likely cause."""
+    async def _load_state_cache(self) -> None:
+        """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
         rows = await self._fetchall("SELECT namespace, [key], value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
@@ -8587,22 +8578,27 @@ class SqlServerStore:
             # through the shared helper: a keyless open of an encrypted store raises the operator-facing
             # StoreKeylessError (table + remedy), and a keyed cipher that cannot decrypt a row raises
             # CipherError — neither is swallowed.
-            try:
-                cache[(r["namespace"], r["key"])] = decrypt_json_cell(
-                    self._cipher,
-                    r["value"],
-                    aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                    table="state",
-                )
-            except CipherError as exc:
-                if folded_collation is not None:
-                    exc.add_note(
-                        f"the state table's key columns use collation {folded_collation}, not"
-                        f" {_STATE_KEY_COLLATION}: a row merged across a case or accent variant"
-                        " is sealed to the other spelling (BACKLOG #1588, #4917)"
-                    )
-                raise
+            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+                self._cipher,
+                r["value"],
+                aad=cell_aad("state", "value", r["namespace"], r["key"]),
+                table="state",
+            )
         self._state_cache = cache
+
+    async def _load_state_cache_noting(self, folded_collation: str | None) -> None:
+        """:meth:`_load_state_cache`, with a note on a ``CipherError`` naming the folding collation
+        :meth:`_report_state_key_collation` found, the likely cause (BACKLOG #4917)."""
+        try:
+            await self._load_state_cache()
+        except CipherError as exc:
+            if folded_collation is not None:
+                exc.add_note(
+                    f"the state table's key columns use collation {folded_collation}, not"
+                    f" {_STATE_KEY_COLLATION}: a row merged across a case or accent variant is"
+                    " sealed to the other spelling (BACKLOG #1588, #4917)"
+                )
+            raise
 
     async def _load_reference_cache(self) -> None:
         """Populate the in-memory reference cache from the ACTIVE snapshot of each set (ADR 0006).
@@ -8678,7 +8674,9 @@ class SqlServerStore:
                 f"reference set name exceeds NVARCHAR(256) "
                 f"({len(name.encode('utf-16-le')) // 2} UTF-16 code units); refusing the snapshot"
             )
-        padded: dict[str, int] = {}  # key with trailing spaces stripped -> first ordinal
+        # Only a key ending in a space can pad onto another, so only those are stripped and held:
+        # usually none, so a large set costs one endswith per key, not a second dict of every key.
+        padded: dict[str, int] = {}  # stripped form of a space-ending key -> its ordinal
         for ordinal, key in enumerate(rows):
             units = len(key.encode("utf-16-le")) // 2
             if units > 450:
@@ -8688,14 +8686,21 @@ class SqlServerStore:
                     f"({units} UTF-16 code units, sha256:{digest}); refusing the snapshot "
                     "(key value withheld: reference keys may be PHI)"
                 )
-            first = padded.setdefault(key.rstrip(" "), ordinal)
-            if first != ordinal:
+            if not key.endswith(" "):
+                continue
+            stripped = key.rstrip(" ")
+            first = padded.get(stripped)
+            if first is None and stripped in rows:
+                first = next(i for i, k in enumerate(rows) if k == stripped)
+            if first is not None:
+                later, first = max(ordinal, first), min(ordinal, first)
                 digest = hashlib.sha256(key.encode()).hexdigest()[:12]
                 raise ValueError(
-                    f"reference set {name!r}: key #{ordinal} (sha256:{digest}) differs from key "
-                    f"#{first} only by trailing spaces, which SQL Server compares as equal; "
-                    "refusing the snapshot (key values withheld: reference keys may be PHI)"
+                    f"reference set {name!r}: keys #{first} and #{later} differ only by trailing"
+                    f" spaces (sha256:{digest} is one), which SQL Server compares as equal;"
+                    " refusing the snapshot (key values withheld: reference keys may be PHI)"
                 )
+            padded[stripped] = ordinal
 
     async def write_reference_snapshot(
         self, *, name: str, version: str, rows: Mapping[str, Any]
