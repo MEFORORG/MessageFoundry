@@ -492,8 +492,10 @@ pure-Python equivalent:
   staging fail-safe, which empties the files a failed backup left in its staging directory, calls
   these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
   file as itself, and refuses a link or junction. It confirms that file lies under the staging
-  directory before any filter serves it. A deduplicated, cloud or tiered file is then truncated
-  through a second open by name, which must reach the same file (BACKLOG #2420, #4992)
+  directory before its filter serves it, except in the cases the backup staging row of
+  [PHI.md section 2](PHI.md#2-where-phi-lives--data-at-rest-inventory) names, where the filter
+  serves first. A deduplicated, cloud or tiered file is then truncated through a second open by
+  name, which must reach the same file (BACKLOG #2420, #4992)
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`

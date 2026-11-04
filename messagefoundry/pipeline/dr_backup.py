@@ -2027,9 +2027,12 @@ def _win_held_walk(
 
     Each directory is HELD by :func:`_win_hold_dirs`, with every directory between it and
     ``staging``, and ``staging`` itself: opened as themselves, refused if one names another path, and
-    shared for reading and writing but not for delete, so that none can be renamed or swapped for a
-    junction. It is held before it is checked and listed, and until the caller has emptied its files
-    and resumes the walk (BACKLOG #4992), the order :func:`_fd_walk` keeps with its descriptors.
+    shared for reading and writing but not for delete, so that, at least, none can be renamed or
+    replaced by another directory or a junction. The hold does not stop a held directory that is
+    empty being turned into a junction in place, which needs only write-attributes access; the
+    backup staging row of docs/PHI.md section 2 names that residual. It is held before it is
+    checked and listed, and until the caller has emptied its files and resumes the walk (BACKLOG
+    #4992), the order :func:`_fd_walk` keeps with its descriptors.
 
     A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
     ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
