@@ -1501,7 +1501,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when the revoke declines to re-stamp it, because an earlier revoke's sweep missed it or its account's record fails its seal, when the revoke ends it in the same transaction (BACKLOG #4975 and its follow-up). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614); the count includes the caller's own session wherever the call ended it. What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -2103,7 +2103,11 @@ the same permission set on the same method reds CI until it is listed here.
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
 > by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
-> #3031).
+> #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> flag request refused for its direction. Such a row's detail carries
+> `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
+> direction (BACKLOG #3378). `POST /connections/{name}/flag` writes it for a direction of
+> `outbound`, and the web console's flag route for any direction other than `inbound`.
 > With an engine bound but not started there is no graph and no name exists. Every route still
 > checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
 > first three routes and 404 from the control routes, with no denial row. With no engine bound at
@@ -2113,10 +2117,19 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name the running graph does not have.
+> reaches the engine, which answers 409 for a name the running graph does not have. The JSON
+> route validates the body before any of this, so a direction other than `inbound` or `outbound`
+> gets a 422 there with no denial row, scoped caller or not. The web console's twin reads the
+> direction itself: for such a direction it gives a scoped caller the 403 and a denial row, and an
+> all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
+> scope, and `control_target` is unset or in it. Each rule it shows has a null `id` (BACKLOG
+> #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> connection name in it, and nothing here reliably tells a label that names one from one that
+> does not. An
+> all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is
+> shown. When it withholds at least one rule, it writes an
 > `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
 > contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
 > or a defect in `AUDIT_WRITE_DEFECTS` loses, is logged at ERROR and the read still answers. A row
@@ -4709,10 +4722,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   its own table-wide statement of the same `UPDATE ... OUTPUT` shape, so treat it as having this
   limit too. That is a reading by likeness to the per-account sweep, not one traced for the
   table-wide statement, and the lock-order bullet below does not cover its every-account lock
-  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592), with
-  at least the exception below. Each of these raises the account's session epoch in the same
-  transaction, and a rotation keeps the epoch the session was sealed under. So the gate refuses
-  and ends the session, and the user's own session list hides it and ends it the same way.
+  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592),
+  within the limits the rest of this bullet states. Each of these raises the
+  account's session epoch in the same transaction, and a rotation keeps the epoch the session was
+  sealed under. So the gate refuses and ends the session, and the user's own session list hides
+  it and ends it the same way.
   **The every-account revoke also raises the store's global session epoch, on all three stores
   (BACKLOG #5091).** Every session is stamped with that epoch when it is minted and resolves
   only while it is current, so the revoke ends a session whatever its read of the account list
@@ -4739,12 +4753,46 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the row is missing, at least these refuse with an error naming it: a read of an existing
   account's user record that a sign-in or a session check makes, and every every-account revoke.
   A request that returns before that read is refused as it would be anyway.
-  **The exception,** for every sweep this bullet names: a request from a missed session to end
-  the user's other sessions, accepted just before the sweep commits, waits for it and then stamps
-  the session with the account's new epoch, so it stays usable. Against the every-account revoke
-  that request stamps the account's epoch alone, so the session still ends. There at least a
-  second every-account revoke keeps a missed session, which needs `users:manage` and a step-up,
-  because that revoke stamps the global epoch.
+  **A revoke asked to keep a missed session does not make it usable again: it ends it**
+  (BACKLOG #4975 and its follow-up). At least two cases reach this: a request from that session to end the
+  user's other sessions, accepted just before the sweep commits, which waits for it and then runs,
+  and an every-account revoke that keeps a session an earlier sweep missed. A revoke that keeps a
+  session, the per-account one or the every-account one, stamps the new epochs onto it only when
+  it carried both epochs that revoke checks. One is its account's epoch, taken from the record the
+  raise read under the account's lock. The other is the global epoch: for the every-account revoke
+  the value its raise replaced, and for the per-account revoke, which raises no global epoch, the
+  value read in its own transaction, which it leaves on the session as it is. Where the account's
+  record fails its seal, its epoch cannot be raised and nothing is stamped; where the per-account
+  revoke finds the global epoch's row missing, nothing is checked against it and nothing is
+  stamped either, and the revoke goes on rather than roll back. **A kept session of an account
+  the revoke sweeps, which it does not stamp, is ended in the same transaction**, as the sweep
+  ends the rest, and counted with them: at least one behind on either epoch, as a missed session
+  is, and one whose account's record failed its seal. A kept session of another account, which
+  only a direct store call could name, is outside the per-account sweep and is left as it is.
+  The revoke still ends the user's other sessions, current ones included. All three stores do
+  this. Because it is ended there, a declined session no longer holds a place
+  under the session cap, and presenting it again is refused as an ended session, not reported as a
+  seal failure. **Each revoke reports whether it stamped the kept session, and whether it ended
+  it, from the transaction that did so** (`RevokeResult` in `messagefoundry/store/store.py`), and
+  the service takes "kept" from that answer and from nothing read afterwards. So a declined session
+  is not called kept, and it was in fact ended: `DELETE /sessions` answers "this session was ended
+  too" and audits scope `all`, and ending the user's other sessions audits scope `self_all`, even
+  with nothing else ended. "Kept" says what the revoke wrote, not what the gate will answer: the
+  gate's expiry checks still apply, and a later revoke can still end the session. The count in
+  the reply and the audit row of `DELETE /sessions` includes the caller's own session wherever the
+  call ended it: in the revoke, as above, or in its fallback sweep where that session failed its
+  own seal. The reply and the audit row of `DELETE /me/sessions` count only the user's other
+  sessions, wherever the caller's own ended. `tests/_session_seal_contract.py` tests the
+  per-account revoke, on a session behind on its account's epoch and on one whose account's record
+  fails its seal; `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on
+  both epochs, on one behind on its account's epoch alone and on one whose account's record fails
+  its seal; and `tests/test_b5091_global_session_epoch.py` both revokes on one behind on the global
+  epoch alone, and on SQLite only, the per-account revoke with the global epoch's row missing.
+  Each declined case sits beside a control where the kept session is current and stays live. Each runs on SQLite and on the server legs `.github/workflows/ci.yml` runs from
+  `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`. Each of those three also
+  checks the store's kept answer. `tests/test_session_seal.py` tests that the service's counts and
+  audit scope follow that answer, and that a read failing after the revoke cannot change them, and
+  `tests/test_b2614_revoke_all_route_cli.py` that both routes' replies do; both run on SQLite only.
   **A request that straddles a revoke's commit can still end the session the revoke kept, and
   reports a seal failure either way.** The gate and the session list read a session before its
   account, so such a request can see a session's old stamps beside the account's new epochs. On
@@ -5393,9 +5441,11 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
   passwordless or smartcard-only account cannot end its other sessions this way;
-- end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session, or from
-  the host with `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What
-  these and the per-account revokes above may miss: *Limits of the session sweep* under
+- end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session only when
+  the revoke re-stamps it and otherwise ends it too, or from the host with
+  `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What these and the
+  per-account revokes above may miss, and when a revoke ends the session it was asked to keep:
+  *Limits of the session sweep* under
   [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142).
 
 [CONFIGURATION.md](CONFIGURATION.md) documents each setting.
@@ -5411,8 +5461,12 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
   to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
   already hold does not unlock a terminate, and the grant is single-use.
-- **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your sessions except the current.
-  Same `session_terminate` re-proof gate.
+- **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your other sessions. The
+  current one is kept only when the revoke re-stamps it. Otherwise it is ended too, in the
+  revoke's own transaction, or, where its own seal fails, by the seal-failure handler before a
+  fallback sweep ends the rest; *Limits of the session sweep* under
+  [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says when. Same
+  `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 

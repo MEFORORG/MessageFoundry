@@ -1827,7 +1827,9 @@ class AlertRuleInfo(BaseModel):
     recipient_count: int = (
         0  # #146 — per-rule email recipients (count only; 0 = uses global email_to)
     )
-    id: str | None = None  # #138 — operator rule label ({rule_id} template var); None = unlabelled
+    # #138 — operator rule label ({rule_id} template var); None = unlabelled, or withheld from the
+    # caller (docs/SECURITY.md, GET /alerts/rules; #3378).
+    id: str | None = None
     control_action: str | None = (
         None  # #144 — restart_inbound/restart_outbound fired on match (None = none)
     )

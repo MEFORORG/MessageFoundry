@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import errno
 import functools
 import hmac
@@ -55,7 +56,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
@@ -79,6 +80,7 @@ from messagefoundry.store.backup_codec import (
 )
 from messagefoundry.store.base import (
     DbaDelegatedError,
+    StoreCipherConfigError,
     build_store_cipher,
     resolve_active_key,
     resolve_decrypt_keys,
@@ -93,17 +95,24 @@ from messagefoundry.store.cipher_cells import (
 )
 from messagefoundry.store.crypto import (
     StoreKeylessError,
+    _decode_key,
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
 from messagefoundry.transports.file import (
+    _FLAG_BACKUP_SEMANTICS,
+    _FLAG_OPEN_REPARSE_POINT,
     _NAME_SURROGATE,
+    _SHARE_ALL,
     _WIN_UNSUPPORTED,
+    _attribute_tag,
+    _fd_for,
     _handle_final_path,
     _os_handle,
     _Replaced,
     _Unconfined,
+    _win_create,
     _win_hold_dirs,
     _win_lstat,
     _win_open_file,
@@ -624,30 +633,37 @@ class BackupRunner:
         # age, so a sibling engine shard's live run survives it, and only by this account's owner:
         # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
         # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
-        # owner a new directory of this process gets, as `_process_owner` reads it. When that read
-        # answers, a volume a killed run filled is freed before this run needs room for its own
-        # directory, and a run whose open fails still sweeps. On Windows the read is itself a probe
-        # directory written in the OS temp dir: when that write fails, or a sibling's sweep removes
-        # the probe before its owner is read, it answers None, and both this sweep and the OS-temp
-        # sweep below are off for this run. The staging root is then swept only by the space check's
-        # probe below, when the run is short, and by this run's own directory's owner once it is
-        # open. Where the staging root gives a directory another owner, the space check below sweeps
-        # by that one too before it refuses. Off the loop, like the rest.
+        # owner a new entry in the staging root gets, learned by `_probe_owner` from a probe it creates
+        # and removes there, and reads through the descriptor it created, so a rename in the staging
+        # root cannot choose it. Never the process's own owner as such: on a share whose
+        # server sets the owner, a directory carrying that one may have been made by another
+        # principal (BACKLOG #4988). The probe is a write, so on a volume it cannot be created on,
+        # such as one a killed run filled, `_fallback_root_owner` keys the sweep on the process's
+        # owner only when the staging root itself carries it, which a root this account made on such
+        # a share does not. When neither answers, this sweep is off; the space check below probes once more when
+        # the run is short, and this run's own directory's owner sweeps once it is open. A run whose
+        # open fails still sweeps. Off the loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
-        early_owner = await asyncio.to_thread(_process_owner)
-        if early_owner is not None:
-            await asyncio.to_thread(_sweep_owned, staging_root, early_owner, own=None)
+        process_owner = await asyncio.to_thread(_process_owner)
+        probed = await asyncio.to_thread(_probe_owner, staging_root)
+        root_owner = probed
+        if root_owner is None:
+            root_owner = await asyncio.to_thread(_fallback_root_owner, staging_root, process_owner)
+        swept_by: list[object] = []
+        if root_owner is not None:
+            swept_by.append(root_owner)
+            await asyncio.to_thread(_sweep_owned, staging_root, root_owner, own=None)
         # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine leaves
-        # its decrypted copy there. Each backup sweeps it too, by the process's own owner: a verify
-        # this account ran there made its directory with that owner, whatever owner a share's server
-        # gives this run's staging directory.
-        await asyncio.to_thread(_sweep_os_temp, early_owner)
-        # After those sweeps, which free what dead runs left when they ran (both are off when the
-        # owner read above answered None), and before this run's directory is opened or any of its
-        # bytes is staged. It is not before every write: the owner probes, above on Windows and below
-        # on a short run, are bare directories written first. A run that cannot fit fails here with kind `space`, naming the volume, not half-way through
-        # a multi-GB write.
-        swept_by: list[object] = [] if early_owner is None else [early_owner]
+        # its decrypted copy there. Each backup sweeps it too, by the owner a new directory there
+        # gets, as `_process_owner` reads it: a verify this account ran there made its directory
+        # with that owner, whatever owner a share's server gives this run's staging directory. On
+        # Windows that read is a probe in the OS temp dir, and when it answers None this sweep is
+        # off for this run.
+        await asyncio.to_thread(_sweep_os_temp, process_owner)
+        # After those sweeps, which free what dead runs left when they ran, and before this run's
+        # directory is opened or any of its bytes is staged. It is not before every write: the
+        # owner probes, above and below on a short run, are written first. A run that cannot fit
+        # fails here with kind `space`, naming the volume, not half-way through a multi-GB write.
         shortfall = await asyncio.to_thread(
             self._space_shortfall,
             staging_root,
@@ -655,20 +671,18 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
-        if shortfall is not None:
-            # On a share whose server sets the owner, or where the early read failed, the early sweep
-            # missed what this account's killed run left, and it would refuse every later run until
-            # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
-            # removed before this returns. Only when that owner is not one a sweep above already went
-            # by, sweep by it and check once more whatever the sweep counted: a leftover it emptied
-            # but could not remove is not counted, yet frees the space. No run directory is open yet, so a refusal still leaves no lock or marker.
-            # Residuals, at least: the probe is a write, so on a volume full to the last block
-            # `mkdtemp` can fail and the refusal stands; and a sibling shard's sweep can remove a
-            # live probe before its owner is read, which answers None and skips this sweep.
-            probed = await asyncio.to_thread(_probe_owner, staging_root)
-            if probed is not None and probed not in swept_by:
-                swept_by.append(probed)
-                await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
+        if shortfall is not None and probed is None:
+            # The early probe answered None, so the early sweep may have missed what this account's
+            # killed run left, and it would refuse every later run until someone deleted it. Probe
+            # once more and, only when that owner is not one a sweep above already went by, sweep by
+            # it and check once more whatever the sweep counted: a leftover it emptied but could not
+            # remove is not counted, yet frees the space. No run directory is open yet, so a refusal
+            # still leaves no lock or marker. When this probe cannot be created either, the refusal
+            # stands.
+            again = await asyncio.to_thread(_probe_owner, staging_root)
+            if again is not None and again not in swept_by:
+                swept_by.append(again)
+                await asyncio.to_thread(_sweep_owned, staging_root, again, own=None)
                 shortfall = await asyncio.to_thread(
                     self._space_shortfall,
                     staging_root,
@@ -714,8 +728,10 @@ class BackupRunner:
         staging_leftover: str | None = None
         try:
             # Swept again by this run's own directory's owner only where no sweep above went by it,
-            # such as a share whose server sets the owner, or where the early read failed.
-            own_owner = await asyncio.to_thread(_owner_of, work.path)
+            # such as where no staging-root probe above could be created. Read from the descriptor
+            # of the lock file this run created there, never by path, so a rename in the staging
+            # root cannot choose it.
+            own_owner = await asyncio.to_thread(work.owner)
             if own_owner is None:
                 log.warning(
                     "DR staging: cannot read the owner of %s, so %s is not swept",
@@ -1393,12 +1409,10 @@ class BackupRunner:
 
     def _resolve_key(self) -> bytes | None:
         """The 32-byte store DEK via the ADR 0019 KeyProvider seam, or ``None`` (identity cipher)."""
-        import base64
-
         key_b64 = resolve_active_key(self._store_settings, posture=self._hop_posture)  # type: ignore[arg-type]
         if not key_b64:
             return None
-        return base64.b64decode(key_b64)
+        return _decode_store_key(key_b64)
 
     def _current_config_dir(self) -> Path | None:
         """The config dir this pass backs up: the constructor's value, or what its callable names
@@ -1712,7 +1726,7 @@ def _verify_archive_blocking(
             # After the key precheck, so a verify that was never going to stage pays for no scan, and
             # before the decrypt, so a dead run's plaintext is gone before this one needs the space.
             # Inside this block, so even a fault in the sweep still releases this run's directory.
-            _sweep_abandoned_staging(staging_root, owned_like=work.path)
+            _sweep_abandoned_staging(staging_root, owner=work.owner(), own=work.path)
         # A standalone verify holds the decrypted tar and the extracted store at once, each about the
         # archive's size (BACKLOG #1174, PR 1771 defect 3). The backup's own verify is covered by the
         # backup's check, which counts this peak on its staging root.
@@ -1819,9 +1833,8 @@ def _fd_walk(
     and every child is opened relative to its parent's with ``O_NOFOLLOW``. Unlike ``os.fwalk`` it
     reports every listing and open failure to ``onerror`` and walks on: a directory that will not list
     or open, or one swapped for a link after it was listed, is reported and is never the end of the
-    walk. One case is skipped silently: an entry whose ``is_dir`` raises is listed as a file, so if it
-    is a directory it is never walked, and the fail-safe's ``lstat`` of it then finds no regular file
-    and reports nothing."""
+    walk. An entry whose ``is_dir`` raises is listed as a file, so if it is a directory it is never
+    walked; the fail-safe's ``lstat`` of it then finds a directory and reports it (BACKLOG #4989)."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("the descriptor walk runs only on POSIX")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -1953,6 +1966,13 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
         return None
     except OSError:
         return name
+    # A directory here is one the walk took for a file because reading its type raised, so nothing
+    # in it was walked or emptied: report it, or the teardown would call the tree clean and raise no
+    # cleanup alert while it may still hold plaintext (BACKLOG #4989). A junction, which Windows
+    # reports as a directory, never reaches here: it names another path, so the Windows screen above
+    # skips it by its reparse tag, which `os.fstat` does not carry.
+    if stat.S_ISDIR(st.st_mode):
+        return f"{name}/ (not walked)"
     # A link is never followed: truncating through one would empty a file outside the directory, and
     # the link itself holds no plaintext.
     if not stat.S_ISREG(st.st_mode):
@@ -2042,7 +2062,7 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 #: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
-#: for :func:`_owner_of`.
+#: for :func:`_owner_of` and :func:`_names_another_path`.
 _WIN_NAME_SURROGATE = _NAME_SURROGATE
 
 # The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
@@ -2291,8 +2311,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
 _SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
-#: The bare directory :func:`_probe_owner` makes to learn the owner a new directory gets. Never a
-#: staging directory; a leaked one is empty, and the sweep removes it by ``rmdir`` alone.
+#: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file. Never a
+#: staging directory; a leaked one is empty, and the sweep removes it only while it is empty. The
+#: sweep also removes an empty probe-named directory by ``rmdir`` alone.
 _OWNER_PROBE_PREFIX = "mefor-owner-probe-"
 
 #: The server-DB staging root, a dot-prefixed directory under the backup destination.
@@ -2373,6 +2394,11 @@ class _Staging:
         self._mutex = threading.Lock()
         self._released = False
         self._claimed = False
+
+    def owner(self) -> object | None:
+        """The owner of the lock file this run created in the directory, read from its descriptor
+        (:func:`_owner_of_fd`), never by path. Called before the directory is released."""
+        return _owner_of_fd(self._fd, self.path / _LOCK_NAME)
 
     def claim(self) -> bool:
         """Called by a worker before it touches the directory. ``False`` if it is already gone."""
@@ -2701,36 +2727,395 @@ def _process_owner() -> object | None:
     without creating one in the staging root. ``None`` when it cannot be read.
 
     POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
-    directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
+    file made in the OS temp dir by :func:`_probe_owner`, since a local NTFS entry takes the token's
     default owner wherever it is made. On a share whose server sets the owner this answer differs
-    from what a directory there gets, and the backup then sweeps by its own directory's owner too.
-    On Windows this is ``None`` when the probe cannot be made, or a sibling's sweep removes it before
-    its owner is read; the backup then skips its early staging-root sweep and its OS-temp sweep."""
+    from what a directory there gets, so the backup keys its OS-temp sweep on it, and sweeps its
+    staging root by :func:`_probe_owner` of that root, or by this answer only as
+    :func:`_fallback_root_owner` allows (BACKLOG #4988). On Windows this is ``None`` when the probe
+    cannot be made; the backup then skips its OS-temp sweep."""
     if sys.platform != "win32":
         return os.geteuid()
     return _probe_owner(None)
 
 
-def _probe_owner(root: Path | None) -> object | None:
-    """The owner a directory this process makes under ``root`` gets, as :func:`_owner_of` reports
-    it, learned by making a bare ``mefor-owner-probe-*`` directory there and removing it. ``None``
-    for the OS temp dir; ``None`` returned when the probe cannot be made or its owner read, and
-    nothing is created when ``root`` does not exist.
+@functools.cache
+def _win_api() -> Any:
+    """``kernel32`` with the prototypes the Windows owner probe uses (:func:`_win_create_owner_probe`,
+    :func:`_win_sd_as_sddl`). The staging fail-safe's opens go through ``transports/file.py``'s own
+    helpers instead (BACKLOG #4992)."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    from ctypes import wintypes
 
-    The probe holds no file, no lock and no marker, so it is never a staging directory. One whose
-    removal fails is left empty, and the next sweep of that root by its owner removes it
-    (:func:`_sweep_owned`).
-    A sibling shard's sweep can remove a probe before its owner is read here; that answers ``None``,
-    and the caller only skips a sweep."""
-    try:
-        probe = Path(tempfile.mkdtemp(prefix=_OWNER_PROBE_PREFIX, dir=root))
-    except OSError:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    return kernel32
+
+
+@functools.cache
+def _win_security_api() -> Any:
+    """``advapi32`` with the prototypes :func:`_win_owner_of_handle` uses."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    pvoid_p = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.c_void_p,
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        pvoid_p,
+        ctypes.c_void_p,
+    ]
+    return advapi32
+
+
+def _win_sd_as_sddl(descriptor: Any, info: int) -> str | None:
+    """The ``info`` parts of the security descriptor ``descriptor`` as SDDL, or ``None`` (logged)
+    when it cannot be rendered."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    from ctypes import wintypes
+
+    text = wintypes.LPWSTR()
+    if not _win_security_api().ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor, 1, info, ctypes.byref(text), None
+    ):
+        log.warning(
+            "DR staging: a security descriptor could not be rendered as SDDL: Win32 status %d",
+            ctypes.get_last_error(),
+        )
         return None
     try:
-        return _owner_of(probe)
+        return text.value
     finally:
-        with contextlib.suppress(OSError):
-            probe.rmdir()
+        _win_api().LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _win_handle_sddl(handle: int, info: int) -> str | None:
+    """The ``info`` parts of the security descriptor of the object open as ``handle``, read with
+    ``GetSecurityInfo`` on the handle, never by path, as SDDL. ``None`` (logged) when it cannot be
+    read. The handle needs ``READ_CONTROL``."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    descriptor = ctypes.c_void_p()
+    status = _win_security_api().GetSecurityInfo(
+        handle,
+        1,  # SE_FILE_OBJECT
+        info,
+        None,
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        log.warning("DR staging: GetSecurityInfo could not read a handle: Win32 status %d", status)
+        return None
+    try:
+        return _win_sd_as_sddl(descriptor, info)
+    finally:
+        _win_api().LocalFree(descriptor)
+
+
+def _win_owner_of_handle(handle: int) -> object | None:
+    """The owner SID of the object open as ``handle``, read with ``GetSecurityInfo`` on the handle,
+    never by path, in the form :func:`_owner_of` reports (SDDL, aliases resolved), so the two compare.
+    ``None`` when it cannot be read. The handle needs ``READ_CONTROL``."""
+    return _owner_from_sddl(_win_handle_sddl(handle, 0x00000001))  # OWNER_SECURITY_INFORMATION
+
+
+def _owner_from_sddl(sddl: str | None) -> object | None:
+    """The owner SID an SDDL string names, aliases resolved, so :func:`_owner_of` and
+    :func:`_owner_of_fd` answer in one form. ``None`` when it names none."""
+    from messagefoundry.store.store import _SDDL_OWNER, _resolve_sid
+
+    found = _SDDL_OWNER.search(sddl) if sddl else None
+    return _resolve_sid(found.group(1)) if found else None
+
+
+@contextlib.contextmanager
+def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
+    """Create an empty ``mefor-owner-probe-*`` file under ``root`` (the OS temp dir when ``None``)
+    with ``O_CREAT | O_EXCL``, yield its descriptor and path, and remove it on exit. A test seam.
+    Raises ``OSError`` on entry when it cannot be created.
+
+    POSIX: ``mkstemp``, removed on exit by name only when, at a check just before, its name still
+    names the object it created: after a rename swap the name holds someone else's object, which is
+    theirs to remove. A swap between that check and the unlink can still remove the swapped-in
+    object. A removal that fails is logged and left for the next sweep. Windows:
+    :func:`_win_create_owner_probe`, created with a protected access list and opened
+    delete-on-close, so the file is deleted when its handle closes, wherever a rename has put it by
+    then, and nothing is ever removed by its name."""
+    if sys.platform == "win32":
+        fd, probe = _win_create_owner_probe(Path(tempfile.gettempdir()) if root is None else root)
+        try:
+            yield fd, probe
+        finally:
+            os.close(fd)
+        return
+    fd, name = tempfile.mkstemp(prefix=_OWNER_PROBE_PREFIX, dir=root)
+    try:
+        yield fd, Path(name)
+    finally:
+        try:
+            made, named = os.fstat(fd), os.lstat(name)
+            if (made.st_dev, made.st_ino) == (named.st_dev, named.st_ino):
+                os.unlink(name)
+        except FileNotFoundError:
+            pass  # a sibling's sweep, or a rename, already took the name
+        except OSError as exc:
+            log.warning("DR staging: could not remove owner probe %s: %s", name, safe_exc(exc))
+        os.close(fd)
+
+
+def _win_create_owner_probe(directory: Path) -> tuple[int, Path]:
+    """Create the Windows owner probe under ``directory`` and return a descriptor owning its handle,
+    and its path. Raises ``OSError`` when it cannot be created as asked.
+
+    The probe carries, from the ``CreateFileW`` call that creates it, the protected access list
+    :mod:`messagefoundry.restricted_file` writes on a key file: full control for SYSTEM,
+    Administrators and the creating account, and nothing inherited from ``directory``. So no access
+    entry inherited from the staging root gives another account ``WRITE_OWNER`` on it, and none can
+    re-own it before its owner is read and choose the owner the sweep goes by (BACKLOG #4988). The
+    list is read back from the handle before the probe is used, and a probe whose list is not
+    protected, or is not exactly the list the create asked for, as on a server that does not
+    apply the list a create asks for, is closed and refused. ``CREATE_NEW`` with
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name already taken, by a file or by a link, and
+    ``FILE_FLAG_DELETE_ON_CLOSE`` deletes the probe when the handle closes, wherever a rename has
+    put it by then."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows owner probe runs only on Windows")
+    import msvcrt
+    from ctypes import wintypes
+
+    from messagefoundry.config.wiring import _win32_config_source_probes
+    from messagefoundry.restricted_file import _expected_access, _protected_sddl
+    from messagefoundry.store.store import _parse_sddl_dacl
+
+    self_sid = _win32_config_source_probes().self_sid
+    if self_sid is None:
+        raise OSError("this process's own account could not be read, so no probe was made")
+    advapi32, kernel32 = _win_security_api(), _win_api()
+    dacl_info = 0x00000004  # DACL_SECURITY_INFORMATION
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = (
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        )
+
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        _protected_sddl(_expected_access(self_sid, ())), 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # The list as Windows renders it, so the read-back below compares like with like.
+        rendered = _win_sd_as_sddl(descriptor, dacl_info)
+        asked = _parse_sddl_dacl(rendered) if rendered is not None else None
+        if asked is None:
+            raise OSError("the probe's access list could not be built")
+        attributes = _SecurityAttributes(
+            ctypes.sizeof(_SecurityAttributes), descriptor.value, False
+        )
+        for _attempt in range(100):
+            probe = directory / f"{_OWNER_PROBE_PREFIX}{os.urandom(8).hex()}"
+            handle = kernel32.CreateFileW(
+                str(probe),
+                0x00020000 | 0x00010000,  # READ_CONTROL, for the owner read; DELETE, for the close
+                0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                ctypes.byref(attributes),
+                1,  # CREATE_NEW
+                # FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE
+                0x00000100 | _FLAG_OPEN_REPARSE_POINT | 0x04000000,
+                None,
+            )
+            if handle is not None and handle != ctypes.c_void_p(-1).value:
+                break
+            error = ctypes.get_last_error()
+            if error not in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS: another name
+                raise ctypes.WinError(error)
+        else:
+            raise FileExistsError(f"no free owner probe name under {directory}")
+    finally:
+        kernel32.LocalFree(descriptor)
+    try:
+        sddl = _win_handle_sddl(handle, dacl_info)
+        got = _parse_sddl_dacl(sddl) if sddl is not None else None
+        if got is None or not got.protected or set(got.aces) != set(asked.aces):
+            raise OSError(
+                f"owner probe in {directory} does not carry the protected access list it was "
+                "created with, so its owner is not read"
+            )
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY), probe
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _probe_owner(root: Path | None) -> object | None:
+    """The owner a new entry this process makes under ``root`` gets, as :func:`_owner_of` reports
+    it, learned from a ``mefor-owner-probe-*`` file made there (:func:`_owner_probe`) and removed
+    again. ``root`` ``None`` is the OS temp dir. ``None`` when the probe cannot be created or its
+    owner read; nothing is created when ``root`` does not exist.
+
+    The owner is read from the descriptor that created the probe (:func:`_owner_of_fd`): ``fstat`` on
+    POSIX, ``GetSecurityInfo`` on its handle on Windows. It is never read by path, so an account that
+    can rename entries in ``root`` cannot swap another object in at its name and choose the answer;
+    nor can a sibling engine shard's sweep removing it first. An empty file needs no data block, so
+    it can often be created on a volume full to the last block, though not on one out of inodes or
+    MFT records (BACKLOG #4988).
+
+    The probe holds no lock and no marker, so it is never a staging directory. One whose removal
+    fails is left empty, and the next sweep of that root by its owner removes it
+    (:func:`_sweep_owned`)."""
+    owner: object | None = None
+    try:
+        with _owner_probe(root) as (fd, name):
+            owner = _owner_of_fd(fd, name)
+    except FileNotFoundError:
+        pass  # no such root (or no temp dir): nothing to probe, and nothing to sweep there
+    except OSError as exc:
+        # The probe's creation, or its close once the owner was read, which keeps that owner.
+        # `_owner_of_fd` itself never raises.
+        log.warning(
+            "DR staging: owner probe in %s failed: %s",
+            "the OS temp dir" if root is None else root,
+            safe_exc(exc),
+        )
+    return owner
+
+
+def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
+    """The owner of the object open as ``fd``, read from the descriptor, never by path: ``fstat`` on
+    POSIX, ``GetSecurityInfo`` on its handle on Windows, in the form :func:`_owner_of` reports.
+    ``None`` when it cannot be read.
+
+    ``opened_as`` is the path ``fd`` was opened at. It is never read here: it is the seam a test's
+    stand-in for a share whose server sets the owner keys on, as it keys :func:`_owner_of` on a
+    path."""
+    del opened_as
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            return _win_owner_of_handle(msvcrt.get_osfhandle(fd))
+        except OSError as exc:
+            log.warning("DR staging: could not read an owner from a handle: %s", safe_exc(exc))
+            return None
+    try:
+        return os.fstat(fd).st_uid
+    except OSError as exc:
+        log.warning("DR staging: could not read an owner from a descriptor: %s", safe_exc(exc))
+        return None
+
+
+def _open_for_owner(root: Path) -> int:
+    """Open the directory ``root`` for :func:`_owner_of_fd` and return a descriptor. POSIX follows a
+    link, as the sweep and the staging open do. Windows opens a link or junction as itself, with
+    ``READ_CONTROL`` and ``FILE_READ_ATTRIBUTES``, so the caller can refuse it."""
+    if sys.platform == "win32":
+        # READ_CONTROL | FILE_READ_ATTRIBUTES, through `transports/file.py`'s own open; its
+        # FILE_FLAG_BACKUP_SEMANTICS lets a directory open at all.
+        return _fd_for(
+            _win_create(
+                root,
+                0x00020000 | 0x00000080,
+                _SHARE_ALL,
+                _FLAG_OPEN_REPARSE_POINT | _FLAG_BACKUP_SEMANTICS,
+            )
+        )
+    return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+def _names_another_path(fd: int) -> bool:
+    """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
+    symbolic link or a junction opened as itself. Always ``False`` on POSIX, where the caller's open
+    follows a link as the sweep does."""
+    if sys.platform != "win32":
+        return False
+    attributes, tag = _attribute_tag(_os_handle(fd))
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _WIN_NAME_SURROGATE)
+
+
+def _fallback_root_owner(root: Path, process: object | None) -> object | None:
+    """The owner the backup's early staging-root sweep goes by when :func:`_probe_owner` of ``root``
+    answers ``None``, such as on a volume a killed run filled: ``process``, the process's own owner
+    as :func:`_process_owner` reads it, and only when ``root`` itself carries that owner. ``None``
+    otherwise, and the early sweep is then off. A root that does not exist answers ``None`` with no
+    log line, since there is nothing to sweep; any other refused probe is logged at WARNING.
+
+    The gate is what keeps BACKLOG #4988 closed. On a share whose server sets the owner, what this
+    account makes there, its staging root among it, carries the server's choice, so the gate fails
+    and no directory carrying the process's own owner, which another principal may have made there,
+    is swept by it. Where a new entry gets the process's owner, a root this account made carries it,
+    so the sweep frees a killed run's leftover before the space check, as it did before the probe.
+    The root is opened (:func:`_open_for_owner`) and its owner read from that descriptor; on Windows
+    a link or junction root is refused, as :func:`_owner_of` refuses one. What the gate leaves open
+    is listed once, in docs/PHI.md section 2's staging row."""
+    if not os.path.isdir(root):
+        return None
+    log.warning(
+        "DR staging: could not learn the owner a new entry in %s gets from a probe there", root
+    )
+    if process is None:
+        return None
+    try:
+        fd = _open_for_owner(root)
+    except OSError as exc:
+        log.warning(
+            "DR staging: could not open staging root %s to read its owner: %s", root, safe_exc(exc)
+        )
+        return None
+    try:
+        if _names_another_path(fd):
+            log.warning(
+                "DR staging: staging root %s is a link or junction; its owner is not read", root
+            )
+            return None
+        return process if _owner_of_fd(fd, root) == process else None
+    except OSError as exc:
+        log.warning(
+            "DR staging: could not read the owner of staging root %s: %s", root, safe_exc(exc)
+        )
+        return None
+    finally:
+        os.close(fd)
 
 
 def _owner_of(path: Path) -> object | None:
@@ -2752,14 +3137,12 @@ def _owner_of(path: Path) -> object | None:
         return None
     if sys.platform != "win32":
         return st.st_uid
-    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl, _resolve_sid
+    from messagefoundry.store.store import _read_dacl_sddl
 
-    sddl = _read_dacl_sddl(path, owner=True)
-    found = _SDDL_OWNER.search(sddl) if sddl else None
-    return _resolve_sid(found.group(1)) if found else None
+    return _owner_from_sddl(_read_dacl_sddl(path, owner=True))
 
 
-def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
+def _sweep_abandoned_staging(root: Path, *, owner: object | None, own: Path) -> int:
     """Remove the staging directories under ``root`` that a dead run left behind. Never raises.
 
     A directory is removed only when its lock file exists, its lock can be taken, and it holds the
@@ -2768,18 +3151,24 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     its lock, and a directory with no lock or no marker has not had plaintext written to it. Age is
     never consulted. Returns how many directories were removed.
 
-    ``owned_like`` names a directory this run just created, and only a directory with its owner is a
-    candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
-    standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
+    ``own`` names a directory this run just created, left alone, and only a directory with ``owner``
+    is a candidate; nothing is swept when ``owner`` is ``None``, an owner that could not be read. It
+    is required (BACKLOG #2420). A standalone verify passes, for the OS temp dir, which can be
+    shared, :meth:`_Staging.owner` of its own directory: the owner of the lock file it created
+    there, read from its descriptor, never by path, so a rename in ``root`` cannot choose it
+    (BACKLOG #4988). A backup sweeps both the OS
     temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
-    with :func:`_sweep_owned` by the same rule, keyed on the process's own owner. Another account
-    could plant a directory in either holding a lock file and a marker, and the teardown must never
-    run on a tree it controls."""
-    owner = _owner_of(owned_like)
+    with :func:`_sweep_owned` by the same rule: the staging root keyed on the owner a probe there
+    gets (:func:`_probe_owner`), or on the process's owner only as :func:`_fallback_root_owner`
+    allows, and the OS temp dir on :func:`_process_owner`.
+    Another account could plant a directory in either holding a lock file and a marker, and the
+    teardown must never run on a tree it controls."""
     if owner is None:
-        log.warning("DR staging: cannot read the owner of %s, so %s is not swept", owned_like, root)
+        log.warning(
+            "DR staging: this run's owner for %s could not be read, so %s is not swept", own, root
+        )
         return 0
-    return _sweep_owned(root, owner, own=owned_like)
+    return _sweep_owned(root, owner, own=own)
 
 
 def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
@@ -2797,16 +3186,32 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         probe = entry.name.startswith(_OWNER_PROBE_PREFIX)
         if not probe and not entry.name.startswith(_SWEPT_PREFIXES):
             continue
+        path = Path(entry.path)
         try:
+            if probe and entry.is_file(follow_symlinks=False):
+                # A probe file `_probe_owner` failed to remove. Only an empty one with this
+                # owner goes, and `unlink` removes the name itself, never what a link names.
+                st = entry.stat(follow_symlinks=False)
+                if st.st_size == 0 and _owner_of(path) == owner:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        log.warning(
+                            "DR staging: could not remove leaked owner probe %s: %s",
+                            path,
+                            safe_exc(exc),
+                        )
+                continue
             if not entry.is_dir(follow_symlinks=False) or os.path.isjunction(entry.path):
                 continue
         except OSError:
             continue
-        path = Path(entry.path)
         if path == own:
             continue  # this run's own directory, held live
         if probe:
-            # A probe `_probe_owner` failed to remove. `rmdir` alone, which refuses a directory that
+            # A probe-named directory. `rmdir` alone, which refuses a directory that
             # holds anything and never follows a link, so nothing but an empty directory goes.
             if _owner_of(path) == owner:
                 with contextlib.suppress(OSError):
@@ -2966,6 +3371,26 @@ def _verify_in_staging(
     )
 
 
+def _decode_store_key(key_b64: str) -> bytes:
+    """One base64 store key as the 32 bytes it names, by the rule ``open_store`` applies.
+
+    A key that is not strict base64 of 32 bytes raises :class:`StoreCipherConfigError`, which the
+    ``restore-verify`` and ``restore`` commands report as "could not start" and exit 2, and a backup
+    run records as a failed backup (BACKLOG #4878). Its text is the decoder's fixed sentence. The
+    decoder, ``_decode_key``, already raises its ``ValueError`` with no chain (BACKLOG #3471); this
+    wrapper changes only the type, so the callers' ``StoreCipherConfigError`` handling reaches it,
+    and raises outside the handler so the new error carries no chain either."""
+    try:
+        decoded = _decode_key(key_b64, "a store encryption key")
+    except ValueError as exc:
+        reason = str(exc)
+    else:
+        key = bytes(decoded)
+        decoded[:] = bytes(len(decoded))  # best effort: the decoder's copy exists to be wiped
+        return key
+    raise StoreCipherConfigError(reason)
+
+
 async def run_restore_verify(
     archive_path: str,
     *,
@@ -2983,8 +3408,6 @@ async def run_restore_verify(
     ``allow_unencrypted`` (``[backup].allow_unencrypted``, default off) mirrors the write-side fail-closed:
     with it off, a plaintext archive is refused (``KEY_MISMATCH``) when a store key is configured (ASVS
     5.2.3 downgrade guard)."""
-    import base64
-
     # The decrypt-capable keyring, NOT just the active key: a backup taken under a key that has since
     # been retired (a routine WP-5 rotation) must still verify, or ADR 0048's cold-seed activation would
     # falsely refuse a perfectly recoverable archive (AC-5: compare to the resolved key, incl. retired).
@@ -2992,7 +3415,7 @@ async def run_restore_verify(
     # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
     # command holds none, and `None` counts as enforcing on that hop.
     keys = [
-        base64.b64decode(k)
+        _decode_store_key(k)
         for k in resolve_decrypt_keys(
             store_settings,  # type: ignore[arg-type]
             posture=posture,
@@ -3606,10 +4029,8 @@ async def run_restore(
     so the refusal's own remedy (*"set [backup].allow_unencrypted"*) named a setting this path does not
     read — a prescription an operator would have followed to no effect. The parameter is gone and the
     refusal now says the true thing: a plaintext archive restores only on a box with no store key."""
-    import base64
-
     keys = [
-        base64.b64decode(k)
+        _decode_store_key(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
     return await asyncio.to_thread(

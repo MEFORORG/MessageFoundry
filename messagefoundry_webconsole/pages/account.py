@@ -593,7 +593,9 @@ def reauth_continue(next_path: str, label: str) -> Markup:
 
 
 def _revoke_others_form(label: str) -> Markup:
-    """The one form that signs out every session but this one; it keeps the current session."""
+    """The one form that signs out every session but this one; the revoke keeps the current session
+    only when it re-stamps it, and otherwise ends it too (docs/SECURITY.md, *Limits of the session
+    sweep*)."""
     return el(
         "form",
         el("button", label, type="submit"),
@@ -609,10 +611,10 @@ def _session_offer(others: int) -> Markup:
     ``others`` is how many sessions the revoke would end: every other session of the caller not yet
     signed out, one that has gone idle included (BACKLOG #3393), as read after the factor change.
     At least a sign-in, the reaper or another revoke before the click can still move it. The form
-    posts to the same route as the sessions page's *Sign out everywhere
-    else*, which keeps the current session. That route asks for a fresh re-proof, bound to the
-    action, and then runs (ASVS 7.5.2). Declining is doing nothing: no session ends unless the
-    caller asks."""
+    posts to the same route as the sessions page's *Sign out everywhere else*, which keeps the
+    current session only when the revoke re-stamps it. That route asks for a fresh re-proof, bound
+    to the action, and then runs (ASVS 7.5.2). Declining is doing nothing: no session ends unless
+    the caller asks."""
     if not others:
         return Markup("")  # nothing to end, as on the sessions page
     return el(

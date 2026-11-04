@@ -92,6 +92,7 @@ __all__ = [
     "HopDisposition",
     "HopPosture",
     "InsecureHopRefused",
+    "StoreTlsRefused",
     "is_vault_hop_refusal",
     "vault_hop_refusal_text",
     "RevocationHopGuard",
@@ -2122,6 +2123,30 @@ class InsecureHopRefused(ValueError):
     A ``ValueError`` subclass so it flows through the existing connector-construction error handling
     (the loader / ``build_check`` surfaces a ``ValueError`` as a ``WiringError``/422 at ``messagefoundry
     check`` / dry-run / reload) with no new except-arms needed."""
+
+
+class StoreTlsRefused(InsecureHopRefused):
+    """The store open refused the engine-to-store hop's own TLS settings (BACKLOG #5000). At
+    least: a weakened hop (``trust_server_certificate`` on or ``encrypt`` off) the escape does not
+    cover, on either server backend; a SQL Server ``[store].ssl_root_cert`` pin the engine must not
+    send, its trust-anchor checks included; and a ``ValueError`` the PostgreSQL store's TLS context
+    builder raises at the open, such as an unreadable pin file or a CRL file that cannot be judged.
+    Raised before the store dials. The PostgreSQL pool's per-connection rebuild does not raise it.
+
+    Typed so a command can tell "could not start" from its other errors. It was a bare
+    ``ValueError``, which reached the CLI's dispatch floor and exited 1, the code ``audit-verify``
+    reserves for a broken chain. An :class:`InsecureHopRefused`, so every handler that already
+    reports a refused store hop reports this too, and still a ``ValueError`` for every caller
+    that caught it as one.
+
+    Its text names the setting, the file's path and the fix, and reads no value from the server.
+    The SQL Server and weakened-hop texts are the engine's own. The PostgreSQL wrap carries the
+    context builder's ``ValueError`` text whole, which can quote the ``ssl`` or ``cryptography``
+    library's message and what was read from the operator's pin or CRL file, such as its dates.
+    Where that ``ValueError`` is, holds or was raised from a codec error, the wrap carries a fixed
+    text instead and no chain, so the byte it met is not quoted (the PostgreSQL store's
+    ``_verifying_context_at_open``). Print it through ``codec_safe_str``, as
+    ``_open_store_or_refuse`` in the CLI does."""
 
 
 #: The module that defines the Vault hop's marked refusal; see :func:`is_vault_hop_refusal`.
