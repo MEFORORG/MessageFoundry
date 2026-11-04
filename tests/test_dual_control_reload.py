@@ -33,7 +33,6 @@ from fastapi import HTTPException
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import (
-    _REFUSAL_LOG_LIMIT,
     _audit_refused_reload,
     _audit_reload_attempt,
     _compare_start_config,
@@ -1141,8 +1140,10 @@ async def test_an_invalid_config_refusal_cannot_forge_a_log_line_and_keeps_its_f
 
 
 async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixture) -> None:
-    """The lifted cut is a larger bound, not none: an error past _REFUSAL_LOG_LIMIT is cut, so one
+    """The lifted cut is a larger bound, not none: an error past REFUSAL_LOG_LIMIT is cut, so one
     refusal cannot write a 64 KiB line for every handler to re-scan on the event loop."""
+    from messagefoundry.redaction import REFUSAL_LOG_LIMIT
+
     error = WiringError(" ".join(f"word-{i:05d}" for i in range(2000)))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         await _audit_refused_reload(
@@ -1151,7 +1152,7 @@ async def test_a_refusal_warning_is_still_bounded(caplog: pytest.LogCaptureFixtu
     [warning] = _refusal_warnings(caplog)
     assert "word-00300" in warning  # well past the old 200-character cut
     assert "word-01999" not in warning
-    assert len(warning) < _REFUSAL_LOG_LIMIT + 200
+    assert len(warning) < REFUSAL_LOG_LIMIT + 200
 
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
@@ -1987,27 +1988,37 @@ async def test_a_policy_refusal_then_a_directory_moved_away_says_not_reached_rel
     ]
 
 
-async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
-    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The directory's own owner and DACL read failed because its share could not be reached
-    (Win32 53), and the directory then stopped listing: ``unreadable``, as a share lost at the
-    walk's listing is, not a source the check could not vet (#3535, vault BACKLOG #5248)."""
+def _lose_the_share_at_the_access_read(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> list[bool]:
+    """Answer ``cfg``'s own Windows owner and DACL read with Win32 53, a share Windows cannot reach,
+    and fail every listing of ``cfg`` from then on. Returns a flag list, true once that read ran."""
     from messagefoundry.config import wiring
 
-    cfg = (tmp_path / "cfg").resolve()
-    lost = False
+    lost = [False]
 
     def _read_path(path: Path) -> Any:
-        nonlocal lost
-        if path.name == "cfg":
-            lost = True
+        if path.name == cfg.name:
+            lost[0] = True
             return wiring._WinPathSecurity(status=53)
         return _CLEAN_READ
 
     probes = wiring._WinConfigSourceProbes(
         self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
     )
+    monkeypatch.setattr(
+        wiring,
+        "_check_trusted_paths",
+        functools.partial(wiring._enforce_windows_paths, probes=probes),
+    )
+    _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost[0], answers_is_dir=True)
+    return lost
+
+
+async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own owner and DACL read failed because its share could not be reached
+    (Win32 53), and the directory then stopped listing: ``unreadable``, as a share lost at the
+    walk's listing is, not a source the check could not vet (#3535, vault BACKLOG #5248)."""
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
@@ -2015,17 +2026,34 @@ async def test_a_share_lost_at_the_windows_access_read_is_audited_unreadable(
         # The strict read already failed, as test_a_directory_lost_after_the_target_check_is_not_
         # audited_as_missing_inline has it, so the load reads lax.
         monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
-        monkeypatch.setattr(
-            wiring,
-            "_check_trusted_paths",
-            functools.partial(wiring._enforce_windows_paths, probes=probes),
-        )
-        _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost, answers_is_dir=True)
+        lost = _lose_the_share_at_the_access_read(monkeypatch, (tmp_path / "cfg").resolve())
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
-    assert lost, "the directory's own read never ran, so nothing was measured"
+    assert lost[0], "the directory's own read never ran, so nothing was measured"
     assert r.status_code == 422, r.text
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+async def test_a_share_lost_at_the_windows_access_read_is_digest_unavailable_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same fault on a release: its strict read raises the listing fault, so the release is
+    refused as ``digest_unavailable``, as a share lost at the walk's listing is, not
+    ``invalid_config`` with the digest check ``not_reached`` (#3535, vault BACKLOG #5248)."""
+    installed: list[list[bool]] = []
+    service = await _service(engine)
+    _, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: installed.append(
+            _lose_the_share_at_the_access_read(monkeypatch, (tmp_path / "cfg").resolve())
+        ),
+    )
+    monkeypatch.undo()
+    assert installed and installed[0][0], "the directory's own read never ran"
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
 
 
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_released(

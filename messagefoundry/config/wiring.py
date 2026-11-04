@@ -101,6 +101,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.config.snapshot import (
+    _UNREACHABLE_WINERRORS,
     ConfigDirMissing,
     ConfigSnapshot,
     config_py_files,
@@ -122,7 +123,13 @@ from messagefoundry.exception_origin import (
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.redaction import _BUILTIN_EXC_RENDERS, _class_attribute, safe_exc, safe_name
+from messagefoundry.redaction import (
+    _BUILTIN_EXC_RENDERS,
+    REFUSAL_LOG_LIMIT,
+    _class_attribute,
+    safe_exc,
+    safe_name,
+)
 from messagefoundry.secretscrub import (
     _QUERY_NAME_SEPARATORS,
     _QUERY_NOT_CREDENTIAL_TAILS,
@@ -8217,16 +8224,6 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
 #: How every config-source refusal of a load begins.
 _CONFIG_SOURCE_LEAD = "refusing to load config from"
 
-#: The ``safe_exc`` bound on a logged refusal: a config-source refusal the load answers some other
-#: way, and the API's reload refusals, which import it. ``safe_exc``'s default 200-character cut
-#: dropped the directory from a long config path, the fix from a long WiringError, and the clamped
-#: escape's text. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
-#: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
-#: bounds how much redaction-missed text one line carries and what each handler's filters re-scan on
-#: the event loop. ``safe_exc`` redacts before the cut. The bound is on the text BEFORE
-#: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
-#: times over. The cut keeps the head, so an error longer than this still loses its tail.
-_REFUSAL_LOG_LIMIT: Final = 8192
 
 #: The folder Python's source loader reads compiled modules from. A matching cache file there runs
 #: in place of the source beside it, so whoever can write it changes the code a load runs.
@@ -8760,7 +8757,16 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
         # Judged again, outside the handler so its raise carries no __context__: a directory that
         # cannot be listed refuses as unreadable, and one gone as missing (vault BACKLOG #5248). A
         # fault deeper in it, such as in its code-set folder, is the refusal below.
-        _require_config_dir(directory, strict=False)
+        try:
+            _require_config_dir(directory, strict=False)
+        except (OSError, WiringError):
+            # ConfigDirMissing and ConfigDirUnlistable each replace the walk's fault: log it.
+            _logger.warning(
+                "config directory %s failed its listing after its trust walk could not vet it: %s",
+                scrub_log_argument(str(directory)),
+                scrub_log_argument(safe_exc(unvetted, limit=REFUSAL_LOG_LIMIT)),
+            )
+            raise
         raise WiringError(
             f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(unvetted)}"
         ) from unvetted
@@ -9116,9 +9122,10 @@ _WIN_PATH_GONE_ERRORS = frozenset({2, 3})
 
 #: The read failures of the config directory's own owner and DACL that say nothing about its policy,
 #: only that the directory was not there to read: gone (2, 3), or on a share Windows cannot reach,
-#: ERROR_BAD_NETPATH (53) and ERROR_BAD_NET_NAME (67). :func:`_assert_safe_config_source` alone may
-#: answer such a refusal from a listing of the directory (vault BACKLOG #5248, #3535).
-_WIN_CONFIG_DIR_UNREACHED_ERRORS = _WIN_PATH_GONE_ERRORS | frozenset({53, 67})
+#: the errors a listing reads the same way (``_UNREACHABLE_WINERRORS``: 53 and 67).
+#: :func:`_assert_safe_config_source` alone may answer such a refusal from a listing of the
+#: directory (vault BACKLOG #5248, #3535).
+_WIN_CONFIG_DIR_UNREACHED_ERRORS = _WIN_PATH_GONE_ERRORS | _UNREACHABLE_WINERRORS
 
 
 class _ConfigDirUnreached(WiringError):
@@ -9133,7 +9140,11 @@ def _refuse_unreached_config_dir(refuse: Callable[[str], None], message: str) ->
     try:
         refuse(message)
     except WiringError as exc:
-        raise _ConfigDirUnreached(str(exc)) from None
+        refusal = exc
+    else:
+        return
+    # Outside the handler, so the marked copy carries no __context__: it is the same refusal.
+    raise _ConfigDirUnreached(str(refusal))
 
 
 @dataclass(frozen=True, slots=True)
@@ -9745,12 +9756,13 @@ def _assert_safe_config_source(directory: Path) -> None:
         # ConfigDirMissing included. The read never reached the directory's policy, so the listing
         # answers what the read could not; this refusal is logged rather than lost.
         _logger.warning(
-            "config directory %s cannot be listed after its trust check refused it: %s",
+            "config directory %s failed its listing after its trust check refused it: %s",
             scrub_log_argument(str(directory)),
-            scrub_log_argument(safe_exc(refusal, limit=_REFUSAL_LOG_LIMIT)),
+            scrub_log_argument(safe_exc(refusal, limit=REFUSAL_LOG_LIMIT)),
         )
         raise
-    raise refusal
+    # As a plain WiringError, so a log that names the refusal's type names a public one.
+    raise WiringError(str(refusal))
 
 
 def _check_trusted_paths(
