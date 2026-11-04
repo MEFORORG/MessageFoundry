@@ -954,7 +954,7 @@ def _label_fits_every_backend(label: str) -> bool:
     UTF-8, and no wider than :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing any of these
     would fail the write on every resend. The length test comes first, so a long sender-controlled
     label is never copied to be measured."""
-    if "\x00" in label or len(label) > _ATTACHMENT_CONTENT_TYPE_MAX:
+    if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
         return False
     try:
         label.encode("utf-8")
@@ -8332,11 +8332,12 @@ class RegistryRunner:
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
-                # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619).
+                # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
+                # tested first so an over-long label is never copied by the MIME check.
                 safe_ct = content_type
-                if not attachment_mime_agrees(
+                if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
                     content_type, b64_head(verbatim_b64)
-                ) or not _label_fits_every_backend(content_type):
+                ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 fault: str | None = None
                 try:
