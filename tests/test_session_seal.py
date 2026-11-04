@@ -291,7 +291,7 @@ async def test_a_kept_session_a_sweep_missed_is_not_reported_kept(
     raw = _raw_for(path)
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
 
     async def missed() -> str:
@@ -370,7 +370,7 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
     store, path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
 
     async def mint() -> str:
@@ -455,7 +455,7 @@ async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(
     store, _path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     caller = mint_token()
     await store.create_session(
