@@ -82,8 +82,11 @@ def split_generic_server(server: str) -> tuple[str, str]:
     """Split a generic-dialect ``server`` into its host and the text after a port separator, which
     is ``""`` when it carries none and is not necessarily a port (:func:`port_or_zero` decides).
 
-    ``host,port`` (the SQL Server spelling), ``host:port``, and ``[v6]:port`` are split. A bare IPv6
-    literal carries more than one colon and is left whole."""
+    ``host:port`` and ``[v6]:port`` are split. A bare IPv6 literal carries more than one colon and
+    is left whole. A comma is NOT split on (BACKLOG #4874): libpq reads a comma in a host as a list
+    of hosts, so the text before it need not be the only host dialled. Both callers deal with a
+    comma before they get here: the egress reading refuses it, and :func:`generic_hop_endpoint`
+    reads the whole text as the host."""
     host = server.strip()
     in_server = ""
     if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
@@ -91,8 +94,6 @@ def split_generic_server(server: str) -> tuple[str, str]:
         if close != -1:
             host, rest = host[1:close], host[close + 1 :]
             in_server = rest[1:] if rest.startswith(":") else ""
-    elif "," in host:  # the SQL-Server-style "host,port"
-        host, _, in_server = host.partition(",")
     elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
         host, _, in_server = host.partition(":")
     return host.strip(), in_server.strip()
@@ -103,9 +104,9 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
 
     The loopback carve-out is decided on the HOST alone and
     :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` never resolves DNS, so a
-    ``host,port`` / ``host:port`` / ``[v6]:port`` suffix has to come off first: left on,
-    ``"127.0.0.1,5432"`` parses as a name rather than an address, is treated as remote, and a genuinely
-    on-box dev hop is refused.
+    ``host:port`` / ``[v6]:port`` suffix has to come off first: left on, ``"127.0.0.1:5432"``
+    parses as a name rather than an address, is treated as remote, and a genuinely on-box dev hop
+    is refused.
 
     A port the ``server`` string does not carry is read from the documented generic ``PORT`` keyword,
     and falls back to 0 when neither says. In the hop guard the port is report-only: it never changes
@@ -115,11 +116,22 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
     are the ones :func:`database_dial_endpoint` reads for ``[egress].allowed_db``, through
     :func:`split_generic_server` and :func:`port_or_zero`. A change to either changes what that
     allowlist admits, so it is reviewed as a change to a control, not to a log line. This function
-    alone reads a port in the ``server`` text; the egress reading refuses such a ``server``."""
-    host, in_server = split_generic_server(server)
+    alone reads a port in the ``server`` text; the egress reading refuses such a ``server``.
+
+    **A ``server`` holding a comma anywhere is read whole, as the host** (BACKLOG #4874). libpq
+    reads a comma in a host as a list of hosts, so ``127.0.0.1,remote``, ``[::1]:5432,remote`` and
+    ``127.0.0.1,5432`` each name a host after the comma, the last one the host ``5432``. The whole
+    text is never an address or ``localhost``, so the loopback check reads it as remote. Before
+    this, the host was the text before the first comma, so such a value counted as on-box under
+    the empty-allowlist opt-out. Put the port in the ``PORT`` keyword, as the egress reading's
+    remedy says."""
+    keyword = str(odbc_param(params, "port") or "")
+    text = server.strip()
+    if "," in text:
+        return text, port_or_zero(keyword)
+    host, in_server = split_generic_server(text)
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
-    keyword = str(odbc_param(params, "port") or "")
     return host, port_or_zero(in_server) or port_or_zero(keyword)
 
 

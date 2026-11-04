@@ -2068,6 +2068,13 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > unchanged. `cleartext_accepted` is an outbound-only declaration, so a `DatabasePoll` inbound's only
 > per-connection relaxation is `tls_hop_attested` with a `tls_hop_attested_reason`, for a hop secured by
 > other means. Otherwise set a verifying TLS mode, or run at `[security].enforcement = warn`.
+>
+> The on-box carve-out reads the host from `server` without resolving it. **A `server` holding a
+> comma anywhere is read whole, as a remote host** (BACKLOG #4874): libpq reads a comma in a host
+> as a list of hosts, so `127.0.0.1,remote` names `remote` too, and `127.0.0.1,5432` names a host
+> `5432`. Before this, the guard read the host from the text before the first comma, so such a
+> value counted as on-box. Name one host in `server` and put the port in the `PORT` keyword, as
+> the `[egress].allowed_db` check already requires.
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe

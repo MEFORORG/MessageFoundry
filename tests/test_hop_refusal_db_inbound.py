@@ -692,15 +692,40 @@ def test_sqlserver_preset_is_untouched_by_the_generic_gate() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "server", ["localhost", "127.0.0.1", "127.0.0.1,5432", "127.0.0.1:5432", "[::1]:5432"]
-)
+@pytest.mark.parametrize("server", ["localhost", "127.0.0.1", "127.0.0.1:5432", "[::1]:5432"])
 def test_generic_loopback_hop_allowed(server: str) -> None:
     # An on-box hop puts no byte on a network. Every port-suffix spelling is here because
     # is_loopback_hop_host never resolves DNS: a suffix left on the host reads as a name, is treated
     # as remote, and would refuse a genuinely on-box dev hop.
     with active_hop_posture(PROD_PHI):
         assert DatabaseDestination(_generic_dest(server=server))
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "127.0.0.1,remote.example",
+        "localhost,remote.example",
+        "[::1],remote.example",
+        "[::1]:5432,remote.example",
+        "127.0.0.1,5432,remote.example",
+        "127.0.0.1,5432",
+        "::1,remote.example",
+    ],
+)
+@pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)
+def test_generic_server_with_a_comma_is_not_on_box(
+    server: str, connector: Callable[[Any], object], config: Callable[..., Any]
+) -> None:
+    """BACKLOG #4874. libpq reads a comma in a host as a list of hosts, so a ``server`` that starts
+    with a loopback address can still name a remote host after the comma. The guard read loopback
+    from the first comma element, so each of these crossed with no TLS keyword on an enforcing
+    instance. Red on the previous head. The control is the first element alone, which is on-box."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        connector(config(server=server))
+    first = server.split(",")[0]
+    with active_hop_posture(PROD_PHI):
+        assert connector(config(server=first))
 
 
 def test_generic_attestation_allows_and_is_audited(caplog: pytest.LogCaptureFixture) -> None:
@@ -780,7 +805,10 @@ def test_generic_guard_is_none_off_the_arm() -> None:
     [
         ("db.example", {}, ("db.example", 0)),
         ("db.example", {"PORT": "5432"}, ("db.example", 5432)),
-        ("db.example,1521", {"PORT": "5432"}, ("db.example", 1521)),  # the server suffix wins
+        # BACKLOG #4874: a comma can name a second host, so the whole text is the host.
+        ("db.example,1521", {"PORT": "5432"}, ("db.example,1521", 5432)),
+        ("127.0.0.1,remote.example", {}, ("127.0.0.1,remote.example", 0)),
+        ("[::1]:5432,remote.example", {}, ("[::1]:5432,remote.example", 0)),
         ("127.0.0.1:5432", {}, ("127.0.0.1", 5432)),
         ("[::1]:5432", {}, ("::1", 5432)),
         ("[fe80::1]", {}, ("fe80::1", 0)),
@@ -789,8 +817,8 @@ def test_generic_guard_is_none_off_the_arm() -> None:
         ("db.example", {"PORT": "9" * 4400}, ("db.example", 0)),  # no int() digit-limit crash
         # ONE definition of "is this a port": an unusable suffix falls through to the keyword rather
         # than swallowing the question, so both lookups agree on what counts.
-        ("db.example,notaport", {"PORT": "5432"}, ("db.example", 5432)),
-        ("db.example,999999", {"PORT": "5432"}, ("db.example", 5432)),
+        ("db.example:notaport", {"PORT": "5432"}, ("db.example", 5432)),
+        ("db.example:999999", {"PORT": "5432"}, ("db.example", 5432)),
     ],
 )
 def test_generic_hop_endpoint_splits(
