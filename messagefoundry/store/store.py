@@ -6277,8 +6277,13 @@ _OWNER_ONLY = stat.S_IRUSR | stat.S_IWUSR  # 0o600
 
 
 def _current_user() -> str | None:
-    """The current OS user for an owner-only DACL, with a fallback when ``%USERNAME%`` is empty
-    (some NSSM/service contexts) — ``getpass.getuser`` consults the process token, not just env."""
+    """The current OS user for an owner-only DACL: ``%USERNAME%``, or when that is empty (some
+    NSSM/service contexts) ``getpass.getuser``. That reads ``LOGNAME``, ``USER``, ``LNAME`` and
+    ``USERNAME`` from the environment, in that order; on Windows it has no ``pwd`` database to fall
+    back on, so with none of them set it raises ``OSError`` and this returns ``None``. So on
+    Windows, the one platform :func:`_secure_file` calls this on, every source is an environment
+    variable, never the process token, and an inherited or overridden variable names whoever it
+    says."""
     user = os.environ.get("USERNAME")
     if user:
         return user
