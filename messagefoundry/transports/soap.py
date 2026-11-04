@@ -142,9 +142,12 @@ _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
 _WSSE_FAULT_RE = re.compile(
     r"FailedAuthentication|InvalidSecurityToken|MessageExpired", re.IGNORECASE
 )
-# SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>.
-_FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
-_CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+# SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>. Only the start tag's
+# NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
+# from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
+# its length. _code_text finds the same `>` and `</` with str.find, once, from the leftmost name.
+_FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
+_CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
 # A <…:Header> element (any/no namespace prefix) smuggled into a <Body> fragment (purity-leak lint).
 _HEADER_EL_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Header[\s/>]", re.IGNORECASE)
 
@@ -167,10 +170,28 @@ _ENV_OPEN = (
 )
 
 
+def _code_text(name_re: re.Pattern[str], body: str) -> str | None:
+    """The text from the first ``name_re`` start tag's ``>`` to the next ``</``, or ``None``.
+
+    The same capture the former ``name[^>]*>(.*?)</`` DOTALL search returned. Only the leftmost name
+    match can be its answer: a later start tag's ``>`` is no earlier than this one's, so if this one
+    has no ``>`` or no ``</`` after it, no later one has either."""
+    m = name_re.search(body)
+    if m is None:
+        return None
+    gt = body.find(">", m.end())
+    if gt < 0:
+        return None
+    close = body.find("</", gt + 1)
+    return None if close < 0 else body[gt + 1 : close]
+
+
 def _fault_code(body: str) -> str:
     """The fault code text (e.g. ``soap:Client`` / ``soap:Receiver``), SOAP 1.1 or 1.2, or ``""``."""
-    m = _FAULTCODE_RE.search(body) or _CODEVALUE_RE.search(body)
-    return m.group(1) if m else ""
+    code = _code_text(_FAULTCODE_RE, body)
+    if code is None:
+        code = _code_text(_CODEVALUE_RE, body)
+    return code or ""
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:
@@ -778,11 +799,7 @@ class SoapDestination(DestinationConnector):
         # so the wire (and any detached JWS over those bytes) carries the secret while the store still
         # holds only the token. No-op / byte-identical when no body_secrets are configured.
         payload = self._apply_body_secrets(payload)
-        body, status, headers = await asyncio.to_thread(self._post, payload)
-        # A fault can arrive inside a 2xx body, so classify it. Transport-level faults (non-2xx,
-        # URL/timeout) already raised inside _post, for both modes. Classify the RAW reply — a partner
-        # fault names none of OUR secrets, and _WSSE_FAULT_RE must see the unscrubbed text.
-        failure = _classify_soap(status, body)
+        body, status, headers, failure = await asyncio.to_thread(self._post_and_classify, payload)
         if not self.capture_response:
             if failure is not None:
                 raise failure  # byte-identical: a 2xx <Fault> still dead-letters/retries
@@ -854,6 +871,19 @@ class SoapDestination(DestinationConnector):
             raise DeliveryError(
                 f"SOAP {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
             ) from exc
+
+    def _post_and_classify(
+        self, payload: str
+    ) -> tuple[str, int, dict[str, str], DeliveryError | None]:
+        """:meth:`_post`, then the 2xx reply's classification, both in the caller's worker thread.
+
+        A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
+        (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
+        classified: a partner fault names none of OUR secrets, and _WSSE_FAULT_RE must see the
+        unscrubbed text. BACKLOG #2827: the scan reads up to the 16 MiB reply cap, so it stays off
+        the event loop, as the non-2xx scan inside _post already was."""
+        body, status, headers = self._post(payload)
+        return body, status, headers, _classify_soap(status, body)
 
     def _post(self, payload: str) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
