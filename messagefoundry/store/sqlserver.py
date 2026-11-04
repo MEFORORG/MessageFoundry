@@ -5575,7 +5575,9 @@ class SqlServerStore:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
         ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
         :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
-        statement and the rollback bounds, so none can be set without the others."""
+        statement and the rollback bounds, so none can be set without the others; a shorter
+        ``[store].command_timeout`` still ends the statement first, and bounds neither of the
+        other two."""
         if timeout_clamp is None:
             borrow, statement_timeout, floored_clamp = self._acquire(), None, None
         else:
@@ -5640,10 +5642,11 @@ class SqlServerStore:
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
         it discards the connection, so a claim's open ``HOLDLOCK`` transaction is never lent to the
         next borrower. A failed claim can therefore hold the caller's ``_leadership_lock`` for up to
-        about three times the clamp, plus a COMMIT, the cursor's creation and its close, none of which
-        anything here bounds. The bound frees the lock, not the server: a discarded session keeps its
-        open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until its close lands or the
-        server ends it, and the timed-out rollback keeps its executor thread until the driver returns."""
+        about three times the clamp, plus at least a COMMIT, the cursor's creation and its close,
+        none of which anything here bounds. The bound frees the lock, not the server: a discarded
+        session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
+        its close lands or the server ends it, and the timed-out rollback keeps its executor thread
+        until the driver returns."""
         rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 
