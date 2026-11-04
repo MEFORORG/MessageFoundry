@@ -259,6 +259,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | an `odbc_params` TLS mode that verifies the server, such as psqlODBC `SSLmode=verify-full` or MySQL `SSLMODE=VERIFY_IDENTITY` (*connection-scoped*; inbound **and** outbound). The engine cannot check that a mode verifies; its gate refuses only a missing or no-TLS mode |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
+| | `ech_sidecar` | no `ech_egress`, or an `https://` sidecar, on every `REST` outbound (*connection-scoped*; an `http://` sidecar is the loosening, named as `ech_sidecar`) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
@@ -1925,6 +1926,43 @@ count is above `0` (vault BACKLOG #2613).
   serve-time loosening warning, which fires before the graph is loaded, exactly as for
   `cleartext_accepted`. `messagefoundry security show` and a graphless `GET /security/posture`
   cannot see it either, and say so in `loosenings_scope`.
+
+### `ech_sidecar` at an `http://` URL — the hop to the ECH sidecar is cleartext
+> **Connection-scoped:** a `REST` outbound that sets `ech_egress` and points `ech_sidecar` at an
+> `http://` listener. The keys are raw settings, written code-first as
+> [`samples/ech-sidecar/README.md`](../samples/ech-sidecar/README.md) shows. ADR 0139.
+- **What you lose:** the engine sends each request to the sidecar over cleartext http on this host,
+  and the sidecar does the TLS to the partner. That hop carries the request body and every request
+  header, any credential included. On a SMART or OAuth2 connection the token-endpoint request takes
+  the same hop, with its client credential. A process on this host that can capture loopback
+  traffic, or that binds the sidecar's port first, reads all of it.
+- **What you keep:** the sidecar must be a loopback address. A sidecar anywhere else is refused at
+  build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
+  `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
+  it.
+- **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
+  normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
+  `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
+  `url`.
+- **The fix:** run the sidecar's listener on `https://`, which encrypts the hop and takes it off
+  this list. The two hops verify the listener's certificate against different stores. The delivery
+  request reads the operating system's trust store alone, not the connection's `tls_ca_file` or
+  the `[tls]` policy. On a SMART or OAuth2 connection the token-endpoint request reads the anchor
+  its token URL resolves to, the connection's `tls_ca_file` included. So the certificate must name
+  the loopback host the URL uses and chain to a CA every hop that takes it reads.
+- **It is never silent:** a WARNING at every construction naming the connection, never a header
+  value; an `ech-sidecar-cleartext` line in `messagefoundry check` naming every such connection;
+  and an `ech_sidecar` entry in `security_loosenings()`, which `GET /security/posture` shows. The
+  last two read one list. It leaves out a sidecar the build refuses, but it reads only
+  `ech_egress` and `ech_sidecar`, so a connection the build refuses for another reason, such as a
+  `proxy_url` beside them, can still be on it. An `env()` value is
+  resolved where the reader has the instance's values: `GET /security/posture` on a running engine
+  does, and `messagefoundry check` does not. One it cannot resolve is listed, marked possibly,
+  unless the other key alone rules the hop out, as a literal `https://` sidecar does. A
+  `deployed = false` connection with an `env()` value is left off, because it is never built.
+- **Where it is NOT reported:** the serve-time loosening warning, which fires before the graph is
+  loaded, exactly as for `cleartext_accepted`. `messagefoundry security show` and a graphless
+  `GET /security/posture` cannot see it either, and say so in `loosenings_scope`.
 
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an

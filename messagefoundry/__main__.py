@@ -3306,6 +3306,7 @@ def _serve(args: argparse.Namespace) -> int:
         attested_hops=(),
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
+        ech_cleartext_sidecar_hops=(),
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
@@ -3326,7 +3327,9 @@ def _serve(args: argparse.Namespace) -> int:
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, tls_check_hostname, "
             "url_query_credential, "
             "generic-ODBC "
-            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173) and FHIR update_url_form declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
+            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
+            "loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -12585,6 +12588,7 @@ def _security(args: argparse.Namespace) -> int:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
+                ech_cleartext_sidecar_hops=(),
                 api=_api,
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
@@ -12626,7 +12630,8 @@ def _security(args: argparse.Namespace) -> int:
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "
             "tls_hop_attested, "
-            "tls_revocation_attested and FHIR update_url_form declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
+            "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+            "NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
             "reading, its start-up reading (launch flags, start-up code, writable site "
