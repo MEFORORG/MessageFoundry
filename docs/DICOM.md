@@ -103,11 +103,14 @@ there never starts one.
 **After that, each PDU has a deadline too.** The SCP reads a PDU's header and then its body, and
 each read has `timeout_seconds`, however slowly the bytes arrive. A peer that stops part way through
 a PDU is ended there. This is a deadline per read, not per object, so at the default 30 seconds a
-sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second.
-Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. A peer that keeps finishing
-PDUs is not ended by this, and pynetdicom's idle timer restarts on each PDU; the deadline for each
-message, below, is what ends one that never finishes its message. Each send has a `timeout_seconds` deadline for the whole send too, so a
-peer that stops reading, or reads a little at a time, is ended. Once the SCP is stopping, a send has
+sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second
+within each PDU. Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. The
+deadline for each message, below, sets a far higher one for a whole object: it has
+`timeout_seconds` plus its size at 64 KiB a second, so a large object has to arrive at nearly that.
+A peer that keeps finishing PDUs is not ended by the per-read deadline, and pynetdicom's idle timer
+restarts on each PDU; the deadline for each message is what ends one that never finishes its
+message. Each send has a `timeout_seconds` deadline for the whole send too, so a peer that stops
+reading, or reads a little at a time, is ended. Once the SCP is stopping, a send has
 at most 1.5 seconds more, so that the status for an object committed as the stop began still goes
 out.
 `timeout_seconds` has to be at least 1 second, since it is a deadline on every read and send and a
