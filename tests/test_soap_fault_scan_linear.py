@@ -52,7 +52,8 @@ def _old_fault_code(body: str, fault: object = None) -> str:
 
 
 # The reference reading: the old patterns, run on the text between the first Fault start tag after
-# the first Body start tag (or anywhere, with no Body start tag) and the Fault's close tag, the
+# the first Body start tag (or anywhere, with no Body start tag or no Fault after it) and the
+# Fault's close tag, the
 # earlier of the two names taken, with an element that cannot hold a code read as empty. It reuses
 # the production close-tag and nested-tag patterns, so it re-checks the str.find bounds and
 # captures, not those patterns; the named shapes pin what they read.
@@ -66,7 +67,7 @@ _REF_START_TAG_RE = re.compile(r"[^>]*>")
 
 def _ref_fault_code(body: str) -> str:
     in_body = _REF_BODY_RE.search(body)
-    if in_body is not None:
+    if in_body is not None and _REF_FAULT_RE.search(in_body.group(1)):
         body = in_body.group(1)
     fault = _REF_FAULT_RE.search(body)
     if fault is None:
@@ -309,13 +310,6 @@ _BEFORE_THE_BODY = {
         "soap-sender",
         "transient",
     ),
-    # With no Fault in the Body, a 2xx reply is delivered.
-    "header-fault-only": (
-        "<soap:Envelope><soap:Header><x:Fault/></soap:Header><soap:Body><m:Ack>ok</m:Ack>"
-        "</soap:Body></soap:Envelope>",
-        "delivered",
-        "soap-fault",
-    ),
 }
 
 
@@ -343,20 +337,53 @@ def test_the_fault_is_read_from_the_body(
     assert _outcome(_classify_soap(200, body)) == unanchored
 
 
+_NO_FAULT_AFTER_THE_BODY = {
+    # A Fault reply with no envelope, and a Body-named element in its detail.
+    "body-in-the-fault-detail": (
+        "<soap:Fault><faultcode>soap:Client</faultcode><detail><Body>x</Body></detail></soap:Fault>",
+        "soap-sender",
+    ),
+    "body-in-a-wsse-fault-detail": (
+        "<soap:Fault><faultcode>wsse:FailedAuthentication</faultcode><detail><x:body >x</x:body>"
+        "</detail></soap:Fault>",
+        "wssecurity",
+    ),
+    # A Fault only before the Body still reads as one.
+    "header-fault-only": (
+        "<soap:Envelope><soap:Header><x:Fault/></soap:Header><soap:Body><m:Ack>ok</m:Ack>"
+        "</soap:Body></soap:Envelope>",
+        "soap-fault",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("body", "outcome"), list(_NO_FAULT_AFTER_THE_BODY.values()), ids=list(_NO_FAULT_AFTER_THE_BODY)
+)
+def test_with_no_fault_after_the_body_the_whole_reply_is_read(body: str, outcome: str) -> None:
+    """Even on HTTP 200, so a rejection is never recorded as delivered. Control: no Fault follows
+    the first Body start tag, so the search from there alone would find none."""
+    body_tag = soap._BODY_RE.search(body)
+    assert body_tag is not None and soap._FAULT_RE.search(body, body_tag.end()) is None
+    assert _outcome(_classify_soap(200, body)) == outcome
+
+
 #: Fragments a random reply is built from: the delimiters the scan looks for, the names, legal and
 #: illegal prefixes, whitespace, and text.
 _FRAGMENTS = (
     "<", ">", "</", "/>", " ", "\n", "faultcode", "FaultCode", "Value", "VALUE", "Fault",
     "soap:", "SOAP-ENV:", "a.b:", ":", "x", "Client", "Receiver", '"', "'", "=", "<!--", "-->",
-    "<![CDATA[", "]]>", "faultcodes", "Values", "Body",
+    "<![CDATA[", "]]>", "faultcodes", "Values", "Body", "<x:Body>",
 )  # fmt: skip
 #: What goes before the Body: the fragments, and Fault-named elements the Body anchor must skip.
 _HEAD_FRAGMENTS = _FRAGMENTS + ("<x:Fault>", "<x:Fault/>", "</x:Fault>", "<!-- <Fault/> -->")
-#: Each envelope's text before its head fragments, and from there to its Fault's first child.
+#: Each envelope's text before its head fragments, and from there to its Fault's first child. The
+#: last has no envelope, so a Body-named fragment after its Fault comes after the Fault.
 _ENVELOPES = (
     ("<soap:Envelope><soap:Header>", "</soap:Header><soap:Body><soap:Fault>"),
     ("<env:Envelope>", "<env:Body ><env:Fault><env:Code>"),
     ("<Envelope><Header>", "</Header><Body><Fault><Code>"),
+    ("", "<soap:Fault>"),
 )
 #: A code element's start tag and its own close tag, around random fragments.
 _CODE_ELEMENTS = (
@@ -388,21 +415,25 @@ def test_random_replies_yield_the_reference_reading() -> None:
     """The argument is in ``_fault_code``'s docstring; this samples it against the regex reference.
     Seeded, so a failure replays.
 
-    Each reply opens an Envelope, a Body, a Fault and a code element, so the floors below hold: at
-    least a fifth of the replies yield a code, and at least one in twenty reads differently when the
-    Fault is searched for from the reply's start. Without them a sample of bodies that yield no
-    code, or that never reach the anchor, would pass any extraction (the seeded sample read about 60%
-    and 10% on 2026-11-04)."""
+    Each reply opens a Fault and a code element, most of them inside an Envelope and a Body, so the
+    floors below hold: at least a fifth of the replies yield a code, at least one in twenty reads
+    differently when the Fault is searched for from the reply's start, and at least one in fifty
+    has a Body start tag with no Fault after it. Without them a sample of bodies that yield no
+    code, or that never reach the anchor or its fallback, would pass any extraction (the seeded
+    sample read about 54%, 6.8% and 4.5% on 2026-11-04)."""
     rng = random.Random(2827)
-    total, with_a_code, anchored = 5_000, 0, 0
+    total, with_a_code, anchored, fallback = 5_000, 0, 0, 0
     for _ in range(total):
         body = _random_reply(rng)
         code = _fault_code(body)
         assert code == _ref_fault_code(body), repr(body)
         with_a_code += bool(code)
         anchored += code != _fault_code(body, soap._FAULT_RE.search(body))
+        body_tag = soap._BODY_RE.search(body)
+        fallback += body_tag is not None and not soap._FAULT_RE.search(body, body_tag.end())
     assert with_a_code >= total // 5, f"only {with_a_code} of {total} replies yield a code"
     assert anchored >= total // 20, f"the Body anchor decided only {anchored} of {total} replies"
+    assert fallback >= total // 50, f"only {fallback} of {total} replies had no Fault after a Body"
 
 
 # --- linear growth, with a positive control -----------------------------------------------------
@@ -435,6 +466,10 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     # Body that holds the Fault.
     "long-prefixes-before-the-body": lambda k: ("<" + "a." * 50) * (k // 101) + "<Body><Fault>",
     "lt-run-before-the-body": lambda k: "<" * k + "<Body><Fault><faultcode>",
+    # The fallback when no Fault follows the Body: the search after it, then the one before it.
+    "lt-runs-around-a-trailing-body": lambda k: (
+        "<Fault>" + "<" * (k // 2) + "<Body>" + "<" * (k // 2)
+    ),
 }
 
 

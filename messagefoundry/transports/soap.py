@@ -205,15 +205,21 @@ def _code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -
 
 def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
     """The first ``_FAULT_RE`` match from where the fault searches start, and that start: the end of
-    the first ``_BODY_RE`` match, or ``0``, the whole reply, when there is none.
+    the first ``_BODY_RE`` match where a Fault follows it, else ``0``, the whole reply.
 
     BACKLOG #2827: so a Fault-named element before the Body, in the Header or a comment say, does
     not decide the class of the Body's fault. The first Body start tag is taken even when it sits in
-    a comment or a CDATA section. With no Body start tag the reply is searched whole, as it was
-    before the anchor."""
+    a comment, a CDATA section or the Header. With no Body start tag, or no Fault after it, the
+    reply is searched whole, as it was before the anchor: a Fault reply with no envelope may carry a
+    Body-named element in its detail, and a Fault found only before the Body still reads as one."""
     m = _BODY_RE.search(body)
-    start = 0 if m is None else m.end()
-    return _FAULT_RE.search(body, start), start
+    if m is not None:
+        fault = _FAULT_RE.search(body, m.end())
+        if fault is not None:
+            return fault, m.end()
+        # Any Fault is before the Body start tag, so the whole-reply search need not pass it again.
+        return _FAULT_RE.search(body, 0, m.start()), 0
+    return _FAULT_RE.search(body), 0
 
 
 def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
@@ -256,7 +262,8 @@ def _classify_soap(status: int, body: str) -> DeliveryError | None:
     fault, start = _find_fault(body)
     if fault:
         code = _fault_code(body, fault)
-        if _WSSE_FAULT_RE.search(code) or _WSSE_FAULT_RE.search(body, start):
+        # The code is a slice of the reply after start, so this search covers it too.
+        if _WSSE_FAULT_RE.search(body, start):
             return NegativeAckError(
                 f"WS-Security fault (HTTP {status})", code="wssecurity", permanent=True
             )
