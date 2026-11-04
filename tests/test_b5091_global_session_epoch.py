@@ -83,7 +83,7 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
 
     # --- an account whose record fails its seal at the revoke keeps its own epoch --------------
     await raw("UPDATE users SET authz_seal=? WHERE id=?", ("mfseal:v1:b5091:bogus", erin))
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(kept)) >= 2
+    assert (await store.revoke_all_sessions(except_token_hash=hash_token(kept))).count >= 2
     erin_raw = await store.get_user(erin)
     assert erin_raw is not None and erin_raw.session_epoch == erin_before.session_epoch
 
@@ -119,6 +119,64 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
     assert await service.identity_for_token(later) is not None  # control: the record verifies
     assert [r.token_hash for r in await service.list_sessions(erin)] == [hash_token(later)]
     assert await service.identity_for_token(failing) is None
+
+    # --- a kept session behind on the global epoch alone is not stamped back (BACKLOG #4975) ----
+    # Its account is put back beside it, so its account epoch is current and only the global
+    # epoch has moved past it: a re-stamp that checked the account epoch alone would revive it.
+    frank = f"b5091-f-{run}"
+    await _user(store, frank)
+    behind = await _mint(store, frank)
+    frank_before = await store.get_user(frank)
+    behind_before = await store.get_session(hash_token(behind))
+    assert frank_before is not None and frank_before.row is not None
+    assert behind_before is not None
+    assert (await store.revoke_all_sessions()).count >= 1
+    await _put_back_account(raw, frank_before.row)
+    await _put_back_session(raw, behind, behind_before.seal)
+    replayed = await store.get_session(hash_token(behind))
+    restored = await store.get_user(frank)
+    assert replayed is not None and restored is not None
+    assert replayed.user_epoch == restored.session_epoch  # current on its account's epoch...
+    assert replayed.global_epoch == restored.global_session_epoch - 1  # ...one global epoch behind
+    assert not (await store.revoke_all_sessions(except_token_hash=hash_token(behind))).kept
+    left = await store.get_session(hash_token(behind))
+    assert left is not None and left.revoked_at is None
+    assert (left.user_epoch, left.global_epoch) == (
+        behind_before.user_epoch,
+        behind_before.global_epoch,
+    )  # not re-stamped with either new epoch
+    assert await service.identity_for_token(behind) is None
+    # Control: a current session, kept by a revoke of the same shape run after it, is stamped
+    # with both new epochs.
+    current = await _mint(store, frank)
+    assert (await store.revoke_all_sessions(except_token_hash=hash_token(current))).kept
+    stamped = await store.get_session(hash_token(current))
+    frank_after = await store.get_user(frank)
+    assert stamped is not None and frank_after is not None
+    assert stamped.user_epoch == frank_after.session_epoch
+    assert stamped.global_epoch == frank_after.global_session_epoch
+    assert await service.identity_for_token(current) is not None
+
+    # --- the per-account revoke on a session behind on the global epoch alone (BACKLOG #4975) --
+    # It raises and checks the account's epoch only, so it stamps the new account epoch and
+    # leaves the old global stamp: the session is still refused. It does stamp the session, so it
+    # reports it kept: ``kept`` says what the revoke wrote, not what the gate will answer.
+    lagging = await _mint(store, frank)
+    account_before = await store.get_user(frank)
+    lagging_before = await store.get_session(hash_token(lagging))
+    assert account_before is not None and account_before.row is not None
+    assert lagging_before is not None
+    assert (await store.revoke_all_sessions()).count >= 1
+    await _put_back_account(raw, account_before.row)
+    await _put_back_session(raw, lagging, lagging_before.seal)
+    assert (await store.revoke_user_sessions(frank, except_token_hash=hash_token(lagging))).kept
+    left = await store.get_session(hash_token(lagging))
+    account_now = await store.get_user(frank)
+    assert left is not None and left.revoked_at is None and account_now is not None
+    assert left.user_epoch == account_now.session_epoch == account_before.session_epoch + 1
+    assert left.global_epoch == lagging_before.global_epoch  # the global stamp is left
+    assert left.global_epoch == account_now.global_session_epoch - 1
+    assert await service.identity_for_token(lagging) is None
 
 
 async def assert_revoke_all_races_sign_ins(

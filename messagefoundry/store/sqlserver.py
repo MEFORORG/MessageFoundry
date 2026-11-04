@@ -74,13 +74,14 @@ from messagefoundry.config.settings import (
     StoreSettings,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
+from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
 from messagefoundry.odbc_call_gate import call_gate as _call_gate
 from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
 from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
 from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
+from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -99,6 +100,7 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreNotFoundError,
     acquire_pooled,
+    driver_sqlstate,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -210,6 +212,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -237,11 +240,15 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EpochBump,
+    EpochRaise,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
+    KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -264,6 +271,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -310,6 +318,7 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     global_epoch_or_refuse,
+    global_epoch_raise,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -436,9 +445,11 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
     """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
 
     A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open
-    transaction and its locks on the server -- after a failed audit rollback, an open audit INSERT
-    and the audit applock -- and an operator whose writes are timing out needs a line that points
-    at it (BACKLOG #1940)."""
+    transaction and its locks on the server, and an operator whose writes are timing out needs a
+    line that points at it (BACKLOG #1940). Whose transaction depends on the discard, which is any
+    :func:`_detach_connection` names: for example the failed work's after a rollback that failed or
+    ran past its bound (:meth:`SqlServerStore._rollback_or_discard`), or a failed schema batch's,
+    which may hold the schema applock."""
     if not fut.cancelled() and fut.exception() is not None:
         log.warning(
             "sqlserver: detached close of a discarded connection failed; the server may hold its"
@@ -450,9 +461,11 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
 
-    The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
-    quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
-    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`).
+    The one detach sequence every discard uses (BACKLOG #1940, engine PR 1722 defect 5), at least:
+    the quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
+    discard after a rollback that failed or ran past its bound
+    (:meth:`SqlServerStore._rollback_or_discard`), whether of an audit append, a lease claim or
+    another write, and the discards after a failed schema batch and a failed LOCK_TIMEOUT reset.
 
     **The first write is the guarantee, and nothing here awaits.** aioodbc derives
     ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
@@ -478,11 +491,13 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     try:
         closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
     except RuntimeError:  # the executor is shut down; see the docstring
+        # No traceback at WARNING: a discard runs inside the failed call's except arm, so one would
+        # chain that call's driver error, whose text can quote stored values (BACKLOG #5066).
         log.warning(
             "sqlserver: could not schedule the close of a discarded connection; it is out of the"
-            " pool and closes when collected",
-            exc_info=True,
+            " pool and closes when collected"
         )
+        log.debug("sqlserver: the refused close's traceback", exc_info=True)
         return None
     closer.add_done_callback(_drain_detached_close)
     return closer
@@ -2819,8 +2834,9 @@ def _live_indexes_sql(count: int) -> str:
 def check_pinned_certificate(
     settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
 ) -> None:
-    """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
-    the setting. A no-op when the store sends no pin.
+    """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises
+    :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, a ``ValueError``, naming the
+    setting (BACKLOG #5000). A no-op when the store sends no pin.
 
     Vault BACKLOG #2223: the pinned file is the connection's only trust anchor, because of what a
     pin match does under ``Encrypt=strict``. The ``ssl_root_cert`` row of ``docs/CONFIGURATION.md``
@@ -2863,7 +2879,7 @@ def check_pinned_certificate(
     path = spec.path
     # The anchor checks read the whole file, so a file too large for a pin is refused first.
     if (too_large := oversized_pin_reason(path)) is not None:
-        raise ValueError(f"[store].ssl_root_cert {path!r} {too_large}")
+        raise StoreTlsRefused(f"[store].ssl_root_cert {path!r} {too_large}")
     checked: bytes | str  # the bytes the anchor checks read, or the refusal
     try:
         enforcing = posture is None or posture.enforcing
@@ -2879,20 +2895,20 @@ def check_pinned_certificate(
         # The store open does not guard a FIFO or an endless device: such a read can block or never end.
         checked = f"[store].ssl_root_cert {path!r} could not be read: the engine ran out of memory"
     if isinstance(checked, str):  # raised outside the handler, so no chained parser text
-        raise ValueError(checked)
+        raise StoreTlsRefused(checked)
     cert = pinned_server_certificate(checked)
     if isinstance(cert, str):
-        raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
+        raise StoreTlsRefused(f"[store].ssl_root_cert {path!r} {cert}")
     moment = time.time() if now is None else now
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
     if moment > not_after.timestamp():
-        raise ValueError(
+        raise StoreTlsRefused(
             f"[store].ssl_root_cert {path!r}: the pinned certificate expired at "
             f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
             "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
         )
     if moment < not_before.timestamp():
-        raise ValueError(
+        raise StoreTlsRefused(
             f"[store].ssl_root_cert {path!r}: the pinned certificate is not valid until "
             f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
             "refuses a pin outside its validity period."
@@ -2923,7 +2939,7 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # STRICT verify-off cell (no gradient warn-and-cross) and keeps NO second escape.
     weakened = settings.trust_server_certificate or not settings.encrypt
     if weakened and not weakened_tls_escape_permitted(posture):
-        raise ValueError(
+        raise StoreTlsRefused(
             "SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
             "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
@@ -2971,7 +2987,8 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     WHY THE STORE NEEDS ITS OWN. aioodbc runs EVERY pyodbc call through
     ``loop.run_in_executor(self._executor, ...)`` and passes ``executor=None`` unless told otherwise, so
     by default every connection in this pool shares the event loop's DEFAULT ThreadPoolExecutor. CPython
-    sizes that at ``min(32, cpu_count + 4)`` -- eight threads on a four-vCPU runner -- and that width is
+    sizes that at ``min(32, (os.process_cpu_count() or 1) + 4)`` -- eight threads on a runner whose
+    process may use four CPUs -- and that width is
     INDEPENDENT of ``[store].pool_size``. So the configured pool silently cannot exceed the loop default.
 
     WHY THAT DEADLOCKS RATHER THAN MERELY THROTTLING, which is the part worth keeping. A write like
@@ -5430,22 +5447,40 @@ class SqlServerStore:
             # Not logged here: _drain_detached_close, on the closer, already logged it at WARNING.
             return
 
-    async def _rollback_or_discard(self, conn: Any) -> None:
-        """Roll back a failed audit append; if that rollback fails too, discard the connection.
+    async def _rollback_or_discard(self, conn: Any, *, within: float | None = None) -> None:
+        """Roll back a failed transaction; if that rollback fails too, discard the connection.
 
-        BACKLOG #1940. The approval gate answers a refused release row with 503, which says the row is
-        absent. A rollback that fails may leave the INSERT open, and :meth:`_acquire` recycles a
-        connection on an ordinary error, so the next borrower's COMMIT would make the row durable.
-        The rollback's own error is logged, not raised: the caller re-raises its original error.
+        **Why discard (BACKLOG #1940).** A rollback that fails may leave the transaction open, and
+        :meth:`_acquire` recycles a connection on an ordinary error, so the next borrower's COMMIT
+        would make the failed work durable, and the next borrower would inherit its locks. The
+        first case found was the audit append: the approval gate answers a refused release row with
+        503, which says the row is absent, so a recycled open INSERT would contradict it. The same
+        holds for a lease claim's ``HOLDLOCK`` (BACKLOG #5066) and the single-statement writes of
+        :meth:`_execute` and :meth:`_execute_output`. The rollback's own error is logged, not
+        raised: the caller re-raises its original error. The WARNING names only its class and
+        SQLSTATE. Its traceback goes to DEBUG: that chains the caller's error too, and SQL Server
+        writes stored values into the text of the errors a write meets most, 2627 and 2601 the
+        duplicate key and 2628 the truncated value.
+
+        ``within`` bounds the rollback, in seconds; ``None``, which every caller but
+        :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
+        all. A rollback that runs past the bound is treated as one that failed: the connection is
+        discarded. Where the call gate already marks the rollback as running, the close is handed
+        to it and lands as it returns (BACKLOG #2049). In the short window before the gate marks
+        it, a separate close can take the gate's lock first; the rollback then runs on a closed
+        handle and fails, with nothing awaiting its error, and the close has already ended the
+        transaction. :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
+        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
         unlike that method it does NOT wait for the close.
         ``_release_dirty`` swallows a cancellation while it waits, which is safe only where the
-        original error IS that cancellation. Not waiting also releases the in-process
-        ``_audit_lock`` sooner. **It does not end the stall, only moves it.** The open transaction
-        holds ``_AUDIT_APPEND_LOCK``, a transaction-owned applock, until the close lands and the
-        server ends the session. Until then every audit append, in this process and in other engine
-        shards, waits on ``sp_getapplock``.
+        original error IS that cancellation. Not waiting also releases an in-process lock the caller
+        holds, such as ``_audit_lock``, sooner. **It does not end the stall, only moves it.** The
+        open transaction keeps its server-side locks until the close lands and the server ends the
+        session. For an audit append that is ``_AUDIT_APPEND_LOCK``, a transaction-owned applock, so
+        until then every audit append, in this process and in other engine shards, waits on
+        ``sp_getapplock``.
 
         Call this after the cursor has closed, so the detached close cannot race the cursor's close on
         another thread. If the executor refuses the close (at loop teardown), the refusal is logged
@@ -5454,14 +5489,26 @@ class SqlServerStore:
 
         A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
         try:
-            await conn.rollback()
-        except Exception:  # noqa: BLE001 - every driver fault; the caller raises the original
-            log.warning(
-                "sqlserver: rollback after a failed audit append failed; discarding the connection",
-                exc_info=True,
-            )
-            # Its future is deliberately not awaited; see the docstring.
+            # No timeout at all for None: asyncio.timeout(None) still needs a current task, and
+            # outside one it raises, which would discard without trying the rollback.
+            async with nullcontext() if within is None else asyncio.timeout(within):
+                await conn.rollback()
+        except Exception as exc:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
+            # Detach first, and read the SQLSTATE guarded, so the log line can neither skip the
+            # discard nor replace the caller's error. Its future is deliberately not awaited; see
+            # the docstring.
             _detach_connection(conn)
+            try:
+                state = driver_sqlstate(exc)
+            except Exception:  # noqa: BLE001 - a diagnostic read; the caller's error must propagate
+                state = None
+            log.warning(
+                "sqlserver: rollback after a failed transaction failed or ran past its bound"
+                " (%s, SQLSTATE %s); discarding the connection",
+                type(exc).__name__,
+                state,
+            )
+            log.debug("sqlserver: the failed rollback's traceback", exc_info=True)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -5527,7 +5574,9 @@ class SqlServerStore:
         the cancelled statement may still be running on an executor thread, and closing the cursor
         beside it frees the handle the statement returns to. Every ``_cursor`` sits inside
         :meth:`_acquire`, which quarantines the connection on the same exit, so the cursor is closed
-        there, after the statement returns. No await here, so the cancellation propagates at once."""
+        there, after the statement returns. No await here, so the cancellation propagates at once.
+        A cursor with no raw pyodbc cursor is closed below instead, and on a real aioodbc cursor
+        :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs that once (BACKLOG #5005)."""
         cur = await conn.cursor()
         abandoned = False
         try:
@@ -5535,7 +5584,7 @@ class SqlServerStore:
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 gate = _call_gate(conn)
-                raw_cur = getattr(cur, "_impl", None)
+                raw_cur = _raw_cursor(cur)
                 if gate is not None and raw_cur is not None:
                     gate.abandon(raw_cur)
                     abandoned = True
@@ -5588,36 +5637,42 @@ class SqlServerStore:
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
         ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
-        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets both bounds, so
-        neither can be set without the other."""
+        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
+        statement and the rollback bounds, so none can be set without the others; a shorter
+        ``[store].command_timeout`` still ends the statement first, and bounds neither of the
+        other two."""
         if timeout_clamp is None:
-            borrow, statement_timeout = self._acquire(), None
+            borrow, statement_timeout, floored_clamp = self._acquire(), None, None
         else:
             # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
-            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow.
-            borrow = self._acquire_clamped(max(1.0, timeout_clamp))
+            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
+            # rollback after a failure gets the same floored clamp (BACKLOG #5066).
+            floored_clamp = max(1.0, timeout_clamp)
+            borrow = self._acquire_clamped(floored_clamp)
             statement_timeout = _clamped_statement_timeout(
                 timeout_clamp, self._settings.command_timeout
             )
-        async with (
-            borrow as conn,
-            self._statement_timeout(conn, statement_timeout),
-            self._cursor(conn) as cur,
-        ):
+        async with borrow as conn:
             try:
-                await cur.execute(sql, params) if params else await cur.execute(sql)
-                columns = [c[0] for c in cur.description]
-                rows = await cur.fetchall()
-                # Read-snapshot release, NOT a durable write — commit without counting (A1). This is the
-                # single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here); routing
-                # every read through _commit was what made committed_txns a superset of the write cost
-                # model on a live SQL Server.
-                await self._commit_read(conn)
+                async with (
+                    self._statement_timeout(conn, statement_timeout),
+                    self._cursor(conn) as cur,
+                ):
+                    await cur.execute(sql, params) if params else await cur.execute(sql)
+                    columns = [c[0] for c in cur.description]
+                    rows = await cur.fetchall()
+                    # Read-snapshot release, NOT a durable write — commit without counting (A1). This is
+                    # the single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here);
+                    # routing every read through _commit was what made committed_txns a superset of the
+                    # write cost model on a live SQL Server.
+                    await self._commit_read(conn)
             except Exception:
                 # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
                 # under RCSI an open snapshot pins the version store / bloats tempdb). Roll back before
-                # it returns to the pool so the next borrower starts clean (M-6).
-                await conn.rollback()
+                # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
+                # closed and the timeout is restored, so a discard races neither; _rollback_or_discard
+                # says why it is bounded and discards (BACKLOG #5066).
+                await self._rollback_or_discard(conn, within=floored_clamp)
                 raise
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
@@ -5631,8 +5686,8 @@ class SqlServerStore:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew is its only caller.
 
-        Two windows, each at most the clamp floored at 1 s. The wait for a pooled connection is the
-        smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
+        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
@@ -5642,9 +5697,19 @@ class SqlServerStore:
         it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
         leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
         clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT and a ROLLBACK after the statement are calls on the
-        connection, not statements, so neither the clamp nor ``[store].command_timeout`` is known to
-        bound them, by a reading of pyodbc's documentation, not a measurement."""
+        clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
+        statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
+        reading of pyodbc's documentation, not a measurement.
+
+        **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
+        1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
+        it discards the connection, so a claim's open ``HOLDLOCK`` transaction is never lent to the
+        next borrower. A failed claim can therefore hold the caller's ``_leadership_lock`` for up to
+        about three times the clamp, plus at least a COMMIT, the cursor's creation and its close,
+        none of which anything here bounds. The bound frees the lock, not the server: a discarded
+        session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
+        its close lands or the server ends it, and the timed-out rollback keeps its executor thread
+        until the driver returns."""
         rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 
@@ -5652,15 +5717,19 @@ class SqlServerStore:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
         the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
         stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(sql, params)
-                # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
-                count = getattr(cur, "rowcount", -1)
-                rows = count if isinstance(count, int) else -1
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
+                    count = getattr(cur, "rowcount", -1)
+                    rows = count if isinstance(count, int) else -1
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # A rollback that fails would otherwise recycle a connection still holding the
+                # write's X locks; _rollback_or_discard discards it instead. After the cursor block,
+                # so a detached close cannot race the cursor's own close.
+                await self._rollback_or_discard(conn)
                 raise
         return rows
 
@@ -5673,14 +5742,17 @@ class SqlServerStore:
         count can come back ``-1`` for a zero-match UPDATE. ``_fetchall`` would not do: it commits
         as a READ. The rows are drained before the commit, and ``_cursor`` frees the statement
         handle the ``OUTPUT`` clause leaves open."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(sql, params)
-                columns = [c[0] for c in cur.description]
-                rows = await cur.fetchall()
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    columns = [c[0] for c in cur.description]
+                    rows = await cur.fetchall()
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # As in _execute: a failed rollback discards rather than recycles the connection,
+                # and it runs after the cursor block.
+                await self._rollback_or_discard(conn)
                 raise
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
@@ -8216,7 +8288,8 @@ class SqlServerStore:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
-        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        would exceed ``correlation_depth_cap``, a reply retention erased (BACKLOG #1560) or a
+        ``response`` row that is missing (:data:`REINGRESS_ARTIFACT_MISSING`, BACKLOG #4996) is
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
@@ -8325,16 +8398,16 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                # A missing row is a corrupt reference. A NULL body means retention erased the reply
-                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
-                # materialized once, so a replay can commit between that read and the erasure. It
-                # must never become a child message. A missing row is damage, not an erasure, so
-                # that token is not blanked: its sealed reference is the evidence.
+                # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says
+                # how a token reaches here). `#eligible` is materialized once, so a replay can
+                # commit between that read and the erasure. It must never become a child message.
+                # A missing row is damage, not an erasure, so that token is not blanked: its
+                # sealed reference is the evidence.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
-                        "re-ingress work-row reference is corrupt/unparseable",
-                        "re-ingress ref corrupt",
+                        REINGRESS_ARTIFACT_MISSING,
+                        "re-ingress reply missing",
                     )
                 if art[0] is None:
                     return await _consume_dead(
@@ -8539,7 +8612,8 @@ class SqlServerStore:
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted reply body behind a ``Stage.RESPONSE`` work-row (ADR 0013) — for the re-ingress
         worker's HL7 peek. ``None`` if the work-row is missing/consumed or its ref is unparseable; ``''``
-        if the artifact body is missing/empty. Reads the SAME immutable artifact ``ingress_handoff``
+        if the artifact row is missing, its body was erased, or the reply was empty, as on SQLite.
+        Reads the SAME immutable artifact ``ingress_handoff``
         re-reads, so the peek and the persisted raw always agree."""
         row = await self._fetchone(
             f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -8559,7 +8633,7 @@ class SqlServerStore:
         )
         return (
             self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
-            if (art and art["body"])
+            if (art and art["body"] is not None)
             else ""
         )
 
@@ -9669,10 +9743,11 @@ class SqlServerStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
-        idempotent, because a row left with neither no longer matches.
+        idempotent, because a row left with neither no longer matches. Returns a
+        :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9691,13 +9766,21 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # As on SQLite: two statements, one count each (BACKLOG #4996). DATALENGTH, not
+                # `<> ''`: T-SQL pads trailing spaces before comparing, so a whitespace-only body
+                # would otherwise read as blank and survive.
                 await cur.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=? AND DATALENGTH(payload) > 0 AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
+                await cur.execute(
+                    "UPDATE queue SET last_error=NULL"
+                    f" WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
+                )
+                cleared = cur.rowcount
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row (per the
                 # negated live-holder predicate), release its streaming attachment here — the deferred half
@@ -9721,7 +9804,10 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        return int(purged) if purged is not None else 0
+        return DeadLetterPurge(
+            bodies=int(purged) if purged is not None else 0,
+            errors_cleared=int(cleared) if cleared is not None else 0,
+        )
 
     async def wal_checkpoint(self) -> None:
         """No-op on SQL Server — there is no SQLite WAL to checkpoint (the engine never calls this on
@@ -14046,14 +14132,17 @@ class SqlServerStore:
         rows = await cur.fetchall()
         return global_epoch_or_refuse(rows[0][0] if rows else None)
 
-    async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
+    async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
-        transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
-        record that fails its seal does not stop the revoke that called this."""
+        transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
+        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
+        the revoke that called this, and reports no raise."""
+        bump = EpochBump()
         try:
-            await self._write_user(cur, user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(cur, user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -15544,8 +15633,9 @@ class SqlServerStore:
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+    ) -> RevokeResult:
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
+        and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Counted from an ``OUTPUT`` rowset, as ``rotate_session`` is (BACKLOG #2283). The count is
         audited and returned to the API caller, and ``cursor.rowcount`` under a session-wide
@@ -15557,9 +15647,10 @@ class SqlServerStore:
         ``create_session`` takes them in. The borrow is :meth:`_acquire_after_commit`'s, for the
         reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
+        kept = False
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
-                await self._bump_session_epoch(cur, user_id)
+                raised = await self._bump_session_epoch(cur, user_id)
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                 else:
@@ -15569,19 +15660,13 @@ class SqlServerStore:
                     )
                 revoked = len(await cur.fetchall())
                 if except_token_hash is not None:
-                    await cur.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
-                    epoch_rows = await cur.fetchall()
-                    epoch = int(epoch_rows[0][0]) if epoch_rows else 0
-                    await self._write_session(
-                        cur,
-                        except_token_hash,
-                        lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
-                    )
+                    restamp = KeptSessionRestamp(user_id, raised)
+                    kept = restamp.kept(await self._write_session(cur, except_token_hash, restamp))
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return revoked
+        return RevokeResult(revoked, kept)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -15599,15 +15684,16 @@ class SqlServerStore:
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
         Raises the epoch of each account its read of the account list returns, ends the sessions
         it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
         session minted before it whatever account it belongs to, and re-seals the kept session
-        under both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that
-        leaves.
+        under both new epochs, when it carried both epochs those raises replaced
+        (:class:`KeptSessionRestamp`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session
+        sweep*, says what that leaves.
 
         LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
         while holding that row. Taken first, as on Postgres, it would close a cycle wherever the
@@ -15624,11 +15710,14 @@ class SqlServerStore:
         old value, so it ends when this commits. Read from the code and not run against a server
         that has READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
+        kept = False
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
-                for (user_id,) in await cur.fetchall():
-                    await self._bump_session_epoch(cur, str(user_id))
+                raised = {
+                    str(user_id): await self._bump_session_epoch(cur, str(user_id))
+                    for (user_id,) in await cur.fetchall()
+                }
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_ALL_SESSIONS_SQL, (now,))
                 else:
@@ -15641,31 +15730,34 @@ class SqlServerStore:
                     "UPDATE global_session_epoch SET epoch = epoch + 1"
                     " OUTPUT inserted.epoch WHERE id = 1"
                 )
-                raised = await cur.fetchall()
-                current = global_epoch_or_refuse(raised[0][0] if raised else None)
+                global_rows = await cur.fetchall()
+                global_raised = global_epoch_raise(
+                    global_epoch_or_refuse(global_rows[0][0] if global_rows else None)
+                )
                 if except_token_hash is not None:
                     await cur.execute(
-                        "SELECT s.user_id, u.session_epoch FROM sessions s"
-                        " JOIN users u ON u.id = s.user_id WHERE s.token_hash=?",
-                        (except_token_hash,),
+                        "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
                     )
-                    kept = await cur.fetchall()
-                    if kept:
-                        epoch = int(kept[0][1])
-                        await self._write_session(
-                            cur,
-                            except_token_hash,
-                            lambda s: replace(s, user_epoch=epoch, global_epoch=current),
+                    owners = await cur.fetchall()
+                    if owners:
+                        owner = str(owners[0][0])
+                        restamp = KeptSessionRestamp(owner, raised.get(owner), global_raised)
+                        kept = restamp.kept(
+                            await self._write_session(cur, except_token_hash, restamp)
                         )
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return revoked
+        return RevokeResult(revoked, kept)
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a SQL Server database's
-        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`.
+
+        So a DBA restore of this store is not recorded at start: no session is ended, and no
+        ``store_restored`` row or alert is written. docs/SECURITY.md, *A restored store brings its
+        sessions back*, names the steps an operator takes by hand (BACKLOG #5092)."""
         return None
 
     async def enforce_session_cap(

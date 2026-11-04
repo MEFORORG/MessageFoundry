@@ -9,7 +9,8 @@ channel. Neither passed through the inbound's listener, so neither met its size 
 drives one guard and was red on the code before this change: the resubmission was committed.
 
 The strict section at the end came later. PR 1490 left strict ``hl7apy`` validation unmirrored, so a
-``validation.strict`` inbound's resend admitted a body its listener would ``AE``-NAK; each refusing test
+``validation.strict`` inbound's resend admitted a body its listener would NAK (``AR`` since BACKLOG
+#5078, ``AE`` before); each refusing test
 there was red before the follow-up, and its conformant control was green.
 
 The refusal is a 4xx plus an audit row, and nothing is committed. That keeps count-and-log whole: no
@@ -477,7 +478,7 @@ def test_guard_holds_a_streaming_inbound_to_the_engine_ceiling() -> None:
 # --- strict hl7apy validation (validation.strict) ---------------------------------------------------
 #
 # ADT and EDITED above pass Peek.parse and fail hl7apy: ADT^A01 requires EVN and PV1. So an inbound
-# with validation.strict set would AE-NAK either from a sender, and a resend must refuse it too. The
+# with validation.strict set would NAK (AR) either from a sender, and a resend must refuse it too. The
 # STRICT_* bodies are the conformant controls, so a red below is the strict check and not the route.
 
 STRICT_ADT = (
@@ -531,8 +532,9 @@ async def test_upload_resend_into_a_tolerant_inbound_still_admits_a_strictly_inv
 async def test_upload_resend_past_the_strict_timeout_is_refused(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The listener AE-NAKs a validate that outruns validation.strict_timeout_s, so the resend refuses
-    # it as well, and the request does not wait on it.
+    # The listener refuses a validate that outruns validation.strict_timeout_s (AR on MLLP once the
+    # validate began, AE if the timeout fired before it began; docs/HL7-VALIDATION.md tables it), so
+    # the resend refuses it as well, and the request does not wait on it.
     import time
 
     from messagefoundry.parsing.validate import ValidationResult

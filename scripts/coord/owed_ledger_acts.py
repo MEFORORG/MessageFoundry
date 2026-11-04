@@ -27,7 +27,7 @@ THE ASK. Two shapes, in a comment on a MERGED pull request by an OWNER, MEMBER o
 (every seat posts under one login, so this keeps out outside accounts, not other seats), not
 minimized:
 
-* PRIMARY, machine-readable: ``<!-- lander-ledger-ask rows=#3844,#3025 file=2 -->``. ``rows`` names
+* PRIMARY, machine-readable: ``<!-- lander-ledger-ask rows=#3844,#3025 file=1 -->``. ``rows`` names
   existing rows whose banner the Lander owes; ``file`` counts new rows to file. Either may be left
   out. It may also sit in the PR body; on a fork PR's body it prints as READ, since an outside
   account wrote it. A marker inside a code span, a fenced block or a quoted line is an example, not
@@ -69,6 +69,16 @@ filing ask now exist and cite this PR, with its repository word, anywhere in the
 precede the merge). Statuses printed: OWED, MISSING (the row is in neither ledger file at the ref),
 READ, ERROR (a failed read, or no ledger commit before a baseline: a shallow clone), and DONE with
 ``--all``.
+
+LEDGER RULING R2 (owner-signed 2026-11-04, in session: "Sign R1-R9"; ``CLAUDE.md`` section 5's
+merge bullet states it) changes what ``file`` should say, not how it is read. From that date a
+merged PR files at most one row, so an ask made since then should read ``file=1`` at most. A larger
+count, from an earlier ask or a mistaken one, is still read as written, and filing asks on one PR
+are still summed, so two asks of ``file=1`` on one PR (a marker in the body and again in a
+comment, say) stay OWED after the one row R2 allows: the safe direction, for a person to clear. An
+item R2 adds to a row that already exists (a step on the row the PR cites, or a finding rolled up
+into a module's open row) is not a new row, so the filing count never sees it, and an ask for it
+under ``rows`` stays OWED while that row stays OPEN.
 
 WHAT IT CANNOT SEE. At least: an ask sent only by fleet mail (so a Manager should also put the
 marker on the PR), an ask in an inline review comment, an ask past the first 100 comments ``gh``

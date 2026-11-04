@@ -696,11 +696,24 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._preflight_destination": Site(
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
+    "messagefoundry/pipeline/dr_backup.py::_Staging.owner": Site(
+        1,
+        INTERNAL,
+        "The fixed lock name in this run's staging directory, never opened: the owner is read "
+        "from the descriptor (BACKLOG #4988).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
         3,
         INTERNAL,
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_held_walk": Site(
+        1,
+        INTERNAL,
+        "A subdirectory name listed from a staging directory this module made, while that "
+        "directory is held; the child is then opened as itself and refused if it names another "
+        "path (BACKLOG #4992).",
     ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
@@ -744,6 +757,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(1, INTERNAL, _STAGING),
     "messagefoundry/pipeline/dr_backup.py::_tree_size": Site(
         1, INTERNAL, "Names from walking a directory this module measures; lstat only."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_create_owner_probe": Site(
+        1,
+        INTERNAL,
+        "A fixed prefix and random hex under the root its caller names; CREATE_NEW with "
+        "FILE_FLAG_OPEN_REPARSE_POINT refuses a name already taken, by a file or a link.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."

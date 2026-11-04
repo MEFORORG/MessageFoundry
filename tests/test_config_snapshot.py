@@ -51,6 +51,7 @@ from messagefoundry.config.snapshot import (
     read_config_snapshot,
 )
 from messagefoundry.config.wiring import (
+    ConfigDirUnlistable,
     WiringError,
     load_config,
     load_snapshot,
@@ -742,8 +743,10 @@ def test_a_load_refuses_a_code_set_folder_on_a_lost_share(
     """It loaded without its tables before, and a graph that asks for one fails only at run time."""
     cfg = _config(tmp_path / "cfg")
     _lost_share(monkeypatch, cfg / "codesets")
-    with pytest.raises(WiringError, match="could not read codesets"):
+    with pytest.raises(WiringError, match="could not read codesets") as refused:
         load_config(cfg)
+    # A folder in the directory, not the directory itself: a config to fix, as it always was.
+    assert not isinstance(refused.value, ConfigDirUnlistable)
 
 
 def test_validate_config_reports_a_code_set_folder_on_a_lost_share(
@@ -772,19 +775,20 @@ def test_a_load_goes_on_past_a_value_folder_on_a_lost_share_and_the_digest_says_
 
 
 @pytest.mark.parametrize(
-    ("after", "refusal"),
-    [(1, "could not vet it"), (2, r"could not read \.")],
-    ids=["lost-before-the-trust-check", "lost-before-the-read"],
+    "after", [1, 2], ids=["lost-before-the-trust-check", "lost-before-the-read"]
 )
 def test_a_load_refuses_a_base_directory_on_a_lost_share_rather_than_run_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after: int, refusal: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after: int
 ) -> None:
     """The first check lists it, and it still answers ``is_dir``, so only a later listing can
     refuse: the trust check's (vault BACKLOG #5117), or past that the read's. It read as an empty
-    bundle before, and with ``allow_empty`` that returned an empty graph."""
+    bundle before, and with ``allow_empty`` that returned an empty graph. Either way the refusal is
+    :class:`ConfigDirUnlistable`, which a reload audits as ``unreadable``: the trust check's
+    listing fault is judged again, and it read as a source the check could not vet, audited
+    ``invalid_config`` (vault BACKLOG #5248 item 4)."""
     cfg = _config(tmp_path / "cfg")
     _lost_share(monkeypatch, cfg, answers_is_dir=True, after=after)
-    with pytest.raises(WiringError, match=refusal):
+    with pytest.raises(ConfigDirUnlistable, match=r"could not read \."):
         load_config(cfg, allow_empty=True)
 
 
@@ -903,7 +907,7 @@ def test_a_base_on_a_lost_share_at_the_first_check_is_a_fault(
     report names a read that failed. None of them calls it a missing directory."""
     cfg = _config(tmp_path / "cfg")
     _lost_share(monkeypatch, cfg, winerror=winerror)
-    with pytest.raises(WiringError, match=r"could not read \."):
+    with pytest.raises(ConfigDirUnlistable, match=r"could not read \."):
         load_config(cfg, allow_empty=True)
     with pytest.raises(OSError) as refused:
         read_trusted_snapshot(cfg, strict=True)

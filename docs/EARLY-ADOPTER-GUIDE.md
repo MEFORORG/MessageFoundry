@@ -727,6 +727,15 @@ For those, the alert's reason in the web console's alert list keeps the archive'
 sessions ended and a pointer to `messagefoundry restore --help`, all inside the about 200 characters
 it keeps.
 
+**Only `messagefoundry restore` onto SQLite is recorded (BACKLOG #5092).** A PostgreSQL or SQL
+Server store restored with the database's own tools, or a SQLite store put back by copying its
+files, carries no marker: the first `serve` ends no session, writes no `store_restored` row and
+raises no `store_restored` alert. Stop every engine process and cluster node on the store before
+such a restore. Before the first `serve` after it, run `messagefoundry
+admin-revoke-sessions` against the restored store, and re-apply by hand the changes listed above.
+[SECURITY.md](SECURITY.md#a-restored-store-brings-its-sessions-back-and-only-messagefoundry-restore-records-it)
+says what is and is not recorded, and at least one start-up signal such a restore can raise.
+
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,
 is refused too, and raising `--max-age-days` does not change that: only `--allow-old-archive`

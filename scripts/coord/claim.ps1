@@ -31,6 +31,21 @@
     original signal and it was actively misleading: a 21h claim whose holder had committed two minutes
     earlier was labelled STALE and recommended for release.
 
+    A QUIET HOLDER IS STILL NOT A REASON TO -Force, EXCEPT WHERE THE OWNER HAS RULED: A BATCH'S CLAIMS
+    (ledger ruling R8, owner-signed 2026-11-04, in session: "Sign R1-R9"). R8 returns a batch whose
+    holder has shown no seat goal, commit or PR activity for 72 hours to FREE, and its claims with
+    it. The holder is the seat that took the batch, which is not always the worktree a claim names.
+    No tool applies R8 yet (2026-11-04). Until one does, the drafting Manager's reading, recorded
+    beside the signed text and not part of the signature, has the seat taking the batch read the
+    holder's seat record and recent commits first. R8's signed test also names PR activity, so
+    read the holder's PR activity too; the reading names only the other two. The reading then has
+    that seat release each claim through the path for another worktree's claim, `-Release` with
+    `-Force`, which records the release as the next paragraph says. That record has no field for a
+    reason, so it does not show that R8 was the ground. This script still expires nothing by
+    itself: it does not measure the 72 hours or tell a batch's claim from any other. Its refusals
+    name R8 only in the directory-only state; where a session is, or may be, in the claim's
+    worktree, they still say to ask it first. CLAUDE.md section 5 cites the signed text, under R5.
+
     EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
     <git-common-dir>/mefor-coord/claims/.history: at least the key, the releasing worktree and branch,
     the tree the command was actually invoked FROM (`invoked_from`, BACKLOG #1358), the prior holder,
@@ -176,6 +191,24 @@ function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
     if ($a -ieq $b) { return }
     Write-Host "  NOTE: your shell is in $a, but this claim is recorded against $b," -ForegroundColor Yellow
     Write-Host "        so the $Subject" -ForegroundColor Yellow
+}
+
+# LEDGER RULING R8, explained once in the header and pointed at from the two directory-only refusals;
+# the note quotes R8's signed sentence, says what follows from it, and leaves the rest to the header.
+# It is framed as an OWNER RULING so that it reads as the owner having said so, which those refusals
+# already count, and not as a third reason. Only there, because only there has this host positively
+# placed no session in the claim's worktree: 'occupied' has one and says to ask it, 'present' and
+# the undated state could not look, and 'elsewhere' cannot see the holder's unpushed commits. The
+# polarity rule below applies: a missing answer must not earn the pointer. Printed, never acted on:
+# nothing here can tell a batch's claim from another or read R8's three signals. Only what R8 signs
+# sits under the OWNER RULING label; who releases, and how, is the Manager's reading and says so.
+function Write-R8Note {
+    Write-Host "  OWNER RULING R8 (ledger, 2026-11-04): a batch whose holder has shown no seat goal, commit"
+    Write-Host "  or PR activity for 72 hours is released to FREE, and its claims with it."
+    Write-Host "  So R8 reaches a claim only through its batch, and one worktree's last commit is not"
+    Write-Host "  its test."
+    Write-Host "  The Manager's reading, not the ruling: the seat taking the batch releases the claims."
+    Write-Host "  The header of scripts\coord\claim.ps1 says how."
 }
 
 # WHERE THE REGISTRY LIVES, resolved from the repository the claim is FOR (BACKLOG #1346).
@@ -897,6 +930,7 @@ if ($Release) {
                 Write-Host ""
                 Write-Host "  A LONG QUIET PERIOD IS NOT A THIRD REASON. Age is not evidence: a session can be alive"
                 Write-Host "  and simply not committing, and this state is the one where you cannot tell."
+                Write-R8Note
                 Write-Host ""
                 # BACKLOG #1466. The facts the owner would ask for first, gathered so nobody has to.
                 Write-Host "  EVIDENCE FOR THE OWNER -- not authority to release, and not a third reason:" -ForegroundColor Cyan
@@ -1158,6 +1192,7 @@ try {
             Write-Host "  an OWNER decision. Escalate to the owner, not to a seat: this line named the Cleaner and"
             Write-Host "  the Dispatcher until 2026-09-11 and both had retired (BACKLOG #1543)."
             Write-Host "  Until one of those, do NOT build it in parallel."
+            Write-R8Note
         }
         default {
             Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow

@@ -263,7 +263,7 @@ async def test_messages_window_keeps_dead_payload_for_its_own_window(store: Mess
 
     # The dead-letter window then nulls the dead payload, keeping the row + status.
     purged = await store.purge_dead_letters(older_than=10 * DAY)
-    assert purged == 1
+    assert purged.bodies == 1
     assert await _payload(store, dead_id) == ""
     [row] = await store.outbox_for(mid)
     assert row["status"] == OutboxStatus.DEAD.value  # row + disposition kept
@@ -272,11 +272,65 @@ async def test_messages_window_keeps_dead_payload_for_its_own_window(store: Mess
 async def test_purge_dead_letters_respects_window_and_is_idempotent(store: MessageStore) -> None:
     _, dead_id = await _dead(store, now=5 * DAY)
     # Cutoff before it died → kept.
-    assert await store.purge_dead_letters(older_than=1 * DAY) == 0
+    assert (await store.purge_dead_letters(older_than=1 * DAY)).bodies == 0
     assert await _payload(store, dead_id) == "OUT|dead-body"
     # Past the window → purged, then idempotent.
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 0
+
+
+async def _dead_with_only_an_error(store: MessageStore, *, now: float) -> str:
+    """A dead row whose body is already blank and whose ``last_error`` still holds text."""
+    _, dead_id = await _dead(store, now=now)
+    await store._db.execute("UPDATE queue SET payload='' WHERE id=?", (dead_id,))
+    await store._commit()
+    return dead_id
+
+
+async def _last_error(store: MessageStore, outbox_id: str) -> str | None:
+    cur = await store._db.execute("SELECT last_error FROM queue WHERE id=?", (outbox_id,))
+    row = await cur.fetchone()
+    assert row is not None
+    return row["last_error"]
+
+
+async def test_purge_dead_letters_counts_a_cleared_error_apart_from_bodies(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #4996. A row already blank purges no body, so ``bodies`` leaves it out, and
+    ``errors_cleared`` counts the error text it nulled. A body-blanked row is counted in both."""
+    blank_id = await _dead_with_only_an_error(store, now=5 * DAY)
+    _, full_id = await _dead(store, now=5 * DAY, control="CID-DEAD-2")
+    assert await _last_error(store, blank_id) is not None  # the premise
+
+    purge = await store.purge_dead_letters(older_than=10 * DAY)
+    assert (purge.bodies, purge.errors_cleared) == (1, 2)
+    assert await _last_error(store, blank_id) is None
+    assert await _payload(store, full_id) == ""
+    again = await store.purge_dead_letters(older_than=10 * DAY)
+    assert (again.bodies, again.errors_cleared) == (0, 0)  # idempotent
+
+
+async def test_a_pass_that_only_clears_dead_error_text_is_audited(store: MessageStore) -> None:
+    """BACKLOG #4996. Error text may carry PHI, so a pass whose only change was nulling a dead row's
+    ``last_error`` is work, and it writes its ``retention_purge`` row. Its body count stays 0, so
+    the row does not claim a body was purged. The control: a second pass with nothing left writes
+    no row."""
+    dead_id = await _dead_with_only_an_error(store, now=0.0)
+    runner = RetentionRunner(store, RetentionSettings(dead_letter_days=1), clock=lambda: 30 * DAY)
+
+    result = await runner.run_once()
+    assert (result.dead_purged, result.dead_errors_cleared) == (0, 1)
+    assert result.did_work
+    assert await _last_error(store, dead_id) is None
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1
+    detail = json.loads(audit[0]["detail"])
+    assert (detail["dead_purged"], detail["dead_errors_cleared"]) == (0, 1)
+
+    assert not (await runner.run_once()).did_work
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1
 
 
 # --- the dead-letter window reaches EVERY stage, not just outbound (#1188) ----
@@ -345,10 +399,12 @@ async def test_purge_dead_letters_reaches_a_dead_ingress_row(store: MessageStore
     assert await _payload(store, ingress_id) != ""  # ...and the body is still here
 
     # Its own (later) window then blanks it, keeping the row + DEAD status (counts/disposition).
-    assert await store.purge_dead_letters(older_than=1 * DAY) == 0  # window not yet elapsed
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (
+        await store.purge_dead_letters(older_than=1 * DAY)
+    ).bodies == 0  # window not yet elapsed
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _payload(store, ingress_id) == ""
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # idempotent
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 0  # idempotent
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (ingress_id,))
     fetched_row = await cur.fetchone()
@@ -361,9 +417,9 @@ async def test_purge_dead_letters_reaches_a_dead_routed_row(store: MessageStore)
     _, routed_id = await _dead_routed(store, now=0.0)
     assert await _payload(store, routed_id) != ""
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _payload(store, routed_id) == ""
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 0
 
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (routed_id,))
     fetched_row = await cur.fetchone()
@@ -399,7 +455,7 @@ async def test_dead_ingress_row_does_not_pin_a_streaming_attachment_forever(
     assert await _attachment_rows(store, mid) == 1
 
     # The dead-letter window blanks the row and releases the last holder in the same transaction.
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _attachment_rows(store, mid) == 0
 
 
@@ -412,9 +468,10 @@ async def _attachment_rows(store: MessageStore, message_id: str) -> int:
     return int(fetched_row["n"])
 
 
-#: Stage predicates each backend's `purge_dead_letters` BODY may still carry, and why. The two body
-#: statements (the payload blank and the attachment release) must be stage-agnostic on all three; the
-#: ONE survivor is SQLite's store-once `body_ref` release, which is legitimately outbound-scoped
+#: Stage predicates each backend's `purge_dead_letters` BODY may still carry, and why. The body
+#: statements (the payload blank, the `last_error` clear and the attachment release) must be
+#: stage-agnostic on all three; the ONE survivor is SQLite's store-once `body_ref` release, which is
+#: legitimately outbound-scoped
 #: because `body_ref` is written only by `_insert_outbound_deliveries`.
 _ALLOWED_STAGE_PREDICATES = {"sqlite": 1, "postgres": 0, "sqlserver": 0}
 

@@ -554,7 +554,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
     beside it. A failed rollback is logged and the connection still goes back: dropping its handle
     would leave a waiting borrower or `wait_closed` unwoken, since aioodbc wakes neither for a
     closed connection. The rollback runs only on a gated connection; on an ungated one it would run
-    beside the statement.
+    beside the statement. **SUPERSEDED by the BACKLOG #5010 note below:** a failed rollback now
+    discards the connection.
   - **Otherwise it returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc
     wakes no waiting borrower when a closed connection is released, so a detached connection could
     leave that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for
@@ -610,6 +611,31 @@ the next reader does not re-derive the wrong precedent from the same comment.
   - A cursor with no raw handle gets no rollback on a cancel.
 
   Pinned offline by `tests/test_backlog2394_database_gate.py`.
+
+  **NOTE 2026-11-03 (BACKLOG #5010): a failed rollback discards the connection.** The bullet above
+  that returns it is superseded, in both places a rollback can fail: after a cancelled statement
+  (`_close_after_a_cancel`) and after a failed send (`DatabaseDestination.send`). Returned open, on
+  a session still alive, the abandoned INSERT stayed open for the next send's commit to commit with
+  its own. After a failed send, `_close_and_release` drops the handle before its first await and
+  closes it on a worker thread, inside the gate where the connection has one. After a cancelled
+  statement, `_close_after_a_cancel` drops it on the worker thread, inside the gate, once the
+  rollback has failed; the connection has not gone back to the pool by then, so nothing can lend
+  it in between. Either way the closed connection goes back to the pool through `_release`, which
+  wakes it through aioodbc 0.5.0's `Pool._wakeup`, so the wake that aioodbc's own release withholds
+  for a closed connection still happens. A pool with no `_wakeup`, or a wake that fails or is
+  cancelled, counts as holding a connection back for good, so its close stops at the bound.
+
+  **What holds, and where it does not reach.** Where the discard runs, aioodbc never lends the dropped handle again, so no later send commits the INSERT
+  on it. The discard runs only where a rollback ran and failed. At least these paths run no
+  rollback, so they discard nothing and return the connection as before: a cancelled statement on
+  a connection with no gate, where a rollback would run beside the statement; a cancelled
+  statement whose cursor has no raw pyodbc cursor (`raw_cursor` returns `None`); and a cancelled
+  statement whose close finds the default executor shut down. Where the executor is shut down
+  after a failed send dropped the handle, no worker thread closes it; it is left for pyodbc to
+  close when it is collected, outside the gate. The residual recorded above for the store holds
+  here too: the close after a failed rollback can leave the session, with its transaction and
+  locks, open until the server ends it. Pinned offline by
+  `tests/test_backlog5010_database_gate_discard.py`.
 
 ## Acceptance Criteria
 

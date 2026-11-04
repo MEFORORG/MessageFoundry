@@ -171,7 +171,10 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /alerts/{alert_id}/suspend": (SCOPED, "the instance is read through the caller's scope"),
     "POST /alerts/{alert_id}/resume": (SCOPED, "the instance is read through the caller's scope"),
     "POST /alerts/test-email": (NOT_CHANNEL_BEARING, "sends a fixed test notice"),
-    "GET /alerts/rules": (SCOPED, "only rules naming no connection outside the caller's scope"),
+    "GET /alerts/rules": (
+        SCOPED,
+        "only rules naming no connection outside the caller's scope, each with a null id",
+    ),
     # --- dead letters and approvals -------------------------------------------------------------
     "GET /dead-letters": (SCOPED, "narrowed to the caller's channels"),
     "POST /dead-letters/replay": (SCOPED, "the requested channel is checked against the scope"),

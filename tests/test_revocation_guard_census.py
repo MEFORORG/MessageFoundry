@@ -74,6 +74,9 @@ _BUILDERS = frozenset(
         "_ftps_ssl_context",
         # the store, the syslog forwarder, the IdP, the LDAPS bind
         "_verifying_context",
+        # The open-time wrapper that types _verifying_context's ValueError as StoreTlsRefused
+        # (BACKLOG #5000). Same hop: it hands its context to _build_ssl, which stays the guarded site.
+        "_verifying_context_at_open",
         "_build_tls_context",
         "build_idp_opener",
         # The settings-reading wrapper both IdP opener sites call (vault BACKLOG #3145), so those

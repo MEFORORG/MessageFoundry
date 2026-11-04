@@ -35,7 +35,11 @@ hostname, key-usage/EKU, and RFC 5280 strict path validation all **still apply**
 `ssl.VerifyFlags` does not *name* it, `SSLContext.verify_flags` accepts a raw `int` OR, and OpenSSL's
 `X509_V_FLAG_NO_CHECK_TIME` (`0x200000`, `openssl/x509_vfy.h` — a stable public constant, unchanged since
 OpenSSL 1.0.2 through 3.5) disables **exactly** the `notBefore`/`notAfter` check during chain
-verification and nothing else. A single shared helper — `config/tls_policy.py:relax_verify_expiry(ctx, *,
+verification and nothing else. *(CORRECTED 2026-11-03, vault BACKLOG #5089: "nothing else" and the
+"**only**" above over-state. The flag skips the `notBefore`/`notAfter` check on at least every
+certificate in the chain, the intermediates and the trust anchor as well as the leaf, and on a CRL's
+own validity window; what still applies is the chain's signatures, the hostname where checked, and key
+usage. The `relax_verify_expiry` docstring in `config/tls_policy.py` states what it relaxes.)* A single shared helper — `config/tls_policy.py:relax_verify_expiry(ctx, *,
 host)` — ORs that bit onto an already-**verifying** context (`CERT_REQUIRED`; it is a guarded no-op on a
 `CERT_NONE` context so a caller bug can never be amplified into a silent downgrade) and logs a
 construction-time WARN (`host` only — never a credential or a body).
