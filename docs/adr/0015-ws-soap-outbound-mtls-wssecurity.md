@@ -146,7 +146,7 @@ response faults are detected by regex (`_FAULT_RE`, [`soap.py`](../../messagefou
 The fault code is found without a parser too. `_FAULTCODE_RE` / `_CODEVALUE_RE` each match a `<`,
 optional whitespace, an optional prefix of word characters, dots and hyphens ending in `:`, and the name
 `faultcode` or `Value` in any case with no word character after it, so a longer name that goes on with
-`.` or `-`, such as `<faultcode.detail>` or `<Value-x>`, matches too. `_code_text` takes the text from
+at least `.`, `-` or `:`, such as `<faultcode.detail>` or `<Value-x>`, matches too. `_code_text` takes the text from
 the next `>` after the first match to the next `</`, with `str.find`. *(Corrected 2026-11-04, for the
 fault-code sentences: until BACKLOG #2827 made the scan linear, the two patterns captured the code text
 themselves.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under

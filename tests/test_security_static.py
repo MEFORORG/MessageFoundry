@@ -60,12 +60,12 @@ invariants can't silently regress.
   body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
   whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
   ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
-  longer name that goes on with ``.`` or ``-``, such as ``<faultcode.detail>`` or ``<Value-x>``.
+  longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
+  ``<Value-x>``.
   ``_code_text`` takes the text from the next ``>`` after the first match to the next ``</``. That
   is an ad-hoc same-type extraction, deliberately out of the clause's scope, as are at least
   ``_FAULT_RE``, ``_WSSE_FAULT_RE``, ``_SENDER_RE`` and ``_RECEIVER_RE``. The fault-code text drives
-  at least retry versus dead-letter. It does not decide a capturing connection's outcome:
-  ``_FAULT_RE``'s match alone decides whether a 2xx reply is recorded as ``rejected``.
+  at least retry versus dead-letter. ``_FAULT_RE``'s match alone decides whether a 2xx reply is recorded as ``rejected``.
 """
 
 from __future__ import annotations
