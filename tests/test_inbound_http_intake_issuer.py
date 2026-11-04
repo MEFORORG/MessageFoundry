@@ -380,12 +380,44 @@ def test_the_index_reads_a_begin_line_only_where_the_context_does(
     assert indexed == (loaded == 2), (label, suffix, head, loaded)
 
 
-def test_a_marker_254_bytes_into_a_line_is_skipped_though_the_context_loads_it() -> None:
-    """The one measured shape where the two disagree, kept so a change on either side is seen.
-    OpenSSL reads a long line in 254-byte pieces, so a BEGIN marker starting the second piece loads.
-    The index models a line, not those pieces, so it skips that CA: every partner under it is
-    denied, never admitted. ``pki._pem_certificate_blocks`` records the same trade."""
-    assert _probe("CERTIFICATE", prefix="y" * 254) == (2, False)
+def test_a_ca_the_scan_skips_is_taken_from_what_the_context_loaded() -> None:
+    """OpenSSL reads a long line in 254-byte pieces, so a BEGIN marker starting the second piece
+    loads. The scan models a line, not those pieces, so it skips that block; the index then takes the
+    CA from the scratch context's own list instead of denying every partner under it."""
+    assert _probe("CERTIFICATE", prefix="y" * 254) == (2, True)
+
+
+def test_a_ca_the_scan_reads_but_the_context_skipped_names_no_issuer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The admit direction. An END marker that does not start its line is body text to OpenSSL, so
+    it reads past it, and a CA block after it is never loaded. The scan finds that END anyway and
+    reads the next block. The index names only what the context holds, sets the rest aside, and says
+    so at start, rather than name a CA a client could present a cross-signed copy of."""
+    a = _ca(_dn((NameOID.COMMON_NAME, "A CA")))
+    b = _ca(_dn((NameOID.COMMON_NAME, "B CA")))
+    cadata = _pem(a[0]).decode("ascii").replace(
+        "-----END CERTIFICATE-----", " -----END CERTIFICATE-----"
+    ) + _pem(b[0]).decode("ascii")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=cadata)
+    held = [c["subject"] for c in ctx.get_ca_certs()]
+    assert held == [((("commonName", "A CA"),),)], held  # the premise: B was never loaded
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        index = _client_issuer_index("IB_PARTNER", cadata, {"CN=B CA": [SUBJECT]})
+    assert index is not None and index.unconfirmed >= 1
+    assert set(index.unmatched_keys(["CN=A CA", "CN=B CA"])) == {"CN=B CA"}
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("could not be matched to what the TLS context loaded" in m for m in warned), warned
+
+
+def test_text_the_context_refuses_names_no_issuer() -> None:
+    """No context can verify a peer against text it refuses, so the index names nothing from it."""
+    good = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    junk = "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n"
+    index = _client_issuer_index("IB_PARTNER", _pem(good[0]).decode("ascii") + junk, {})
+    assert index is not None and (index.unreadable, index.unconfirmed) == (1, 1)
+    assert "CN=Acme CA" in index.unmatched_keys(["CN=Acme CA"])
 
 
 @pytest.mark.parametrize(

@@ -431,7 +431,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # `cryptography` directly — this is the single cert-tooling crypto call site. BACKLOG #1352:
     # .pfx import also decrypts each PKCS#12 EncryptedData part (PBKDF2 + AES-CBC) so keywrap can
     # check the key bags inside before the bundle loads.
-    "messagefoundry/pki.py": frozenset({"cryptography"}),
+    # BACKLOG #4948: IssuerIndex trial-loads the client CA text into a throwaway server SSLContext
+    # and reads back which certificates it holds, so the issuer index names no CA the listener's
+    # own context skipped. It verifies no peer, loads no key and chooses no algorithm, and is
+    # discarded, as anchor_cadata's trial load is, so section 4 gains no row.
+    "messagefoundry/pki.py": frozenset({"cryptography", "ssl"}),
     # BACKLOG #1748: hashlib = sha256 of a partner-chosen FILE NAME, so `safe_name` can put a short,
     # stable label in a log line where the cleartext name (which can embed an MRN) must never go. The
     # same derived-id, never-a-secret use as transports/file.py's dedup key below, and likewise not a
@@ -1451,6 +1455,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.Name.from_rfc4514_string",
             "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
+            # BACKLOG #4948: IssuerIndex's throwaway cadata= trial load (_context_load), read back
+            # with get_ca_certs and cert_store_stats. It verifies no peer.
+            "tls_context:.load_verify_locations()",
+            "tls_context:ssl.SSLContext",
             # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL
             # Server pin file, so a bundle is refused at load. Public certificates only.
             "key_cert:cryptography.x509.load_pem_x509_certificates",

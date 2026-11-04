@@ -19,6 +19,7 @@ import datetime
 import ipaddress
 import os
 import re
+import ssl
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -1593,30 +1594,63 @@ class IssuerIndex:
     only when ``verify_directly_issued_by`` holds: its subject equals the leaf's issuer name exactly
     AND its key verifies the leaf's signature. A client-sent intermediate is never a loaded CA, so it
     never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
-    itself, whether or not it is marked as a CA."""
+    itself, whether or not it is marked as a CA.
+
+    **The PEM scan is checked against what the TLS context loaded** (BACKLOG #4948). The scan models
+    OpenSSL's reader and can disagree with it, so ``cadata`` is also loaded into a scratch context.
+    A certificate OpenSSL counts as a CA is named only where its DER is one that context holds, and
+    one the scan missed is taken from there. A certificate it does not count as a CA, such as a
+    pinned self-signed client certificate, cannot be listed back from a context, so those the scan
+    read are kept only where their number equals the context's. Anything set aside here is counted
+    in :attr:`unconfirmed`, and names no issuer, which denies rather than admits."""
 
     def __init__(self, cadata: str) -> None:
-        seen: set[bytes] = set()  # de-duplicates a certificate listed twice
         self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
         # Distinct KEYS per rendered subject. A re-issued CA certificate with the same key, or a root
         # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
         # are, because the map names only the name.
         self._subject_keys: dict[str, set[bytes]] = {}
+        #: Blocks the scan read that ``cryptography`` could not parse.
         self.unreadable = 0
+        #: Certificates the scan and the scratch context disagree on, set aside or not found.
+        self.unconfirmed = 0
+        scanned: dict[bytes, x509.Certificate] = {}  # by DER, so a certificate listed twice is one
         for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
             try:
                 cert = x509.load_pem_x509_certificate(block)
+            except (ValueError, UnsupportedAlgorithm):
+                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
+                continue
+            scanned.setdefault(cert.public_bytes(serialization.Encoding.DER), cert)
+        loaded = _context_load(cadata)
+        if loaded is None:
+            self.unconfirmed = len(scanned)  # a context refuses this text, so none verifies a peer
+            return
+        ca_ders, total = loaded
+        named: list[x509.Certificate] = []
+        for der in ca_ders:
+            found = scanned.get(der)
+            if found is None:
+                try:
+                    found = x509.load_der_x509_certificate(der)
+                except ValueError:
+                    self.unconfirmed += 1
+                    continue
+            named.append(found)
+        others = [cert for der, cert in scanned.items() if der not in ca_ders]
+        if len(others) == total - len(ca_ders):
+            named.extend(others)
+        else:
+            self.unconfirmed += max(len(others), total - len(ca_ders))
+        for cert in named:
+            try:
                 subject = cert.subject.rfc4514_string()
-                der = cert.public_bytes(serialization.Encoding.DER)
                 key = cert.public_key().public_bytes(
                     serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
                 )
             except (ValueError, UnsupportedAlgorithm):
-                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
+                self.unreadable += 1
                 continue
-            if der in seen:
-                continue  # the same certificate twice is one anchor
-            seen.add(der)
             self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
             self._subject_keys.setdefault(subject, set()).add(key)
 
@@ -1656,6 +1690,20 @@ class IssuerIndex:
         return problems
 
 
+def _context_load(cadata: str) -> tuple[frozenset[bytes], int] | None:
+    """What a fresh TLS context holds after loading ``cadata``: the DER of each certificate OpenSSL
+    counts as a CA, and how many certificates it holds in all. ``None`` where it refuses the text.
+
+    ``get_ca_certs`` lists only the certificates ``X509_check_ca`` accepts, so a non-CA anchor is in
+    the count and not the list. A fresh context's store starts empty, so both read ``cadata`` alone."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.load_verify_locations(cadata=cadata)
+    except (ssl.SSLError, ValueError):
+        return None
+    return frozenset(ctx.get_ca_certs(binary_form=True)), ctx.cert_store_stats()["x509"]
+
+
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     try:
         leaf.verify_directly_issued_by(issuer)
@@ -1683,12 +1731,13 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     cause. A block this read but the context skipped would let a client-sent copy of that CA count as
     loaded. So a block counts only from a BEGIN line :data:`_CERTIFICATE_BEGIN` matches.
 
-    This models OpenSSL's reader rather than being it. At least one shape was measured where the two
-    disagree: OpenSSL reads a long line in 254-byte pieces, so a marker starting the second piece
-    loads, and here it is skipped, which denies rather than admits. A BEGIN line with no END after it
-    ends the scan; the context was measured to refuse such text, so no listener runs on it. A block
-    read here that ``cryptography`` cannot parse is counted in :attr:`IssuerIndex.unreadable`, which
-    fails closed with a warning."""
+    This models OpenSSL's reader rather than being it, and at least these shapes were measured where
+    the two disagree: a marker 254 bytes into a long line, an END marker that does not start its
+    line, a block that makes OpenSSL stop reading without an error, and a certificate block nested in
+    a block under another label. A BEGIN line with no END after it ends the scan. So this is never
+    the last word: :class:`IssuerIndex` checks what it yields against what a TLS context loaded from
+    the same text. A block read here that ``cryptography`` cannot parse is counted in
+    :attr:`IssuerIndex.unreadable`, which fails closed with a warning."""
     at = 0
     while (begin := _CERTIFICATE_BEGIN.search(pem, at)) is not None:
         end = b"-----END " + begin[1] + b"-----"

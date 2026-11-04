@@ -724,6 +724,14 @@ def _client_issuer_index(
             name,
             index.unreadable,
         )
+    if index.unconfirmed:
+        logger.warning(
+            "HTTP source %s: %d certificate(s) in tls_ca_file could not be matched to what the TLS "
+            "context loaded, for intake_client_subjects; no client certificate is admitted under "
+            "them (BACKLOG #4948)",
+            name,
+            index.unconfirmed,
+        )
     for issuer in index.unmatched_keys(subjects):
         # pki's own reason names the API's file, so this line states both causes in this
         # listener's terms rather than quote it.
