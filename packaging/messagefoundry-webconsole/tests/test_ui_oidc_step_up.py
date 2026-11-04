@@ -101,6 +101,7 @@ async def _service(engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False
         auth_provider="ad",
         directory_object_id="guid-jdoe",
         password_generated=False,
+        audits=(),
     )
     await service.bind_federated_subject(
         user_id, _SUB, expected_issuer=None, expected_subject=None, actor="admin"

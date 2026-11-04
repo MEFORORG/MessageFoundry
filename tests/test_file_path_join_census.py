@@ -666,7 +666,11 @@ SITES: dict[str, Site] = {
         1, INTERNAL, "A fixed lock name in the spool directory."
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._add_config_dir": Site(
-        1, OPERATOR, "Parents of files found walking the operator's config directory."
+        2,
+        OPERATOR,
+        "Names found walking the operator's config directory (each directory is checked for "
+        "staging, each file is added); the walk prunes a link or a junction it reads (BACKLOG "
+        "#5221).",
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._build_archive_blocking": Site(
         1, INTERNAL, "A fixed name in a work directory this module made."
@@ -686,10 +690,17 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
-        4,
+        3,
         INTERNAL,
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_held_walk": Site(
+        1,
+        INTERNAL,
+        "A subdirectory name listed from a staging directory this module made, while that "
+        "directory is held; the child is then opened as itself and refused if it names another "
+        "path (BACKLOG #4992).",
     ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
@@ -736,6 +747,13 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_walk_unfollowed": Site(
+        1,
+        OPERATOR,
+        "A directory name os.walk listed under the operator's config directory, joined to lstat "
+        "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
+        "#5221).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."

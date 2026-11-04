@@ -57,7 +57,8 @@ def test_send_one_each_returns_the_seq_of_each_send_it_queued() -> None:
         sampler=lambda _mix: None, next=lambda _sampler: SimpleNamespace(seq=next(seqs))
     )
 
-    assert driver.send_one_each(corpus=corpus, mix=_MIX) == [10, 12]
+    # Each queued seq maps to the port it went to, so a silent inbound can be named (BACKLOG #5089).
+    assert driver.send_one_each(corpus=corpus, mix=_MIX) == {10: 2600, 12: 2602}
     assert sent == [[10], [], [12]]
     assert driver._m.counters.deferred == 1
 

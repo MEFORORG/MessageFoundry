@@ -133,7 +133,11 @@ class _Rig:
     async def local_admin(self, *, disabled: bool) -> None:
         user_id = uuid.uuid4().hex
         await self.store.create_user(
-            user_id=user_id, username="admin2", auth_provider="local", password_generated=False
+            user_id=user_id,
+            username="admin2",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         await self.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="admin")
         if disabled:

@@ -175,12 +175,17 @@ async def test_a_faulting_msh10_read_skips_correlation_and_delivers(
     assert _FAULT_TEXT not in caplog.text
 
 
-async def test_an_unparseable_msh10_skips_correlation_quietly(
+async def test_an_unreadable_msh10_on_an_hl7_payload_skips_correlation_and_says_so(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The ``HL7PeekError`` arm is the documented quiet skip for a payload with no readable MSH-10.
-    ``HL7PeekError`` is a ``ValueError``, so merging the two arms would still pass the faulted arm
-    above while logging a WARNING on every such send; this arm pins the silence."""
+    """CHANGED by BACKLOG #4905: this arm pinned the ``HL7PeekError`` skip as QUIET for every payload.
+    That silence also covered ``Peek.parse`` cap refusals of a body whose MSH-10 was readable, so a
+    delivery check switched off with no log. The send site now parses the header alone, and an
+    ``HL7PeekError`` on a payload that leads with MSH logs by type name, like the fault arm above.
+    The non-HL7 quiet case is pinned in ``tests/test_mllp_send_cap_correlation.py``.
+
+    It still pins that the two arms stay apart: the ``HL7PeekError`` arm logs its own wording
+    (``read refused``), never the fault arm's ``raised``."""
     calls = _inject_msh10_fault(monkeypatch, HL7PeekError)
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         peer, result = await _send_against_mismatched_ack()
@@ -188,4 +193,8 @@ async def test_an_unparseable_msh10_skips_correlation_quietly(
     assert result is None
     assert len(peer.received) == 1
     assert calls == [1]
-    assert _skip_warnings(caplog) == []
+    records = _skip_warnings(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    text = records[0].getMessage()
+    assert "MSH-10 read refused (HL7PeekError)" in text
+    assert _FAULT_TEXT not in caplog.text

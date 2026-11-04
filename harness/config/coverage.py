@@ -19,7 +19,7 @@ delivery path is reachable by choosing the message you send:
 | ADT^A02                         | handler returns None                     | FILTERED              |
 | ADT^A03                         | handler raises                           | ERROR (AE NAK)        |
 | any non-ADT type (ORU/ORM/…)    | router returns []                        | UNROUTED              |
-| anything malformed / wrong ver. | to IB_Coverage_Strict (port 2577)        | ERROR (AE NAK)        |
+| anything malformed / wrong ver. | to IB_Coverage_Strict (port 2577)        | ERROR (AR NAK)        |
 
 The fan-out path also demonstrates **independent outbound draining** and **dead-lettering**:
 ``OB_Coverage_Echo`` delivers to the harness Receive tab (127.0.0.1:2576). If that listener is

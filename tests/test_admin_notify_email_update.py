@@ -66,8 +66,9 @@ async def _account(store: MessageStore, *, notify: str | None, profile: str | No
         email=notify,
         password_hash=hash_password(PW),
         password_generated=False,
+        audits=(),
     )
-    await store.update_user_profile("u1", display_name="Bob", email=profile)
+    await store.update_user_profile("u1", display_name="Bob", email=profile, audits=())
 
 
 async def _rows(store: AuditStore) -> list[Any]:
@@ -467,7 +468,9 @@ async def _api(engine: Engine, notifier: _FakeNotifier | None = None) -> tuple[A
         roles=[Role.VIEWER.value],
         actor="test",
     )
-    await service.store.update_user_profile(target, display_name=None, email="dir@example.org")
+    await service.store.update_user_profile(
+        target, display_name=None, email="dir@example.org", audits=()
+    )
     return service, target
 
 
@@ -654,7 +657,9 @@ async def test_patch_without_email_saves_over_a_stored_address_the_rule_refuses(
     """The route fills an omitted ``email`` from the stored row, so a stored value the rule refuses
     must not turn every later save into a 400."""
     service, target = await _api(engine)
-    await service.store.update_user_profile(target, display_name=None, email="not-an-address")
+    await service.store.update_user_profile(
+        target, display_name=None, email="not-an-address", audits=()
+    )
     r = await _patch(engine, service, target, {"display_name": "Renamed"})
     assert r.status_code == 200, r.text
     user = await service.store.get_user(target)

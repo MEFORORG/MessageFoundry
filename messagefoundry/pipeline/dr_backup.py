@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
 import errno
 import functools
 import hmac
@@ -56,7 +55,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import BinaryIO, cast
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
@@ -98,6 +97,18 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.transports.file import (
+    _NAME_SURROGATE,
+    _WIN_UNSUPPORTED,
+    _handle_final_path,
+    _os_handle,
+    _Replaced,
+    _Unconfined,
+    _win_hold_dirs,
+    _win_lstat,
+    _win_open_file,
+    _win_release,
+)
 
 __all__ = [
     "BackupRunner",
@@ -285,15 +296,22 @@ class BackupResult:
     #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
     #: next backup's sweep retries the directory.
     staging_leftover: str | None = None
-    #: Whether the archive carries the config dir under ``config/``, the dir this pass read, and,
-    #: when it could not be read, the fault's class name (vault BACKLOG #3094). A full run with
-    #: ``config_bundled`` false and a fault still succeeds: the store snapshot is worth keeping.
+    #: Whether the archive carries a config file under ``config/``, the dir this pass read, and,
+    #: when it could not be read, the fault's class name (vault BACKLOG #3094), or
+    #: :data:`CONFIG_WALK_ADDED_NOTHING` when the walk added no regular file (vault BACKLOG #5220).
+    #: A full run with ``config_bundled`` false still succeeds: the store snapshot is worth keeping.
     config_bundled: bool = False
     config_dir: str | None = None
     config_bundle_error: str | None = None
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
     #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
+
+
+#: The ``config_bundle_error`` a pass records when its config walk added no regular file, as for an
+#: empty dir or one holding only links (vault BACKLOG #5220). Every other value there is an exception
+#: class name, so this one is spelled so it cannot be read as one.
+CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
 
 
 @dataclass(frozen=True)
@@ -307,6 +325,14 @@ class _ConfigBundle:
     #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
     #: of the whole bundle (vault BACKLOG #3765).
     left_out: tuple[str, ...] = ()
+
+    def after_walk(self, added: int) -> _ConfigBundle:
+        """This bundle as the record states it once the walk has run: a bundled pass whose walk
+        added no regular file carries no config, so it is recorded as not bundled, with
+        :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG #5220)."""
+        if self.bundled and added == 0:
+            return replace(self, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
+        return self
 
     def manifest_fields(self) -> dict[str, object]:
         """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
@@ -535,6 +561,30 @@ class BackupRunner:
 
     async def _do_backup(self, now: float, *, force_config_only: bool = False) -> BackupResult:
         s = self._settings
+        # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
+        # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
+        # --config-only flag forces config-only even on SQLite.
+        config_only = force_config_only or self._is_server_db()
+        # Read once, so the space check, the archive's config/ members and its fingerprint all name
+        # one directory even if a reload lands during the pass.
+        config_dir = self._current_config_dir()
+        if self._is_server_db() and not s.config_only_on_server_db:
+            raise BackupError(
+                "snapshot",
+                f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
+                "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
+            )
+        if config_only and (config_dir is None or not s.include_config):
+            # A config-only archive without its config holds nothing to restore, yet it would verify
+            # and take a keep-N slot from an archive that does (vault BACKLOG #5220). Refused before
+            # any I/O; a dir that cannot be listed, and a walk that adds no file, are refused below.
+            why = (
+                "no config dir is loaded"
+                if config_dir is None
+                else "[backup].include_config is false"
+            )
+            raise BackupError("snapshot", f"config-only backup: {why}; nothing to archive")
+
         dest_dir = Path(s.destination)
         self._ensure_destination(dest_dir)
 
@@ -555,20 +605,6 @@ class BackupRunner:
         # A store on the frozen v1 writer has no salt: the frames are then sealed under the DEK and
         # charged to the DEK's row, which is where that store's own values are counted too.
         salt = self._store_salt() if key is not None else None
-
-        # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
-        # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
-        # --config-only flag forces config-only even on SQLite.
-        config_only = force_config_only or self._is_server_db()
-        # Read once, so the space check, the archive's config/ members and its fingerprint all name
-        # one directory even if a reload lands during the pass.
-        config_dir = self._current_config_dir()
-        if self._is_server_db() and not s.config_only_on_server_db:
-            raise BackupError(
-                "snapshot",
-                f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
-                "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
-            )
 
         ext = _ENCRYPTED_EXT if key is not None else _PLAINTEXT_EXT
         stamp = _utc_stamp(now)
@@ -719,7 +755,8 @@ class BackupRunner:
             bundle = await asyncio.to_thread(self._inspect_config, config_dir)
             if config_only and bundle.error is not None:
                 # A config-only archive without its config holds nothing to restore, yet it would
-                # verify and take a keep-N slot from an archive that does. It fails instead.
+                # verify and take a keep-N slot from an archive that does. It fails instead. A walk
+                # that adds no file is refused in the build, which is where the walk runs.
                 raise BackupError(
                     "snapshot",
                     f"config-only backup: the config dir {config_dir} could not be read "
@@ -730,6 +767,7 @@ class BackupRunner:
                     snapshot_sha256,
                     row_counts,
                     archive_bytes,
+                    config_files_added,
                     staging_leftover,
                 ) = await asyncio.to_thread(
                     self._build_in_staging,
@@ -788,6 +826,8 @@ class BackupRunner:
         # every earlier archive that also passed — and nothing that failed (AC-6).
         pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
 
+        # What the archive carries, as its manifest records it (vault BACKLOG #5220).
+        bundle = bundle.after_walk(config_files_added)
         return BackupResult(
             archive_path=str(archive_path),
             archive_bytes=archive_bytes,
@@ -984,12 +1024,12 @@ class BackupRunner:
         now: float,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int, str | None]:
+    ) -> tuple[str, dict[str, int], int, int, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
-        thread. Returns the build's result plus the release's leftover sentence (``None`` when no file
-        in the directory still holds plaintext). Releasing here, not on the loop, is what makes a
-        cancelled build clean up after itself: it keeps running on this thread, and the directory goes
-        only once it has let go of the files."""
+        thread. Returns the build's four values, then the release's leftover sentence (``None`` when
+        no file in the directory still holds plaintext). Releasing here, not on the loop, is what
+        makes a cancelled build clean up after itself: it keeps running on this thread, and the
+        directory goes only once it has let go of the files."""
         if not work.claim():
             raise OSError(f"the backup staging directory {work.path} was released before the build")
         try:
@@ -1009,6 +1049,10 @@ class BackupRunner:
             leftover = work.release()
             if leftover is None:
                 raise
+            if isinstance(exc, BackupError):
+                # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
+                # same reason, and a note would not reach the audit row or the alert.
+                raise BackupError(exc.kind, f"{leftover}; the build failed: {exc}") from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
@@ -1031,10 +1075,11 @@ class BackupRunner:
         secure: bool,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int]:
+    ) -> tuple[str, dict[str, int], int, int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
-        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a file in
+        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes, config_files_added)``, the
+        last the regular config files the walk added. The tar goes to a file in
         ``work_dir`` (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the
         archive. That tar is plaintext, so with ``secure`` it is locked to its owner before its first
         byte, the way the restore path locks its own staged tar.
@@ -1049,25 +1094,6 @@ class BackupRunner:
             snapshot_sha256 = _sha256_file(snap_path)
             row_counts = _count_tables(snap_path)
 
-        manifest = {
-            "format": "mfbak",
-            # The .mfbak archive format version — parity with the AAD-bound codec header (ADR 0049
-            # "What's in the archive"). The header's value is authoritative for decode; this is the
-            # human-/tooling-readable copy inside the manifest.
-            "format_version": FORMAT_VERSION,
-            "engine_version": self._engine_version,
-            "instance": self._instance,
-            "created_utc": _utc_iso(now),
-            "snapshot_method": self._settings.snapshot_method,
-            "config_only": config_only,
-            "backend": self._backend_value(),
-            "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-            **bundle.manifest_fields(),
-            "snapshot_sha256": snapshot_sha256,
-            "row_counts": row_counts,
-        }
-        manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
-
         # In the run's own staging directory, which the caller releases on every exit.
         tar_path = work_dir / "archive.tar"
         with open(tar_path, "wb") as tar_fh:
@@ -1075,8 +1101,39 @@ class BackupRunner:
             with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
+                added = 0
                 if bundle.bundled and bundle.path is not None:
-                    self._add_config_dir(tar, bundle.path)
+                    added = self._add_config_dir(tar, bundle.path)
+                if config_only and added == 0:
+                    # Before the archive is written, so nothing is published or pruned: an archive of
+                    # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
+                    # The verdict leads the message, ahead of the path. A staging leftover, when
+                    # there is one, is put ahead of both by `_build_in_staging`.
+                    raise BackupError(
+                        "snapshot",
+                        "config-only backup: the config walk added no regular file, so there is "
+                        f"nothing to archive (config dir {bundle.path})",
+                    )
+                # Built after the walk, so `config_bundled` says whether a config file was added,
+                # not whether the walk was asked to run (vault BACKLOG #5220).
+                manifest = {
+                    "format": "mfbak",
+                    # The .mfbak archive format version — parity with the AAD-bound codec header
+                    # (ADR 0049 "What's in the archive"). The header's value is authoritative for
+                    # decode; this is the human-/tooling-readable copy inside the manifest.
+                    "format_version": FORMAT_VERSION,
+                    "engine_version": self._engine_version,
+                    "instance": self._instance,
+                    "created_utc": _utc_iso(now),
+                    "snapshot_method": self._settings.snapshot_method,
+                    "config_only": config_only,
+                    "backend": self._backend_value(),
+                    "key_id": key_id,  # one-way fingerprint, NEVER key bytes
+                    **bundle.after_walk(added).manifest_fields(),
+                    "snapshot_sha256": snapshot_sha256,
+                    "row_counts": row_counts,
+                }
+                manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -1109,31 +1166,71 @@ class BackupRunner:
             dst.flush()
             os.fsync(dst.fileno())
         archive_bytes = out_path.stat().st_size
-        return snapshot_sha256, row_counts, archive_bytes
+        return snapshot_sha256, row_counts, archive_bytes, added
 
-    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> None:
+    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> int:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
-        ``connections.toml``, ``codesets/``, fixtures). Symlinks are NOT followed (a symlink out of the
-        bundle would smuggle an arbitrary host file into the archive); only regular files are added.
+        ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
+        arbitrary host file into the archive, so the walk aims to add only regular files and does
+        NOT follow at least: a symlinked file, a symlinked directory, and on Windows a junction or
+        volume mount point below ``base`` (vault BACKLOG #5221), as :func:`_walk_unfollowed` reads
+        them. A filesystem mounted below ``base`` on POSIX is not a link, and is walked. ``base``
+        itself is the operator's configured directory and is walked whatever it is. At least each
+        directory link the walk lists as a directory is named in one WARNING, since the loader and
+        the config digest may read through it.
+
+        Not covered, at least: the walk reads each entry, then lists or opens it by name, so a path
+        swapped for a link in between is followed. The swaps that reach it include at least these.
+        A directory swapped for a junction in that gap is descended, as :func:`_walk_unfollowed`
+        says, and the files behind it are bundled. A parent folder swapped for a junction after the
+        walk had already decided to descend into the folder lets ``tar.add`` open each name listed
+        under the folder through the junction. A swapped file adds one member, since ``tar.add`` is
+        not recursive. This walk does not close that race, and this docstring does not bound who
+        can win it; closing it is separate work.
 
         A config editor's lock file and candidate directories are skipped (vault BACKLOG #2782): a
         candidate lives only for one validation, so one listed here may be gone by the add, and a
-        killed editor's leftover is not config."""
-        for path in sorted(base.rglob("*")):
+        killed editor's leftover is not config. So is the backup's own staging, which a data dir
+        inside the config dir puts there (BACKLOG #1174): its plaintext snapshot and the tar being
+        written must not ride in the bundle.
+
+        Returns how many regular files it added, which a config-only pass needs (vault BACKLOG
+        #5220)."""
+        pruned: list[str] = []
+        found: list[Path] = []
+        for dirpath, dirs, files in _walk_unfollowed(base, pruned):
+            # Pruned here, before the walk descends them, so a link inside one is not reported.
+            dirs[:] = [
+                d
+                for d in dirs
+                if not (atomic_edit.is_candidate_dir_name(d) or _is_staging_dir(Path(dirpath, d)))
+            ]
+            found.extend(Path(dirpath, name) for name in files)
+        if pruned:
+            log.warning(
+                "DR backup: the config bundle of %s does not follow a directory link, so it leaves "
+                "out: %s",
+                base,
+                scrub_log_argument(
+                    ", ".join(sorted(Path(p).relative_to(base).as_posix() for p in pruned))
+                ),
+            )
+        added = 0
+        # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
+        for path in sorted(found):
             if path.is_symlink() or not path.is_file():
                 continue
-            if _is_config_edit_artifact(path.relative_to(base)):
+            rel = path.relative_to(base)
+            if _is_config_edit_artifact(rel):
                 continue
-            if any(
-                _is_staging_dir(base / parent)
-                for parent in path.relative_to(base).parents
-                if parent != Path(".")
-            ):
-                # A data dir inside the config dir puts the backup's own staging there (BACKLOG
-                # #1174): its plaintext snapshot and the tar being written must not ride in the bundle.
-                continue
-            rel = path.relative_to(base).as_posix()
-            tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel}")
+            before = len(tar.getmembers())
+            tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
+            # Counted from the member tar wrote, so a path swapped for a link or a folder after the
+            # check above does not count as a file, nor one tar skipped, such as a socket.
+            members = tar.getmembers()
+            if len(members) > before and members[-1].isreg():
+                added += 1
+        return added
 
     # --- keep-N retention ----------------------------------------------------
 
@@ -1316,8 +1413,9 @@ class BackupRunner:
 
         A directory that is gone or cannot be listed is not bundled, and the archive records that
         with the fault's class name (vault BACKLOG #3094). The fold and the archive walk both list
-        through ``glob``, which swallows that error, so without this check the archive would carry
-        an empty ``config/``, and an empty-bundle digest, under a clean success. A full pass still
+        through calls that swallow that error (``glob``, ``os.walk``), so without this check the
+        archive would carry an empty ``config/``, and an empty-bundle digest, under a clean
+        success. A full pass still
         goes on, because the store snapshot is worth keeping; a config-only pass fails, in
         :meth:`_do_backup`. The digest itself catches what
         :meth:`Engine.fingerprint_bundle_blocking` catches, its rule's source of record, so a bundle
@@ -1763,14 +1861,9 @@ def _fd_walk(
             os.close(fd)
 
 
-#: The walk the truncate fail-safe uses, named here so a test can refuse a listing without patching
-#: every caller's walk. POSIX walks by descriptor (:func:`_fd_walk`). Windows has no such walk, so there
-#: it goes by path and each directory's and file's final path is checked instead (see
-#: :func:`_empty_files_in_place`).
-if sys.platform == "win32":
-    _walk = os.walk
-else:
-    _walk = _fd_walk
+#: The POSIX walk the truncate fail-safe uses, named here so a test can refuse a listing without
+#: patching every caller's walk. Windows walks by held handle instead (:func:`_win_held_walk`).
+_walk = _fd_walk
 
 
 def _empty_files_in_place(staging: Path) -> list[str]:
@@ -1788,11 +1881,9 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     - POSIX: :func:`_fd_walk` hands over a descriptor per directory and opens each child directory with
       ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
-    - Windows: ``staging`` and each directory under it are opened without following a reparse point
-      that names another path, and must lie under ``staging``'s final path, or the directory is left
-      unwalked and reported without its name. Each file is opened the same way, and its final path
-      must lie under ``staging``'s too. A reparse point that names no path (a cloud, deduplicated or
-      tiered file) is opened again so its filter serves it, and must still be the same file.
+    - Windows: :func:`_win_held_walk` holds each directory, and the ones above it, while it is checked,
+      listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
+      its final path must lie under ``staging``'s.
 
     What this leaves open is listed once, in docs/PHI.md section 2's staging row."""
     unproven: list[str] = []
@@ -1807,44 +1898,11 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     walked = False
     if sys.platform == "win32":
-        try:
-            inside = _win_real_directory(staging)
-        except OSError as exc:
-            if getattr(exc, "winerror", None) in _WIN_FINAL_PATH_UNSUPPORTED:
-                # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM
-                # disks) cannot name a handle's final path, so nothing here can be shown to lie
-                # inside the directory. Truncating by path instead is what BACKLOG #2420 removed,
-                # so nothing is emptied, and that is said, without any file's name.
-                log.warning(
-                    "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
-                    "cannot report a file's final path, so no file in it was emptied",
-                    staging,
-                )
-            _unlisted(exc)
-            return unproven
-        for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
+        for dirpath, dirnames, filenames, inside in _win_held_walk(staging, unproven, _report):
             walked = True
-            # Checked before any of its entries is opened or named: a directory swapped for a
-            # junction after its listing, or reached through one, is not walked.
-            try:
-                outside = not _win_real_directory(Path(dirpath)).startswith(inside)
-            except NotADirectoryError:
-                outside = True
-            except OSError as exc:
-                dirnames[:] = []
-                _unlisted(exc)
-                continue
-            if outside:
-                dirnames[:] = []
-                _report(_OUTSIDE_REASON)
-                continue
             # Never descend through a link or a junction, which `os.walk` follows even with
             # `followlinks=False`.
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
-            ]
+            dirnames[:] = [d for d in dirnames if not _is_dir_link(os.path.join(dirpath, d))]
             for name in filenames:
                 _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
     else:
@@ -1862,10 +1920,15 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
 
-#: The Win32 errors ``GetFinalPathNameByHandleW`` returns on a volume that does not support it:
-#: ``ERROR_INVALID_FUNCTION``, ``ERROR_NOT_SUPPORTED`` and ``ERROR_INVALID_PARAMETER``, the set
-#: ``transports/file.py`` treats as "this volume does not do that".
-_WIN_FINAL_PATH_UNSUPPORTED = frozenset({1, 50, 87})
+
+class _HardLinked(OSError):
+    """The opened file has a second link, so it is not truncated (see :func:`_vet_for_truncate`).
+    Never carries a name."""
+
+
+class _Outside(OSError):
+    """Windows: the file opened as itself has a final path outside the staging directory, so it is
+    not truncated and is reported as :data:`_OUTSIDE_REASON`. Never carries a name."""
 
 
 def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
@@ -1873,15 +1936,19 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
     ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
-    path on Windows, as :func:`_win_real_directory` returns it. The ``lstat`` first only skips a link
-    or a hard link without opening it; the check that decides is the one on the open handle."""
+    path on Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a
+    hard link without opening it; the check that decides is the one on the open handle."""
     name = entry.name
     try:
-        st = (
-            os.lstat(entry)
-            if dir_fd is None
-            else os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        )
+        if dir_fd is not None:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        elif sys.platform == "win32":
+            # Not `os.lstat`, which opens a cloud, deduplicated or tiered file through its filter.
+            st, tag = _win_lstat(entry)
+            if tag & _NAME_SURROGATE:
+                return None  # a link, skipped as below; `os.fstat` calls a file symlink regular
+        else:
+            st = os.lstat(entry)
     except FileNotFoundError:
         return None
     except OSError:
@@ -1895,194 +1962,253 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
-        fd = _open_unfollowed(entry, dir_fd)
+        fd = _open_unfollowed(entry, dir_fd, inside)
     except FileNotFoundError:
         return None
-    except OSError:
-        return name
+    except OSError as exc:
+        return _not_truncated(name, exc)
     try:
-        if inside is not None and not _win_final_path(fd).startswith(inside):
-            return _OUTSIDE_REASON
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or _names_another_path(fd):
-            return f"{name} (changed while being emptied, not truncated)"
-        if opened.st_nlink > 1:
-            return f"{name} (hard-linked, not truncated)"
+        # Checked on the handle that truncates: POSIX's only check, and on Windows the reopened
+        # handle of a file a filter serves (the handle opened as itself was checked before that,
+        # inside test included, and the reopen must be that same file).
+        _vet_for_truncate(fd)
         os.ftruncate(fd, 0)
-    except OSError:
-        return name
+    except OSError as exc:
+        return _not_truncated(name, exc)
     finally:
         os.close(fd)
     return None
 
 
-def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
+def _not_truncated(name: str, exc: OSError) -> str:
+    """What the fail-safe reports for the file ``name`` it did not truncate, by why."""
+    if isinstance(exc, _Outside):
+        return _OUTSIDE_REASON
+    if isinstance(exc, _HardLinked):
+        return f"{name} (hard-linked, not truncated)"
+    if isinstance(exc, (_Unconfined, _Replaced)):
+        # The name became a link or not a regular file, or the Windows reopen that lets a filter
+        # serve the file reached another one. A swap, not something reached through a link.
+        return f"{name} (changed while being emptied, not truncated)"
+    return name
+
+
+def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int:
     """Open ``entry`` for writing without following a link at its last component, and return a
-    descriptor. A test seam.
+    descriptor. A test seam. ``dir_fd`` and ``inside`` are as :func:`_truncate_unfollowed` takes
+    them.
 
     POSIX opens ``entry.name`` relative to ``dir_fd`` (``entry`` itself without one) with
     ``O_NOFOLLOW``, so a link there fails with ``ELOOP``. ``O_NONBLOCK`` too, so a FIFO swapped in
     after the check fails at once rather than holding the teardown's thread until a reader comes; it
     also makes an open that breaks a file lease fail rather than wait, and that file is reported.
 
-    Windows opens ``entry`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, so a link or junction there is
-    opened as itself, which the caller's check then refuses. A reparse point that names no path is
-    opened again so its filter serves its data, and must be the same file, or this raises."""
+    Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
+    connector's own open: as itself, refusing a link or junction there (``_Unconfined``), and
+    refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
+    file, the file opened as itself must have a final path under ``inside`` (``_Outside``) and pass
+    :func:`_vet_for_truncate`, so a file reached outside the directory, through a directory turned
+    into a junction in place, is never served by its filter (BACKLOG #4992).
+
+    A name that is gone once the file was opened as itself, as when it is renamed away before the
+    reopen, raises ``_Replaced``, not ``FileNotFoundError``: the caller reads that as nothing to
+    empty, and the file still holds its bytes under another name."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
-        fd = _win_open(entry, access, _WIN_OPEN_REPARSE_POINT, os.O_RDWR)
+        opened: list[bool] = []
+
+        def vet(fd: int) -> None:
+            opened.append(True)
+            if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
+                raise _Outside("outside the directory")
+            _vet_for_truncate(fd)
+
         try:
-            attributes, tag = _win_attribute_tag(fd)
-            if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and not tag & _WIN_NAME_SURROGATE:
-                first = os.fstat(fd)
-                os.close(fd)
-                fd = -1
-                fd = _win_open(entry, access, 0, os.O_RDWR)
-                again = os.fstat(fd)
-                if (again.st_dev, again.st_ino) != (first.st_dev, first.st_ino):
-                    raise OSError(errno.ESTALE, "not the file first opened", str(entry))
-        except OSError:
-            if fd >= 0:
-                os.close(fd)
+            return _win_open_file(entry, access, vet=vet, fd_flags=os.O_RDWR)
+        except FileNotFoundError as exc:
+            if opened:
+                raise _Replaced("gone after it was opened") from exc
             raise
-        return fd
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
     if dir_fd is None:
         return os.open(entry, flags)
     return os.open(entry.name, flags, dir_fd=dir_fd)
 
 
-#: Win32 constants for the fail-safe: ``FILE_FLAG_OPEN_REPARSE_POINT``, the bit a reparse tag carries
-#: when it names another path (a symbolic link, a junction), and ``FileAttributeTagInfo``.
-_WIN_OPEN_REPARSE_POINT = 0x00200000
 #: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
 #: lock file or marker planted as a link. Windows has none, and follows one there.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
-_WIN_NAME_SURROGATE = 0x20000000
-_WIN_FILE_ATTRIBUTE_TAG_INFO = 9
+#: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
+#: for :func:`_owner_of`.
+_WIN_NAME_SURROGATE = _NAME_SURROGATE
+
+# The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
+# helpers (`_win_hold_dirs`, `_win_open_file`, `_handle_final_path`), the ones the file connector
+# confines its drops with, so one copy of that code serves both (BACKLOG #4992).
 
 
-@functools.cache
-def _win_api() -> Any:
-    """``kernel32`` with the prototypes the Windows half of :func:`_empty_files_in_place` uses."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    from ctypes import wintypes
+def _vet_for_truncate(fd: int) -> None:
+    """Refuse, on the open file, what the fail-safe never truncates: something that is not a regular
+    file, or a file with a second link.
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-    kernel32.GetFinalPathNameByHandleW.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-    ]
-    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
-    kernel32.GetFileInformationByHandleEx.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    return kernel32
+    On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
+    filter serve a reparse point that names no path, and the screen before that open is
+    :func:`_win_lstat`, not ``os.lstat`` (BACKLOG #4992). What still reaches a filter first is
+    listed in docs/PHI.md section 2's staging row."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise _Unconfined("not a regular file")
+    if st.st_nlink > 1:
+        raise _HardLinked("a second link")
 
 
-def _win_open(path: Path, access: int, flags: int, fd_flags: int) -> int:
-    """Open ``path`` with the given ``CreateFileW`` flags, sharing everything, and return a descriptor
-    that owns the handle."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
+def _win_final_path(handle: int) -> str:
+    """The final path of the object open on the OS ``handle``, every link and junction resolved, in
+    ``os.path.normcase`` form. A test seam: the one call whose failure can mean the volume cannot
+    report a final path at all."""
+    return os.path.normcase(_handle_final_path(handle))
 
-    api = _win_api()
-    handle = api.CreateFileW(
-        str(path),
-        access,
-        0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-        None,
-        3,  # OPEN_EXISTING
-        flags,
-        None,
+
+def _win_unlisted(
+    unproven: list[str], where: Path, exc: OSError, *, final_path: bool = False
+) -> None:
+    """Report the directory ``where`` as not listed, by its own name, and log the error it met as
+    itself (BACKLOG #4992).
+
+    Only a failed final-path query (``final_path``) with ``ERROR_INVALID_FUNCTION``,
+    ``ERROR_NOT_SUPPORTED`` or ``ERROR_INVALID_PARAMETER`` is read as a volume that cannot report a
+    final path. The same codes from an open or an attribute query mean something else, and are logged
+    as what they are."""
+    unproven.append(f"{where.name}/ (not listed)")
+    if final_path and getattr(exc, "winerror", None) in _WIN_UNSUPPORTED:
+        # Some redirectors and file systems (VirtualBox shared folders, WebDAV, some RAM disks)
+        # cannot name a handle's final path, so nothing here can be shown to lie inside the
+        # directory. Truncating by path instead is what BACKLOG #2420 removed, so nothing is
+        # emptied, and that is said, without any file's name.
+        log.warning(
+            "DR staging: the truncate fail-safe cannot run on the volume holding %s, which "
+            "cannot report a file's final path, so no file in it was emptied",
+            where,
+        )
+        return
+    log.warning(
+        "DR staging: the truncate fail-safe could not open or list %s, so no file in it was "
+        "emptied: %s",
+        where,
+        safe_exc(exc),
     )
-    if handle is None or handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _win_held_walk(
+    staging: Path, unproven: list[str], report: Callable[[str | None], None]
+) -> Iterator[tuple[str, list[str], list[str], str]]:
+    """Windows: walk ``staging`` top down, as ``os.walk`` does, yielding ``(dirpath, dirnames,
+    filenames, inside)`` for each directory, where ``inside`` is ``staging``'s final path with a
+    trailing separator, for a prefix test. A caller that prunes ``dirnames`` in place prunes the walk.
+
+    Each directory is HELD by :func:`_win_hold_dirs`, with every directory between it and
+    ``staging``, and ``staging`` itself: opened as themselves, refused if one names another path, and
+    shared for reading and writing but not for delete, so that, at least, none can be renamed or
+    replaced by another directory or a junction. The hold does not stop a held directory that is
+    empty being turned into a junction in place, which needs only write-attributes access; the
+    backup staging row of docs/PHI.md section 2 names that residual. It is held before it is
+    checked and listed, and until the caller has emptied its files and resumes the walk (BACKLOG
+    #4992), the order :func:`_fd_walk` keeps with its descriptors.
+
+    A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
+    ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
+    junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
+    as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
+    held_root = _win_hold_root(staging, unproven)
+    if held_root is None:
+        return
+    root, inside = held_root
     try:
-        return msvcrt.open_osfhandle(handle, fd_flags | os.O_BINARY)
-    except BaseException:
-        api.CloseHandle(handle)
-        raise
-
-
-def _win_attribute_tag(fd: int) -> tuple[int, int]:
-    """The attributes and reparse tag of the object open on ``fd``. ``os.fstat`` reports no tag."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
-
-    info = (ctypes.c_uint32 * 2)()  # FILE_ATTRIBUTE_TAG_INFO: FileAttributes, ReparseTag
-    if not _win_api().GetFileInformationByHandleEx(
-        msvcrt.get_osfhandle(fd), _WIN_FILE_ATTRIBUTE_TAG_INFO, info, ctypes.sizeof(info)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return info[0], info[1]
-
-
-def _names_another_path(fd: int) -> bool:
-    """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
-    symbolic link or a junction opened as itself. Always ``False`` on POSIX, where ``O_NOFOLLOW``
-    already refused one."""
-    if sys.platform != "win32":
-        return False
-    attributes, tag = _win_attribute_tag(fd)
-    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _WIN_NAME_SURROGATE)
-
-
-def _win_final_path(fd: int) -> str:
-    """The final path of the object open on ``fd``, every link and junction resolved, in
-    ``os.path.normcase`` form."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the Windows file API runs only on Windows")
-    import msvcrt
-
-    size = 512
-    while True:
-        buf = ctypes.create_unicode_buffer(size)
-        got = _win_api().GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, size, 0)
-        if got == 0:
-            raise ctypes.WinError(ctypes.get_last_error())
-        if got < size:
-            return os.path.normcase(buf.value)
-        size = got + 1  # too small: `got` is the size it needs
-
-
-def _win_real_directory(path: Path) -> str:
-    """The final path of ``path`` with a trailing separator, for a prefix test. Opened without
-    following a reparse point; raises ``OSError`` when it cannot be opened, is not a directory, or is
-    itself a link or junction."""
-    # FILE_READ_ATTRIBUTES, with FILE_FLAG_BACKUP_SEMANTICS so a directory opens at all.
-    fd = _win_open(path, 0x00000080, 0x02000000 | _WIN_OPEN_REPARSE_POINT, os.O_RDONLY)
-    try:
-        attributes = getattr(os.fstat(fd), "st_file_attributes", 0)
-        if not attributes & stat.FILE_ATTRIBUTE_DIRECTORY or _names_another_path(fd):
-            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", str(path))
-        return _win_final_path(fd).rstrip("\\") + "\\"
+        stack = [staging]
+        while stack:
+            where = stack.pop()
+            held = _win_hold_below(staging, where, inside, unproven, report)
+            if held is None:
+                continue
+            try:
+                try:
+                    with os.scandir(where) as listing:
+                        entries = list(listing)
+                except OSError as exc:
+                    _win_unlisted(unproven, where, exc)
+                    continue
+                dirnames: list[str] = []
+                filenames: list[str] = []
+                for entry in entries:
+                    # Not followed: a link to a directory is listed as a file, and its lstat skips it.
+                    (dirnames if entry.is_dir(follow_symlinks=False) else filenames).append(
+                        entry.name
+                    )
+                yield os.fspath(where), dirnames, filenames, inside
+                stack.extend(where / name for name in reversed(dirnames))
+            finally:
+                _win_release(held)
     finally:
-        os.close(fd)
+        _win_release(root)
+
+
+def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] | None:
+    """Hold ``staging`` itself and return its handle with its final path, or ``None`` once what
+    stopped it is reported. A link or a junction there is never walked."""
+    try:
+        root = _win_hold_dirs(staging.parent, (staging.name,))
+    except _Unconfined:
+        unproven.append(f"{staging.name}/ (not listed)")
+        log.warning(
+            "DR staging: the truncate fail-safe did not walk %s, which is a link, a junction or not "
+            "a directory, so no file in it was emptied",
+            staging,
+        )
+        return None
+    except OSError as exc:
+        _win_unlisted(unproven, staging, exc)
+        return None
+    try:
+        return root, _win_final_path(root[0]).rstrip("\\") + "\\"
+    except OSError as exc:
+        _win_release(root)
+        _win_unlisted(unproven, staging, exc, final_path=True)
+        return None
+
+
+def _win_hold_below(
+    staging: Path,
+    where: Path,
+    inside: str,
+    unproven: list[str],
+    report: Callable[[str | None], None],
+) -> list[int] | None:
+    """Hold every directory from below ``staging`` down to ``where`` and return their handles, or
+    ``None`` once what refused it is reported. ``staging`` itself is held by the caller."""
+    try:
+        held = _win_hold_dirs(staging, where.relative_to(staging).parts)
+    except _Unconfined:
+        report(_OUTSIDE_REASON)
+        return None
+    except OSError as exc:
+        _win_unlisted(unproven, where, exc)
+        return None
+    if not held:  # `staging` itself, checked by _win_hold_root
+        return held
+    try:
+        outside = not (_win_final_path(held[-1]).rstrip("\\") + "\\").startswith(inside)
+    except OSError as exc:
+        _win_release(held)
+        _win_unlisted(unproven, where, exc, final_path=True)
+        return None
+    if outside:
+        _win_release(held)
+        report(_OUTSIDE_REASON)
+        return None
+    return held
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
@@ -2319,11 +2445,52 @@ def _is_config_edit_artifact(rel: Path) -> bool:
     )
 
 
-def _tree_size(root: Path) -> int:
-    """The total size of the regular files under ``root``, never following a link, which is also
-    what ``_add_config_dir`` puts in the archive. 0 when ``root`` cannot be walked."""
-    total = 0
+def _walk_unfollowed(
+    root: Path, pruned: list[str] | None = None
+) -> Iterator[tuple[str, list[str], list[str]]]:
+    """``os.walk(root)``, top-down, that does not descend a directory link below ``root``, as
+    :func:`_is_dir_link` reads one: at least a symlinked directory and, on Windows, a junction or
+    volume mount point, which ``os.walk`` descends even with ``followlinks=False`` (vault BACKLOG
+    #5221). A directory whose ``lstat`` fails is not descended either. Each pruned directory's path
+    is appended to ``pruned`` when one is given. A caller may prune the yielded directory list
+    further, as with ``os.walk``. The read and the descent are by name, so a directory swapped for a
+    link between them is descended."""
     for dirpath, dirs, files in os.walk(root, followlinks=False):
+        kept = []
+        for d in dirs:
+            full = os.path.join(dirpath, d)
+            if not _is_dir_link(full, unreadable=True):
+                kept.append(d)
+            elif pruned is not None:
+                pruned.append(full)
+        dirs[:] = kept
+        yield dirpath, dirs, files
+
+
+def _is_dir_link(path: str, *, unreadable: bool = False) -> bool:
+    """Whether ``path`` names another path: a symlink, or on Windows a name-surrogate reparse point,
+    at least a junction or a volume mount point. Read by ``lstat``, never by a following ``stat``. A
+    reparse point that names no other path, such as a cloud placeholder or a deduplicated file, is
+    not one, so it is walked as what it holds; the same rule as :func:`_owner_of`. ``unreadable`` is
+    the answer when the ``lstat`` fails: the config walk prunes such an entry, and the staging walk,
+    which reports what it cannot list, lets ``os.walk`` try it as it did before."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return unreadable
+    reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISLNK(st.st_mode) or bool(
+        reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
+    )
+
+
+def _tree_size(root: Path) -> int:
+    """The total size of the regular files under ``root``, on the walk ``_add_config_dir`` uses
+    (:func:`_walk_unfollowed`), so a directory link it passes over is not counted. Unlike that
+    walk it does not skip the backup's own staging or a config editor's lock file. 0 when ``root``
+    cannot be walked."""
+    total = 0
+    for dirpath, dirs, files in _walk_unfollowed(root):
         # Candidate directories are pruned, as _add_config_dir skips their files.
         dirs[:] = [d for d in dirs if not atomic_edit.is_candidate_dir_name(d)]
         for name in files:
@@ -2749,11 +2916,8 @@ def _verify_in_staging(
 
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     integrity_ok, integrity_msg = _integrity_check(snap)
-    raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
     row_counts = _count_tables(snap)
+    manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if not integrity_ok:
         return VerifyResult(
             "FAIL",
@@ -2762,35 +2926,15 @@ def _verify_in_staging(
             manifest_counts=manifest_counts,
             reason=f"integrity_check failed: {integrity_msg}",
         )
-    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
-    #
-    # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
-    # `_count_tables` derives its table set from the file it is given, so `row_counts` here
-    # reflects the RESTORED snapshot's own schema, which can legitimately be a superset of
-    # what an OLDER manifest recorded — a manifest written before this table set was widened
-    # (or before a later table existed at all) has fewer keys than the archive it describes
-    # really has tables. `run_restore_verify` is explicitly a standalone check of an OLDER
-    # archive (see its docstring and the AC-5 comment above), so that gap is an ordinary
-    # thing to hit, not tampering, and dict equality would FAIL every such archive on sight.
-    # A table the manifest tracked but the snapshot's schema no longer has (dropped, or never
-    # existed there) reads as a 0, the same convention the old fixed-list `_count_tables` used
-    # for a table absent from the schema — so a manifest count of 0 for it still passes, and a
-    # nonzero one still correctly FAILs (real data loss). A table `row_counts` has that the
-    # manifest never tracked is not compared at all: an older manifest cannot be faulted for
-    # not knowing about a table it never counted.
-    mismatches = {
-        table: (manifest_counts[table], row_counts.get(table, 0))
-        for table in manifest_counts
-        if row_counts.get(table, 0) != manifest_counts[table]
-    }
-    if mismatches:
+    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot, and a compare that
+    # read nothing); :func:`_compare_row_counts` says why it is keyed off the manifest's tables.
+    if count_refusal is not None:
         return VerifyResult(
             "FAIL",
             integrity_ok=True,
             row_counts=row_counts,
             manifest_counts=manifest_counts,
-            reason=f"row-count mismatch on {sorted(mismatches)}: "
-            f"snapshot={row_counts} manifest={manifest_counts}",
+            reason=count_refusal,
         )
     decrypted_cells = 0
     if full:
@@ -2920,7 +3064,7 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     has fewer keys than a snapshot's schema really has — and that is expected, not tampering:
     ``run_restore_verify`` is a standalone check of an archive from any earlier point (AC-5), so an
     older, narrower manifest is an ordinary thing to verify. The compare in
-    :func:`_verify_archive_blocking` is written to tolerate exactly that (keyed off the manifest's
+    :func:`_compare_row_counts` is written to tolerate exactly that (keyed off the manifest's
     own keys, not dict equality) — this function only ever reports what IS in the schema, and does
     not itself guarantee cross-build equality.
 
@@ -3827,36 +3971,86 @@ def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None
             log.warning("could not remove the partially restored config member %s: %s", path, exc)
 
 
-def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
-    """``integrity_check`` + the manifest row-count compare on the extracted ``store.db``, run on the
-    exact file about to be placed. Same two checks (and the same helpers) as
-    :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore summary.
+def _compare_row_counts(
+    manifest: dict[str, object], row_counts: dict[str, int]
+) -> tuple[dict[str, int], str | None]:
+    """The manifest's recorded counts, and the reason the snapshot's ``row_counts`` fail the compare
+    against them (``None`` when they agree). The one compare both :func:`_verify_in_staging` (the
+    archive verify) and :func:`_verify_extracted_store` (restore's pre-place check) run.
 
-    The compare is keyed off the MANIFEST's own keys rather than dict equality, for the reason
-    :func:`_verify_archive_blocking` gives at its step 4: :func:`_count_tables` derives its table set
-    from the snapshot's own ``sqlite_master`` (BACKLOG #1722), so a manifest written before that set
-    was widened records fewer tables than the archive really has. Restoring an archive taken by an
-    EARLIER build is the ordinary case for this subcommand, so dict equality would refuse on sight the
-    archives a restore exists to accept. A table the manifest tracked that the snapshot's schema lacks
-    reads as 0, so a manifest count of 0 still passes and a nonzero one still raises: real data loss is
-    still caught. A table the snapshot has that the manifest never tracked is not compared at all."""
-    integrity_ok, integrity_msg = _integrity_check(snap)
-    if not integrity_ok:
-        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
-    row_counts = _count_tables(snap)
+    Keyed off the MANIFEST's own tables, not dict equality (BACKLOG #1722 follow-up).
+    :func:`_count_tables` derives its table set from the file it is given, so ``row_counts`` reflects
+    the snapshot's own schema, which can legitimately be a superset of what an OLDER manifest
+    recorded: one written before this table set was widened (or before a later table existed) has
+    fewer keys than the archive really has tables. Verifying or restoring an archive taken by an
+    earlier build is ordinary (AC-5), so dict equality would refuse every such archive on sight. A
+    table the manifest tracked that the snapshot's schema lacks reads as 0, so a manifest count of 0
+    for it still agrees and a nonzero one is real data loss. A table the snapshot has that the
+    manifest never tracked is not compared at all.
+
+    Because the compare walks the manifest's tables, it reads nothing when the manifest records none
+    (``row_counts`` empty or missing), and nothing of the snapshot when the two share no table, the
+    case of a snapshot whose schema holds no table at all: every manifest count then reads as 0. A PASS there would certify counts nobody compared, the shape BACKLOG #2186 produced
+    when the backup and the verify both counted an empty stand-in, so at least those refuse (BACKLOG
+    #5056). A full archive never legitimately has either: its manifest lists every table of its
+    store, and even the oldest, four-table manifest names ``messages``. A config-only archive carries
+    no snapshot and returns before this compare. A ``row_counts`` that is not a mapping, or a count
+    that is not a non-negative integer, refuses too, rather than being coerced (``3.9`` read as
+    ``3``) or raising out of the verify."""
     raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
+    manifest_counts: dict[str, int] = {}
+    if raw_counts is not None and not isinstance(raw_counts, dict):
+        return manifest_counts, (
+            f"the manifest's row counts are a {type(raw_counts).__name__}, not a mapping of table "
+            "to count, so they cannot be compared"
+        )
+    malformed: list[str] = []
+    for table, count in (raw_counts or {}).items():
+        # bool is an int subclass, and a float, a string or a null is not a row count.
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            manifest_counts[str(table)] = count
+        else:
+            malformed.append(str(table))
+    if malformed:
+        return manifest_counts, (
+            f"the manifest's row counts for {sorted(malformed)} are not non-negative integers, so "
+            "they cannot be compared"
+        )
+    if not manifest_counts:
+        return manifest_counts, (
+            "the manifest records no row counts, so the row-count compare would read nothing; a "
+            "full archive's manifest lists every table of its store"
+        )
     mismatches = sorted(
         table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
     )
     if mismatches:
-        raise BackupError(
-            "verify",
-            f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
-            f"snapshot={row_counts} manifest={manifest_counts}",
+        return manifest_counts, (
+            f"row-count mismatch on {mismatches} (a torn snapshot or a wrong manifest): "
+            f"snapshot={row_counts} manifest={manifest_counts}"
         )
+    # After the mismatch check, so a truncated snapshot against nonzero counts still reads as the
+    # data loss it is; what reaches here is an all-zero manifest agreeing with tables it never saw.
+    if not manifest_counts.keys() & row_counts.keys():
+        return manifest_counts, (
+            f"the manifest's {len(manifest_counts)} table(s) share none with the archive's store.db "
+            f"({len(row_counts)} table(s)), so the row-count compare would read nothing"
+        )
+    return manifest_counts, None
+
+
+def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
+    """``integrity_check`` + the manifest row-count compare (:func:`_compare_row_counts`) on the
+    extracted ``store.db``, run on the exact file about to be placed. Same two checks (and the same
+    helpers) as :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore
+    summary."""
+    integrity_ok, integrity_msg = _integrity_check(snap)
+    if not integrity_ok:
+        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
+    row_counts = _count_tables(snap)
+    _manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
+    if count_refusal is not None:
+        raise BackupError("verify", count_refusal)
     return row_counts
 
 

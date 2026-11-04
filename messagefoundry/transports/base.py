@@ -24,6 +24,7 @@ import abc
 import asyncio
 import contextlib
 import errno
+import logging
 import math
 import numbers
 import operator
@@ -34,9 +35,9 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Final, Protocol, runtime_checkable
 
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 
 # Re-exported beside the connector contract it belongs to; :mod:`messagefoundry.connection_events`
@@ -50,6 +51,7 @@ from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 # transports/ must not import api/, so the shared leaf lives at the package root. The five connector
 # call sites (mllp/tcp/x12/dicom/http_listener) keep importing it from here, unchanged.
 from messagefoundry.netaddr import peer_ip_allowed
+from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "ENCODING_CODE",
@@ -57,10 +59,17 @@ __all__ = [
     "CONNECTION_EVENT_KINDS",
     "ConnectionEventSink",
     "IntakeAuditSink",
+    "INTAKE_AUDIT_ACTIONS",
     "IntakeRateLimiter",
     "IntakeGate",
     "intake_open",
     "wait_for_intake",
+    "HANDLER_RETRY_DELAYS",
+    "HANDLER_FAULT_REPORT_AFTER",
+    "HandlerFaultUnrecovered",
+    "hold_and_retry",
+    "owes_hl7_reply",
+    "recover_handler_fault",
     "InboundReply",
     "ReplyOutcome",
     "SyncReplyResolver",
@@ -452,6 +461,19 @@ ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 # ``detail`` carries the mode and the outcome only.
 IntakeAuditSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
+#: ``connection_event`` kind -> ``audit_log`` action for an intake refusal (ADR 0154 D6), the one
+#: map both listeners that refuse a peer at intake read: the HTTP listener for ``intake_auth``, and
+#: the MLLP listener for ``tls_client_subjects`` (BACKLOG #4907), whose refused sender is audited
+#: under the same actions as HTTP's ``mtls_subject``. The kinds double as the ``connection_event``
+#: vocabulary, which CI derives from the literal emit call sites and asserts against
+#: ``docs/PHI.md`` section 7 and ``CONNECTION_EVENT_KINDS`` as an exact set, so a kind added here
+#: without those two is a build failure, by design.
+INTAKE_AUDIT_ACTIONS: Final[Mapping[str, str]] = {
+    "intake_auth_failed": "intake.auth_failed",
+    "auth_subject_denied": "intake.auth_subject_denied",
+    "auth_rate_limited": "intake.auth_rate_limited",
+}
+
 
 class IntakeRateLimiter(Protocol):
     """The failed-attempt budget an intake-authenticating source consults (ADR 0154 D6).
@@ -460,7 +482,8 @@ class IntakeRateLimiter(Protocol):
     and synchronous is honest: the underlying sliding window completes without awaiting, so it is
     atomic on the event loop.
 
-    The three methods exist separately because the budget is charged on **failure only**. Consulting
+    Consulting, charging and noting are separate methods because the budget is charged on **failure
+    only**; :meth:`check_peer` is a narrower read of the same budget. Consulting
     and charging in one call — which is what the shipped ``allow()`` does — would turn a
     brute-force bound into a per-peer throughput cap, silently refusing an authenticated partner's
     traffic pre-ingress, where it is not even counted.
@@ -468,6 +491,17 @@ class IntakeRateLimiter(Protocol):
 
     def check(self, peer: str) -> bool:
         """Whether ``peer`` may make another attempt. **Read-only** — never records one."""
+        ...
+
+    def check_peer(self, peer: str) -> bool:
+        """Whether ``peer``'s OWN per-address budget admits another attempt, the global arm unread.
+        **Read-only**, as :meth:`check` is.
+
+        For a source that can tell a listed peer apart before anything is read, as MLLP's
+        ``tls_client_subjects`` can (BACKLOG #4907): it consults this before the compare and the
+        global arm only once the compare has refused, so refusals from other addresses can never
+        close a listed sender unread.
+        """
         ...
 
     def charge_failure(self, peer: str) -> None:
@@ -586,6 +620,245 @@ async def wait_for_intake(
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(opened.wait(), poll_seconds)
     return True
+
+
+#: The pause before each further attempt, for :func:`hold_and_retry`; the last repeats until the
+#: frame is recorded or the listener stops. Short at first, since a store blip is the common case,
+#: then backing off, so a long outage costs the store one attempt per connection per 30 s.
+HANDLER_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+
+#: Failed attempts after which :func:`hold_and_retry` reports the fault (``handler_error`` and an
+#: ERROR line). A blip the first retries recover leaves WARNING lines and no ``handler_error``.
+HANDLER_FAULT_REPORT_AFTER = 4
+
+#: How often a held retry looks at its ``stopped`` predicate while it pauses. A poll, not a wait on
+#: an event: the listeners' only stop signal is ``ListenerAdmission.stopping``, a plain flag that
+#: every socket listener and its tests set directly. A quarter second is well inside stop()'s 5 s
+#: grace for its client tasks.
+_HOLD_STOP_POLL_SECONDS = 0.25
+
+#: The bound on the ``handler_error`` report a cancelled hold still makes. The store may be what is
+#: hung, and stop() waits for the task it cancelled, so the report must not hold stop() open.
+_CANCELLED_REPORT_SECONDS = 1.0
+
+
+def owes_hl7_reply(ack_mode: AckMode, content_type: ContentType | None) -> bool:
+    """Whether a listener's inbound answers each frame in HL7, so its sender waits for a reply.
+
+    Mirrors the runner, which replies only on an HL7 inbound with acknowledgements on.
+    ``content_type`` is injected by the runner; ``None`` (a direct build, as in tests) reads as HL7,
+    the conservative answer, since a sender told nothing then resends.
+    """
+    return ack_mode is not AckMode.NONE and content_type in (None, ContentType.HL7V2)
+
+
+class HandlerFaultUnrecovered(Exception):
+    """The frame the inbound handler faulted on is not recorded, and the caller closes the
+    connection. :func:`recover_handler_fault` has already logged it and reported ``handler_error``."""
+
+
+async def recover_handler_fault(
+    handler: InboundHandler,
+    frame: bytes,
+    reason: str,
+    *,
+    owes_reply: bool,
+    transport: str,
+    peer: object,
+    log: logging.Logger,
+    stopped: Callable[[], bool],
+    report: Callable[[str], Awaitable[None]],
+) -> str | None:
+    """What the raw-TCP and X12 listeners do when ``handler`` faults on a frame their decoder read
+    cleanly (BACKLOG #5022). Returns the handler's reply once an attempt records the frame, or
+    raises :class:`HandlerFaultUnrecovered` when the connection is to close.
+
+    ``reason`` is the fault already scrubbed with ``safe_exc``. The caller passes the text and calls
+    this after its ``except`` clause, so a hold that can last hours keeps neither the exception's
+    traceback, with the frames and message locals it references, nor a context every retry's
+    exception would chain to.
+
+    With ``owes_reply`` (:func:`owes_hl7_reply`) the sender waits for a reply and resends on a close,
+    so this logs at ERROR, calls ``report`` with ``reason`` for the caller's ``handler_error`` event,
+    and raises at once: the sender resends this frame and those behind it, in order, and a retry
+    would hold it past its own reply timeout. Otherwise the sender never resends, and
+    :func:`hold_and_retry` holds the frame.
+    """
+    if not owes_reply:
+        return await hold_and_retry(
+            handler,
+            frame,
+            reason,
+            transport=transport,
+            peer=peer,
+            log=log,
+            stopped=stopped,
+            report=report,
+        )
+    log.error(
+        "%s message from %s failed in the inbound handler: %s (this inbound sends a reply, so "
+        "closing the connection for the sender to resend)",
+        transport,
+        peer,
+        reason,
+    )
+    await report(reason)
+    raise HandlerFaultUnrecovered
+
+
+async def _pause(delay: float, stopped: Callable[[], bool]) -> None:
+    """Sleep ``delay`` seconds, waking early once ``stopped()`` turns True. It yields at least once,
+    so a zero delay still lets a cancellation or a timeout reach the task."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + delay
+    while True:
+        await asyncio.sleep(min(_HOLD_STOP_POLL_SECONDS, max(deadline - loop.time(), 0.0)))
+        if stopped() or loop.time() >= deadline:
+            return
+
+
+async def hold_and_retry(
+    handler: InboundHandler,
+    frame: bytes,
+    reason: str,
+    *,
+    transport: str,
+    peer: object,
+    log: logging.Logger,
+    stopped: Callable[[], bool],
+    report: Callable[[str], Awaitable[None]],
+) -> str | None:
+    """Retry ``handler`` on a frame it faulted on, for a listener whose sender waits for no reply
+    (BACKLOG #5022), and return its reply once one attempt succeeds. ``reason`` is the first fault,
+    scrubbed (see :func:`recover_handler_fault`).
+
+    That sender never resends, so the frame in hand is its only copy. It is held, and the handler
+    retried after each :data:`HANDLER_RETRY_DELAYS` pause, until it is recorded or ``stopped()``
+    turns True. Nothing is read meanwhile, so TCP flow control stalls the sender rather than the
+    listener taking frames it cannot record. After :data:`HANDLER_FAULT_REPORT_AFTER` failed
+    attempts it calls ``report`` with the scrubbed reason, once, for the caller's ``handler_error``
+    event; a fault the earlier retries clear leaves WARNING lines and no event. A fault that never
+    clears holds the connection until the listener stops.
+
+    Once a stop is seen, the next attempt to start is the last, made at once, inside stop()'s grace
+    for its client tasks: a stop during a pause cuts it short, and a stop during a failing attempt
+    still gets one after it. Should that fail too, or should stop() cancel the task, the hold ends
+    without the frame,
+    and the frames behind it on this connection are lost with it, since the connection closes and
+    the sender never resends. Each way logs one ERROR line saying so and reports, unless it already
+    has. A failed last attempt raises :class:`HandlerFaultUnrecovered`. A cancel bounds the report
+    by :data:`_CANCELLED_REPORT_SECONDS` and re-raises; one that cuts off an attempt inside the
+    handler says the frame may or may not be recorded, since the cut may follow its commit. A fault
+    that came after the commit means a retry commits another copy, which at-least-once delivery
+    allows. Nothing is acknowledged here, so the ACK-after-commit rule holds. Every line carries
+    the ``safe_exc`` text, never the frame.
+    """
+    failed = 1  # attempts that ended in a fault
+    reported = False
+    in_attempt = False
+    try:
+        while True:
+            # The last attempt is the first one to START once the stop is seen, so a stop that
+            # lands during a failing attempt still gets one after it.
+            last = stopped()
+            if last:
+                log.warning(
+                    "%s message from %s failed in the inbound handler (attempt %d): %s; the "
+                    "listener is stopping, so making one last attempt now",
+                    transport,
+                    peer,
+                    failed,
+                    reason,
+                )
+            else:
+                if failed == HANDLER_FAULT_REPORT_AFTER:
+                    log.error(
+                        "%s message from %s failed in the inbound handler %d times: %s (this "
+                        "inbound sends no reply, so the frame is held and retried until it is "
+                        "recorded or the listener stops; the sender is stalled meanwhile)",
+                        transport,
+                        peer,
+                        failed,
+                        reason,
+                    )
+                    await report(reason)
+                    reported = True
+                delay = HANDLER_RETRY_DELAYS[min(failed, len(HANDLER_RETRY_DELAYS)) - 1]
+                log.warning(
+                    "%s message from %s failed in the inbound handler (attempt %d): %s; retrying "
+                    "in %.2fs",
+                    transport,
+                    peer,
+                    failed,
+                    reason,
+                    delay,
+                )
+                await _pause(delay, stopped)
+                last = stopped()  # a stop during the pause makes this attempt the last
+            in_attempt = True
+            try:
+                reply = await handler(frame)
+            except Exception as exc:  # noqa: BLE001 -- any escape is a handler fault; see the docstring
+                in_attempt = False
+                reason = safe_exc(exc)
+                failed += 1
+                if last:
+                    break
+                continue
+            in_attempt = False
+            if reported:
+                log.warning(
+                    "%s message from %s was recorded on attempt %d after the inbound handler faults",
+                    transport,
+                    peer,
+                    failed + 1,
+                )
+            return reply
+    except asyncio.CancelledError:
+        if in_attempt:
+            log.error(
+                "%s message from %s may or may not be recorded: the listener task was cancelled "
+                "inside attempt %d, after %d failed with: %s. No frame behind it on this connection "
+                "is recorded (closing the connection)",
+                transport,
+                peer,
+                failed + 1,
+                failed,
+                reason,
+            )
+        else:
+            _log_hold_loss(log, transport, peer, failed, reason, "the listener task was cancelled")
+        if not reported:
+            try:
+                await asyncio.wait_for(report(reason), _CANCELLED_REPORT_SECONDS)
+            except TimeoutError:
+                log.warning(
+                    "%s handler_error event for %s not written within %.1fs of the cancel",
+                    transport,
+                    peer,
+                    _CANCELLED_REPORT_SECONDS,
+                )
+        raise
+    _log_hold_loss(log, transport, peer, failed, reason, "the listener is stopping")
+    if not reported:
+        await report(reason)
+    raise HandlerFaultUnrecovered
+
+
+def _log_hold_loss(
+    log: logging.Logger, transport: str, peer: object, failed: int, reason: str, why: str
+) -> None:
+    # The sender never resends, and the connection closes with the frames behind the held one still
+    # unhandled in the read or unread in the socket, so the loss is all of them, not one frame.
+    log.error(
+        "%s message from %s is not recorded, nor is any frame behind it on this connection: the "
+        "inbound handler failed %d times and %s: %s (closing the connection)",
+        transport,
+        peer,
+        failed,
+        why,
+        reason,
+    )
 
 
 class ReplyOutcome(str, Enum):  # noqa: UP042 - matches MessageStatus/OutboxStatus house style
@@ -1079,9 +1352,12 @@ class DeliveryResponse:
     A capturing ``send`` returns one of these instead of ``None``; a non-capturing ``send`` returns
     ``None`` exactly as before (byte-identical). The transport hands back the **already-derived**
     outcome it computed anyway (the MSA-1 family, the HTTP status, a SOAP fault) so the store never
-    re-parses the encrypted-at-rest body to reconstruct it.
+    re-parses the stored body to reconstruct it.
 
-    * ``body`` — the partner's reply text, already decoded by the transport (PHI; encrypted at rest).
+    * ``body`` — the partner's reply text, already decoded by the transport (PHI). The store cipher
+      covers it at rest only when a store key is configured; a keyless store writes it in
+      plaintext. ``docs/PHI.md`` section 3 says when ``serve`` accepts a keyless store (BACKLOG
+      #5017).
     * ``outcome`` — one of :data:`RESPONSE_OUTCOMES`. ``accepted`` (a positive reply), ``rejected`` (a
       partner ``<Fault>``/negative content on an otherwise-OK transport), ``unparseable`` (a reply
       frame **was received** but its content could not be parsed — **never** "no reply was received",
@@ -1091,11 +1367,14 @@ class DeliveryResponse:
       only when a store key is configured. The store passes it through ``safe_text(detail,
       limit=200)`` before it is written (BACKLOG #2984): that redacts the PHI shapes the scrubber
       knows, such as an HL7 segment fragment, and keeps at most 200 characters of the scrubbed text,
-      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. It does not catch
-      every identifier: at least a lone surname such as ``Smith``, an identifier such as
-      ``MRN7731`` and a resource id such as ``Patient/12345`` read back unchanged through
-      ``response_get(dest).detail``, so a connector author keeps partner free text out of
-      ``detail``.
+      cut back to a whole token, followed by a ``(+N chars)`` note when it cut. A ``detail`` longer
+      than the scan window loses its tail unscanned and gains a ``[redaction bound: dropped N more
+      chars unscanned]`` marker (BACKLOG #5017). ``docs/PHI.md`` section 3, *The store's
+      200-character bound*, is the one statement of the window, both notes, and when a stored value
+      can run past 200 characters. The scrub does not catch every identifier: at least a lone
+      surname such as ``Smith``, an identifier such as ``MRN7731`` and a resource id such as
+      ``Patient/12345`` read back unchanged through ``response_get(dest).detail``, so a connector
+      author keeps partner free text out of ``detail``.
     * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
       #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
       destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
@@ -1199,10 +1478,17 @@ class SourceConnector(abc.ABC):
 
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
-    answer. A sender that waits for none cannot be told to resend, and at least one shipped
-    listener loses a message that was not committed in that case: the MLLP listener records
-    ``handler_error`` and keeps the connection. It may not be the only one. That is a gap in the
-    shipped code, not a pattern to copy."""
+    answer; the raw-TCP and X12 listeners close with no reply for such a sender. A sender that
+    waits for none cannot be told to resend, so the frame in hand is its only copy. At least the
+    socket listeners differ there:
+
+    * the raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or
+      the listener stops (:func:`hold_and_retry`, BACKLOG #5022). At least two things lose it,
+      together with every frame behind it on that connection: a stop during the hold whose last
+      attempt also fails or is cancelled, which logs the loss at ERROR, and the process dying
+      during the hold, which logs nothing, since the held frames are only in memory;
+    * the MLLP listener records ``handler_error``, drops the frame with no retry and reads on. That
+      is a gap in the shipped code, not a pattern to copy. Other sources may have one too."""
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
@@ -1280,6 +1566,16 @@ class SourceConnector(abc.ABC):
     #: so a direct caller or test that never sets it is byte-identical. At least the listeners, the
     #: poll sources and the timer consult it. The loopback and pass-through sources read nothing.
     intake_gate: IntakeGate | None = None
+
+    #: Optional refusal for a message from a sender whose verified certificate is not on its
+    #: inbound's certificate-subject allowlist (BACKLOG #4907), **injected by the runner after
+    #: build**, the same runtime-injection shape as :attr:`on_connection_event`. The runner
+    #: records the message as an ``ERROR`` row, then returns the ``AR`` reply where the inbound
+    #: answers in HL7, else ``None``, so a refused message is counted and logged rather than
+    #: accepted and dropped. Only the MLLP listener's ``tls_client_subjects`` calls it so far.
+    #: ``None`` (a direct build) means nothing can record such a message, and a listener that
+    #: refuses a sender then reads none of its messages.
+    refuse_unlisted_sender: InboundHandler | None = None
 
     @abc.abstractmethod
     async def start(
@@ -1396,6 +1692,14 @@ class DestinationConnector(abc.ABC):
         :meth:`send` runs: on a simulate (shadow) outbound, and on each MLLP batch member with
         ``rewrite=False``, because a member sits in the envelope as stored and :meth:`send` applies
         any delimiter rewrite to the whole envelope, not to the member."""
+        return None
+
+    async def forget_payload(self, payload: str) -> None:
+        """Drop any state this connector keeps in memory about ``payload`` across sends. The delivery
+        worker calls it once the store has dead-lettered a single row it sent ``payload`` for at the
+        retry policy's ``max_attempts``, so a replay of that row starts clean. The default is a no-op:
+        at least the DICOM C-STORE SCU overrides it, for its count of unanswered stores of a large
+        object (vault BACKLOG #4908)."""
         return None
 
     async def validate_startup(self) -> None:

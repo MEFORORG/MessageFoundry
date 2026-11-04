@@ -168,7 +168,7 @@ async def test_a_pair_whose_bodies_retention_erased_is_not_a_target(store: Any) 
     """
     await _dead(store, "IB_OLD", "OB_OLD", now=10.0)
     await _dead(store, "IB_NEW", "OB_A", now=1_000_000.0)
-    assert await store.purge_dead_letters(older_than=100.0, now=1_000_000.0) == 1
+    assert (await store.purge_dead_letters(older_than=100.0, now=1_000_000.0)).bodies == 1
 
     assert await store.count_dead(allowed_channels=None) == 2
     assert await store.list_replay_targets(allowed_channels=None) == [("IB_NEW", "OB_A")]

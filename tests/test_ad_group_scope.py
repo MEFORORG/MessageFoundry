@@ -55,7 +55,9 @@ async def test_scope_writes_record_their_source(tmp_path: Path) -> None:
     """Every scope write carries its writer, in the same statement (BACKLOG #1927)."""
     s = await MessageStore.open(tmp_path / "src.db")
     try:
-        await s.create_user(user_id="u", username="u", auth_provider="ad", password_generated=False)
+        await s.create_user(
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
+        )
         assert (await s.get_user("u")).channel_scope_source is None  # never written
         await s.set_user_channel_scope("u", json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
         got = await s.get_user("u")
@@ -73,7 +75,9 @@ async def test_the_scope_write_compare_and_sets_on_its_source(tmp_path: Path) ->
     write that does go through, so a method that refused everything would fail here."""
     s = await MessageStore.open(tmp_path / "cas.db")
     try:
-        await s.create_user(user_id="u", username="u", auth_provider="ad", password_generated=False)
+        await s.create_user(
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
+        )
         cas = s.set_user_channel_scope_if_source
         assert (await s.get_user("u")).channel_scope_source is None
         # A named source does not match a NULL one; None does.
@@ -106,7 +110,9 @@ async def test_the_scope_source_column_upgrade_reruns_clean(tmp_path: Path) -> N
     db = tmp_path / "pre-source.db"
     s = await MessageStore.open(str(db))
     try:
-        await s.create_user(user_id="u", username="u", auth_provider="ad", password_generated=False)
+        await s.create_user(
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
+        )
         await s.set_user_channel_scope("u", json.dumps(["IB_A"]), source=SCOPE_SOURCE_MANUAL)
     finally:
         await s.close()
@@ -143,7 +149,7 @@ async def test_the_scope_source_column_upgrade_reruns_clean(tmp_path: Path) -> N
 
 async def _ad_user(store: MessageStore, username: str) -> object:
     await store.create_user(
-        user_id=username, username=username, auth_provider="ad", password_generated=False
+        user_id=username, username=username, auth_provider="ad", password_generated=False, audits=()
     )
     return await store.get_user(username)
 
@@ -198,7 +204,7 @@ async def test_sync_no_matching_group_leaves_scope_untouched(tmp_path: Path) -> 
         await service.initialize()
         await store.set_ad_group_scope_map([("grp-a", "IB_A")])
         await store.create_user(
-            user_id="u", username="u", auth_provider="ad", password_generated=False
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
         )
         # A manual per-user scope, set the way an administrator sets one.
         await service.set_channel_scope("u", ["MANUAL"], actor="admin")
@@ -501,10 +507,10 @@ async def test_the_users_list_shows_who_wrote_each_scope(engine: Engine) -> None
     # Hex ids, because the JSON route takes a ResourceId in its path.
     ada_id, len_id = uuid.uuid4().hex, uuid.uuid4().hex
     await engine.store.create_user(
-        user_id=ada_id, username="ada", auth_provider="ad", password_generated=False
+        user_id=ada_id, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     await engine.store.create_user(
-        user_id=len_id, username="len", auth_provider="local", password_generated=False
+        user_id=len_id, username="len", auth_provider="local", password_generated=False, audits=()
     )
     ada = await service._sync_ad_channel_scope(
         await engine.store.get_user(ada_id), frozenset(), ["grp-a"]
@@ -541,7 +547,7 @@ async def _directory_scoped_user(engine: Engine, service: AuthService) -> str:
     await engine.store.set_ad_group_scope_map([("grp-a", "IB_A")])
     ada_id = uuid.uuid4().hex  # hex, because the JSON route takes a ResourceId in its path
     await engine.store.create_user(
-        user_id=ada_id, username="ada", auth_provider="ad", password_generated=False
+        user_id=ada_id, username="ada", auth_provider="ad", password_generated=False, audits=()
     )
     ada = await service._sync_ad_channel_scope(
         await engine.store.get_user(ada_id), frozenset(), ["grp-a"]
@@ -610,7 +616,7 @@ async def test_a_scope_the_directory_does_not_own_saves_without_expected_source(
     service = await _admin_service(engine)
     len_id = uuid.uuid4().hex
     await engine.store.create_user(
-        user_id=len_id, username="len", auth_provider="local", password_generated=False
+        user_id=len_id, username="len", auth_provider="local", password_generated=False, audits=()
     )
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -635,6 +641,7 @@ async def _legacy_scoped_user(engine: Engine, provider: str, scope_json: str | N
         username=f"u{user_id[:8]}",
         auth_provider=provider,
         password_generated=False,
+        audits=(),
     )
     await engine.store.set_user_channel_scope(
         user_id,
@@ -934,10 +941,14 @@ async def test_editing_an_ad_map_revokes_directory_sessions(
         await service.initialize()
 
         await store.create_user(
-            user_id="ada", username="ada", auth_provider="ad", password_generated=False
+            user_id="ada", username="ada", auth_provider="ad", password_generated=False, audits=()
         )
         await store.create_user(
-            user_id="len", username="len", auth_provider="local", password_generated=False
+            user_id="len",
+            username="len",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         await _session_for(store, "ada", f"h-ada-{setter}")
         await _session_for(store, "len", f"h-len-{setter}")

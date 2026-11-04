@@ -71,7 +71,7 @@ python -P -X disable-remote-debug -m messagefoundry serve --config harness/confi
 | ADT^A02                                  | FILTERED |
 | ADT^A03                                  | ERROR (AE NAK) |
 | any non-ADT type                         | UNROUTED |
-| malformed / wrong version (→ 2577)       | ERROR (AE NAK) |
+| malformed / wrong version (→ 2577)       | ERROR (AR NAK) |
 
 To see retries → dead-letter → replay: leave the Receive tab **not** listening on 2576 (or set it
 to *fail N then AA* / *close*), send an ADT^A01, and watch the echo delivery dead-letter in the

@@ -675,7 +675,7 @@ becomes the bottleneck.
 - **PostgreSQL:** use your standard DB backups — `pg_dump` for logical backups and/or WAL archiving /
   PITR for point-in-time recovery. The engine is greenfield-only on server DBs, so the DB tier owns
   store-level DR here. A `.mfbak` taken against a server DB is **config-only** and cannot restore the
-  database.
+  database. A config-only pass with no config file to archive, such as one over an empty config dir, fails instead of writing an archive, so that pass does not take the retention slot of a good one; on a PostgreSQL or SQL Server store, `[backup].enabled = true` with `[backup].config_only_on_server_db = true` and `[backup].include_config = false` is refused when the settings load ([`CONFIGURATION.md`](CONFIGURATION.md) `[backup]` lists at least what each refuses).
 
 **Restore an archive.** `messagefoundry restore <archive> --to <new store path>` verifies the archive,
 decrypts it, and writes the store. It **refuses to overwrite** an existing store (or a leftover `-wal` /
@@ -726,6 +726,15 @@ line. A custom email template cannot name that key, and a rule with `transports 
 For those, the alert's reason in the web console's alert list keeps the archive's age, the count of
 sessions ended and a pointer to `messagefoundry restore --help`, all inside the about 200 characters
 it keeps.
+
+**Only `messagefoundry restore` onto SQLite is recorded (BACKLOG #5092).** A PostgreSQL or SQL
+Server store restored with the database's own tools, or a SQLite store put back by copying its
+files, carries no marker: the first `serve` ends no session, writes no `store_restored` row and
+raises no `store_restored` alert. Stop every engine process and cluster node on the store before
+such a restore. Before the first `serve` after it, run `messagefoundry
+admin-revoke-sessions` against the restored store, and re-apply by hand the changes listed above.
+[SECURITY.md](SECURITY.md#a-restored-store-brings-its-sessions-back-and-only-messagefoundry-restore-records-it)
+says what is and is not recorded, and at least one start-up signal such a restore can raise.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,

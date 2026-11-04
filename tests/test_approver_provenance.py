@@ -517,6 +517,7 @@ async def test_an_administrator_create_that_loses_the_username_race_pages_nobody
             username=kwargs["username"],
             auth_provider="local",
             password_generated=False,
+            audits=(),
         )
         await original(**kwargs)
 

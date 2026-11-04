@@ -917,32 +917,40 @@ async def _warm_up(
     """
     before = None if pid is None else await asyncio.to_thread(subtree_size, pid)
     hold_ack, hold_e2e = metrics.ack, metrics.e2e
-    warm_e2e = Histogram()
-    metrics.ack, metrics.e2e = Histogram(), warm_e2e
+    # Every warm-up arrival lands in the throwaway histogram; only each send's FIRST arrival lands
+    # in first_e2e, so a redelivery or a fan-out copy cannot move the first-delivery figures.
+    first_e2e = Histogram()
+    metrics.ack, metrics.e2e = Histogram(), Histogram()
     loop = asyncio.get_running_loop()
     start = loop.time()
     try:
-        seqs = driver.send_one_each(corpus=corpus, mix=_MIX)
-        sent = len(seqs)
+        ports_by_seq = driver.send_one_each(corpus=corpus, mix=_MIX)
+        sent = len(ports_by_seq)
         # Nothing has awaited since the sends were queued, so no arrival can precede this.
-        correlator.await_first_deliveries(seqs)
+        correlator.track_first_deliveries(ports_by_seq, first_e2e)
         deadline = start + timeout
         while correlator.undelivered > 0 and loop.time() < deadline:
             await asyncio.sleep(_WARMUP_POLL_S)
         seconds = loop.time() - start
+        silent = sorted(ports_by_seq[seq] for seq in correlator.undelivered_seqs)
     finally:
         metrics.ack, metrics.e2e = hold_ack, hold_e2e
-    delivered = sent - correlator.undelivered
+        # Stop tracking, even on a cancel, so the hold neither pays for a silent seq nor records
+        # its late arrival here.
+        correlator.track_first_deliveries(())
+    delivered = sent - len(silent)
     after = None if pid is None else await asyncio.to_thread(subtree_size, pid)
-    if delivered < sent:
+    if silent:
         log.warning(
-            "connscale warm-up [sandbox=%s]: %d of %d first deliveries in %.1fs",
+            "connscale warm-up [sandbox=%s]: %d of %d first deliveries in %.1fs; no delivery "
+            "from the inbound on port(s) %s",
             sandbox.requested,
             delivered,
             sent,
             seconds,
+            ", ".join(str(port) for port in silent),
         )
-    first = warm_e2e.summary() if warm_e2e.count > 0 else None
+    first = first_e2e.summary() if first_e2e.count > 0 else None
     return replace(
         sandbox,
         processes_before_warmup=before,

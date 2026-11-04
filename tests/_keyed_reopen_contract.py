@@ -237,6 +237,7 @@ async def write_every_cell(store: Any) -> Written:
         auth_provider="local",
         password_hash="h",
         password_generated=False,
+        audits=(),
     )
     staged = await store.set_totp_secret(_USER, secret=plain(("users", "totp_secret")))
     assert staged is not None

@@ -145,7 +145,8 @@ requires one plain mailbox. That means all of these:
 2. It has exactly one `@`, with text on both sides.
 3. Every character is printable, and none is whitespace.
 4. It holds none of `,` `;` `<` `>` `"` `(` `)` `[` `]` `:` `\`.
-5. The domain has a dot inside it, and no dot at its start or end.
+5. The domain has a dot inside it. A dot at its start or end is refused by rule 8, as an empty
+   label.
 6. The whole address is at most 254 characters, and the part before the `@` is at most 64.
 7. The part before the `@` is ASCII letters, digits and ``#$&'*+-^_`{}~``, in runs split by single
    dots. It does not start with a hyphen.
