@@ -5,14 +5,15 @@
 On the stdlib ``ProactorEventLoop``, the accept loop ``asyncio.start_server`` and
 ``loop.create_server`` run closes its listening socket on the first failed AcceptEx. A connection
 its peer resets while it waits in the backlog fails AcceptEx with ERROR_NETNAME_DELETED (winerror
-64), so one such peer stopped every listener for good, while the server still read as serving.
-``messagefoundry.proactor_accept`` guards it.
+64), so one such peer stopped the listener it reached for good, while the server still read as
+serving. ``messagefoundry.proactor_accept`` guards it.
 
-The fault is real, not faked: :func:`_reset_one_in_the_backlog` blocks the loop while one client
-takes the single pending AcceptEx and a second waits in the backlog and resets there with
-``SO_LINGER`` 0. The controls run the same steps without the guard and show the listening socket
-closed, so the fault demonstrably fired. Each loop test runs on a fresh ``ProactorEventLoop``,
-because the suite's session loop may already carry the guard from another test.
+The fault is real, not faked: :func:`_block_and_reset` blocks the loop while one client takes the
+single pending AcceptEx and a second waits in the backlog and resets there with ``SO_LINGER`` 0.
+The controls run the same steps without the guard and show the listening socket closed, so the
+fault demonstrably fired; each guarded test also reads the guard's own skip line. Each loop test
+runs on a fresh ``ProactorEventLoop``, because the suite's session loop may already carry the guard
+from another test.
 
 Synthetic HL7 only, never real PHI.
 """
@@ -22,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import gc
 import logging
+import signal
 import socket
 import struct
 import sys
@@ -41,15 +44,33 @@ from tests.test_listener_admission import _ack_handler, _build, _Events, _until
 
 _ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
+#: The guard's DEBUG line for one skipped connection.
+_SKIPPED = "peer dropped before the accept"
+
 windows_only = pytest.mark.skipif(
     sys.platform != "win32", reason="the Proactor loop is Windows-only"
 )
 
+type _Accepted = asyncio.Future[tuple[socket.socket, Any]]
+
+
+def _on_fresh_loop[T](
+    make: Callable[[], Coroutine[Any, Any, T]], factory: Callable[[], asyncio.AbstractEventLoop]
+) -> T:
+    """Run ``make()`` on a new loop from ``factory``. A ``ProactorEventLoop`` takes the main
+    thread's signal wakeup fd and clears it on close, so the session loop's is put back after."""
+    previous = signal.set_wakeup_fd(-1)
+    signal.set_wakeup_fd(previous)
+    try:
+        with asyncio.Runner(loop_factory=factory) as runner:
+            return runner.run(make())
+    finally:
+        signal.set_wakeup_fd(previous)
+
 
 def _on_fresh_proactor[T](make: Callable[[], Coroutine[Any, Any, T]]) -> T:
     """Run ``make()`` on a new stdlib ``ProactorEventLoop`` that no earlier test has guarded."""
-    with asyncio.Runner(loop_factory=asyncio.ProactorEventLoop) as runner:  # type: ignore[attr-defined,unused-ignore]
-        return runner.run(make())
+    return _on_fresh_loop(make, asyncio.ProactorEventLoop)  # type: ignore[attr-defined,unused-ignore]
 
 
 def _block_and_reset(port: int) -> socket.socket:
@@ -104,6 +125,11 @@ async def _bare_listener(
         server.close()
 
 
+def _never_retrieved(reported: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    gc.collect()  # a task reports an unread exception only when it is finalized
+    return [c for c in reported if c.get("message") == "Task exception was never retrieved"]
+
+
 @windows_only
 def test_control_one_backlog_reset_closes_an_unguarded_stdlib_listener() -> None:
     # Pins the stdlib defect the guard exists for, and that the reset above really fires it.
@@ -125,14 +151,31 @@ def test_a_guarded_listener_skips_the_reset_connection_and_accepts_the_next(
     async def run() -> None:
         with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
             async with _bare_listener(guard=True) as (accepted, reported, listening):
-                assert await _until(lambda: "peer dropped before the accept" in caplog.text, 5.0)
+                assert await _until(lambda: _SKIPPED in caplog.text, timeout=5.0)
                 assert listening.fileno() != -1
                 _reader, writer = await asyncio.open_connection(
                     "127.0.0.1", listening.getsockname()[1]
                 )
                 assert await _until(lambda: len(accepted) == 2, timeout=5.0), accepted
                 writer.close()
-                assert reported == [], reported  # nothing reported the skipped accept again
+                # Nothing reported the skipped accept again, as the control below shows it would.
+                assert _never_retrieved(reported) == [] and reported == [], reported
+
+    _on_fresh_proactor(run)
+
+
+@windows_only
+def test_control_without_the_read_mark_the_skipped_accept_is_reported_twice(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The negative control for the single report: the stdlib helper task does report it unread.
+    monkeypatch.setattr(proactor_accept, "_retrieve", lambda task: None)
+
+    async def run() -> None:
+        with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
+            async with _bare_listener(guard=True) as (_accepted, reported, _listening):
+                assert await _until(lambda: _SKIPPED in caplog.text, timeout=5.0)
+                assert await _until(lambda: bool(_never_retrieved(reported)), timeout=5.0)
 
     _on_fresh_proactor(run)
 
@@ -174,24 +217,26 @@ def test_control_an_engine_listener_without_the_guard_dies_on_one_reset(
 @windows_only
 @pytest.mark.parametrize("name", _SOURCES)
 def test_an_engine_listener_survives_one_reset_and_takes_the_next_connection(
-    name: str, monkeypatch: pytest.MonkeyPatch
+    name: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def run() -> None:
-        async with _source_after_a_reset(name, monkeypatch, guard=True) as (
-            source,
-            events,
-            listening,
-        ):
-            reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
-            # The first connection and this one; the reset one never became a connection.
-            assert await _until(lambda: events.count("established") == 2, 5.0), events.events
-            assert listening.fileno() != -1
-            if name == "mllp":
-                writer.write(frame(_ADT))
-                await writer.drain()
-                reply = await asyncio.wait_for(reader.readuntil(bytes([EB, CR])), 5.0)
-                assert b"MSA|AA|MSG1" in reply
-            writer.close()
+        with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
+            async with _source_after_a_reset(name, monkeypatch, guard=True) as (
+                source,
+                events,
+                listening,
+            ):
+                assert await _until(lambda: _SKIPPED in caplog.text, timeout=5.0)
+                reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
+                # The first connection and this one; the reset one never became a connection.
+                assert await _until(lambda: events.count("established") == 2, 5.0), events.events
+                assert listening.fileno() != -1
+                if name == "mllp":
+                    writer.write(frame(_ADT))
+                    await writer.drain()
+                    reply = await asyncio.wait_for(reader.readuntil(bytes([EB, CR])), 5.0)
+                    assert b"MSA|AA|MSG1" in reply
+                writer.close()
 
     _on_fresh_proactor(run)
 
@@ -243,41 +288,66 @@ def test_control_the_api_listener_uvicorn_runs_dies_on_one_reset_without_the_gua
 
 
 @windows_only
-def test_the_api_listener_survives_one_reset_with_the_guard_installed_in_its_lifespan() -> None:
-    assert _on_fresh_proactor(lambda: _api_survives_a_reset(guard=True)) is True
+def test_the_api_listener_survives_one_reset_with_the_guard_installed_in_its_lifespan(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
+        assert _on_fresh_proactor(lambda: _api_survives_a_reset(guard=True)) is True
+    assert _SKIPPED in caplog.text  # the reset fired, and was skipped
 
 
 # The guard's own logic, with a fake accept: these run on every platform.
 
 
+async def _hold(future: _Accepted, conn: socket.socket) -> None:
+    """The stdlib accept's helper task, in shape: it closes ``conn`` only on cancellation."""
+    try:
+        await future
+    except asyncio.CancelledError:
+        conn.close()
+        raise
+
+
 class _FakeAccept:
-    """An ``accept`` whose every call returns a future the test settles."""
+    """An ``accept`` whose every call returns a future the test settles, and starts a helper task
+    holding a fresh accept socket, as ``IocpProactor.accept`` does. ``raises`` maps a 1-based call
+    number to the error that call raises at once."""
 
     def __init__(
-        self, loop: asyncio.AbstractEventLoop, *, raise_on_call: int | None = None
+        self, loop: asyncio.AbstractEventLoop, raises: dict[int, OSError] | None = None
     ) -> None:
         self.loop = loop
-        self.futures: list[asyncio.Future[tuple[socket.socket, Any]]] = []
-        self.raise_on_call = raise_on_call
+        self.futures: list[_Accepted] = []
+        self.conns: list[socket.socket] = []
+        self.raises = raises or {}
+        self.calls = 0
 
-    def __call__(self, listener: socket.socket) -> asyncio.Future[tuple[socket.socket, Any]]:
-        if self.raise_on_call is not None and len(self.futures) + 1 == self.raise_on_call:
-            raise OSError(errno.EBADF, "listener gone")
-        future: asyncio.Future[tuple[socket.socket, Any]] = self.loop.create_future()
+    def __call__(self, listener: socket.socket) -> _Accepted:
+        self.calls += 1
+        if self.calls in self.raises:
+            raise self.raises[self.calls]
+        future: _Accepted = self.loop.create_future()
+        conn = socket.socket()
         self.futures.append(future)
+        self.conns.append(conn)
+        self.loop.create_task(_hold(future, conn))
         return future
 
 
 @contextlib.contextmanager
 def _guarded_fake(
-    raise_on_call: int | None = None,
-) -> Iterator[tuple[_FakeAccept, socket.socket, asyncio.Future[tuple[socket.socket, Any]]]]:
+    raises: dict[int, OSError] | None = None,
+) -> Iterator[tuple[_FakeAccept, socket.socket, _Accepted]]:
     """A guarded accept on an open loopback socket: yields the fake, the listener and the future."""
     loop = asyncio.get_running_loop()
-    fake = _FakeAccept(loop, raise_on_call=raise_on_call)
+    fake = _FakeAccept(loop, raises)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        yield fake, listener, _guarded(loop, fake)(listener)
+        try:
+            yield fake, listener, _guarded(loop, fake)(listener)
+        finally:
+            for conn in fake.conns:
+                conn.close()
 
 
 def _winerror(code: int) -> OSError:
@@ -296,16 +366,29 @@ def test_peer_dropped_reads_the_windows_codes_and_connection_errors() -> None:
     assert not _peer_dropped(RuntimeError())
 
 
-async def test_a_peer_dropped_accept_is_posted_again_and_the_next_result_returned() -> None:
+async def test_a_peer_dropped_accept_is_posted_again_and_its_socket_closed() -> None:
     with _guarded_fake() as (fake, _listener, outer):
         fake.futures[0].set_exception(_winerror(64))
         assert await _until(lambda: len(fake.futures) == 2)
         assert not outer.done()
+        assert fake.conns[0].fileno() == -1  # the stdlib would have left it open
         fake.futures[1].set_exception(ConnectionResetError())
         assert await _until(lambda: len(fake.futures) == 3)
-        sentinel: tuple[Any, Any] = (object(), ("127.0.0.1", 1))
-        fake.futures[2].set_result(sentinel)
-        assert await asyncio.wait_for(outer, 1.0) is sentinel
+        accepted = (fake.conns[2], ("127.0.0.1", 1))
+        fake.futures[2].set_result(accepted)
+        assert await asyncio.wait_for(outer, 1.0) is accepted
+        assert fake.conns[2].fileno() != -1  # the accepted connection is the caller's
+
+
+async def test_a_peer_drop_reported_at_once_is_posted_again_too() -> None:
+    # AcceptEx can return WSAECONNRESET directly, on the first post or a later one.
+    raises: dict[int, OSError] = {1: ConnectionResetError(), 3: _winerror(64)}
+    with _guarded_fake(raises) as (fake, _listener, outer):
+        assert fake.calls == 2 and len(fake.futures) == 1
+        fake.futures[0].set_exception(_winerror(1236))
+        assert await _until(lambda: len(fake.futures) == 2)
+        assert fake.calls == 4
+        assert not outer.done()
 
 
 async def test_any_other_accept_failure_reaches_the_caller_unchanged() -> None:
@@ -316,6 +399,7 @@ async def test_any_other_accept_failure_reaches_the_caller_unchanged() -> None:
             await asyncio.wait_for(outer, 1.0)
         assert raised.value is fault
         assert len(fake.futures) == 1  # not posted again
+        assert fake.conns[0].fileno() == -1
 
 
 async def test_a_peer_drop_on_a_closed_listener_is_not_retried() -> None:
@@ -328,7 +412,7 @@ async def test_a_peer_drop_on_a_closed_listener_is_not_retried() -> None:
 
 
 async def test_a_repost_that_fails_synchronously_fails_the_accept() -> None:
-    with _guarded_fake(raise_on_call=2) as (fake, _listener, outer):
+    with _guarded_fake({2: OSError(errno.EBADF, "listener gone")}) as (fake, _listener, outer):
         fake.futures[0].set_exception(_winerror(64))
         with pytest.raises(OSError) as raised:
             await asyncio.wait_for(outer, 1.0)
@@ -336,7 +420,7 @@ async def test_a_repost_that_fails_synchronously_fails_the_accept() -> None:
 
 
 async def test_the_first_post_raises_synchronously_as_the_unguarded_call_does() -> None:
-    with pytest.raises(OSError), _guarded_fake(raise_on_call=1):
+    with pytest.raises(OSError), _guarded_fake({1: OSError(errno.EBADF, "listener gone")}):
         pass
 
 
@@ -346,12 +430,35 @@ async def test_cancelling_the_accept_cancels_the_try_in_flight() -> None:
         assert await _until(lambda: len(fake.futures) == 2)
         outer.cancel()
         assert await _until(lambda: fake.futures[1].cancelled())
+        assert await _until(lambda: fake.conns[1].fileno() == -1)
+
+
+async def test_a_connection_accepted_as_the_accept_is_cancelled_is_closed() -> None:
+    with _guarded_fake() as (fake, _listener, outer):
+        # Both in one iteration: the try completes, then the caller cancels before it settles.
+        fake.futures[0].set_result((fake.conns[0], ("127.0.0.1", 1)))
+        outer.cancel()
+        assert await _until(lambda: fake.conns[0].fileno() == -1)
 
 
 async def test_a_cancelled_try_cancels_the_accept() -> None:
     with _guarded_fake() as (fake, _listener, outer):
         fake.futures[0].cancel()
         assert await _until(outer.cancelled)
+
+
+async def test_a_long_run_of_skips_logs_one_warning(caplog: pytest.LogCaptureFixture) -> None:
+    with (
+        caplog.at_level(logging.WARNING, logger=proactor_accept.__name__),
+        _guarded_fake() as (fake, _listener, outer),
+    ):
+        for n in range(proactor_accept._SKIP_WARN_EVERY):
+            fake.futures[n].set_exception(_winerror(64))
+            await asyncio.sleep(0)  # settle runs, and posts the next try
+            assert len(fake.futures) == n + 2
+        assert not outer.done()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "skipped 100 connections in a row" in warnings[0].getMessage()
 
 
 @windows_only
@@ -368,11 +475,10 @@ def test_the_guard_is_idempotent() -> None:
     _on_fresh_proactor(run)
 
 
-def test_the_guard_leaves_a_selector_loop_alone() -> None:
+def test_the_guard_leaves_a_selector_loop_alone(caplog: pytest.LogCaptureFixture) -> None:
     async def run() -> None:
-        loop = asyncio.get_running_loop()
-        guard_accepts()  # must not raise on a loop with no proactor
-        assert type(loop) is asyncio.SelectorEventLoop
+        guard_accepts()  # must neither raise nor warn on a loop with no proactor
 
-    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
-        runner.run(run())
+    with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
+        _on_fresh_loop(run, asyncio.SelectorEventLoop)
+    assert caplog.records == []
