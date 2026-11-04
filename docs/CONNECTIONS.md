@@ -3208,7 +3208,7 @@ with one bound (vault BACKLOG #4908): for an object over 32 MiB, which only a ra
 Every engine SCP aborts such an object with no status (owner ruling B462-R3), and the SCU cannot tell
 that abort from any other end with no response, at least another peer's abort or the SCU's own DIMSE
 timeout on a slow link to any peer, so each counts, and the refusal names no cause. The count is of one
-object, keyed by a hash of all its bytes, so two objects, with or without a SOP instance UID, do not share one. Any answered store, a refusal included, starts its count again,
+object, keyed by its length and two checksums of all its bytes, so identical bytes share one count, and two objects that differ, with or without a SOP instance UID, share one only by a checksum collision. Any answered store, a refusal included, starts its count again,
 and so does a dead-letter of the row at the retry policy's `max_attempts` or on any permanent refusal of it, so a replay of it gets all three sends. The
 count is kept in memory with this connection's connector, so anything that builds a new connector starts
 it again: at least a restart and a reload that changes this connection's settings. An operator

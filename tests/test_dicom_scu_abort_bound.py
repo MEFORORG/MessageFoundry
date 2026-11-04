@@ -17,8 +17,11 @@ the abort tests SKIP without it.
 from __future__ import annotations
 
 import logging
+import threading
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -276,7 +279,7 @@ async def test_an_error_raised_mid_store_counts_toward_the_same_bound(
 
 
 def _key(n: int) -> int:
-    """A stand-in for _unanswered_key's hash: the count only needs keys that differ."""
+    """A stand-in for _unanswered_key's key: the count only needs keys that differ."""
     return n
 
 
@@ -310,7 +313,8 @@ def test_the_key_is_the_whole_object_so_two_objects_of_one_size_never_share_it(
     monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", 3)
     first, second = dicom_module._unanswered_key(b"abcd"), dicom_module._unanswered_key(b"abce")
     assert first is not None and second is not None and first != second
-    assert dicom_module._unanswered_key(b"abcd") == first, "a re-send meets its own count"
+    again = bytes(bytearray(b"abcd"))  # another object, the same bytes, as a re-send decodes
+    assert dicom_module._unanswered_key(again) == first, "a re-send meets its own count"
 
 
 def _two_without_uid() -> tuple[bytes, bytes]:
@@ -489,29 +493,80 @@ async def test_a_permanent_refusal_drops_the_count_so_a_replay_gets_every_send(
     assert outcomes == ["re-send"] * (limit - 1) + ["final"]
 
 
-async def test_an_answered_store_with_nothing_counted_pays_no_hash(
+async def test_an_answered_store_with_nothing_counted_computes_no_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Round 1: the key was hashed before every association of an object over the ceiling.
+    # Round 1: the key was computed before every association of an object over the ceiling.
     _needs_dicom()
     from tests._dicom_sample import make_sr_part10
 
     data = make_sr_part10()
     monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
-    real, hashed = dicom_module._unanswered_key, []
+    real, keyed = dicom_module._unanswered_key, []
 
     def counting(object_bytes: bytes) -> int | None:
-        hashed.append(len(object_bytes))
+        keyed.append(len(object_bytes))
         return real(object_bytes)
 
     monkeypatch.setattr(dicom_module, "_unanswered_key", counting)
     with _scp_that_aborts([0x0000, None]) as port:
         scu = _uncapped_scu(port, "PACS_SCP")
         assert await _outcomes(scu, data, 1) == ["stored"]
-        assert hashed == []
-        # CONTROL: an unanswered end of the same object does hash it.
+        assert keyed == []
+        # CONTROL: an unanswered end of the same object does compute it.
         assert await _outcomes(scu, data, 1) == ["re-send"]
-    assert hashed == [len(data)]
+    assert keyed == [len(data)]
+
+
+async def test_the_key_is_computed_off_the_loop_by_checksums_that_release_the_gil(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # B8rr: the key was hash() of the whole object. A worker thread ran it, but hash() holds the
+    # GIL for every byte, so the event loop stalled on each unanswered or forgotten store of an
+    # object over the ceiling. zlib's checksums release the GIL over a buffer this large.
+    _needs_dicom()
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
+
+    def no_hash(obj: object) -> int:
+        raise AssertionError("hash() holds the GIL over the whole object")
+
+    # A module global shadows the builtin, so the old key would call this.
+    monkeypatch.setattr(dicom_module, "hash", no_hash, raising=False)
+    checksummed: list[tuple[str, int, int]] = []
+
+    def spy(name: str) -> Any:
+        real = getattr(zlib, name)
+
+        def checksum(buf: bytes) -> int:
+            checksummed.append((name, len(buf), threading.get_ident()))
+            return int(real(buf))
+
+        return checksum
+
+    monkeypatch.setattr(
+        dicom_module, "zlib", SimpleNamespace(crc32=spy("crc32"), adler32=spy("adler32"))
+    )
+    loop_thread = threading.get_ident()
+    scu = _uncapped_scu(1, "PACS_SCP")
+    monkeypatch.setattr(scu, "_associate", lambda ae: _ResetMidStore())
+    payload = _carry(data)
+    with pytest.raises(DeliveryError) as caught:
+        await scu.send(payload)
+    assert not isinstance(caught.value, NegativeAckError)
+    assert len(scu._unanswered) == 1
+    await scu.forget_payload(payload)
+    assert scu._unanswered == {}
+    # Both checksums, over the whole object, once on the unanswered end and once on the forget.
+    assert sorted((name, size) for name, size, _ in checksummed) == [
+        ("adler32", len(data)),
+        ("adler32", len(data)),
+        ("crc32", len(data)),
+        ("crc32", len(data)),
+    ]
+    assert loop_thread not in {thread for _, _, thread in checksummed}, "never on the loop thread"
 
 
 def test_the_factorys_role_default_reads_as_what_it_means() -> None:
