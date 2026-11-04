@@ -512,8 +512,15 @@ def _sidecar_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord
 
 def test_a_loopback_http_sidecar_warns_at_construction(caplog: pytest.LogCaptureFixture) -> None:
     """A loopback sidecar passes every hop gate, so before this nothing said the hop is cleartext.
-    The WARNING names the connection and what crosses the hop, and never a header value."""
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.rest"):
+    The WARNING names the connection and what crosses the hop, and never a header value.
+
+    Captured at DEBUG from every logger, so a header value logged at any level anywhere would be
+    seen. The probe line is the positive control: the capture does see a DEBUG line, and the token
+    in it, so the absence asserted after it is not the capture's blindness."""
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("messagefoundry.transports.rest").debug("probe %s", _SYNTHETIC_BEARER)
+        assert _SYNTHETIC_BEARER in caplog.text
+        caplog.clear()
         _rest(
             ech_egress=True,
             ech_sidecar="http://127.0.0.1:8123",

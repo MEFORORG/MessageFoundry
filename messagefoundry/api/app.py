@@ -403,6 +403,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
     UNRESOLVED_DRIVER_REASON,
+    UNRESOLVED_ECH_SIDECAR,
     ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
@@ -2068,7 +2069,18 @@ def _posture_loosenings(
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
     path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
-    ech_hops = hops(ech_cleartext_sidecar_hops)
+    # Resolved against the same values as the DATABASE hops above. A name the values cannot
+    # resolve keeps the reader's marker, because the entry keeps names only.
+    ech_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note == UNRESOLVED_ECH_SIDECAR else name
+            for name, note in ech_cleartext_sidecar_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(

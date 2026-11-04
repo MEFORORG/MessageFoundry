@@ -2897,11 +2897,10 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
 def _check_ech_cleartext_sidecar(config_dir: str | Path) -> CheckResult:
     """Name every ``REST`` outbound that sends through an ``http://`` ECH sidecar (ADR 0139).
 
-    The sidecar is always loopback, because the resolver refuses any other, so no cleartext-hop gate
-    refuses the hop to it. That hop still carries the body and every request header, a credential
-    included, unencrypted on this host. The set and its ``env()`` case are in
-    :func:`~messagefoundry.config.wiring.ech_cleartext_sidecar_hops`. Advisory
-    (``required=False``): an https sidecar listener is the fix, and nothing refuses the hop.
+    The set and its ``env()`` case are in
+    :func:`~messagefoundry.config.wiring.ech_cleartext_sidecar_hops`; what the hop carries is in
+    ``docs/SECURITY-LOOSENING.md``, ``ech_sidecar``. Advisory (``required=False``): nothing refuses
+    the hop, and an https sidecar listener is the fix.
 
     SKIPs when the graph will not load, the same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, ech_cleartext_sidecar_hops, load_config

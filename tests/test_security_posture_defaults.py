@@ -2798,6 +2798,8 @@ def _ech_sidecar_registry(*, named: bool = True) -> Any:
     shapes: dict[str, dict[str, object]] = {
         "OB_ECH_HTTPS": {"ech_egress": True, "ech_sidecar": "https://127.0.0.1:8123"},
         "OB_ECH_OFF": {"ech_egress": False, "ech_sidecar": "http://127.0.0.1:8123"},
+        # The build refuses an off-host sidecar, so no hop to it is ever made.
+        "OB_ECH_REMOTE": {"ech_egress": True, "ech_sidecar": "http://sidecar.example.org:8123"},
         "OB_PLAIN": {},
     }
     if named:
@@ -2815,19 +2817,40 @@ def _ech_sidecar_registry(*, named: bool = True) -> Any:
 
 def test_the_ech_cleartext_sidecar_is_actually_wired() -> None:
     """ADR 0139: driven through its reader AND through ``security_loosenings``. The https sidecar,
-    the switched-off key and the plain REST connection are the controls that must not be named."""
-    from messagefoundry.config.wiring import ech_cleartext_sidecar_hops
+    the switched-off key, the off-host sidecar the build refuses and the plain REST connection are
+    the controls that must not be named."""
+    from messagefoundry.config.wiring import UNRESOLVED_ECH_SIDECAR, ech_cleartext_sidecar_hops
 
     found = ech_cleartext_sidecar_hops(_ech_sidecar_registry())
     assert found == [
-        ("OB_ECH_ENV", "an env() value this reading does not resolve"),
+        ("OB_ECH_ENV", UNRESOLVED_ECH_SIDECAR),
         ("OB_ECH_HTTP", "an http:// sidecar"),
     ]
     risk = dict(_pairs(ech_hops=tuple(name for name, _ in found)))["ech_sidecar"]
     assert "OB_ECH_HTTP" in risk and "OB_ECH_ENV" in risk
-    assert "OB_ECH_HTTPS" not in risk and "OB_ECH_OFF" not in risk and "OB_PLAIN" not in risk
+    for control in ("OB_ECH_HTTPS", "OB_ECH_OFF", "OB_ECH_REMOTE", "OB_PLAIN"):
+        assert control not in risk
     assert "CLEARTEXT" in risk and "every request header" in risk
     assert "ech_sidecar" not in _names()  # control: nothing declared, nothing named
+
+
+@pytest.mark.parametrize(
+    ("value", "listed"),
+    [("http://127.0.0.1:8123", True), ("https://127.0.0.1:8123", False)],
+    ids=["resolves-http", "resolves-https"],
+)
+def test_the_ech_reader_resolves_an_env_sidecar_with_the_values(value: str, listed: bool) -> None:
+    """With the instance's values the reader reads an env() sidecar as the build does: one that
+    resolves to http is named as an http sidecar, and one that resolves to https, the control, is
+    not named at all."""
+    from messagefoundry.config.wiring import ech_cleartext_sidecar_hops
+
+    found = dict(
+        ech_cleartext_sidecar_hops(_ech_sidecar_registry(), env_values={"ech_sidecar": value})
+    )
+    assert ("OB_ECH_ENV" in found) is listed
+    if listed:
+        assert found["OB_ECH_ENV"] == "an http:// sidecar"
 
 
 async def test_posture_route_names_an_http_ech_sidecar(engine: Engine) -> None:
@@ -2840,6 +2863,8 @@ async def test_posture_route_names_an_http_ech_sidecar(engine: Engine) -> None:
         if e["switch"] == "ech_sidecar"
     )
     assert "OB_ECH_HTTP" in entry["risk"] and "OB_ECH_HTTPS" not in entry["risk"]
+    # The engine was built with no env values, so the env() sidecar is listed with the marker.
+    assert "OB_ECH_ENV (possibly:" in entry["risk"]
 
 
 async def test_posture_route_does_not_name_an_https_ech_sidecar(engine: Engine) -> None:

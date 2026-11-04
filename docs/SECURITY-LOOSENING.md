@@ -1929,16 +1929,21 @@ count is above `0` (vault BACKLOG #2613).
   build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
   `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
   it.
-- **Why it is listed when a loopback `http://` `url` is not:** the connection's `url` is
-  `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
-  `http://127.0.0.1` `url` shows what it is.
+- **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
+  normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
+  `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
+  `url`.
 - **The fix:** run the sidecar's listener on `https://`, which encrypts the hop and takes it off
-  this list.
+  this list. The engine verifies that listener's certificate against the operating system's trust
+  store alone, not a connection's `tls_ca_file` or the `[tls]` policy, so the certificate must
+  chain to a CA that store holds and name the loopback host the URL uses.
 - **It is never silent:** a WARNING at every construction naming the connection, never a header
   value; an `ech-sidecar-cleartext` line in `messagefoundry check` naming every such connection;
   and an `ech_sidecar` entry in `security_loosenings()`, which `GET /security/posture` shows. The
-  last two read one list. A connection whose `ech_egress` or `ech_sidecar` is an `env()` reference
-  is on it, because the value cannot be read before it resolves.
+  last two read one list, and it leaves out a sidecar the build refuses. An `env()` value is
+  resolved where the reader has the instance's values: `GET /security/posture` on a running engine
+  does, and `messagefoundry check` does not. One it cannot resolve is listed, marked possibly,
+  unless the other key alone rules the hop out, as a literal `https://` sidecar does.
 - **Where it is NOT reported:** the serve-time loosening warning, which fires before the graph is
   loaded, exactly as for `cleartext_accepted`. `messagefoundry security show` and a graphless
   `GET /security/posture` cannot see it either, and say so in `loosenings_scope`.

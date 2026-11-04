@@ -1659,7 +1659,7 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
         return "plain FTP (tls=False) builds no TLS context"
     if not bool_setting(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
-    if settings.get("ech_egress") and _ech_sidecar_is_cleartext(settings.get("ech_sidecar")):
+    if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
         return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
     if _token_hop_reads_ca(settings):
         return None
@@ -1668,15 +1668,6 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     if _is_http_url(settings.get("url")):
         return "the url is http://, so the hop has no TLS, and no token hop reads it"
     return None
-
-
-def _ech_sidecar_is_cleartext(value: object) -> bool:
-    """:func:`messagefoundry.transports.rest.ech_sidecar_is_cleartext`, imported only when a
-    connection sets ``ech_egress``, for the reason :func:`_generic_odbc_param` gives. The construction
-    WARNING and the listed loosening apply the same rule, so the three cannot disagree."""
-    from messagefoundry.transports.rest import ech_sidecar_is_cleartext
-
-    return ech_sidecar_is_cleartext(value)
 
 
 def _is_http_url(value: object) -> bool:

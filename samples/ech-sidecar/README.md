@@ -40,8 +40,9 @@ the wheel; and it is inert until a partner publishes an `ECHConfig`).
 
 A conforming sidecar is a **loopback TLS-terminating re-originator**, not a tunnel:
 
-1. Accept the engine's egress on a loopback listener (same-host → the cleartext loopback hop has no wire
-   exposure, the ADR 0092 same-host posture). The engine dials that listener direct. It uses no web
+1. Accept the engine's egress on a loopback listener (same-host, so the hop has no wire exposure, the
+   ADR 0092 same-host posture; an `http://` listener still leaves it cleartext on the host, a listed
+   loosening, see below). The engine dials that listener direct. It uses no web
    proxy on this hop, whatever the environment or the operating system names as one.
 2. For each destination, open a **new** TLS connection with **ECH enabled**, fetching the `ECHConfig` from
    the destination's DNS **HTTPS record over DoH/DoT** (so the hostname is not leaked in cleartext DNS

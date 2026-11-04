@@ -213,6 +213,7 @@ __all__ = [
     "validate_config",
     "accepted_cleartext_hops",
     "ech_cleartext_sidecar_hops",
+    "UNRESOLVED_ECH_SIDECAR",
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
@@ -6999,41 +7000,59 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def ech_cleartext_sidecar_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every ``REST`` outbound that sends through an ECH sidecar at an ``http://`` URL, as
-    ``(name, note)`` (ADR 0139).
+#: The note :func:`ech_cleartext_sidecar_hops` gives a connection whose ``ech_egress`` or
+#: ``ech_sidecar`` is an ``env()`` reference it could not resolve. ``GET /security/posture`` keeps
+#: only names, so it marks such a name with this text rather than state the hop is cleartext.
+UNRESOLVED_ECH_SIDECAR = "possibly: an env() value this reading could not resolve"
+
+
+def ech_cleartext_sidecar_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """Every ``REST`` outbound that would build and send through an ECH sidecar at an ``http://``
+    URL, as ``(name, note)`` (ADR 0139).
 
     The single reader of that set, on the contract of :func:`path_form_fhir_updates`:
-    ``messagefoundry check`` and ``GET /security/posture`` (the ``ech_sidecar`` entry of
-    ``security_loosenings()``) both read it, so they cannot disagree. Sorted by name.
+    ``messagefoundry check`` and the ``ech_sidecar`` entry of ``security_loosenings()`` read it.
+    Sorted by name. What the hop carries is stated once, in ``docs/SECURITY-LOOSENING.md``.
 
-    Such a hop is loopback, because the sidecar resolver refuses any other, so no cleartext-hop
-    gate refuses it. It still carries the request body and every request header, a credential
-    included, unencrypted on this host, and nothing named it until this reader and the
-    construction WARNING in ``transports.rest``. Both apply one rule,
-    ``transports.rest.ech_sidecar_is_cleartext``, imported lazily for the one-way rule.
+    It decides each connection with the build's own rules, imported lazily for the one-way rule:
+    ``transports.rest.ech_sidecar_url_from_settings``, so a sidecar the build refuses (off-host,
+    a bad scheme) is not listed, and ``ech_sidecar_is_cleartext``, the rule the construction
+    WARNING applies. Only the ``REST`` destination honours ``ech_egress``; every other connector
+    refuses it at build, so only ``REST`` outbounds are walked.
 
-    Only the ``REST`` destination honours ``ech_egress``; every other connector refuses it at
-    build, so only ``REST`` outbounds are walked. An ``env()`` value for either key cannot be read
-    before it resolves, so such a connection is listed with a note saying so rather than left off.
+    An ``env()`` value is resolved against ``env_values`` when the caller has them, as the build
+    resolves it (the live posture route passes the runner's). One it cannot resolve, with no values
+    or on a ``deployed=False`` connection (ADR 0111 AC-1), is listed with
+    :data:`UNRESOLVED_ECH_SIDECAR` rather than left off, unless the other key alone already rules
+    the hop out.
 
     Pure: it reads the loaded graph and touches nothing else."""
-    from messagefoundry.transports.rest import ech_sidecar_is_cleartext
+    from messagefoundry.transports.rest import (
+        ech_sidecar_is_cleartext,
+        ech_sidecar_url_from_settings,
+    )
 
     out: list[tuple[str, str]] = []
     for oc in registry.outbound.values():
         if oc.spec.type != ConnectorType.REST:
             continue
-        settings = oc.spec.settings
-        egress, sidecar = settings.get("ech_egress"), settings.get("ech_sidecar")
+        values = env_values if oc.deployed else None
+        egress = _db_setting(oc.spec.settings, "ech_egress", None, values)
+        sidecar = _db_setting(oc.spec.settings, "ech_sidecar", None, values)
         if not egress:
             continue
-        sidecar_unread = isinstance(sidecar, EnvRef)
-        # A literal https sidecar is never cleartext, whatever an env() ech_egress resolves to.
-        if not (sidecar_unread or ech_sidecar_is_cleartext(sidecar)):
+        if sidecar is _UNRESOLVED:
+            out.append((oc.name, UNRESOLVED_ECH_SIDECAR))
             continue
-        unread = sidecar_unread or isinstance(egress, EnvRef)
-        note = "an env() value this reading does not resolve" if unread else "an http:// sidecar"
+        try:
+            resolved = ech_sidecar_url_from_settings({"ech_egress": True, "ech_sidecar": sidecar})
+        except ValueError:
+            continue  # the build refuses this sidecar, so no hop to it is ever made
+        if resolved is None or not ech_sidecar_is_cleartext(resolved):
+            continue
+        note = UNRESOLVED_ECH_SIDECAR if egress is _UNRESOLVED else "an http:// sidecar"
         out.append((oc.name, note))
     return sorted(out)
 
@@ -7061,7 +7080,7 @@ _UNRESOLVED = object()
 def _db_setting(
     settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
 ) -> object:
-    """A DATABASE connection's ``key`` setting, an ``env()`` reference resolved as the build
+    """A connection's ``key`` setting, an ``env()`` reference resolved as the build
     resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
     values, or a key the values do not hold and no default."""
     value = settings.get(key, default)

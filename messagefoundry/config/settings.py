@@ -10887,9 +10887,8 @@ def security_loosenings(
                 "transaction form keeps the id out of the URL",
             )
         )
-    # ADR 0139: the engine-to-sidecar hop of an ECH connection. Always loopback, since the resolver
-    # refuses any other sidecar, so no cleartext-hop gate refuses it; this entry is where it is
-    # named. Not a refusal: an https sidecar listener is the fix, and the entry says so.
+    # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,
+    # `ech_sidecar`, says why it is listed although it is loopback.
     if ech_cleartext_sidecar_hops:
         named = ", ".join(sorted(ech_cleartext_sidecar_hops))
         out.append(
@@ -10900,9 +10899,10 @@ def security_loosenings(
                 "CLEARTEXT, and it carries the request body and every request header, any "
                 "credential included, and on a SMART or OAuth2 connection the token-endpoint "
                 "request with its client credential. A process on this host that can capture "
-                "loopback traffic, or that binds the sidecar's port first, reads them. An https sidecar "
-                "listener encrypts the hop. An env() value is listed because it cannot be read "
-                "before it resolves",
+                "loopback traffic, or that binds the sidecar's port first, reads them. An https "
+                "sidecar listener encrypts the hop. A name marked possibly has an env() value this "
+                "reading could not resolve, and the above holds of it only if it resolves to an "
+                "http:// sidecar with ech_egress on",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
