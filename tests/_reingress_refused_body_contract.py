@@ -12,7 +12,8 @@ step (``RegistryRunner._process_response_item``) over each backend and read the 
 Extra-free on the ``_erased_reply_contract`` precedent, so the gated Postgres and SQL Server suites run
 the same body. Each case needs a clean store: its helpers claim whole lanes (the outbound to
 ``OB_RB`` and the loopback's response and ingress stages), so a row another case left there would be
-claimed in its place. Every fixture that runs these cases opens a fresh store or truncates first.
+claimed in its place. The fixtures that run them today, in test_refused_body_reingress.py,
+test_postgres_store.py and test_sqlserver_store.py, each open a fresh store or truncate first.
 
 Synthetic bodies only; no real PHI.
 """
@@ -132,7 +133,7 @@ async def assert_a_refused_reply_flood_stores_heads_past_the_allowance(store: An
             # Edit-and-resubmit refuses the cut child and points at the whole reply's origin,
             # without naming the origin, which may be outside the caller's scope.
             refusal = head_only_resubmit_refusal(child["id"], json.dumps(child["meta"]))
-            assert refusal is not None and "origin message's captured response" in refusal
+            assert refusal is not None and "origin message's response" in refusal
             assert child["meta"]["correlation_id"] not in refusal
         stored += len(child["raw"].encode())
     assert stored <= allowance_bytes + len(bodies) * HEAD

@@ -174,7 +174,7 @@ async def test_a_head_only_reingress_child_409_names_no_other_message(engine: En
 
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]
-    assert "its origin message's captured response" in detail
+    assert "its whole reply was captured on its origin message's response" in detail
     assert "have the sender send its own copy again" not in detail
     # The only message the body names is the one asked about.
     others = await _message_ids(engine) - {mid}

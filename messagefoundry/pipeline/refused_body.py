@@ -276,9 +276,9 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         # A loopback re-ingress child (vault BACKLOG #4796): its sender is a partner's reply, which
         # the engine captured whole on the origin message. The origin's id is not named: that
         # message may sit on a channel the caller is not scoped to, where the API answers 404.
-        "its whole reply is held in its origin message's captured response, where a user scoped"
-        " to that message can read it until retention erases it"
-        if "reingress_of_seq" in parsed
+        "its whole reply was captured on its origin message's response; unless retention has"
+        " erased it, a user scoped to that message who may view raw bodies can read it there"
+        if "reingress_of_seq" in parsed and isinstance(parsed.get("correlation_id"), str)
         else "have the sender send its own copy again"
     )
     return (

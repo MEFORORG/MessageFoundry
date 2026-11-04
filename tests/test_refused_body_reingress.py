@@ -173,11 +173,14 @@ def test_a_head_only_reingress_child_points_at_its_origin_without_naming_it() ->
     text = head_only_resubmit_refusal("child-1", json.dumps({**lineage, **record}))
     assert text is not None
     assert text.endswith(
-        "; its whole reply is held in its origin message's captured response, where a user scoped"
-        " to that message can read it until retention erases it"
+        "; its whole reply was captured on its origin message's response; unless retention has"
+        " erased it, a user scoped to that message who may view raw bodies can read it there"
     )
     # The origin may be outside the caller's scope, so neither lineage id is disclosed.
     assert "origin-1" not in text and "root-1" not in text
+    # A re-ingress marker with no origin id keeps the sender remedy rather than point at nothing.
+    orphan = head_only_resubmit_refusal("child-2", json.dumps({"reingress_of_seq": 1, **record}))
+    assert orphan is not None and orphan.endswith("; have the sender send its own copy again")
     # A listener's head-only row keeps the sender remedy.
     listener = head_only_resubmit_refusal("row-1", json.dumps(record))
     assert listener is not None and listener.endswith("; have the sender send its own copy again")
