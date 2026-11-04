@@ -236,7 +236,6 @@ from messagefoundry.store.store import (
     DbStatus,
     DestinationMetrics,
     DiskFreeStatus,
-    EpochBump,
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
@@ -323,6 +322,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    raise_session_epoch,
     read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
@@ -13931,16 +13931,9 @@ class SqlServerStore:
         return count
 
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise:
-        """Raise the account's session epoch through the write helper, on ``cur`` inside an open
-        transaction, and report the raise (BACKLOG #2592, #4975); store.py's
-        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
-        the revoke that called this."""
-        bump = EpochBump()
-        try:
-            return bump.report(await self._write_user(cur, user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
-            return None
+        """Raise the account's session epoch on ``cur`` inside an open transaction; see store.py's
+        :func:`raise_session_epoch`."""
+        return await raise_session_epoch(lambda change: self._write_user(cur, user_id, change))
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);

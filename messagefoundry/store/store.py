@@ -2751,23 +2751,35 @@ UserChange = Callable[[UserAuthzRecord], UserAuthzRecord | None]
 EpochRaise = tuple[int, int] | None
 
 
-class EpochBump:
+class _EpochBump:
     """A :data:`UserChange` that raises the account's session epoch and keeps the epoch it raised
-    from (BACKLOG #4975). ``_write_user`` calls it with the record it read under the account's
-    lock, so :attr:`before` is the value that write replaced, not a separate read."""
+    from. ``_write_user`` calls it with the record it read under the account's lock before it
+    returns a record, so :attr:`before` is the value that write replaced, not a separate read."""
 
     def __init__(self) -> None:
-        self.before: int | None = None
+        self.before = 0
 
     def __call__(self, record: UserAuthzRecord) -> UserAuthzRecord:
         self.before = record.row.session_epoch
         return record.bump_epoch()
 
-    def report(self, updated: UserAuthzRecord | None) -> EpochRaise:
-        """The :data:`EpochRaise` for the write that returned ``updated``."""
-        if updated is None or self.before is None:
-            return None
-        return self.before, updated.row.session_epoch
+
+async def raise_session_epoch(
+    write_user: Callable[[UserChange], Awaitable[UserAuthzRecord | None]],
+) -> EpochRaise:
+    """Raise an account's session epoch through a backend's ``_write_user``, bound to the account
+    and the caller's transaction, and report the raise (BACKLOG #2592, #4975).
+
+    An account whose record fails its seal is refused on every read already, so the revoke that
+    called this goes ahead without the raise, and reports none: ending sessions needs no key, and
+    refusing it would keep them live."""
+    bump = _EpochBump()
+    try:
+        updated = await write_user(bump)
+    except RowSealError:
+        log.warning("an account's record failed its integrity seal; its sessions end anyway")
+        return None
+    return None if updated is None else (bump.before, updated.row.session_epoch)
 
 
 def restamp_kept_session(
@@ -18065,17 +18077,9 @@ class MessageStore:
         return record
 
     async def _bump_session_epoch(self, user_id: str) -> EpochRaise:
-        """Raise the account's session epoch through the write helper, inside the caller's writer
-        transaction (BACKLOG #2592), and report the raise as :data:`EpochRaise` (BACKLOG #4975).
-        An account whose record fails its seal is refused on every read already, so the revoke
-        that called this goes ahead without the raise: ending sessions needs no key, and refusing
-        it would keep them live."""
-        bump = EpochBump()
-        try:
-            return bump.report(await self._write_user(user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
-            return None
+        """Raise the account's session epoch inside the caller's writer transaction; see
+        :func:`raise_session_epoch`."""
+        return await raise_session_epoch(lambda change: self._write_user(user_id, change))
 
     async def enforce_session_cap(
         self,
