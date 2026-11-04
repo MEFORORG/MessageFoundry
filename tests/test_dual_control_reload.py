@@ -1768,10 +1768,18 @@ async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
 
 
-def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
+def _lose_after_one_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: Path,
+    fails: Callable[[int], bool] = lambda listing: listing > 1,
+    *,
+    answers_is_dir: bool = False,
+) -> None:
     """Fail every listing of ``cfg`` past the next one, which is the reload's target check, as a
     share Windows cannot reach fails, and answer ``Path.is_dir`` of it ``False``, as both do for a
-    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory."""
+    real one. The old load gate asked ``is_dir`` alone, so it called this a missing directory.
+    ``fails`` picks the listings that fail by their number, from 1, in place of all past the
+    first, and ``answers_is_dir`` leaves ``is_dir`` alone, for a share that comes and goes."""
     real_scandir, real_is_dir = os.scandir, Path.is_dir
     listings = 0
 
@@ -1779,7 +1787,7 @@ def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
         nonlocal listings
         if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
             listings += 1
-            if listings > 1:
+            if fails(listings):
                 raise _share_fault()
         return real_scandir(path)
 
@@ -1787,7 +1795,8 @@ def _lose_after_one_listing(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
         return self.resolve() != cfg and real_is_dir(self, **kwargs)
 
     monkeypatch.setattr(os, "scandir", _scandir)
-    monkeypatch.setattr(Path, "is_dir", _is_dir)
+    if not answers_is_dir:
+        monkeypatch.setattr(Path, "is_dir", _is_dir)
 
 
 async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing_inline(
@@ -1818,35 +1827,25 @@ async def test_a_directory_unlistable_only_at_the_trust_walk_is_audited_unreadab
     from messagefoundry.config import wiring
 
     cfg = (tmp_path / "cfg").resolve()
-    real_scandir = os.scandir
-    calls = 0
+    walked = wiring.config_source_trust_paths
+    lost = False
 
-    def _scandir(path: Any) -> Any:
-        # Listings of cfg: the target check, the strict read's first check (lost here, so the
-        # load reads again), the lax first check, then the walk and every one after it.
-        nonlocal calls
-        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
-            calls += 1
-            if calls == 2 or calls > 3:
-                raise _share_fault()
-        return real_scandir(path)
+    def _walk(directory: Path) -> list[Path]:
+        nonlocal lost
+        lost = True  # the share drops as the walk starts, after the load's own check listed it
+        return walked(directory)
 
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         op = await _token(c, "op")
-        monkeypatch.setattr(os, "scandir", _scandir)
-        walked = wiring.config_source_trust_paths
-        reached: list[Path] = []
-
-        def _walk(directory: Path) -> list[Path]:
-            reached.append(directory)
-            return walked(directory)
-
+        # The strict read already failed, as the test above has it, so the load reads lax.
+        monkeypatch.setattr(Engine, "_reload_snapshot_blocking", staticmethod(lambda path: None))
+        _lose_after_one_listing(monkeypatch, cfg, lambda _listing: lost, answers_is_dir=True)
         monkeypatch.setattr(wiring, "config_source_trust_paths", _walk)
         r = await c.post("/config/reload", json={}, headers=op)
         monkeypatch.undo()
-    assert reached, "the trust walk never ran, so this measured the first check"
+    assert lost, "the trust walk never ran, so this measured the first check"
     assert r.status_code == 422, r.text
     assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
 

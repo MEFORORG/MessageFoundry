@@ -356,10 +356,12 @@ def _take_windows_path(
     read: _WinPathSecurity,
     self_sid: str | None,
     by_name: dict[str, _WinPathSecurity] | None = None,
+    moves_away: tuple[Path, int] | None = None,
 ) -> list[Path]:
     """Route load_config down the Windows branch with fake readers; return the paths read.
 
-    ``read`` answers every path unless ``by_name`` names that path's file name."""
+    ``read`` answers every path unless ``by_name`` names that path's file name. ``moves_away``
+    renames that path to ``<name>.moved`` as it is read, and answers it with that Win32 status."""
     import messagefoundry.config.wiring as wiring
 
     seen: list[Path] = []
@@ -367,6 +369,9 @@ def _take_windows_path(
 
     def _read_path(path: Path) -> _WinPathSecurity:
         seen.append(path)
+        if moves_away is not None and path == moves_away[0] and path.exists():
+            path.rename(path.with_name(f"{path.name}.moved"))
+            return _WinPathSecurity(status=moves_away[1])
         return overrides.get(path.name, read)
 
     probes = _WinConfigSourceProbes(
@@ -532,39 +537,64 @@ def test_config_directory_not_found_still_refuses(
 
 
 @pytest.mark.parametrize("gone", [2, 3])  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
-def test_config_directory_gone_before_its_read_is_missing(gone: int, tmp_path: Path) -> None:
+def test_config_directory_moved_away_before_its_read_is_missing(
+    gone: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The directory moved away between the walk's listing and this read: missing, as the load's
     own check of it answers, so a reload audits it ``not_found``, not a source it could not vet
     (vault BACKLOG #5248 item 1). The test above is the control: still there, it refuses."""
     from messagefoundry.config.fingerprint import ConfigDirMissing
-    from messagefoundry.config.wiring import (
-        _CONFIG_SOURCE_LEAD,
-        _enforce_windows_paths,
-        _refuse_unsafe_config_source,
-    )
 
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
     cfg = tmp_path / "cfg"
     cfg.mkdir()
     _write_cfg(cfg)
-    paths = [cfg, cfg / "cfg.py"]
+    seen = _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, moves_away=(cfg, gone))
+    with pytest.raises(ConfigDirMissing, match="config directory not found"):
+        load_config(cfg)
+    assert seen == [cfg] and (tmp_path / "cfg.moved").is_dir()
+
+
+def test_config_directory_lost_during_its_access_reads_is_unlistable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A share lost while the owners and access lists were read: a read fails with a network
+    error and the directory no longer lists. That is ``ConfigDirUnlistable``, which a reload audits
+    ``unreadable``, not a source it could not vet (vault BACKLOG #5248 item 4)."""
+    import messagefoundry.config.wiring as wiring
+    from messagefoundry.config.wiring import ConfigDirUnlistable
+    from tests._share_fault import _share_fault
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    real_scandir = os.scandir
+    losing, lost = True, False
+
+    def _scandir(target: Any) -> Any:
+        if lost and Path(target) == tmp_path:
+            raise _share_fault(53)
+        return real_scandir(target)
 
     def _read_path(path: Path) -> _WinPathSecurity:
-        if path == cfg:
-            cfg.rename(tmp_path / "moved")
-            return _WinPathSecurity(status=gone)
+        nonlocal lost
+        if path.name == "cfg.py":
+            lost = losing
+            return _WinPathSecurity(status=53)
         return _CLEAN_READ
 
     probes = _WinConfigSourceProbes(
         self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
     )
-    with pytest.raises(ConfigDirMissing, match="config directory not found"):
-        _enforce_windows_paths(
-            paths,
-            probes,
-            lead=_CONFIG_SOURCE_LEAD,
-            refuse=_refuse_unsafe_config_source,
-            first_is_required=True,
-        )
+    monkeypatch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
+    monkeypatch.setattr("messagefoundry.config.wiring.sys.platform", "win32")
+    monkeypatch.setattr(os, "scandir", _scandir)
+    with pytest.raises(ConfigDirUnlistable, match=r"could not read \."):
+        load_config(tmp_path)
+    # The control: the same read failure on a directory that still lists is still a refusal.
+    losing, lost = False, False
+    with pytest.raises(WiringError, match=r"\(Win32 error 53\)") as refused:
+        load_config(tmp_path)
+    assert not isinstance(refused.value, ConfigDirUnlistable)
 
 
 # ---- Tier 2: Windows-gated integration via icacls ---------------------------

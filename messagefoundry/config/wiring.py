@@ -226,9 +226,9 @@ class WiringError(ValueError):
 
 
 class ConfigDirUnlistable(WiringError):
-    """A load refused because the config directory itself could not be listed, for a reason other
-    than its being missing: at least a share Windows cannot reach and a folder this account cannot
-    list. Its own type, so a reload audits it as ``unreadable``, as it audits the engine's own
+    """A load refused because the config directory itself could not be read, for a reason other
+    than its being missing: at least a share Windows cannot reach, a folder this account cannot
+    list, and one that lists while ``Path.is_dir`` says no. Its own type, so a reload audits it as ``unreadable``, as it audits the engine's own
     check of the target, not as a config to fix (vault BACKLOG #5248). Still a ``WiringError``, so
     every caller that refuses a bad config refuses this one the same way."""
 
@@ -8736,13 +8736,17 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
         if strict:
             raise
-        # Judged again, as the walk judges a listing that says missing: a directory that cannot
-        # be listed now refuses as unreadable, and one gone as missing (vault BACKLOG #5248). A
+        unvetted: OSError | None = exc
+    else:
+        unvetted = None
+    if unvetted is not None:
+        # Judged again, outside the handler so its raise carries no __context__: a directory that
+        # cannot be listed refuses as unreadable, and one gone as missing (vault BACKLOG #5248). A
         # fault deeper in it, such as in its code-set folder, is the refusal below.
         _require_config_dir(directory, strict=False)
         raise WiringError(
-            f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(exc)}"
-        ) from exc
+            f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(unvetted)}"
+        ) from unvetted
     snapshot = read_config_snapshot(directory, strict=strict)
     # Before the directory is judged again, so that judging it cannot replace a fault this read
     # recorded with a different answer.
@@ -9142,11 +9146,8 @@ def _enforce_windows_paths(
 
     For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
     with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
-    POSIX arm reads. With ``first_is_required``, a not-found read of the first path, which is the
-    config directory itself, is never skipped: it raises
-    :class:`~messagefoundry.config.fingerprint.ConfigDirMissing` where nothing is there any more,
-    and refuses where something still is. Any other path that is gone by the time it is read is
-    skipped, as below.
+    POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
+    config directory itself. Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -9173,12 +9174,11 @@ def _enforce_windows_paths(
         )
     for index, path in enumerate(paths):
         sec = probes.read_path(path)
-        if sec.status in _WIN_PATH_GONE_ERRORS and not os.path.lexists(path):
-            if first_is_required and index == 0:
-                # The config directory moved away during the walk: missing, as the load's own
-                # check of it answers, which a reload audits as not_found (vault BACKLOG #5248).
-                # Nothing is left to run, so this refuses the load as surely as a refusal would.
-                raise ConfigDirMissing(f"config directory not found: {path}")
+        if (
+            sec.status in _WIN_PATH_GONE_ERRORS
+            and not (first_is_required and index == 0)
+            and not os.path.lexists(path)
+        ):
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
@@ -9666,7 +9666,12 @@ def _assert_safe_config_source(directory: Path) -> None:
 
     A directory it cannot list raises that ``OSError``, a missing one included, and each caller
     refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
-    for a share Windows cannot reach (vault BACKLOG #5117)."""
+    for a share Windows cannot reach (vault BACKLOG #5117).
+
+    A refusal is judged again by listing the directory, so one moved away while its owners and
+    access lists were read raises ``ConfigDirMissing``, and one lost then raises the listing's
+    ``OSError``, as the walk's own listing would have: a refusal of a path that is no longer there
+    to read must not be audited as a config to fix (vault BACKLOG #5248)."""
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
@@ -9676,12 +9681,22 @@ def _assert_safe_config_source(directory: Path) -> None:
             # Moved away since the caller's own check: missing, as that check answers (#3157).
             _require_config_dir(directory, strict=True)
         raise
-    _check_trusted_paths(
-        paths,
-        lead=_CONFIG_SOURCE_LEAD,
-        refuse=_refuse_unsafe_config_source,
-        first_is_required=True,
-    )
+    try:
+        _check_trusted_paths(
+            paths,
+            lead=_CONFIG_SOURCE_LEAD,
+            refuse=_refuse_unsafe_config_source,
+            first_is_required=True,
+        )
+    except WiringError as exc:
+        refusal = exc
+    else:
+        return
+    # Outside the handler, so a raise here does not carry the refusal as its __context__. It
+    # raises only when the directory itself is gone or cannot be listed; one that lists keeps
+    # the refusal.
+    _require_config_dir(directory, strict=True)
+    raise refusal
 
 
 def _check_trusted_paths(
