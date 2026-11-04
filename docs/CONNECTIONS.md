@@ -635,9 +635,13 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
-  accepted-with-warning (delivered, **not** retried, logged). An empty TA1-04, or one outside that
-  code set, is accepted too, and its captured `detail` is a fixed phrase, never the partner's text;
-  only a TA1-04 of `A` records `TA1*A` (BACKLOG #2984). **A TA1 is acted on only when its
+  accepted-with-warning (delivered, **not** retried, logged). TA1-04 is compared after trimming
+  surrounding whitespace and ignoring case, so a padded `R ` still dead-letters. An empty TA1-04, or
+  one outside that code set, is accepted too, not retried, because a retry could re-send an
+  interchange the partner accepted. It is logged at WARNING. That line names the code only by a
+  fixed phrase, beside the host, port and TA1-01 control number, and its captured `detail` is the
+  same fixed phrase; neither carries the TA1-04 text. Only a TA1-04 of `A` records `TA1*A` (BACKLOG
+  #2984, #5018). **A TA1 is acted on only when its
   TA1-01 names the ISA13 just sent.** Both are compared as nine-digit control numbers, and a shorter
   all-digit TA1-01 is zero-padded. If the sent ISA13 is not nine digits, only an exact echo matches;
   a blank one matches nothing. If the sent payload has no readable ISA there is nothing to
@@ -2310,16 +2314,43 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 **Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
 `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
 id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
-just runs whatever statement you declare, bound from the row.
+just runs whatever statement you declare, bound from the row. A high-water mark can still pass a row
+that was never handed off, in at least the cases *Reliability* below names. Where that matters, mark
+with a status column or a delete-from-queue.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
 **unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
 `poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
-`mark_statement`. After a handler failure the poller goes on to the next row, and that row's mark
-advances the cursor past the failed one, so the failed row is never read again. Where that matters,
-mark with a status column or a delete-from-queue. A `poll_statement` the read-only test refuses never
+`mark_statement` over a `poll_statement` that does not return rows in cursor order, or over a
+cursor column that is not unique (below).
+**With a `mark_statement`, a handler failure also stops the
+poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
+next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on: no
+mark can move past the failed row, so stopping would not make a later poll any likelier to read it. That keeps a high-water-mark `mark_statement` from moving the cursor past
+a row whose handler failed, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
+column): a later row's mark would otherwise do so, and the poll would never select the failed row
+again. Without that order, a row with a higher key handed off earlier in the same poll has already
+moved the cursor past it. On a cursor column with ties, such as a timestamp, a failed row that
+shares its cursor value with a row handed off before it in the same poll is lost even in cursor
+order: that row's mark sets the cursor to the shared value, and a `>` predicate never selects the
+failed row again. **The trade-off is head-of-line blocking.** A row whose handler fails on
+every attempt, such as one whose value a server store rejects as too long, holds back every row
+`poll_statement` returns after it, on every poll and whatever the mark shape, a status column or a
+delete-from-queue included; with an `ORDER BY` that is the whole feed. Each failure logs a WARNING
+and, when connection events are captured, emits a `handler_error` connection event. With a
+`mark_statement` that is at most one event per poll, since the poll stops at the failure; with none
+it is one per failing row. Its reason renders the error the way the log line does: a driver error as its type, SQLSTATE and
+native error number, without its message, and any other error as the scrubbed, bounded text of
+`safe_exc`, which is a bound rather than a guarantee that no value survives. Repair or remove that
+row to release the feed.
+**The stop closes only the handler-failure path, not high-water-mark loss outright.** A row the
+source cannot decode is different, and so is a body the configured `encoding` cannot carry; neither
+reaches the handler. Each is skipped rather than stopped at (see
+[per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
+still moves the cursor past it, and its `row_undecodable` event is the record of it.
+A `poll_statement` the read-only test refuses never
 reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
 run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
 kills the poller; it retries next interval.
@@ -3941,8 +3972,8 @@ Facts that are easy to get wrong, stated plainly first:
   **MLLP, raw-TCP, X12 and HTTP** listeners emit an ADR 0021 `at_capacity` (and
   `peer_not_allowlisted`) connection_event; the **DICOM** listener refuses identically but emits **no
   connection event at all** — `transports/dicom.py` contains zero `_emit_event` call sites. X12 sat
-  in that silent set until BACKLOG #1665 and no longer does: it now records the same seven kinds as
-  its raw-TCP twin, so an X12 refusal at either gate is no longer evidence-free.
+  in that silent set until BACKLOG #1665 and no longer does: it now records the same kinds as its
+  raw-TCP twin, so an X12 refusal at either gate is no longer evidence-free.
   The slow-loris guard is the **separate**
   `receive_timeout` (default 60 s), not `max_connections`; the HTTP listener additionally answers a
   synchronous `408` when a request read exceeds it.
@@ -4223,9 +4254,11 @@ the poll does not fetch is still in the table, unmarked. The next tick takes it.
 the [`poll_statement`](#database-source--databasepoll) row. On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
-least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
-the rest, end every poll at the skip cap described below, so the rows behind them would never be
-reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
+least two cases would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
+the rest, end every poll at the skip cap described below, and one row whose handler fails every time
+stops every poll at that row (BACKLOG #4921, the head-of-line trade-off in the
+[Database source](#database-source--databasepoll) section), so in either case the rows behind would
+never be reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
 accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never read was
 never received, and there is no disposition to record. A poll that writes and passes the read-only
 test would break that: at least the rows it marked past the ceiling would be accepted-and-dropped.
@@ -4267,7 +4300,8 @@ to prevent.
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
 left in place. The database ceiling is charged at the **fetch**, for the memory reason above, so the
-row has to be decoded under the open cursor and replaced from the same cursor — the shortfall is
+row has to be decoded, and its body encoded in the configured `encoding` (BACKLOG #4921), under the
+open cursor and replaced from the same cursor — the shortfall is
 re-fetched, never the whole result set. Do not read this as parity of mechanism; what the two share is
 that a budget can only be charged by something that makes progress. Two bounds keep the replacement
 from becoming a log flood: a `body_column` that names no column `poll_statement` selects is **static**
@@ -4335,8 +4369,8 @@ reading this page already applies to a file the scan never opened.
 |---|---|---|---|---|
 | MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted; on the standard asyncio loop with a DEBUG line, giving its slot back, and under uvloop before any slot is taken. A failed one is recorded as a throttled `tls_handshake_failed` connection event on any loop; [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) says what it counts and when it names the peer (vault BACKLOG #2613, #3302); a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
-| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
-| X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |
+| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is `handler_error`, never `framing_error`. An HL7 inbound with acknowledgements on records it at once and closes with no reply, so its sender resends. Any other holds the frame and retries until it is recorded or the listener stops, and records `handler_error` only for a fault that outlasts several attempts or one a stop ends; a fault an earlier retry clears logs WARNING lines and no event. A stop during the hold gets one last attempt; if that fails too, or stop cancels it, the held frame and every frame behind it on that connection are lost. The held frames are only in memory, so the process dying during the hold loses them too. The `hold_and_retry` docstring in [`transports/base.py`](../messagefoundry/transports/base.py) states how (BACKLOG #5022) | n/a |
+| X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries; a fault inside the inbound handler is handled as on the raw-TCP row above. This listener emits the same kinds as the raw-TCP row above (BACKLOG #1665, #5022) | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408`. With `tls = true`, the MLLP listener row's fixed 10 s handshake bound applies, and so does its admission order on each event loop (BACKLOG #2479): on the stdlib loop `source_ip_allowlist`, `max_connections` and `max_connections_per_host` act **before** the handshake, and a socket they refuse there is closed with no answer, since a TLS client cannot read a plaintext `403` or `503`. The TLS close exchange keeps asyncio's 30 s default here, since a `reply_from` answer can be partner-sized | handler `finally` closes the connection with a shutdown grace; stop also closes a socket still in its TLS handshake on the stdlib loop | an over-size body is refused before buffering; a TLS handshake over its bound, or one that fails, is aborted, as on the MLLP row | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |

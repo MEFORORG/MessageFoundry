@@ -2814,8 +2814,12 @@ at-least-once guarantees that cover a crash mid-poll — the file rename, the da
 mark-after-hand-off, and the downstream queue's idempotent handoff make a re-read a tolerated
 duplicate, never data loss. For a `database` source at least two shapes break that: a
 `poll_statement` that writes, which the read-only test on it does not always catch, and a
-high-water-mark `mark_statement`, whose mark on a later row advances the cursor past a row whose
-handler failed; see the [Database source](CONNECTIONS.md#database-source--databasepoll) section. The
+high-water-mark `mark_statement`, in at least the cases the
+[Database source](CONNECTIONS.md#database-source--databasepoll) section names. When the source has a
+`mark_statement`, each node stops its poll at a row whose handler failed (BACKLOG #4921); with none,
+the poll goes on to the next row. That stop covers the handler-failure path alone, not
+high-water-mark loss outright: a node's mark can still move the cursor past a row no node handed
+off, at least a row it skipped as one it could not turn into a body. The
 worst-case transition window is bounded by the lease timing: a partitioned leader keeps polling until
 it self-fences (within `leader_fence_timeout_seconds`), and a standby cannot take over until the lease
 expires (`leader_lease_ttl_seconds`) — and `fence < TTL` guarantees the old leader has stopped first.
