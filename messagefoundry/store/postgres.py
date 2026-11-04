@@ -10742,7 +10742,8 @@ class PostgresStore:
         minted before it whatever account it belongs to, then the epoch of each account its read of
         the account list returns, then ends the sessions it finds and re-seals the kept one under
         both new epochs, when it carried both epochs those raises replaced
-        (:func:`restamp_kept_session`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session sweep*, says what that leaves.
+        (:func:`restamp_kept_session`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session
+        sweep*, says what that leaves.
 
         The raise is first so a second revoke of every account waits on that one row, holding
         nothing, until this one commits. Nothing else locks the row: every reader of the global

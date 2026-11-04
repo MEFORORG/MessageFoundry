@@ -15515,8 +15515,8 @@ class SqlServerStore:
         it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
         session minted before it whatever account it belongs to, and re-seals the kept session
         under both new epochs, when it carried both epochs those raises replaced
-        (:func:`restamp_kept_session`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session sweep*, says what that
-        leaves.
+        (:func:`restamp_kept_session`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session
+        sweep*, says what that leaves.
 
         LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
         while holding that row. Taken first, as on Postgres, it would close a cycle wherever the

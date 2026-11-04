@@ -2868,11 +2868,13 @@ def restamp_kept_session(
     leaves the session's global stamp as it is, so a session behind on it stays refused."""
 
     def change(s: SessionRecord) -> SessionRecord:
-        if raised is None or s.user_id != user_id or s.user_epoch != raised.before:
+        if raised is None or s.user_id != user_id:
             return s
         if global_raised is None:
-            return replace(s, user_epoch=raised.after)
-        if s.global_epoch != global_raised.before:
+            return replace(s, user_epoch=raised.after) if s.user_epoch == raised.before else s
+        if not session_epochs_current(
+            s, user_epoch=raised.before, global_epoch=global_raised.before
+        ):
             return s
         return replace(s, user_epoch=raised.after, global_epoch=global_raised.after)
 
