@@ -10,7 +10,9 @@ replies could grow the store unmetered on a first deployment. These cases drive 
 step (``RegistryRunner._process_response_item``) over each backend and read the child it records.
 
 Extra-free on the ``_erased_reply_contract`` precedent, so the gated Postgres and SQL Server suites run
-the same body. Each case scopes its reads to the messages it made, so it needs no clean store.
+the same body. Each case needs a clean store: its helpers claim whole lanes (the outbound to
+``OB_RB`` and the loopback's response and ingress stages), so a row another case left there would be
+claimed in its place. Every fixture that runs these cases opens a fresh store or truncates first.
 
 Synthetic bodies only; no real PHI.
 """
@@ -127,10 +129,11 @@ async def assert_a_refused_reply_flood_stores_heads_past_the_allowance(store: An
             assert child["raw"] == body[:HEAD]
             assert record["stored"] == "head" and record["head_bytes"] == HEAD
             assert child["error"] == note + REINGRESS_PEEK_FAILED
-            # Edit-and-resubmit refuses the cut child and points at the whole reply's origin.
+            # Edit-and-resubmit refuses the cut child and points at the whole reply's origin,
+            # without naming the origin, which may be outside the caller's scope.
             refusal = head_only_resubmit_refusal(child["id"], json.dumps(child["meta"]))
-            origin = child["meta"]["correlation_id"]
-            assert refusal is not None and f"origin message {origin} " in refusal
+            assert refusal is not None and "origin message's captured response" in refusal
+            assert child["meta"]["correlation_id"] not in refusal
         stored += len(child["raw"].encode())
     assert stored <= allowance_bytes + len(bodies) * HEAD
     # No refused reply became ingress work on the loopback.

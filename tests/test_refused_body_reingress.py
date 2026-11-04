@@ -167,15 +167,17 @@ def test_a_held_text_with_a_nul_keeps_its_characters_in_the_head() -> None:
     assert decode_carriage(nul_head.raw) == ("café\x00" + "x" * 10).encode()
 
 
-def test_a_head_only_reingress_child_names_its_origin_as_the_remedy() -> None:
+def test_a_head_only_reingress_child_points_at_its_origin_without_naming_it() -> None:
     record = {"refused_body": {"bytes": 9000, "stored": "head", "head_bytes": 256}}
-    child = {"correlation_id": "origin-1", "reingress_of_seq": 1, **record}
-    text = head_only_resubmit_refusal("child-1", json.dumps(child))
+    lineage = {"correlation_id": "origin-1", "correlation_root_id": "root-1", "reingress_of_seq": 1}
+    text = head_only_resubmit_refusal("child-1", json.dumps({**lineage, **record}))
     assert text is not None
     assert text.endswith(
-        "; its whole reply stays in the captured response of origin message origin-1 until"
-        " retention erases it"
+        "; its whole reply is held in its origin message's captured response, where a user scoped"
+        " to that message can read it until retention erases it"
     )
+    # The origin may be outside the caller's scope, so neither lineage id is disclosed.
+    assert "origin-1" not in text and "root-1" not in text
     # A listener's head-only row keeps the sender remedy.
     listener = head_only_resubmit_refusal("row-1", json.dumps(record))
     assert listener is not None and listener.endswith("; have the sender send its own copy again")

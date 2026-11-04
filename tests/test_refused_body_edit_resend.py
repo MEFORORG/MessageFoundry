@@ -84,9 +84,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         await eng.stop()
 
 
-async def _seed_refused(engine: Engine, *, allowance_bytes: int) -> str:
+async def _seed_refused(
+    engine: Engine, *, allowance_bytes: int, lineage: dict[str, object] | None = None
+) -> str:
     """Record ``_REFUSED`` as a refused row the way the runner does, under an allowance of
-    ``allowance_bytes``: 0 stores only its head, a large one stores it whole."""
+    ``allowance_bytes``: 0 stores only its head, a large one stores it whole. ``lineage`` adds the
+    keys a loopback re-ingress child carries beside its record (vault BACKLOG #4796)."""
     allowance = RefusedBodyAllowance(
         RefusedBodyPolicy(allowance_bytes=allowance_bytes, head_bytes=_HEAD_BYTES)
     )
@@ -104,7 +107,7 @@ async def _seed_refused(engine: Engine, *, allowance_bytes: int) -> str:
         status=MessageStatus.ERROR,
         error=bounded.error,
         source_type="mllp",
-        metadata=bounded.metadata,
+        metadata=json.dumps({**bounded.fields, **(lineage or {})}),
     )
 
 
@@ -152,6 +155,30 @@ async def test_edit_resend_refuses_a_head_only_refused_row(engine: Engine, to: s
     assert await _edit_resend_audits(engine) == 0
     # The refused row itself is untouched.
     assert await engine.store.get_message(mid) == stored
+
+
+async def test_a_head_only_reingress_child_409_names_no_other_message(engine: Engine) -> None:
+    # Vault BACKLOG #4796: a loopback re-ingress child's origin may sit on a channel the caller is
+    # not scoped to, so the 409 points at the origin's captured response without naming its id.
+    origin = await engine.store.record_received(
+        channel_id="in1", raw=EDITED, status=MessageStatus.PROCESSED, source_type="mllp"
+    )
+    lineage = {"correlation_id": origin, "correlation_root_id": origin, "reingress_of_seq": 1}
+    mid = await _seed_refused(engine, allowance_bytes=0, lineage=lineage)
+    stored = await engine.store.get_message(mid)
+    assert stored is not None
+    async with _client(engine) as c:
+        r = await c.post(
+            f"/messages/{mid}/edit-resend", json={"raw": stored["raw"], "idempotency_key": "k"}
+        )
+
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "its origin message's captured response" in detail
+    assert "have the sender send its own copy again" not in detail
+    # The only message the body names is the one asked about.
+    others = await _message_ids(engine) - {mid}
+    assert origin in others and not any(other in detail for other in others)
 
 
 @pytest.mark.parametrize("to", [None, "OB2"], ids=["reroute", "direct"])

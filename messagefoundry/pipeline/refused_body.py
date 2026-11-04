@@ -257,7 +257,7 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
 
     A whole-stored refusal, any other row, and metadata that is absent (a retention purge nulls it
     with the body) or unreadable all answer ``None``, as before this check existed. The text names
-    lengths and ids only, never a byte of the body."""
+    lengths and ``message_id`` only, never a byte of the body or another message's id."""
     if not metadata:
         return None
     try:
@@ -272,13 +272,13 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
     body = f"this {total:,}-byte refused body" if total is not None else "this refused body"
     # The bound, not a count of the sender's bytes: a decoded head is cut to this much UTF-8.
     kept = f", cut to a {head:,}-byte head bound" if head is not None else ""
-    origin = parsed.get("correlation_id") if "reingress_of_seq" in parsed else None
     remedy = (
         # A loopback re-ingress child (vault BACKLOG #4796): its sender is a partner's reply, which
-        # the engine captured whole on the origin message.
-        f"its whole reply stays in the captured response of origin message {origin} until"
-        " retention erases it"
-        if isinstance(origin, str)
+        # the engine captured whole on the origin message. The origin's id is not named: that
+        # message may sit on a channel the caller is not scoped to, where the API answers 404.
+        "its whole reply is held in its origin message's captured response, where a user scoped"
+        " to that message can read it until retention erases it"
+        if "reingress_of_seq" in parsed
         else "have the sender send its own copy again"
     )
     return (
