@@ -3540,8 +3540,9 @@ def _restore_blocking(
     same key, downgrade and size checks, its manifest is read, the age refusal applies, and then only
     its config bundle is extracted, under every check :func:`_extract_config_members` applies. An
     archive that carries a store is refused on this route, at its first tar member where the store
-    leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by its manifest or by
-    the store member itself: its store is the restore."""
+    leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by the store member
+    itself: its store is the restore. One whose manifest does not mark it config-only is refused
+    there too."""
     import sqlite3
 
     from messagefoundry.store.store import (
@@ -3715,11 +3716,19 @@ def _restore_blocking(
                 ) from exc
             config_only = bool(manifest.get("config_only"))
             if dest_store_path is None:
-                # The manifest's word, and the members themselves: a manifest that says config-only
+                # The members themselves, then the manifest's word: a manifest that says config-only
                 # over an archive that carries a store is refused too, not restored with its store
                 # dropped.
-                if not config_only or _tar_has_member(tar_path, _STORE_MEMBER):
+                if _tar_has_member(tar_path, _STORE_MEMBER):
                     raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
+                if not config_only:
+                    # No store, and no word that there should be none: neither route restores it,
+                    # so the refusal does not send the operator to --to.
+                    raise BackupError(
+                        "restore",
+                        "the archive's manifest does not mark it CONFIG-ONLY, yet it carries no "
+                        f"{_STORE_MEMBER}; refusing to restore it on either route",
+                    )
                 # The age refusal binds here too: an old bundle brings back old credentials and old
                 # router and handler code, and --max-age-days / --allow-old-archive say what they
                 # say on every route (BACKLOG #2614).
@@ -3855,6 +3864,17 @@ def _restore_blocking(
             # nothing was decrypted or written: a refusal line, not a traceback.
             raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
         if not completed:
+            refusal = exc.__context__
+            if isinstance(refusal, BackupError):
+                # The staging directory's teardown failed while a refusal was already leaving the
+                # block, and its OSError would replace that refusal with a traceback. Keep the
+                # refusal, and name the leftover, which holds decrypted archive bytes.
+                raise BackupError(
+                    refusal.kind,
+                    f"{refusal}. Its staging directory {staging} could not be removed "
+                    f"({safe_exc(exc)}) and still holds decrypted archive content: delete it by "
+                    "hand once nothing holds it open",
+                ) from refusal
             raise
         # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
         # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
@@ -3932,7 +3952,7 @@ def _remove_made_dirs(dirs: list[Path]) -> None:
         except FileNotFoundError:
             continue
         except OSError as exc:
-            log.debug("left the directory %s this restore created: %s", path, safe_exc(exc))
+            log.warning("left the directory %s this restore created: %s", path, safe_exc(exc))
 
 
 class _StoreMemberGuard:
@@ -4236,7 +4256,7 @@ def _dangling_link_refusal(member: tarfile.TarInfo) -> str:
     """The refusal for a hard-link config member that names no config file extracted before it."""
     return (
         f"archive carries a config member {member.name!r} that is a hard link to "
-        f"{member.linkname!r}, which is not a config file this restore has already extracted; "
+        f"{member.linkname!r}, which names no config member earlier in the archive; "
         "refusing to restore it rather than leave that name out"
     )
 

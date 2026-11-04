@@ -1463,6 +1463,39 @@ def test_restore_config_members_refuses_a_member_that_ends_early(tmp_path) -> No
     assert dr_backup._restore_config_members(tar, tmp_path / "cfg-whole") == 1
 
 
+def test_a_refusal_survives_a_staging_teardown_that_fails(tmp_path, capsys, monkeypatch) -> None:
+    # On Windows a scanner holding the staged archive makes the teardown raise. That OSError used to
+    # replace the refusal leaving the block, so the operator got a traceback. The refusal stands,
+    # and names the leftover.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    real = tempfile.TemporaryDirectory
+
+    class HeldOpen(real):  # type: ignore[valid-type,misc]
+        def cleanup(self) -> None:
+            raise PermissionError(13, "held open by a scanner", self.name)
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", HeldOpen)
+    assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    err = _refusal(capsys)
+    assert "restore failed (age_undated)" in err and "Nothing was written" in err, err
+    assert "could not be removed" in err and "mefor-restore-" in err, err
+    assert "Traceback" not in err, err
+
+
+def test_config_only_route_refuses_an_archive_marked_neither_way(tmp_path, capsys) -> None:
+    # No store member, and a manifest that does not say config-only: `--to` would refuse it as
+    # having no store, so this route must not send the operator there.
+    tar = _plain_tar(
+        tmp_path / "neither.tar", [("config/feed.py", b"# a\n"), ("manifest.json", b"{}")]
+    )
+    toml = _service_toml(tmp_path, key_b64=None)
+    assert main([*_config_only_argv(str(tar), toml, tmp_path / "cfg"), "--allow-old-archive"]) == 1
+    err = _refusal(capsys)
+    assert "does not mark it CONFIG-ONLY" in err and "needs --to" not in err, err
+    assert not (tmp_path / "cfg").exists()
+
+
 def test_config_only_dangling_link_refusal_does_not_offer_dropping_config_to(tmp_path) -> None:
     # The pre-check's advice is for the store route. The extractor, which the config-only route
     # runs, refuses the same link without it: dropping --config-to there restores nothing.
