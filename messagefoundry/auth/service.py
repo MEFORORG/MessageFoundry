@@ -11689,8 +11689,9 @@ class AuthService:
         (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
         after it. The store keeps the session only when it re-stamped it with the new epoch, so a
         session an earlier sweep missed, left unstamped and refused at its next request, is not
-        reported kept. The count is always the rows this call revoked: the caller's own session is
-        in it only on the seal-failure path, where this call revoked it."""
+        reported kept. The count is the caller's other sessions this call revoked, never the
+        caller's own: on the seal-failure path the handler ends that one before the counted sweep.
+        :meth:`revoke_every_session` counts it there instead."""
         try:
             result = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
@@ -11698,14 +11699,11 @@ class AuthService:
         except RowSealError:
             # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
             # The caller asked to end every other session and its own is suspect: end them all,
-            # and audit that scope, since the caller's own session is ended too. The sweep runs
-            # first so the suspect row is in its count, as revoke_every_session does (BACKLOG
-            # #4975); the handler still runs if the sweep raises, and its own revoke then matches
-            # nothing.
-            try:
-                result = await self._store.revoke_user_sessions(identity.user_id)
-            finally:
-                await self._session_seal_failed(current_token_hash)
+            # and audit that scope, since the caller's own session is ended too. The handler ends
+            # it before the sweep, so the count and the reply ("signed out N other sessions") stay
+            # the other sessions only.
+            await self._session_seal_failed(current_token_hash)
+            result = await self._store.revoke_user_sessions(identity.user_id)
         scope = "self_others" if result.kept else "self_all"
         if result.count or not result.kept:
             await self._audit(
@@ -11773,7 +11771,8 @@ class AuthService:
         after it: kept only when the store re-stamped it with the new epochs. Not kept covers at
         least a session another request ended first, one an earlier sweep missed, which the store
         leaves unstamped and the gate refuses at its next request, and the seal-failure path. The
-        count is always the rows this call revoked, as :meth:`revoke_other_sessions` counts."""
+        count is the rows this call's sweep revoked: on the seal-failure path that includes the
+        caller's own, which :meth:`revoke_other_sessions` leaves out of its count."""
         try:
             result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:

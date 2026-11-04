@@ -4756,10 +4756,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   what the revoke wrote, not what the gate will answer: the gate's expiry checks still apply, a
   later revoke can still end the session, and the per-account revoke reports as kept a session
   behind on the global epoch only, which it stamps as above and the gate still refuses. The count
-  in either audit row is the sessions that call revoked. Where the caller's own session failed
-  its seal, the fallback revoke ended it, so it is in the count; where the revoke left it
-  unstamped, it was not revoked and is not in the count. The reply to `DELETE /me/sessions`
-  still says only how many other sessions ended. The session left unstamped stays unrevoked
+  in either audit row is the sessions that call's sweep revoked. Where the caller's own session
+  failed its seal, `DELETE /sessions` ends it in its fallback sweep, so it is in that count, and
+  ending the user's other sessions ends it apart from its sweep, so it is not. Where the revoke
+  left it unstamped, it was not revoked and is in neither count. The reply to `DELETE
+  /me/sessions` says only how many other sessions ended. The session left unstamped stays unrevoked
   until it is presented, and its refusal then is reported as a seal failure, as below.
   `tests/_session_seal_contract.py` tests the per-account revoke, a seal failure included;
   `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on both epochs and

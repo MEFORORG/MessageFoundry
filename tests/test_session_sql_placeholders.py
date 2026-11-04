@@ -133,7 +133,7 @@ def _reads_session_row(sql: str) -> bool:
 
 class _MssqlCursor:
     """Records each statement. Reports one affected row; answers a session row read with one live
-    row, an account epoch read with 0, and everything else with no result rows."""
+    row, the global epoch read with 0, and everything else with no result rows."""
 
     def __init__(self, seen: list[tuple[str, tuple[Any, ...]]]) -> None:
         self._seen = seen

@@ -353,8 +353,8 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
     """BACKLOG #4975: whether a revoke kept the caller's session is the store's answer from the
     revoke's own transaction, and the reply and the audit scope follow it. Three cases, kept,
     declined and the seal failure, each beside a control that differs only in that answer. The
-    count is the rows the call revoked: the caller's own row is in it on the seal-failure path,
-    where the fallback revoked it, and not on the declined path, where it was left."""
+    count is the rows the call's sweep revoked: the every-account revoke's fallback sweep counts
+    the caller's sealed-out row, and signing out elsewhere ends it apart from its count."""
     store, path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
@@ -416,8 +416,8 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
             {"scope": "all", "count": 3} if bent else {"scope": "all_but_caller", "count": 2}
         )
         await store.revoke_user_sessions("u")
-    # The same for signing out everywhere else: the caller's own row is in the count when the
-    # fallback ended it, as it is above.
+    # Signing out everywhere else ends the caller's sealed-out row too, but apart from its counted
+    # sweep, so its count and reply stay the other sessions only; the scope says the caller's ended.
     for bent in (False, True):
         caller, *_ = [await mint() for _ in range(3)]
         identity = await service.identity_for_token(caller)
@@ -426,12 +426,8 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
             await _raw_for(path)(
                 "UPDATE sessions SET reauth_at=? WHERE token_hash=?", (1.0, hash_token(caller))
             )
-        assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == (
-            3 if bent else 2
-        )
-        assert await last() == (
-            {"scope": "self_all", "count": 3} if bent else {"scope": "self_others", "count": 2}
-        )
+        assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 2
+        assert await last() == {"scope": "self_all" if bent else "self_others", "count": 2}
         caller_row = await store.get_session(hash_token(caller))
         assert caller_row is not None and (caller_row.revoked_at is not None) is bent
         await store.revoke_user_sessions("u")
