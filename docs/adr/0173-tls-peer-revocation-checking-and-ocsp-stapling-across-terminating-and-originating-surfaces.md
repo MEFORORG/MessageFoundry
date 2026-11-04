@@ -790,10 +790,11 @@ the relaxed hop: the call sites the next sentence names, MLLP and the DICOM SCU 
 a builder that hands the relaxed context or opener on, such as REST's `_expiry_relaxed_opener`,
 which SOAP and FHIR call too. It fails on a new site.
 `test_every_relaxed_hop_is_a_connection_that_hands_its_guard_no_relaxed_context` checks that each
-hop is a connection's constructor, and reads each of its guard calls, at the call or one wrapper
-down. It fails where a call may hand `capture()` the relaxed context or opener, or names no
-connection. It reads the condition's shape, not its value, and a context relaxed by other means
-than `relax_verify_expiry` is outside both tests. The rest of this paragraph is as of
+hop is the `__init__` of a class naming `DestinationConnector` or `SourceConnector`, and reads each
+of its guard calls, at the call or one wrapper down. It fails where a call may hand `capture()` the
+relaxed context or opener, or passes no `connection` argument. It reads code as written, not what
+it evaluates to, so at least an inverted comparison in the condition passes it, and a context
+relaxed by other means than `relax_verify_expiry` is outside both tests. The rest of this paragraph is as of
 2026-10-30.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
