@@ -2330,9 +2330,9 @@ class PostgresStore:
         what is not. Reads only."""
         expected = _declared_schema()
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
-        schema: object = None
-        for r in await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns)):
-            schema = r["schema_name"]
+        live_columns = await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
+        schema = live_columns[0]["schema_name"] if live_columns else None
+        for r in live_columns:
             shape = (
                 None
                 if r["type"] is None

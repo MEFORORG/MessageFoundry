@@ -27,28 +27,31 @@ The EXPECTED shape is read from the DDL text itself, because no scratch database
 it on as the SQLite check does: the columns of every ``CREATE TABLE`` and every ``ALTER TABLE``, and
 every named ``CREATE INDEX`` with its table, key columns, uniqueness and whether it has a ``WHERE``.
 Statements are read in order, so a later ``DROP`` or rename changes what an earlier one created. A key
-column that is an expression reads as ``<expr>``, on both sides; ``(col)`` reads as ``col``.
+column that is an expression reads as ``<expr>``, on both sides, followed by any operator class or
+collation the live read prints after it; ``(col)`` reads as ``col``.
 
 Given a backend, each column is also read for its type, its nullability, whether the server numbers it
-(``SERIAL``, ``IDENTITY``) and, on SQL Server, a ``COLLATE`` it declares (BACKLOG #5085). A guarded
-``ADD`` builds a column only on a store that lacks it, so a column whose ``CREATE TABLE`` and ``ADD``
-disagree, with no later ``ALTER COLUMN`` to bring both together, is built two ways and raises.
+(``SERIAL``, ``IDENTITY``, a PostgreSQL ``DEFAULT nextval(...)``) and, on SQL Server, a ``COLLATE``
+it declares (BACKLOG #5085). A guarded ``ADD`` builds a column only on a store that lacks it, so a
+column whose ``CREATE TABLE`` and ``ADD`` disagree, with no later ``ALTER COLUMN`` to bring both
+together, is built two ways and raises.
 
 DDL the reader cannot place raises ``ValueError`` rather than being skipped or misread, at least: a
 ``CREATE ... INDEX``, ``CREATE TABLE``, ``DROP TABLE``, ``DROP INDEX`` or ``sp_rename`` its patterns do
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
-a ``USING`` access method, a key column carrying a collation, an operator class or a ``NULLS`` order, a
-column type or clause it does not know, a SQL Server column that leaves its nullability to the
-session, and a ``--`` or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a
-literal's text. A unit test reads each shipped batch, so a new form fails there before it reaches an
-open.
+a ``USING`` access method, a key column or expression carrying a collation, an operator class or a
+``NULLS`` order, a column type or clause it does not know, a SQL Server column that leaves its
+nullability to the session, and a ``--`` or ``/*`` inside a quoted string, which may be dynamic SQL's
+comment or a literal's text. A unit test reads each shipped batch, so a new form fails there before
+it reaches an open.
 
-What is NOT compared includes at least: a column's default, a PostgreSQL column's collation,
-constraint indexes (a ``PRIMARY KEY`` or ``UNIQUE`` declared on the table), ``CHECK`` and foreign
-keys, an index's ``INCLUDE`` list and storage options, and a partial index's predicate, of which only
-its presence is compared. A default is not compared because each catalog prints it in its own
-rewritten form (PostgreSQL ``''::text``, SQL Server ``((0))``), and a missing one fails the first
-insert that relies on it rather than passing silently. An index that exists but cannot serve, such as
+What is NOT compared includes at least: a column's default, other than whether PostgreSQL's is a
+``nextval()`` call, which reads as numbering; a PostgreSQL column's collation; constraint indexes (a
+``PRIMARY KEY`` or ``UNIQUE`` declared on the table); ``CHECK`` and foreign keys; an index's
+``INCLUDE`` list and storage options; and a partial index's predicate, of which only its presence is
+compared. A default is not compared because each catalog prints it in its own rewritten form
+(PostgreSQL ``''::text``, SQL Server ``((0))``), and a missing one fails the first insert that relies
+on it rather than passing silently. An index that exists but cannot serve, such as
 an invalid or non-btree one on PostgreSQL or a disabled one on SQL Server, is reported by the backend
 that reads it. A store whose marker already matches is not re-read at open: the ADR 0064 fast path
 skips the batch and this check together, so a change made by hand after the marker was written is not
@@ -116,14 +119,20 @@ _ALTER_TABLE = re.compile(
 )
 #: What may follow a DROP's last name: the statement's end, or a word that starts the next one. Any
 #: other text, such as ``DROP TABLE public . t``, leaves the strict pattern unmatched, so it raises.
-_DROP_END = r"(?=\s*(?:[;')]|$)|\s+(?:CASCADE|RESTRICT|IF|BEGIN|END|EXEC|ELSE|DROP|CREATE|ALTER)\b)"
+#: ``IF`` starts a T-SQL statement, ``IF EXISTS (`` included, but never ``IF EXISTS <name>``: that is
+#: the drop's own guard after a word the pattern took for a name, as in ``DROP INDEX CONCURRENTLY IF
+#: EXISTS ix`` read without the ``CONCURRENTLY`` its pattern now allows.
+_DROP_END = (
+    r"(?=\s*(?:[;')]|$)|\s+(?:CASCADE|RESTRICT|BEGIN|END|EXEC|ELSE|DROP|CREATE|ALTER)\b"
+    r"|\s+IF\b(?!\s+EXISTS\s*[\w\[\"]))"
+)
 _DROP_TABLE = re.compile(
     rf"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<names>{_NAME}(?:\s*,\s*{_NAME})*){_DROP_END}",
     re.I,
 )
 _ON_TABLE = rf"(?:\s+ON\s+{_NAME})?"
 _DROP_INDEX = re.compile(
-    rf"\bDROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?"
+    rf"\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?"
     rf"(?P<names>{_NAME}{_ON_TABLE}(?:\s*,\s*{_NAME}{_ON_TABLE})*){_DROP_END}",
     re.I,
 )
@@ -181,18 +190,27 @@ class ColumnShape:
     identity: bool = False
     collation: str | None = None
 
-    def describe(self) -> str:
+    def describe(self, *, collation: bool = True) -> str:
+        """The shape in lower-case words. The service log's redaction filter reads a run of
+        all-caps words, such as ``NOT NULL`` or ``IDENTITY NOT NULL``, as a name and rewrites it
+        to ``[redacted]``, which would hide the very difference a refusal reports. A refusal
+        names a collation in a clause of its own, so passes ``collation=False``."""
         return (
             self.type
-            + (f" COLLATE {self.collation}" if self.collation else "")
-            + (" IDENTITY" if self.identity else "")
-            + (" NULL" if self.nullable else " NOT NULL")
+            + (" identity" if self.identity else "")
+            + (" null" if self.nullable else " not null")
+            + (f" collate {self.collation}" if collation and self.collation else "")
         )
 
-    def satisfied_by(self, live: ColumnShape) -> bool:
-        if (self.type, self.nullable, self.identity) != (live.type, live.nullable, live.identity):
-            return False
-        return self.collation is None or self.collation.lower() == (live.collation or "").lower()
+    def core_differs(self, live: ColumnShape) -> bool:
+        """Whether ``live`` has another type, nullability or numbering."""
+        return replace(self, collation=None) != replace(live, collation=None)
+
+    def collation_differs(self, live: ColumnShape) -> bool:
+        """Whether this shape declares a collation that ``live`` does not have."""
+        return (
+            self.collation is not None and self.collation.lower() != (live.collation or "").lower()
+        )
 
 
 def _no_columns() -> Mapping[str, Mapping[str, ColumnShape]]:
@@ -498,6 +516,9 @@ class _Column:
     identity: bool
     collation: str | None
     primary_key: bool
+    #: A PostgreSQL ``DEFAULT nextval(...)``: the server numbers the column, as the live read says,
+    #: but unlike ``SERIAL`` or an identity it does not make the column NOT NULL.
+    numbered_default: bool = False
 
 
 def _skip_group(tokens: list[str], i: int) -> int:
@@ -552,7 +573,7 @@ def _read_column(dialect: Dialect, text: str) -> tuple[str, _Column]:
     col_type, identity = _canonical_type(dialect, " ".join(words).replace(" (", "("))
     nullable: bool | None = None
     collation: str | None = None
-    primary_key = False
+    primary_key = numbered_default = False
 
     def word(k: int) -> str:
         return tokens[k].lower() if k < len(tokens) else ""
@@ -582,6 +603,7 @@ def _read_column(dialect: Dialect, text: str) -> tuple[str, _Column]:
             if word(i) == "(":
                 i = _skip_group(tokens, i)
         elif w == "default" and i + 1 < len(tokens):
+            numbered_default = dialect == "postgres" and _numbers(" ".join(tokens[i + 1 :]))
             i += 2 if tokens[i + 1] not in "+-" else 3
             if tokens[i - 1] == "(":
                 i = _skip_group(tokens, i - 1)
@@ -612,7 +634,13 @@ def _read_column(dialect: Dialect, text: str) -> tuple[str, _Column]:
                 i = _skip_group(tokens, i)
         else:
             raise ValueError(f"a column clause the live-schema check cannot read: {text!r}")
-    return name, _Column(col_type, nullable, identity, collation, primary_key)
+    return name, _Column(col_type, nullable, identity, collation, primary_key, numbered_default)
+
+
+def _numbers(default: str) -> bool:
+    """Whether a PostgreSQL default, the text after ``DEFAULT``, is a ``nextval()`` call, which the
+    live read counts as numbering. Outer parentheses are skipped: the catalog prints the call bare."""
+    return re.match(r"[\s(]*nextval\s*\(", default, re.I) is not None
 
 
 def _finish(dialect: Dialect, col: _Column, text: str) -> ColumnShape:
@@ -628,7 +656,7 @@ def _finish(dialect: Dialect, col: _Column, text: str) -> ColumnShape:
         if dialect == "sqlserver":
             raise ValueError(f"a SQL Server column that leaves NULL to the session: {text!r}")
         nullable = True
-    return ColumnShape(col.type, nullable, col.identity, col.collation)
+    return ColumnShape(col.type, nullable, col.identity or col.numbered_default, col.collation)
 
 
 def declared_column(dialect: Dialect, text: str) -> ColumnShape:
@@ -641,10 +669,10 @@ def declared_column(dialect: Dialect, text: str) -> ColumnShape:
 def _declared_key(text: str) -> str:
     """:func:`key_column` for a key in the DDL, refusing one whose live spelling would differ: a
     column with a collation, an operator class or a ``NULLS`` order is read with them on PostgreSQL
-    and could never compare equal to the bare name. An expression key with a ``NULLS`` order is
-    refused too. A plain name in parentheses, ``(col)``, is the column itself, as the catalog reads
-    it. No shipped index uses any of these; refusing here makes a future one fail the unit test that
-    reads each shipped batch, not every open."""
+    and could never compare equal to the bare name. An expression key with a ``NULLS`` order, an
+    operator class or a collation is refused too. A plain name in parentheses, ``(col)``, is the
+    column itself, as the catalog reads it. No shipped index uses any of these; refusing here makes
+    a future one fail the unit test that reads each shipped batch, not every open."""
     key, direction = text.strip(), ""
     if match := _DIRECTION.search(key):
         key, direction = key[: match.start()], match.group(0)
@@ -656,27 +684,48 @@ def _declared_key(text: str) -> str:
     elif inner != key and re.search(r"\bCOLLATE\b", inner, re.I):
         # PostgreSQL stores ((col COLLATE x)) as the column with an index collation.
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
+    elif (end := _expression_end(key)) is not None and key[end:].strip():
+        # An expression with an operator class or a collation after it, such as
+        # lower(a) text_pattern_ops: the live read prints those only where they are not the
+        # expression's defaults, which the DDL text cannot say.
+        raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     key += direction
     if _NULLS_ORDER.search(key) or (_PLAIN_KEY.match(key) is None and _EXPR_KEY.match(key) is None):
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     return key_column(key)
 
 
+def _expression_end(key: str) -> int | None:
+    """Where the expression that opens ``key`` ends, or ``None`` when ``key`` does not open with
+    one or its parentheses do not balance."""
+    if (match := _EXPR_KEY.match(key)) is None:
+        return None
+    try:
+        return _balanced(key, match.end())[1]
+    except ValueError:
+        return None
+
+
 def key_column(text: str) -> str:
     """One index key column as both sides of the compare spell it: a name as :func:`_ident` reads
     it, ``<expr>`` for an expression, then what the live read printed after it (a collation or an
-    operator class), then `` DESC`` when descending and a ``NULLS`` order when one was printed."""
+    operator class), then `` DESC`` when descending and a ``nulls`` order when one was printed. The
+    order is lower-cased: the service log's redaction filter rewrites a run of all-caps words such
+    as ``DESC NULLS FIRST`` to ``[redacted]``."""
     key = " ".join(text.split())
     nulls = ""
     if match := _NULLS_ORDER.search(key):
-        nulls, key = " " + " ".join(match.group(0).upper().split()), key[: match.start()]
+        nulls, key = " " + " ".join(match.group(0).lower().split()), key[: match.start()]
     desc = ""
     if match := _DIRECTION.search(key):
         desc, key = (" DESC" if match.group(1).upper() == "DESC" else ""), key[: match.start()]
     if _PLAIN_NAME.match(key):
         base = _ident(key)
-    elif _EXPR_KEY.match(key):
-        base = "<expr>"
+    elif (end := _expression_end(key)) is not None:
+        # What follows the expression, an operator class or a collation, is kept, so an
+        # expression index built with one does not pass as the bare expression.
+        rest = key[end:].strip()
+        base = "<expr>" + (f" {rest}" if rest else "")
     else:
         head, _, rest = key.partition(" ")
         base = (_ident(head) if _PLAIN_NAME.match(head) else head) + (f" {rest}" if rest else "")
@@ -831,7 +880,10 @@ class _Reader:
             nullable = upper.startswith("DROP")
             built.altered(lambda s: replace(s, nullable=nullable))
         elif upper == "DROP DEFAULT" or upper.startswith("SET DEFAULT "):
-            return
+            # A nextval() default numbers the column as the live read sees it, and any other
+            # default, or none, does not. PostgreSQL refuses either on an identity column.
+            numbered = _numbers(rest[len("SET DEFAULT ") :])  # empty after DROP DEFAULT
+            built.altered(lambda s: replace(s, identity=numbered))
         elif match := re.match(
             r"(?:SET\s+DATA\s+)?TYPE\s+(.+?)(?:\s+USING\s+.*)?$", rest, re.I | re.S
         ):
@@ -983,7 +1035,8 @@ def server_schema_differences(
     table holding an index's name, a view holding a table's). Such a name gets its own clause, which
     says why the guarded ``CREATE`` skipped it, in place of a bare "is missing". ``unusable`` maps an
     expected index that exists under its name to why it cannot serve, such as ``disabled``. A column
-    both shapes describe is compared by :meth:`ColumnShape.satisfied_by`."""
+    both shapes describe is compared by :meth:`ColumnShape.core_differs` and
+    :meth:`ColumnShape.collation_differs`, one clause for each that differs."""
     unusable = unusable or {}
     problems: list[str] = []
     for name in sorted(taken):
@@ -1031,12 +1084,20 @@ def server_schema_differences(
             got_table = live.column_shapes.get(table, {})
             for col, want in sorted(expected.column_shapes[table].items()):
                 got = got_table.get(col)
-                if got is not None and not want.satisfied_by(got):
-                    # A live collation is named only where the batch declares one to compare.
-                    seen = got if want.collation else replace(got, collation=None)
+                if got is None:
+                    continue
+                # Two clauses, so a long collation name never pushes the type and nullability past
+                # the 200-character cut safe_exc makes. A live collation is named only where the
+                # batch declares one to compare.
+                if want.core_differs(got):
                     problems.append(
-                        f"table {table!r} column {col!r} is {seen.describe()},"
-                        f" expected {want.describe()}"
+                        f"table {table!r} column {col!r} is {got.describe(collation=False)},"
+                        f" expected {want.describe(collation=False)}"
+                    )
+                if want.collation_differs(got):
+                    problems.append(
+                        f"table {table!r} column {col!r} has collation {got.collation!r},"
+                        f" expected {want.collation!r}"
                     )
     return problems
 
@@ -1090,6 +1151,14 @@ class ServerSchemaMismatchError(RuntimeError):
         )
         if schema is not None:
             where = f"schema {schema!r} of {where}"
+        # A column numbered where this build does not number it, or the reverse.
+        numbering = (
+            "for a column whose identity differs, rebuild its table as this build declares it and"
+            " copy the rows across, because SQL Server cannot add or remove an identity in place"
+            if backend == "sqlserver"
+            else "for a column whose numbering differs, add or drop its identity, or its nextval()"
+            " default"
+        )
         # The differences lead and the remedy follows. At least two paths that print this cut it
         # short, provision-schema at 500 characters and safe_exc at 200, while others, the CLI and
         # log.error among them, print it whole. The remedy is the same every time, so it is what a
@@ -1099,8 +1168,8 @@ class ServerSchemaMismatchError(RuntimeError):
             f"{backend} schema differs: " + "; ".join(self.differences) + f". In {where}; the"
             " open refused and marked nothing current. Rename or drop an object that takes a name,"
             " or an index of another shape or that cannot serve; add a missing column, or alter a"
-            " column of another type or nullability, as this build declares it; or use an empty"
-            " database or schema. Then restart."
+            " column of another type, nullability or collation, as this build declares it;"
+            f" {numbering}; or use an empty database or schema. Then restart."
         )
 
     def __reduce__(self) -> tuple[type[ServerSchemaMismatchError], tuple[object, ...]]:

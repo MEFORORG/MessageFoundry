@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import inspect
+import logging
 import os
 import pickle
 import re
@@ -31,6 +32,8 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import SchemaManagement, StoreSettings
+from messagefoundry.logging_setup import RedactionFilter
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.schema_verify import IndexShape, SchemaShape
 from messagefoundry.store.server_schema_verify import (
@@ -322,9 +325,13 @@ def test_the_refusal_names_where_it_looked_and_scopes_its_remedy() -> None:
     remedy = text[text.index("Rename or drop") :]
     # BACKLOG #5085: a column of another type or nullability is told to be altered, not dropped.
     assert (
-        "add a missing column, or alter a column of another type or nullability, as this build"
-        " declares it" in remedy
+        "add a missing column, or alter a column of another type, nullability or collation, as"
+        " this build declares it" in remedy
     )
+    # A numbering difference gets its own step on each backend.
+    assert "add or drop its identity, or its nextval() default" in remedy
+    sqlserver = str(ServerSchemaMismatchError("sqlserver", "mf", ["x"]))
+    assert "SQL Server cannot add or remove an identity in place" in sqlserver
     # The rename-or-drop remedy is scoped to a taken name or an index, never to a whole table.
     rename = remedy[: remedy.index(";")]
     assert rename == (
@@ -774,6 +781,8 @@ async def test_live_postgres_migration_adds_a_column_another_schema_holds() -> N
 @pytest.fixture
 async def sqlserver_scratch() -> AsyncIterator[tuple[Any, StoreSettings]]:
     """An empty scratch database, dropped afterwards, and auto-mode settings that point at it."""
+    import pyodbc
+
     from messagefoundry.config.settings import load_settings
     from tests._live_scratch import bounded, scratch_name, sqlserver_admin
 
@@ -785,9 +794,11 @@ async def sqlserver_scratch() -> AsyncIterator[tuple[Any, StoreSettings]]:
                 await bounded(
                     base, "create the scratch database", admin.run(f"CREATE DATABASE [{db}]")
                 )
-            except TimeoutError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - a fixture limit, not a finding
+            except pyodbc.ProgrammingError as exc:
+                # Only the principal's refusal is a fixture limit: error 262, "CREATE DATABASE
+                # permission denied". A stall, a lost link or any other error is a finding.
+                if "(262)" not in str(exc):
+                    raise
                 pytest.skip(f"cannot create a scratch database with this principal: {exc}")
             yield (
                 admin,
@@ -1001,11 +1012,11 @@ def test_a_table_level_primary_key_makes_its_columns_not_null() -> None:
 @pytest.mark.parametrize(
     ("live", "clause"),
     [
-        (ColumnShape("bigint", True), "is bigint NULL, expected integer NOT NULL"),
-        (ColumnShape("integer", True), "is integer NULL, expected integer NOT NULL"),
+        (ColumnShape("bigint", True), "is bigint null, expected integer not null"),
+        (ColumnShape("integer", True), "is integer null, expected integer not null"),
         (
             ColumnShape("integer", False, True),
-            "is integer IDENTITY NOT NULL, expected integer NOT NULL",
+            "is integer identity not null, expected integer not null",
         ),
     ],
 )
@@ -1026,8 +1037,8 @@ def test_a_collation_is_compared_only_where_the_batch_declares_one() -> None:
         {"t": {"a", "b"}}, {}, {"t": {"a": ci, "b": ColumnShape("int", True, False, "any")}}
     )
     assert server_schema_differences(expected, live, {}) == [
-        "table 't' column 'a' is nvarchar(64) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,"
-        " expected nvarchar(64) COLLATE latin1_general_100_bin2 NOT NULL"
+        "table 't' column 'a' has collation 'SQL_Latin1_General_CP1_CI_AS',"
+        " expected 'latin1_general_100_bin2'"
     ]
     upper = ColumnShape("nvarchar(64)", False, False, "Latin1_General_100_BIN2")
     same = live_shape({"t": {"a", "b"}}, {}, {"t": {"a": upper}})
@@ -1048,7 +1059,7 @@ def test_refuse_short_schema_reads_each_columns_shape_and_an_empty_table() -> No
     assert caught.value.differences == (
         "table 'u' is missing column 'x'",
         "table 'u' is missing column 'y'",
-        "table 't' column 'a' is bigint NOT NULL, expected integer NOT NULL",
+        "table 't' column 'a' is bigint not null, expected integer not null",
     )
 
 
@@ -1069,8 +1080,8 @@ async def test_postgres_refuses_a_column_of_another_type() -> None:
     with pytest.raises(ServerSchemaMismatchError) as caught:
         await _pg_store(conn)._ensure_schema()
     assert caught.value.differences == (
-        "table 'webauthn_credentials' column 'credential_id_hash' is text NULL,"
-        " expected character varying(128) NOT NULL",
+        "table 'webauthn_credentials' column 'credential_id_hash' is text null,"
+        " expected character varying(128) not null",
     )
     assert not conn.marker_written()
 
@@ -1081,8 +1092,8 @@ async def test_sqlserver_refuses_a_not_null_change() -> None:
     with pytest.raises(ServerSchemaMismatchError) as caught:
         await _ms_store(conn)._ensure_schema()
     assert caught.value.differences == (
-        "table 'secret_rotation_meta' column 'fingerprint' is nvarchar(max) NULL,"
-        " expected nvarchar(max) NOT NULL",
+        "table 'secret_rotation_meta' column 'fingerprint' is nvarchar(max) null,"
+        " expected nvarchar(max) not null",
     )
     assert not conn.marker_written()
 
@@ -1180,10 +1191,13 @@ def test_a_live_key_keeps_the_options_the_ddl_reader_refuses() -> None:
     assert key_column('name COLLATE "C"') == 'name COLLATE "C"'
     assert (
         key_column("body text_pattern_ops DESC NULLS LAST")
-        == "body text_pattern_ops DESC NULLS LAST"
+        == "body text_pattern_ops DESC nulls last"
     )
-    assert key_column("seq NULLS FIRST") == "seq NULLS FIRST"
-    assert key_column("lower(name) DESC NULLS LAST") == "<expr> DESC NULLS LAST"
+    assert key_column("seq NULLS FIRST") == "seq nulls first"
+    assert key_column("lower(name) DESC NULLS LAST") == "<expr> DESC nulls last"
+    # An expression keeps what the read printed after it, so it is not the bare expression.
+    assert key_column("lower(name) text_pattern_ops DESC") == "<expr> text_pattern_ops DESC"
+    assert key_column('(a || b) COLLATE "C"') == '<expr> COLLATE "C"'
     assert (
         key_column("seq NULLS FIRST")
         != declared_schema(("CREATE INDEX ix ON t (seq)",)).named_indexes["ix"].columns[0]
@@ -1275,5 +1289,139 @@ def test_an_index_named_like_a_table_does_not_hide_the_table() -> None:
     assert server_schema_differences(expected, live, {}, {"roles": "disabled"}) == [
         "index 'roles' exists but is disabled (expected on other(x))",
         "table 'roles' is missing column 'name'",
-        "table 'roles' column 'id' is bigint NOT NULL, expected int NOT NULL",
+        "table 'roles' column 'id' is bigint not null, expected int not null",
     ]
+
+
+# --- batch 606 repair: refusal text, pre-read, nextval, DROP INDEX, expression keys -----------------
+
+
+def _redacted(text: str) -> str:
+    """``text`` as the service log's redaction filter leaves it."""
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "%s", (text,), None)
+    assert RedactionFilter().filter(record)
+    return record.getMessage()
+
+
+def test_the_refusal_survives_the_log_redaction_and_the_safe_exc_cut() -> None:
+    """The service log rewrites a run of all-caps words such as ``NOT NULL`` to ``[redacted]``, which
+    hid the very difference #5085 reports. The shape is written in lower case, and a long collation
+    gets a clause of its own, so it cannot push the nullability past safe_exc's 200-character cut."""
+    assert "[redacted]" in _redacted("is bigint NULL, expected bigint IDENTITY NOT NULL")  # control
+    declared = ColumnShape("nvarchar(256)", False, True, "latin1_general_100_ci_as_sc_utf8")
+    expected = live_shape(
+        {"connection_state": {"connection"}}, {}, {"connection_state": {"connection": declared}}
+    )
+    live_col = ColumnShape("nvarchar(256)", True, False, "SQL_Latin1_General_CP1_CI_AS_KS_WS")
+    got = live_shape(
+        {"connection_state": {"connection"}}, {}, {"connection_state": {"connection": live_col}}
+    )
+    exc = ServerSchemaMismatchError("sqlserver", None, server_schema_differences(expected, got, {}))
+    core = (
+        "table 'connection_state' column 'connection' is nvarchar(256) null,"
+        " expected nvarchar(256) identity not null"
+    )
+    assert exc.differences == (
+        core,
+        "table 'connection_state' column 'connection' has collation"
+        " 'SQL_Latin1_General_CP1_CI_AS_KS_WS', expected 'latin1_general_100_ci_as_sc_utf8'",
+    )
+    logged = _redacted(str(exc))
+    assert core in logged and "[redacted]" not in logged
+    assert core in safe_exc(exc)
+    assert "[redacted]" not in _redacted(key_column("seq DESC NULLS FIRST"))
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_ddl_the_check_cannot_read_fails_before_the_lock_and_the_batch(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch is read before the schema lock on both backends, so a form the reader refuses
+    fails with no lock taken and no DDL run (BACKLOG #5062)."""
+    from messagefoundry.store import postgres, sqlserver
+
+    def unreadable() -> ServerSchemaShape:
+        raise ValueError("DDL the live-schema check cannot read")
+
+    monkeypatch.setattr(
+        postgres if backend == "postgres" else sqlserver, "_declared_schema", unreadable
+    )
+    if backend == "postgres":
+        pg = _PgConn()
+        with pytest.raises(ValueError, match="cannot read"):
+            await _pg_store(pg)._ensure_schema()
+        assert not any("advisory" in sql for sql in pg.executed)
+        assert not set(postgres._SCHEMA) & set(pg.executed)
+        assert pg.executed[-1] == "ROLLBACK"
+    else:
+        ms = _MsConn()
+        with pytest.raises(ValueError, match="cannot read"):
+            await _ms_store(ms)._ensure_schema()
+        sqls = [sql for sql, _p, _t in ms.executed]
+        assert not any("sp_getapplock" in sql for sql in sqls)
+        assert not set(sqlserver._SCHEMA) & set(sqls)
+        assert ms.rolledback >= 1
+
+
+def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
+    """The live read counts a ``nextval()`` default as numbering, so the declared side must too, or a
+    correct column refuses. Unlike ``SERIAL`` it adds no NOT NULL."""
+    assert declared_column("postgres", "a BIGINT DEFAULT nextval('s'::regclass)") == ColumnShape(
+        "bigint", True, True
+    )
+    assert declared_column("postgres", "a BIGINT NOT NULL DEFAULT nextval('s')") == ColumnShape(
+        "bigint", False, True
+    )
+    assert declared_column("postgres", "a BIGINT DEFAULT (nextval('s'))") == ColumnShape(
+        "bigint", True, True
+    )
+    assert declared_column("postgres", "a BIGINT DEFAULT 0") == ColumnShape("bigint", True)
+    created = declared_schema(("CREATE TABLE t (a BIGINT DEFAULT nextval('s'))",), "postgres")
+    assert created.column_shapes["t"]["a"] == ColumnShape("bigint", True, True)
+    # An ALTER COLUMN reaches only an older store, so its result must match the CREATE: a nextval()
+    # default it sets or drops changes the numbering, and any other default does not.
+    same = declared_schema(
+        (
+            "CREATE TABLE t (a BIGINT DEFAULT nextval('s'), b INT)",
+            "ALTER TABLE t ALTER COLUMN a SET DEFAULT nextval('s')",
+            "ALTER TABLE t ALTER COLUMN b SET DEFAULT 0",
+        ),
+        "postgres",
+    )
+    assert same.column_shapes["t"]["a"] == ColumnShape("bigint", True, True)
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a BIGINT DEFAULT nextval('s'))",
+                "ALTER TABLE t ALTER COLUMN a DROP DEFAULT",
+            ),
+            "postgres",
+        )
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema(
+            ("CREATE TABLE t (a BIGINT)", "ALTER TABLE t ALTER COLUMN a SET DEFAULT nextval('s')"),
+            "postgres",
+        )
+
+
+def test_drop_index_concurrently_if_exists_drops_the_index() -> None:
+    """``DROP INDEX CONCURRENTLY IF EXISTS ix`` once read ``CONCURRENTLY`` as the name, ended at the
+    ``IF``, and left ``ix`` expected. A T-SQL ``IF EXISTS (`` after a drop still ends it."""
+    base = ("CREATE TABLE t (a INT)", "CREATE INDEX ix ON t (a)")
+    assert not declared_schema((*base, "DROP INDEX CONCURRENTLY IF EXISTS ix")).named_indexes
+    assert not declared_schema((*base, "DROP INDEX CONCURRENTLY ix")).named_indexes
+    assert not declared_schema(
+        (*base, "DROP INDEX ix ON t IF EXISTS (SELECT 1 FROM sys.objects) SELECT 1")
+    ).named_indexes
+    with pytest.raises(ValueError, match="cannot read"):
+        declared_schema((*base, "DROP INDEX bogus IF EXISTS ix"))
+
+
+@pytest.mark.parametrize(
+    "key", ["lower(a) text_pattern_ops", '(a || b) COLLATE "C"', "lower(a) text_pattern_ops DESC"]
+)
+def test_an_expression_key_with_an_operator_class_or_collation_raises(key: str) -> None:
+    """The live read prints an expression's operator class and collation, so the declared side
+    cannot read one as the bare ``<expr>``."""
+    with pytest.raises(ValueError, match="options"):
+        declared_schema((f"CREATE INDEX ix ON t ({key})",))

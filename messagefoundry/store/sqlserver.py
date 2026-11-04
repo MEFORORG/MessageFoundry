@@ -4705,6 +4705,9 @@ class SqlServerStore:
                         raise StoreNotFoundError.server_schema(
                             self.backend, self._settings.database
                         )
+                # Read before the applock and the batch, so DDL the live-schema check cannot read
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
+                _declared_schema()
                 # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
                 # so each step below runs on its own cursor, opened after the connection timeout is set
                 # for that step, and closed before the next opens (no MARS: one active statement per
