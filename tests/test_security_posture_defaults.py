@@ -2535,6 +2535,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     # strict AEAD allow-list to that one hop, and leaving it unset is the shipped posture every other
     # connection already has. A reader that reported it would be reporting operators who hardened.
     "tls_ciphers": "opt-in AEAD allow-list on one hop -- a tightening, not a deviation to report",
+    # BACKLOG #4907. A TIGHTENING, like tls_ciphers and tls_ca_pin above: setting it refuses a
+    # verified MLLP sender whose certificate names no listed subject under its issuing CA, and
+    # leaving it unset is the shipped posture of every mTLS listener.
+    "tls_client_subjects": "opt-in MLLP sender allowlist -- a tightening, not a deviation to report",
     # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
     "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
     # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses
