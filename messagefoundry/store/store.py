@@ -985,12 +985,14 @@ _REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
 class DeadLetterPurge:
     """What one ``purge_dead_letters`` call did (BACKLOG #4996). Counts only, never content.
 
-    ``bodies`` is the dead rows whose ``payload`` it blanked: the retention audit's purged count. That
-    payload is the body, or for a store-once row its ``shared_body`` key and for a re-ingress token
-    its reply reference, each of which the blank cuts off. ``errors_cleared`` is the dead rows whose
-    ``last_error`` it nulled, a payload-blanked row included. It is counted apart because a row whose
-    payload was already blank can still hold error text, which may carry PHI, and a pass that clears
-    only that text must still write its audit row. The backends' docstrings point here."""
+    ``bodies`` is the dead rows whose ``payload`` it blanked, whatever that payload held: the
+    retention audit's purged count. It is a body (on a keyed store, a sealed empty body too), a
+    store-once row's ``shared_body`` key, or a re-ingress token's reply reference. Blanking that
+    reference leaves the reply in ``response.body`` until :meth:`MessageStore.purge_message_bodies`
+    erases it. A row whose payload was already blank is not counted. ``errors_cleared`` is the dead
+    rows whose ``last_error`` it nulled, a payload-blanked row included. It is counted apart because
+    a row whose payload was already blank can still hold error text, which may carry PHI, and a pass
+    that clears only that text must still write its audit row. The backends' docstrings point here."""
 
     bodies: int = 0
     errors_cleared: int = 0
@@ -13149,8 +13151,8 @@ class MessageStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
         parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
-        prior handoff) or its reference is malformed, and ``""`` if the artifact is gone, which
-        ``ingress_handoff`` then dead-letters. The
+        prior handoff) or its reference is malformed, and ``""`` if the artifact row is missing, its
+        body was erased, or the reply was empty; :meth:`ingress_handoff` tells those apart. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
         peek and the raw always agree."""
         async with self._read() as db:

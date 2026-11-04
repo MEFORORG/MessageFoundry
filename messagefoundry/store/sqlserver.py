@@ -8205,7 +8205,8 @@ class SqlServerStore:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
-        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        would exceed ``correlation_depth_cap``, a reply retention erased (BACKLOG #1560) or a
+        ``response`` row that is missing (:data:`REINGRESS_ARTIFACT_MISSING`, BACKLOG #4996) is
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
@@ -8316,9 +8317,9 @@ class SqlServerStore:
                 art = await cur.fetchone()
                 # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says
                 # how a token reaches here). `#eligible` is materialized once, so a replay can
-                # commit between that read and the erasure. It
-                # must never become a child message. A missing row is damage, not an erasure, so
-                # that token is not blanked: its sealed reference is the evidence.
+                # commit between that read and the erasure. It must never become a child message.
+                # A missing row is damage, not an erasure, so that token is not blanked: its
+                # sealed reference is the evidence.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
@@ -8528,7 +8529,8 @@ class SqlServerStore:
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted reply body behind a ``Stage.RESPONSE`` work-row (ADR 0013) — for the re-ingress
         worker's HL7 peek. ``None`` if the work-row is missing/consumed or its ref is unparseable; ``''``
-        if the artifact body is missing/empty. Reads the SAME immutable artifact ``ingress_handoff``
+        if the artifact row is missing, its body was erased, or the reply was empty, as on SQLite.
+        Reads the SAME immutable artifact ``ingress_handoff``
         re-reads, so the peek and the persisted raw always agree."""
         row = await self._fetchone(
             f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",

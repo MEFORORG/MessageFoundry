@@ -27,13 +27,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
-from messagefoundry.store.crypto import MARKER_PREFIX
+from messagefoundry.store.crypto import MARKER_PREFIX, TagFailureHook
 from messagefoundry.store.queue_tag import QUEUE_TAG_SELECT, open_queue_cell
 from tests._erased_reply_contract import status_of
 from tests._queue_tag_contract import RawFetch, RawSql
 from tests._store_audit import no_operator_audit
-
-TagFailureHook = Callable[[str, str], None]
 
 
 class OpenKeyed(Protocol):
@@ -274,19 +272,23 @@ async def assert_the_dead_letter_purge_counts_only_the_bodies_it_blanks(
     keyless: Any, _open_keyed: OpenKeyed, fetch: RawFetch, _raw: RawSql
 ) -> None:
     """BACKLOG #4996. A dead row whose payload is already blank only loses its ``last_error``. No
-    body is purged, so the body count the retention audit records leaves it out, and the dead row
-    beside it that held a body is counted. Both cleared errors are counted apart."""
+    body is purged, so the body count the retention audit records leaves it out, and the dead rows
+    beside it that held a body are counted. Every cleared error is counted apart. A whitespace-only
+    body is a body: T-SQL pads trailing spaces before comparing, so SQL Server's purge must not read
+    it as blank and leave it."""
     blank = await terminal(keyless, "OB_KB_DLQ_BLANK", dead=True)
     full = await terminal(keyless, "OB_KB_DLQ_BODY", dead=True, body=BODY)
+    spaces = await terminal(keyless, "OB_KB_DLQ_SPACES", dead=True, body="   ")
     errors = "SELECT payload, last_error FROM queue WHERE message_id=?"
     assert (await fetch(errors, (blank,)))[0]["last_error"] is not None  # the premise
     assert (await fetch(errors, (full,)))[0]["payload"] == BODY
+    assert (await fetch(errors, (spaces,)))[0]["payload"] == "   "
 
     later = time.time() + 86400.0  # ``older_than`` is an absolute cutoff
     purge = await keyless.purge_dead_letters(older_than=later, now=later)
-    assert (purge.bodies, purge.errors_cleared) == (1, 2)  # both errors cleared, one body
+    assert (purge.bodies, purge.errors_cleared) == (2, 3)  # every error cleared, two bodies
 
-    for mid in (blank, full):
+    for mid in (blank, full, spaces):
         [row] = await fetch(errors, (mid,))
         assert row["payload"] == "" and row["last_error"] is None, mid
     again = await keyless.purge_dead_letters(older_than=later, now=later)
