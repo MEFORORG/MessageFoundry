@@ -11,8 +11,10 @@ Extra-free on the ``_finalize_race_contract`` precedent, so the gated Postgres a
 run the same body on legs that install only their own driver extra.
 
 ``keyless`` is a store opened with no key on a database no keyed open has touched. ``open_keyed`` opens
-a new keyed handle on the same database, and the contract closes it. ``fetch`` and ``raw`` run one
-statement outside the store, with ``?`` placeholders, and each backend's adapter respells them.
+a new keyed handle on the same database, and the contract closes it. Its ``on_tag_failure`` is
+installed on the cipher BEFORE the open, so it sees an alarm the open itself raises. ``fetch`` and
+``raw`` run one statement outside the store, with ``?`` placeholders, and each backend's adapter
+respells them.
 
 **The refusal is a control, and this contract pins that it did not move.** A blank on a surface that
 is already keyed is what a plant looks like, so the second case keeps refusing it.
@@ -22,16 +24,38 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
 
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
-from messagefoundry.store.crypto import MARKER_PREFIX
+from messagefoundry.store.crypto import MARKER_PREFIX, TagFailureHook
 from messagefoundry.store.queue_tag import QUEUE_TAG_SELECT, open_queue_cell
 from tests._erased_reply_contract import status_of
 from tests._queue_tag_contract import RawFetch, RawSql
 from tests._store_audit import no_operator_audit
 
-OpenKeyed = Callable[[], Awaitable[Any]]
+
+class OpenKeyed(Protocol):
+    def __call__(self, *, on_tag_failure: TagFailureHook | None = None) -> Awaitable[Any]: ...
+
+
+def keyed_cipher(
+    make_cipher: Callable[..., Any],
+    key: str,
+    *,
+    on_tag_failure: TagFailureHook | None = None,
+) -> Any:
+    """The cipher an ``open_keyed`` adapter opens with, its tag-failure hook already installed."""
+    cipher = make_cipher(key, write_v2=True)
+    if on_tag_failure is not None:
+        cipher.set_tag_failure_hook(on_tag_failure)
+    return cipher
+
+
+def alarm_log() -> tuple[list[str], TagFailureHook]:
+    """A list of tag-failure reasons and the hook that appends to it."""
+    alarms: list[str] = []
+    return alarms, lambda _table, reason: alarms.append(reason)
+
 
 RAW = "MSH|^~\\&|SYNTH|F|R|RF|20260101||ADT^A01|KB1|P|2.5.1\rPID|1||SYNTH-100||DOE^JANE\r"
 BODY = "SYNTH-BODY"
@@ -58,13 +82,20 @@ async def marked(fetch: RawFetch) -> bool:
     )
 
 
+async def unmark(raw: RawSql) -> None:
+    """Drop ``queue.payload``'s ``keyed_surface`` marker, leaving its ciphertext the only signal."""
+    await raw(
+        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
+    )
+
+
 async def outbound(store: Any, lane: str, body: str) -> str:
     return str(await store.enqueue_message(channel_id="IB_KB", raw=RAW, deliveries=[(lane, body)]))
 
 
-async def terminal(store: Any, lane: str, *, dead: bool) -> str:
-    """A delivery with an empty body, driven to a terminal status on the keyless store."""
-    mid = await outbound(store, lane, "")
+async def terminal(store: Any, lane: str, *, dead: bool, body: str = "") -> str:
+    """A delivery, empty unless ``body`` says otherwise, driven to a terminal status."""
+    mid = await outbound(store, lane, body)
     [item] = await store.claim_ready(destination_name=lane)
     if dead:
         await store.dead_letter_now(item.id, "permanent reject")
@@ -87,11 +118,10 @@ async def assert_first_keyed_open_seals_a_live_empty_row(
     for mid in (pending, inflight, done, dead):
         assert (await row_of(fetch, mid))["payload"] == ""  # the premise: all blank at rest
 
-    keyed = await open_keyed()
+    alarms, hook = alarm_log()
+    keyed = await open_keyed(on_tag_failure=hook)
     try:
-        alarms: list[str] = []
         cipher = keyed.cipher()
-        cipher.set_tag_failure_hook(lambda _table, reason: alarms.append(reason))
         assert await marked(fetch)
 
         # The sweep and the claim agree: both read each live row as a real, empty row.
@@ -156,9 +186,9 @@ async def assert_a_blank_on_a_keyed_surface_stays_refused(
     keyless: Any, open_keyed: OpenKeyed, fetch: RawFetch, raw: RawSql
 ) -> None:
     """The control this fix must not loosen. Nothing a keyed writer does leaves a live blank, so one
-    on a marked surface is a plant. A second keyed open leaves it, the claim dead-letters it and
-    alarms, and the next row on the lane is delivered. The same holds when the marker row is gone and
-    the surface's own ciphertext is the only signal it is sealed."""
+    on a marked surface is a plant. A second keyed open leaves it, with the marker present and again
+    with the marker row gone, when the surface's own ciphertext is the only signal it is sealed. The
+    claim then dead-letters it and alarms, and the next row on the lane is delivered."""
     keyed = await open_keyed()
     try:
         mid = await outbound(keyed, "OB_KB_PLANT", BODY)
@@ -168,14 +198,17 @@ async def assert_a_blank_on_a_keyed_surface_stays_refused(
         await keyed.close()
     await raw("UPDATE queue SET payload='' WHERE message_id=?", (mid,))
     await raw("UPDATE queue SET payload='' WHERE message_id=?", (unmarked,))
-    await raw(
-        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
-    )
-
-    keyed = await open_keyed()
+    keyed = await open_keyed()  # the marker is present
     try:
-        alarms: list[str] = []
-        keyed.cipher().set_tag_failure_hook(lambda _table, reason: alarms.append(reason))
+        assert (await row_of(fetch, mid))["payload"] == ""
+        assert (await row_of(fetch, unmarked))["payload"] == ""
+    finally:
+        await keyed.close()
+    await unmark(raw)
+
+    alarms, hook = alarm_log()
+    keyed = await open_keyed(on_tag_failure=hook)
+    try:
         assert await marked(fetch)  # the open restored the marker
         # Neither blank was sealed: the witness's ciphertext kept the surface sealed.
         assert (await row_of(fetch, mid))["payload"] == ""
@@ -191,6 +224,33 @@ async def assert_a_blank_on_a_keyed_surface_stays_refused(
         assert item is not None and item.payload == BODY  # the control
     finally:
         await keyed.close()
+
+
+async def assert_the_dead_letter_purge_counts_only_the_bodies_it_blanks(
+    keyless: Any, _open_keyed: OpenKeyed, fetch: RawFetch, _raw: RawSql
+) -> None:
+    """BACKLOG #4996. A dead row whose payload is already blank only loses its ``last_error``. No
+    body is purged, so the body count the retention audit records leaves it out, and the dead rows
+    beside it that held a body are counted. Every cleared error is counted apart. A whitespace-only
+    body is a body: T-SQL pads trailing spaces before comparing, so SQL Server's purge must not read
+    it as blank and leave it."""
+    blank = await terminal(keyless, "OB_KB_DLQ_BLANK", dead=True)
+    full = await terminal(keyless, "OB_KB_DLQ_BODY", dead=True, body=BODY)
+    spaces = await terminal(keyless, "OB_KB_DLQ_SPACES", dead=True, body="   ")
+    errors = "SELECT payload, last_error FROM queue WHERE message_id=?"
+    assert (await fetch(errors, (blank,)))[0]["last_error"] is not None  # the premise
+    assert (await fetch(errors, (full,)))[0]["payload"] == BODY
+    assert (await fetch(errors, (spaces,)))[0]["payload"] == "   "
+
+    later = time.time() + 86400.0  # ``older_than`` is an absolute cutoff
+    purge = await keyless.purge_dead_letters(older_than=later, now=later)
+    assert (purge.bodies, purge.errors_cleared) == (2, 3)  # every error cleared, two bodies
+
+    for mid in (blank, full, spaces):
+        [row] = await fetch(errors, (mid,))
+        assert row["payload"] == "" and row["last_error"] is None, mid
+    again = await keyless.purge_dead_letters(older_than=later, now=later)
+    assert (again.bodies, again.errors_cleared) == (0, 0)  # idempotent
 
 
 async def assert_a_blank_reingress_token_is_not_sealed(
@@ -231,6 +291,7 @@ CASES = (
     assert_a_live_empty_ingress_row_is_sealed,
     assert_terminal_blanks_alone_seal_nothing,
     assert_a_blank_on_a_keyed_surface_stays_refused,
+    assert_the_dead_letter_purge_counts_only_the_bodies_it_blanks,
     assert_a_blank_reingress_token_is_not_sealed,
     assert_retention_clears_the_error_of_a_blank_delivered_row,
 )

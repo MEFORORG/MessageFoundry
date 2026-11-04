@@ -214,6 +214,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -239,6 +240,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
     FailOutcome,
@@ -5638,17 +5640,17 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # A missing row is a corrupt reference. A NULL body means retention erased the
-                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
-                    # snapshot made the purge's token blank skip it, while the same statement still
-                    # erased the reply. This branch is the only control for that, and the reply
-                    # must never become a child message. A missing row is damage, not an erasure,
-                    # so that token is not blanked: its sealed reference is the evidence.
+                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that
+                    # re-pended this token after the purge's snapshot made the purge's token blank
+                    # skip it, while the same statement still erased the reply. This branch is the
+                    # only control for that, and the reply must never become a child message. A
+                    # missing row is damage, not an erasure, so that token is not blanked: its
+                    # sealed reference is the evidence.
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            "re-ingress ref corrupt",
+                            REINGRESS_ARTIFACT_MISSING,
+                            "re-ingress reply missing",
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -11114,10 +11116,10 @@ class PostgresStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
         retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns the number of dead rows purged.
+        Ported, not stubbed. Returns a :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -11139,14 +11141,22 @@ class PostgresStore:
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
                 purged = _rowcount(result)
+                cleared = _rowcount(
+                    await conn.execute(
+                        "UPDATE queue SET last_error=NULL"
+                        f" WHERE status=$1 AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                        OutboxStatus.DEAD.value,
+                        *cutoff_params,
+                    )
+                )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row, release its
                 # streaming attachment here — the deferred half of the per-MESSAGE dead-row split with
@@ -11157,7 +11167,7 @@ class PostgresStore:
                     older_than, connection_cutoffs
                 )
                 await self._release_message_attachments(conn, rel_where, rel_params)
-        return purged
+        return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention) and
