@@ -34,7 +34,7 @@ def root_logging_restored() -> Iterator[None]:
     """Restore root handlers, each one's filters/level/formatter, root filters, level and guard.
 
     Also restores the process-wide ``logging.disable`` level, which silences every capture, and
-    ``logging.lastResort``, which ``__main__.main`` replaces on a handler-less root (BACKLOG #3768).
+    ``logging.lastResort``, which a CLI ``main()`` replaces on a handler-less root (BACKLOG #3768).
 
     pytest re-uses its capture handler instances across phases, so re-adding the snapshot re-adds
     live handlers, not stale ones. A handler the body added is closed, which releases a forwarder's

@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     # statement of main() anyway, because tests/test_cp1252_console_safety.py reads it here.
     harden_console_streams()
     # BACKLOG #3768: before parsing, so a record no handler takes from here until a subcommand's
-    # handlers exist meets the filter chain. The function says what it keeps and what it misses.
+    # handlers exist meets the filter chain. docs/PHI.md section 7 row 1 says what it misses.
     install_filtered_last_resort()
     # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
     # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
@@ -12818,8 +12818,8 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #:
 #: Neither has a handler before its own `configure_logging` call: `serve` makes it only after its
 #: settings, key and egress gates run, and `supervise` after its remote-debug guard and imports.
-#: For that window main() calls `install_filtered_last_resort` before parsing (BACKLOG #3768); the
-#: docstring of `install_filtered_last_resort` says what it covers and what it misses.
+#: For that window main() calls `install_filtered_last_resort` before parsing (BACKLOG #3768); its
+#: docstring says what it covers, and docs/PHI.md section 7 row 1 what it misses.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 #: The subcommands `run_cli` does NOT mark as carrying a result on stdout, so a print() in a config

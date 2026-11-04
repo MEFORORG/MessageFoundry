@@ -228,6 +228,48 @@ def test_the_filtered_last_resort_refuses_a_stream_assignment() -> None:
     assert resort.stream is sys.stderr
 
 
+def _run_cli_callers(source: str) -> dict[str, bool]:
+    """Each function in ``source`` that calls ``run_cli``, mapped to whether it calls
+    ``install_filtered_last_resort`` on an earlier line."""
+    found: dict[str, bool] = {}
+    for fn in ast.walk(ast.parse(source)):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        lines: dict[str, list[int]] = {"run_cli": [], "install_filtered_last_resort": []}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name in lines:
+                    lines[name].append(node.lineno)
+        if lines["run_cli"]:
+            installs = lines["install_filtered_last_resort"]
+            found[fn.name] = bool(installs) and min(installs) < min(lines["run_cli"])
+    return found
+
+
+def test_every_run_cli_caller_installs_the_filtered_last_resort_first() -> None:
+    """BACKLOG #3768: the install lives in each command's ``main()``, not in ``run_cli``, so a new
+    caller of ``run_cli`` could leave it out and reopen the parse window with nothing failing.
+    This finds every call in the shipped packages, pins the set, and checks each one installs
+    first. The pin makes a new caller a visible edit here."""
+    repo = Path(__file__).resolve().parents[1]
+    callers: dict[str, bool] = {}
+    for package in ("messagefoundry", "messagefoundry_toolkit", "messagefoundry_webconsole"):
+        for path in sorted((repo / package).rglob("*.py")):
+            for name, ok in _run_cli_callers(path.read_text(encoding="utf-8")).items():
+                callers[f"{path.relative_to(repo).as_posix()}:{name}"] = ok
+    assert callers == {
+        "messagefoundry/__main__.py:main": True,
+        "messagefoundry_toolkit/__main__.py:main": True,
+    }
+    # The control: the checker flags a caller that installs late or not at all.
+    assert _run_cli_callers(
+        "def a():\n    run_cli()\n    install_filtered_last_resort()\n"
+        "def b():\n    run_cli()\n"
+        "def c():\n    install_filtered_last_resort()\n    run_cli()\n"
+    ) == {"a": False, "b": False, "c": True}
+
+
 def test_routes_uvicorn_loggers_to_root() -> None:
     configure_logging("INFO")
     uvicorn_logger = logging.getLogger("uvicorn.error")

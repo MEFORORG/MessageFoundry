@@ -130,7 +130,8 @@ def run_cli(
     # that now finds this handler and adds no second one. The exempt subcommands are named at
     # `_CONFIGURES_OWN_LOGGING` in `__main__.py`. Their window before their own handlers is not
     # covered here: every caller's `main()` calls `logging_setup.install_filtered_last_resort`
-    # first, before it parses (BACKLOG #3768), and a new caller must too. Its docstring says why.
+    # before it reaches this function (BACKLOG #3768), as tests/test_logging.py pins. Its
+    # docstring says why.
     #
     # Only when the root has NO handler yet, which is the state a `python -m messagefoundry` process
     # starts in. A caller that configured logging before calling main() owns its own handlers, and

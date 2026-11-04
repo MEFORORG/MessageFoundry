@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     # tests/test_cp1252_console_safety.py reads it here. run_cli() hardens again, which is a no-op.
     harden_console_streams()
     # BACKLOG #3768: before parsing, as the engine's main() does, so a record no handler takes
-    # meets the filter chain. One call per process; the function says what it keeps.
+    # meets the filter chain. A second main() in one process builds nothing new.
     install_filtered_last_resort()
     args = sys.argv[1:] if argv is None else argv
     mismatch = version_mismatch(metadata.version)
