@@ -244,7 +244,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   decode/re-encode). `reader` is an injected async callable so the helper stays **pure** and
   unit-testable; `pipeline/` supplies the async store read. **Fail-loud:** a value that looks like a
   handle but whose `reader` returns `None` / raises (attachment missing or GC'd) raises `DocRefError` — it
-  **never** emits the raw `mfdoc:v1:ref:` text. A body with no handle is returned **byte-identical**.
+  **never** emits the raw `mfdoc:v1:ref:` text. A body with no handle is returned unchanged unless
+  refused (the delimiter-class rule below).
 - **The delivery seam** `RegistryRunner._hydrate_payload` runs **before** `connector.send` on both the
   single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A cheap
   gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or an `MSH-1`/`MSH-2` that names a character
@@ -280,11 +281,12 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   malformed or names any other address raises `UnreattachableDocumentError` before any read. A
   copy of the handle marker, raw or as the payload's delimiters escape it, where the splice does
   not reach (`NTE-3`, a second `OBX-5.5` repetition) raises it too: before the splice where the
-  message holds a document, the copy names a content address, or a separator or the escape
-  character is a lowercase hex digit (the payload's escaping then breaks up a copied address, so
-  it cannot be read), and after the splice wherever the message also carries a bound handle. Either way the row dead-letters alone rather than
-  re-pending on a strict-FIFO lane. A handle the payload hides behind any other escape does not
-  open the gate by itself, so on its own it is carried as the sender's text and resolves nothing.
+  message holds a document, the copy names a content address in either case (as `parse_doc_ref`
+  reads one), or a delimiter is a base64 character (the delimiter-class rule below), and after
+  the splice wherever the message also carries a bound handle. Either way the row dead-letters
+  alone rather than re-pending on a strict-FIFO lane. A handle the payload hides behind any other
+  escape does not open the gate by itself, so on its own it is carried as the sender's text and
+  resolves nothing.
   Where the gate opens for another reason, the re-attach reads it as it reads any handle, so it
   still resolves only to an attachment the message holds.
   The ingress detach refuses a received body whose `OBX-5.5` already holds a handle instead of
@@ -294,6 +296,33 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   dead-letter on every outbound. No base64 value holds the marker, since base64 has no `:`. Each
   refusal is an `InboundDocRefError`: an `ERROR` row, an `AR` on MLLP and a permanent refusal on
   HTTP, before the ACK.
+  **One delimiter-class rule (BACKLOG #5099, added 2026-11-04).** `Message.set` escapes a
+  delimiter wherever it occurs in a value. So when a message's delimiters, read as
+  `Message._encoding_chars` reads them (`MSH-1` and the first four `MSH-2` characters of the first
+  `MSH`; a fifth, truncation character does not count), include a character of the base64
+  alphabet `A-Za-z0-9+/=`, a document set back into `OBX-5.5` is not the sender's base64, and the
+  content address after a copied marker may not read as one. The rule is applied in four places,
+  all through `_delimits_with_base64`:
+  1. *Ingress detach refusal.* Where a document would be detached, the detach refuses the body
+     before anything is stored (`Base64DelimiterError`, an `InboundDocRefError`).
+  2. *Ingress marker refusal.* Both listeners refuse a body of any size that holds the handle
+     marker, raw or as its delimiters escape it (`marker_under_base64_delimiters`). The cost is a
+     header read, plus two substring scans only under such delimiters.
+  3. *Egress splice refusal.* The re-attach refuses a handle it would splice before any read, so
+     a Handler that changed `MSH-2` after the detach cannot corrupt the document.
+  4. *Egress copy refusal.* The re-attach refuses any marker it finds with no handle to splice.
+     This is the backstop for a copy a Handler made and for an operator edit-and-resubmit or
+     resend.
+
+  Each ingress refusal is an `ERROR` row before any ingress row, an `AR` on MLLP and a permanent
+  refusal on HTTP. Ordinary delimiters, `|^~\&` and variants such as a `#` or `!`, hold no base64
+  character and are unaffected. A row ingested before this rule under such delimiters now
+  dead-letters at delivery rather than reaching the partner corrupted.
+  *Out of scope:* an outbound `encoding_characters` override, which the transport applies after
+  hydration, is operator configuration. An uppercased marker `MFDOC:V1:REF:` is not a handle, since
+  `is_doc_ref` is case-sensitive. A marker hidden behind `\Xhh\` escapes is not something the
+  engine writes. Reserving the marker at every listener under ordinary delimiters is a policy
+  change left to the owner.
   A pass-through child, an edit-and-resubmit child and an edit-and-resend child each carry a body
   under a new message id, so the store links each child to the parent's documents a handle in its
   `OBX-5.5` names, read as delivery reads one (behind its gate), with one reference of its own, in
