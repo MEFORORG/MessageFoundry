@@ -54,7 +54,8 @@
   plain_sha256 that is not A1's; a YES needs that match. A3 still reads its result when the profile
   was not seen unloaded, so a refusal there shows; only a YES is held back to INCONCLUSIVE. The
   verdict line reads INVALID when any arm is INVALID or any of A1 to A3 is NO, whatever A4 and A5
-  say; INCONCLUSIVE when A1 and A2 are not both YES; else SURVIVES when A4 and A5 both open the
+  say; INCONCLUSIVE when A1 to A3 do not all open the blob (A3 counted where the unload was not
+  seen; the payload's exit code is the same test); else SURVIVES when A4 and A5 both open the
   user-scope blob with every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START when A5 opens it
   and A4 is refused; DOES NOT SURVIVE when A5 is refused with the controls held and A4 did not open
   it; INCONCLUSIVE, A4 OPENED AND A5 DID NOT for that contradiction; and INCONCLUSIVE otherwise, A5
@@ -650,11 +651,11 @@ function Read-Report([string]$Dir, [string]$Name) {
     $r
 }
 
-function Get-Verdict($Report, [string]$Action, [string]$Extra, $Plain, [string]$YesOnly) {
+function Get-Verdict($Report, [string]$Action, [string]$Extra, [string]$Plain) {
     # Returns @(verdict, why): YES, NO, INVALID (the report shows a broken instrument) or
     # INCONCLUSIVE. $Extra is a precondition of any answer, already judged: '' when it holds.
-    # $Plain is report-A1's plain_sha256 ('' when A1 gives none), or $null for A1 itself. $YesOnly
-    # is a precondition of a YES alone, read after the result, so a refusal under it still shows.
+    # $Plain is report-A1's plain_sha256, which every unprotect start must carry ('' when A1
+    # gives none).
     if (-not $Report) { return @('INCONCLUSIVE', 'no report') }
     if ($Report['identity'] -ne $Account -or -not ([string]$Report['sid']).StartsWith('S-1-5-80-')) {
         return @('INCONCLUSIVE', "ran as $($Report['identity']) $($Report['sid']), not the virtual account")
@@ -668,7 +669,7 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra, $Plain, [string]$
         return @('INCONCLUSIVE', "protect_user $($Report['protect_user']), protect_machine $($Report['protect_machine'])")
     }
     if ($Extra) { return @('INCONCLUSIVE', $Extra) }
-    if ($null -ne $Plain) {
+    if ($Action -eq 'unprotect') {
         if (-not $Plain) { return @('INCONCLUSIVE', 'report-A1 gives no plain_sha256 to compare') }
         if ($Report['plain_sha256'] -ne $Plain) { return @('INVALID', "plain_sha256 $($Report['plain_sha256']) is not report-A1's $Plain") }
     }
@@ -679,10 +680,7 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra, $Plain, [string]$
     $held = $Report['control_foreign'] -eq $NteBadKeyState -and ([string]$Report['control_tampered']).StartsWith('FAIL') -and
         $Report['machine_unprotect'] -eq 'OK match'
     if (-not $held) { return @('INCONCLUSIVE', "a control FAILED: $controls") }
-    if ($user -eq 'OK match') {
-        if ($YesOnly) { return @('INCONCLUSIVE', "$YesOnly; user_unprotect $user; controls HELD: $controls") }
-        return @('YES', "user_unprotect $user; controls HELD: $controls")
-    }
+    if ($user -eq 'OK match') { return @('YES', "user_unprotect $user; controls HELD: $controls") }
     if ($user.StartsWith('FAIL')) { return @('NO', "user_unprotect $user; controls HELD: $controls") }
     @('INCONCLUSIVE', "user_unprotect $user; controls HELD: $controls")
 }
@@ -724,9 +722,10 @@ function Get-BootRelation($Earlier, $Later) {
 
 function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     # Returns @{ Lines; Verdicts; PrePass }, Verdicts keyed A1 to A5. PrePass is the pre-reboot
-    # arms' pass: A1 and A2 YES, and A3 YES or INCONCLUSIVE only because no unload was seen.
+    # arms' pass: A1 to A3 open the blob, A3 counted even where the unload was not seen.
+    $arms = 'A1', 'A2', 'A3', 'A4', 'A5'
     $r = @{}
-    foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { $r[$a] = Read-Report $Dir $a }
+    foreach ($a in $arms) { $r[$a] = Read-Report $Dir $a }
     # A global control: the administrator must be refused the service's user-scope blob, by the
     # key refusal, not by a data error that a damaged blob would also give.
     $cross = ''
@@ -738,33 +737,35 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     $plain = ''
     if ($r['A1']) { $plain = [string]$r['A1']['plain_sha256'] }
     $v = @{}
-    $v['A1'] = Get-Verdict $r['A1'] 'protect' $crossProblem $null ''
-    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem $plain ''
-    # Without a seen unload A3 is one more restart: it can still fail, but cannot answer YES.
-    $unload = 'the profile was not seen unloaded before the start'
+    $v['A1'] = Get-Verdict $r['A1'] 'protect' $crossProblem $plain
+    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem $plain
+    $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $crossProblem $plain
+    # The pre-reboot arms pass when A1 to A3 open the blob. Read before the hold-back below, so an
+    # A3 that opened passes even where the unload was not seen.
+    $prePass = $v['A1'][0] -eq 'YES' -and $v['A2'][0] -eq 'YES' -and $v['A3'][0] -eq 'YES'
+    # Without a seen unload A3 was one more restart: its result is read, but a YES answers nothing.
     $pf = Join-Path $Dir 'profile-A3.txt'
-    if ((Test-Path -LiteralPath $pf) -and ([string](Get-Content -LiteralPath $pf -Raw) -match 'loaded_before_start=False')) { $unload = '' }
-    $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $crossProblem $plain $unload
-    $a3Ok = $v['A3'][0] -eq 'YES' -or ($unload -and $v['A3'][0] -eq 'INCONCLUSIVE' -and $v['A3'][1].StartsWith("$unload; "))
-    $prePass = $v['A1'][0] -eq 'YES' -and $v['A2'][0] -eq 'YES' -and $a3Ok
+    $unloaded = (Test-Path -LiteralPath $pf) -and ([string](Get-Content -LiteralPath $pf -Raw) -match 'loaded_before_start=False')
+    if (-not $unloaded -and $v['A3'][0] -eq 'YES') { $v['A3'] = @('INCONCLUSIVE', "the profile was not seen unloaded before the start; $($v['A3'][1])") }
     if ($Rebooted) {
-        $a4Rebooted = $r['A3'] -and $r['A4'] -and (Get-BootRelation $r['A3'] $r['A4']) -eq 'rebooted'
+        # Each relation once, as 'missing' where a report is.
+        $rel = @{}
+        foreach ($pair in @('A3', 'A4'), @('A3', 'A5'), @('A4', 'A5')) {
+            $key = "$($pair[0])-$($pair[1])"
+            if ($r[$pair[0]] -and $r[$pair[1]]) { $rel[$key] = Get-BootRelation $r[$pair[0]] $r[$pair[1]] } else { $rel[$key] = 'missing' }
+        }
+        # A reboot report-A4 shows is report-A5's too when both are from one boot, even where
+        # report-A5's own tick count is past report-A3's.
+        if ($rel['A3-A5'] -ne 'rebooted' -and $rel['A3-A4'] -eq 'rebooted' -and $rel['A4-A5'] -eq 'same') { $rel['A3-A5'] = 'rebooted' }
         foreach ($a in 'A4', 'A5') {
             $extra = ''
-            if (-not $r['A3'] -or -not $r[$a]) { $extra = 'no reboot shown: a report is missing' }
-            else {
-                $rel = Get-BootRelation $r['A3'] $r[$a]
-                $sameAsA4 = ''
-                if ($a -eq 'A5' -and $r['A4']) { $sameAsA4 = Get-BootRelation $r['A4'] $r['A5'] }
-                # A reboot report-A4 shows is report-A5's too when both are from one boot, even
-                # where report-A5's own tick count is past report-A3's.
-                if ($rel -ne 'rebooted' -and $sameAsA4 -eq 'same' -and $a4Rebooted) { $rel = 'rebooted' }
-                if ($rel -ne 'rebooted') { $extra = "no reboot shown between report-A3 and report-${a}: $rel" }
-                # A5 narrows against A4 only when both are from one boot.
-                elseif ($sameAsA4 -and $sameAsA4 -ne 'same') { $extra = "report-A5 is not shown to be from the boot report-A4 is from: $sameAsA4" }
-            }
+            $since = $rel["A3-$a"]
+            if ($since -eq 'missing') { $extra = 'no reboot shown: a report is missing' }
+            elseif ($since -ne 'rebooted') { $extra = "no reboot shown between report-A3 and report-${a}: $since" }
+            # A5 narrows against A4 only when both are from one boot.
+            elseif ($a -eq 'A5' -and $r['A4'] -and $rel['A4-A5'] -ne 'same') { $extra = "report-A5 is not shown to be from the boot report-A4 is from: $($rel['A4-A5'])" }
             if ($crossProblem) { $extra = $crossProblem }
-            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra $plain ''
+            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra $plain
         }
     } else {
         $notRun = @('NOT RUN', 'this route cannot reboot the VM inside a run')
@@ -780,20 +781,20 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     }
     $lines = @("DPAPI-REBOOT crosscheck, the administrator opens the service's user-scope blob: $cross")
     # The raw readings the reboot is judged from, so a reader can check the judge's call.
-    $boots = @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') {
+    $boots = @(foreach ($a in $arms) {
             if ($r[$a]) { "$a boot_id=$($r[$a]['boot_id']) uptime_ms=$($r[$a]['uptime_ms']) boot_utc=$($r[$a]['boot_utc'])" } else { "$a no report" }
         }) -join '; '
     $lines += "DPAPI-REBOOT boots: $boots"
-    $lines += @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { "DPAPI-REBOOT $($names[$a]): $($v[$a][0]) ($($v[$a][1]))" })
+    $lines += @(foreach ($a in $arms) { "DPAPI-REBOOT $($names[$a]): $($v[$a][0]) ($($v[$a][1]))" })
     # A NO before the reboot, or an INVALID anywhere, is the instrument or the setup failing, and
     # no reboot arm beside it answers the question.
-    $broken = @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') {
+    $broken = @(foreach ($a in $arms) {
             if ($v[$a][0] -eq 'INVALID' -or ($v[$a][0] -eq 'NO' -and $a -in 'A1', 'A2', 'A3')) { "$a $($v[$a][0])" }
         })
     $overall = 'NOT RUN'
     if ($broken.Count) { $overall = "INVALID ($($broken -join ', '): the instrument or the setup failed)" }
-    elseif ($Rebooted -and -not ($v['A1'][0] -eq 'YES' -and $v['A2'][0] -eq 'YES')) {
-        $overall = 'INCONCLUSIVE (A1 and A2 did not both read YES, so the instrument is not shown working before the reboot)'
+    elseif ($Rebooted -and -not $prePass) {
+        $overall = 'INCONCLUSIVE (A1 to A3 did not all open the blob, so the instrument is not shown working before the reboot)'
     } elseif ($Rebooted) {
         # A5 is the survival question: a demand start, once boot is over. A4 can only narrow it,
         # and an A4 that opened beside an A5 that did not contradicts it.

@@ -37,8 +37,8 @@ PROFILE_LOADED = "loaded_before_start=True profile=C:\\Windows\\ServiceProfiles\
 # Lifts the judge and the assignments it reads out of the rig, and runs nothing else of it: the
 # rig's top level is a circuit breaker and a mode switch. A parse error anywhere in the rig fails
 # here, since no CI leg runs the rig's Host-mode code. Then it judges each scenario folder.
-_DRIVER = r"""
-param([string]$Rig, [string]$List)
+_LIFT = r"""
+param([string]$Rig, [string]$Arg)
 $ErrorActionPreference = 'Stop'
 $errors = $null
 $tree = [System.Management.Automation.Language.Parser]::ParseFile($Rig, [ref]$null, [ref]$errors)
@@ -49,12 +49,46 @@ foreach ($n in 'ServiceName', 'Account', 'NteBadKeyState') {
     if ($a.Count -ne 1) { throw "the rig assigns `$$n $($a.Count) times at top level" }
     . ([scriptblock]::Create($a[0].Extent.Text))
 }
-foreach ($n in 'Read-Report', 'Get-Verdict', 'Get-BootReading', 'Get-BootRelation', 'Invoke-Judge') {
+foreach ($n in FUNCTIONS) {
     $f = @($top | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq $n })
     if ($f.Count -ne 1) { throw "the rig defines $n $($f.Count) times at top level" }
     . ([scriptblock]::Create($f[0].Extent.Text))
 }
-foreach ($row in Get-Content -LiteralPath $List) {
+"""
+
+
+def _lift(*functions: str) -> str:
+    return _LIFT.replace("FUNCTIONS", ", ".join(f"'{f}'" for f in functions))
+
+
+def _run_pwsh(driver: Path, arg: Path, timeout: int) -> str:
+    """Runs a lifting driver against the rig; returns its stdout, and fails on a non-zero exit."""
+    assert _PWSH is not None
+    proc = subprocess.run(
+        [
+            _PWSH,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(driver),
+            "-Rig",
+            str(_RIG),
+            "-Arg",
+            str(arg),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+_DRIVER = (
+    _lift("Read-Report", "Get-Verdict", "Get-BootReading", "Get-BootRelation", "Invoke-Judge")
+    + r"""
+foreach ($row in Get-Content -LiteralPath $Arg) {
     $name, $dir, $rebooted = $row -split '\|'
     "==== $name"
     $j = Invoke-Judge $dir ($rebooted -eq '1')
@@ -62,6 +96,7 @@ foreach ($row in Get-Content -LiteralPath $List) {
     "DPAPI-REBOOT prepass: $($j.PrePass)"
 }
 """
+)
 
 Reports = dict[str, dict[str, str] | None]
 
@@ -106,9 +141,10 @@ CROSS_ABSENT = "admin_open=ABSENT by REVTEST01\\Administrator exit=0"
 
 
 def _no_blob_run(a1: dict[str, str], every: dict[str, str]) -> Reports:
-    reports: Reports = {a: _report(a, **NO_BLOB, **every) for a in ("A1", "A2", "A3", "A4", "A5")}
-    reports["A1"] = _report("A1", **NO_BLOB, **every, **a1)
-    return reports
+    return {
+        a: _report(a, **NO_BLOB, **every, **(a1 if a == "A1" else {}))
+        for a in ("A1", "A2", "A3", "A4", "A5")
+    }
 
 
 # The boot counter stayed put across a reboot the tick count and the boot time both show.
@@ -242,6 +278,8 @@ SCENARIOS: dict[str, Scenario] = {
     "a3_refused_loaded": Scenario(_all(A3=_report("A3", **REFUSED))),
     "a3_damaged_loaded": Scenario(_all(A3=_report("A3", user_unprotect="FAIL win32=13"))),
     "a3_no_report": Scenario(_all(A3=None), rebooted=False),
+    # A3's control failed: A4 and A5 open the blob, but nothing before the reboot shows A3 working.
+    "a3_control_failed": Scenario(_all(A3=_report("A3", control_tampered="OPENED"))),
     "a5_damaged": Scenario(_all(A5=_report("A5", user_unprotect="FAIL win32=13"))),
     "a4_mismatch": Scenario(_all(A4=_report("A4", user_unprotect="OK mismatch"))),
     "a5_other_value": Scenario(_all(A5=_report("A5", plain_sha256="cd" * 32))),
@@ -285,26 +323,7 @@ def judged(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, str]
         rows.append(f"{name}|{d}|{'1' if sc.rebooted else '0'}")
     (root / "list.txt").write_text("\n".join(rows) + "\n", encoding="ascii")
     (root / "driver.ps1").write_text(_DRIVER, encoding="ascii")
-    assert _PWSH is not None
-    proc = subprocess.run(
-        [
-            _PWSH,
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(root / "driver.ps1"),
-            "-Rig",
-            str(_RIG),
-            "-List",
-            str(root / "list.txt"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    out = _parse(proc.stdout)
+    out = _parse(_run_pwsh(root / "driver.ps1", root / "list.txt", 300))
     assert set(out) == set(SCENARIOS)
     return out
 
@@ -355,6 +374,7 @@ _OVERALL: list[tuple[str, str]] = [
     ("a5_other_value", "INVALID"),
     ("a1_protect_refused", "INVALID"),
     ("a1_no_sha", "INCONCLUSIVE"),
+    ("a3_control_failed", "INCONCLUSIVE"),
     ("a1_dpapi_down", "INCONCLUSIVE"),
     ("not_rebooted_a2_refused", "INVALID"),
 ]
@@ -464,6 +484,7 @@ def test_payload_pass_holds_only_for_an_unobserved_unload(judged: Judged) -> Non
         "a3_refused_loaded",
         "a3_damaged_loaded",
         "a3_no_report",
+        "a3_control_failed",
         "a1_protect_refused",
     ):
         assert judged[scenario]["prepass"].endswith("False"), scenario
@@ -490,13 +511,11 @@ def test_a5_opening_without_a4_is_not_a_survival_verdict(judged: Judged) -> None
     assert _v(judged, "a4_missing_a5_opened", "A5") == "YES"
 
 
-_LOCK_DRIVER = r"""
-param([string]$Rig, [string]$Dir)
-$ErrorActionPreference = 'Stop'
-$tree = [System.Management.Automation.Language.Parser]::ParseFile($Rig, [ref]$null, [ref]$null)
-$f = @($tree.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Enter-HvTestLock' })
-. ([scriptblock]::Create($f[0].Extent.Text))
+_LOCK_DRIVER = (
+    _lift("Enter-HvTestLock")
+    + r"""
 $VMName = 'REVTEST01'
+$Dir = $Arg
 $path = Join-Path $Dir 'revtest01.lock'
 $held = Enter-HvTestLock $path
 try { $null = Enter-HvTestLock $path; 'second=OPENED' } catch { "second=$($_.Exception.Message)" }
@@ -505,32 +524,14 @@ $held.Dispose()
 $null = New-Item -ItemType Directory -Path (Join-Path $Dir 'dir.lock')
 try { $null = Enter-HvTestLock (Join-Path $Dir 'dir.lock'); 'dir=OPENED' } catch { "dir=$($_.Exception.Message)" }
 """
+)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the sharing-violation HRESULT is Windows'")
 def test_only_a_sharing_or_lock_violation_reads_busy(tmp_path: Path) -> None:
     driver = tmp_path / "lock.ps1"
     driver.write_text(_LOCK_DRIVER, encoding="ascii")
-    assert _PWSH is not None
-    proc = subprocess.run(
-        [
-            _PWSH,
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(driver),
-            "-Rig",
-            str(_RIG),
-            "-Dir",
-            str(tmp_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    second, other = proc.stdout.strip().splitlines()
+    second, other = _run_pwsh(driver, tmp_path, 120).strip().splitlines()
     assert second.startswith("second=STOP     REVTEST01 is busy"), second
     assert other.startswith("dir=STOP     cannot open hvtest's lock file"), other
     assert "HRESULT 0x80070005" in other, other
