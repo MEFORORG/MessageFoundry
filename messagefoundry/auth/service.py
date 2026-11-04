@@ -11706,7 +11706,7 @@ class AuthService:
             # the other sessions only.
             await self._session_seal_failed(current_token_hash)
             result = await self._store.revoke_user_sessions(identity.user_id)
-        others = result.count - result.ended_kept
+        others = result.others
         scope = "self_others" if result.kept else "self_all"
         if others or not result.kept:
             await self._audit(

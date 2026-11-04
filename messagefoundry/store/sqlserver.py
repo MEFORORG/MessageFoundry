@@ -15491,7 +15491,7 @@ class SqlServerStore:
                         _MSSQL_REVOKE_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, user_id, except_token_hash),
                     )
-                result = RevokeResult(len(await cur.fetchall()), kept=False, ended_kept=False)
+                result = RevokeResult(len(await cur.fetchall()))
                 if except_token_hash is not None:
                     unmoved = global_epoch_unmoved(await self._global_session_epoch(cur))
                     result = await self._keep_or_end_session(
@@ -15515,7 +15515,7 @@ class SqlServerStore:
         ``MessageStore._keep_or_end_session`` states the contract. The end is counted from its
         ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
         if restamp.kept(await self._write_session(cur, token_hash, restamp)):
-            return RevokeResult(revoked, kept=True, ended_kept=False)
+            return RevokeResult(revoked, kept=True)
         await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, token_hash, restamp.user_id))
         ended = len(await cur.fetchall()) == 1
         return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
@@ -15577,7 +15577,7 @@ class SqlServerStore:
                         _MSSQL_REVOKE_ALL_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, except_token_hash),
                     )
-                result = RevokeResult(len(await cur.fetchall()), kept=False, ended_kept=False)
+                result = RevokeResult(len(await cur.fetchall()))
                 await cur.execute(
                     "UPDATE global_session_epoch SET epoch = epoch + 1"
                     " OUTPUT inserted.epoch WHERE id = 1"

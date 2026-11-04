@@ -2885,8 +2885,13 @@ class RevokeResult:
     (follow-up to BACKLOG #4975); that row is in :attr:`count`."""
 
     count: int
-    kept: bool
-    ended_kept: bool
+    kept: bool = False
+    ended_kept: bool = False
+
+    @property
+    def others(self) -> int:
+        """How many sessions the revoke ended besides the one it was asked to keep."""
+        return self.count - self.ended_kept
 
 
 class KeptSessionRestamp:
@@ -18111,7 +18116,7 @@ class MessageStore:
                     _REVOKE_USER_SESSIONS_SQL + _EXCEPT_TOKEN_HASH_SQL,
                     (now, user_id, except_token_hash),
                 )
-            result = RevokeResult(int(cur.rowcount), kept=False, ended_kept=False)
+            result = RevokeResult(int(cur.rowcount))
             if except_token_hash is not None:
                 unmoved = global_epoch_unmoved(await self._global_session_epoch())
                 result = await self._keep_or_end_session(
@@ -18132,7 +18137,7 @@ class MessageStore:
         its next request anyway, but meanwhile it would hold a slot under the session cap and its
         refusal would read as a seal failure, so it is ended here, as the sweep ends the rest."""
         if restamp.kept(await self._write_session(token_hash, restamp)):
-            return RevokeResult(revoked, kept=True, ended_kept=False)
+            return RevokeResult(revoked, kept=True)
         cur = await self._db.execute(
             _END_DECLINED_KEPT_SESSION_SQL, (now, token_hash, restamp.user_id)
         )
@@ -18196,19 +18201,19 @@ class MessageStore:
             " AND (? IS NULL OR token_hash != ?)",
             (now, except_token_hash, except_token_hash),
         )
-        swept = RevokeResult(int(cur.rowcount), kept=False, ended_kept=False)
+        revoked = int(cur.rowcount)
         if except_token_hash is None:
-            return swept
+            return RevokeResult(revoked)
         cur = await self._db.execute(
             "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
         )
         owner = await cur.fetchone()
         if owner is None:
-            return swept
+            return RevokeResult(revoked)
         user_id = str(owner[0])
         global_raised = global_epoch_raise(await self._global_session_epoch())
         return await self._keep_or_end_session(
-            swept.count,
+            revoked,
             except_token_hash,
             KeptSessionRestamp(user_id, raised.get(user_id), global_raised),
             now,

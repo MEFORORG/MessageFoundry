@@ -16,7 +16,6 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -36,6 +35,8 @@ from messagefoundry.store.store import MessageStore, RevokeResult
 from tests._admin_account import create_local_user_chosen
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
 from tests.test_api_auth import PW, _clear_must_change
+from tests.test_b2614_restore_record import _revoked
+from tests.test_b2614_revoke_all import _sqlite_raw
 
 
 @pytest.fixture
@@ -189,35 +190,18 @@ async def test_a_kept_session_that_fails_its_seal_is_counted_with_the_rest(
     assert row is not None and row.revoked_at is not None
 
 
-def _restore(db: Path, token_hash: str, seal: str) -> None:
-    """Put a revoked session back as a sweep that missed it would leave it: live, sealed, behind
-    on the epoch the sweep raised. Outside the store, as only a missed row could stand there."""
-    conn = sqlite3.connect(db)
-    try:
-        conn.execute(
-            "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?", (seal, token_hash)
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _miss(store: Any, db: Path, token_hash: str) -> str:
+async def _miss(store: MessageStore, db: Path, token_hash: str) -> str:
     """Leave the session ``token_hash`` names where an earlier per-account sweep's miss leaves
     it, and return its account. It has already passed the gate, as a request that straddles that
     sweep's commit has."""
     snapshot = await store.get_session(token_hash)
     assert snapshot is not None and snapshot.revoked_at is None
     await store.revoke_user_sessions(snapshot.user_id)
-    _restore(db, token_hash, snapshot.seal)
+    await _sqlite_raw(db)(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, token_hash),
+    )
     return snapshot.user_id
-
-
-async def _ended_by_the_revoke(store: Any, token: str) -> None:
-    """The revoke itself ended the caller's row: read before anything presents the token, since
-    the gate would end a live one it refuses, and report it as a seal failure."""
-    row = await store.get_session(hash_token(token))
-    assert row is not None and row.revoked_at is not None
 
 
 async def test_a_caller_session_the_revoke_declines_is_ended_and_said_to_be(
@@ -232,6 +216,7 @@ async def test_a_caller_session_the_revoke_declines_is_ended_and_said_to_be(
     await _local(service, "root", Role.ADMINISTRATOR)
     await _local(service, "ops", Role.OPERATOR)
     store = engine.store
+    assert isinstance(store, MessageStore)
     db = tmp_path / "b2614_route.db"
     real = store.revoke_all_sessions
     live: list[int] = []
@@ -261,7 +246,8 @@ async def test_a_caller_session_the_revoke_declines_is_ended_and_said_to_be(
         assert r.status_code == 200, r.text
         assert live and live[0] >= 2  # the caller's row and ops', both unrevoked at the revoke
         assert r.json()["detail"] == f"revoked {live[0]} session(s); this session was ended too"
-        await _ended_by_the_revoke(store, root)
+        # Read before anything presents the token: the gate would end a live one it refuses.
+        assert await _revoked(store, root)  # ended by the revoke itself
         assert not await _alive(c, root)
         assert not await _alive(c, ops)
     rows = await store.list_audit(action="auth.session_revoked", limit=1)
@@ -279,6 +265,7 @@ async def test_signing_out_elsewhere_from_a_declined_session_counts_the_others_o
     service = await _service(engine)
     await _local(service, "root", Role.ADMINISTRATOR)
     store = engine.store
+    assert isinstance(store, MessageStore)
     db = tmp_path / "b2614_route.db"
     real = store.revoke_user_sessions
 
@@ -300,7 +287,7 @@ async def test_signing_out_elsewhere_from_a_declined_session_counts_the_others_o
         r = await c.delete("/me/sessions", headers=_auth(root))
         assert r.status_code == 200, r.text
         assert r.json()["detail"] == "signed out 1 other session(s)"
-        await _ended_by_the_revoke(store, root)
+        assert await _revoked(store, root)  # ended by the revoke, before the gate saw it
         assert not await _alive(c, root)
     rows = await store.list_audit(action="auth.session_revoked", limit=1)
     assert json.loads(rows[0]["detail"]) == {"scope": "self_all", "count": 1}

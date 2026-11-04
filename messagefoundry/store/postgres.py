@@ -10728,7 +10728,7 @@ class PostgresStore:
                 except_token_hash,
             )
             if except_token_hash is None:
-                return RevokeResult(_rowcount(status), kept=False, ended_kept=False)
+                return RevokeResult(_rowcount(status))
             unmoved = global_epoch_unmoved(await self._global_session_epoch(conn))
             return await self._keep_or_end_session(
                 conn,
@@ -10745,7 +10745,7 @@ class PostgresStore:
         ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract."""
         if restamp.kept(await self._write_session(conn, token_hash, restamp)):
-            return RevokeResult(revoked, kept=True, ended_kept=False)
+            return RevokeResult(revoked, kept=True)
         status = await conn.execute(
             _PG_END_DECLINED_KEPT_SESSION_SQL, now, token_hash, restamp.user_id
         )
@@ -10794,18 +10794,18 @@ class PostgresStore:
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")
             }
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
-            swept = RevokeResult(_rowcount(status), kept=False, ended_kept=False)
+            revoked = _rowcount(status)
             if except_token_hash is None:
-                return swept
+                return RevokeResult(revoked)
             owner = await conn.fetchval(
                 "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
             )
             if owner is None:
-                return swept
+                return RevokeResult(revoked)
             owner = str(owner)
             return await self._keep_or_end_session(
                 conn,
-                swept.count,
+                revoked,
                 except_token_hash,
                 KeptSessionRestamp(owner, raised.get(owner), global_raised),
                 now,
