@@ -685,8 +685,10 @@ class BackupRunner:
         staging_leftover: str | None = None
         try:
             # Swept again by this run's own directory's owner only where no sweep above went by it,
-            # such as where no staging-root probe above could be created.
-            own_owner = await asyncio.to_thread(_owner_of, work.path)
+            # such as where no staging-root probe above could be created. Read from the descriptor
+            # of the lock file this run created there, never by path, so a rename in the staging
+            # root cannot choose it.
+            own_owner = await asyncio.to_thread(work.owner)
             if own_owner is None:
                 log.warning(
                     "DR staging: cannot read the owner of %s, so %s is not swept",
@@ -2107,12 +2109,17 @@ def _win_owner_of_handle(handle: int) -> object | None:
         ctypes.byref(descriptor),
     )
     if status != 0:
+        log.warning("DR staging: GetSecurityInfo could not read an owner: Win32 status %d", status)
         return None
     try:
         text = wintypes.LPWSTR()
         if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor, 1, owner_info, ctypes.byref(text), None
         ):
+            log.warning(
+                "DR staging: an owner could not be rendered as SDDL: Win32 status %d",
+                ctypes.get_last_error(),
+            )
             return None
         try:
             sddl = text.value
@@ -2338,6 +2345,11 @@ class _Staging:
         self._mutex = threading.Lock()
         self._released = False
         self._claimed = False
+
+    def owner(self) -> object | None:
+        """The owner of the lock file this run created in the directory, read from its descriptor
+        (:func:`_owner_of_fd`), never by path. Called before the directory is released."""
+        return _owner_of_fd(self._fd, self.path / _LOCK_NAME)
 
     def claim(self) -> bool:
         """Called by a worker before it touches the directory. ``False`` if it is already gone."""
@@ -2642,8 +2654,10 @@ def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
     with ``O_CREAT | O_EXCL``, yield its descriptor and path, and remove it on exit. A test seam.
     Raises ``OSError`` on entry when it cannot be created.
 
-    POSIX: ``mkstemp``, removed on exit only while its name still names the object it created:
-    after a rename swap the name holds someone else's object, which is theirs to remove. Windows:
+    POSIX: ``mkstemp``, removed on exit by name only when, at a check just before, its name still
+    names the object it created: after a rename swap the name holds someone else's object, which is
+    theirs to remove. A swap between that check and the unlink can still remove the swapped-in
+    object. A removal that fails is logged and left for the next sweep. Windows:
     ``NamedTemporaryFile``, opened with ``O_TEMPORARY``, so the file is deleted when its handle
     closes, wherever a rename has put it by then, and nothing is ever removed by its name."""
     if sys.platform == "win32":
@@ -2654,10 +2668,14 @@ def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
     try:
         yield fd, Path(name)
     finally:
-        with contextlib.suppress(OSError):
+        try:
             made, named = os.fstat(fd), os.lstat(name)
             if (made.st_dev, made.st_ino) == (named.st_dev, named.st_ino):
                 os.unlink(name)
+        except FileNotFoundError:
+            pass  # a sibling's sweep, or a rename, already took the name
+        except OSError as exc:
+            log.warning("DR staging: could not remove owner probe %s: %s", name, safe_exc(exc))
         os.close(fd)
 
 
@@ -2681,12 +2699,14 @@ def _probe_owner(root: Path | None) -> object | None:
     try:
         with _owner_probe(root) as (fd, name):
             owner = _owner_of_fd(fd, name)
+    except FileNotFoundError:
+        pass  # no such root (or no temp dir): nothing to probe, and nothing to sweep there
     except OSError as exc:
-        # The probe's creation, or its removal once the owner was read, which keeps that owner.
+        # The probe's creation, or its close once the owner was read, which keeps that owner.
         # `_owner_of_fd` itself never raises.
         log.warning(
             "DR staging: owner probe in %s failed: %s",
-            tempfile.gettempdir() if root is None else root,
+            "the OS temp dir" if root is None else root,
             safe_exc(exc),
         )
     return owner
@@ -2706,11 +2726,13 @@ def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
 
         try:
             return _win_owner_of_handle(msvcrt.get_osfhandle(fd))
-        except OSError:
+        except OSError as exc:
+            log.warning("DR staging: could not read an owner from a handle: %s", safe_exc(exc))
             return None
     try:
         return os.fstat(fd).st_uid
-    except OSError:
+    except OSError as exc:
+        log.warning("DR staging: could not read an owner from a descriptor: %s", safe_exc(exc))
         return None
 
 
@@ -2842,8 +2864,16 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
                 # owner goes, and `unlink` removes the name itself, never what a link names.
                 st = entry.stat(follow_symlinks=False)
                 if st.st_size == 0 and _owner_of(path) == owner:
-                    with contextlib.suppress(OSError):
+                    try:
                         os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        log.warning(
+                            "DR staging: could not remove leaked owner probe %s: %s",
+                            path,
+                            safe_exc(exc),
+                        )
                 continue
             if not entry.is_dir(follow_symlinks=False) or os.path.isjunction(entry.path):
                 continue

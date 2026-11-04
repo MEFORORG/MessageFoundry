@@ -99,6 +99,37 @@ async def test_a_failed_probe_on_a_share_does_not_fall_back_to_the_process_owner
     assert (other / "archive.tar").read_bytes() == b"synthetic plaintext"
 
 
+async def test_the_post_open_sweep_goes_by_the_lock_files_descriptor_not_a_path_read(
+    tmp_path, monkeypatch
+) -> None:
+    """With no early sweep, the sweep once this run's directory is open goes by the owner of the
+    lock file the run created there, read from its descriptor. A path read of the run's directory,
+    which an account that can rename entries in the staging root could choose, here answers another
+    owner, and this account's killed run's leftover is still swept."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    ours = _abandoned(data, "mefor-backup-")
+    _root_probe_answers_none(data, monkeypatch, first=None)
+    monkeypatch.setattr(dr_backup, "_fallback_root_owner", lambda root, process: None)
+    real_owner = dr_backup._owner_of
+
+    def owner(path: Path) -> object | None:
+        p = Path(path).absolute()
+        if p.parent == data and p.name.startswith("mefor-backup-") and p != ours:
+            return "path-read-owner"  # this run's own directory, read by path
+        return real_owner(path)
+
+    monkeypatch.setattr(dr_backup, "_owner_of", owner)
+    ours_at_open = _exists_at_open(monkeypatch, ours)
+    try:
+        result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.ok
+    assert ours_at_open[0] is True  # the control: no early sweep took it
+    assert not ours.exists()
+
+
 def _probe_creation_fails_in(data: Path, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     """Creating an owner probe in ``data`` fails with ENOSPC, as on a volume a killed run filled.
     Returns the refused attempts."""
