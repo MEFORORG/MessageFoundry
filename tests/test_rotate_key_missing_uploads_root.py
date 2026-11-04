@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import _uploads_root_refusal, main
+from messagefoundry.config.settings import load_settings
 from messagefoundry.pipeline.secret_rotation import ROTATION_RECORD_ID, dek_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -152,12 +153,18 @@ def test_rotate_key_refuses_a_nul_in_uploads_dir_with_exit_2(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """End to end: the refusal's exit 2 with nothing written, not a ValueError at exit 1. An
-    environment variable cannot hold a NUL, so the settings file carries it as a TOML escape."""
+    environment variable cannot hold a NUL, so the settings file carries it as a TOML escape.
+
+    The file is not named ``nul.toml``: Windows before 11, Server 2022 included, reads a DOS device
+    name followed by an extension as that device, so the write went to NUL and the run read an
+    empty file, no ``uploads_dir`` at all, and completed with exit 0 (BACKLOG #4940). The load is
+    checked first, so a file the settings do not read fails here rather than at the exit code."""
     db, uploads, key_a, key_b = rig
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     monkeypatch.delenv("MEFOR_STORE_UPLOADS_DIR")
-    cfg = db.with_name("nul.toml")
+    cfg = db.with_name("uploads-dir-with-a-nul.toml")
     cfg.write_text('[store]\nuploads_dir = "up\\u0000loads"\n', encoding="utf-8")
+    assert load_settings(config_path=cfg).store.uploads_dir == "up\0loads"
     assert main(["rotate-key", "--service-config", str(cfg), "--db", str(db)]) == 2
     assert "contains a NUL character" in capsys.readouterr().err
     rows = asyncio.run(_rows(db, key_a))  # key A alone: nothing was re-encrypted
