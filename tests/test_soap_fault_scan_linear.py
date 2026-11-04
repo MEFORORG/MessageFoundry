@@ -10,9 +10,8 @@ Three things are pinned here: the new extraction returns what the old patterns r
 grows linearly, and the 2xx classification runs in the worker thread. The old patterns are kept
 below, verbatim, as the reference for the first and the positive control for the second.
 
-The third is about which thread runs the scan, not about the loop staying responsive: each regex
-call holds the GIL until it returns, so the loop can still wait out one call. The linear growth is
-what bounds that wait; ``SoapDestination._post_and_classify`` says how long it measured.
+The third is about which thread runs the scan, not about the loop staying responsive.
+``SoapDestination._post_and_classify`` says why the two differ, and what bounds the difference.
 """
 
 from __future__ import annotations

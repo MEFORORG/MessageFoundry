@@ -137,9 +137,12 @@ is a new message envelope), not a purity violation. (The idempotency footgun thi
 #### 2a. Envelope assembly mechanism — stdlib string templating, no XML parser (Q4)
 
 This is **load-bearing** because the codebase is **regex-only and imports no XML parser** today: response
-faults are detected by regex (`_FAULT_RE` / `_FAULTCODE_RE` /`_CODEVALUE_RE`,
-[`soap.py:56-61`](../../messagefoundry/transports/soap.py)) and there is no `xml.etree` / `ElementTree` /
-`lxml` / `defusedxml` import anywhere under `messagefoundry/`. We keep that posture:
+faults are detected by regex (`_FAULT_RE`, [`soap.py`](../../messagefoundry/transports/soap.py)). The
+fault code is found without a parser too: `_FAULTCODE_RE` / `_CODEVALUE_RE` match only its start tag's
+name, and `_code_text` takes the text after that tag with `str.find`. *(Corrected 2026-11-04: until
+BACKLOG #2827 made the scan linear, the two patterns captured the code text themselves.)* There is no
+`xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under `messagefoundry/`. We keep
+that posture:
 
 - **Assembly is stdlib `str` templating** (an f-string / `str.format` skeleton), **not** `xml.etree`. The
   transport builds the `<soap:Envelope>` + `<soap:Header>` from its own controlled, namespace-fixed

@@ -880,9 +880,12 @@ class SoapDestination(DestinationConnector):
 
         THIS DOES NOT MAKE THE LOOP IMMUNE TO THE SCAN. Each ``re`` search and ``str`` replace is one
         C call that holds the GIL until it returns, so the loop can still wait out the longest single
-        call. What bounds that wait is the scan being linear: a 16 MiB fault reply measured 0.6 to
-        0.8 s on one workstation (2026-11-03), most of it the ``_WSSE_FAULT_RE`` pass over the whole
-        body, which predates #2827."""
+        call. What bounds that wait is the scan being linear: each call is one pass over at most the
+        16 MiB reply, and which call is longest depends on the reply's shape. On one 16-core desktop
+        (Ryzen 9 9950X, CPython 3.14, 2026-11-04) the costliest crafted reply found took about 2.6 s
+        in all: a fault code running the whole body, in a string stored four bytes a character. Its
+        longest single call was about 0.8 s, a ``_WSSE_FAULT_RE`` pass, which predates #2827; no name
+        scan passed 0.4 s. Those are that machine's readings, not a bound on another."""
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
