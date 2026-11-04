@@ -301,11 +301,23 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   class/instance UID, AE title, peer host) or a redacted URL — never the dataset, an element value, or pixel data.
   The rule holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A
   UID or AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe
-  identifier. The SCP redacts it from at least these lines, which stay with the element's name and the reason
-  while the value reads `[redacted]`: pynetdicom's non-conformant and refused value lines, its non-conformant
-  transfer syntax and related SOP class lines, pydicom's invalid value line, and the UID and AE title fields of
-  pynetdicom's DEBUG dumps of an association request and a DIMSE message. A line of another shape, or on another
-  logger, passes whole, so a pynetdicom or pydicom upgrade must re-read them. The SCP reads each association
+  identifier. The DICOM transport meets that rule with a log filter on those libraries' loggers, installed
+  when the transport is imported and again at each SCP start, so it covers the SCU's lines as well as the
+  SCP's. The filter redacts the value from at least these lines, which stay with the element's name and the
+  reason while the value reads `[redacted]`: pynetdicom's non-conformant and refused value lines; its
+  non-conformant transfer syntax and related SOP class lines, and its line naming a transfer syntax under the
+  DICOM root that is no transfer syntax; the exception its DUL logs when a received PDU does not decode, with
+  its traceback; pydicom's invalid value line; and the UID and AE title fields of pynetdicom's DEBUG dumps of
+  an association request, an association acceptance and a DIMSE message. A dump field keeps its value only
+  when the value passes the check pynetdicom flags it on, so the dump's `unknown` for a missing implementation
+  class UID is redacted too, since a peer can send that word itself. The lines are a list of the known
+  pynetdicom 3.0.4 and pydicom 3.0.2 shapes. A line of another shape, or on another logger, passes whole, so a
+  new shape that a library upgrade adds reaches the log until it is added to the list. The pin tests in
+  `tests/test_dicom_peer_value_logs.py` fail when either library's version changes, and when a line they read
+  changes, so an upgrade has to re-read the shapes. Known shapes not covered yet, at least: the exception
+  pynetdicom logs when a received DIMSE message does not convert, which only the SCU can reach, since the SCP
+  ends such an association first; and a flagged UID that spells a name in pydicom's UID dictionary, which a
+  dump field keeps. The SCP reads each association
   request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
   written only where pynetdicom will not read the same bytes again; a line on any other logger is written twice.
   pydicom also raises each of its lines as a `UserWarning`, which would carry the value to stderr. A warnings
