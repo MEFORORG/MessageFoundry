@@ -77,7 +77,6 @@ from typing import Any, ClassVar, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
-    EXPIRY_RELAXED_WAYS_ACROSS,
     RevocationHopGuard,
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
@@ -2364,12 +2363,11 @@ class DicomScuDestination(DestinationConnector):
         # it never reached keeps it. Disjoint from the cleartext guard above, which is taken only
         # when TLS is off.
         #
-        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
-        # is handed to the guard as no context: see skips_validity_period (vault BACKLOG #2978, ADR
-        # 0173 §13). The owner's 2026-10-05 ruling names MLLP; its reach to this hop is the batch 191
-        # Manager's reading of "one rule everywhere".
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so
+        # the guard is told with expiry_relaxed: see skips_validity_period (vault BACKLOG #2978 and
+        # #5089, ADR 0173 §13). The owner's 2026-10-05 ruling names MLLP; its reach to this hop is
+        # the batch 191 Manager's reading of "one rule everywhere".
         if self._ssl is not None:
-            expiry_relaxed = skips_validity_period(self._ssl)
             RevocationHopGuard.capture(
                 host=self._host,
                 cell="DICOM C-STORE client (SCU) over TLS",
@@ -2377,9 +2375,8 @@ class DicomScuDestination(DestinationConnector):
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                context=None if expiry_relaxed else self._ssl,
-                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
-                expiry_relaxed=expiry_relaxed,
+                context=self._ssl,
+                expiry_relaxed=skips_validity_period(self._ssl),
             ).enforce_construction()
 
     async def send(

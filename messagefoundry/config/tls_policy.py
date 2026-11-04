@@ -885,9 +885,13 @@ def verifies_peer_fully(ctx: object) -> bool:
 def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
     """Relax the certificate validity-period check on a **verifying** client context (#129, ADR 0094).
 
-    It relaxes one thing besides: OpenSSL applies the same flag to a CRL's validity window, so a CRL
-    past ``nextUpdate`` on this context is accepted, and a revocation guard gives it no credit
-    (:func:`skips_validity_period`, ADR 0173 §13). A leaf the CRL lists is still refused.
+    It relaxes at least these besides the peer leaf's validity period. The validity period of every
+    other certificate in the chain, the intermediates and the trust anchor, goes unchecked too.
+    OpenSSL applies the same flag to a CRL's validity window, so a CRL past ``nextUpdate`` on this
+    context is accepted, and a revocation guard gives it no credit
+    (:func:`skips_validity_period`, ADR 0173 §13); a leaf the CRL lists is still refused. And
+    OpenSSL's choice among candidate issuers stops preferring one whose own validity period is
+    current, so a chain may be built through an expired issuer where a current one exists.
 
     The granular alternative to the blunt ``tls_verify=false`` (which drops chain AND hostname AND expiry
     together via ``CERT_NONE``): this ORs :data:`_X509_V_FLAG_NO_CHECK_TIME` into ``ctx.verify_flags`` so a
@@ -940,10 +944,12 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
     OpenSSL applies that flag to a CRL's validity window as well as the certificate's, so a CRL past
     ``nextUpdate`` is accepted at the handshake on such a context. A CRL there is therefore no
     evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal. The MLLP
-    destination and the DICOM SCU ask this of the context they dial with and, on True, hand the
-    guard no context and name :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978, ADR 0173
-    §13). The REST family (vault BACKLOG #2188) and FTPS (vault BACKLOG #2193) reach the same answer
-    from the ``tls_allow_expired`` setting instead, and of those only FTPS names that remedy."""
+    destination and the DICOM SCU ask this of the context they dial with and, on True, pass
+    ``expiry_relaxed=True`` to :meth:`RevocationHopGuard.capture`, which drops the CRL credit and
+    names :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978 and #5089, ADR 0173 §13). FTPS
+    (vault BACKLOG #2193) reaches the same answer from the ``tls_allow_expired`` setting and passes
+    the same flag. The REST family (vault BACKLOG #2188) reads the setting too and hands the guard
+    no context, and does not name that remedy."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 
@@ -2669,7 +2675,8 @@ class RevocationHopGuard:
     #: field is exactly what let one env var cross every enforcing hop in the instance.
     blanket_attested: bool = False
     #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
-    #: context in :meth:`capture`, never from a global setting.
+    #: context in :meth:`capture`, never from a global setting. False for a caller that passes
+    #: ``expiry_relaxed=True``, whatever its context loads (ADR 0173 §13).
     crl_checked: bool = False
     #: Whether this hop skips the validity-period check (``tls_allow_expired``,
     #: :func:`skips_validity_period`): the caller says so, or the context handed in does. It
@@ -2746,10 +2753,15 @@ class RevocationHopGuard:
         ``declaration`` is the setting :attr:`declaration` says it is; omitted, the record names a
         connection's flag.
 
-        ``expiry_relaxed`` is for a caller that skips validity-period checks and therefore hands
-        no context (ADR 0173 §13): the guard cannot read that off a context it never sees, and
-        this hop's refusal, WARNING and attested line word such a hop differently. A context that
-        skips them sets it too."""
+        ``expiry_relaxed=True`` says this hop skips validity-period checks (``tls_allow_expired``,
+        ADR 0173 §13), and by itself it settles both halves of that rule, so a caller cannot pass
+        one without the other. Its context earns no CRL credit: ``crl_checked`` is False whatever
+        CRL the context loads, because the relaxation also skips the CRL's own validity window.
+        And an omitted ``ways_across`` becomes :data:`EXPIRY_RELAXED_WAYS_ACROSS`, so the record
+        never offers the CRL it has just refused to credit. A caller passes the context it dials
+        with and this flag. A context that skips the check without the flag sets
+        :attr:`expiry_relaxed` for the wording only; whether such a context's CRL should admit
+        the hop is not decided here (vault BACKLOG #5086)."""
         return cls(
             host=host,
             cell=cell,
@@ -2757,10 +2769,14 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=context_checks_revocation(context),
+            crl_checked=not expiry_relaxed and context_checks_revocation(context),
             expiry_relaxed=expiry_relaxed
             or (context is not None and skips_validity_period(context)),
-            ways_across=ways_across,
+            ways_across=(
+                EXPIRY_RELAXED_WAYS_ACROSS
+                if expiry_relaxed and ways_across is None
+                else ways_across
+            ),
             attested_reason=attested_reason,
             connection=connection,
             declaration=declaration,
@@ -2819,12 +2835,13 @@ class RevocationHopGuard:
         # see the hop crossed with no revocation check, on their attestation. A hop whose CRL is a
         # real check crossed on that check, so this line would be a false record there and it is
         # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
-        # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Its
-        # disposition is ALLOW on that CRL flag, which this line does not move. Nothing here refuses
-        # such a CRL: each caller makes the choice at its own call site, passing no context on a
-        # tls_allow_expired hop. At least the REST, SOAP and FHIR destinations, FTPS
-        # (_guard_ftps_revocation), MLLP and the DICOM SCU do (ADR 0173 §4.3 and §13), so those
-        # hops cross on the attestation and keep the line for that reason.
+        # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Handed one
+        # without `expiry_relaxed`, its disposition is ALLOW on that CRL flag, which this line does
+        # not move (vault BACKLOG #5086). A caller says so at its own call site: at least FTPS
+        # (_guard_ftps_revocation), MLLP and the DICOM SCU pass `expiry_relaxed=True` on a
+        # tls_allow_expired hop, which drops the CRL credit in `capture`, and the REST, SOAP and FHIR
+        # destinations pass no context there (ADR 0173 §4.3 and §13). Those hops cross on the
+        # attestation and keep the line for that reason.
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (

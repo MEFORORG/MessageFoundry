@@ -781,15 +781,22 @@ changed no disposition. Where the line no longer fires, the
 attestation stays visible elsewhere: `messagefoundry check` lists a connection's, and
 `security_loosenings()` names an `[alerts]` pair.
 
-**Note 2026-11-03 (BACKLOG #5089):** on the MLLP destination, the DICOM SCU and both FTPS
-directions, the kept line on a `tls_allow_expired` hop now says what it lacks. Each passes
-`expiry_relaxed` to `RevocationHopGuard.capture`, which it otherwise could not read off the context
-it withholds, and the line then reads *crossed without a revocation check the guard credits*: the
-chain is verified but not the validity period, and a CRL, where one reaches the hop, is read
-without its own validity window. The refusal and the WARNING on such a hop use the same words. A
-guard handed a context that skips time validity words it the same way.
-The REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
-paragraph describes; their refusal text is left open in §13 too. No disposition reads the flag.
+**Note 2026-11-03 (BACKLOG #5089):** on at least the MLLP destination, the DICOM SCU and both
+FTPS directions, the kept line on a `tls_allow_expired` hop now says what it lacks. Each passes
+`RevocationHopGuard.capture` the context it dials with and `expiry_relaxed=True`. That one flag
+settles both halves of §13's rule, so a caller cannot set one without the other: `crl_checked` is
+False whatever CRL the context loads, and the record names `EXPIRY_RELAXED_WAYS_ACROSS` where the
+caller passes no remedy of its own. Before this note those hops handed the guard no context
+instead, which gave the same disposition; where an older passage of this ADR says one of them hands
+the guard no context, read this note. The line then reads *crossed without a revocation check the
+guard credits*: the chain is verified but not the validity period, and a CRL, where one reaches the
+hop, is read without its own validity window. The refusal and the WARNING on such a hop use the
+same words, and so does a guard handed a context that skips time validity without the flag; whether
+such a context's CRL should admit the hop is not decided here (vault BACKLOG #5086). The AI broker
+writes its own records, not the guard's, and its line keeps the unrelaxed words: no context that
+skips time validity reaches it, because it dials rest.py's shared opener, which never relaxes. The
+REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
+paragraph describes; their refusal text is left open in §13 too.
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.
@@ -1532,10 +1539,12 @@ on first deployment, with no attestation.
   caller", unhedged, and put the cause the wrong way round. §4.3's CORRECTED 2026-10-30 paragraph
   records the condition the code applies, `crl_is_a_check`. It is what silences the line on a hop
   whose CRL is a real check, and it keeps the line for a context that skips time validity. At least
-  the callers that paragraph names hand the guard no context when theirs skips time validity, and
-  that handoff is what makes `crl_is_a_check` equal `crl_checked` on each of them, so on those
-  callers the effect matches the reverted fix's. A caller that handed the guard such a context
-  would differ: there `crl_checked` is True and `crl_is_a_check` is False.)*
+  the callers that paragraph names drop the CRL credit when theirs skips time validity: the REST,
+  SOAP and FHIR hops hand the guard no context, and MLLP, the SCU and FTPS pass `expiry_relaxed`
+  (§4.3's note of 2026-11-03). Either makes `crl_checked` False, so `crl_is_a_check` equals it on
+  each of them, and on those callers the effect matches the reverted fix's. A caller that handed
+  the guard such a context without that flag would differ only where the context loads a CRL:
+  there `crl_checked` is True and `crl_is_a_check` is False. Where it loads none, both are False.)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL

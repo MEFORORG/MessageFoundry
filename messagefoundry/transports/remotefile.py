@@ -93,7 +93,6 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
-    EXPIRY_RELAXED_WAYS_ACROSS,
     RevocationHopGuard,
     TrustAnchorPolicy,
     build_verifying_client_context,
@@ -2111,15 +2110,14 @@ def _guard_ftps_revocation(
     the only gate on them. A CRL that is configured but cannot be loaded never gets here: the
     context build refuses it first (``harden_crl_check``).
 
-    A ``tls_allow_expired`` hop hands the guard no context, so a CRL cannot relax its refusal and
-    only an attestation crosses it. ``relax_verify_expiry`` sets ``X509_V_FLAG_NO_CHECK_TIME``,
-    which OpenSSL applies to a CRL's validity window as well as the certificate's, so a CRL past
+    A ``tls_allow_expired`` hop passes ``expiry_relaxed=True``, which drops the CRL credit, so a
+    CRL cannot relax its refusal and only an attestation crosses it (ADR 0173 §13).
+    ``relax_verify_expiry`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's validity window as well as the certificate's, so a CRL past
     ``nextUpdate`` would still be accepted. The REST family reads the same setting for the same
     reason (``refuse_unrevoked_verified_hop``, vault BACKLOG #2188); the truthiness here is the
     one ``_ftps_ssl_context`` relaxes on."""
     if context is None or context.verify_mode is ssl.CERT_NONE:
         return
-    expiry_relaxed = bool(s.get("tls_allow_expired"))
     RevocationHopGuard.capture(
         host=str(s["host"]),
         cell=f"REMOTEFILE ftps {direction}",
@@ -2130,9 +2128,8 @@ def _guard_ftps_revocation(
         attested=attested,
         attested_reason=attested_reason,
         connection=connection,
-        context=None if expiry_relaxed else context,
-        ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
-        expiry_relaxed=expiry_relaxed,
+        context=context,
+        expiry_relaxed=bool(s.get("tls_allow_expired")),
     ).enforce_construction()
 
 

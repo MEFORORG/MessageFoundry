@@ -46,7 +46,6 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
-    EXPIRY_RELAXED_WAYS_ACROSS,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
@@ -918,9 +917,10 @@ class MLLPDestination(DestinationConnector):
         # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
         # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
         #
-        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
-        # is handed to the guard as no context: see skips_validity_period (owner ruling 2026-10-05;
-        # vault BACKLOG #2978, ADR 0173 §13).
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so
+        # the guard is told with expiry_relaxed, which drops that credit and names the relaxed
+        # remedy: see skips_validity_period (owner ruling 2026-10-05; vault BACKLOG #2978 and #5089,
+        # ADR 0173 §13).
         expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
@@ -930,13 +930,11 @@ class MLLPDestination(DestinationConnector):
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                # BACKLOG #299: the context this hop will actually hand to wrap_socket, unless it
-                # skips validity-period checks (above, #2978), when it is deliberately None and
-                # must stay so. A CRL that reached it (via [tls].crl_file through the resolved
-                # anchor) sets VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the
-                # setting -- so a sibling hop the same CRL never reached keeps its refusal.
-                context=None if expiry_relaxed else self._ssl,
-                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+                # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
+                # reached it (via [tls].crl_file through the resolved anchor) sets
+                # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting --
+                # so a sibling hop the same CRL never reached keeps its refusal.
+                context=self._ssl,
                 expiry_relaxed=expiry_relaxed,
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE

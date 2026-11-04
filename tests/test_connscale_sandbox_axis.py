@@ -13,7 +13,6 @@ import argparse
 import asyncio
 import dataclasses
 import inspect
-import logging
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +45,7 @@ from harness.load.connscale.stepconfig import graph_module_text
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram, LiveMetrics
+from tests.test_revocation_guard_remaining_hops import _guard_log
 
 _SANDBOX_AB = """
 [connscale]
@@ -258,21 +258,12 @@ async def test_a_redelivery_does_not_stand_in_for_a_connection_that_never_delive
     monkeypatch.setattr(runner_mod, "subtree_size", lambda _pid: None)
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
 
-    # A handler on the runner's own logger, not caplog, which reads at the root and so depends on
-    # every logger between staying as this test found it under xdist.
-    records: list[logging.LogRecord] = []
-    handler = logging.Handler(logging.WARNING)
-    handler.emit = lambda record: records.append(record)  # type: ignore[method-assign]
-    level = runner_mod.log.level
-    runner_mod.log.setLevel(logging.WARNING)
-    runner_mod.log.addHandler(handler)
-    try:
+    # Collected on the runner's own logger, not through caplog, which reads at the root and so
+    # depends on every logger between staying as this test found it under xdist.
+    with _guard_log(runner_mod.log.name) as log:
         reading = await _warm(
             metrics, arrivals=[0, 1, 2, 3, 4, 5, 6, 7, 8, 0], pid=None, timeout=0.3
         )
-    finally:
-        runner_mod.log.removeHandler(handler)
-        runner_mod.log.setLevel(level)
 
     assert metrics.counters.sink_received == 10
     assert (reading.warmup_sent, reading.warmup_delivered) == (10, 9)
@@ -280,8 +271,8 @@ async def test_a_redelivery_does_not_stand_in_for_a_connection_that_never_delive
     # first-delivery figures: their max is connection 8's first arrival, at 9 ms (BACKLOG #5089).
     assert reading.warmup_first_delivery_max_ms == pytest.approx(9.0, rel=0.02)
     # The warning names the silent inbound by its port, and no other.
-    silent = [r.getMessage() for r in records if "first deliveries" in r.getMessage()]
-    assert len(silent) == 1, silent
+    silent = [m for m in log.messages if "first deliveries" in m]
+    assert len(silent) == 1, log.state()
     assert silent[0].endswith(f"port(s) {_BASE_PORT + 9}"), silent
 
 

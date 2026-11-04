@@ -388,8 +388,10 @@ def _alert_hop_posture(posture: HopPosture | None) -> HopPosture:
     return ambient if ambient is not None else HopPosture.fail_closed(enforcing=None)
 
 
-#: The ``[alerts]`` revocation attestation flags, spelled once: each is both the flag the reason
-#: check names and, prefixed, the declaration the attested-crossing line names.
+#: The ``[alerts]`` revocation attestation flags as the two guard calls below name them, so each
+#: call names its flag once: it is both the flag the reason check names and, prefixed, the
+#: declaration the attested-crossing line names. They are not the only spelling. The remedy
+#: sentences above and the ``AlertsSettings`` fields spell the same names again.
 _WEBHOOK_ATTESTATION = "webhook_tls_revocation_attested"
 _EMAIL_ATTESTATION = "email_tls_revocation_attested"
 

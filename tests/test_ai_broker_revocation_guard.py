@@ -12,7 +12,6 @@ for this hop. All endpoints and keys here are synthetic.
 from __future__ import annotations
 
 import json
-import logging
 import ssl
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -44,6 +43,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
+from tests.test_revocation_guard_remaining_hops import _guard_log
 
 _ENDPOINT = "https://ai.internal/v1/messages"
 _KEY = "synthetic-ai-key-value"
@@ -100,25 +100,10 @@ def ai_log() -> Iterator[list[str]]:
 
     Not the root-level capture fixture, which depends on every logger between the emitter and the
     root staying as this test found it; a test elsewhere on the same xdist worker can change that,
-    and an arm that asserts no line would then pass with its records lost. A handler on the
-    emitting logger sees each record first. Its level, ``disabled`` flag and ``logging.disable``
-    are set for the test and put back after."""
-    lines: list[str] = []
-    handler = logging.Handler(logging.WARNING)
-    handler.emit = lambda record: lines.append(record.getMessage())  # type: ignore[method-assign]
-    logger = logging.getLogger(_LOGGER)
-    saved = (logger.level, logger.disabled, logging.root.manager.disable)
-    logging.disable(logging.NOTSET)
-    logger.setLevel(logging.WARNING)
-    logger.disabled = False
-    logger.addHandler(handler)
-    try:
-        yield lines
-    finally:
-        logger.removeHandler(handler)
-        logger.setLevel(saved[0])
-        logger.disabled = saved[1]
-        logging.disable(saved[2])
+    and an arm that asserts no line would then pass with its records lost. The suite's shared
+    capture on the emitting logger, which says what it sets and puts back."""
+    with _guard_log(_LOGGER) as log:
+        yield log.messages
 
 
 # --- the guard -----------------------------------------------------------------------------------
