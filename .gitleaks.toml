@@ -38,9 +38,9 @@ regexes = [
   #
   # EXACT LITERALS, never a family prefix -- the practice the #1183 block sets. A tidy `wt-.*` would
   # also allowlist a REAL leaked key that happened to match the shape, leaving the scanner blind to
-  # the exact thing it exists to catch. ONLY THE NINE THAT ACTUALLY TRIP ARE LISTED: the file carries
-  # 22 sentinels and gitleaks flagged these nine on entropy, so allowlisting the other 13
-  # pre-emptively would widen the scanner's blind spot to buy nothing.
+  # the exact thing it exists to catch. ONLY THE ONES THAT ACTUALLY TRIP ARE LISTED: the file carried
+  # 22 sentinels and gitleaks flagged nine on entropy, and one added for BACKLOG #5030 later, so
+  # allowlisting the others pre-emptively would widen the scanner's blind spot to buy nothing.
   #
   # `encryption_key=` on the store-open line; pattern _KEY_MATERIAL.
   '''wt-Enc_Key-51''',
